@@ -27,10 +27,13 @@ LP-0MSORPUMX002LLIA — proxy-side enabler for herdr same-slot idle tracking
 - Bounded by the `STATUS_QUERY_TIMEOUT` window (default 1.0s) via the
   helper's own httpx timeout, so a slow `/slots` response cannot blow the
   endpoint's response budget.
-- Fail-open: `slots` is an empty array when llama-server is not running, no
-  model is loaded yet, or the slots query fails/times out — never a
-  malformed payload. `total_slots` / `available_slots` behavior is
-  unchanged.
+- Fail-open: `slots` falls back to the last-known per-slot detail cache
+  (updated by the periodic broadcast/SSE loops) when the fresh query fails
+  or returns nothing, so slot identity survives a transient `/slots`
+  failure (LP-0MUFSVXID0039ZAQ). It is an empty array only when
+  llama-server is not running, no model is loaded yet, or no cached detail
+  exists — never a malformed payload. `total_slots` / `available_slots`
+  behavior is unchanged.
 
 ## Graceful degradation on `/slots` failure (LP-0MSVP7XJ6008QPKX)
 
@@ -49,8 +52,13 @@ Now:
   3600s; env-configurable) so a genuinely-unavailable llama-server
   eventually fail-closes rather than serving stale capacity forever.
 - The payload and `status_request` log gain a `slots_stale` boolean that is
-  `true` whenever the served counts came from the cache (vs a fresh query),
-  so a future silent failure is observable.
+  `true` whenever the served slot data (counts or per-slot detail) came from
+  the cache (vs a fresh query), so a future silent failure is observable.
+- Per-slot detail degrades the same way (LP-0MUFSVXID0039ZAQ): when the
+  fresh `_query_slots_detail()` call fails or returns an empty list, the
+  handler serves `_last_slot_details_cache` instead of `slots: []`, preserving
+  herdr per-slot identity; an empty cache still yields a well-formed empty
+  array. A cached-detail response sets `slots_stale: true`.
 - Every failed query increments `llama_slots_query_failures_total{reason=...}`
   (Prometheus counter), alerting via `monitoring/slots_query_alerts.yaml`
   when the failure rate is sustained.

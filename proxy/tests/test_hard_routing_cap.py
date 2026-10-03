@@ -55,18 +55,13 @@ def provider_mod():
 
 @pytest.fixture
 def real_config():
-    """Loaded real config files (AC5: ratio surface resolves to absolutes)."""
-    proxy_dir = Path(__file__).resolve().parent.parent
-    import yaml
-
-    def _load(name):
-        with open(proxy_dir / name) as f:
-            return yaml.safe_load(f)
+    """Loaded real config profiles (AC5: ratio surface resolves to absolutes)."""
+    from tests.config_test_utils import load_profile
 
     return {
-        "fast": _load("config-fast.yaml"),
-        "cheap": _load("config-cheap.yaml"),
-        "base": _load("config.yaml"),
+        "fast": load_profile("config-fast.yaml"),
+        "cheap": load_profile("config-cheap.yaml"),
+        "base": load_profile("config.yaml"),
     }
 
 

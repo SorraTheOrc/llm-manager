@@ -577,8 +577,9 @@ _last_slot_details_cache: list[dict] = []
 """Last successful result from ``_query_slots_detail()``.
 
 Updated by ``_periodic_broadcast_loop()`` on each successful query.
-Read by ``status_events()`` in ``proxy.ui`` as a fallback when the
-initial /slots query times out.
+Read by ``status_events()`` in ``proxy.ui`` and by the
+``/llama/local/status`` handler (``proxy.handlers``) as a fallback when
+the initial /slots query fails or times out (LP-0MUFSVXID0039ZAQ).
 """
 
 
@@ -601,6 +602,19 @@ Maps ``slot_id`` to ``{"n_tokens": int, "stable_since": float}``.
 When ``n_tokens`` stops increasing for > 3 seconds, generation is
 considered complete (streaming response to client).  Used to set
 ``generation_done`` in enriched slot details.
+"""
+
+
+GENERATION_COMPLETE_TOKEN_MARGIN: int = 20
+"""Tokens within ``total_tokens`` that count as prefill-complete.
+
+A stable ``n_tokens`` value is not sufficient evidence that generation
+has finished: during prompt prefill a batch can pause for more than the
+stability window, which previously flipped the Web UI to its 'Working'
+badge and back to 'Processed x of y...' on the next increment
+(WL-0MSZVB902004AZZN).  Only treat stability as completion when prefill
+is also essentially done, i.e. ``n_tokens`` is within this margin of
+``total_tokens``.
 """
 
 
@@ -1306,14 +1320,28 @@ def _enrich_slot_details_with_progress(slot_details: list[dict],
             slot["n_decoded"] = n_tokens
 
         # --- Generation-complete detection via n_tokens stability ---
-        # When n_tokens stops increasing for > 3s, generation is done
-        # and the session is streaming the response to the client.
+        # When n_tokens stops increasing for > 3s *and* prefill is complete,
+        # generation is done and the session is streaming the response to
+        # the client.  Requiring prefill completion prevents a prefill-phase
+        # pause from being mistaken for completion, which made the Web UI
+        # flip to 'Working' and back to a prefill increment
+        # (WL-0MSZVB902004AZZN).
+        total_tokens = slot.get("total_tokens")
+        prefill_complete = (
+            total_tokens is not None
+            and n_tokens >= total_tokens - GENERATION_COMPLETE_TOKEN_MARGIN
+        )
         stable = _slot_stable_tracker.get(sid)
         if stable and stable["n_tokens"] == n_tokens:
             # n_tokens hasn't changed — check how long it's been stable
-            if now - stable["stable_since"] > 3.0:
+            if now - stable["stable_since"] > 3.0 and prefill_complete:
                 slot["generation_done"] = True
                 slot["is_processing"] = False
+            else:
+                # Still prefilling (or within the stability window): keep
+                # reporting progress instead of the 'Working' state.
+                slot["generation_done"] = False
+                slot["is_processing"] = True
         else:
             # n_tokens increased (or first sighting) — reset tracker
             _slot_stable_tracker[sid] = {"n_tokens": n_tokens, "stable_since": now}

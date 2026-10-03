@@ -332,23 +332,17 @@ def test_setup_logging_pruning_logs_on_startup(tmp_path, monkeypatch, caplog, _c
 
 
 def test_config_files_have_7_day_retention():
-    """All config files should have retention_days: 7 (LP-0MSNKMXIK004P7TL AC5)."""
-    import yaml
+    """Every config profile resolves retention_days: 7 (LP-0MSNKMXIK004P7TL AC5).
 
-    proxy_root = Path(__file__).resolve().parent.parent  # proxy/
-    config_files = [
-        proxy_root / "config.yaml",
-        proxy_root / "config-cheap.yaml",
-        proxy_root / "config-fast.yaml",
-    ]
+    The mode files are overlays, so retention is inherited from config.yaml.
+    """
+    from tests.config_test_utils import load_profile
 
-    for config_path in config_files:
-        assert config_path.exists(), f"Config file missing: {config_path}"
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f)
+    for config_name in ("config.yaml", "config-cheap.yaml", "config-fast.yaml"):
+        cfg = load_profile(config_name)
         retention = cfg.get("logging", {}).get("retention_days")
         assert retention == 7, (
-            f"{config_path.name}: expected retention_days=7, got {retention}"
+            f"{config_name}: expected retention_days=7, got {retention}"
         )
 
 

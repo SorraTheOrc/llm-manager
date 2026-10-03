@@ -42,6 +42,23 @@ def _reset_slots_poll_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_slot_details_cache():
+    """Reset the last-known per-slot detail cache before every test.
+
+    ``_last_slot_details_cache`` is populated by the broadcast/SSE paths and
+    consumed as a fallback by the ``/llama/local/status`` handler when the
+    fresh per-slot query fails (LP-0MUFSVXID0039ZAQ). Without a reset, an
+    earlier test that populated the cache would make a later test observing a
+    stubbed failure see cached detail instead of ``[]``.
+    """
+    import proxy.observability as obs
+
+    obs._last_slot_details_cache = []
+    yield
+    obs._last_slot_details_cache = []
+
+
+@pytest.fixture(autouse=True)
 def _reset_server_global_state(monkeypatch):
     """Reset global server counters that leak across tests.
 
@@ -71,6 +88,64 @@ def _reset_server_global_state(monkeypatch):
     server.active_queries = 0
     server.local_active_queries = 0
     server.local_generating_queries = 0
+
+
+@pytest.fixture(autouse=True)
+def _isolate_startup_ramp_config():
+    """Isolate the process-global startup-ramp config between tests.
+
+    ``proxy.mode._startup_ramp_config`` is a module-level variable mutated
+    by ``set_startup_ramp_config()``.  A test that calls
+    ``set_startup_ramp_config(None)`` installs the *enabled* defaults
+    (``{"enabled": True, ...}``), not a disabled state — so a teardown that
+    does ``set_startup_ramp_config(None)`` leaves the global enabled and
+    causes 503-gate failures in all subsequent tests that expect the process
+    default of ``None``.
+
+    This autouse fixture saves the value before each test and restores it
+    afterwards, preventing any test from inheriting a leaked enabled ramp
+    configuration (LP-0MUD0D0DU005R2VQ).
+    """
+    import proxy.mode as mode_module
+
+    saved = mode_module._startup_ramp_config
+    yield
+    mode_module._startup_ramp_config = saved
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provider_availability_state(tmp_path, monkeypatch):
+    """Isolate persisted provider availability state between tests.
+
+    Provider cooldowns and the usage-limit account quarantine are persisted
+    to ``proxy/provider-state.json`` and restored at startup
+    (LP-0MUI6KB67005X44B). ``mark_provider_unavailable()`` and the
+    usage-limit quarantine sites now write on every cold-path mutation, so
+    without a redirect a test would write the real runtime file and leak
+    availability state across test modules.
+
+    Point the loader/saver at a per-test temporary file (via
+    ``LLAMA_PROXY_PROVIDER_STATE_FILE``) and clear the in-memory maps so every
+    test starts from a clean, empty availability state. Tests can still read
+    and write a state file — they just never touch the real one.
+    """
+    import proxy.provider as provider
+
+    monkeypatch.setenv(
+        provider._PROVIDER_STATE_FILE_ENV,
+        str(tmp_path / "provider-state.json"),
+    )
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
+    provider._usage_reset_guessed.clear()
+    provider._usage_limit_last_probe.clear()
+    yield
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
+    provider._usage_reset_guessed.clear()
+    provider._usage_limit_last_probe.clear()
 
 
 def _find_live_e2e_summary_data() -> tuple[dict[str, Any] | None, str | None]:

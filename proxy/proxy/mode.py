@@ -13,13 +13,14 @@ The proxy runs in one of two operator-selected operating modes:
 
 The active mode is persisted in a small runtime state file
 (``proxy/.mode``); when absent the mode defaults to ``fast`` (current
-behavior). ``scripts/start-proxy.sh`` reads the mode at startup and selects
-the corresponding config file; ``load_config()`` (``proxy/proxy/utils.py``)
-falls back to the mode-selected config when ``LLAMA_PROXY_CONFIG`` is unset.
+behavior). ``proxy/scripts/start-proxy.sh`` reads the mode at startup and
+selects the corresponding config overlay; ``load_config()``
+(``proxy/proxy/utils.py``) deep-merges that overlay on top of the
+authoritative base ``config.yaml`` when ``LLAMA_PROXY_CONFIG`` is unset.
 
 Switching modes via ``POST /admin/set-mode`` persists the new mode and
-triggers a full proxy restart (``scripts/start-proxy.sh --restart``) so the
-new config profile takes effect. A mode-switch restart terminates in-flight
+triggers a full proxy restart (``proxy/scripts/start-proxy.sh --restart``) so
+the new config profile takes effect. A mode-switch restart terminates in-flight
 requests — clients retry (same semantics as the previous slot-schedule
 transitions, LP-0MSF9RUSQ007M346). This is accepted behavior, not a bug.
 
@@ -122,8 +123,12 @@ MODE_SWITCH_DRAIN_RETRY_MARGIN_SECONDS = 15.0
 #   1. ``PROXY_START_TIME`` records when the new process started (set by
 #      server.py in the lifespan handler).
 #   2. While ``startup_ramp`` is active, every new chat request receives
-#      ``Retry-After = uniform(jitter_min, jitter_max)``.
-#   3. Clients simply retry after that delay, spreading the reconnects over
+#      ``Retry-After = uniform(jitter_min, jitter_max)`` plus a 3 s margin.
+#   3. The 503 body also carries ``ramp_ends_at`` (ISO-8601 UTC ceiling) and
+#      ``ramp_remaining_seconds`` (non-negative whole seconds) so clients and
+#      operators can see when the ramp ends rather than guessing from the
+#      jittered ``Retry-After`` (LP-0MU9Z7O8M0053Y0K).
+#   4. Clients simply retry after that delay, spreading the reconnects over
 #      the ramp window.
 #
 # Config lives in ``server.startup_ramp`` with defaults:
@@ -805,10 +810,14 @@ def resolve_config_path() -> Path:
 
     Precedence:
     1. ``LLAMA_PROXY_CONFIG`` env var (explicit override — set by
-       ``scripts/start-proxy.sh`` from the persisted mode).
-    2. The mode-selected config file (``config-fast.yaml`` /
+       ``proxy/scripts/start-proxy.sh`` from the persisted mode).
+    2. The mode-selected config overlay (``config-fast.yaml`` /
        ``config-cheap.yaml``) when a valid mode has been persisted.
     3. ``proxy/config.yaml`` (default/fallback, current behavior).
+
+    ``load_config()`` deep-merges the resolved overlay on top of the
+    authoritative base ``proxy/config.yaml`` (see ``proxy.config_merge``);
+    this function only resolves the path.
     """
     env = os.environ.get("LLAMA_PROXY_CONFIG")
     if env:
@@ -894,7 +903,7 @@ def set_mode(
       persisted and no restart is armed (a manual call still refreshes the
       override expiry).
     - Requesting a different mode persists the new mode and spawns the
-      restart (``scripts/start-proxy.sh --restart``) in the background.
+      restart (``proxy/scripts/start-proxy.sh --restart``) in the background.
 
     Raises ``RuntimeError`` when a mode-switch restart is already pending
     and the requested mode differs (rejected to avoid restart loops), and
@@ -955,7 +964,7 @@ def _write_override_expiry(schedule: ModeScheduleConfig | None) -> None:
 
 
 def _spawn_restart() -> None:
-    """Spawn ``scripts/start-proxy.sh --restart`` in the background.
+    """Spawn ``proxy/scripts/start-proxy.sh --restart`` in the background.
 
     Runs in a daemon thread after ``RESTART_DELAY_SECONDS`` so the API
     response flushes before the process is killed. The persisted mode is

@@ -316,12 +316,9 @@ class TestConfigTokenizerPlumbing:
     @pytest.mark.parametrize("config_file", ["config.yaml", "config-fast.yaml"])
     def test_local_qwen3_models_have_tokenizer(self, config_file):
         """plan/author/code (all local Qwen3) carry tokenizer: qwen3."""
-        from pathlib import Path
+        from tests.config_test_utils import load_profile
 
-        import yaml
-
-        path = Path(__file__).resolve().parent.parent / config_file
-        cfg = yaml.safe_load(path.read_text())
+        cfg = load_profile(config_file)
         for model in ("plan", "author", "code"):
             entry = cfg["models"][model]
             assert entry.get("tokenizer") == "qwen3", (
@@ -332,12 +329,9 @@ class TestConfigTokenizerPlumbing:
     def test_server_level_multiplier_removed(self, config_file):
         """The server-level token_estimate_multiplier is gone — the native
         tokenizer replaces it (AC4: removing it causes no behavior change)."""
-        from pathlib import Path
+        from tests.config_test_utils import load_profile
 
-        import yaml
-
-        path = Path(__file__).resolve().parent.parent / config_file
-        cfg = yaml.safe_load(path.read_text())
+        cfg = load_profile(config_file)
         server = cfg.get("server", {})
         assert "token_estimate_multiplier" not in server, (
             f"server-level token_estimate_multiplier must be removed from "

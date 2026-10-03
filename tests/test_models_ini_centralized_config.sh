@@ -552,6 +552,50 @@ FAKE
 }
 
 # ---------------------------------------------------------------
+# Test: [Qwen3] carries the derived prompt-cache sizing and no dead
+# swa-full flag (LP-0MUPPAC7R0053J8L AC2/AC3/AC7/AC8)
+# ---------------------------------------------------------------
+test_qwen3_cache_ram_present() {
+    echo "Test: Production models.ini [Qwen3] has derived cache-ram"
+
+    local val
+    val=$(awk 'BEGIN { found=0; val="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "qwen3") found=1 }
+    found && /^cache-ram/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
+    END { if (val != "") print val }' "$MODELS_INI")
+
+    [ "$val" = "23552" ] && pass "[Qwen3] cache-ram=23552 (got: $val)" \
+        || fail "[Qwen3] cache-ram expected 23552, got: '$val'"
+}
+
+test_qwen3_ctx_checkpoints_present() {
+    echo "Test: Production models.ini [Qwen3] pins ctx-checkpoints"
+
+    local val
+    val=$(awk 'BEGIN { found=0; val="" }
+    /^\[/ { gsub(/\[|\]/, ""); found=0; if (tolower($0) == "qwen3") found=1 }
+    found && /^ctx-checkpoints/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
+    END { if (val != "") print val }' "$MODELS_INI")
+
+    [ "$val" = "32" ] && pass "[Qwen3] ctx-checkpoints=32 (got: $val)" \
+        || fail "[Qwen3] ctx-checkpoints expected 32, got: '$val'"
+}
+
+test_no_active_swa_full() {
+    echo "Test: models.ini has no active swa-full flag (dead on hybrid arch)"
+
+    # Match only uncommented key lines; commentary mentioning swa-full is fine.
+    local active
+    active=$(awk 'BEGIN { n=0 }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*swa-full[[:space:]]*=/ { n++ }
+    END { print n }' "$MODELS_INI")
+
+    [ "$active" -eq 0 ] && pass "no active swa-full lines remain" \
+        || fail "$active active swa-full line(s) still present in models.ini"
+}
+
+# ---------------------------------------------------------------
 # Test: Script exists and is executable
 # ---------------------------------------------------------------
 test_script_exists() {
@@ -571,6 +615,9 @@ test_script_exists
 test_per_model_ctx_size_present
 test_per_model_reasoning_format_present
 test_per_model_cache_type_present
+test_qwen3_cache_ram_present
+test_qwen3_ctx_checkpoints_present
+test_no_active_swa_full
 test_global_ngl_from_models_ini
 test_global_ngl_defaults_to_80
 test_global_ngl_zero_disables_gpu

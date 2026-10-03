@@ -21,6 +21,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 import slot_persistence_harness as h
+from lib.proxy_logs import discover_proxy_log_files, iter_proxy_log_lines
 
 # ---------------------------------------------------------------------------
 # Fixture lines (real shapes from /var/log/llama-proxy)
@@ -348,10 +349,28 @@ class TestAnalyzeCorpus:
         _write(tmp_path, "llama-server.10.log", [LLAMA_CHECKPOINT_CREATE])
         _write(tmp_path, "llama-server.log-2026-08-27.gz", [LLAMA_SLOTS_200])
         corpus = h.analyze(tmp_path, None, None, None)
-        assert corpus["meta"]["proxy_files"] == len(h._iter_proxy_files(tmp_path)) == 3
+        assert len(discover_proxy_log_files(tmp_path)) == 3
+        assert corpus["meta"]["proxy_files"] == 3
         assert corpus["meta"]["llama_files"] == len(h._iter_llama_files(tmp_path)) == 3
         assert corpus["baseline_metrics"]["total_slot_saves"] == 3
         assert corpus["baseline_metrics"]["llama_checkpoints_created"] == 2
+
+    def test_proxy_iter_reads_dash_named_and_gzip_files(self, tmp_path):
+        """Regression (LP-0MUIEK66C003VGO1): the harness reads every
+        rotated naming/compression variant through the shared helper.
+
+        The harness previously carried a duplicate discovery copy; a dash-named
+        or ``.gz`` file's content must contribute to the corpus."""
+        _write(tmp_path, "proxy.log-2026-08-27_00", [SLOT_SAVE_SUCCESS])
+        _write(tmp_path, "proxy.log.2026-08-28_00.gz", [SLOT_SAVE_SUCCESS])
+        corpus = h.analyze(tmp_path, None, None, None)
+        assert corpus["baseline_metrics"]["total_slot_saves"] == 2
+        assert corpus["meta"]["proxy_files"] == 2
+        pairs = list(iter_proxy_log_lines(tmp_path))
+        assert {p.name for p, _ in pairs} == {
+            "proxy.log-2026-08-27_00",
+            "proxy.log.2026-08-28_00.gz",
+        }
 
     def test_llama_file_glob_filters_day(self, tmp_path):
         """--llama-file restricts llama parsing to the day's rotated file

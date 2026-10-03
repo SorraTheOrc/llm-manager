@@ -1,6 +1,74 @@
 # Changelog
 
+## v0.1.20 (2026-10-03)
+### Features
+- Release post-step ran without a release: 74 items mislabeled 'Shipped in v0.1.18' and v0.1.19 changelog empty (LP-0MUEALIM60037F1S)
+- Time-based automatic mode switching (cheap 00:01-10:00, fast 10:00-00:01) (LP-0MSM5K4TX004MICX)
+- Add a fallback to the fast and cheap configs (LP-0MU0W548B0029255)
+- Hierarchical failure-domain exclusion: gateway-wide versus model-specific failures (LP-0MTVMB8DW0067H9A)
+- Guessed usage-limit quarantine locks opencode-go accounts for up to 30 days when the gateway omits the reset duration (LP-0MUQTCMW2001VXH8)
+- Fix: no-progress watchdog releases local lease but never cancels the upstream prefill (wedged llama-server slot) (LP-0MUGQHPJ50046LV8)
+- Correct proxy-usage-analysis 429 recommendation: GoUsageLimitError uses account quarantine, not the 3-hour cooldown (LP-0MUI6KL3F0094YBS)
+- Startup-ramp 503: include the ramp end time in the response (LP-0MU9Z7O8M0053Y0K)
+- promoting thinking to content (LP-0MSEHOE7B005DE08)
+- Split Time to first token by cheap/fast (LP-0MUI56OCI008EGML)
+- Multi-backend: support multiple local llama-server instances with provider-level fallback (LP-0MRPILSMW004T4H8)
+### Bug Fixes
+- [test-failure] tests/test_rebuild_llama.py — failing test (LP-0MUK0KYMV003TIWV)
+- Proxy usage analysis: fast/cheap bucketing uses analysis-time config, not the mode active during the window (LP-0MSPZUD4G007IYGH)
+- render_report.py reads auditResult but wl show exposes audit under 'audit' (report always shows 'Audit: not run') (LP-0MU6U1VLR001LEX6)
+- Bug: proxy-usage-analysis file discovery silently excludes rotated logs whose name-encoded rotation time precedes window start (LP-0MSISZS1O004KJRR)
+- proxy-usage-analysis: hourly table hides real activity (session-first-hour attribution, no per-hour traffic columns, duplicate hour-of-day buckets give >100% rows) (LP-0MTYAZFGN003BYQS)
+- llama-proxy: serve cached per-slot detail when /slots counts are stale (slots_stale) so herdr per-slot dispatch keeps slot identity (LP-0MUFSVXID0039ZAQ)
+- test runner changed-scope selects DELETED test files, failing the implement.py changed-scope gate (LP-0MTZYRTNF0092JKW)
+- Exempt local providers from the sibling-fallback circuit breaker (600s quarantine) (LP-0MUNTOGLB005LUKY)
+- Proxy emits malformed SSE: re-frame upstream bytes to event boundaries and drop partial events on stream transition (LP-0MUOBUPBC002GYTL)
+- StatusLifecycle.require_claimed rejects wl's in-progress status (hyphen vs underscore) (LP-0MUESDZVW006YJ1N)
+### Other
+- Waiting for 2026-08-13: 24h proxy report — contention-fallback share vs 2026-08-11 baseline (LP-0MSQ1ZL6Y000N6AP)
+- Consolidate proxy log-file discovery: 4 sibling scripts still hardcode dot-only naming and miss gzipped/dash logs (LP-0MU148SHI004WHQM)
+- Remove accidentally committed proxy/node_modules symlink; harden gitignore (LP-0MUIH7FYS0010MLT)
+- RCA: llama-proxy reported busy for entire 7h09m idle window (2026-08-07/08) — zero herdr downtime dispatch; investigate and design fix (LP-0MSU72I2V009YN79)
+- Add local-only 'private' model (no remote fallback) to proxy configs (LP-0MUGXAWLT007KEFG)
+- Overnight remote-chain exhaustion: accurate diagnostics, quarantine visibility, bounded chain-hold (LP-0MU56Z3XY001I0NO)
+- skill/skill/shared committed absolute symlink causes duplicate/inconsistent test collection in worktrees (LP-0MUHOHP82006NT3W)
+- Fix test-isolation leak in test_mode_grandfathering_integration.py subset runs (LP-0MUD0D0DU005R2VQ)
+
 ## v0.1.19 (2026-09-23)
+
+### Features
+
+- Cheap mode: prevent slot-contention fallback (bounded queue); keep context fallback (LP-0MSORQVK50012Q4D)
+- Add Time to First Token section to proxy usage report (LP-0MTSSM5SO003PKU0)
+- Add 'compact' model (Muse → DeepSeek) and wire proxy-side compaction to it (LP-0MTT0O74N009E7N2)
+- Avoid promoting thinking to content for empty responses (LP-0MTTSBT0R004HC6B)
+- Surface proxy-side compaction metadata in responses (Pi client bridge) (LP-0MTYGZ1DI0004QP8)
+- Add fast→cheap mode-switch cooldown to stop flip-flopping (LP-0MU6MQIPP0058198)
+- Post-restart startup ramp: gate new chat requests with 503 + Retry-After (thundering-herd mitigation) (LP-0MU9ZXFQS0023DXT)
+- Startup ramp: shorten the window and clear the gate when backends are ready (LP-0MUAY98ZR002JBAA)
+- Startup ramp: only gate chat requests that would dispatch locally (LP-0MUAY9AMS002O2ZO)
+
+### Bug Fixes
+
+- Unkown errors from Muse (LP-0MTV77DAT0018ZUS)
+- Fix local summarizer timeout causing compaction failures (LP-0MTVJF5HU007ISP1)
+- Bug: generating-only slot pool over-subscribes local Qwen (active=2 with session_slot_pool_size=1) (LP-0MU09CAL3001MP0Z)
+- Compaction summarizer: minimise reasoning (reasoning_effort=minimal / disable Qwen3 thinking) to eliminate empty_completion (LP-0MU58PBRD004OV1I)
+- Cheap mode must serve economically-bypassed large contexts locally (fast mode keeps remote fallback) (LP-0MU5A4QBR003YJM0)
+- Compaction trigger and routing pressure use different token estimates (advisory says compact, trigger says noop) (LP-0MU5A84YU003YOTY)
+- Server-side compaction is unreachable for oversized sessions (routing bypass runs before session handling) (LP-0MU5ARWSP001BYYB)
+- Proxy mode flapping: four mode-switch restarts in 5 minutes at the 10:00 schedule boundary (herdr set-mode suspected) (LP-0MU5BOK3P0090O0V)
+
+### Other
+
+- Refactor: Formatting in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MTPMJGC3007YG0S-add-live-summarizer-wiring-to-router-hel/proxy/proxy/router_helpers.py (LP-0MTRWI65I005VXOC)
+- Refactor: Unused Import in /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MRPILSMW004T4H8-multi-backend-support-multiple-local-lla/proxy/tests/test_multi_backend.py (LP-0MTT1054U001OMWR)
+- Only poison failure domain after 2nd consecutive empty_response (LP-0MTVPJQ6T004EZ75)
+- [CRITICAL] Dedicated small summarizer model for proxy-side session compaction (LP-0MTXCQA8I0038J4X)
+- Disable proxy-side (server-side) session compaction (LP-0MU61IRVC003RRN6)
+- Restart-resilient local dispatch: prevent post-restart pool wedge from no-progress prefills (LP-0MUCEEZ6B003NZH5)
+- Untrack runtime llama-server signature state file and gitignore it (LP-0MUD2G0V8004EXXZ)
+- Validate: downtime dispatcher per-slot owner-lease gate in cheap mode (proxy per-slot identity contract) (LP-0MUD3A4Q000313D3)
 
 ## v0.1.18 (2026-09-16)
 ### Features

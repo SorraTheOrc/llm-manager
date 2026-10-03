@@ -10,7 +10,12 @@ The proxy can keep embeddings and a primary model available without restarts.
 ## Configuration
 
 - `models.ini` defines router presets (default location: repo root `models.ini`).
-- `proxy/config.yaml` enables router mode and can preload models.
+- `proxy/config.yaml` enables router mode and can preload models. It is the
+  **authoritative base** config: the mode profiles `proxy/config-fast.yaml`
+  and `proxy/config-cheap.yaml` are overlays deep-merged on top of it by
+  `load_config()` (recursive dict merge; lists/scalars in the overlay replace
+  the base value wholesale). See the README's
+  [Config model](../proxy/README.md#config-model-base--mode-overlays).
 
 Example `server` config:
 
@@ -193,6 +198,13 @@ The config is validated at startup (`validate_compaction_config` in
 `llama_model`, or non-positive ctx/max-token values fail startup with a clear
 error. See `proxy/tests/test_compaction_config.py`.
 
+> **Current deployment (2026-09):** the shipped profiles use the remote-only
+> `models.compact` chain (`opencode-go-compact` Muse → `deepseek-flash-compact`)
+> and `compaction_trigger_ratio: 0` (disabled) — see
+> [local-llm-responses-api-investigation-LP-0MTY7EKZC006T893.md](local-llm-responses-api-investigation-LP-0MTY7EKZC006T893.md).
+> The local-summariser example above is retained for the backwards-compatible
+> path used only when `models.compact` is absent.
+
 ## Routing-estimate tokenizer mismatch (LP-0MSAOQTJS000FFVM F2/F3 finding)
 
 The smart-routing clamp (`_effective_large_context_thresholds` in
@@ -278,27 +290,28 @@ server:
 > (cold, warm] band must never collapse — dead-code guard
 > LP-0MSI2M5BT004BCDP):
 >
-> - `proxy/config-fast.yaml` — `38000` (fast mode runs 1 slot × 262144 total
->   ctx, LP-0MU03AL730000B5W, so the warm clamp is
+> - `proxy/config.yaml` (authoritative base, default/fallback) — `38000`.
+> - `proxy/config-fast.yaml` — inherits `38000` from the base (fast mode runs
+>   1 slot × 262144 total ctx, LP-0MU03AL730000B5W, so the warm clamp is
 >   `min(100000, 262144//1 − 4096 = 258048) = 100000`; recaptures the old
 >   (30000, 38000] cold-cache bypass band).
-> - `proxy/config-cheap.yaml` — `38000` (3 slots → warm resolves to
->   `min(100000, 262144//3 − 4096 = 83285) = 83285`; symmetric with fast after
->   the 60000 raise failed guardrails and was reverted — see
->   LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K / LP-0MSY0V4ZO002ANPL).
-> - `proxy/config.yaml` (default/fallback) — `38000`, mirroring fast mode.
+> - `proxy/config-cheap.yaml` — overrides to `42000` (3 slots → warm resolves
+>   to `min(100000, 262144//3 − 4096 = 83285) = 83285`; the 60000 raise failed
+>   guardrails and was reverted to 38000 before the cheap-only raise to 42000
+>   — LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K / LP-0MSY0V4ZO002ANPL /
+>   LP-0MT50SMU1005ZAD6 / LP-0MT50WCCP000DU00).
 >
 > Prompts above the per-slot warm clamp are **never** routed local
 > (`context_too_large` — physical capacity, unchanged).
 
 ## Per-mode slot counts (operator-directed simplification LP-0MTZRM5HV0007S0V)
 
-Each mode profile defines its slot count **once** via
-``session_slot_pool_size`` (default/fast: 1, cheap: 3; counts set by
-LP-0MU03AL730000B5W, structure from LP-0MTZRM5HV0007S0V). There is no
-``slot_schedule``; the time-based slot scheduler was removed. The slot
-count changes only when the operating mode changes (a mode switch restarts
-the proxy with the new profile).
+Each resolved mode profile defines its slot count **once** via
+``session_slot_pool_size`` (default base and fast: 1 — fast inherits it —
+cheap: 3, an overlay override; counts set by LP-0MU03AL730000B5W, structure
+from LP-0MTZRM5HV0007S0V). There is no ``slot_schedule``; the time-based slot
+scheduler was removed. The slot count changes only when the operating mode
+changes (a mode switch restarts the proxy with the new profile).
 
 Per-slot context is derived from the profile's static pair:
 ``local_model_ctx_size // session_slot_pool_size`` (262144 across all

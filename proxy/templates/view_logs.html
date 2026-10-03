@@ -972,9 +972,17 @@
         // Reconnect slot streams (section DOM is preserved across switches)
         connectSlotEvents();
         currentSlots.forEach(connectSlotTails);
+        // Release the raw-pane connections while the Slots tab is active so
+        // the per-slot tails stay within the browser's per-origin HTTP/1.1
+        // connection budget (LP-0MUJZHTCN006IZRW).
+        disconnectProxy();
+        disconnectLlama();
       } else {
         disconnectSlotEvents();
         disconnectSlotTails();
+        // Raw All Logs panes connect only while this tab is visible.
+        connectProxy();
+        connectLlama();
       }
     }
 
@@ -993,7 +1001,7 @@
     // ===================================================================
 
     let slotEventSource = null;
-    let slotTailSources = {};  // slotId -> {proxy: EventSource, llama: EventSource}
+    let slotTailSources = {};  // slotId -> EventSource (combined proxy+llama)
     let expandedSlotId = null;
     let currentSlots = [];     // last slot list from /events (all slots)
 
@@ -1207,6 +1215,11 @@
       if (slotEventSource) { slotEventSource.close(); slotEventSource = null; }
     }
 
+    // One combined SSE connection per slot carries BOTH the proxy and llama
+    // lines (tagged with `source`). Two connections per slot exhausted the
+    // browser's ~6-connections-per-origin budget once the raw panes and the
+    // /events status stream were counted, so most slot panes never received
+    // any log output (LP-0MUJZHTCN006IZRW).
     function connectSlotTails(slot) {
       const sid = slot.slot_id;
       const key = String(sid);
@@ -1216,34 +1229,33 @@
       const sessionId = slot.session_id || null;
       const n = Math.max(1, parseInt(sharedLinesInput.value || '200'));
 
-      const sources = {};
-      ['proxy', 'llama'].forEach(function (src) {
-        let url = '/logs/tail?lines=' + n + '&source=' + src + '&slot=' + sid;
-        if (sessionId) url += '&session=' + encodeURIComponent(sessionId);
-        const es = new EventSource(url);
-        sources[src] = es;
-        es.onmessage = function (e) {
-          try {
-            const obj = JSON.parse(e.data);
-            if (obj.initial !== undefined) {
-              obj.initial.split(String.fromCharCode(10)).forEach(function (l) {
-                if (l) appendSlotLine(sid, src, l);
-              });
-            } else if (obj.line !== undefined) {
-              appendSlotLine(sid, src, obj.line);
-            }
-          } catch (err) {}
-        };
-        es.onerror = function () { /* EventSource auto-reconnects */ };
-      });
-      slotTailSources[key] = sources;
+      let url = '/logs/tail/slot?lines=' + n + '&slot=' + sid;
+      if (sessionId) url += '&session=' + encodeURIComponent(sessionId);
+      const es = new EventSource(url);
+      es.onmessage = function (e) {
+        try {
+          const obj = JSON.parse(e.data);
+          const src = obj.source === 'llama' ? 'llama' : 'proxy';
+          if (obj.initial !== undefined) {
+            obj.initial.split(String.fromCharCode(10)).forEach(function (l) {
+              if (l) appendSlotLine(sid, src, l);
+            });
+          } else if (obj.line !== undefined) {
+            appendSlotLine(sid, src, obj.line);
+          } else if (obj.error) {
+            appendSlotLine(sid, src, '[error] ' + JSON.stringify(obj));
+          }
+        } catch (err) {}
+      };
+      es.onerror = function () { /* EventSource auto-reconnects */ };
+      slotTailSources[key] = es;
     }
 
     function stopSlotTails(slotId) {
       const key = String(slotId);
-      const sources = slotTailSources[key];
-      if (!sources) return;
-      Object.values(sources).forEach(function (es) { try { es.close(); } catch (err) {} });
+      const es = slotTailSources[key];
+      if (!es) return;
+      try { es.close(); } catch (err) {}
       delete slotTailSources[key];
     }
 
@@ -1285,12 +1297,11 @@
       });
     }
 
-    // Initialise
-    connectProxy();
-    connectLlama();
+    // Initialise — the Slots tab is the default, so the raw All Logs panes
+    // connect lazily when that tab is first opened (LP-0MUJZHTCN006IZRW).
     loadSessions();
     startPolling();
-    connectSlotEvents();  // Slots tab is the default tab
+    connectSlotEvents();
 
     window.addEventListener('beforeunload', () => {
       if (esProxy) esProxy.close();

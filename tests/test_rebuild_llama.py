@@ -5,9 +5,14 @@ Covers the LP-0MSXXKZOW0038XLK deploy-ordering fix: the deploy step must stop
 running llama-server processes bound to the deploy path BEFORE copying, must
 copy the binary AND its sibling shared libs, and must patch the RUNPATH to
 $ORIGIN so the deployed artifacts resolve from the deploy dir.
+
+Covers the LP-0MUK0KYMV003TIWV fix: `--deploy-only` re-deploys an already-built
+artifact and must not require build-only tooling (`cmake`), so the script no
+longer aborts with "cmake missing" on hosts/CI images without a compiler.
 """
 import json
 import os
+import shutil
 import subprocess
 
 SCRIPT = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'scripts', 'rebuild-llama.sh'))
@@ -57,6 +62,33 @@ def _fake_tools(tmp_path):
     for name in ("pkill", "pgrep", "patchelf"):
         (tools / name).chmod(0o755)
     return tools, order
+
+
+def _path_without(tmp_path, excluded):
+    """Mirror the current PATH into a shadow dir, omitting executables named
+    ``excluded``.
+
+    Reproduces environments (e.g. CI images) where a build-only tool such as
+    ``cmake`` is absent, so a test can assert that ``--deploy-only`` never
+    consults it (LP-0MUK0KYMV003TIWV).
+    """
+    shadow = tmp_path / "shadow-bin"
+    shadow.mkdir()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or not os.path.isdir(entry):
+            continue
+        for name in os.listdir(entry):
+            if name == excluded:
+                continue
+            src = os.path.join(entry, name)
+            dest = shadow / name
+            if dest.exists() or not os.access(src, os.X_OK):
+                continue
+            try:
+                dest.symlink_to(src)
+            except OSError:
+                pass
+    return shadow
 
 
 def _run(extra_args, env_extra=None):
@@ -128,6 +160,37 @@ def test_deploy_only_copies_binary_and_libs_and_stops_server_first(tmp_path, mon
     assert "10480" in data["version"]
     assert data["git_commit"] == "unknown"  # fake build tree is not a git repo
     assert "libggml-base.so.0.20.1" in data["deployed_libs"]
+
+
+def test_deploy_only_does_not_require_cmake(tmp_path):
+    """--deploy-only deploys an existing artifact and must not require cmake.
+
+    cmake is only needed to build; requiring it in deploy-only mode made the
+    script abort ("Errors: cmake missing") on hosts/CI images without cmake,
+    even though the deploy path never builds (LP-0MUK0KYMV003TIWV).
+    """
+    _fake_build(tmp_path)
+    tools, _ = _fake_tools(tmp_path)
+    deploy_bin = tmp_path / "deploy" / "bin"
+    deploy_bin.mkdir(parents=True)
+
+    shadow = _path_without(tmp_path, "cmake")
+    # Guard against a vacuous pass on machines where cmake is genuinely absent
+    # from the inherited PATH: the shadow must actively hide it when present.
+    assert shutil.which("cmake", path=str(shadow)) is None
+
+    proc = subprocess.run(
+        [SCRIPT, "--deploy-only", "--json", "--dir", str(tmp_path), "--deploy-path", str(deploy_bin / "llama-server")],
+        capture_output=True, text=True,
+        env={**os.environ, "PATH": f"{tools}{os.pathsep}{shadow}"},
+    )
+
+    assert proc.returncode == 0, f"stderr: {proc.stderr}\nstdout: {proc.stdout}"
+    data = json.loads(proc.stdout)
+    assert data["ok"] == 1
+    assert (deploy_bin / "llama-server").exists()
+    # The fake build tree is not a git repo, so the commit falls back cleanly.
+    assert data["git_commit"] == "unknown"
 
 
 def test_deploy_only_requires_existing_artifact(tmp_path):

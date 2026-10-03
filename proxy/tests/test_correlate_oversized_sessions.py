@@ -199,6 +199,25 @@ class TestAnalyzeDay:
         res = analyzer.analyze_day(tmp_path, DAY, CAPS)
         assert res.total_routing_checks == 1
 
+    def test_dash_named_rotated_file_content_is_read(self, tmp_path):
+        """Regression (LP-0MU148SHI004WHQM): logrotate dash-named files count.
+
+        The dot-only discovery this script inherited silently dropped
+        ``proxy.log-*`` files, which carry the daytime window.
+        """
+        _write_log(tmp_path, [ROUTING_FAST_OVER], name="proxy.log-2026-08-26_10")
+        res = analyzer.analyze_day(tmp_path, DAY, CAPS)
+        assert res.total_routing_checks == 1
+        assert res.sessions["herdr-1787669217-851654-15207"].wasted_work == 100000
+
+    def test_dash_named_gzip_content_is_read(self, tmp_path):
+        """Regression (LP-0MU148SHI004WHQM): dash + .gz content is decompressed."""
+        p = tmp_path / "proxy.log-2026-08-26_09.gz"
+        with gz.open(p, "wt", encoding="utf-8") as fh:
+            fh.write(ROUTING_CHEAP_OVER + "\n")
+        res = analyzer.analyze_day(tmp_path, DAY, CAPS)
+        assert res.sessions["herdr-1787669217-851654-15208"].wasted_work == 70000
+
 
 class TestLlamaDecodeWindow:
     def test_slow_decodes_attributed_by_mtime(self, tmp_path):

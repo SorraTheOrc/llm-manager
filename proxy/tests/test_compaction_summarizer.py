@@ -592,7 +592,7 @@ class TestTimeoutDiagnosticContext:
     def test_fail_open_still_returns_empty_summary(self, caplog):
         """AC3: No regression in fail-open — still returns EmptySummary."""
         import httpx
-        from proxy.compaction_summarizer import build_local_summarizer, EmptySummary
+        from proxy.compaction_summarizer import EmptySummary, build_local_summarizer
 
         cfg = {"server": {"compaction_summarizer_timeout": 600}}
         with (

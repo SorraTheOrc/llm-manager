@@ -413,11 +413,9 @@ def build_report(
         ap(f"| {provider} | {model} | {count} | {fast} ({_pct(fast, total_fast_sessions):.1f}%) | "
            f"{cheap} ({_pct(cheap, total_cheap_sessions):.1f}%) | {reqs} | {fb} |")
 
-    # TTFT section: collect all parsed TTFT values (LP-0MTSSM5SO003PKU0)
-    ttft_values: list[float] = [
-        e.ttft_ms for e in summary.ttft_events if e.ttft_ms is not None
-    ]
-    _append_ttft_section(ap, ttft_values)
+    # TTFT section: Total / Fast / Cheap split by session bucket
+    # (LP-0MTSSM5SO003PKU0, LP-0MUI56OCI008EGML).
+    _append_ttft_section(ap, summary.ttft_events, summary.sessions)
     _append_ttc_section(ap, sessions)
     _append_speed_section(ap, "Decode speed", "decode", speed)
     _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
@@ -897,7 +895,17 @@ def _busy_cell(busy: float, window: float) -> str:
     return f"{_fmt_duration(busy)} ({busy / window * 100:.1f}%)" if window else f"{_fmt_duration(busy)}"
 
 
-SESSION_CLASSIFICATION_KEYS = ("local_only", "fell_back", "remote_only")
+# Per-hour activity columns for the ``## Summary by hour`` table
+# (LP-0MTYAZFGN003BYQS): internal counter key -> display label. Counted from
+# each event's own timestamp, so long-running sessions contribute to every
+# hour they touch instead of only their first-request hour.
+ACTIVITY_COLUMNS = (
+    ("requests_started", "Requests started"),
+    ("local_attempts", "Local attempts"),
+    ("local_served", "Local served"),
+    ("fallbacks", "Fallbacks"),
+    ("local_skip", "Local-skip"),
+)
 
 
 def _session_classification(s: SessionStats) -> str:
@@ -921,76 +929,81 @@ def _session_classification(s: SessionStats) -> str:
     return "remote_only"
 
 
-def _hourly_session_classification(sessions: list[SessionStats]) -> dict[int, Counter]:
+def _hourly_session_classification(sessions: list[SessionStats]) -> dict[datetime, Counter]:
     """Session-classification counts keyed by the session's start hour.
 
-    Each session is counted once, in the hour of day in which its **first
-    request** (first in-window ``Stream started``) began; the count feeds the
-    Summary by hour table's three classification columns. Same hour-of-day
-    keying as ``BusyStats.hourly_busy``: windows longer than 24h that cover
-    the same hour twice would collide (daily reports never hit this).
+    Each session is counted once, in the **absolute top-of-hour** bucket in
+    which its **first request** (first in-window ``Stream started``) began.
+    Retained for the JSON summary (``hourly_session_classification``); the
+    report table itself now uses the per-hour activity counters
+    (LP-0MTYAZFGN003BYQS). Absolute-hour keying matches
+    ``BusyStats.hourly_busy``, so a rolling window never collides two
+    different days' same hour-of-day.
     """
-    by_hour: dict[int, Counter] = {}
+    by_hour: dict[datetime, Counter] = {}
     for s in sessions:
-        by_hour.setdefault(s.start.hour, Counter())[_session_classification(s)] += 1
+        key = s.start.replace(minute=0, second=0, microsecond=0)
+        by_hour.setdefault(key, Counter())[_session_classification(s)] += 1
     return by_hour
 
 
 def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
     """Append the top-of-report ``## Summary by hour`` table.
 
-    One row per hour of the report window (window-bounded buckets, partial
-    first/last hours truncated to the window edges, idle hours listed as
-    ``0s``), with the busy time / busy-% columns of the former ``Busy time by
-    hour:`` sub-table plus three per-session-classification columns: the
-    sessions whose **first request** started in that hour, by journey
-    (started local and completed local / started local and fell back /
-    started remote-only), rendered in the Session summary's ``n (pct%)``
-    style where pct is of the sessions started in that hour
-    (LP-0MTFO210Q0044TTF). Always rendered — also when the window has no
-    local traffic (busy columns then read ``0s`` / ``0.0%``); with no session
-    data at all the body shows a ``No data`` note. Ends with a Totals row:
-    window busy totals plus the overall classification percentages (matching
-    the Session summary table).
+    One row per **absolute wall-clock hour** of the report window
+    (window-bounded buckets, partial first/last hours truncated to the
+    window edges, idle hours listed as ``0s``), with busy time / busy-%
+    columns (busy seconds ÷ window-bounded bucket duration, defensively
+    clamped to 100%) and five per-hour **activity** columns counted by each
+    event's own timestamp (LP-0MTYAZFGN003BYQS): ``Requests started`` (all
+    ``Stream started`` events), ``Local attempts`` (``Stream started`` with
+    ``provider=local``), ``Local served`` (``Stream finished`` with
+    ``provider=local``), ``Fallbacks`` (``Fallback triggered`` events), and
+    ``Local-skip`` (``routing_skip_local`` events) — replacing the previous
+    session-first-hour classification columns. Buckets are keyed by absolute
+    hour, so a rolling window that straddles an hour emits two distinct edge
+    partials rather than two rows sharing one hour-of-day bucket. Always
+    rendered — also when the window has no local traffic (busy columns then
+    read ``0s`` / ``0.0%``); with no events at all the body shows a
+    ``No data`` note. Ends with a Totals row: window busy totals plus the sum
+    of each activity column over the window.
     """
     sessions = list(summary.sessions.values())
-    by_hour = _hourly_session_classification(sessions)
     hourly = dict(summary.busy.hourly_busy) if summary.busy else {}
     end = summary.window_end
+    has_data = bool(sessions) or bool(summary.hourly_activity)
 
     ap("")
     ap("## Summary by hour")
     ap("")
-    ap("| Hour | Busy | % | Started local, completed local | Started local, fell back | Started remote-only |")
-    ap("|---|---|---|---|---|---|")
-    if not sessions:
-        ap("| _No session data in window._ | - | - | - | - | - |")
+    ap("| Hour | Busy | % | " + " | ".join(label for _, label in ACTIVITY_COLUMNS) + " |")
+    ap("|" + "---|" * (3 + len(ACTIVITY_COLUMNS)))
+    activity_totals: Counter = Counter()
+    if not has_data:
+        ap("| _No session data in window._ |" + " - |" * (2 + len(ACTIVITY_COLUMNS)))
     else:
-        # Window-bounded hour buckets (LP-0MSVMLM7G009N74N): one row per hour
-        # from window_start to window_end, with the first/last rows truncated
-        # to the window edges and idle hours listed as 0s. Busy seconds come
-        # from ``BusyStats.hourly_busy`` (hour-of-day -> seconds), which is
-        # already window-correct because intervals are clipped to the window
-        # before attribution; the % is busy / window-bounded bucket duration.
-        # Limitation: buckets are keyed by hour-of-day, so windows longer than
-        # 24h that cover the same hour twice would collide — out of scope for
-        # the daily report (``DEFAULT_HOURS = 24``).
+        # Window-bounded hour buckets keyed by ABSOLUTE hour
+        # (LP-0MTYAZFGN003BYQS): each bucket's key is the top of its hour, so
+        # the two edge partials of a rolling window never share a key and no
+        # busy duration is double-counted. Busy seconds come from
+        # ``BusyStats.hourly_busy`` (absolute hour -> seconds), already
+        # window-correct because intervals are clipped to the window before
+        # attribution.
         cursor = summary.window_start
         while cursor < end:
-            # The first bucket ends at the next full hour boundary (truncated
-            # to the window end for a partial last hour); subsequent cursors
-            # are already on the hour so +1h is the next bucket boundary.
-            bucket_end = cursor.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-            bucket_end = min(bucket_end, end)
+            bucket_key = cursor.replace(minute=0, second=0, microsecond=0)
+            bucket_end = min(bucket_key + timedelta(hours=1), end)
             duration = (bucket_end - cursor).total_seconds()
-            seconds = hourly.get(cursor.hour, 0.0)
-            pct = (seconds / duration * 100.0) if duration else 0.0
-            counts = by_hour.get(cursor.hour, Counter())
-            started = sum(counts.values())
-            cells = [
-                f"{counts.get(key, 0)} ({_pct(counts.get(key, 0), started):.1f}%)"
-                for key in SESSION_CLASSIFICATION_KEYS
-            ]
+            seconds = hourly.get(bucket_key, 0.0)
+            # Defensive clamp: absolute-hour keys make a >100% row
+            # impossible, but never emit one even if inputs drift.
+            pct = min(100.0, (seconds / duration * 100.0)) if duration else 0.0
+            counts = summary.hourly_activity.get(bucket_key, Counter())
+            cells = []
+            for key, _label in ACTIVITY_COLUMNS:
+                value = counts.get(key, 0)
+                activity_totals[key] += value
+                cells.append(str(value))
             ap(
                 f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {_fmt_duration(seconds)} | {pct:.1f}% | "
                 + " | ".join(cells)
@@ -998,17 +1011,12 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
             )
             cursor = bucket_end
 
-    n = len(sessions)
-    local_only = sum(1 for s in sessions if _session_classification(s) == "local_only")
-    fell_back = sum(1 for s in sessions if _session_classification(s) == "fell_back")
-    remote_only = sum(1 for s in sessions if _session_classification(s) == "remote_only")
     busy_seconds = summary.busy.busy_seconds if summary.busy else 0.0
     busy_pct = summary.busy.busy_pct if summary.busy else 0.0
     ap(
         f"| Totals | {_fmt_duration(busy_seconds)} | {busy_pct:.1f}% | "
-        f"{local_only} ({_pct(local_only, n):.1f}%) | "
-        f"{fell_back} ({_pct(fell_back, n):.1f}%) | "
-        f"{remote_only} ({_pct(remote_only, n):.1f}%) |"
+        + " | ".join(str(activity_totals.get(key, 0)) for key, _label in ACTIVITY_COLUMNS)
+        + " |"
     )
 
 
@@ -1163,20 +1171,49 @@ def _ttft_cell(value: float | None) -> str:
     return f"{value:.0f}ms"
 
 
+def _ttft_buckets(
+    ttft_events: list[log_parser.LogEvent],
+    sessions: dict[str, SessionStats],
+) -> dict[str, list[float]]:
+    """Partition TTFT samples (ms) into ``total`` / ``fast`` / ``cheap`` lists.
+
+    Uses the same mode-aware session bucketing as the rest of the report:
+    ``_bucket_key(session.bucket)``, where any non-``cheap`` bucket counts as
+    fast. Every sample lands in ``total``; ``fast`` and ``cheap`` partition the
+    samples whose session resolves against *sessions*. A sample whose session is
+    absent (e.g. a TTFT line whose stream started outside the window) is counted
+    in ``total`` only, so ``fast + cheap`` may be less than ``total`` in that
+    rare case.
+    """
+    buckets: dict[str, list[float]] = {"total": [], "fast": [], "cheap": []}
+    for event in ttft_events:
+        value = event.ttft_ms
+        if value is None:
+            continue
+        buckets["total"].append(value)
+        session = sessions.get(event.session) if event.session else None
+        if session is not None:
+            buckets[_bucket_key(session.bucket)].append(value)
+    return buckets
+
+
 def _append_ttft_section(
     ap,
-    ttft_values: list[float],
+    ttft_events: list[log_parser.LogEvent],
+    sessions: dict[str, SessionStats],
 ) -> None:
     """Append the ``## Time to first token`` section to the report.
 
-    Shows p10 / median / p90 of TTFT (dispatch → first token),
-    parsed from both local ``dispatch_first_byte_ms=`` and remote
-    ``ttft_seconds=`` log lines.
+    Shows p10 / median / p90 of TTFT (dispatch → first token), parsed from both
+    local ``dispatch_first_byte_ms=`` and remote ``ttft_seconds=`` log lines,
+    split into Total / Fast / Cheap rows using the mode-aware session bucketing
+    (``_bucket_key``, LP-0MUI56OCI008EGML).
     """
     ap("")
     ap("## Time to first token")
     ap("")
-    if not ttft_values:
+    buckets = _ttft_buckets(ttft_events, sessions)
+    if not buckets["total"]:
         ap("_No TTFT data in window._")
         return
     ap("Percentiles of time from dispatch to first token (ms), from local")
@@ -1184,11 +1221,12 @@ def _append_ttft_section(
     ap("")
     ap("| Bucket | Samples | p10 | Median | p90 |")
     ap("|---|---|---|---|---|")
-    p10 = _percentile(ttft_values, 10)
-    med = _percentile(ttft_values, 50)
-    p90 = _percentile(ttft_values, 90)
-    ap(f"| Total | {len(ttft_values)} | "
-       f"{_ttft_cell(p10)} | {_ttft_cell(med)} | {_ttft_cell(p90)} |")
+    for label, bucket_key in (("Total", "total"), ("Fast", "fast"), ("Cheap", "cheap")):
+        values = buckets[bucket_key]
+        ap(f"| {label} | {len(values)} | "
+           f"{_ttft_cell(_percentile(values, 10))} | "
+           f"{_ttft_cell(_percentile(values, 50))} | "
+           f"{_ttft_cell(_percentile(values, 90))} |")
     ap("")
 
 
@@ -1433,6 +1471,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "local_only_sessions": local_only,
         "fallback_sessions": fell_back,
         "remote_only_sessions": remote_only,
+        "hourly_activity": _hourly_activity_json(summary),
         "hourly_session_classification": _hourly_session_classification_json(sessions),
         "total_requests": total,
         "local_requests": summary.local_requests,
@@ -1458,15 +1497,20 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "local_busy": _busy_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
-        "ttft": _ttft_json(summary.ttft_events),
+        "ttft": _ttft_json(summary.ttft_events, summary.sessions),
     }
 
 
 def _hourly_session_classification_json(sessions: list[SessionStats]) -> list[dict]:
-    """JSON-friendly per-hour session-classification counts (start hour)."""
+    """JSON-friendly per-hour session-classification counts (absolute hour).
+
+    Keyed by the absolute top-of-hour in which each session's first request
+    started (LP-0MTYAZFGN003BYQS); the report table no longer shows these
+    columns, but the machine-readable summary keeps the journey split.
+    """
     return [
         {
-            "hour": hour,
+            "hour": _fmt_ts(hour),
             "local_only": counts["local_only"],
             "fell_back": counts["fell_back"],
             "remote_only": counts["remote_only"],
@@ -1475,34 +1519,54 @@ def _hourly_session_classification_json(sessions: list[SessionStats]) -> list[di
     ]
 
 
-def _ttft_json(ttft_events: list[object]) -> dict | None:
+def _hourly_activity_json(summary: AnalysisResult) -> list[dict]:
+    """JSON-friendly per-hour activity counters (absolute hour -> counts).
+
+    Mirrors the ``## Summary by hour`` activity columns so agents can query
+    per-hour traffic without scraping the Markdown (LP-0MTYAZFGN003BYQS).
+    """
+    return [
+        {
+            "hour": _fmt_ts(hour),
+            "requests_started": counts.get("requests_started", 0),
+            "local_attempts": counts.get("local_attempts", 0),
+            "local_served": counts.get("local_served", 0),
+            "fallbacks": counts.get("fallbacks", 0),
+            "local_skip": counts.get("local_skip", 0),
+        }
+        for hour, counts in sorted(summary.hourly_activity.items())
+    ]
+
+
+def _ttft_json(
+    ttft_events: list[log_parser.LogEvent],
+    sessions: dict[str, SessionStats],
+) -> dict | None:
     """Machine-readable TTFT summary for ``summary_to_json``.
 
-    Returns p10 / median / p90 in milliseconds for Total/Fast/Cheak buckets,
-    or ``None`` when no TTFT data is available.
+    Returns p10 / median / p90 in milliseconds for Total/Fast/Cheap buckets
+    (Fast/Cheap via mode-aware session bucketing, LP-0MUI56OCI008EGML), with
+    ``null`` percentiles for a bucket that has no samples; returns ``None`` when
+    no TTFT data is available.
     """
-    values = [e.ttft_ms for e in ttft_events if e.ttft_ms is not None]
-    if not values:
+    buckets = _ttft_buckets(ttft_events, sessions)
+    if not buckets["total"]:
         return None
-    return {
-        "total": {
+
+    def _stats(values: list[float]) -> dict:
+        if not values:
+            return {"samples": 0, "p10": None, "median": None, "p90": None}
+        return {
             "samples": len(values),
             "p10": round(_percentile(values, 10), 1),
             "median": round(_percentile(values, 50), 1),
             "p90": round(_percentile(values, 90), 1),
-        },
-        "fast": {
-            "samples": 0,
-            "p10": None,
-            "median": None,
-            "p90": None,
-        },
-        "cheap": {
-            "samples": 0,
-            "p10": None,
-            "median": None,
-            "p90": None,
-        },
+        }
+
+    return {
+        "total": _stats(buckets["total"]),
+        "fast": _stats(buckets["fast"]),
+        "cheap": _stats(buckets["cheap"]),
     }
 
 
@@ -1527,7 +1591,10 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
         "cheap_busy_seconds": busy.cheap_busy_seconds,
         "fast_window_seconds": busy.fast_window_seconds,
         "cheap_window_seconds": busy.cheap_window_seconds,
-        "hourly_busy": busy.hourly_busy,
+        "hourly_busy": [
+            {"hour": _fmt_ts(hour), "seconds": seconds}
+            for hour, seconds in busy.hourly_busy
+        ],
     }
 
 

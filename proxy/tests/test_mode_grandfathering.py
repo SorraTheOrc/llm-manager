@@ -8,8 +8,10 @@ detection, and pruning. Time is injected as explicit epoch values so no clock
 monkeypatching is needed.
 """
 
+import json
 from datetime import datetime
 from datetime import time as dt_time
+from pathlib import Path
 
 import pytest
 from proxy.grandfathering import (
@@ -399,3 +401,123 @@ class TestRegistryFromConfig:
             "proxy.grandfathering.proxy_dir", lambda: tmp_path
         )
         assert default_state_file() == tmp_path / "grandfathering-state.json"
+
+
+# ---------------------------------------------------------------------------
+# F7 (LP-0MUI680OJ0083S73): the other-mode config used for grandfathering is
+# the MERGED config (base config.yaml + the mode overlay). The overlays no
+# longer repeat the base `models` section, so a raw explicit load would leave
+# `other_models` empty and mis-derive remote-provider counts.
+# ---------------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _pre_dedup_models(mode: str) -> dict:
+    """The mode's `models` as they were BEFORE the F4 dedup (frozen fixture)."""
+    with open(_FIXTURES / f"prededup_raw_{mode}.json") as fh:
+        return json.load(fh)["models"]
+
+
+class TestMergedOtherModeConfig:
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_load_merged_config_inherits_complete_models(self, mode):
+        from proxy.mode import mode_config_file
+        from proxy.utils import load_merged_config
+
+        merged = load_merged_config(str(mode_config_file(mode)))
+
+        assert set(merged["models"]) == set(_pre_dedup_models(mode))
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_remote_counts_match_pre_dedup_raw(self, mode):
+        from proxy.grandfathering import _remote_provider_count
+        from proxy.mode import mode_config_file
+        from proxy.utils import load_merged_config
+
+        merged_models = load_merged_config(str(mode_config_file(mode)))["models"]
+        pre_dedup_models = _pre_dedup_models(mode)
+
+        for model in set(merged_models) | set(pre_dedup_models):
+            assert _remote_provider_count(
+                merged_models, model
+            ) == _remote_provider_count(pre_dedup_models, model)
+
+    def test_raw_cheap_overlay_no_longer_declares_models(self):
+        """Documents why the merged load is required for the cheap direction."""
+        import yaml
+        from proxy.mode import mode_config_file
+
+        with open(mode_config_file("cheap")) as fh:
+            raw = yaml.safe_load(fh)
+        assert "models" not in raw
+
+    def test_explicit_load_config_stays_raw(self):
+        """AC1 backward compat: an explicit path is never merged."""
+        from proxy.mode import mode_config_file
+        from proxy.utils import load_config
+
+        raw = load_config(str(mode_config_file("cheap")))
+        assert "models" not in raw
+
+    @pytest.mark.parametrize(
+        "active_mode,other_mode",
+        [("cheap", "fast"), ("fast", "cheap")],
+    )
+    def test_startup_loads_complete_other_mode_config(
+        self, active_mode, other_mode, tmp_path, monkeypatch
+    ):
+        from proxy.utils import load_merged_config
+
+        from proxy import grandfathering as gf_mod
+        from proxy import mode as mode_module
+        from proxy import server
+
+        mode_file = tmp_path / ".mode"
+        mode_file.write_text(active_mode + "\n")
+        monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
+        monkeypatch.setattr(
+            gf_mod, "default_state_file", lambda: tmp_path / "gf-state.json"
+        )
+        active_cfg = load_merged_config(
+            str(mode_module.mode_config_file(active_mode))
+        )
+        monkeypatch.setattr(server, "config", active_cfg)
+        monkeypatch.setattr(server, "grandfathering_registry", None)
+        monkeypatch.setattr(server, "other_mode_config", None)
+
+        server._startup_initialize_grandfathering()
+
+        assert server.other_mode_config is not None
+        assert set(server.other_mode_config["models"]) == set(
+            _pre_dedup_models(other_mode)
+        )
+
+    @pytest.mark.parametrize(
+        "active_mode,other_mode",
+        [("cheap", "fast"), ("fast", "cheap")],
+    )
+    def test_is_grandfathered_matches_pre_dedup_behaviour(
+        self, active_mode, other_mode, tmp_path
+    ):
+        from proxy.grandfathering import GrandfatheringRegistry
+        from proxy.mode import mode_config_file
+        from proxy.utils import load_merged_config
+
+        registry = GrandfatheringRegistry(tmp_path / "s.json", mode_schedule=None)
+        session_id = "sess-1"
+        registry.record(session_id, "plan", other_mode)
+
+        current_models = load_merged_config(
+            str(mode_config_file(active_mode))
+        )["models"]
+        merged_other = load_merged_config(
+            str(mode_config_file(other_mode))
+        )["models"]
+        pre_dedup_other = _pre_dedup_models(other_mode)
+
+        assert registry.is_grandfathered(
+            session_id, active_mode, current_models, merged_other
+        ) == registry.is_grandfathered(
+            session_id, active_mode, current_models, pre_dedup_other
+        )

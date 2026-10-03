@@ -336,6 +336,111 @@ def _extract_delta_text_from_sse_chunk(chunk_text: str) -> str:
 
 
 # ===================================================================
+# SSE event re-framing
+# ===================================================================
+
+# An SSE event is terminated by a blank line: either LF LF or CR LF CR LF.
+_SSE_EVENT_SEPARATOR_RE = re.compile(rb"\r\n\r\n|\n\n")
+
+
+class SSEFrameOverflowError(ValueError):
+    """Raised when a single SSE event exceeds the re-framer's buffer cap."""
+
+    def __init__(self, pending_bytes: int, max_bytes: int):
+        self.pending_bytes = pending_bytes
+        self.max_bytes = max_bytes
+        super().__init__(
+            "SSE event exceeded the maximum buffered size "
+            f"({pending_bytes} > {max_bytes} bytes); refusing to buffer further"
+        )
+
+
+class SSEEventReframer:
+    """Re-frame an arbitrary byte stream into complete SSE events.
+
+    Upstream ``aiter_bytes()`` reads are arbitrary: a single read may contain a
+    complete event plus the start of the next, or end mid-event. Forwarding
+    those bytes verbatim lets a later synthetic/retry event concatenate with
+    the dangling partial, which the client's SSE decoder merges into one event
+    whose ``data:`` payload is not valid JSON ("malformed server-sent event
+    JSON").
+
+    :meth:`feed` buffers trailing partial data and only returns bytes up to a
+    complete event boundary (``\\n\\n`` or ``\\r\\n\\r\\n``), so complete
+    events are still flushed as soon as they are read. A held partial is
+    dropped on a stream transition via :meth:`discard_pending`, guaranteeing
+    the next stream cannot be concatenated with the abandoned attempt.
+
+    ``max_pending_bytes`` bounds the held partial. When a single event exceeds
+    it, :meth:`feed` raises :class:`SSEFrameOverflowError` and clears the
+    buffer: the framing can no longer be trusted, so the caller must fail
+    closed (terminate the stream with an error) rather than buffer unbounded or
+    forward a truncated tail as if it were a new event.
+    """
+
+    # A few MB is far larger than any well-formed OpenAI-compatible SSE event;
+    # exceeding it means the upstream is not speaking event-framed SSE.
+    DEFAULT_MAX_PENDING_BYTES = 8 * 1024 * 1024
+
+    def __init__(self, max_pending_bytes: int | None = None):
+        self.max_pending_bytes = (
+            int(max_pending_bytes)
+            if max_pending_bytes is not None
+            else self.DEFAULT_MAX_PENDING_BYTES
+        )
+        self._pending = b""
+        # Cumulative bytes dropped via discard_pending()/overflow (diagnostics).
+        self.discarded_bytes = 0
+
+    @property
+    def pending(self) -> bytes:
+        """The currently buffered trailing partial event (may be empty)."""
+        return self._pending
+
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        """Return the complete events contained in *chunk*.
+
+        Any trailing partial event is retained in :attr:`pending` and returned
+        by a later call once its boundary arrives. Raises
+        :class:`SSEFrameOverflowError` if the retained partial exceeds
+        ``max_pending_bytes``.
+        """
+        if not chunk:
+            return []
+        if isinstance(chunk, (bytearray, memoryview)):
+            chunk = bytes(chunk)
+        self._pending += chunk
+        events: list[bytes] = []
+        start = 0
+        for match in _SSE_EVENT_SEPARATOR_RE.finditer(self._pending):
+            events.append(self._pending[start:match.end()])
+            start = match.end()
+        if start:
+            self._pending = self._pending[start:]
+        if len(self._pending) > self.max_pending_bytes:
+            overflow = self._pending
+            self._pending = b""
+            self.discarded_bytes += len(overflow)
+            raise SSEFrameOverflowError(len(overflow), self.max_pending_bytes)
+        return events
+
+    def discard_pending(self) -> bytes:
+        """Drop any buffered partial event and return the dropped bytes.
+
+        Call on every stream transition (retry, re-route, synthetic event,
+        clean stop) so an abandoned attempt's partial can never be
+        concatenated with the next stream's bytes.
+        """
+        dropped = self._pending
+        self._pending = b""
+        self.discarded_bytes += len(dropped)
+        return dropped
+
+
+# ===================================================================
 # Empty response retry helper
 # ===================================================================
 
@@ -451,6 +556,59 @@ def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dic
 # Config loading
 # ===================================================================
 
+def _config_base_path() -> Path:
+    """Return the authoritative base config path (``proxy/config.yaml``)."""
+    from proxy.mode import proxy_dir
+
+    return proxy_dir() / "config.yaml"
+
+
+def _load_merged_config(overlay_path) -> dict:
+    """Load the base config and deep-merge *overlay_path* on top of it.
+
+    ``proxy/config.yaml`` is authoritative; a mode profile
+    (``config-fast.yaml`` / ``config-cheap.yaml``) is an overlay that
+    overrides only the values that differ. Merge semantics live in
+    :func:`proxy.config_merge.deep_merge` (recursive dict merge; every other
+    value replaces the base value wholesale).
+
+    Special cases:
+
+    * The overlay resolves to the base file itself (e.g.
+      ``LLAMA_PROXY_CONFIG=proxy/config.yaml``) -> the file is loaded once and
+      returned unchanged (no second load, no double validation).
+    * The overlay file does not exist -> the base config alone is returned
+      and a warning is logged.
+    """
+    from proxy.config_merge import deep_merge
+
+    base_path = _config_base_path()
+    with open(base_path) as f:
+        base = yaml.safe_load(f) or {}
+
+    overlay = Path(overlay_path)
+    try:
+        same_file = overlay.resolve() == base_path.resolve()
+    except OSError:
+        same_file = False
+    if same_file:
+        return base
+
+    if not overlay.is_file():
+        logging.getLogger("llama-proxy").warning(
+            "Config overlay %s not found; falling back to base config %s",
+            overlay,
+            base_path,
+        )
+        return base
+
+    with open(overlay) as f:
+        overlay_cfg = yaml.safe_load(f) or {}
+    if not isinstance(overlay_cfg, dict):
+        return base
+    return deep_merge(base, overlay_cfg)
+
+
 def load_config(config_path: str | None = None) -> dict:
     """Load configuration from YAML file.
 
@@ -458,24 +616,54 @@ def load_config(config_path: str | None = None) -> dict:
     ``proxy.mode.resolve_config_path()``: ``LLAMA_PROXY_CONFIG`` env var if
     set (start-proxy.sh exports it from the persisted mode), else the
     mode-selected profile (``config-fast.yaml`` / ``config-cheap.yaml``),
-    else ``proxy/config.yaml`` (default/fallback).
+    else ``proxy/config.yaml`` (default/fallback). The resolved file is then
+    deep-merged **on top of** the authoritative base config
+    (``proxy/config.yaml``), so every base-only key is inherited.
+
+    When *config_path* is given explicitly, only that file is loaded
+    (unchanged backward-compatible behaviour — no merge with the base).
     """
     if config_path is None:
         from proxy.mode import resolve_config_path
 
-        config_path = str(resolve_config_path())
+        cfg = _load_merged_config(resolve_config_path())
+    else:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        if cfg is None:
+            cfg = {}
 
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+    _validate_config(cfg)
 
+    return cfg
+
+
+def load_merged_config(config_path) -> dict:
+    """Load *config_path* deep-merged on top of the authoritative base config.
+
+    Unlike :func:`load_config`, this never returns a raw overlay: the base
+    ``proxy/config.yaml`` is always merged underneath *config_path* (unless
+    *config_path* is the base itself, in which case it is loaded once). This
+    is the entry point for consumers that must see a **complete** config for
+    a mode other than the active one — currently the mode-switch
+    grandfathering other-mode load (``server._startup_initialize_
+    grandfathering``), which compares remote-provider counts between modes.
+
+    The merged config is validated exactly like :func:`load_config`.
+    """
+    cfg = _load_merged_config(config_path)
+    _validate_config(cfg)
+    return cfg
+
+
+def _validate_config(cfg: dict) -> None:
+    """Run the standard config validators on *cfg* (raises ``ValueError``)."""
     # Validate system_prompt configurations
     _validate_prompt_configs(cfg)
     # Validate chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5)
     _validate_chain_hold_config(cfg)
     # Validate compaction configuration (LP-0MTG6RW3L003X122)
     _validate_compaction_config(cfg)
-
-    return cfg
 
 
 def _validate_chain_hold_config(cfg: dict) -> None:

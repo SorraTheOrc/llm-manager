@@ -277,6 +277,16 @@ were retired with `opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in
 
 ## Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG)
 
+> **Scope:** applies to **remote providers only** (LP-0MUNTOGLB005LUKY).
+> Local providers are explicitly exempt: a local empty response never
+> increments the streak and never triggers the 600s quarantine. The extended
+> cooldown exists to stop retrying remote sibling API keys against a dead
+> gateway; a local entry has no sibling keys, and quarantining it removes the
+> only healthy local capacity from the chain. Local providers keep their
+> existing normal handling (the `empty_response_max_cooldown_seconds` cap of
+> 10s, `local_slot_exhaustion_retry_attempts`, the no-progress watchdog and
+> the dispatch lease).
+
 A remote provider that repeatedly returns an **empty response** or **stalls**
 (zero usable content) across retry cycles is quarantined for an **extended
 cooldown** so the fallback chain permanently skips it and routes to the next
@@ -295,9 +305,13 @@ quarantine.
 **Behaviour:**
 
 1. Every `empty_response` / `stall_*` / zero-content stream error on a
-   provider entry increments a per-entry consecutive-failure streak
-   (`_sibling_failure_count` in `proxy/proxy/provider.py`), shared across
-   requests (module-level state, like the other cooldown mechanisms).
+   **remote** provider entry increments a per-entry consecutive-failure
+   streak (`_sibling_failure_count` in `proxy/proxy/provider.py`), shared
+   across requests (module-level state, like the other cooldown mechanisms).
+   `_record_sibling_failure()` takes an optional `provider_type` argument
+   (`None` defaults to remote, preserving existing callers); `"local"`
+   returns early without marking the provider unavailable or incrementing
+   the streak.
 2. Once the streak reaches `sibling_fallback_threshold` (default 2) within
    `sibling_fallback_window_seconds` (default 600s), the provider is marked
    unavailable for `sibling_fallback_cooldown_seconds` (default 600s) — via

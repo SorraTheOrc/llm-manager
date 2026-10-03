@@ -1,0 +1,702 @@
+"""Tests for provider-availability persistence (LP-0MUIGX0QU0042NZZ).
+
+Parent: LP-0MUI6KB67005X44B — persist the usage-limit account quarantine
+(``_usage_reset_at``) and provider/entry cooldowns
+(``_provider_unavailable_until``) across proxy restarts.
+
+This slice covers the persistence helpers only:
+
+- empty-map and both-map round-trips;
+- expired entries dropped at load (and excluded from the written payload);
+- missing / unreadable / malformed / non-dict state file handled safely;
+- malformed entries skipped while valid siblings survive;
+- absolute epoch expiries round-trip unchanged;
+- state-file path default (beside ``proxy/.mode``) and env override;
+- atomic write (temp file + replace, no partial file left behind, failure
+  cleans up the temp file).
+
+The mutation hooks and the startup restore call are separate child slices
+(LP-0MUIGX4HF / LP-0MUIGX4H8); here the helpers are exercised directly.
+"""
+
+import json
+import os
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+import proxy.provider as provider
+import proxy.server as server
+import pytest
+from fastapi import Response
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provider_state(tmp_path, monkeypatch):
+    """Isolate the maps and the state-file path for every test in this module.
+
+    The env override is pointed at a per-test temporary file so no test can
+    ever touch the real ``proxy/provider-state.json``.
+    """
+    monkeypatch.setenv(
+        provider._PROVIDER_STATE_FILE_ENV,
+        str(tmp_path / "provider-state.json"),
+    )
+    provider._provider_unavailable_until.clear()
+    provider._usage_reset_at.clear()
+    provider._provider_failure_count.clear()
+    yield
+    provider._provider_unavailable_until.clear()
+    provider._usage_reset_at.clear()
+    provider._provider_failure_count.clear()
+
+
+def _write_state(path: Path, payload) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+class TestSaveLoadRoundTrip:
+    def test_empty_maps_round_trip(self, tmp_path):
+        path = tmp_path / "empty.json"
+
+        provider.save_provider_state(path)
+        assert path.exists()
+
+        restored = provider.load_provider_state(path)
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+
+    def test_written_document_is_versioned_with_both_maps(self, tmp_path):
+        path = tmp_path / "state.json"
+        provider._provider_unavailable_until["brand"] = time.time() + 60
+        provider._usage_reset_at["key@domain"] = time.time() + 600
+
+        provider.save_provider_state(path)
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["version"] == provider._PROVIDER_STATE_VERSION
+        assert set(raw["provider_unavailable_until"]) == {"brand"}
+        assert set(raw["usage_reset_at"]) == {"key@domain"}
+
+    def test_both_maps_round_trip_with_absolute_expiries(self, tmp_path):
+        path = tmp_path / "state.json"
+        cooldown_expiry = time.time() + 123.5
+        quarantine_expiry = time.time() + 987654.25
+        provider._provider_unavailable_until["opencode-go"] = cooldown_expiry
+        provider._usage_reset_at["OPENCODE_2_API_KEY@opencode.ai"] = (
+            quarantine_expiry
+        )
+
+        provider.save_provider_state(path)
+        # Wipe the in-memory maps to simulate a process restart.
+        provider._provider_unavailable_until.clear()
+        provider._usage_reset_at.clear()
+
+        restored = provider.load_provider_state(path)
+
+        assert restored == (1, 1)
+        # Absolute epoch expiries round-trip unchanged (neither extended nor
+        # reset by the restart boundary).
+        assert provider._provider_unavailable_until == {
+            "opencode-go": cooldown_expiry
+        }
+        assert provider._usage_reset_at == {
+            "OPENCODE_2_API_KEY@opencode.ai": quarantine_expiry
+        }
+
+    def test_load_replaces_rather_than_merges_in_memory_state(self, tmp_path):
+        path = tmp_path / "state.json"
+        provider._provider_unavailable_until["from_file"] = time.time() + 60
+        provider.save_provider_state(path)
+        provider._provider_unavailable_until.clear()
+
+        # A stale in-memory entry must not survive a reload.
+        provider._provider_unavailable_until["stale"] = time.time() + 60
+        provider.load_provider_state(path)
+
+        assert set(provider._provider_unavailable_until) == {"from_file"}
+
+    def test_round_trip_uses_env_override_path_by_default(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "via-env.json"
+        monkeypatch.setenv(provider._PROVIDER_STATE_FILE_ENV, str(path))
+        provider._usage_reset_at["acct"] = time.time() + 60
+
+        provider.save_provider_state()
+        assert path.exists()
+
+        provider._usage_reset_at.clear()
+        assert provider.load_provider_state() == (0, 1)
+        assert set(provider._usage_reset_at) == {"acct"}
+
+
+class TestExpiryHandling:
+    def test_expired_entries_dropped_at_load(self, tmp_path):
+        path = tmp_path / "state.json"
+        now = time.time()
+        _write_state(
+            path,
+            {
+                "version": 1,
+                "provider_unavailable_until": {
+                    "expired": now - 5,
+                    "live": now + 300,
+                },
+                "usage_reset_at": {
+                    "expired@domain": now - 1,
+                    "live@domain": now + 3000,
+                },
+            },
+        )
+
+        restored = provider.load_provider_state(path)
+
+        assert restored == (1, 1)
+        assert provider._provider_unavailable_until == {"live": now + 300}
+        assert provider._usage_reset_at == {"live@domain": now + 3000}
+
+    def test_save_excludes_expired_entries(self, tmp_path):
+        path = tmp_path / "state.json"
+        now = time.time()
+        provider._provider_unavailable_until["expired"] = now - 10
+        provider._provider_unavailable_until["live"] = now + 10
+        provider._usage_reset_at["expired@domain"] = now - 10
+
+        provider.save_provider_state(path)
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert set(raw["provider_unavailable_until"]) == {"live"}
+        assert raw["usage_reset_at"] == {}
+
+    def test_entry_expiring_exactly_now_is_dropped(self, tmp_path):
+        path = tmp_path / "state.json"
+        _write_state(
+            path,
+            {
+                "version": 1,
+                "provider_unavailable_until": {},
+                "usage_reset_at": {},
+            },
+        )
+        provider._usage_reset_at["boundary"] = time.time()
+        provider.save_provider_state(path)
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["usage_reset_at"] == {}
+
+
+class TestCorruptionTolerance:
+    def test_missing_file_is_safe(self, tmp_path, caplog):
+        path = tmp_path / "does-not-exist.json"
+
+        with caplog.at_level("WARNING"):
+            restored = provider.load_provider_state(path)
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+        assert any(
+            "no state file" in record.message for record in caplog.records
+        )
+
+    def test_corrupt_json_is_safe(self, tmp_path, caplog):
+        path = tmp_path / "corrupt.json"
+        path.write_text("{not valid json", encoding="utf-8")
+
+        with caplog.at_level("WARNING"):
+            restored = provider.load_provider_state(path)
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+        assert any(
+            "unreadable state file" in record.message
+            for record in caplog.records
+        )
+
+    def test_non_dict_top_level_payload_is_safe(self, tmp_path, caplog):
+        path = tmp_path / "list.json"
+        _write_state(path, [1, 2, 3])
+
+        with caplog.at_level("WARNING"):
+            restored = provider.load_provider_state(path)
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+        assert any(
+            "malformed state file" in record.message
+            for record in caplog.records
+        )
+
+    def test_non_dict_map_payload_is_safe(self, tmp_path):
+        path = tmp_path / "badmap.json"
+        _write_state(
+            path,
+            {
+                "version": 1,
+                "provider_unavailable_until": "not-a-dict",
+                "usage_reset_at": ["also", "not", "a", "dict"],
+            },
+        )
+
+        assert provider.load_provider_state(path) == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+
+    def test_malformed_entries_are_skipped_valid_ones_survive(self, tmp_path):
+        path = tmp_path / "mixed.json"
+        now = time.time()
+        _write_state(
+            path,
+            {
+                "version": 1,
+                "provider_unavailable_until": {
+                    "good": now + 100,
+                    "bad_string": "soon",
+                    "bad_bool": True,
+                    "bad_null": None,
+                    "bad_list": [1, 2],
+                },
+                "usage_reset_at": {
+                    "good@domain": now + 200,
+                    "bad_object": {"expiry": now + 200},
+                },
+            },
+        )
+
+        restored = provider.load_provider_state(path)
+
+        assert restored == (1, 1)
+        assert provider._provider_unavailable_until == {"good": now + 100}
+        assert provider._usage_reset_at == {"good@domain": now + 200}
+
+    def test_corrupt_file_clears_any_existing_in_memory_state(self, tmp_path):
+        provider._provider_unavailable_until["leftover"] = time.time() + 60
+        provider._usage_reset_at["leftover@domain"] = time.time() + 60
+        path = tmp_path / "corrupt.json"
+        path.write_text("<<<", encoding="utf-8")
+
+        provider.load_provider_state(path)
+
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+
+
+class TestStateFilePath:
+    def test_default_path_is_beside_proxy_mode(self, monkeypatch):
+        monkeypatch.delenv(provider._PROVIDER_STATE_FILE_ENV, raising=False)
+
+        path = provider.default_provider_state_file()
+
+        assert path.name == "provider-state.json"
+        # Parent is the outer ``proxy`` project directory (where ``.mode``
+        # and ``grandfathering-state.json`` live).
+        assert path.parent.name == "proxy"
+        assert path.parent == Path(provider.__file__).parent.parent
+
+    def test_env_override_wins(self, monkeypatch, tmp_path):
+        override = tmp_path / "custom" / "state.json"
+        monkeypatch.setenv(provider._PROVIDER_STATE_FILE_ENV, str(override))
+
+        assert provider.default_provider_state_file() == override
+
+
+class TestAtomicWrite:
+    def test_successful_save_leaves_no_temp_files(self, tmp_path):
+        path = tmp_path / "state.json"
+        provider._provider_unavailable_until["x"] = time.time() + 60
+
+        provider.save_provider_state(path)
+
+        assert path.exists()
+        assert list(tmp_path.glob("state.json.*.tmp")) == []
+        # A complete, parseable document — never a partial file.
+        json.loads(path.read_text(encoding="utf-8"))
+
+    def test_failed_replace_cleans_up_temp_and_raises(self, tmp_path, monkeypatch):
+        path = tmp_path / "state.json"
+        path.write_text(
+            json.dumps({"version": 1, "marker": "original"}), encoding="utf-8"
+        )
+
+        def _boom(_src, _dst):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(os, "replace", _boom)
+
+        with pytest.raises(OSError, match="simulated replace failure"):
+            provider.save_provider_state(path)
+
+        # The original file is untouched and no partial temp file is left.
+        assert json.loads(path.read_text(encoding="utf-8"))["marker"] == "original"
+        assert list(tmp_path.glob("state.json.*.tmp")) == []
+
+
+class TestStartupRestore:
+    """Startup restore + first-routing-decision behaviour (LP-0MUIGX4H80051MYG).
+
+    The startup helper (``server._startup_restore_provider_state``) is the
+    process-start hook that reloads the persisted maps; ``resolve_provider``
+    is then exercised to prove the restored entries force a skip with the
+    existing log lines and no provider is returned for the request.
+    """
+
+    @staticmethod
+    def _provider_cfg(**overrides) -> dict:
+        cfg = {
+            "name": "acme-primary",
+            "type": "remote",
+            "provider": "acme",
+            "endpoint": "https://acme.example/v1",
+            "model": "m1",
+            "api_key_env": "ACME_API_KEY",
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_restored_quarantine_skips_account_without_dispatch(
+        self, caplog, tmp_path, monkeypatch
+    ):
+        cfg = self._provider_cfg()
+        usage_key = provider._usage_limit_account_key(cfg)
+        far_future = time.time() + 30 * 24 * 3600
+        provider._usage_reset_at[usage_key] = far_future
+        provider.save_provider_state()
+        # Wipe in-memory state to simulate a restart before restore.
+        provider._usage_reset_at.clear()
+
+        restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 1)
+        assert provider._usage_reset_at == {usage_key: far_future}
+
+        model_config = {"providers": [cfg]}
+        with caplog.at_level("INFO"):
+            resolved = provider.resolve_provider(model_config)
+
+        # No provider returned => the request would make no upstream call.
+        assert resolved is None
+        assert any(
+            "usage_limit_reset_pending" in record.message
+            and "acme-primary" in record.message
+            for record in caplog.records
+        )
+
+    def test_restored_cooldown_skips_provider_without_dispatch(self, caplog):
+        provider._provider_unavailable_until["acme-primary"] = (
+            time.time() + 3600
+        )
+        provider.save_provider_state()
+        provider._provider_unavailable_until.clear()
+
+        restored = server._startup_restore_provider_state()
+
+        assert restored == (1, 0)
+
+        model_config = {"providers": [self._provider_cfg()]}
+        with caplog.at_level("INFO"):
+            resolved = provider.resolve_provider(model_config)
+
+        assert resolved is None
+        assert any(
+            "in cooldown" in record.message
+            and "acme-primary" in record.message
+            for record in caplog.records
+        )
+
+    def test_expired_restored_entries_are_dropped_and_do_not_skip(self):
+        cfg = self._provider_cfg()
+        usage_key = provider._usage_limit_account_key(cfg)
+        now = time.time()
+        # Write directly: save() prunes expired entries, and this test needs
+        # the loader itself to drop them.
+        _write_state(
+            provider.default_provider_state_file(),
+            {
+                "version": 1,
+                "provider_unavailable_until": {"acme-primary": now - 5},
+                "usage_reset_at": {usage_key: now - 5},
+            },
+        )
+
+        restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+        # The provider is available again, so it is returned (not skipped).
+        assert provider.resolve_provider({"providers": [cfg]}) == cfg
+
+    def test_restore_logs_counts_at_info(self, caplog):
+        provider._provider_unavailable_until["acme-primary"] = (
+            time.time() + 60
+        )
+        provider._usage_reset_at["key@domain"] = time.time() + 600
+        provider.save_provider_state()
+        provider._provider_unavailable_until.clear()
+        provider._usage_reset_at.clear()
+
+        with caplog.at_level("INFO"):
+            server._startup_restore_provider_state()
+
+        assert any(
+            "restored 1 cooldown entries and 1 usage-limit quarantine entries"
+            in record.message
+            for record in caplog.records
+        )
+
+    def test_missing_file_never_blocks_startup(self, caplog):
+        assert not provider.default_provider_state_file().exists()
+
+        with caplog.at_level("WARNING"):
+            restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+        assert any("no state file" in r.message for r in caplog.records)
+
+    def test_corrupt_file_never_blocks_startup(self, caplog):
+        provider.default_provider_state_file().write_text(
+            "{ corrupt", encoding="utf-8"
+        )
+
+        with caplog.at_level("WARNING"):
+            restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 0)
+        assert provider._provider_unavailable_until == {}
+        assert provider._usage_reset_at == {}
+        assert any(
+            "unreadable state file" in r.message for r in caplog.records
+        )
+
+    def test_unexpected_loader_error_is_swallowed(self, caplog, monkeypatch):
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("simulated loader failure")
+
+        monkeypatch.setattr(server, "load_provider_state", _boom)
+
+        with caplog.at_level("WARNING"):
+            restored = server._startup_restore_provider_state()
+
+        assert restored == (0, 0)
+        assert any(
+            "Failed to restore provider availability state" in r.message
+            for r in caplog.records
+        )
+
+    def test_startup_persistence_tasks_invoke_restore(self):
+        provider._usage_reset_at["key@domain"] = time.time() + 600
+        provider.save_provider_state()
+        provider._usage_reset_at.clear()
+
+        # The real startup hook must reach the loader (no event loop here:
+        # the task-spawning section is guarded by RuntimeError).
+        server._startup_launch_persistence_tasks()
+
+        assert "key@domain" in provider._usage_reset_at
+
+
+class TestPersistOnMutation:
+    """Mutations persist the availability maps (LP-0MUIGX4HF003NWS5).
+
+    Both mutation sites are covered end-to-end: the provider cooldown setter
+    and the two usage-limit quarantine assignments (streaming and
+    non-streaming fallback paths). A persistence failure must be logged and
+    swallowed, never raised into the routing/fallback path.
+    """
+
+    _CHAIN = {
+        "providers": [
+            {
+                "name": "acme-primary",
+                "type": "remote",
+                "provider": "acme",
+                "endpoint": "https://acme.example/v1",
+                "api_key_env": "ACME_API_KEY",
+                "model": "m1",
+            },
+            {
+                "name": "acme-backup",
+                "type": "remote",
+                "provider": "acme-backup",
+                "endpoint": "https://backup.example/v1",
+                "api_key_env": "BACKUP_API_KEY",
+                "model": "m1",
+            },
+        ],
+    }
+
+    class _DummyRequest:
+        def __init__(self, body: bytes = b'{"model":"test"}'):
+            self._body = body
+            self.headers = {}
+            self.method = "POST"
+            self.url = type("U", (), {"path": "/v1/chat/completions"})()
+
+        async def body(self):
+            return self._body
+
+    @staticmethod
+    def _gousage_429() -> Response:
+        body = json.dumps(
+            {
+                "error": {
+                    "type": "GoUsageLimitError",
+                    "message": "Weekly usage limit reached. Resets in 2 hours.",
+                },
+                "metadata": {"limitName": "weekly"},
+            }
+        )
+        return Response(
+            status_code=429, content=body.encode("utf-8"),
+            media_type="application/json",
+        )
+
+    @staticmethod
+    def _ok() -> Response:
+        return Response(
+            content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    def _persisted(self) -> dict:
+        return json.loads(
+            provider.default_provider_state_file().read_text(encoding="utf-8")
+        )
+
+    def test_mark_provider_unavailable_persists_cooldown_round_trip(self):
+        before = time.time()
+
+        provider.mark_provider_unavailable("acme-primary", 120)
+
+        raw = self._persisted()
+        persisted_expiry = raw["provider_unavailable_until"]["acme-primary"]
+        assert before + 119 <= persisted_expiry <= before + 122
+
+        # Reloading from disk (simulated restart) restores the same absolute
+        # expiry — neither extended nor reset.
+        provider._provider_unavailable_until.clear()
+        assert provider.load_provider_state() == (1, 0)
+        assert provider._provider_unavailable_until["acme-primary"] == (
+            persisted_expiry
+        )
+
+    def test_mark_provider_unavailable_does_not_persist_failure_count(self):
+        provider.mark_provider_unavailable(
+            "acme-primary", 120, use_exponential_backoff=True
+        )
+
+        # The backoff counter is updated in memory but must NOT be persisted.
+        assert provider._provider_failure_count["acme-primary"] == 1
+        raw = self._persisted()
+        assert "provider_failure_count" not in raw
+        assert "_provider_failure_count" not in raw
+
+    def test_mark_provider_unavailable_save_failure_is_swallowed(
+        self, caplog, monkeypatch
+    ):
+        def _boom(*_args, **_kwargs):
+            raise OSError("simulated disk failure")
+
+        monkeypatch.setattr(provider, "save_provider_state", _boom)
+
+        with caplog.at_level("WARNING"):
+            provider.mark_provider_unavailable("acme-primary", 60)
+
+        # The cooldown is still applied in memory and nothing raised.
+        assert "acme-primary" in provider._provider_unavailable_until
+        assert any(
+            "failed to persist availability state" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_streaming_usage_limit_site_persists_quarantine(self):
+        account_key = provider._usage_limit_account_key(
+            self._CHAIN["providers"][0]
+        )
+        call_count = 0
+
+        async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+            nonlocal call_count
+            call_count += 1
+            if provider_cfg.get("name") == "acme-primary":
+                return self._gousage_429()
+            return self._ok()
+
+        with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+            result = await provider.proxy_with_remote_fallback(
+                self._DummyRequest(), "v1/chat/completions", self._CHAIN,
+                {"provider_cooldown_seconds": 60},
+            )
+
+        assert result.status_code == 200
+        assert call_count == 2
+        raw = self._persisted()
+        assert account_key in raw["usage_reset_at"]
+        assert raw["usage_reset_at"][account_key] == pytest.approx(
+            provider._usage_reset_at[account_key]
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_usage_limit_site_persists_quarantine(self):
+        account_key = provider._usage_limit_account_key(
+            self._CHAIN["providers"][0]
+        )
+        call_count = 0
+
+        async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+            nonlocal call_count
+            call_count += 1
+            if provider_cfg.get("name") == "acme-primary":
+                return self._gousage_429()
+            return self._ok()
+
+        with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+            result = await provider.proxy_with_fallback(
+                self._DummyRequest(), "v1/chat/completions", self._CHAIN,
+                {"provider_cooldown_seconds": 60},
+            )
+
+        assert result.status_code == 200
+        assert call_count == 2
+        raw = self._persisted()
+        assert account_key in raw["usage_reset_at"]
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_save_failure_does_not_break_fallback(
+        self, caplog, monkeypatch
+    ):
+        def _boom(*_args, **_kwargs):
+            raise OSError("simulated disk failure")
+
+        monkeypatch.setattr(provider, "save_provider_state", _boom)
+        call_count = 0
+
+        async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+            nonlocal call_count
+            call_count += 1
+            if provider_cfg.get("name") == "acme-primary":
+                return self._gousage_429()
+            return self._ok()
+
+        with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+            with caplog.at_level("WARNING"):
+                result = await provider.proxy_with_remote_fallback(
+                    self._DummyRequest(), "v1/chat/completions",
+                    self._CHAIN, {"provider_cooldown_seconds": 60},
+                )
+
+        # The fallback still succeeded despite the persist failure.
+        assert result.status_code == 200
+        assert any(
+            "failed to persist availability state" in r.message
+            for r in caplog.records
+        )

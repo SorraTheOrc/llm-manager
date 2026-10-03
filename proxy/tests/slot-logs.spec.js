@@ -170,25 +170,21 @@ test.describe('Slot Logs Tab', () => {
   });
 
   test('per-slot streams are routed to their own section only', async ({ page }) => {
+    // One combined connection per slot (`/logs/tail/slot?slot=N`) carries both
+    // the proxy and llama lines, tagged with `source` (LP-0MUJZHTCN006IZRW).
     const routes = [
       eventsRoute([twoSlotStatus()]),
       {
-        urlContains: 'source=llama&slot=2',
+        urlContains: 'slot=2',
         delayMs: 200,
         payloads: [
           { initial: '[57463] slot update_slots: id  2 | task 209403 | n_tokens = 16750, ...\n[57463] slot      release: id  2 | task 209403', source: 'llama', slot: 2 },
           { line: '[57463] slot print_timing: id  2 | task 209403', source: 'llama', slot: 2 },
-        ],
-      },
-      {
-        urlContains: 'source=proxy&slot=2',
-        delayMs: 200,
-        payloads: [
           { line: 'slot_save success session=' + SESSION_A + ' slot=2', source: 'proxy', slot: 2 },
         ],
       },
       {
-        urlContains: 'source=llama&slot=3',
+        urlContains: 'slot=3',
         delayMs: 200,
         payloads: [
           { line: '[57463] slot update_slots: id  3 | task 209410 | n_tokens = 9000, ...', source: 'llama', slot: 3 },
@@ -215,6 +211,43 @@ test.describe('Slot Logs Tab', () => {
     await expect(slot3Log).toContainText('id  3');
     await expect(slot3Log).not.toContainText('id  2');
     await expect(slot3Log).not.toContainText('slot_save success');
+  });
+
+  test('every slot receives log output (connection-budget regression)', async ({ page }) => {
+    // LP-0MUJZHTCN006IZRW: opening two SSE connections per slot exhausted the
+    // browser's ~6-connections-per-origin budget, so most slot panes never
+    // received any data. One combined connection per slot keeps every pane fed.
+    const slots = [0, 1, 2, 3].map((i) => ({
+      slot_id: i,
+      is_processing: true,
+      n_decoded: 10 + i,
+      n_tokens: 10 + i,
+      progress: 0.1,
+      total_tokens: 100,
+      session_id: '99999999-1111-2222-3333-44444444444' + i,
+      generation_done: false,
+    }));
+    const routes = [eventsRoute([statusPayload(slots)])];
+    slots.forEach((s) => {
+      routes.push({
+        urlContains: 'slot=' + s.slot_id,
+        delayMs: 200 + s.slot_id * 20,
+        payloads: [
+          { line: '[57463] slot update_slots: id  ' + s.slot_id + ' | task ' + s.slot_id + ' | n_tokens = 4242', source: 'llama', slot: s.slot_id },
+          { line: 'slot_save success session=' + s.session_id + ' slot=' + s.slot_id, source: 'proxy', slot: s.slot_id },
+        ],
+      });
+    });
+    await page.addInitScript(installFakeEventSource, routes);
+
+    await page.goto('/logs');
+    await expect(page.locator('#slotSections .slot-section')).toHaveCount(4);
+
+    for (const s of slots) {
+      const pane = page.locator('.slot-section[data-slot-id="' + s.slot_id + '"] .slot-log');
+      await expect(pane).toContainText('n_tokens = 4242');
+      await expect(pane).toContainText('slot_save success');
+    }
   });
 
   test('slot sections refresh as slots become active/inactive', async ({ page }) => {
@@ -324,7 +357,7 @@ test.describe('Slot Logs Tab', () => {
         ],
       },
       {
-        urlContains: 'source=llama&slot=1',
+        urlContains: 'slot=1',
         delayMs: 400,
         payloads: [
           { line: '[57463] slot update_slots: id  1 | task 209403 | n_tokens = 16750, ...', source: 'llama', slot: 1 },

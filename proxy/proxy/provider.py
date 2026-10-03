@@ -15,17 +15,24 @@ Provides:
 - Cooldown tracking: Mark providers as temporarily unavailable after failures
 - Timed access: Skip providers outside their configured `available_times` UTC
   windows (LP-0MS4ETBNO0022QAC)
+- Availability persistence: provider cooldowns and usage-limit account
+  quarantine survive proxy restarts via `proxy/provider-state.json`
+  (LP-0MUI6KB67005X44B)
 """
 
 import asyncio
 import inspect
 import json
 import logging
+import os
 import re
+import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -89,6 +96,14 @@ _FREE_USAGE_LIMIT_COOLDOWN_SECONDS = 10800
 # are skipped by every routing decision until the reset time passes.
 _usage_reset_at: dict[str, float] = {}
 
+# Accounts whose quarantine duration was GUESSED from ``metadata.limitName``
+# alone — the upstream 429 carried no explicit "Resets in ..." duration. A
+# period name is a weak signal (all observed opencode 429s are duration-less),
+# so guessed quarantines are (a) capped to a short window and (b) never
+# persisted: an account that recovered must not stay locked out for weeks
+# after a restart (LP-0MUQTCMW2001VXH8).
+_usage_reset_guessed: set[str] = set()
+
 # 2-minute safety margin added to the computed usage-limit reset time so a
 # clock-skewed upstream does not start re-serving 429s the moment the limit
 # nominally resets.
@@ -101,6 +116,246 @@ _PERIOD_DEFAULT_SECONDS = {
     "weekly": 7 * 24 * 3600,
     "monthly": 30 * 24 * 3600,
 }
+
+# Upper bound applied to a GUESSED (period-name-only) quarantine. The full
+# period (up to 30 days) is never used without an explicit duration from the
+# gateway; a guess is capped at this short window. Override with
+# ``server.usage_limit_guess_cap_seconds`` or the env var below
+# (LP-0MUQTCMW2001VXH8).
+_USAGE_LIMIT_GUESS_MAX_SECONDS = 24 * 3600
+_USAGE_LIMIT_GUESS_CAP_ENV = "LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS"
+
+# Self-healing probe: re-validate a guessed quarantine at most once per this
+# interval per account, so a recovered account is reintroduced promptly
+# without hammering the upstream on every request.
+_USAGE_LIMIT_PROBE_INTERVAL_SECONDS = 300.0
+_usage_limit_last_probe: dict[str, float] = {}
+
+# Per-probe request timeout (seconds). A probe must never hang a request.
+_USAGE_LIMIT_PROBE_TIMEOUT_SECONDS = 15.0
+
+# Injectable probe transport: an async ``(provider_cfg) -> bool`` returning
+# True when the account is usable again. Left ``None`` in production (the
+# httpx default is used); tests replace it to avoid real network calls.
+_usage_limit_probe_transport: Callable[[dict], Awaitable[bool]] | None = None
+
+# ---------------------------------------------------------------------------
+# Provider availability persistence (LP-0MUI6KB67005X44B)
+#
+# Provider availability is process state: upstream cooldowns
+# (_provider_unavailable_until) and usage-limit account quarantine
+# (_usage_reset_at) previously lived only in memory, so every proxy restart
+# wiped them and re-exposed an already-exhausted upstream. Both maps are
+# persisted to a small versioned JSON document beside proxy/.mode and
+# restored on startup.
+#
+# Scope boundary: _provider_failure_count (the exponential-backoff counter)
+# and the sibling-failure / local-400 streak state are deliberately NOT
+# persisted — backoff restarts at its base interval after a restart and those
+# counters are cheap to re-learn.
+#
+# The write path is atomic (temp file + os.replace) and runs only on the cold
+# path (a provider failing / an upstream 429). The read path is
+# corruption-tolerant: any error leaves the maps empty and never blocks
+# startup.
+# ---------------------------------------------------------------------------
+
+# On-disk schema version for the persisted provider-availability document.
+_PROVIDER_STATE_VERSION = 1
+
+# Environment override for the state-file path (used by tests and non-default
+# deployments). When unset, the file lives beside proxy/.mode.
+_PROVIDER_STATE_FILE_ENV = "LLAMA_PROXY_PROVIDER_STATE_FILE"
+
+# Top-level keys of the persisted document.
+_PROVIDER_STATE_COOLDOWNS_KEY = "provider_unavailable_until"
+_PROVIDER_STATE_QUARANTINE_KEY = "usage_reset_at"
+
+
+def default_provider_state_file() -> Path:
+    """Return the persisted provider-availability state-file path.
+
+    Defaults to ``proxy/provider-state.json`` (beside ``proxy/.mode`` and
+    ``proxy/grandfathering-state.json``). Override with the
+    ``LLAMA_PROXY_PROVIDER_STATE_FILE`` environment variable.
+    """
+    override = os.environ.get(_PROVIDER_STATE_FILE_ENV)
+    if override:
+        return Path(override)
+    return Path(__file__).parent.parent / "provider-state.json"
+
+
+def _prune_expired_expiries(
+    mapping: dict[str, float], now: float
+) -> dict[str, float]:
+    """Return a copy of *mapping* without entries expired at *now*."""
+    return {key: expiry for key, expiry in mapping.items() if expiry > now}
+
+
+def save_provider_state(path: str | Path | None = None) -> None:
+    """Persist provider cooldowns and usage-limit quarantine atomically.
+
+    Serialises both availability maps to a versioned JSON document and writes
+    it via a temp file in the target directory plus ``os.replace`` so a
+    concurrent reader never observes a partial file. Already-expired entries
+    are excluded from the payload so the file does not grow with stale keys.
+
+    The write is synchronous: callers invoke it on the cold path (a provider
+    failing or an upstream 429), where a small atomic write is inexpensive.
+    A failure is raised to the caller, which is expected to persist
+    best-effort without letting the error reach the routing path.
+
+    Args:
+        path: Target state-file path (defaults to
+            :func:`default_provider_state_file`).
+    """
+    target = Path(path) if path else default_provider_state_file()
+    now = time.time()
+    # Guessed (period-name-only) quarantines are deliberately NOT persisted:
+    # they are weak evidence and must not outlive a restart as a long-lived
+    # lockout. Only explicit-duration quarantines are written
+    # (LP-0MUQTCMW2001VXH8).
+    persistable_quarantine = {
+        key: expiry
+        for key, expiry in _usage_reset_at.items()
+        if key not in _usage_reset_guessed
+    }
+    payload = {
+        "version": _PROVIDER_STATE_VERSION,
+        _PROVIDER_STATE_COOLDOWNS_KEY: _prune_expired_expiries(
+            _provider_unavailable_until, now
+        ),
+        _PROVIDER_STATE_QUARANTINE_KEY: _prune_expired_expiries(
+            persistable_quarantine, now
+        ),
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _coerce_expiry_map(raw: Any) -> dict[str, float]:
+    """Coerce a persisted mapping to ``{str: float}``, dropping bad entries.
+
+    A non-dict payload, a non-string key, or a non-numeric expiry is skipped
+    rather than raising, so a single malformed entry never discards the rest
+    of the map.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        result[key] = float(value)
+    return result
+
+
+def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
+    """Restore provider cooldowns and usage-limit quarantine from disk.
+
+    Reads the state file written by :func:`save_provider_state`, drops any
+    entry whose absolute epoch expiry is at or before ``time.time()``, and
+    installs the remainder into the module-level maps. Both maps are replaced
+    (not merged) so a reload is deterministic.
+
+    Corruption tolerance: a missing, unreadable, malformed, or non-dict file
+    leaves the maps empty and logs a warning; a malformed entry is skipped
+    while valid siblings survive. This function never raises.
+
+    Args:
+        path: Source state-file path (defaults to
+            :func:`default_provider_state_file`).
+
+    Returns:
+        ``(restored_cooldowns, restored_quarantine)`` — the number of entries
+        restored into each map.
+    """
+    target = Path(path) if path else default_provider_state_file()
+    now = time.time()
+    cooldowns: dict[str, float] = {}
+    quarantine: dict[str, float] = {}
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        logger.warning(
+            "provider-state: no state file at %s; starting with empty "
+            "cooldown/quarantine state",
+            target,
+        )
+        raw = None
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "provider-state: ignoring unreadable state file %s: %s",
+            target,
+            exc,
+        )
+        raw = None
+    else:
+        if not isinstance(raw, dict):
+            logger.warning(
+                "provider-state: ignoring malformed state file %s "
+                "(top-level payload is not an object)",
+                target,
+            )
+            raw = None
+
+    if isinstance(raw, dict):
+        cooldowns = _prune_expired_expiries(
+            _coerce_expiry_map(raw.get(_PROVIDER_STATE_COOLDOWNS_KEY)), now
+        )
+        quarantine = _prune_expired_expiries(
+            _coerce_expiry_map(raw.get(_PROVIDER_STATE_QUARANTINE_KEY)), now
+        )
+
+    _provider_unavailable_until.clear()
+    _provider_unavailable_until.update(cooldowns)
+    _usage_reset_at.clear()
+    _usage_reset_at.update(quarantine)
+    # Loaded entries are always explicit/hard (guessed quarantines are never
+    # persisted), so no stale guessed markers survive a reload.
+    _usage_reset_guessed.clear()
+    _usage_limit_last_probe.clear()
+
+    logger.info(
+        "provider-state: restored %d cooldown entries and %d usage-limit "
+        "quarantine entries from %s",
+        len(cooldowns),
+        len(quarantine),
+        target,
+    )
+    return len(cooldowns), len(quarantine)
+
+
+def _persist_provider_state_best_effort() -> None:
+    """Persist the availability maps, swallowing (but logging) any failure.
+
+    Called on the cold path — a provider failing or an upstream 429. The write
+    must never raise into the routing/fallback path: a failed persist only
+    means the cooldown/quarantine is lost on the next restart, which is no
+    worse than the pre-persistence behaviour.
+    """
+    try:
+        save_provider_state()
+    except Exception:
+        logger.warning(
+            "provider-state: failed to persist availability state",
+            exc_info=True,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Default sibling-fallback constants
@@ -1835,6 +2090,7 @@ def mark_provider_unavailable(
         _provider_failure_count[provider_name] = count + 1
 
     _provider_unavailable_until[provider_name] = time.time() + cooldown_seconds
+    _persist_provider_state_best_effort()
 
 
 def _reset_provider_failure_count(provider_name: str) -> None:
@@ -1904,6 +2160,13 @@ def _entry_cooldown_key(provider_cfg: dict) -> str | None:
     name = provider_cfg.get("name", "")
     if _is_provider_unavailable(name):
         return name
+    # Model-scoped failure-domain quarantine: the sibling-fallback circuit
+    # breaker marks ``normalized_endpoint:model`` so same-model siblings on a
+    # shared gateway are skipped WITHOUT over-quarantining other models on the
+    # same gateway (LP-0MTVMB8DW0067H9A AC4).
+    domain = _failure_domain_key(provider_cfg)
+    if domain != name and _is_provider_unavailable(domain):
+        return domain
     brand = provider_cfg.get("provider")
     if brand and _is_provider_unavailable(brand):
         return brand
@@ -2078,22 +2341,89 @@ def _compute_retry_after(
     return int(max(candidates))
 
 
+def _quarantined_providers(model_config: dict) -> list[dict[str, Any]]:
+    """Return provider entries quarantined by a pending usage-limit reset.
+
+    Usage-limit quarantine (``_usage_reset_at``, keyed by
+    ``_usage_limit_account_key``) does not populate the cooldown map
+    (``_provider_unavailable_until``), so it was previously invisible to
+    exhaustion diagnostics. This helper exposes it with the remaining reset
+    seconds and the true reason (quarantine before window/cooldown),
+    (LP-0MU56ZFVD001LP0H).
+
+    Each entry contains ``name``, ``type``, ``account``, ``reset_in`` (whole
+    seconds) and ``reset_at`` (ISO-8601 UTC). Entries sharing a quarantined
+    account are each returned; expired entries are pruned by
+    ``_usage_reset_remaining``.
+    """
+    result: list[dict[str, Any]] = []
+    for p in model_config.get("providers") or []:
+        if not isinstance(p, dict):
+            continue
+        account = _usage_limit_account_key(p)
+        remaining = _usage_reset_remaining(account)
+        if remaining <= 0:
+            continue
+        result.append({
+            "name": p.get("name", "unknown"),
+            "type": p.get("type", "remote"),
+            "account": account,
+            "reset_in": int(remaining),
+            "reset_at": datetime.fromtimestamp(
+                _usage_reset_at[account], tz=UTC
+            ).isoformat(),
+        })
+    return result
+
+
+def _record_quarantine_attempts(
+    attempts: list[dict[str, Any]], model_config: dict
+) -> list[dict[str, Any]]:
+    """Append ``usage_limit_reset`` diagnostics for quarantined providers.
+
+    Called before window-skip diagnostics so a provider that is both
+    quarantined and outside its window is represented once, as a quota reset
+    (quarantine takes precedence over the window reason). Returns the
+    quarantined entries for callers that want to log them
+    (LP-0MU56ZFVD001LP0H).
+    """
+    quarantined = _quarantined_providers(model_config)
+    for q in quarantined:
+        _record_attempt(
+            attempts,
+            provider=q["name"],
+            type=q["type"],
+            status="usage_limit_reset",
+            reset_in=q["reset_in"],
+            reset_at=q["reset_at"],
+        )
+    return quarantined
+
+
 def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
     """Return ``{name, type}`` pairs for providers whose ``available_times``
     window excludes the current UTC time.
 
     Used to record ``outside_time_window`` diagnostics when a fallback chain is
     exhausted. Providers actually attempted this request cannot be outside
-    their window (they were selected), so this set is exactly the providers
-    skipped solely due to time windows.
+    their window (they were selected), so this set is (absent quarantine)
+    exactly the providers skipped solely due to time windows. A provider that
+    is also usage-limit quarantined is excluded: quarantine is the true reason
+    and is reported once as ``usage_limit_reset`` by
+    ``_record_quarantine_attempts`` (LP-0MU56ZFVD001LP0H).
     """
     result: list[dict[str, str]] = []
     for p in model_config.get("providers") or []:
-        if isinstance(p, dict) and not _is_within_allowed_window(p):
-            result.append({
-                "name": p.get("name", "unknown"),
-                "type": p.get("type", "remote"),
-            })
+        if not isinstance(p, dict):
+            continue
+        if _is_within_allowed_window(p):
+            continue
+        if _usage_reset_remaining(_usage_limit_account_key(p)) > 0:
+            continue  # quarantine takes precedence over the window reason
+        result.append({
+            "name": p.get("name", "unknown"),
+            "type": p.get("type", "remote"),
+        })
     return result
 
 
@@ -2255,6 +2585,8 @@ def _record_sibling_failure(
     provider_name: str,
     config: dict,
     brand: str | None = None,
+    domain_key: str | None = None,
+    provider_type: str | None = None,
 ) -> bool:
     """Record a consecutive empty_response/stall failure for *provider_name*.
 
@@ -2267,24 +2599,46 @@ def _record_sibling_failure(
     ``_reset_sibling_failure_count()``) or when the window expires
     without failures.
 
-    When *brand* is provided (the entry's ``provider`` field, e.g.
-    ``"opencode-go"``), the extended cooldown is applied to BOTH the entry
-    name and the brand.  ``_entry_cooldown_key`` checks the brand of every
-    entry, so quarantining the brand blocks all same-gateway sibling
-    entries (``opencode-go-2``/``opencode-go-3``) from being retried
-    through other API keys on the same failing endpoint
-    (LP-0MTPMF03P0046MFG) — mirroring how the Tier-3 stall circuit breaker
-    marks the provider brand.
+    When *domain_key* is provided (the entry's model-scoped failure domain,
+    e.g. ``https://opencode.ai/zen/go:deepseek-v4-flash``), the extended
+    cooldown is applied to the entry name AND that domain. ``_entry_cooldown_key``
+    checks the domain of every entry, so quarantining the MODEL-scoped domain
+    blocks same-model same-gateway siblings without over-quarantining other
+    upstream models on the same gateway (LP-0MTVMB8DW0067H9A AC4).
+
+    When *brand* is provided and no *domain_key* is available (entries with no
+    endpoint/model), the extended cooldown is applied to BOTH the entry name
+    and the brand (legacy behavior, LP-0MTPMF03P0046MFG).
 
     Args:
         provider_name: Provider entry name (e.g. ``"opencode-go"``).
         config: Server configuration (to read threshold/window).
         brand: Optional provider brand (``provider_cfg.get("provider")``)
             shared by same-gateway sibling entries.
+        domain_key: Optional model-scoped failure-domain key
+            (``_failure_domain_key(provider_cfg)``). When present, it is
+            quarantined instead of *brand* so other models on the same
+            gateway stay eligible (LP-0MTVMB8DW0067H9A AC4).
+        provider_type: Optional provider type (``"local"`` / ``"remote"``).
+            ``"local"`` exempts the provider from the sibling-fallback
+            breaker entirely (no streak increment, no quarantine); ``None``
+            and ``"remote"`` both keep the remote behaviour so existing
+            callers are unchanged (LP-0MUNTOGLB005LUKY AC1/AC2).
 
     Returns:
         ``True`` if the extended cooldown threshold was exceeded.
     """
+    # AC4 (LP-0MUNTOGLB005LUKY): local providers are exempt from the
+    # sibling-fallback circuit breaker.  The 600s quarantine was designed
+    # for remote siblings sharing a dead gateway — it has no meaning for
+    # a local entry (no sibling keys), and when it fires it removes the
+    # only healthy local capacity, forcing requests onto exhausted remote
+    # providers.  Local providers keep their existing normal handling:
+    # empty_response_max_cooldown_seconds cap (10s), slot-exhaustion
+    # retry, no-progress watchdog, and dispatch lease.
+    if provider_type == "local":
+        return False
+
     now = time.monotonic()
     window = _get_sibling_fallback_window_seconds(config)
 
@@ -2311,10 +2665,15 @@ def _record_sibling_failure(
     if count >= threshold:
         cooldown = _get_sibling_fallback_cooldown_seconds(config)
         mark_provider_unavailable(provider_name, cooldown)
-        # Also quarantine the shared brand so same-gateway sibling entries
-        # are not retried via other API keys (LP-0MTPMF03P0046MFG).
-        if brand and str(brand) != provider_name:
-            mark_provider_unavailable(str(brand), cooldown)
+        # Also quarantine the shared failure domain so same-model siblings are
+        # not retried via other API keys. Prefer the MODEL-scoped domain
+        # (``endpoint:model``) over the whole brand so healthy models on the
+        # same gateway are not over-quarantined (LP-0MTVMB8DW0067H9A AC4).
+        # Entries without an endpoint/model fall back to the brand (legacy
+        # behavior, LP-0MTPMF03P0046MFG).
+        quarantine_key = domain_key or brand
+        if quarantine_key and str(quarantine_key) != provider_name:
+            mark_provider_unavailable(str(quarantine_key), cooldown)
         logger.warning(
             "Sibling-fallback circuit breaker triggered: "
             "provider=%s brand=%s consecutive_failures=%d "
@@ -2629,6 +2988,14 @@ def _build_reasoning_content_roundtrip_error() -> Response:
     )
 
 
+# Stable machine-readable exhaustion codes (LP-0MU56ZM0K005F69G). Clients must
+# discriminate on ``code`` (never on the human-readable ``error``/``detail``
+# prose); the existing ``error`` text is retained for older clients.
+EXHAUSTION_CODE_ALL = "all_exhausted"
+EXHAUSTION_CODE_TIME_WINDOW = "outside_time_window"
+EXHAUSTION_CODE_SLOTS = "all_slots_exhausted"
+
+
 def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
@@ -2637,21 +3004,36 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
                                    slot exhaustion (returns HTTP 429).
                                    Otherwise, returns HTTP 503 with JSON body.
         total_slots: Total number of slots across local providers (used only
-                     for the slot-exhaustion 429 text body).
+                     for the slot-exhaustion 429 body).
         unavailable_providers: Optional mapping of provider -> remaining cooldown seconds
                                to include in the 503 JSON payload for diagnostics.
         diagnostics: Optional list of per-provider attempt diagnostics (order-preserving)
+
+    The JSON body carries a stable ``code`` (``all_exhausted`` or
+    ``all_slots_exhausted``) so clients can classify exhaustion without relying
+    on the ``error`` prose, whose meaning is preserved for older clients
+    (LP-0MU56ZM0K005F69G).
     """
     if all_local_slot_exhaustion:
-        # total_slots may be 0 if unknown; still format per acceptance criteria
+        # total_slots may be 0 if unknown; still format per acceptance criteria.
+        # JSON keeps the machine-readable ``code`` alongside the retained prose.
+        slot_payload: dict[str, Any] = {
+            "error": "All providers exhausted",
+            "code": EXHAUSTION_CODE_SLOTS,
+            "message": f"Model server busy: 0/{int(total_slots)} slots available. Retry later.",
+        }
         return Response(
-            content=(f"Model server busy: 0/{int(total_slots)} slots available. Retry later.").encode(),
+            content=json.dumps(slot_payload).encode("utf-8"),
             status_code=429,
-            media_type="text/plain",
+            media_type="application/json",
         )
 
     retry_after = _compute_retry_after(unavailable_providers, model_config=model_config)
-    payload: dict[str, Any] = {"error": "All providers exhausted", "retry_after": retry_after}
+    payload: dict[str, Any] = {
+        "error": "All providers exhausted",
+        "code": EXHAUSTION_CODE_ALL,
+        "retry_after": retry_after,
+    }
     if unavailable_providers:
         # Attach diagnostic info about which providers are in cooldown
         try:
@@ -2685,19 +3067,42 @@ def _build_time_window_exhausted_response(
 
     The distinguishable response is used only when time windows are the *only*
     reason nothing could be used: no provider was actually tried (no errors, no
-    cooldown recorded this request) and no provider is currently in cooldown.
+    cooldown recorded this request), no provider is currently in cooldown, and
+    every recorded skip is an ``outside_time_window`` skip. A usage-limit
+    quarantine, a local/compaction skip, an error or any other non-window
+    reason means the window is not the sole cause (LP-0MU56ZFII004L7OO).
     Otherwise ``None`` is returned and the caller falls through to the generic
     exhausted response (whose diagnostics still expose any
     ``outside_time_window`` skips).
     """
     if any_provider_tried or unavailable:
         return None
-    if not any(a.get("status") == "outside_time_window" for a in attempts):
+    # Sole-cause check (LP-0MU56ZFII004L7OO): require at least one window skip
+    # AND that every recorded attempt is a window skip. A single
+    # ``usage_limit_reset`` / local-skip / error diagnostic means the window is
+    # not the only blocker and the generic exhausted response must be used.
+    if not attempts or any(
+        a.get("status") != "outside_time_window" for a in attempts
+    ):
         return None
+    # Defensive completeness check: when the chain is known, every provider
+    # must have been window-skipped. A provider skipped for an unrecorded
+    # reason (e.g. a router-level local/compaction skip) must not yield the
+    # window-specific message either.
+    if model_config is not None:
+        window_names = {
+            a.get("provider") for a in attempts
+            if a.get("status") == "outside_time_window"
+        }
+        for p in (model_config.get("providers") or []):
+            if isinstance(p, dict) and p.get("name") not in window_names:
+                return None
 
     retry_after = _compute_retry_after(unavailable, model_config=model_config)
     payload: dict[str, Any] = {
-        "error": "All providers unavailable: no provider is available during the current scheduled time window",
+        "error": "All providers exhausted",
+        "code": EXHAUSTION_CODE_TIME_WINDOW,
+        "detail": "no provider is available during the current scheduled time window",
         "retry_after": retry_after,
     }
     if attempts:
@@ -2724,6 +3129,36 @@ def _is_connection_error(exc: Exception) -> bool:
         httpx.RemoteProtocolError,
         httpx.NetworkError,
     ))
+
+
+# Connection-ESTABLISHMENT failures poison the whole gateway: the TCP/TLS
+# connection could not be made (DNS resolution, refused connection, connect
+# timeout) or the wire protocol failed before a usable HTTP exchange.
+# ``ReadTimeout``/``WriteTimeout`` are deliberately excluded: they can occur
+# after the connection is established and may be specific to the upstream
+# model, so they stay model-scoped (LP-0MTVMB8DW0067H9A).
+_GATEWAY_LEVEL_ERROR_TYPES: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.RemoteProtocolError,
+)
+
+
+def _is_gateway_level_error(exc: Exception) -> bool:
+    """Return True when *exc* indicates the gateway itself is unreachable.
+
+    A ``True`` result means failure-domain exclusion must use the
+    endpoint-wide scope (``_gateway_domain_key``): every provider entry
+    sharing the endpoint is skipped for the rest of the request, regardless
+    of upstream model (LP-0MTVMB8DW0067H9A AC1).
+
+    ``ConnectError`` covers DNS resolution failures and refused connections;
+    ``ConnectTimeout`` covers TCP/TLS connect timeouts; ``RemoteProtocolError``
+    covers malformed/closes-before-response wire failures. ``ReadTimeout`` is
+    intentionally NOT included — it is ambiguous (connect vs post-connect) and
+    is treated as request-level/model-scoped (AC2).
+    """
+    return isinstance(exc, _GATEWAY_LEVEL_ERROR_TYPES)
 
 
 def _is_http_error_status(status_code: int) -> bool:
@@ -3214,6 +3649,60 @@ def _normalize_endpoint_for_failure_domain(endpoint: str) -> str | None:
     return urlunsplit((scheme, netloc, path, parsed.query, ""))
 
 
+def _gateway_domain_key(provider_cfg: dict) -> str:
+    """Return the endpoint-only failure-domain key for a provider entry.
+
+    Unlike ``_failure_domain_key`` (which appends ``:model``), this key
+    identifies the whole gateway: a connection-level failure poisons it so
+    ALL entries sharing the endpoint are excluded for the rest of the request,
+    regardless of upstream model (LP-0MTVMB8DW0067H9A AC1).
+
+    Remote entries key on the normalized endpoint; local/no-endpoint entries
+    fall back to the brand, then the entry name (mirroring
+    ``_failure_domain_key`` so local domains stay unchanged).
+    """
+    endpoint = provider_cfg.get("endpoint")
+    if endpoint:
+        normalized = _normalize_endpoint_for_failure_domain(str(endpoint))
+        if normalized:
+            return normalized
+    brand = provider_cfg.get("provider")
+    if brand:
+        return str(brand)
+    return str(provider_cfg.get("name") or "unknown")
+
+
+def _is_domain_excluded(provider_cfg: dict, excluded_domains: set[str]) -> str | None:
+    """Return the excluded key matching *provider_cfg*, or ``None``.
+
+    Checks BOTH the model-scoped failure domain (``endpoint:model``) and the
+    endpoint-wide gateway domain (``endpoint``): a connection-level failure
+    records the latter so every model on the dead gateway is skipped
+    (LP-0MTVMB8DW0067H9A AC1), while request-level failures record the former
+    (AC2).
+    """
+    domain = _failure_domain_key(provider_cfg)
+    if domain in excluded_domains:
+        return domain
+    gateway = _gateway_domain_key(provider_cfg)
+    if gateway != domain and gateway in excluded_domains:
+        return gateway
+    return None
+
+
+def _connection_error_domain_key(provider_cfg: dict, exc: Exception) -> str:
+    """Return the failure-domain key to record for a connection exception.
+
+    Connection-establishment failures exclude the whole gateway
+    (``_gateway_domain_key``); ambiguous connection-ish failures such as
+    ``ReadTimeout`` stay model-scoped (``_failure_domain_key``)
+    (LP-0MTVMB8DW0067H9A AC1/AC2).
+    """
+    if _is_gateway_level_error(exc):
+        return _gateway_domain_key(provider_cfg)
+    return _failure_domain_key(provider_cfg)
+
+
 def _usage_limit_account_key(provider_cfg: dict) -> str:
     """Return a canonical key identifying the upstream ACCOUNT for usage-limit
     quarantine (LP-0MSMBWB23009XYPW).
@@ -3257,13 +3746,13 @@ def _resolve_provider_with_exclusions(
         name = provider_cfg.get("name", "")
         if name in excluded_provider_names:
             continue
-        domain = _failure_domain_key(provider_cfg)
-        if domain in excluded_domains:
+        matched_domain = _is_domain_excluded(provider_cfg, excluded_domains)
+        if matched_domain is not None:
             logger.info(
                 "Skipping provider=%s: same failure domain as an already-failed "
                 "entry (domain=%s)",
                 name,
-                domain,
+                matched_domain,
             )
             continue
         # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ): the ACCOUNT hit an
@@ -3414,16 +3903,60 @@ def _parse_resets_in(message: str) -> float | None:
     return total if found else None
 
 
-def _usage_limit_reset_seconds(response: Response, body_text: str) -> float | None:
-    """Return seconds until the usage limit resets for a 429 usage-limit error.
+class _UsageLimitReset(NamedTuple):
+    """Resolved usage-limit reset for a 429 response.
+
+    ``explicit`` is True only when the gateway message carried an actual
+    ``Resets in ...`` duration; a duration guessed from ``metadata.limitName``
+    is ``explicit=False`` and is capped and treated as soft/re-checkable
+    (LP-0MUQTCMW2001VXH8).
+    """
+
+    seconds: float
+    explicit: bool
+    limit_name: str | None
+
+
+def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
+    """Return the cap applied to a guessed (period-name-only) quarantine.
+
+    Resolution order: ``server.usage_limit_guess_cap_seconds`` (accepting a
+    flat or nested ``server:`` config), then the
+    ``LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS`` env override, then the
+    24-hour default. Invalid/non-positive values fall through to the default.
+    """
+    candidates: list[Any] = []
+    if isinstance(config, dict):
+        server_cfg = config.get("server", config)
+        if isinstance(server_cfg, dict):
+            candidates.append(server_cfg.get("usage_limit_guess_cap_seconds"))
+    candidates.append(os.environ.get(_USAGE_LIMIT_GUESS_CAP_ENV))
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return float(_USAGE_LIMIT_GUESS_MAX_SECONDS)
+
+
+def _usage_limit_reset_info(
+    response: Response, body_text: str, config: dict | None = None
+) -> _UsageLimitReset | None:
+    """Return the resolved usage-limit reset for a 429 error response.
 
     Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ) and any usage-limit
     error variant that carries a reset duration in its message (including
-    ``FreeUsageLimitError`` responses that include one). The reset duration is
-    parsed from the provider message (``Resets in 22hr 43min``); when the
-    message has no explicit duration, ``metadata.limitName``
-    (daily/weekly/monthly) supplies the period. The 2-minute safety margin is
-    added to the returned duration.
+    ``FreeUsageLimitError`` responses that include one). An explicit
+    ``Resets in 22hr 43min`` duration is honoured in full. When the message
+    has no explicit duration, ``metadata.limitName`` (daily/weekly/monthly)
+    supplies a GUESSED period that is capped at
+    :func:`_usage_limit_guess_cap_seconds` (24h by default) — the full 30-day
+    period is never used without explicit evidence (LP-0MUQTCMW2001VXH8). The
+    2-minute safety margin is added to the returned duration.
 
     Returns ``None`` when the response is not a 429 usage-limit error or no
     reset duration can be computed — callers then fall back to the existing
@@ -3460,11 +3993,75 @@ def _usage_limit_reset_seconds(response: Response, body_text: str) -> float | No
         return None
 
     seconds = _parse_resets_in(message) if message else None
-    if seconds is None and limit_name in _PERIOD_DEFAULT_SECONDS:
-        seconds = _PERIOD_DEFAULT_SECONDS[limit_name]
-    if seconds is None:
-        return None
-    return float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS
+    if seconds is not None:
+        return _UsageLimitReset(
+            float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS, True, limit_name
+        )
+    if limit_name in _PERIOD_DEFAULT_SECONDS:
+        guessed = min(
+            float(_PERIOD_DEFAULT_SECONDS[limit_name]),
+            _usage_limit_guess_cap_seconds(config),
+        )
+        return _UsageLimitReset(
+            guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, limit_name
+        )
+    return None
+
+
+def _usage_limit_reset_seconds(
+    response: Response, body_text: str, config: dict | None = None
+) -> float | None:
+    """Backwards-compatible wrapper returning only the reset duration.
+
+    See :func:`_usage_limit_reset_info` for the explicit-vs-guessed detail.
+    """
+    info = _usage_limit_reset_info(response, body_text, config)
+    return info.seconds if info is not None else None
+
+
+def _set_usage_limit_quarantine(
+    account: str, reset: _UsageLimitReset
+) -> None:
+    """Record a usage-limit quarantine and persist it (best effort).
+
+    Guessed (period-name-only) quarantines are tagged in
+    ``_usage_reset_guessed`` so they are capped at read time, skipped by the
+    persistence layer, and eligible for self-healing probes
+    (LP-0MUQTCMW2001VXH8).
+    """
+    _usage_reset_at[account] = time.time() + reset.seconds
+    if reset.explicit:
+        _usage_reset_guessed.discard(account)
+    else:
+        _usage_reset_guessed.add(account)
+    _persist_provider_state_best_effort()
+
+
+def clear_usage_limit_quarantine(account: str | None = None) -> list[str]:
+    """Clear pending usage-limit quarantine entries at runtime.
+
+    With ``account`` set, clears just that account (a no-op when absent).
+    With ``account`` ``None``, clears every pending entry. Returns the list of
+    cleared account keys and persists the change (best effort). This backs the
+    ``POST /admin/clear-usage-limit`` escape hatch so an operator can
+    reintroduce a healthy account without restarting the proxy
+    (LP-0MUQTCMW2001VXH8).
+    """
+    if account is None:
+        cleared = list(_usage_reset_at)
+        _usage_reset_at.clear()
+        _usage_reset_guessed.clear()
+        _usage_limit_last_probe.clear()
+    elif account in _usage_reset_at:
+        del _usage_reset_at[account]
+        _usage_reset_guessed.discard(account)
+        _usage_limit_last_probe.pop(account, None)
+        cleared = [account]
+    else:
+        cleared = []
+    if cleared:
+        _persist_provider_state_best_effort()
+    return cleared
 
 
 def _usage_reset_remaining(failure_domain: str) -> float:
@@ -3481,8 +4078,126 @@ def _usage_reset_remaining(failure_domain: str) -> float:
     remaining = expiry - time.time()
     if remaining <= 0:
         del _usage_reset_at[failure_domain]
+        _usage_reset_guessed.discard(failure_domain)
+        _usage_limit_last_probe.pop(failure_domain, None)
         return 0.0
     return remaining
+
+
+# ---------------------------------------------------------------------------
+# Usage-limit self-healing probe (LP-0MUQTCMW2001VXH8)
+# ---------------------------------------------------------------------------
+
+
+async def _default_usage_limit_probe_transport(provider_cfg: dict) -> bool:
+    """Send a cheap probe request to the provider's upstream.
+
+    Returns True on any 2xx response (the account can serve again). A missing
+    endpoint/api key, a non-2xx status, or any transport error returns False —
+    the caller then keeps the quarantine. Never raises.
+    """
+    endpoint = str(provider_cfg.get("endpoint", "") or "").rstrip("/")
+    if not endpoint:
+        return False
+    api_key = None
+    api_key_env = provider_cfg.get("api_key_env")
+    if api_key_env:
+        api_key = os.environ.get(api_key_env)
+    if not api_key:
+        api_key = provider_cfg.get("api_key")
+    if not api_key:
+        return False
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    try:
+        # opencode gateways reject requests without a session id header.
+        from .proxy_remote import _is_opencode_upstream
+
+        if _is_opencode_upstream(endpoint):
+            headers["x-opencode-session"] = "usage-limit-probe"
+    except Exception:
+        pass
+    model = provider_cfg.get("model") or provider_cfg.get("name") or "probe"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_USAGE_LIMIT_PROBE_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                f"{endpoint}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+    except Exception:
+        logger.info(
+            "usage-limit probe transport error for account=%s",
+            _usage_limit_account_key(provider_cfg),
+            exc_info=True,
+        )
+        return False
+    return 200 <= int(response.status_code) < 300
+
+
+async def _probe_usage_limit_account(provider_cfg: dict) -> bool:
+    """Return True when a quarantined account is usable again.
+
+    Uses the injectable ``_usage_limit_probe_transport`` when set (tests),
+    otherwise :func:`_default_usage_limit_probe_transport`. Never raises: any
+    error is treated as "still unavailable" (False).
+    """
+    transport = _usage_limit_probe_transport
+    try:
+        if transport is not None:
+            return bool(await transport(provider_cfg))
+        return bool(await _default_usage_limit_probe_transport(provider_cfg))
+    except Exception:
+        logger.info(
+            "usage-limit probe failed for account=%s (keeping quarantine)",
+            _usage_limit_account_key(provider_cfg),
+            exc_info=True,
+        )
+        return False
+
+
+async def _maybe_probe_quarantined_accounts(model_config: dict) -> None:
+    """Self-heal guessed usage-limit quarantines before routing.
+
+    For each provider whose account carries a GUESSED quarantine that is due
+    for a probe (interval-gated), issue a cheap probe and clear the
+    quarantine on success, so the recovered account is routed to within the
+    same request cycle. Hard (explicit-duration) quarantines are left alone.
+    Never raises.
+    """
+    if not _usage_reset_guessed:
+        return
+    now = time.time()
+    seen: set[str] = set()
+    for provider_cfg in (model_config.get("providers") or []):
+        if not isinstance(provider_cfg, dict):
+            continue
+        account = _usage_limit_account_key(provider_cfg)
+        if account in seen or account not in _usage_reset_guessed:
+            continue
+        seen.add(account)
+        if account not in _usage_reset_at:
+            _usage_reset_guessed.discard(account)
+            continue
+        last = _usage_limit_last_probe.get(account, 0.0)
+        if now - last < _USAGE_LIMIT_PROBE_INTERVAL_SECONDS:
+            continue
+        _usage_limit_last_probe[account] = now
+        if await _probe_usage_limit_account(provider_cfg):
+            logger.info(
+                "usage-limit probe succeeded; clearing quarantine for "
+                "account=%s",
+                account,
+            )
+            clear_usage_limit_quarantine(account)
 
 
 # ---------------------------------------------------------------------------
@@ -4208,6 +4923,7 @@ def _log_exhausted_providers(model_config: dict, path: str) -> dict[str, int]:
     when all providers are exhausted (LP-0MSG45LOO007K236).
     """
     unavailable: dict[str, int] = {}
+    quarantined: list[dict[str, Any]] = []
     try:
         providers = model_config.get("providers", []) or []
         for p in providers:
@@ -4219,7 +4935,21 @@ def _log_exhausted_providers(model_config: dict, path: str) -> dict[str, int]:
                 remaining = _provider_cooldown_remaining(key)
                 if remaining > 0:
                     unavailable[key] = remaining
-        logger.warning("All providers exhausted for model=%s; unavailable=%s", path, unavailable)
+        # Usage-limit quarantine does not populate the cooldown map; surface
+        # it explicitly so operators can distinguish a quota block from a
+        # transient cooldown. Quarantine overrides a cooldown on the same
+        # provider because the resolver checks it first
+        # (LP-0MU56ZFVD001LP0H).
+        quarantined = _quarantined_providers(model_config)
+        for q in quarantined:
+            unavailable[q["name"]] = q["reset_in"]
+        logger.warning(
+            "All providers exhausted for model=%s; unavailable=%s; "
+            "usage_limit_reset=%s",
+            path,
+            unavailable,
+            {q["name"]: q["reset_in"] for q in quarantined} or None,
+        )
     except Exception:
         pass
     return unavailable
@@ -4325,8 +5055,16 @@ async def _hold_sleep(request, seconds: float) -> bool:
     checks.
 
     Returns True when the client disconnected during the hold (caller should
-    abort the hold, AC4), False when the full hold elapsed.
+    abort the hold, AC4), False when the full hold elapsed. A zero-length hold
+    still checks for a disconnect so an instant-retry (``retry_after == 0``)
+    loop with ``chain_hold_max_cycles == 0`` cannot spin forever on a gone
+    client (LP-0MU56ZKQD005SX08).
     """
+    try:
+        if await request.is_disconnected():
+            return True
+    except Exception:
+        pass
     if seconds <= 0:
         return False
     interval = min(1.0, max(0.05, seconds / 20))
@@ -4352,6 +5090,11 @@ async def _hold_feedback(request, hold_seconds: float, comment: str):
     start.
     """
     comment_bytes = (comment + "\n\n").encode("utf-8")
+    try:
+        if await request.is_disconnected():
+            return
+    except Exception:
+        pass
     if hold_seconds <= 0:
         yield comment_bytes
         return
@@ -4402,12 +5145,95 @@ def _log_chain_hold_start(path: str, hold_seconds: float, cycle: int, max_cycles
     re-route / exhausted log lines)."""
     logger.warning(
         "Chain exhausted for model=%s; holding %.0fs before restarting cycle "
-        "from the first provider (cycle=%d, max_cycles=%s)",
+        "from the first provider (chain_hold_cycle=%d, cycle=%d, max_cycles=%s)",
         path,
         hold_seconds,
         cycle,
+        cycle,
         max_cycles if max_cycles else "infinite",
     )
+
+
+def _set_chain_hold_cycle(request, cycle: int) -> None:
+    """Record the current chain-hold cycle index on the request.
+
+    Cycle 0 is the first (pre-hold) cycle; every hold-restart increments it.
+    The value is surfaced on routing / skip / compaction / hold log lines so a
+    single held request re-emitted across cycles is distinguishable from
+    genuine new client demand (LP-0MU5AIAAY003KVM0 AC4). Fail-open: requests
+    without a ``state`` (test stubs) simply do not carry the field.
+    """
+    try:
+        request.state.chain_hold_cycle = int(cycle)
+    except Exception:
+        pass
+
+
+def _get_chain_hold_cycle(request) -> int:
+    """Return the current chain-hold cycle index (0 when unset)."""
+    try:
+        return int(getattr(request.state, "chain_hold_cycle", 0))
+    except Exception:
+        return 0
+
+
+def _exhaustion_retry_after(response: Response) -> int | None:
+    """Return an exhaustion response's ``Retry-After`` in seconds.
+
+    Prefers the ``Retry-After`` header; falls back to the JSON
+    ``retry_after`` field. Returns ``None`` when neither is present/parsable
+    (unknown wait — the caller then preserves the legacy full hold).
+    """
+    try:
+        header = response.headers.get("Retry-After")
+        if header is not None:
+            return max(0, int(float(header)))
+    except Exception:
+        pass
+    try:
+        body = _response_body_text(response)
+        payload = json.loads(body) if body else None
+        if isinstance(payload, dict) and "retry_after" in payload:
+            return max(0, int(float(payload["retry_after"])))
+    except Exception:
+        pass
+    return None
+
+
+def _bounded_hold_seconds(
+    hold_seconds: float, response: Response, max_cycles: int
+) -> float | None:
+    """Bound a chain hold by the exhaustion response's real ``retry_after``.
+
+    Semantics (LP-0MU56ZKQD005SX08): a hold only helps when a provider can
+    become available within the configured hold budget. Returns:
+
+    - ``None`` when the chain must NOT hold — ``retry_after`` exceeds the
+      total budget ``hold_seconds * max_cycles`` (a window edge / usage-limit
+      reset hours away), so holding would only add latency before an
+      inevitable exhaustion. The response is returned immediately with its
+      accurate ``Retry-After``.
+    - ``min(hold_seconds, retry_after)`` when ``retry_after`` is within the
+      budget, so the next cycle runs as soon as a provider can serve. A
+      ``retry_after`` of 0 (instant cooldown expiry) returns ``0.0`` — retry
+      immediately without latency.
+    - ``hold_seconds`` (legacy behaviour) when ``retry_after`` is unknown
+      (non-JSON error responses), so existing short-cooldown recovery is
+      preserved.
+    """
+    retry_after = _exhaustion_retry_after(response)
+    if retry_after is None:
+        return hold_seconds
+    if retry_after <= 0:
+        # No known wait (e.g. instant cooldown expiry): retry immediately
+        # without adding latency.
+        return 0.0
+    total_budget = (
+        hold_seconds * max_cycles if max_cycles and max_cycles > 0 else hold_seconds
+    )
+    if retry_after > total_budget:
+        return None
+    return min(hold_seconds, float(retry_after))
 
 
 def _build_streaming_hold_response(
@@ -4437,13 +5263,21 @@ def _build_streaming_hold_response(
         cycle = next_cycle
         current_exhaustion = exhaustion_response
         while True:
-            _log_chain_hold_start(path, hold_seconds, cycle, max_cycles)
+            effective_hold = _bounded_hold_seconds(
+                hold_seconds, current_exhaustion, max_cycles
+            )
+            if effective_hold is None:
+                # retry_after exceeds the budget — surface the exhaustion
+                # immediately instead of holding through doomed cycles.
+                yield _response_to_sse_bytes(current_exhaustion)
+                return
+            _log_chain_hold_start(path, effective_hold, cycle, max_cycles)
             comment = _build_chain_hold_comment(
                 first_provider,
-                hold_seconds,
+                effective_hold,
                 _exhaustion_diagnostics(current_exhaustion),
             )
-            async for c in _hold_feedback(request, hold_seconds, comment):
+            async for c in _hold_feedback(request, effective_hold, comment):
                 yield c
             try:
                 if await request.is_disconnected():
@@ -4451,6 +5285,7 @@ def _build_streaming_hold_response(
             except Exception:
                 pass
             try:
+                _set_chain_hold_cycle(request, cycle)
                 result = await cycle_fn(request, path, model_config, config)
             except ChainExhaustedError as exc:
                 if max_cycles != 0 and cycle >= max_cycles:
@@ -4507,14 +5342,34 @@ async def _run_chain_cycles(
     hold_seconds = _get_chain_hold_seconds(config)
     max_cycles = _get_chain_hold_max_cycles(config)
 
+    # Semantics (LP-0MU5AIAAY003KVM0, option (a) — decided): every hold cycle
+    # re-runs the FULL fallback cycle, including local routing and compaction
+    # evaluation. Local session handling (``_handle_session``) runs whenever a
+    # cycle dispatches local; when local is bypassed, the bypass path still
+    # re-evaluates compaction (``_evaluate_compaction_for_bypass``). A
+    # summarizer failure in one cycle therefore does NOT pin the request: a
+    # later cycle re-evaluates compaction, and a success refreshes the request
+    # body before dispatch. ``_set_chain_hold_cycle`` stamps each cycle so the
+    # repeated routing_check / compaction log lines are attributable to one
+    # held request (AC4/AC5).
     cycle = 0
     while True:
         try:
+            _set_chain_hold_cycle(request, cycle)
             return await cycle_fn(request, path, model_config, config)
         except ChainExhaustedError as exc:
             if max_cycles != 0 and cycle >= max_cycles:
                 return exc.response
-            _log_chain_hold_start(path, hold_seconds, cycle, max_cycles)
+            effective_hold = _bounded_hold_seconds(
+                hold_seconds, exc.response, max_cycles
+            )
+            if effective_hold is None:
+                # retry_after exceeds the hold budget (or is 0): holding could
+                # not make the next cycle succeed, so return the exhaustion
+                # response immediately with its accurate Retry-After
+                # (LP-0MU56ZKQD005SX08).
+                return exc.response
+            _log_chain_hold_start(path, effective_hold, cycle, max_cycles)
             if await _request_is_streaming(request):
                 # Streaming: return a streaming response that emits SSE hold
                 # comments, sleeps, then runs the remaining cycles inside the
@@ -4532,7 +5387,7 @@ async def _run_chain_cycles(
                 )
             # Non-streaming: silent (deferred) hold, then a new cycle from
             # the first provider.
-            if await _hold_sleep(request, hold_seconds):
+            if await _hold_sleep(request, effective_hold):
                 # Client disconnected during the hold — abort (AC4).
                 return exc.response
             cycle += 1
@@ -4569,6 +5424,10 @@ async def _proxy_with_remote_fallback_cycle(
         ChainExhaustedError: when all providers are exhausted (the carried
             response is the 503/429/error response the cycle would return).
     """
+    # Self-healing: re-validate guessed (period-name-only) usage-limit
+    # quarantines so a recovered account is reintroduced within this request
+    # cycle (LP-0MUQTCMW2001VXH8).
+    await _maybe_probe_quarantined_accounts(model_config)
     cooldown_seconds = _get_cooldown_seconds(config)
     all_slot_exhaustion = True
     any_provider_tried = False
@@ -4655,7 +5514,8 @@ async def _proxy_with_remote_fallback_cycle(
                     # failure streak so the provider gets an extended cooldown
                     # after the threshold and the retry cycle skips to a sibling.
                     _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg)
                     )
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
@@ -4682,7 +5542,8 @@ async def _proxy_with_remote_fallback_cycle(
                     # count toward the streak so it is skipped for a sibling
                     # after the threshold.
                     _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg)
                     )
                     # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
                     # entry's failure domain is skipped for the rest of this
@@ -4747,10 +5608,10 @@ async def _proxy_with_remote_fallback_cycle(
                 # API-key ACCOUNT until the computed reset time + 2m margin.
                 # Not the whole endpoint: distinct api_key_env entries on the
                 # same gateway have independent limits (LP-0MSMBWB23009XYPW).
-                _reset_seconds = _usage_limit_reset_seconds(response, body_text)
-                if _reset_seconds is not None:
+                _reset_info = _usage_limit_reset_info(response, body_text, config)
+                if _reset_info is not None:
                     _reset_account = _usage_limit_account_key(provider_cfg)
-                    _usage_reset_at[_reset_account] = time.time() + _reset_seconds
+                    _set_usage_limit_quarantine(_reset_account, _reset_info)
                     fallback_reason = "usage_limit_reset"
                     prev_provider = provider_name
                     attempted_domains.add(_reset_account)
@@ -4761,7 +5622,7 @@ async def _proxy_with_remote_fallback_cycle(
                         status="usage_limit_reset",
                         status_code=int(response.status_code),
                         body_snippet=(body_text[:512] if body_text else None),
-                        reset_in_seconds=int(_reset_seconds),
+                        reset_in_seconds=int(_reset_info.seconds),
                     )
                     all_slot_exhaustion = False
                     continue
@@ -4836,8 +5697,12 @@ async def _proxy_with_remote_fallback_cycle(
                     # siblings) once the streak threshold is exceeded so a
                     # single empty response does not block sibling API keys
                     # on the same endpoint (LP-0MTVPJQ6T004EZ75).
+                    # LP-0MUNTOGLB005LUKY: pass provider_type so the breaker
+                    # can skip local providers entirely.
                     _threshold_exceeded = _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg),
+                        provider_type=provider_type,
                     )
                     if _threshold_exceeded:
                         attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -4863,7 +5728,7 @@ async def _proxy_with_remote_fallback_cycle(
                 exc, provider_name, provider_type, cooldown_seconds, attempts,
             ):
                 any_provider_tried = True
-                attempted_domains.add(_failure_domain_key(provider_cfg))
+                attempted_domains.add(_connection_error_domain_key(provider_cfg, exc))
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
@@ -4873,6 +5738,11 @@ async def _proxy_with_remote_fallback_cycle(
 
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)
+
+    # Usage-limit quarantine takes precedence over the window reason, so it
+    # is recorded first; the window loop below skips providers already
+    # quarantined (LP-0MU56ZFVD001LP0H).
+    _record_quarantine_attempts(attempts, model_config)
 
     # Record time-window skips as distinct diagnostics so operators can tell
     # whether providers were excluded by their available_times windows rather
@@ -5070,6 +5940,10 @@ async def _proxy_with_fallback_cycle(
         ChainExhaustedError: when all providers are exhausted (the carried
             response is the 503/429/error response the cycle would return).
     """
+    # Self-healing: re-validate guessed (period-name-only) usage-limit
+    # quarantines so a recovered account is reintroduced within this request
+    # cycle (LP-0MUQTCMW2001VXH8).
+    await _maybe_probe_quarantined_accounts(model_config)
     cooldown_seconds = _get_cooldown_seconds(config)
     local_slot_retry_attempts = _get_local_slot_retry_attempts(config)
     local_slot_retry_delay_seconds = _get_local_slot_retry_delay_seconds(config)
@@ -5137,7 +6011,7 @@ async def _proxy_with_fallback_cycle(
                 candidate_name = candidate.get("name", "")
                 if candidate_name in attempted_provider_names:
                     continue
-                if _failure_domain_key(candidate) in attempted_domains:
+                if _is_domain_excluded(candidate, attempted_domains) is not None:
                     continue
                 if candidate.get("type") != "remote":
                     continue
@@ -5292,7 +6166,8 @@ async def _proxy_with_fallback_cycle(
                 logger.info(
                     "routing_check provider=%s model=%s "
                     "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                    "new_tokens=%d cached_ratio=%.2f messages=%d session=%s",
+                    "new_tokens=%d cached_ratio=%.2f messages=%d session=%s "
+                    "chain_hold_cycle=%d",
                     provider_name,
                     _llama_model or "unknown",
                     _estimated_tokens,
@@ -5302,6 +6177,7 @@ async def _proxy_with_fallback_cycle(
                     _routing_cached_ratio,
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
                     _session_id or "unknown",
+                    _get_chain_hold_cycle(request),
                 )
                 # Context-pressure compaction signal (LP-0MSDCLQ2W001LGWC):
                 # KV reads scale linearly with context (20 KB/token at f16),
@@ -5348,7 +6224,7 @@ async def _proxy_with_fallback_cycle(
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
                         "new_tokens=%d cached_ratio=%.2f "
                         "reason=%s → skipping local, routing to next remote provider "
-                        "session=%s",
+                        "session=%s chain_hold_cycle=%d",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
@@ -5358,6 +6234,7 @@ async def _proxy_with_fallback_cycle(
                         _routing_cached_ratio,
                         _skip_reason,
                         _session_id or "unknown",
+                        _get_chain_hold_cycle(request),
                     )
                     _record_attempt(
                         attempts,
@@ -5450,7 +6327,7 @@ async def _proxy_with_fallback_cycle(
                         logger.info(
                             "compaction_bypass_eval provider=%s model=%s "
                             "evaluated=%s action=%s reason=%s est_before=%d "
-                            "est_after=%d session=%s",
+                            "est_after=%d session=%s chain_hold_cycle=%d",
                             provider_name,
                             _llama_model or "unknown",
                             _bypass_compaction["evaluated"],
@@ -5459,6 +6336,7 @@ async def _proxy_with_fallback_cycle(
                             _bypass_compaction["estimated_before"],
                             _bypass_compaction["estimated_after"],
                             _session_id or "unknown",
+                            _get_chain_hold_cycle(request),
                         )
                     if not _rescued_local:
                         # No rescue — preserve the original bypass behaviour
@@ -5566,7 +6444,8 @@ async def _proxy_with_fallback_cycle(
                     # failure streak so the provider gets an extended cooldown
                     # after the threshold and the retry cycle skips to a sibling.
                     _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg)
                     )
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     _record_attempt(
@@ -5593,7 +6472,8 @@ async def _proxy_with_fallback_cycle(
                     # count toward the streak so it is skipped for a sibling
                     # after the threshold.
                     _record_sibling_failure(
-                        provider_name, config, provider_cfg.get("provider")
+                        provider_name, config, provider_cfg.get("provider"),
+                        domain_key=_failure_domain_key(provider_cfg)
                     )
                     # Same-gateway exclusion (LP-0MSG45I8Q0020N1F): the stalled
                     # entry's failure domain is skipped for the rest of this
@@ -5670,12 +6550,103 @@ async def _proxy_with_fallback_cycle(
                         status="local_lease_active",
                         slot_info=slot_info,
                     )
-                    all_slot_exhaustion = False
-                    continue
+                    # A lease denial is a LOCAL CAPACITY condition, not a
+                    # provider failure. With the queue policy, wait for the
+                    # protected local slot (bounded by
+                    # contention_queue_max_wait_seconds) before falling
+                    # through to a remote chain that may be entirely out of
+                    # window (LP-0MU5BOMJM008F17C).
+                    _lease_cur, _lease_max = _local_concurrency_info(
+                        config, endpoint=local_endpoint
+                    )
+                    _lease_action, _lease_reason, _lease_elapsed = (
+                        await _maybe_queue_for_local_slot(
+                            config, _lease_cur, _lease_max, request, body_json,
+                            model_config, provider_cfg, _session_id,
+                        )
+                    )
+                    if _lease_action == "dispatch":
+                        # A slot freed within the budget: re-dispatch local
+                        # with the queue wait subtracted from the adaptive
+                        # timeout budget.
+                        _set_queue_wait_on_request(request, _lease_elapsed)
+                        try:
+                            from proxy import contention_queue as _cq_mod
+                            _lease_depth = _cq_mod.queue_depth()
+                        except Exception:
+                            _lease_depth = 0
+                        logger.info(
+                            "contention_queue_dispatch provider=%s session=%s "
+                            "queued_duration=%.2fs policy=queue depth=%d "
+                            "reason=local_lease_active",
+                            provider_name,
+                            _session_id or "unknown",
+                            _lease_elapsed or 0.0,
+                            _lease_depth,
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_lease_queued",
+                            elapsed_wait_seconds=round(_lease_elapsed or 0.0, 3),
+                        )
+                        response = await _dispatch_local(
+                            ptr_local, request, path, local_endpoint
+                        )
+                        body_text = _response_body_text(response)
+                        slot_info = _parse_slot_exhaustion(response)
+                        if slot_info is not None and _is_local_lease_active_response(
+                            response
+                        ):
+                            # Still denied after the wait: fall through to the
+                            # remote chain (bounded, no further waiting).
+                            all_slot_exhaustion = False
+                            continue
+                        # Slot freed — evaluate the fresh response below.
+                    elif _lease_action == "fallback":
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="fallback_after_queue",
+                            elapsed_wait_seconds=round(_lease_elapsed or 0.0, 3),
+                        )
+                        logger.info(
+                            "contention_queue_fallback_after_queue provider=%s "
+                            "session=%s queued_duration=%.2fs "
+                            "reason=local_lease_active",
+                            provider_name,
+                            _session_id or "unknown",
+                            _lease_elapsed or 0.0,
+                        )
+                        all_slot_exhaustion = False
+                        continue
+                    elif _lease_action == "context_bypass":
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="cached_tokens_skip",
+                            reason=_lease_reason,
+                        )
+                        fallback_reason = _lease_reason
+                        all_slot_exhaustion = False
+                        continue
+                    else:
+                        # Queue disabled / fallback policy: preserve the
+                        # pre-existing immediate remote fallback.
+                        all_slot_exhaustion = False
+                        continue
 
+                # A successful post-dispatch lease re-dispatch clears
+                # ``slot_info``; fall through to the common response handling
+                # instead of the slot-retry paths (LP-0MU5BOMJM008F17C).
+                if slot_info is None:
+                    pass
                 # Optional local retry window for startup races where router/model
                 # is loaded but slot probes briefly report 0 available.
-                if provider_type == "local" and local_slot_retry_attempts > 0:
+                elif provider_type == "local" and local_slot_retry_attempts > 0:
                     resolved_after_retry = False
                     for retry_idx in range(1, local_slot_retry_attempts + 1):
                         if local_slot_retry_delay_seconds > 0:
@@ -5882,10 +6853,10 @@ async def _proxy_with_fallback_cycle(
                     # API-key ACCOUNT until the computed reset time + 2m margin.
                     # Not the whole endpoint: distinct api_key_env entries on the
                     # same gateway have independent limits (LP-0MSMBWB23009XYPW).
-                    _reset_seconds = _usage_limit_reset_seconds(response, body_text)
-                    if _reset_seconds is not None:
+                    _reset_info = _usage_limit_reset_info(response, body_text, config)
+                    if _reset_info is not None:
                         _reset_account = _usage_limit_account_key(provider_cfg)
-                        _usage_reset_at[_reset_account] = time.time() + _reset_seconds
+                        _set_usage_limit_quarantine(_reset_account, _reset_info)
                         fallback_reason = "usage_limit_reset"
                         prev_provider = provider_name
                         attempted_domains.add(_reset_account)
@@ -5896,7 +6867,7 @@ async def _proxy_with_fallback_cycle(
                             status="usage_limit_reset",
                             status_code=int(response.status_code),
                             body_snippet=(body_text[:512] if body_text else None),
-                            reset_in_seconds=int(_reset_seconds),
+                            reset_in_seconds=int(_reset_info.seconds),
                         )
                         all_slot_exhaustion = False
                         continue
@@ -6002,8 +6973,12 @@ async def _proxy_with_fallback_cycle(
                                 response, provider_name, provider_type,
                                 cooldown_seconds, attempts, body_text, config,
                             )
+                            # LP-0MUNTOGLB005LUKY: pass provider_type so the
+                            # breaker can skip local providers entirely.
                             _threshold_exceeded = _record_sibling_failure(
-                                provider_name, config, provider_cfg.get("provider")
+                                provider_name, config, provider_cfg.get("provider"),
+                                domain_key=_failure_domain_key(provider_cfg),
+                                provider_type=provider_type,
                             )
                             if _threshold_exceeded:
                                 attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -6017,8 +6992,12 @@ async def _proxy_with_fallback_cycle(
                             response, provider_name, provider_type,
                             cooldown_seconds, attempts, body_text, config,
                         )
+                        # LP-0MUNTOGLB005LUKY: pass provider_type so the
+                        # breaker can skip local providers entirely.
                         _threshold_exceeded = _record_sibling_failure(
-                            provider_name, config, provider_cfg.get("provider")
+                            provider_name, config, provider_cfg.get("provider"),
+                            domain_key=_failure_domain_key(provider_cfg),
+                            provider_type=provider_type,
                         )
                         if _threshold_exceeded:
                             attempted_domains.add(_failure_domain_key(provider_cfg))
@@ -6048,7 +7027,7 @@ async def _proxy_with_fallback_cycle(
                 exc, provider_name, provider_type, cooldown_seconds, attempts,
             ):
                 any_provider_tried = True
-                attempted_domains.add(_failure_domain_key(provider_cfg))
+                attempted_domains.add(_connection_error_domain_key(provider_cfg, exc))
                 fallback_reason = str(type(exc).__name__)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
@@ -6149,6 +7128,11 @@ async def _proxy_with_fallback_cycle(
 
     # All providers exhausted — log diagnostic details
     unavailable = _log_exhausted_providers(model_config, path)
+
+    # Usage-limit quarantine takes precedence over the window reason, so it
+    # is recorded first; the window loop below skips providers already
+    # quarantined (LP-0MU56ZFVD001LP0H).
+    _record_quarantine_attempts(attempts, model_config)
 
     # Record time-window skips as distinct diagnostics so operators can tell
     # whether providers were excluded by their available_times windows rather

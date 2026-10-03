@@ -410,13 +410,66 @@ def generate_recommendations(
     return recs
 
 
+def _upstream_429_detail(
+    count: int, prov_str: str, et_str: str, error_types: Counter
+) -> str:
+    """Compose the 429 remediation detail from the error types present.
+
+    Mirrors the proxy's precedence (``proxy/proxy/provider.py``):
+    ``_usage_limit_reset_seconds`` is evaluated before
+    ``_is_free_usage_limit_error``, so a ``GoUsageLimitError`` takes the
+    account-level usage-limit reset quarantine (LP-0MSLJPOCC0001ROJ). A
+    ``FreeUsageLimitError`` only reaches the 3-hour per-model cooldown
+    (LP-0MRGU0I91006ODFD) when no reset can be computed. The log parser
+    extracts only ``error.type`` (not ``metadata.limitName`` or the reset
+    duration), so the quarantine duration is described, not echoed. An
+    unrecognised error type keeps the generic quota wording — no mechanism is
+    fabricated.
+    """
+    types_lower = {et.lower() for et in error_types}
+    mechanisms: list[str] = []
+    if "gousagelimiterror" in types_lower:
+        mechanisms.append(
+            "an account-level usage-limit reset quarantine (LP-0MSLJPOCC0001ROJ), "
+            "computed from the error message's reset time or `metadata.limitName` "
+            "(daily/weekly/monthly) plus a 2-minute safety margin"
+        )
+    if "freeusagelimiterror" in types_lower:
+        mechanisms.append(
+            "a 3-hour per-model cooldown (LP-0MRGU0I91006ODFD) when no reset "
+            "duration can be computed"
+        )
+
+    prefix = f"{count} upstream HTTP 429 event(s) from {prov_str} (error types: {et_str}). "
+    if not mechanisms:
+        return prefix + (
+            "These are upstream rate-limit responses; check the upstream "
+            "provider quota or usage limits."
+        )
+
+    if len(mechanisms) == 1:
+        mechanism_clause = f"The proxy applies {mechanisms[0]}"
+    else:
+        mechanism_clause = f"The proxy applies {mechanisms[0]} and {mechanisms[1]}"
+    return (
+        prefix
+        + mechanism_clause
+        + ". This is intended to suppress repeat fallbacks; if 429s persist, "
+        "check the upstream provider quota or usage limits."
+    )
+
+
 def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
     """Remediation recommendations driven by the parsed error events.
 
     Mirrors the Aug 3 error-analysis plan (LP-0MSDFKCK4007CPMY): stream
     finish errors point at recovery-first silent continue and informative-
     error fallback; slot_save ReadTimeouts point at local ctx-size pressure;
-    upstream 429s point at the FreeUsageLimitError cooldown; backend_retry
+    upstream 429s follow the proxy's own precedence: a usage-limit error with
+    a computable reset (``GoUsageLimitError``, and ``FreeUsageLimitError``
+    when the body carries a reset) takes the account-level reset quarantine
+    (LP-0MSLJPOCC0001ROJ), while a ``FreeUsageLimitError`` without one falls
+    back to the 3-hour per-model cooldown (LP-0MRGU0I91006ODFD); backend_retry
     timeouts are informational (upstream instability).
     """
     recs: list[Recommendation] = []
@@ -517,12 +570,7 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
             if status == 429:
                 severity = "medium"
                 title = "Upstream HTTP 429: rate limiting active"
-                detail = (
-                    f"{count} upstream HTTP 429 event(s) from {prov_str} "
-                    f"(error types: {et_str}). The proxy's 3-hour per-model cooldown "
-                    f"(LP-0MRGU0I91006ODFD) should suppress repeat fallbacks to the affected model; "
-                    f"if 429s persist, check the upstream provider quota or usage limits."
-                )
+                detail = _upstream_429_detail(count, prov_str, et_str, error_types)
             elif status == 402:
                 severity = "high"
                 title = "Upstream HTTP 402: payment/balance required"
