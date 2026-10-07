@@ -799,6 +799,105 @@ class TestSlotProgressCache:
         result = _enrich_slot_details_with_progress(slot_details, srv=None)
         assert "lease_session_id" not in result[0]
 
+    # --- dispatch-lease session-id normalisation (WL-0MUKY4MAX0008I0L) ---
+
+    def _clear_slot_assignments(self):
+        from proxy.observability import _processing_slot_assignments
+        _processing_slot_assignments.clear()
+
+    def _tuple_keyed_srv(self, session_id: str):
+        """A minimal srv whose only dispatch lease is per-endpoint keyed."""
+        import time as _time
+        return self._fake_srv_with_lease({
+            ("http://localhost:8080", session_id): {
+                "backend": "http://localhost:8080",
+                "started_at": _time.time() - 1.0,
+                "active": True,
+                "expires_at": 10**12,
+            },
+        })
+
+    def test_processing_slot_assignments_normalises_tuple_key(self):
+        """Per-endpoint (endpoint, session_id) tuple keys are exposed as the
+        bare session-id string, never a tuple/array (WL-0MUKY4MAX0008I0L)."""
+        from proxy.observability import (
+            _build_slot_to_session_map,
+            _slot_progress_cache,
+        )
+        session_id = "01a0e6f0-38eb-71f2-9961-6d186bac2ded"
+        self._clear_stable_tracker()
+        self._clear_slot_assignments()
+        _slot_progress_cache[0] = {
+            "n_tokens": 10, "progress": 0.5, "timestamp": 1000.0,
+        }
+        srv = self._tuple_keyed_srv(session_id)
+        try:
+            with _patch_time(1000.0):
+                mapping = _build_slot_to_session_map(
+                    srv, slot_details=[{"slot_id": 0, "is_processing": True}],
+                )
+            assert mapping == {0: session_id}
+            assert isinstance(mapping[0], str)
+        finally:
+            _slot_progress_cache.clear()
+            self._clear_slot_assignments()
+
+    def test_processing_slot_assignments_keeps_legacy_string_key(self):
+        """Legacy single-server string keys are stored unchanged."""
+        from proxy.observability import (
+            _build_slot_to_session_map,
+            _slot_progress_cache,
+        )
+        self._clear_stable_tracker()
+        self._clear_slot_assignments()
+        _slot_progress_cache[1] = {
+            "n_tokens": 10, "progress": 0.5, "timestamp": 1000.0,
+        }
+        srv = self._fake_srv_with_lease({
+            "sess-legacy-1": {
+                "backend": "local",
+                "started_at": 1.0,
+                "active": True,
+                "expires_at": 10**12,
+            },
+        })
+        try:
+            with _patch_time(1000.0):
+                mapping = _build_slot_to_session_map(
+                    srv, slot_details=[{"slot_id": 1, "is_processing": True}],
+                )
+            assert mapping == {1: "sess-legacy-1"}
+        finally:
+            _slot_progress_cache.clear()
+            self._clear_slot_assignments()
+
+    def test_enrich_slot_session_id_is_string_for_tuple_key(self):
+        """The enriched slot payload exposes a string ``session_id`` even when
+        the dispatch lease is keyed by an (endpoint, session_id) tuple
+        (WL-0MUKY4MAX0008I0L)."""
+        from proxy.observability import (
+            _enrich_slot_details_with_progress,
+            _slot_progress_cache,
+        )
+        session_id = "01a0e6f0-38eb-71f2-9961-6d186bac2ded"
+        self._clear_stable_tracker()
+        self._clear_slot_assignments()
+        _slot_progress_cache[0] = {
+            "n_tokens": 10, "progress": 0.5, "timestamp": 1000.0,
+        }
+        srv = self._tuple_keyed_srv(session_id)
+        try:
+            with _patch_time(1000.0):
+                result = _enrich_slot_details_with_progress(
+                    [{"slot_id": 0, "is_processing": True, "n_decoded": 10}],
+                    srv=srv,
+                )
+            assert result[0]["session_id"] == session_id
+            assert isinstance(result[0]["session_id"], str)
+        finally:
+            _slot_progress_cache.clear()
+            self._clear_slot_assignments()
+
 
 class _TimePatcher:
     """Context manager that patches time.time() to return a fixed value."""

@@ -1427,6 +1427,7 @@ http://localhost:8000/
 **Slot Status**
 - Real-time per-slot status cards for the local llama-server (idle/processing/waiting indicators, decoded-token progress)
 - Updates live via SSE broadcasts from `/events` (per-slot data queried from the llama-server `/slots` endpoint)
+- The per-slot `session_id` (and the top-level `local_owner_session_id`) is always a plain session-id **string**. Per-endpoint dispatch leases are keyed internally by an `(endpoint, session_id)` tuple; the proxy normalises it via `_dispatch_key_session_id()` before it reaches the wire (WL-0MUKY4MAX0008I0L). Older proxies may still send the legacy two-element array (`["<endpoint>", "<session-id>"]`); the UI (`normaliseSessionId()` in `templates/index.html`) tolerates both shapes and never calls `.substring()` on a non-string.
 - Covered by Playwright E2E tests in `tests/slot-status.spec.js`
 
 **Quick Links**

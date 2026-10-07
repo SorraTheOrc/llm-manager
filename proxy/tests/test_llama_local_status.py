@@ -85,6 +85,58 @@ async def test_llama_local_status_shows_local_owner_when_lease_active():
 
 
 @pytest.mark.asyncio
+async def test_llama_local_status_normalises_tuple_lease_owner():
+    """A per-endpoint (endpoint, session_id) lease key is exposed as the bare
+    session-id string, never as a JSON array (WL-0MUKY4MAX0008I0L)."""
+    import time
+
+    from proxy.server import app
+
+    from proxy import server
+
+    async def fake_query():
+        return {"llama_server_running": True}
+
+    transport = httpx.ASGITransport(app=app)
+
+    lease_expires_at = time.monotonic() + 60.0
+    session_id = "01a0e6f0-38eb-71f2-9961-6d186bac2ded"
+    records = {
+        ("http://localhost:8080", session_id): {
+            "backend": "http://localhost:8080",
+            "started_at": time.monotonic(),
+            "active": True,
+            "expires_at": lease_expires_at,
+        }
+    }
+
+    class FakeLock:
+        def locked(self):
+            return False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+    with patch("proxy.server.query_llama_status", side_effect=fake_query):
+        with patch.object(server, "local_dispatch_records", records):
+            with patch.object(server, "local_dispatch_records_lock", FakeLock()):
+                with patch.object(server, "model_switch_refcount", 0):
+                    with patch.object(server, "model_switch_lock", FakeLock()):
+                        with patch.object(server, "background_loads", {}):
+                            with patch.object(server, "current_model", "test-model"):
+                                async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                                    resp = await ac.get("/llama/local/status")
+
+    assert resp.status_code == 200
+    j = resp.json()
+    assert j.get("local_owner_session_id") == session_id
+    assert isinstance(j.get("local_owner_session_id"), str)
+
+
+@pytest.mark.asyncio
 async def test_llama_local_status_shows_no_local_owner_when_no_lease():
     """When no local dispatch lease is active, status returns null for owner fields."""
     from proxy.server import app
