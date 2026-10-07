@@ -559,7 +559,7 @@ server:
   # stream errors. State is in-memory (no persistence), like the other
   # cooldown mechanisms.
   sibling_fallback_threshold: 2
-  sibling_fallback_cooldown_seconds: 600
+  sibling_fallback_cooldown_seconds: 300
   sibling_fallback_window_seconds: 600
   # Chain-hold retry (LP-0MSH94Z7K007VKC9): when EVERY provider in a model's
   # fallback chain is exhausted, hold the request for chain_hold_seconds
