@@ -71,25 +71,31 @@ prompt, an order of magnitude above the old effective budget.
 
 The value is derived from the measurement, not chosen as a round number:
 
-* **per-prompt state** = mean evicted-entry size = **1,517.6 MiB**
+* **per-prompt state** = mean evicted-entry size ≈ **1,456–1,518 MiB**
   (evicted entries are exactly the large prompts we want to retain). The
   checkpoint-derived upper bound is 2,010 MiB and the upstream rule 3,200 MiB.
-* **target prompts** = observed maximum concurrently-retained prompts = **12**.
+* **target prompts** = observed maximum concurrently-retained prompts —
+  **12** in the pre-deploy baseline, **18** in the post-deploy measurement.
 * **margin** = 1.25 for headroom.
 
 ```
-1,517.6 MiB x 12 x 1.25 = 22,764 MiB  ->  round up to 23 GiB = 23,552 MiB
+1,517.6 MiB x 12 x 1.25 = 22,764 MiB  ->  23 GiB = 23,552 MiB  (first step)
+1,456.3 MiB x 18 x 1.25 = 32,767 MiB  ->  32 GiB = 32,768 MiB  (raised)
 ```
 
 Configured in `models.ini` `[Qwen3]`:
 
 ```ini
-cache-ram = 23552
+cache-ram = 32768
 ctx-checkpoints = 32
 ```
 
-This raises the retained prompts from ~3–5 to ~15, so a session prefix
-survives across turns.
+The first step (23,552 MiB) raised the retained prompts from ~3–5 to ~15.
+The post-deploy measurement then observed up to **18** concurrent prompts and
+residual evictions, so the cap was raised to **32,768 MiB** (~22 prompts) —
+the value `--recommend` derives from the 2026-10-07 measurement
+(LP-0MUYFC3C5004TCYN). This keeps a session prefix resident across turns under
+the busier post-deploy load.
 
 ### Checkpoint lever (AC3)
 
@@ -154,7 +160,7 @@ Capture a baseline or an after-window measurement with the analysis script:
 
 # Machine-readable artifact (commit this for before/after comparison)
 ./scripts/prompt_cache_analysis.py --json --recommend \
-    --assume-cache-ram-mib 23552 > docs/dev/prompt-cache-after.json
+    --assume-cache-ram-mib 32768 > docs/dev/prompt-cache-after.json
 
 # Restrict to one rotated file (llama-server logs carry no timestamps)
 ./scripts/prompt_cache_analysis.py --glob 'llama-server.log-2026-10-01'
@@ -165,7 +171,7 @@ Capture a baseline or an after-window measurement with the analysis script:
 
 # Post-deploy corpus without a symlink farm: keep only files whose
 # cache-state lines declare the new cap (llama logs have no timestamps)
-./scripts/prompt_cache_analysis.py --cache-ram-filter 23552
+./scripts/prompt_cache_analysis.py --cache-ram-filter 32768
 ```
 
 ### Throughput and first-byte latency (AC6)
@@ -184,7 +190,7 @@ the llama-server log, so restrict it with `--proxy-glob` (comma-separated)
 to align the proxy window with the llama corpus:
 
 ```bash
-./scripts/prompt_cache_analysis.py --cache-ram-filter 23552 \
+./scripts/prompt_cache_analysis.py --cache-ram-filter 32768 \
     --proxy-glob 'proxy.log,proxy.log.2026-10-*'
 ```
 
@@ -260,17 +266,18 @@ require an equal-length warm-cache window.
 ### Cache sizing at the margin
 
 The post-deploy measurement shows `cache_prompts_max = 18` (vs 12 before),
-so the `recommend()` function now suggests **32768 MiB** (32 GiB) to hold
-22 prompts at 1.25× margin. The current 23552 MiB holds 16 prompts, which
-is adequate for the baseline's 12 but not for the current peak of 18.
-Projected at 23552 MiB: 78 of 88 evictions would be avoided (capacity
-adequate = False). Whether to increase to 32 GiB depends on whether 18
-prompts concurrent is the new steady-state or an elevated peak.
+so the `recommend()` function suggests **32768 MiB** (32 GiB) to hold 22
+prompts at 1.25× margin. The 23552 MiB cap held 16 prompts, adequate for the
+baseline's 12 but not for the current peak of 18. **Applied** under
+LP-0MUYFC3C5004TCYN: `models.ini` `[Qwen3]` now sets `cache-ram = 32768`.
 
 **Headroom check at 32768 MiB:**
 ```
-MemAvailable ~81,419 MiB - 32,768 = 48,651 MiB >= 12,744 MiB (reserve)  -> safe
+MemAvailable ~77,108 MiB - 32,768 = 44,340 MiB >= 12,744 MiB (reserve)  -> safe
 ```
+
+The wider margin means the `server_prompt_cache::alloc()` OOM fallback
+(`limit_size = 0.4 * size()`) is not approached.
 
 ## AC6 — Throughput / latency
 
