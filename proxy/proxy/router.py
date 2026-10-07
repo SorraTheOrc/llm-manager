@@ -1589,7 +1589,12 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     # the safety buffer while progress advances or
                                     # the slot is observed processing
                                     # (LP-0MUXQ5QL40027VZ4: liveness is the only
-                                    # signal b8782 exposes).
+                                    # signal b8782 exposes). This branch only
+                                    # runs while no actual data has arrived, so
+                                    # the open stream itself is passed as
+                                    # prefill_in_flight=True — the reliable
+                                    # liveness signal when /slots is blocked
+                                    # (LP-0MUXTW4MD003TVIC).
                                     # This covers very large prefills beyond the
                                     # adaptive token-estimate cap (1500s); the
                                     # existing chunk-refresh path takes over once
@@ -1615,6 +1620,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     model_name=model_name,
                                                     slot_id=slot_id,
                                                     last_progress=_prefill_progress,
+                                                    prefill_in_flight=True,
                                                 )
                                             )
                                     # Build heartbeat JSON with token progress (LP-0MRDFUHMP005SFU2)

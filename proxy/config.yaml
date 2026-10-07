@@ -768,18 +768,27 @@ server:
   #   NOTE (LP-0MUXQ5QL40027VZ4): the prefill-phase lease extension refreshes
   #   ``last_progress_ts`` on *liveness* (per-slot ``is_processing``) as well as on
   #   numeric progress, because the deployed llama.cpp b8782 build exposes no
-  #   numeric prefill progress. Without liveness refresh, every prefill longer
-  #   than this timeout was released, its upstream stream cancelled, and the
-  #   client retried into a full re-prefill forever. A wedged slot that keeps
-  #   reporting ``is_processing`` is still bounded by
+  #   numeric prefill progress.
+  #   NOTE (LP-0MUXTW4MD003TVIC): ``/slots`` is NOT usable as the prefill-phase
+  #   signal under load — llama-server holds it for the duration of a
+  #   prompt-processing batch (measured 8.7s, then >15s, versus the 1s
+  #   ``STATUS_QUERY_TIMEOUT``), and a queued request's slot reports
+  #   ``is_processing=False``. The extension therefore also refreshes
+  #   ``last_progress_ts`` whenever the upstream request is still in flight
+  #   with no error (``prefill_in_flight``), which is authoritative and does not
+  #   depend on ``/slots``. Without it every prefill or queue wait longer than
+  #   this timeout was released, its upstream stream cancelled, and the client
+  #   retried into a full re-prefill forever. A genuinely wedged slot (no
+  #   response, no chunks) is still bounded by
   #   ``local_dispatch_max_prefill_seconds`` below.
   # local_dispatch_max_prefill_seconds: Hard ceiling on a single local dispatch
   #   record's lifetime (default 900s; 0 disables). A record active for longer than
-  #   this is released regardless of observed progress or liveness — this is the
-  #   wedge bound that pairs with the liveness extension above. Also bounds the
-  #   initial first-byte wait: a local request that produces no first byte within
-  #   this window is aborted server-side with a retryable 503 + Retry-After
-  #   (LP-0MUCEFB8E003YVFF).
+  #   this is released regardless of observed progress or in-flight liveness —
+  #   this is the wedge bound that pairs with the prefill extension above. Also
+  #   bounds the initial first-byte wait: a local request that produces no first
+  #   byte within this window is aborted server-side with a retryable 503 +
+  #   Retry-After (LP-0MUCEFB8E003YVFF). Checking this ceiling is what makes the
+  #   in-flight liveness signal safe (LP-0MUXTW4MD003TVIC).
   # local_dispatch_prefill_observability_warn_seconds: Threshold (default 30s) at
   #   which a long initial first-byte wait logs a ``prefill_wait_exceeds_threshold``
   #   warning. While awaiting the SSE response headers, the proxy polls prefill
