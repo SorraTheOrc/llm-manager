@@ -158,17 +158,47 @@ Capture a baseline or an after-window measurement with the analysis script:
 
 # Restrict to one rotated file (llama-server logs carry no timestamps)
 ./scripts/prompt_cache_analysis.py --glob 'llama-server.log-2026-10-01'
+
+# Multi-file corpus: comma-separated globs = any match
+./scripts/prompt_cache_analysis.py \
+    --glob 'llama-server.log,llama-server.*.log,llama-server.log-2026-10-*'
+
+# Post-deploy corpus without a symlink farm: keep only files whose
+# cache-state lines declare the new cap (llama logs have no timestamps)
+./scripts/prompt_cache_analysis.py --cache-ram-filter 23552
 ```
 
-The JSON records the corpus (`meta.files`) so the window is reproducible. For
-AC5/AC6, after the new `models.ini` is deployed (proxy restart):
+### Throughput and first-byte latency (AC6)
+
+Since LP-0MUYFBVHX004Z0UE the script also reports the metrics AC6 needs:
+
+* `prompt_eval_tok_s` — prompt-eval throughput (tok/s);
+* `decode_tok_s` — generation (decode) throughput (tok/s);
+* `first_byte_ms` — client-visible first-byte latency, parsed from the
+  proxy's `dispatch_first_byte_ms=` lines (`--proxy-log-dir`, default the
+  same directory as the llama-server logs; `--no-proxy` skips it).
+
+Each is a `{samples, median, p10, p90}` block in the `--json` summary and a
+single line in the human summary. The proxy log rotates far more often than
+the llama-server log, so restrict it with `--proxy-glob` (comma-separated)
+to align the proxy window with the llama corpus:
+
+```bash
+./scripts/prompt_cache_analysis.py --cache-ram-filter 23552 \
+    --proxy-glob 'proxy.log,proxy.log.2026-10-*'
+```
+
+The JSON records the corpus (`meta.files`, `meta.proxy_files`,
+`meta.cache_ram_filter_mib`, `meta.globs`, `meta.proxy_globs`) so the window
+is reproducible. For AC5/AC6, after the new `models.ini` is deployed (proxy
+restart):
 
 1. wait a comparable window;
 2. re-run the script over the post-deploy files;
 3. compare `large_full_prefill_requests`, `tokens_prefilled`,
    `prefill_wall_seconds` and `evictions` against the committed baseline;
-4. confirm prefill throughput (tokens/second in the `prompt eval time` lines)
-   and client first-byte latency have not regressed.
+4. confirm `prompt_eval_tok_s`, `decode_tok_s` and `first_byte_ms`
+   (proxy-side) have not regressed.
 
 The capacity projection in `--recommend`/`--assume-cache-ram-mib` gives the
 expected effect up front: at 23,552 MiB the cache holds ~15 prompts versus the

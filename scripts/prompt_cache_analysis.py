@@ -22,10 +22,21 @@ apples-to-apples:
   wall time, eviction count + sizes, cache-saturation samples and checkpoint
   overhead.
 
+AC6 (LP-0MUYFBVHX004Z0UE) adds the throughput / latency metrics that must
+not regress:
+
+  * prompt-eval and decode (generation) throughput, from the llama-server
+    ``prompt eval time`` / ``eval time`` lines (tok/s); and
+  * client-visible first-byte latency, from the proxy's
+    ``dispatch_first_byte_ms=`` lines (``--proxy-log-dir``, default the same
+    directory as the llama-server logs).
+
 Usage:
   ./scripts/prompt_cache_analysis.py                          # summary
   ./scripts/prompt_cache_analysis.py --json                   # machine readable
   ./scripts/prompt_cache_analysis.py --glob 'llama-server.log-2026-09-30.gz'
+  ./scripts/prompt_cache_analysis.py --glob 'llama-server.log,llama-server.*.log'
+  ./scripts/prompt_cache_analysis.py --cache-ram-filter 23552 # post-deploy corpus
   ./scripts/prompt_cache_analysis.py --recommend              # sizing proposal
   ./scripts/prompt_cache_analysis.py --assume-cache-ram-mib 24576
   ./scripts/prompt_cache_analysis.py --json > after.json      # baseline artifact
@@ -54,6 +65,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import slot_persistence_harness as harness  # noqa: E402
+from lib.proxy_logs import (  # noqa: E402
+    discover_proxy_log_files,
+    open_proxy_log_text,
+)
 
 MIB = 1024 * 1024
 
@@ -77,9 +92,18 @@ _FORCE_RE = re.compile(
     r"slot update_slots: id\s+(?P<slot>\d+) \| task (?P<task>\d+) \| "
     r"forcing full prompt re-processing"
 )
+# llama-server eval-timing lines, e.g.
+#   [32999] prompt eval time = 29504.01 ms / 11449 tokens ( 2.58 ms per token, 388.05 tokens per second)
+#   [32999]        eval time =  3776.71 ms /   153 tokens (24.68 ms per token,  40.51 tokens per second)
+# The alternation is ordered so ``prompt eval time`` wins over ``eval time``
+# at its own (earlier) position.
 _EVAL_RE = re.compile(
-    r"prompt eval time =\s+(?P<ms>[0-9.]+) ms /\s+(?P<tokens>\d+) tokens "
+    r"(?P<kind>prompt eval time|eval time)\s*=\s+"
+    r"(?P<ms>[0-9.]+) ms /\s+(?P<tokens>\d+) tokens \("
+    r"\s*(?P<ms_per_tok>[0-9.]+) ms per token,\s*(?P<tok_s>[0-9.]+) tokens per second\)"
 )
+# proxy.log: client-visible first-byte latency (LP-0MTJET616005S7PN).
+_FIRST_BYTE_RE = re.compile(r"dispatch_first_byte_ms=(?P<ms>[0-9.]+)")
 _CKPT_RE = harness._LLAMA_CHECKPOINT_RE
 
 # --- cache bookkeeping ----------------------------------------------------
@@ -121,6 +145,8 @@ class _Metrics:
     forced_full_prefills: int = 0
     prefill_wall_ms: float = 0.0
     prefill_eval_lines: int = 0
+    prompt_eval_tok_s: list[float] = field(default_factory=list)
+    decode_tok_s: list[float] = field(default_factory=list)
     eviction_sizes_mib: list[float] = field(default_factory=list)
     cache_states: int = 0
     cache_limit_mib: float = 0.0
@@ -131,6 +157,14 @@ class _Metrics:
     checkpoint_sizes_mib: list[float] = field(default_factory=list)
     checkpoint_per_prompt: list[int] = field(default_factory=list)
     files: int = 0
+
+
+@dataclass
+class _ProxyMetrics:
+    """Proxy-side metrics (AC6): client-visible first-byte latency."""
+
+    first_byte_ms: list[float] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
 
 
 def _finalise(metrics: _Metrics, task: _Task, large_tokens: int) -> None:
@@ -153,78 +187,162 @@ def _finalise(metrics: _Metrics, task: _Task, large_tokens: int) -> None:
             metrics.large_full_prefill_tokens += task.total
 
 
-def collect(log_dir: Path, name_glob: str | None = None, large_tokens: int = _DEFAULT_LARGE_TOKENS) -> _Metrics:
+def _read_llama_lines(path: Path):
+    """Yield lines from one llama-server log, gzip-aware."""
+    import gzip
+
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", errors="replace") as fh:
+        yield from fh
+
+
+def _file_declares_cache_limit(path: Path, limit_mib: float) -> bool:
+    """True when *path* has a cache-state line with the given cap (MiB)."""
+    needle = f"limits: {limit_mib:.3f} MiB"
+    try:
+        for line in _read_llama_lines(path):
+            if needle in line:
+                return True
+    except OSError as exc:
+        print(f"warning: cannot read {path}: {exc}", file=sys.stderr)
+    return False
+
+
+def _select_llama_files(
+    log_dir: Path,
+    patterns: list[str] | None,
+    cache_ram_filter: float | None,
+) -> list[Path]:
+    """Resolve the llama-server corpus for the run.
+
+    *patterns* keeps files matching any glob (empty = all). *cache_ram_filter*
+    keeps only files whose cache-state lines declare that ``--cache-ram`` limit
+    — llama-server logs carry no timestamps, so the cap is the reproducible way
+    to isolate a post-deploy corpus.
+    """
+    import fnmatch
+
+    files = harness._iter_llama_files(log_dir)
+    if patterns:
+        files = [p for p in files if any(fnmatch.fnmatch(p.name, pat) for pat in patterns)]
+    if cache_ram_filter is not None:
+        files = [p for p in files if _file_declares_cache_limit(p, cache_ram_filter)]
+    return files
+
+
+def collect(
+    log_dir: Path,
+    patterns: list[str] | None = None,
+    large_tokens: int = _DEFAULT_LARGE_TOKENS,
+    cache_ram_filter: float | None = None,
+) -> _Metrics:
     """Parse llama-server logs and return the aggregate metric set."""
     metrics = _Metrics()
     tasks: dict[tuple[str, str, str], _Task] = {}
     ckpt_per_task: Counter = Counter()
 
-    files_seen: set[str] = set()
-    for path, line in harness._iter_llama_logs(log_dir, name_glob):
-        files_seen.add(str(path))
+    files = _select_llama_files(log_dir, patterns, cache_ram_filter)
+    metrics.files = len(files)
 
-        m = _NEW_PROMPT_RE.search(line)
-        if m:
-            key = _pid_key(line, m)
-            # Finalise a stale task on the same slot before overwriting.
-            _finalise_slot(metrics, tasks, line, m.group("slot"), large_tokens)
-            tasks[key] = _Task(total=int(m.group("tokens")))
-            continue
+    for path in files:
+        for line in _read_llama_lines(path):
+            m = _NEW_PROMPT_RE.search(line)
+            if m:
+                key = _pid_key(line, m)
+                # Finalise a stale task on the same slot before overwriting.
+                _finalise_slot(metrics, tasks, line, m.group("slot"), large_tokens)
+                tasks[key] = _Task(total=int(m.group("tokens")))
+                continue
 
-        m = _PROGRESS_RE.search(line) or _DONE_RE.search(line)
-        if m:
-            key = _pid_key(line, m)
-            task = tasks.get(key)
-            if task is None:
-                # Processing without a preceding "new prompt" (e.g. a
-                # continuation or a log rotation seam): track it anyway.
-                task = _Task(total=int(m.group("n_tokens")))
-                tasks[key] = task
-            task.prefilled += int(m.group("batch"))
-            continue
+            m = _PROGRESS_RE.search(line) or _DONE_RE.search(line)
+            if m:
+                key = _pid_key(line, m)
+                task = tasks.get(key)
+                if task is None:
+                    # Processing without a preceding "new prompt" (e.g. a
+                    # continuation or a log rotation seam): track it anyway.
+                    task = _Task(total=int(m.group("n_tokens")))
+                    tasks[key] = task
+                task.prefilled += int(m.group("batch"))
+                continue
 
-        m = _FORCE_RE.search(line)
-        if m:
-            task = tasks.get(_pid_key(line, m))
-            if task is not None:
-                task.forced = True
-            continue
+            m = _FORCE_RE.search(line)
+            if m:
+                task = tasks.get(_pid_key(line, m))
+                if task is not None:
+                    task.forced = True
+                continue
 
-        m = _EVAL_RE.search(line)
-        if m:
-            metrics.prefill_wall_ms += float(m.group("ms"))
-            metrics.prefill_eval_lines += 1
-            continue
+            m = _EVAL_RE.search(line)
+            if m:
+                if m.group("kind") == "prompt eval time":
+                    metrics.prefill_wall_ms += float(m.group("ms"))
+                    metrics.prefill_eval_lines += 1
+                    metrics.prompt_eval_tok_s.append(float(m.group("tok_s")))
+                else:
+                    metrics.decode_tok_s.append(float(m.group("tok_s")))
+                continue
 
-        m = _EVICT_RE.search(line)
-        if m:
-            metrics.eviction_sizes_mib.append(float(m.group("size")) * _UNIT_MIB[m.group("unit")])
-            continue
+            m = _EVICT_RE.search(line)
+            if m:
+                metrics.eviction_sizes_mib.append(float(m.group("size")) * _UNIT_MIB[m.group("unit")])
+                continue
 
-        m = _CACHE_STATE_RE.search(line)
-        if m:
-            metrics.cache_states += 1
-            size = float(m.group("size"))
-            limit = float(m.group("limit"))
-            metrics.cache_limit_mib = limit or metrics.cache_limit_mib
-            metrics.cache_peak_mib = max(metrics.cache_peak_mib, size)
-            metrics.cache_prompts_max = max(metrics.cache_prompts_max, int(m.group("prompts")))
-            if limit > 0 and size >= 0.9 * limit:
-                metrics.cache_saturated += 1
-            continue
+            m = _CACHE_STATE_RE.search(line)
+            if m:
+                metrics.cache_states += 1
+                size = float(m.group("size"))
+                limit = float(m.group("limit"))
+                metrics.cache_limit_mib = limit or metrics.cache_limit_mib
+                metrics.cache_peak_mib = max(metrics.cache_peak_mib, size)
+                metrics.cache_prompts_max = max(metrics.cache_prompts_max, int(m.group("prompts")))
+                if limit > 0 and size >= 0.9 * limit:
+                    metrics.cache_saturated += 1
+                continue
 
-        m = _CKPT_RE.search(line)
-        if m:
-            metrics.checkpoint_sizes_mib.append(float(m.group("size")))
-            metrics.checkpoint_counts[int(m.group("total"))] += 1
-            ckpt_per_task[_pid_key(line, m)] += 1
-            continue
+            m = _CKPT_RE.search(line)
+            if m:
+                metrics.checkpoint_sizes_mib.append(float(m.group("size")))
+                metrics.checkpoint_counts[int(m.group("total"))] += 1
+                ckpt_per_task[_pid_key(line, m)] += 1
+                continue
 
     # Finalise everything still open at end of corpus.
     for task in tasks.values():
         _finalise(metrics, task, large_tokens)
     metrics.checkpoint_per_prompt = list(ckpt_per_task.values())
-    metrics.files = len(files_seen)
+    return metrics
+
+
+def collect_proxy(proxy_log_dir: Path, patterns: list[str] | None = None) -> _ProxyMetrics:
+    """Parse proxy logs for client-visible first-byte latency (AC6).
+
+    A missing/unreadable directory yields empty stats rather than an error, so
+    a llama-only corpus still runs. *patterns* restricts the proxy files by
+    glob (any match) so the proxy window can be aligned with the llama corpus
+    — proxy logs are rotated far more often, so the default full-history span
+    would otherwise be much wider than a filtered llama-server corpus.
+    """
+    import fnmatch
+
+    metrics = _ProxyMetrics()
+    if not proxy_log_dir.is_dir():
+        return metrics
+    files = discover_proxy_log_files(proxy_log_dir)
+    if patterns:
+        files = [p for p in files if any(fnmatch.fnmatch(p.name, pat) for pat in patterns)]
+    seen: set[str] = set()
+    for path in files:
+        seen.add(str(path))
+        try:
+            with open_proxy_log_text(path) as fh:
+                for line in fh:
+                    m = _FIRST_BYTE_RE.search(line)
+                    if m:
+                        metrics.first_byte_ms.append(float(m.group("ms")))
+        except OSError as exc:
+            print(f"warning: cannot read {path}: {exc}", file=sys.stderr)
+    metrics.files = sorted(seen)
     return metrics
 
 
@@ -258,8 +376,23 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def summarise(metrics: _Metrics, large_tokens: int) -> dict:
+def _stats(values: list[float]) -> dict:
+    """Median/p10/p90 summary for a sample list (empty -> zeros)."""
+    return {
+        "samples": len(values),
+        "median": round(_percentile(values, 50), 1) if values else 0.0,
+        "p10": round(_percentile(values, 10), 1) if values else 0.0,
+        "p90": round(_percentile(values, 90), 1) if values else 0.0,
+    }
+
+
+def summarise(
+    metrics: _Metrics,
+    large_tokens: int,
+    proxy_metrics: _ProxyMetrics | None = None,
+) -> dict:
     """Turn raw parse output into the comparable metric summary."""
+    proxy_metrics = proxy_metrics or _ProxyMetrics()
     requested = metrics.prompt_tokens_requested
     prefilled = metrics.tokens_prefilled
     reused = max(0, requested - prefilled)
@@ -300,6 +433,9 @@ def summarise(metrics: _Metrics, large_tokens: int) -> dict:
         "checkpoints_per_slot_max": ckpt_total,
         "checkpoint_overhead_per_prompt_mib": round(ckpt_total * _mean(ckpt), 1) if ckpt else 0.0,
         "checkpoints_observed": len(ckpt),
+        "prompt_eval_tok_s": _stats(metrics.prompt_eval_tok_s),
+        "decode_tok_s": _stats(metrics.decode_tok_s),
+        "first_byte_ms": _stats(proxy_metrics.first_byte_ms),
         "files": metrics.files,
     }
 
@@ -456,6 +592,15 @@ def project_capacity(summary: dict, assume_cache_mib: float) -> dict:
 # Rendering
 # ---------------------------------------------------------------------------
 
+def _fmt_stats(stats: dict) -> str:
+    if not stats.get("samples"):
+        return "n/a"
+    return (
+        f"{stats['median']:.1f} (p10 {stats['p10']:.1f} / p90 {stats['p90']:.1f}, "
+        f"n={stats['samples']})"
+    )
+
+
 def render_summary(summary: dict, recommendation: dict | None, projection: dict | None) -> str:
     lines = [
         "llama-server prompt-cache analysis",
@@ -482,6 +627,9 @@ def render_summary(summary: dict, recommendation: dict | None, projection: dict 
         f"checkpoints                   : {summary['checkpoints_per_slot_max']} x "
         f"{summary['checkpoint_size_mib']} MiB = "
         f"{summary['checkpoint_overhead_per_prompt_mib']:.0f} MiB/prompt",
+        f"prompt-eval throughput        : {_fmt_stats(summary['prompt_eval_tok_s'])} tok/s",
+        f"decode throughput             : {_fmt_stats(summary['decode_tok_s'])} tok/s",
+        f"first-byte latency (proxy)    : {_fmt_stats(summary['first_byte_ms'])} ms",
     ]
     if recommendation:
         r = recommendation
@@ -516,19 +664,31 @@ def render_summary(summary: dict, recommendation: dict | None, projection: dict 
     return "\n".join(lines)
 
 
-def _file_list(log_dir: Path, name_glob: str | None) -> list[str]:
-    import fnmatch
+def _split_patterns(raw: str | None) -> list[str]:
+    """Split a comma-separated ``--glob`` value into non-empty patterns."""
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
-    files = harness._iter_llama_files(log_dir)
-    if name_glob:
-        files = [p for p in files if fnmatch.fnmatch(p.name, name_glob)]
-    return [p.name for p in files]
+
+def _file_list(log_dir: Path, patterns: list[str], cache_ram_filter: float | None) -> list[str]:
+    """Names of the llama-server files the run actually measured."""
+    return [p.name for p in _select_llama_files(log_dir, patterns, cache_ram_filter)]
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--log-dir", default="/var/log/llama-proxy", type=Path)
-    p.add_argument("--glob", default=None, help="fnmatch pattern restricting llama-server files")
+    p.add_argument("--glob", default=None,
+                   help="filename glob restricting llama-server files; comma-separated = any match")
+    p.add_argument("--cache-ram-filter", type=float, default=None,
+                   help="keep only files whose cache-state lines declare this --cache-ram cap (MiB)")
+    p.add_argument("--proxy-log-dir", type=Path, default=None,
+                   help="directory with proxy.log* for first-byte latency (default: --log-dir)")
+    p.add_argument("--proxy-glob", default=None,
+                   help="filename glob(s) restricting proxy.log* files; comma-separated = any match")
+    p.add_argument("--no-proxy", action="store_true",
+                   help="skip proxy-log parsing (first-byte stats stay empty)")
     p.add_argument("--large-tokens", type=int, default=_DEFAULT_LARGE_TOKENS,
                    help="prompt-length threshold separating new-session from lost-prefix prefills")
     p.add_argument("--json", action="store_true")
@@ -548,11 +708,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.log_dir.is_dir():
         print(f"error: log directory not found: {args.log_dir}", file=sys.stderr)
         return 1
-    metrics = collect(args.log_dir, args.glob, args.large_tokens)
+    patterns = _split_patterns(args.glob)
+    metrics = collect(args.log_dir, patterns, args.large_tokens, args.cache_ram_filter)
     if metrics.files == 0:
         print(f"error: no llama-server logs found in {args.log_dir}", file=sys.stderr)
         return 1
-    summary = summarise(metrics, args.large_tokens)
+    proxy_dir = args.proxy_log_dir or args.log_dir
+    proxy_patterns = _split_patterns(args.proxy_glob)
+    proxy_metrics = (
+        _ProxyMetrics() if args.no_proxy else collect_proxy(proxy_dir, proxy_patterns)
+    )
+    summary = summarise(metrics, args.large_tokens, proxy_metrics)
 
     recommendation = None
     if args.recommend:
@@ -573,8 +739,14 @@ def main(argv: list[str] | None = None) -> int:
                 "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
                 "log_dir": str(args.log_dir),
                 "glob": args.glob,
+                "globs": patterns,
+                "cache_ram_filter_mib": args.cache_ram_filter,
+                "proxy_log_dir": str(proxy_dir),
+                "proxy_glob": args.proxy_glob,
+                "proxy_globs": proxy_patterns,
+                "proxy_files": [Path(p).name for p in proxy_metrics.files],
                 "large_tokens_threshold": args.large_tokens,
-                "files": _file_list(args.log_dir, args.glob),
+                "files": _file_list(args.log_dir, patterns, args.cache_ram_filter),
             },
             "summary": summary,
         }
