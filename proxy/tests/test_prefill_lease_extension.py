@@ -16,10 +16,17 @@ sessions based on **observed prefill progress** (per-slot ``n_past`` /
 ``n_prompt_tokens_processed`` from llama-server ``/slots``, falling back to
 aggregate ``kv_cache_tokens`` from ``query_llama_status()``): while the
 reported progress is advancing, ``expires_at`` is pushed out to
-``now + safety_buffer``. Extension stops when the first actual data chunk
-arrives (the existing chunk-refresh path takes over) or the stream ends.
-When progress is unobservable, the lease keeps the adaptive token-estimate
-value applied at acquisition (fallback) rather than being dropped.
+``now + safety_buffer``. **LP-0MUXQ5QL40027VZ4** additionally extends on
+observed slot *liveness* (``is_processing``), because the deployed
+llama.cpp b8782 exposes no numeric prefill progress; without it every
+prefill longer than ``local_dispatch_no_progress_timeout_seconds`` was
+released, its upstream stream cancelled, and the client retried into a
+full re-prefill forever. Extension stops when the first actual data chunk
+arrives (the existing chunk-refresh path takes over) or the stream ends,
+and the max-prefill ceiling still bounds a liveness-extended wedge.
+When progress is unobservable AND the slot is not processing, the lease
+keeps the adaptive token-estimate value applied at acquisition (fallback)
+rather than being dropped.
 
 These tests verify hermetically (fake server state, no live llama-server):
 
@@ -470,33 +477,172 @@ async def test_extend_lease_does_not_extend_when_progress_stalls(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_extend_lease_does_not_extend_on_liveness_alone(monkeypatch):
-    """LP-0MUCEFB8E003YVFF: liveness-only extension is removed.
+async def test_extend_lease_on_liveness_alone(monkeypatch):
+    """LP-0MUXQ5QL40027VZ4: liveness-only extension is restored.
 
     llama.cpp b8782 reports no numeric progress but the slot is observed
-    processing (is_processing=True). Previously this extended the lease
-    indefinitely, allowing a stuck (no-progress) request to hold the
-    dispatch pool forever. Now the lease is NOT extended on liveness alone;
-    the no-progress watchdog in ``_cleanup_stale_local_dispatch`` releases
-    such records after ``local_dispatch_no_progress_timeout_seconds``."""
+    processing (is_processing=True). The lease IS extended on that liveness
+    signal (otherwise every prefill longer than
+    ``local_dispatch_no_progress_timeout_seconds`` was killed and retried
+    forever). The numeric progress baseline is preserved (never ``None``) and
+    ``last_progress_ts`` is refreshed so the watchdog does not fire."""
     from proxy.router_helpers import _extend_lease_during_prefill
 
     now = time.monotonic()
     original_expiry = now + 0.3
     srv = _make_srv(records={
-        "sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": original_expiry},
+        "sess-1": {
+            "backend": "local",
+            "started_at": now,
+            "active": True,
+            "expires_at": original_expiry,
+            "last_progress": 0,
+            "last_progress_ts": now - 500.0,
+        },
     })
     _install_fake_progress(monkeypatch, [(None, True)])
 
     last_progress, extended = await _extend_lease_during_prefill(
-        srv, "sess-1", llama_port=8080, slot_id=None, last_progress=0
+        srv, "sess-1", llama_port=8080, slot_id=0, last_progress=0
     )
-    assert extended is False, (
-        "Lease must NOT be extended on liveness alone (no progress advance)"
+    assert extended is True, (
+        "Lease must be extended on observed liveness when numeric progress "
+        "is unobservable (b8782)"
     )
+    assert last_progress == 0, "Numeric baseline must be preserved, not set to None"
+    record = srv.local_dispatch_records["sess-1"]
+    assert record["expires_at"] > original_expiry
+    assert record["last_progress_ts"] > now - 1.0, (
+        "Liveness must refresh the no-progress clock"
+    )
+    assert any("lease_extended_during_prefill" in line for line in _info_log_lines(srv.logger))
+
+
+@pytest.mark.asyncio
+async def test_watchdog_preserves_liveness_extended_prefill_lease(monkeypatch):
+    """LP-0MUXQ5QL40027VZ4 AC1: a prefill that is alive but reports no numeric
+    progress is extended on liveness and is NOT released by the no-progress
+    watchdog, even after the no-progress timeout has elapsed."""
+    from proxy.router_helpers import (
+        _cleanup_stale_local_dispatch,
+        _extend_lease_during_prefill,
+        _watchdog_no_progress,
+    )
+
+    config = copy.deepcopy(BASE_SERVER_CONFIG)
+    config["server"]["local_dispatch_no_progress_timeout_seconds"] = 180
+    config["server"]["local_dispatch_max_prefill_seconds"] = 900
+    now = time.monotonic()
+    srv = _make_srv(
+        records={
+            "sess-1": {
+                "backend": "local",
+                "started_at": now - 200.0,  # already past the no-progress timeout
+                "active": True,
+                "expires_at": now + 10.0,
+                "last_progress": 0,
+                "last_progress_ts": now - 200.0,
+            },
+        },
+        config=config,
+    )
+
+    # Without a refresh the watchdog considers the record stalled.
+    assert _watchdog_no_progress(
+        srv, "sess-1", srv.local_dispatch_records["sess-1"]
+    ) is True
+
+    _install_fake_progress(monkeypatch, [(None, True)])  # alive, no numeric progress
+    last_progress, extended = await _extend_lease_during_prefill(
+        srv, "sess-1", llama_port=8080, slot_id=0, last_progress=0
+    )
+    assert extended is True
     assert last_progress == 0
-    assert srv.local_dispatch_records["sess-1"]["expires_at"] == original_expiry
-    assert not any("lease_extended_during_prefill" in line for line in _info_log_lines(srv.logger))
+
+    record = srv.local_dispatch_records["sess-1"]
+    assert _watchdog_no_progress(srv, "sess-1", record) is False, (
+        "Liveness-refreshed lease must not be released by the no-progress watchdog"
+    )
+    assert await _cleanup_stale_local_dispatch(srv) == 0
+    assert "sess-1" in srv.local_dispatch_records
+
+
+@pytest.mark.asyncio
+async def test_watchdog_releases_prefill_when_slot_not_alive(monkeypatch):
+    """LP-0MUXQ5QL40027VZ4 AC3: when the slot reports neither numeric progress
+    nor liveness the lease is not extended and the watchdog releases it."""
+    from proxy.router_helpers import (
+        _extend_lease_during_prefill,
+        _watchdog_no_progress,
+    )
+
+    config = copy.deepcopy(BASE_SERVER_CONFIG)
+    config["server"]["local_dispatch_no_progress_timeout_seconds"] = 180
+    config["server"]["local_dispatch_max_prefill_seconds"] = 900
+    now = time.monotonic()
+    srv = _make_srv(
+        records={
+            "sess-1": {
+                "backend": "local",
+                "active": True,
+                "started_at": now - 200.0,
+                "expires_at": now + 10.0,
+                "last_progress": 0,
+                "last_progress_ts": now - 200.0,
+            },
+        },
+        config=config,
+    )
+    _install_fake_progress(monkeypatch, [(None, False)])
+
+    last_progress, extended = await _extend_lease_during_prefill(
+        srv, "sess-1", llama_port=8080, slot_id=0, last_progress=0
+    )
+    assert extended is False
+    assert last_progress == 0
+    assert _watchdog_no_progress(
+        srv, "sess-1", srv.local_dispatch_records["sess-1"]
+    ) is True, "A prefill with no progress and no liveness must be released"
+
+
+@pytest.mark.asyncio
+async def test_watchdog_releases_liveness_extended_lease_at_max_prefill_ceiling(monkeypatch):
+    """LP-0MUXQ5QL40027VZ4: liveness cannot hold a lease forever. A wedged slot
+    that keeps reporting ``is_processing`` is still released once the record's
+    total active time exceeds ``local_dispatch_max_prefill_seconds``."""
+    from proxy.router_helpers import (
+        _extend_lease_during_prefill,
+        _watchdog_no_progress,
+    )
+
+    config = copy.deepcopy(BASE_SERVER_CONFIG)
+    config["server"]["local_dispatch_no_progress_timeout_seconds"] = 180
+    config["server"]["local_dispatch_max_prefill_seconds"] = 900
+    now = time.monotonic()
+    srv = _make_srv(
+        records={
+            "sess-1": {
+                "backend": "local",
+                "active": True,
+                "started_at": now - 1000.0,  # beyond the 900s ceiling
+                "expires_at": now + 10.0,
+                "last_progress": 0,
+                "last_progress_ts": now - 1000.0,
+            },
+        },
+        config=config,
+    )
+    _install_fake_progress(monkeypatch, [(None, True)])
+
+    _, extended = await _extend_lease_during_prefill(
+        srv, "sess-1", llama_port=8080, slot_id=0, last_progress=0
+    )
+    assert extended is True
+    record = srv.local_dispatch_records["sess-1"]
+    assert record["last_progress_ts"] > now - 1.0
+    assert _watchdog_no_progress(srv, "sess-1", record) is True, (
+        "The max-prefill ceiling must still bound a liveness-extended lease"
+    )
 
 
 @pytest.mark.asyncio

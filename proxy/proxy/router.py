@@ -1586,7 +1586,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     # session is explicit, poll llama-server for
                                     # observed prefill progress at the configured
                                     # cadence and extend the dispatch lease by
-                                    # the safety buffer while progress advances.
+                                    # the safety buffer while progress advances or
+                                    # the slot is observed processing
+                                    # (LP-0MUXQ5QL40027VZ4: liveness is the only
+                                    # signal b8782 exposes).
                                     # This covers very large prefills beyond the
                                     # adaptive token-estimate cap (1500s); the
                                     # existing chunk-refresh path takes over once

@@ -975,18 +975,26 @@ async def _extend_lease_during_prefill(
     - **Progress advance** — observed numeric progress (per-slot
       ``n_past``/``n_prompt_tokens_processed`` or aggregate
       ``kv_cache_tokens``) is greater than *last_progress*.
+    - **Liveness** — the slot is observed processing (``is_processing``)
+      while no numeric progress is reported (LP-0MUXQ5QL40027VZ4). This is
+      the only usable signal on the deployed llama.cpp b8782 build, which
+      removed the numeric per-slot fields. Without it, every prefill longer
+      than ``local_dispatch_no_progress_timeout_seconds`` was released by
+      the watchdog, its upstream stream cancelled, and the client retried
+      into a fresh full prefill — an unbounded kill/retry loop.
 
-    **Liveness-only extension is removed** (LP-0MUCEFB8E003YVFF). A slot
-    observed as alive (``is_processing``) but with no progress advance
-    no longer extends the lease. This prevents stuck requests from holding
-    the lease indefinitely when the backend produces no output. The
-    no-progress watchdog in ``_cleanup_stale_local_dispatch`` will release
-    such records after ``local_dispatch_no_progress_timeout_seconds``.
+    Liveness cannot hold a lease indefinitely: the
+    ``local_dispatch_max_prefill_seconds`` ceiling in
+    ``_watchdog_no_progress`` still releases a record once its total active
+    time exceeds the ceiling, so a wedged slot that keeps reporting
+    ``is_processing`` is bounded (LP-0MUCEFB8E003YVFF wedge protection).
 
     Returns ``(last_progress, extended)``:
 
-    - *last_progress* is the latest observed progress the caller should
-      pass back on the next poll so extension stops when progress stalls.
+    - *last_progress* is the latest numeric progress the caller should pass
+      back on the next poll so numeric extension stops when progress stalls.
+      When only liveness is observable the caller's previous baseline is
+      returned unchanged (never ``None``).
     - *extended* is True when ``expires_at`` was pushed out.
 
     When progress is unobservable AND the slot is not alive, the lease is
@@ -1003,14 +1011,21 @@ async def _extend_lease_during_prefill(
         endpoint=endpoint,
     )
     advancing = progress is not None and progress > last_progress
-    # LP-0MUCEFB8E003YVFF: Only extend on progress advance.  Liveness-only
-    # extension is removed — a slot that is alive but not making progress
-    # will be caught by the no-progress watchdog instead of holding the
-    # lease indefinitely (the wedge condition).
-    if not advancing:
-        # Unobservable or stalled: no extension. Unobservable keeps the
-        # adaptive estimate applied at acquisition (fallback).
+    # LP-0MUXQ5QL40027VZ4: extend on a numeric progress advance OR on
+    # observed liveness during the prefill phase. On the deployed b8782
+    # build numeric progress is unobservable, so liveness is the only usable
+    # signal; the max-prefill ceiling in `_watchdog_no_progress` still bounds
+    # a wedged slot. Liveness-only extension was removed in
+    # LP-0MUCEFB8E003YVFF on the assumption that numeric progress would be
+    # available — it is not, so the removal turned every long prefill into a
+    # watchdog kill.
+    if not advancing and not alive:
+        # Unobservable and not processing: no extension. Keeps the adaptive
+        # estimate applied at acquisition (fallback).
         return last_progress, False
+
+    # Preserve the caller's numeric baseline when only liveness is observed.
+    observed_progress = progress if progress is not None else last_progress
 
     extended = False
     try:
@@ -1022,21 +1037,24 @@ async def _extend_lease_during_prefill(
                 )
                 if record is not None and record.get("active"):
                     record["expires_at"] = time.monotonic() + buffer_seconds
-                    record["last_progress"] = progress
+                    if progress is not None:
+                        record["last_progress"] = progress
                     record["last_progress_ts"] = time.monotonic()
                     extended = True
                     try:
                         srv.logger.info(
-                            "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
+                            "lease_extended_during_prefill session=%s progress=%s "
+                            "alive=%s buffer=%.0fs",
                             session_key if session_key else "unknown",
                             progress,
+                            alive,
                             buffer_seconds,
                         )
                     except Exception:
                         pass
     except Exception:
         pass
-    return progress, extended
+    return observed_progress, extended
 
 
 async def _await_first_byte_with_prefill_monitor(
@@ -1063,8 +1081,10 @@ async def _await_first_byte_with_prefill_monitor(
     prefill-progress poll, so that:
 
     - Progress observed before the first byte extends the dispatch lease via
-      ``_extend_lease_during_prefill`` (progress-only; liveness alone no
-      longer extends — LP-0MUCEFB8E003YVFF).
+      ``_extend_lease_during_prefill`` (numeric progress advance OR observed
+      slot liveness — LP-0MUXQ5QL40027VZ4; liveness was briefly removed in
+      LP-0MUCEFB8E003YVFF and restored because b8782 exposes no numeric
+      prefill progress).
     - A distinct ``prefill_wait_exceeds_threshold`` warning is emitted once
       the initial wait exceeds *warn_seconds*, making a long pre-header wait
       visible in production (previously this path was silent).
@@ -1813,7 +1833,10 @@ def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
 
     # The watchdog only has an opinion about records whose progress clock it
     # owns (``last_progress_ts``). This is set at creation and refreshed on
-    # every observed progress advance / data chunk.
+    # every observed progress advance, every observed prefill liveness signal
+    # (LP-0MUXQ5QL40027VZ4), and every data chunk. A record that is being
+    # liveness-extended therefore falls through to the ``max_prefill`` ceiling
+    # below, which bounds a wedged slot that keeps reporting ``is_processing``.
     last_progress_ts = record.get("last_progress_ts")
     if last_progress_ts is None:
         return False
