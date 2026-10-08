@@ -329,7 +329,7 @@
     "session_slot_skip_when_busy": true,
     "session_slot_timeout_per_token_seconds": 0.0015,
     "session_slot_timeout_seconds": 3.0,
-    "sibling_fallback_cooldown_seconds": 600,
+    "sibling_fallback_cooldown_seconds": 300,
     "sibling_fallback_threshold": 2,
     "sibling_fallback_window_seconds": 600,
     "slot_unavailable_retry_after": 5,
