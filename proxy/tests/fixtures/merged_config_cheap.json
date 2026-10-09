@@ -348,6 +348,7 @@
     "local_dispatch_lease_timeout_seconds": 30,
     "local_large_context_cold_cache_threshold": 42000,
     "local_large_context_economic_bypass_serves_local": true,
+    "local_large_context_economic_ceiling_ratio": 0.3815,
     "local_large_context_warm_cache_threshold": 100000,
     "local_model_ctx_size": 262144,
     "local_slot_exhaustion_retry_attempts": 2,

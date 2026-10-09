@@ -28,6 +28,14 @@
 #
 # Deleting this file makes `mode_config_file()` fall back to `config.yaml`,
 # i.e. the fast profile degrades to the base profile.
+#
+# Inherited large-context thresholds (LP-0MU466L1X003RTHN): fast runs 1 slot x
+# 262144 ctx. The warm threshold is auto-derived as
+#   min(physical 262144//1 - 4096 = 258048,
+#       economic min(round(0.3815 x 262144), 100000) = 100000) = 100000
+# and cold stays the fixed economic 38000, so the (38000, 100000] band is
+# non-empty. No manual recalculation is needed when the slot count or model
+# context size changes.
 # ---------------------------------------------------------------------------
 
 models:

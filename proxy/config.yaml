@@ -648,12 +648,28 @@ server:
   # was a misnomer: this is a context-size cap, not a cache-warmth signal).
   # Set to 0 to disable. Default: 60000.
   #
-  # This is a HARD PHYSICAL CAPACITY LIMIT: it is clamped to the actual
-  # per-slot context (local_model_ctx_size / active_slots, minus output
-  # headroom, LP-0MSAZXXDY005AWA1) so prompts that cannot fit the KV slot are
-  # never routed local. Unlike the cold threshold it is NOT an economic
-  # threshold, so only this value is clamped (LP-0MSI2M5BT004BCDP).
+  # This is the WARM (total-context) upper bound. The effective warm
+  # threshold is resolved through the 3-term model (LP-0MU466L1X003RTHN):
+  #   effective_warm = min(physical per-slot clamp, economic ceiling)
+  #     physical = local_model_ctx_size // slots - 4096 (output headroom)
+  #     economic = round(local_large_context_economic_ceiling_ratio
+  #                      x local_model_ctx_size), capped by this value
+  # The physical term is a hard capacity limit (LP-0MSAZXXDY005AWA1) so
+  # prompts that cannot fit the KV slot are never routed local. The economic
+  # term is the latency/utilisation limit. Only WARM is clamped/capped; COLD
+  # is the economic new-token threshold and is left unchanged so the
+  # (cold, warm] band stays non-empty (LP-0MSI2M5BT004BCDP).
   local_large_context_warm_cache_threshold: 100000
+
+  # Latency-derived economic-ceiling ratio for the WARM threshold
+  # (LP-0MU466L1X003RTHN). The ceiling scales linearly with the model context
+  # size (not the slot count) so a profile change (smaller model, different
+  # slot count) needs no manual threshold recalculation. Shipped 0.3815 =
+  # 100000 / 262144, calibrated to the ~37 tok/s @100K prefill floor: warm
+  # contexts are capped at ~30-38% of the model context. 0 falls back to the
+  # absolute local_large_context_warm_cache_threshold; both 0 disables the
+  # warm cap.
+  local_large_context_economic_ceiling_ratio: 0.3815
 
   # `local_hard_routing_cap_ratio_fast` RETIRED (LP-0MTVXP7DG00613ZB AC3):
   # the single `compaction_trigger_ratio` below is the only session detection

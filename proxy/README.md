@@ -2022,11 +2022,12 @@ contaminate another session's routing decisions:
 
 - **Cold** — The session's backend KV slot is invalidated or has never been
   populated. Large-context requests bypass local at the **cold threshold**
-  (mode-aware, LP-0MSOMVOPH004ATAK: 38K tokens in fast mode, 60K in cheap
+  (mode-aware, LP-0MSOMVOPH004ATAK: 38K tokens in fast mode, 42K in cheap
   mode; configurable via `local_large_context_cold_cache_threshold`).
 - **Warm** — The session has confirmed cache persistence. Large-context requests
-  bypass local only at the **warm threshold** (default: 100K tokens,
-  configurable via `local_large_context_warm_cache_threshold`).
+  bypass local at the **effective warm threshold** — the minimum of the
+  physical per-slot clamp and a latency-derived economic ceiling
+  (LP-0MU466L1X003RTHN; default effective value: 100K tokens in fast mode).
 - **No session ID** — Falls back to model-level cache state (conservative).
   Sessions without a session_id header default to the same cold behavior.
 
@@ -2047,8 +2048,26 @@ disabled, non-streaming proxy-only mode) does **not** warm the cache.
 
 ```yaml
 local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 = disable cold bypass
-local_large_context_warm_cache_threshold: 100000  # tokens; 0 = disable warm bypass
+local_large_context_warm_cache_threshold: 100000  # absolute warm upper bound; 0 = disable
+local_large_context_economic_ceiling_ratio: 0.3815  # warm economic ceiling = ratio x model ctx
 ```
+
+The effective warm threshold is resolved through a **3-term model**
+(LP-0MU466L1X003RTHN):
+
+```
+effective_warm = min(physical per-slot clamp, economic ceiling)
+  physical = local_model_ctx_size // slots - 4096
+  economic = round(local_large_context_economic_ceiling_ratio x local_model_ctx_size)
+             capped by local_large_context_warm_cache_threshold (when > 0)
+```
+
+The **physical** term is a hard capacity limit; the **economic** term is a
+latency/utilisation limit that scales with the model context size (not the slot
+count). The per-slot clamp dominates at 3+ slots; the economic ceiling
+dominates at 1 slot. The absolute `local_large_context_warm_cache_threshold`,
+when set, remains an upper bound; a ratio of `0` falls back to it and both `0`
+disables the warm cap.
 
 The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK) and follows the
 base + overlay model: the base `config.yaml` (and therefore the fast overlay,
@@ -2056,11 +2075,11 @@ which does not override it) uses `38000`; `config-cheap.yaml` overrides it to
 `42000` (LP-0MT50SMU1005ZAD6 / LP-0MT50WCCP000DU00, after the initial 60000
 raise breached the cheap queue guardrails and was reverted —
 LP-0MSRM54YO007YG0K AC7).
-Each value stays below its mode's effective warm clamp (fast resolves to
-`min(100000, 262144//1 − 4096 = 258048) = 100000`; cheap resolves to
-`min(100000, 262144//3 − 4096 = 83285) = 83285`) so the (cold, warm] band never
-collapses (LP-0MSI2M5BT004BCDP). Prompts above the per-slot warm clamp are
-never routed local (`context_too_large` — physical capacity).
+Each value stays below its mode's effective warm threshold (fast resolves to
+`min(258048, min(round(0.3815 x 262144), 100000)) = 100000`; cheap resolves to
+`min(83285, 100000) = 83285`) so the (cold, warm] band never collapses
+(LP-0MSI2M5BT004BCDP). Prompts above the effective warm threshold are never
+routed local (`context_too_large` — physical capacity).
 
 When a threshold is set to `0`, the corresponding bypass is disabled entirely.
 

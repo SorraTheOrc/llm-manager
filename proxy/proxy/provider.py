@@ -1328,41 +1328,123 @@ def effective_per_slot_threshold(ctx_size: int, slots: int) -> int:
     return per_slot - _LOCAL_ROUTING_OUTPUT_HEADROOM
 
 
+# Default large-context warm economic-ceiling ratio
+# (LP-0MU466L1X003RTHN). The ratio scales the warm routing threshold
+# linearly with the local model's total context size so a profile change
+# (smaller model, different slot count) needs no manual threshold
+# recalculation. 0 disables the ratio — the absolute
+# ``local_large_context_warm_cache_threshold`` is then the only upper bound.
+# The shipped ``config.yaml`` sets 0.3815 (= 100000 / 262144), the
+# latency-derived ceiling calibrated to the ~37 tok/s @100K prefill floor.
+_DEFAULT_ECONOMIC_CEILING_RATIO = 0.0
+
+
+def _get_economic_ceiling_ratio(config: dict) -> float:
+    """Read the large-context warm economic-ceiling ratio.
+
+    Supports both nested (``server.local_large_context_economic_ceiling_ratio``)
+    and flat config keys for production/test compatibility.
+
+    Returns 0.0 when unset/disabled (the absolute
+    ``local_large_context_warm_cache_threshold`` is then the only upper
+    bound). Negative or non-numeric values are treated as 0.0.
+    """
+    val = config.get("local_large_context_economic_ceiling_ratio")
+    if val is None:
+        val = config.get("server", {}).get(
+            "local_large_context_economic_ceiling_ratio",
+            _DEFAULT_ECONOMIC_CEILING_RATIO,
+        )
+    try:
+        return max(0.0, float(val or 0))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def effective_large_context_economic_ceiling(config: dict) -> int:
+    """Compute the latency-derived economic ceiling for the warm threshold.
+
+    The ceiling is ``round(ratio × local_model_ctx_size)`` capped by the
+    absolute ``local_large_context_warm_cache_threshold`` when that is > 0.
+    It scales with the **model** context size (not the slot count): the
+    physical per-slot clamp is the capacity term, this is the economic term
+    (LP-0MU466L1X003RTHN).
+
+    Returns 0 (warm cap disabled) when both the ratio and the absolute warm
+    override are 0. When the ratio is 0 the absolute value is used verbatim
+    (legacy behaviour). When ``local_model_ctx_size`` is 0 (scaling disabled)
+    the absolute value is also returned.
+    """
+    ratio = _get_economic_ceiling_ratio(config)
+    warm_override = _get_warm_cache_threshold(config)
+
+    # Both inputs 0 -> warm cap explicitly disabled.
+    if ratio <= 0 and warm_override <= 0:
+        return 0
+    # Ratio disabled or no ctx to scale with -> fall back to the absolute
+    # (legacy) warm override.
+    if ratio <= 0:
+        return warm_override
+    ctx_size = _get_local_model_ctx_size(config)
+    if ctx_size <= 0:
+        return warm_override
+    ceiling = round(ratio * ctx_size)
+    if warm_override > 0:
+        ceiling = min(ceiling, warm_override)
+    return ceiling
+
+
 def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
-    """Return (cold, warm) thresholds clamped to the actual per-slot context.
+    """Return (cold, warm) thresholds under the 3-term warm model.
 
-    The configured cold/warm thresholds were tuned assuming a fixed per-slot
-    context (e.g. 65000). When the real per-slot context is smaller
-    (``local_model_ctx_size`` / active slots, minus output headroom), prompts
-    larger than the slot capacity would be routed local and truncate with
-    ``finish_reason=length`` (context exhaustion) — surfaced by pi as the
-    misleading "maximum output token limit" error (LP-0MSAZXXDY005AWA1).
+    WARM resolves through the 3-term model (LP-0MU466L1X003RTHN):
 
-    The warm threshold is clamped to the actual per-slot context because it
-    represents a **hard capacity limit**: total context exceeding the slot
-    must be routed remote to prevent context exhaustion.
+        warm = min(physical per-slot clamp, latency-derived economic ceiling)
 
-    The cold threshold is an **economic new-token threshold** and must NOT be
-    clamped — it defines the band (cold, warm] where the cached_ratio routing
-    check (Check 2 in ``_should_skip_local``) operates. Clamping cold to the
-    same cap as warm collapses the band to zero width, making the ratio check
+    - **Physical term** — ``effective_per_slot_threshold(ctx_size, slots)``
+      (= ``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``): a hard
+      capacity limit. Prompts above it cannot fit the KV slot and must be
+      routed remote to prevent context exhaustion (``finish_reason=length``,
+      surfaced by pi as the misleading "maximum output token limit" error,
+      LP-0MSAZXXDY005AWA1).
+    - **Economic term** — ``effective_large_context_economic_ceiling(config)``:
+      ``round(ratio × local_model_ctx_size)`` capped by the absolute
+      ``local_large_context_warm_cache_threshold``. A latency/utilisation
+      limit that scales with the model context size, so a profile change
+      needs no manual threshold recalculation.
+
+    The per-slot clamp dominates when ``slots >= 3``; the economic ceiling
+    dominates when ``slots == 1``. The absolute warm config, when set, is
+    retained as an upper bound inside the ceiling helper; a ratio of 0 falls
+    back to the absolute value, and both 0 disables the warm cap.
+
+    COLD is an **economic new-token threshold** and is NOT clamped or scaled:
+    it defines the band (cold, warm] where the cached_ratio routing check
+    (Check 2 in ``_should_skip_local``) operates. Clamping cold to the same
+    cap as warm collapses the band to zero width, making the ratio check
     unreachable dead code (LP-0MSI2M5BT004BCDP).
 
     Returns the configured thresholds unchanged when ``local_model_ctx_size``
-    is 0 (clamp disabled) or per-slot context cannot be computed.
+    is 0 (clamp disabled) or per-slot context cannot be computed: the
+    economic ceiling then falls back to the absolute warm override.
     """
     cold = _get_large_context_threshold(config)
-    warm = _get_warm_cache_threshold(config)
     ctx_size = _get_active_local_ctx_size(config)
     slots = _get_active_local_slots(config)
+
+    # WARM: 3-term model (LP-0MU466L1X003RTHN). The economic ceiling replaces
+    # the raw warm config as the economic term and already folds in the
+    # absolute ``local_large_context_warm_cache_threshold`` as an upper bound.
+    warm = effective_large_context_economic_ceiling(config)
 
     cap = effective_per_slot_threshold(ctx_size, slots)
     if cap <= 0:
         return cold, warm
 
-    # Only clamp the WARM threshold to the per-slot cap (hard capacity limit).
-    # COLD stays as the economic new-token threshold so the (cold, warm] band
-    # remains non-empty for Check 2 (cached_ratio routing) to operate in.
+    # The physical per-slot clamp is a hard capacity limit: warm is capped by
+    # it, but only when the warm cap is enabled (> 0). COLD stays as the
+    # economic new-token threshold so the (cold, warm] band remains non-empty
+    # for Check 2 (cached_ratio routing) to operate in.
     if warm > 0:
         warm = min(warm, cap)
         # LP-0MTBOX45O005LD1S AC4: also clamp warm to the hard-routing cap
