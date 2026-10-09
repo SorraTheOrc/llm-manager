@@ -774,7 +774,12 @@ is a capacity condition, not a provider failure: with
 `contention_queue_max_wait_seconds` for the protected local slot before
 falling back to the remote chain (`contention_queue_dispatch ...
 reason=local_lease_active` when admitted, `contention_queue_fallback_after_queue`
-on budget expiry).
+on budget expiry). The wait predicate accounts for **both** occupancy gates
+(LP-0MU498TWH008DBCI): the generating-only pool AND the prefill-in-flight count,
+so a request denied solely by the router's prefill-aware guard waits for the
+prefill to finish instead of re-dispatching immediately. Each wait logs
+`contention_queue_wait ... saturation=<generating|prefill|none>` so the two
+saturation kinds are distinguishable in observability.
 
 Behavior:
 - **Streaming requests** (`stream: true`) receive periodic SSE comment lines

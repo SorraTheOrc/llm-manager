@@ -3482,6 +3482,57 @@ def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tu
     return (cur_active, max_local)
 
 
+def _local_slot_saturation(
+    config: dict, max_local: int, endpoint: str | None = None
+) -> str | None:
+    """Which local occupancy gate is saturated, or None when a slot is free.
+
+    LP-0MU498TWH008DBCI: the contention queue wake predicate must account for
+    BOTH occupancy gates that ``_try_acquire_local_dispatch`` enforces:
+
+    - ``"generating"`` — the generating-only pool is at capacity
+      (LP-0MTH7JX82000YS5N).
+    - ``"prefill"`` — the prefill-in-flight count is at the slot-pool cap
+      (the router's prefill-aware guard, LP-0MTJET4I5009EHNX).
+    - ``None`` — at least one slot is free for a new dispatch.
+
+    Generating is checked first so a busy generating pool (the common case)
+    is labelled correctly. The prefill counter is global (keyed by session),
+    so it is not endpoint-scoped.
+    """
+    try:
+        cur_local, _ = _local_concurrency_info(config, endpoint=endpoint)
+        if cur_local >= max_local:
+            return "generating"
+    except Exception:
+        pass
+    # Prefill-aware guard (LP-0MTJET4I5009EHNX): a prefill in flight holds a
+    # slot; never admit more concurrent prefills than the slot pool.
+    try:
+        import proxy.server as _srv
+        from proxy.router_helpers import _get_prefill_in_flight_count
+
+        if _get_prefill_in_flight_count(_srv) >= max_local:
+            return "prefill"
+    except Exception:
+        pass
+    return None
+
+
+def _local_slot_free(
+    config: dict, max_local: int, endpoint: str | None = None
+) -> bool:
+    """Whether a local slot is free, accounting for prefill-in-flight.
+
+    A predicate that only watches the generating count would wake a queued
+    request immediately while a prefill is in flight (generating == 0),
+    re-dispatch it, be denied by the router's prefill guard and fall through
+    to a remote provider without ever waiting for the prefill to finish
+    (LP-0MU498TWH008DBCI).
+    """
+    return _local_slot_saturation(config, max_local, endpoint=endpoint) is None
+
+
 # ---------------------------------------------------------------------------
 # Bounded cross-session contention queue (LP-0MSORQVK50012Q4D)
 # ---------------------------------------------------------------------------
@@ -3564,6 +3615,7 @@ async def _maybe_queue_for_local_slot(
     model_config: dict,
     provider_cfg: dict,
     session_id: str | None,
+    endpoint: str | None = None,
 ) -> tuple[str, str | None, float | None]:
     """Queue-wait for a local slot (cheap mode, queue policy) instead of
     immediately falling back to the next remote provider.
@@ -3600,11 +3652,21 @@ async def _maybe_queue_for_local_slot(
 
     from proxy import contention_queue
 
+    # LP-0MU498TWH008DBCI AC5: record which gate the request waits on so
+    # generating-saturation and prefill-saturation waits are distinguishable.
+    _saturation = _local_slot_saturation(config, max_local, endpoint=endpoint)
+    logger.info(
+        "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s",
+        cq["max_wait_seconds"], cq["max_depth"], _saturation or "none",
+    )
+
     _wait_started = _time.monotonic()
     elapsed = await contention_queue.wait_for_local_slot(
         max_wait_seconds=cq["max_wait_seconds"],
         max_depth=cq["max_depth"],
-        slot_free_check=lambda: _get_local_concurrency_info(config)[0] < max_local,
+        slot_free_check=lambda: _local_slot_free(
+            config, max_local, endpoint=endpoint
+        ),
     )
     if elapsed is None:
         # Caps exceeded — the caller falls back. Surface the measured wait so
@@ -6187,6 +6249,7 @@ async def _proxy_with_fallback_cycle(
                         await _maybe_queue_for_local_slot(
                             config, cur_local, max_local, request, body_json,
                             model_config, provider_cfg, _session_id,
+                            endpoint=local_endpoint,
                         )
                     )
                     if _cq_action == "dispatch":
@@ -6694,6 +6757,7 @@ async def _proxy_with_fallback_cycle(
                         await _maybe_queue_for_local_slot(
                             config, _lease_cur, _lease_max, request, body_json,
                             model_config, provider_cfg, _session_id,
+                            endpoint=local_endpoint,
                         )
                     )
                     if _lease_action == "dispatch":
