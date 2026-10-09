@@ -300,7 +300,8 @@ run (`Previous outputs archived to …`).
    `Stream error:`, `slot_save failed`, `backend_retry`, `[remote] upstream
    error`) are parsed in the same streaming pass, collected per window, and
    rendered into the report's **Error analysis** section (taxonomy table
-   **with a Status column** for upstream HTTP errors, plus an
+   **with a Status column** for upstream HTTP errors, plus a
+   **Root-cause breakdown** table for stream errors, an
    **Upstream HTTP error breakdown by status** table, and a
    **Provider/model breakdown** table) plus `errors.csv`/`errors.json`.
    Provider/model attribution is best effort: `Stream finished: reason=error`
@@ -403,9 +404,13 @@ run (`Previous outputs archived to …`).
   derivable from the log line show as `-` in the report and `(unknown)` in
   `errors.json`.
   - `Stream finished: reason=error` — the client-visible synthetic error
-    event (no payload). Remediation: recovery-first silent continue
-    (LP-0MSDP2PDB004GV86) + informative-error fallback
-    (LP-0MSDP2PH20079WQ7).
+    event. It carries the enriched `error_type`/`error_message`/
+    `suggested_action` payload, and each event is classified with a
+    **root cause** (see [Root-cause taxonomy](#root-cause-taxonomy)). The
+    recovery-first re-route and informative-error fallback are **already
+    shipped and live** (LP-0MSETOTWY000SU0Z, LP-0MT60S55M000TK1H), so the
+    report's recommendation states the strategy is live and names the
+    dominant residual cause instead of prescribing adoption.
   - `Stream finished: reason=client_disconnect` — terminal event logged by
     the proxy when a local stream is aborted because the client disconnected
     mid-stream (in-loop `is_disconnected()` check, GeneratorExit, or the
@@ -436,28 +441,37 @@ run (`Previous outputs archived to …`).
     clustering (provider outage). Other 4xx codes carry the specific error
     message in the `errors.csv` evidence column.
 
-  **Root-cause classification of observed `reason=error` events (LP-0MT60S55M000TK1H):**
+  <a id="root-cause-taxonomy"></a>
+  **Root-cause taxonomy for stream errors (LP-0MUQO82LJ008F1FS / LP-0MUQO862C004UT7T):**
 
-  A 2026-08-23 investigation of 13 `Stream finished: reason=error` events plus
-  7 `Stream error` exceptions across `opencode-go/deepseek-v4-flash` and
-  `local/Qwen3` providers classified the root causes into three categories:
+  Every `stream_finish_error` / `stream_error` event is classified with a
+  deterministic `root_cause` from log fields plus restart correlation (a
+  documented ±120s window around a `Mode-switch restart spawned:` /
+  `router-mode restart complete` marker or a mode-switch line):
 
-  1. **Mode-switch restart kills (4 events, local/Qwen3)** — `RemoteProtocolError`
-     when the mode-switch restart spawned during an in-flight stream. Per
-     LP-0MSF9RUSQ007M346 the drain window was deliberately removed ("just
-     restart, the client will deal with it"); in-flight streams die mid-generation.
-     Observed at 00:08:22, 01:00:24×2, and 10:00:03 transition windows.
-  2. **Genuine ReadTimeout (1 event, local/Qwen3)** — llama-server stalled under
-     high contention (available_slots=0, queue depth ~54) at 03:48:41.
-  3. **Remote chain exhaustion (8 events, opencode-go/deepseek-v4-flash)** —
-     empty response / stall retries exhausted (2 attempts) while all sibling
-     providers were in cooldown or usage-limit-reset-pending. Correct handling
-     (enriched error, no re-route after content/tool_calls); not a proxy defect.
+  1. **`upstream_stall_after_content`** — the enriched `error_type` is
+     `stall_after_content`: the upstream stalled *after* content was delivered,
+     so re-route is impossible and the informative error is the correct
+     terminal outcome (by design; no proxy-side action).
+  2. **`mode_switch_restart`** — a `local` stream error within the correlation
+     window of a restart / mode-switch marker: the restart killed the
+     in-flight llama-server stream. The bounded drain bounds the window
+     (LP-0MUQO862J001VBWU).
+  3. **`remote_chain_exhaustion`** — any other remote-provider stream error
+     (empty response / stall retries exhausted while siblings were in
+     cooldown). Correct handling (enriched error, no re-route after
+     content/tool_calls); not a proxy defect. The client-side retry closes
+     the loop (LP-0MUQO862N002559W).
+  4. **`other`** — no restart correlation and no known enriched type; never
+     fabricated. Inspect the `errors.csv` evidence.
 
-  The remaining 7 `Stream error` exceptions were proxy-side exceptions (not
-  `finish_reason: error` events) and are handled by the informative-error
-  fallback (LP-0MSDP2PH20079WQ7). All 13 events are now classified per this
-  taxonomy.
+  The classification is surfaced as the `root_cause` column in `errors.csv`,
+  the `by_root_cause` breakdown in `errors.json`, and the **Root-cause
+  breakdown** table in the report. The 2026-09-25 → 2026-09-26 window split
+  was **24 / 6 / 1** (stall / restart / remote). The prior LP-0MT60S55M000TK1H
+  investigation of 13 `reason=error` events used the same three real classes
+  (restart kills, remote chain exhaustion, one genuine ReadTimeout); this
+  taxonomy generalises it and adds the deterministic restart correlation.
 
 ## Testing
 

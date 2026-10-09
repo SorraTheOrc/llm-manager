@@ -1501,16 +1501,88 @@ class TestErrorRecommendations:
         )
         return res
 
-    def test_stream_errors_trigger_recovery_first_recommendation(self):
+    def test_stream_errors_report_strategy_live_not_adopt(self):
+        """With the enriched payload present, the recommendation states the
+        strategy is live and no longer tells the operator to adopt it
+        (LP-0MUQO862C004UT7T AC1)."""
         errors = [
-            log_parser.LogEvent("stream_finish_error", ERROR_WINDOW_START, provider="opencode-go", model="deepseek-v4-flash")
+            log_parser.LogEvent(
+                "stream_finish_error", ERROR_WINDOW_START,
+                provider="opencode-go", model="deepseek-v4-flash",
+                error_type="stall_after_content",
+                root_cause="upstream_stall_after_content",
+            )
             for _ in range(3)
         ]
         res = self._res_with_errors(errors)
         recs = recommendations.generate_recommendations(res, config=None)
-        titles = " | ".join(r.title.lower() for r in recs)
-        assert "recovery-first" in titles, f"expected recovery-first recommendation, got: {titles}"
-        assert "LP-0MSDP2PDB004GV86" in " | ".join(r.detail for r in recs)
+        stream_recs = [r for r in recs if "stream finish errors" in r.title.lower()]
+        assert stream_recs, "expected a stream-finish recommendation"
+        title = stream_recs[0].title.lower()
+        assert "adopt" not in title
+        assert "is live" in title
+        detail = stream_recs[0].detail
+        assert "already implemented and shipped" in detail
+        assert "strategy is live" in detail
+        # Cites the shipped strategy work items, not the stale adoption pair.
+        assert "LP-0MSETOTWY000SU0Z" in detail
+        assert "LP-0MT60S55M000TK1H" in detail
+        assert "LP-0MSDP2PDB004GV86" not in detail
+
+    def test_stream_errors_name_dominant_residual_cause_with_counts(self):
+        """The recommendation names the dominant residual cause and cites the
+        root-cause counts (LP-0MUQO862C004UT7T AC2)."""
+        errors = (
+            [
+                log_parser.LogEvent(
+                    "stream_finish_error", ERROR_WINDOW_START,
+                    provider="opencode-go", model="deepseek-v4.1-flash",
+                    error_type="stall_after_content",
+                    root_cause="upstream_stall_after_content",
+                )
+                for _ in range(24)
+            ]
+            + [
+                log_parser.LogEvent(
+                    "stream_finish_error", ERROR_WINDOW_START,
+                    provider="local", model="Qwen3",
+                    error_type="stream_exception",
+                    root_cause="mode_switch_restart",
+                )
+                for _ in range(6)
+            ]
+            + [
+                log_parser.LogEvent(
+                    "stream_finish_error", ERROR_WINDOW_START,
+                    provider="deepseek", model="deepseek-flash",
+                    error_type="stream_exception",
+                    root_cause="remote_chain_exhaustion",
+                )
+            ]
+        )
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        stream_rec = next(r for r in recs if "stream finish errors" in r.title.lower())
+        assert "upstream_stall_after_content 24" in stream_rec.detail
+        assert "mode_switch_restart 6" in stream_rec.detail
+        assert "remote_chain_exhaustion 1" in stream_rec.detail
+        assert "Dominant residual cause: upstream_stall_after_content" in stream_rec.detail
+        # The dominant cause is by-design and names no proxy-side action.
+        assert "by design" in stream_rec.detail
+
+    def test_stream_errors_without_enriched_payload_do_not_claim_live(self):
+        errors = [
+            log_parser.LogEvent(
+                "stream_finish_error", ERROR_WINDOW_START,
+                provider="opencode-go", model="deepseek-v4-flash",
+            )
+            for _ in range(3)
+        ]
+        res = self._res_with_errors(errors)
+        recs = recommendations.generate_recommendations(res, config=None)
+        stream_rec = next(r for r in recs if "stream finish errors" in r.title.lower())
+        assert "is live" not in stream_rec.title.lower()
+        assert "cannot be verified" in stream_rec.detail
 
     def test_slot_save_errors_trigger_ctx_pressure_recommendation(self):
         errors = [
@@ -2853,6 +2925,34 @@ class TestEndToEnd:
             "remote_chain_exhaustion": 1,
             "upstream_stall_after_content": 24,
         }
+
+    def test_window_report_removes_stale_recommendation(self, tmp_path):
+        """Regenerating the 2026-09-25 → 2026-09-26 report removes the stale
+        adoption recommendation, states the strategy is live, and renders the
+        24 / 6 / 1 root-cause split (LP-0MUQO862C004UT7T AC3/AC4)."""
+        log_dir = tmp_path / "logs_f2"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            "\n".join(fixtures.window_2026_09_25_lines()) + "\n"
+        )
+        out_dir = tmp_path / "out_f2"
+        reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=fixtures.WINDOW_2026_09_25_START,
+            window_end=fixtures.WINDOW_2026_09_25_END,
+            output_dir=out_dir,
+            config=None,
+        )
+        report_md = (out_dir / "report.md").read_text()
+        # Stale adoption wording is gone; the live-strategy wording is present.
+        assert "adopt recovery-first" not in report_md
+        assert "recovery-first + informative-error strategy is live" in report_md
+        # The root-cause taxonomy renders the 24 / 6 / 1 split.
+        assert "### Root-cause breakdown" in report_md
+        assert "| Stream finished: reason=error | upstream_stall_after_content | 24 |" in report_md
+        assert "| Stream finished: reason=error | mode_switch_restart | 6 |" in report_md
+        assert "| Stream finished: reason=error | remote_chain_exhaustion | 1 |" in report_md
+        assert "Dominant residual cause: upstream_stall_after_content" in report_md
 
     def test_error_root_cause_in_summary_json(self, tmp_path):
         log_dir = tmp_path / "logs_root_summary"

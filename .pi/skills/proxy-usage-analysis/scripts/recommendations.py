@@ -26,7 +26,13 @@ from collections import Counter
 from dataclasses import dataclass
 
 import bucketing
-from aggregation import AnalysisResult
+from aggregation import (
+    ROOT_CAUSE_OTHER,
+    ROOT_CAUSE_REMOTE,
+    ROOT_CAUSE_RESTART,
+    ROOT_CAUSE_STALL,
+    AnalysisResult,
+)
 from log_parser import CONTEXT_TOO_LARGE
 
 # Reasons that point at local slot pool contention.
@@ -459,18 +465,45 @@ def _upstream_429_detail(
     )
 
 
+# Actionable follow-up per residual root cause (LP-0MUQO862C004UT7T). The
+# recovery-first + informative-error strategy is shipped; these describe
+# what, if anything, remains actionable for the dominant residual cause.
+_ROOT_CAUSE_ACTIONS = {
+    ROOT_CAUSE_STALL: (
+        "the upstream stalled after content was delivered, so re-route is "
+        "impossible and the informative error is the correct terminal outcome "
+        "(by design; no proxy-side action)"
+    ),
+    ROOT_CAUSE_RESTART: (
+        "in-flight local streams were killed by a mode-switch / llama-server "
+        "restart; the bounded drain bounds the window (LP-0MUQO862J001VBWU)"
+    ),
+    ROOT_CAUSE_REMOTE: (
+        "the remote provider chain was exhausted; the client-side retry of "
+        "the proxy stream error closes the loop (LP-0MUQO862N002559W)"
+    ),
+    ROOT_CAUSE_OTHER: (
+        "no restart correlation or known enriched type; inspect the raw "
+        "evidence in errors.csv"
+    ),
+}
+
+
 def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
     """Remediation recommendations driven by the parsed error events.
 
     Mirrors the Aug 3 error-analysis plan (LP-0MSDFKCK4007CPMY): stream
-    finish errors point at recovery-first silent continue and informative-
-    error fallback; slot_save ReadTimeouts point at local ctx-size pressure;
-    upstream 429s follow the proxy's own precedence: a usage-limit error with
-    a computable reset (``GoUsageLimitError``, and ``FreeUsageLimitError``
-    when the body carries a reset) takes the account-level reset quarantine
-    (LP-0MSLJPOCC0001ROJ), while a ``FreeUsageLimitError`` without one falls
-    back to the 3-hour per-model cooldown (LP-0MRGU0I91006ODFD); backend_retry
-    timeouts are informational (upstream instability).
+    finish errors are adoption-aware — recovery-first silent continue and
+    informative-error fallback are already shipped, so the recommendation
+    states the strategy is live and breaks the residual events down by the
+    F1 root-cause classification (LP-0MUQO862C004UT7T); slot_save ReadTimeouts
+    point at local ctx-size pressure; upstream 429s follow the proxy's own
+    precedence: a usage-limit error with a computable reset
+    (``GoUsageLimitError``, and ``FreeUsageLimitError`` when the body carries
+    a reset) takes the account-level reset quarantine (LP-0MSLJPOCC0001ROJ),
+    while a ``FreeUsageLimitError`` without one falls back to the 3-hour
+    per-model cooldown (LP-0MRGU0I91006ODFD); backend_retry timeouts are
+    informational (upstream instability).
     """
     recs: list[Recommendation] = []
     if not result.error_events:
@@ -494,7 +527,8 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
             top = ", ".join(f"{p}/{m}" if p and m else (p or m) for (p, m), _ in pm.most_common(3))
             provider_detail = f" Affected: {top}."
         # Informative-error coverage (LP-0MT6322OT00900OX): when the stream
-        # finish errors carry the enriched payload, note the coverage.
+        # finish errors carry the enriched payload, the strategy is live and
+        # no longer needs adopting (LP-0MUQO862C004UT7T).
         enriched = [
             e for e in result.error_events
             if e.kind == "stream_finish_error" and e.error_type
@@ -504,26 +538,59 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
                 f"{len(enriched)} of {stream_finish} carry the enriched error payload "
                 "(type/message/suggested-action) in the log and client-visible SSE event."
             )
+            strategy_note = (
+                "Recovery-first re-route (LP-0MSETOTWY000SU0Z) and informative-error "
+                "fallback (LP-0MT60S55M000TK1H) are already implemented and shipped, so "
+                "the strategy is live — no adoption is required."
+            )
+            title = (
+                "Stream finish errors: recovery-first + informative-error strategy "
+                "is live"
+            )
         else:
-            payload_note = "Log lines carry no error payload; enriched coverage cannot be verified."
+            payload_note = (
+                "Log lines carry no error payload; enriched coverage cannot be verified."
+            )
+            strategy_note = (
+                "Recovery-first re-route and informative-error fallback cannot be "
+                "verified from these logs (no enriched payload present)."
+            )
+            title = (
+                "Stream finish errors: recovery-first + informative-error coverage "
+                "unverified"
+            )
+        # Residual events broken down by the F1 root-cause classification, so
+        # the recommendation names the dominant residual cause and what (if
+        # anything) remains actionable instead of prescribing shipped strategy.
+        breakdown = result.root_cause_counts.get("stream_finish_error", {})
+        breakdown_str = ", ".join(
+            f"{rc} {n}"
+            for rc, n in sorted(breakdown.items(), key=lambda kv: (-kv[1], kv[0]))
+        ) or "unavailable (events not classified)"
+        if breakdown:
+            dominant = max(breakdown.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            dominant_note = (
+                f"Dominant residual cause: {dominant} — "
+                f"{_ROOT_CAUSE_ACTIONS.get(dominant, 'inspect errors.csv')}."
+            )
+        else:
+            dominant_note = (
+                "Residual root causes were not classified for these events "
+                "(classification runs during aggregation)."
+            )
         recs.append(
             Recommendation(
                 severity="high",
-                title="Stream finish errors: adopt recovery-first + informative-error strategy",
+                title=title,
                 detail=(
                     f"{stream_finish} stream(s) ended with the synthetic `finish_reason: error` event. "
-                    f"{payload_note} Recommended "
-                    "proxy-side remediation: (1) recovery-first silent continue — re-route to the next "
-                    "healthy provider before content is delivered (see LP-0MSDP2PDB004GV86); (2) when "
-                    "recovery is impossible, emit an informative error (type/message/provider/suggested "
-                    "action) in the synthetic SSE event (see LP-0MSDP2PH20079WQ7). No client-side change "
-                    "required."
+                    f"{payload_note} {strategy_note} "
+                    f"Residual events by root cause: {breakdown_str}. {dominant_note}"
                 ),
                 evidence=(
                     f"{stream_finish} of {total} error events ({_pct(stream_finish, total):.1f}%) were "
                     f"`stream_finish_error` ({stream_err} `stream_error` proxy exceptions)."
-                    f"{provider_detail} Follow-ups: LP-0MSDP2PDB004GV86 (recovery-first), "
-                    "LP-0MSDP2PH20079WQ7 (informative error)."
+                    f"{provider_detail} Root-cause split: {breakdown_str}."
                 ),
             )
         )

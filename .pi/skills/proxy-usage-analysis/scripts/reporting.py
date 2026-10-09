@@ -890,6 +890,22 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
             f"payload (types: {', '.join(types) or 'n/a'}) — informative-error fallback is "
             "reaching the log line."
         )
+    # Root-cause breakdown (LP-0MUQO862C004UT7T): render the F1 classification
+    # for stream errors so the operator sees which residual cause dominates
+    # (e.g. a stall-after-content terminal class vs restart kills).
+    root_causes = summary.root_cause_counts
+    if root_causes:
+        ap("### Root-cause breakdown")
+        ap("")
+        ap("| Error type | Root cause | Count |")
+        ap("|---|---|---|")
+        for kind in sorted(root_causes):
+            label = ERROR_TYPE_LABELS.get(kind, kind)
+            for rc, count in sorted(
+                root_causes[kind].items(), key=lambda kv: (-kv[1], kv[0])
+            ):
+                ap(f"| {label} | {rc} | {count} |")
+        ap("")
     ap(
         f"- {len(summary.error_events)} error event(s) in window — see `errors.csv` / `errors.json` "
         "and the remediation recommendations below (recovery-first silent continue, informative-error "
