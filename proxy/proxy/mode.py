@@ -108,6 +108,21 @@ MODE_SWITCH_COOLDOWN_SECONDS = 30 * 60
 # window" property is preserved: new requests are refused only during the
 # drain (with a Retry-After), and ``enabled: false`` / ``max_seconds: 0``
 # restores the old "just restart" behavior.
+#
+# Residual restart kills (LP-0MUQO862J001VBWU). The drain bounds but does not
+# eliminate the window: a local stream that outlives ``max_seconds`` is still
+# killed by the restart (drain-deadline case), and the restart script also
+# restarts llama-server, so a stream the proxy no longer tracks can be killed
+# by the server restart itself (llama-server-restart case). The 2026-09-25 →
+# 2026-09-26 window had 6 such local/Qwen3 kills, each within seconds of a
+# restart marker — see the work item spike note. Rather than extend the drain
+# (which would reintroduce a long rejection window), the kills are classified
+# deterministically: ``_wait_for_in_flight_local_streams`` logs a structured
+# ``mode_switch_drain: waited=… remaining=… timed_out=…`` outcome line, and
+# the proxy-usage-analysis root-cause taxonomy (LP-0MUQO82LJ008F1FS)
+# attributes any local stream error near a restart marker to
+# ``mode_switch_restart``. The retained bound stays 30s (fast/cheap) / 90s
+# (base).
 MODE_SWITCH_DRAIN_MAX_SECONDS = 90.0
 MODE_SWITCH_DRAIN_RETRY_MARGIN_SECONDS = 15.0
 
@@ -369,11 +384,24 @@ def _wait_for_in_flight_local_streams(
         # to wait for — proceed to the restart directly.
         _end_drain()
         return
-    while True:
-        active = _count_in_flight_local_streams()
-        if active <= 0 or time.monotonic() >= deadline:
-            break
+    start = time.monotonic()
+    remaining = _count_in_flight_local_streams()
+    while remaining > 0 and time.monotonic() < deadline:
         time.sleep(0.25)
+        remaining = _count_in_flight_local_streams()
+    timed_out = remaining > 0
+    # Structured drain outcome (LP-0MUQO862J001VBWU): future restart kills are
+    # attributable deterministically. ``timed_out=true`` with ``remaining>0``
+    # means streams outlived the bounded drain (drain-deadline case); a kill
+    # after ``remaining=0`` is a llama-server restart kill outside the drain's
+    # control. Both are classified ``mode_switch_restart`` by the
+    # proxy-usage-analysis root-cause taxonomy (LP-0MUQO82LJ008F1FS).
+    logger.info(
+        "mode_switch_drain: waited=%.1fs remaining=%d timed_out=%s",
+        time.monotonic() - start,
+        remaining,
+        timed_out,
+    )
     _end_drain()
 
 

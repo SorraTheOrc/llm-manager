@@ -123,6 +123,53 @@ class TestDrainArming:
         assert restart is False
         assert m.draining() is False
 
+    def test_manual_switch_arms_drain_and_restart(self, drain_config, monkeypatch, tmp_path):
+        """A manual (POST /admin/set-mode) switch arms the drain and spawns
+        exactly one restart (LP-0MUQO862J001VBWU AC3, manual path)."""
+        from proxy import mode as m
+
+        spawned = {"count": 0}
+
+        def _count_spawn():
+            spawned["count"] += 1
+
+        monkeypatch.setattr(m, "_spawn_restart", _count_spawn)
+        monkeypatch.setattr(m, "read_mode", lambda: m.MODE_FAST)
+        monkeypatch.setattr(m, "write_mode", lambda mode: None)
+        monkeypatch.setattr(
+            m, "override_until_file", lambda: tmp_path / ".mode.override-until"
+        )
+
+        persisted, restart = m.set_mode(m.MODE_CHEAP, manual=True)
+        assert restart is True
+        assert persisted == m.MODE_CHEAP
+        assert m.draining() is True
+        assert spawned["count"] == 1
+
+    def test_scheduled_switch_arms_drain(self, drain_config, monkeypatch, tmp_path):
+        """A scheduled transition arms the drain too (LP-0MUQO862J001VBWU AC3,
+        scheduled path)."""
+        from proxy import mode as m
+
+        monkeypatch.setattr(m, "_spawn_restart", lambda: None)
+        monkeypatch.setattr(m, "read_mode", lambda: m.MODE_FAST)
+        monkeypatch.setattr(m, "write_mode", lambda mode: None)
+        monkeypatch.setattr(m, "manual_override_active", lambda: False)
+        monkeypatch.setattr(
+            m, "override_until_file", lambda: tmp_path / ".mode.override-until"
+        )
+        schedule = m.ModeScheduleConfig(
+            {
+                "enabled": True,
+                "entries": [
+                    {"time": "01:00", "mode": "cheap"},
+                    {"time": "10:00", "mode": "fast"},
+                ],
+            }
+        )
+        assert m._mode_scheduler_step(schedule, now=dt_time(1, 0)) is True
+        assert m.draining() is True
+
     def test_drain_retry_after_zero_when_idle(self, drain_config):
         """No drain -> Retry-After of 0."""
         assert mode_module.drain_retry_after() == 0
@@ -196,6 +243,56 @@ class TestDrainWait:
         mode_module._wait_for_in_flight_local_streams()
         assert time.monotonic() - start < 0.5
         assert mode_module.draining() is False
+
+    def test_stream_outliving_deadline_is_bounded_and_logged(
+        self, drain_config, monkeypatch, caplog
+    ):
+        """A stream that outlives the drain deadline does not hold the restart
+        past the bound, and the structured outcome line records the
+        drain-deadline mechanism (LP-0MUQO862J001VBWU AC2/AC3)."""
+        import logging
+
+        import proxy.server as srv_mod
+
+        monkeypatch.setattr(srv_mod, "local_active_queries", 2)
+        drain_config["max_seconds"] = 0.2  # short bounded window
+        mode_module._begin_drain()
+        start = time.monotonic()
+        with caplog.at_level(logging.INFO, logger="llama-proxy"):
+            mode_module._wait_for_in_flight_local_streams()
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0  # bounded — never held hostage by a stuck stream
+        assert mode_module.draining() is False
+        outcome = [
+            r.getMessage()
+            for r in caplog.records
+            if "mode_switch_drain:" in r.getMessage()
+        ]
+        assert outcome, "expected a structured drain-outcome log line"
+        assert "remaining=2" in outcome[-1]
+        assert "timed_out=True" in outcome[-1]
+
+    def test_drain_outcome_logged_zero_when_streams_finish(
+        self, drain_config, monkeypatch, caplog
+    ):
+        """When in-flight streams finish, the outcome line records remaining=0
+        and timed_out=False (llama-server-restart attribution)."""
+        import logging
+
+        import proxy.server as srv_mod
+
+        monkeypatch.setattr(srv_mod, "local_active_queries", 0)
+        mode_module._begin_drain()
+        with caplog.at_level(logging.INFO, logger="llama-proxy"):
+            mode_module._wait_for_in_flight_local_streams()
+        outcome = [
+            r.getMessage()
+            for r in caplog.records
+            if "mode_switch_drain:" in r.getMessage()
+        ]
+        assert outcome, "expected a structured drain-outcome log line"
+        assert "remaining=0" in outcome[-1]
+        assert "timed_out=False" in outcome[-1]
 
 
 # ---------------------------------------------------------------------------
