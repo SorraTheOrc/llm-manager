@@ -38,6 +38,78 @@ from log_parser import (
 
 UNKNOWN_LABEL = "(unknown)"
 
+# Root-cause classification for stream errors (LP-0MUQO82LJ008F1FS).
+# A stream error is the client-visible synthetic ``finish_reason: error``
+# (``stream_finish_error``) or its proxy-side companion (``stream_error``);
+# the taxonomy attributes it to one of four deterministic buckets,
+# validated against the 2026-09-25 → 2026-09-26 window (24 / 6 / 1).
+ROOT_CAUSE_STALL = "upstream_stall_after_content"
+ROOT_CAUSE_RESTART = "mode_switch_restart"
+ROOT_CAUSE_REMOTE = "remote_chain_exhaustion"
+ROOT_CAUSE_OTHER = "other"
+
+# Enriched error type that maps to :data:`ROOT_CAUSE_STALL` (the proxy sets
+# ``error_type=stall_after_content`` on the synthetic finish event).
+ERROR_TYPE_STALL_AFTER_CONTENT = "stall_after_content"
+
+# A restart / mode-switch marker within this many seconds of a local stream
+# error classifies it as a restart kill. Evidence from the 2026-09-25 →
+# 2026-09-26 window: a 17:27:58 restart preceded 2 kills at 17:28:00; a
+# 14:10:19 restart preceded 1 kill; the 10:00 scheduled switch preceded 3
+# kills at 10:00:36-37. The explicit restart marker is logged immediately
+# before the kill and the ``restart_services`` completion marker immediately
+# after, so a symmetric window is used to tolerate log-flush ordering; 120s
+# is far wider than the observed ≤3s gap yet tight enough to avoid
+# correlating an unrelated local error with a distant restart.
+RESTART_CORRELATION_WINDOW_SECONDS = 120
+
+# Error kinds that are stream-level failures and therefore carry a root
+# cause. Other error kinds (slot_save, backend_retry, upstream HTTP) are
+# infrastructure/informational signals and leave ``root_cause`` unset.
+STREAM_ERROR_KINDS = ("stream_finish_error", "stream_error")
+
+
+def _near_restart(ts: datetime, restart_signals: Iterable[datetime]) -> bool:
+    """Return True when *ts* is within the restart-correlation window of a
+    restart or mode-switch marker."""
+    for marker_ts in restart_signals:
+        delta = abs((ts - marker_ts).total_seconds())
+        if delta <= RESTART_CORRELATION_WINDOW_SECONDS:
+            return True
+    return False
+
+
+def classify_root_cause(
+    ev: LogEvent, restart_signals: Iterable[datetime]
+) -> str | None:
+    """Classify a parsed stream error into a deterministic root cause.
+
+    Rules (validated against the 2026-09-25 → 2026-09-26 window):
+
+    - ``upstream_stall_after_content`` — the enriched ``error_type`` is
+      ``stall_after_content`` (the upstream stalled *after* content was
+      delivered, so the proxy cannot re-route).
+    - ``mode_switch_restart`` — a ``local`` stream error correlated with a
+      restart / mode-switch marker within
+      :data:`RESTART_CORRELATION_WINDOW_SECONDS` (the restart killed the
+      in-flight llama-server stream).
+    - ``remote_chain_exhaustion`` — any other remote-provider stream error.
+    - ``other`` — anything else (including a local error with no restart
+      marker); never fabricates a cause from missing evidence.
+
+    Returns ``None`` for non-stream error kinds so the CSV/JSON only carry a
+    root cause where it is meaningful.
+    """
+    if ev.kind not in STREAM_ERROR_KINDS:
+        return None
+    if ev.error_type == ERROR_TYPE_STALL_AFTER_CONTENT:
+        return ROOT_CAUSE_STALL
+    if ev.provider == LOCAL_PROVIDER and _near_restart(ev.ts, restart_signals):
+        return ROOT_CAUSE_RESTART
+    if ev.provider and ev.provider != LOCAL_PROVIDER:
+        return ROOT_CAUSE_REMOTE
+    return ROOT_CAUSE_OTHER
+
 
 def _bucket_key(bucket: str | None) -> str:
     return "cheap" if bucket == "cheap" else "fast"
@@ -157,6 +229,21 @@ class AnalysisResult:
     def error_provider_model_counts(self) -> Counter:
         """Error events grouped by (error type, provider, model)."""
         return Counter((e.kind, e.provider, e.model) for e in self.error_events)
+
+    @property
+    def root_cause_counts(self) -> dict[str, dict[str, int]]:
+        """Stream-error root-cause counts keyed by error kind then root cause
+        (LP-0MUQO82LJ008F1FS).
+
+        Only error events carrying a root cause (``stream_finish_error`` /
+        ``stream_error``) are included, so the breakdown is self-describing
+        and remains data-driven.
+        """
+        out: dict[str, Counter] = {}
+        for e in self.error_events:
+            if e.root_cause:
+                out.setdefault(e.kind, Counter())[e.root_cause] += 1
+        return {kind: dict(counts) for kind, counts in out.items()}
 
     @property
     def upstream_error_by_status(self) -> dict[int, int]:
@@ -787,11 +874,22 @@ def aggregate(
     # Operating-mode transitions across the (margin-widened) event stream:
     # the mode timeline used for fast/cheap session bucketing.
     mode_transitions: list[tuple[datetime, str]] = []
+    # Restart / mode-switch marker timestamps across the (margin-widened)
+    # event stream (LP-0MUQO82LJ008F1FS): used to correlate local stream
+    # errors with the restart that killed them. Collected before the window
+    # filter so an error near the window edge still finds its marker.
+    restart_signals: list[datetime] = []
 
     for ev in events:
         if ev.kind == "mode_switch":
             if ev.mode in ("fast", "cheap"):
                 mode_transitions.append((ev.ts, ev.mode))
+            restart_signals.append(ev.ts)
+            if window_start <= ev.ts <= window_end:
+                total_lines += 1
+            continue
+        if ev.kind == "restart":
+            restart_signals.append(ev.ts)
             if window_start <= ev.ts <= window_end:
                 total_lines += 1
             continue
@@ -862,6 +960,12 @@ def aggregate(
 
     if mode_map is not None:
         mode_map.transitions = sorted(mode_transitions)
+
+    # Root-cause classification (LP-0MUQO82LJ008F1FS): every stream-level
+    # error is attributed to a deterministic cause using the restart / mode
+    # markers collected above. Non-stream errors keep ``root_cause=None``.
+    for ev in error_events:
+        ev.root_cause = classify_root_cause(ev, restart_signals)
 
     sessions: dict[str, SessionStats] = {}
     for sid, builder in builders.items():

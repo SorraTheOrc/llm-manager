@@ -112,13 +112,15 @@ Outputs written to:
   hours).
 - `errors.csv` — one row per **error event** in the window (stream finish
   errors, stream errors, `slot_save` failures, `backend_retry` timeouts,
-  upstream HTTP errors), with error type, timestamp, provider/model, session,
-  config entry, error detail, HTTP status, retry attempt/signal, source log
-  file, and the raw evidence line.
+  upstream HTTP errors), with error type, root cause, timestamp,
+  provider/model, session, config entry, error detail, HTTP status, retry
+  attempt/signal, source log file, and the raw evidence line.
 - `errors.json` — aggregated error counts by type plus a **provider/model
   breakdown** (nested `{error_type: {provider: {model: count}}}`; providers or
-  models not derivable from the log line are keyed `(unknown)`) plus
-  **upstream HTTP error breakdown by status** (`{status: count}` and
+  models not derivable from the log line are keyed `(unknown)`) plus a
+  **root-cause breakdown** for stream errors (`by_root_cause`, nested
+  `{error_type: {root_cause: count}}`; see the root-cause taxonomy below)
+  plus **upstream HTTP error breakdown by status** (`{status: count}` and
   `{status: {provider: count}}`) plus the window bounds.
 - `--json` summary field `compaction` — machine-readable compaction summary
   (same as in the report): `"compaction": {"events": N, "compact_events":

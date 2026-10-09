@@ -21,6 +21,7 @@ import gzip
 import json
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -246,13 +247,18 @@ class TestLogLineParsing:
         assert ev.mode == "cheap"
         assert ev.ts == datetime(2026, 8, 19, 18, 20, 16, 684000)
 
-    def test_manual_mode_switch_enabled_and_restart_lines_ignored(self):
+    def test_manual_mode_switch_enabled_and_restart_lines_not_mode_signals(self):
         """The manual-switch 'enabled with N entries' announcement (it fired
-        for the scheduled 10:00 transition too) and the 'router-mode restart
-        complete' corroboration line carry no reliable mode and stay outside
-        the timeline."""
+        for the scheduled 10:00 transition too) carries no reliable mode and
+        stays outside the timeline. The 'router-mode restart complete'
+        corroboration line is not a mode signal either — since
+        LP-0MUQO82LJ008F1FS it is parsed as a ``restart`` marker (used to
+        correlate stream errors with a restart), never as a ``mode_switch``."""
         assert log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_CHEAP) is None
-        assert log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_RESTART) is None
+        restart_ev = log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_RESTART)
+        assert restart_ev is not None
+        assert restart_ev.kind == "restart"
+        assert restart_ev.kind != "mode_switch"
 
     def test_manual_mode_switch_slot_scheduler_current_ignored(self):
         """slot_scheduler logs ``(current=%d`` with a slot COUNT, not a mode;
@@ -476,6 +482,26 @@ class TestErrorLineParsing:
         assert ev is not None
         assert ev.kind == "stream_finished"
         assert ev.reason == "stop"
+
+    def test_mode_switch_restart_spawned_parsed(self):
+        ev = log_parser.parse_log_line(fixtures.RESTART_SPAWNED_LINE)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "spawned"
+        assert ev.ts == datetime(2026, 9, 25, 17, 27, 58)
+        assert ev.raw and "Mode-switch restart spawned" in ev.raw
+
+    def test_router_mode_restart_complete_parsed(self):
+        ev = log_parser.parse_log_line(fixtures.RESTART_COMPLETE_LINE)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "complete"
+        assert ev.ts == datetime(2026, 9, 25, 17, 28, 5)
+
+    def test_restart_services_non_restart_line_ignored(self):
+        # Only the ``router-mode restart complete`` marker is a restart event;
+        # the generic ``restarting llama-server`` line is not.
+        assert log_parser.parse_log_line(fixtures.RESTART_SERVICES_OTHER_LINE) is None
 
     def test_iter_events_attaches_source_file(self, tmp_path):
         log_dir = tmp_path / "logs"
@@ -968,6 +994,125 @@ class TestErrorAggregation:
         )
         assert res.upstream_error_by_status == {}
         assert res.upstream_error_by_status_provider == {}
+
+
+class TestRootCauseClassification:
+    """Stream errors are attributed a deterministic root cause from log fields
+    plus restart correlation (LP-0MUQO82LJ008F1FS)."""
+
+    def _window_result(self):
+        return aggregation.aggregate(
+            _events(fixtures.window_2026_09_25_lines()),
+            fixtures.WINDOW_2026_09_25_START,
+            fixtures.WINDOW_2026_09_25_END,
+            _schedule(),
+        )
+
+    def _classify(self, lines):
+        return aggregation.aggregate(
+            _events(lines),
+            fixtures.WINDOW_2026_09_25_START,
+            fixtures.WINDOW_2026_09_25_END,
+            _schedule(),
+        )
+
+    def test_window_asserts_24_6_1_split(self):
+        res = self._window_result()
+        finish = [e for e in res.error_events if e.kind == "stream_finish_error"]
+        assert len(finish) == 31
+        counts = Counter(e.root_cause for e in finish)
+        assert counts["upstream_stall_after_content"] == 24
+        assert counts["mode_switch_restart"] == 6
+        assert counts["remote_chain_exhaustion"] == 1
+        # No event is left unclassified.
+        assert None not in counts
+
+    def test_root_cause_counts_breakdown(self):
+        res = self._window_result()
+        assert res.root_cause_counts == {
+            "stream_finish_error": {
+                "mode_switch_restart": 6,
+                "remote_chain_exhaustion": 1,
+                "upstream_stall_after_content": 24,
+            }
+        }
+
+    def test_stall_after_content_classified(self):
+        ts, session = fixtures.STALL_AFTER_CONTENT_EVENTS_2026_09_25[0]
+        line = fixtures._stream_finish_error_line(
+            ts, session, "opencode-go", "deepseek-v4.1-flash",
+            "stall_after_content", "Upstream idle timeout after content delivered",
+            "Retry the request",
+        )
+        res = self._classify([line])
+        (ev,) = res.error_events
+        assert ev.root_cause == "upstream_stall_after_content"
+
+    def test_local_error_near_restart_marker_classified(self):
+        local = fixtures._stream_finish_error_line(
+            "2026-09-25 17:28:00,333", "sess-local", "local", "Qwen3",
+            "stream_exception", "Local stream error (RemoteProtocolError)",
+            "Check llama-server logs",
+        )
+        res = self._classify([fixtures.RESTART_SPAWNED_LINE, local])
+        (ev,) = [e for e in res.error_events if e.kind == "stream_finish_error"]
+        assert ev.root_cause == "mode_switch_restart"
+
+    def test_local_error_near_mode_switch_classified(self):
+        # A scheduled/ manual mode-switch line is also a restart signal even
+        # when the explicit restart-spawn marker is absent from the logs.
+        local = fixtures._stream_finish_error_line(
+            "2026-09-25 10:00:36,989", "sess-local", "local", "Qwen3",
+            "stream_exception", "Local stream error (RemoteProtocolError)",
+            "Check llama-server logs",
+        )
+        mode_switch = (
+            "2026-09-25 10:00:18,041 - INFO - "
+            "Mode scheduler: applied scheduled mode fast"
+        )
+        res = self._classify([mode_switch, local])
+        (ev,) = [e for e in res.error_events if e.kind == "stream_finish_error"]
+        assert ev.root_cause == "mode_switch_restart"
+
+    def test_local_error_without_marker_degrades_to_other(self):
+        # Missing-marker fixture: never fabricates a cause (F1 AC4).
+        res = self._classify([fixtures.LOCAL_ERROR_NO_MARKER_2026_09_25])
+        (ev,) = res.error_events
+        assert ev.root_cause == "other"
+
+    def test_local_error_outside_correlation_window_is_other(self):
+        # The restart marker is 200s before the error — beyond the documented
+        # ±120s correlation window — so it is not attributed to the restart.
+        local = fixtures._stream_finish_error_line(
+            "2026-09-25 17:31:18,000", "sess-local", "local", "Qwen3",
+            "stream_exception", "Local stream error (RemoteProtocolError)",
+            "Check llama-server logs",
+        )
+        res = self._classify([fixtures.RESTART_SPAWNED_LINE, local])
+        (ev,) = [e for e in res.error_events if e.kind == "stream_finish_error"]
+        assert ev.root_cause == "other"
+
+    def test_remote_error_classified_as_chain_exhaustion(self):
+        res = self._classify(fixtures.window_2026_09_25_lines())
+        remote = [
+            e for e in res.error_events
+            if e.kind == "stream_finish_error" and e.provider == "deepseek"
+        ]
+        assert len(remote) == 1
+        assert remote[0].root_cause == "remote_chain_exhaustion"
+
+    def test_non_stream_errors_have_no_root_cause(self):
+        res = aggregation.aggregate(
+            _events(ERROR_LINES), ERROR_WINDOW_START, ERROR_WINDOW_END, _schedule()
+        )
+        non_stream = [
+            e for e in res.error_events
+            if e.kind in ("slot_save_error", "backend_retry", "upstream_http_error")
+        ]
+        assert non_stream
+        assert all(e.root_cause is None for e in non_stream)
+        # Root-cause breakdown therefore only carries stream-error kinds.
+        assert set(res.root_cause_counts) <= {"stream_finish_error", "stream_error"}
 
 
 # ---------------------------------------------------------------------------
@@ -2666,6 +2811,69 @@ class TestEndToEnd:
         bpm = data["errors_by_provider_model"]
         assert bpm["stream_error"]["local"]["Qwen3"] == 1
         assert bpm["upstream_http_error"]["opencode"]["(unknown)"] == 1
+        json.dumps(data)
+
+    def test_error_root_cause_artifacts(self, tmp_path):
+        """The 2026-09-25 → 2026-09-26 window's 24 / 6 / 1 classification is
+        exposed in errors.csv (root_cause column) and errors.json
+        (by_root_cause breakdown), entirely data-driven (F1 AC3/AC4)."""
+        log_dir = tmp_path / "logs_root_cause"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            "\n".join(fixtures.window_2026_09_25_lines()) + "\n"
+        )
+        out_dir = tmp_path / "out_root_cause"
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=fixtures.WINDOW_2026_09_25_START,
+            window_end=fixtures.WINDOW_2026_09_25_END,
+            output_dir=out_dir,
+            config=None,
+        )
+        finish = [
+            e for e in result.summary.error_events if e.kind == "stream_finish_error"
+        ]
+        assert len(finish) == 31
+
+        errors_csv = out_dir / "errors.csv"
+        assert errors_csv.exists()
+        with errors_csv.open() as f:
+            rows = list(csv.DictReader(f))
+        assert "root_cause" in rows[0]
+        finish_rows = [r for r in rows if r["error_type"] == "stream_finish_error"]
+        counts = Counter(r["root_cause"] for r in finish_rows)
+        assert counts["upstream_stall_after_content"] == 24
+        assert counts["mode_switch_restart"] == 6
+        assert counts["remote_chain_exhaustion"] == 1
+        assert "" not in counts  # no unclassified stream-finish row
+
+        data = json.loads((out_dir / "errors.json").read_text())
+        assert data["by_root_cause"]["stream_finish_error"] == {
+            "mode_switch_restart": 6,
+            "remote_chain_exhaustion": 1,
+            "upstream_stall_after_content": 24,
+        }
+
+    def test_error_root_cause_in_summary_json(self, tmp_path):
+        log_dir = tmp_path / "logs_root_summary"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            "\n".join(fixtures.window_2026_09_25_lines()) + "\n"
+        )
+        out_dir = tmp_path / "out_root_summary"
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=fixtures.WINDOW_2026_09_25_START,
+            window_end=fixtures.WINDOW_2026_09_25_END,
+            output_dir=out_dir,
+            config=None,
+        )
+        data = reporting.summary_to_json(result.summary)
+        assert data["errors_by_root_cause"]["stream_finish_error"] == {
+            "mode_switch_restart": 6,
+            "remote_chain_exhaustion": 1,
+            "upstream_stall_after_content": 24,
+        }
         json.dumps(data)
 
     def test_empty_log_dir(self, tmp_path):
