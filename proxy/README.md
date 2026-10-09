@@ -1239,6 +1239,42 @@ impact (recovery-first avoids the pre-content window; informative-error
 covers 100% of client-visible errors), and the emission-site audit
 (`proxy/docs/sse-error-emission-audit.md`).
 
+##### Residual stream-error classes (fix-or-classify, LP-0MUI5B98B0080CIB)
+
+Both strategies above are live, so the residual `finish_reason: error`
+events are no longer "adopt the strategy" work — they break down into a
+deterministic root-cause taxonomy (LP-0MUQO82LJ008F1FS, rendered by the
+`proxy-usage-analysis` skill):
+
+- **`upstream_stall_after_content`** — the upstream stalled *after* content
+  was delivered, so re-route is impossible; the informative error is the
+  correct terminal outcome (by design).
+- **`mode_switch_restart`** — an in-flight **local** stream was killed by a
+  mode-switch / llama-server restart. The bounded drain
+  (`server.mode_switch_drain.max_seconds`, 30s fast/cheap, 90s base) waits
+  for in-flight local streams, but a stream that outlives the bound, or one
+  the proxy no longer tracks when `start-proxy.sh --restart` restarts
+  llama-server, is still killed. The drain outcome is logged
+  (`mode_switch_drain: waited=… remaining=… timed_out=…`) and the
+  `proxy-usage-analysis` skill classifies these deterministically
+  (LP-0MUQO862J001VBWU). The drain is deliberately **not** extended — doing
+  so would reintroduce the long rejection window ruled out by
+  LP-0MSF9RUSQ007M346.
+- **`remote_chain_exhaustion`** — the remote provider chain was exhausted
+  (empty response / stall retries while siblings were in cooldown); correct
+  handling, not a proxy defect.
+
+##### Client-visibility gap: pi-ai drops the enriched error payload
+
+The informative `error` object (`type` / `message` / `suggested_action`) is
+emitted in the SSE event, but `@earendil-works/pi-ai`'s `mapStopReason()`
+collapses `finish_reason: "error"` to the generic string
+`Provider finish_reason: error` and discards the payload before the client
+sees it. Tracked upstream as
+[earendil-works/pi#10752](https://github.com/earendil-works/pi/issues/10752)
+(LP-0MUQO862N002559W). Until it lands, clients retry the generic string (the
+ContextHub recovery extension does this — WL-0MUQO8AEE003G1Z2).
+
 ##### SSE event re-framing guarantee (LP-0MUOBUPBC002GYTL)
 
 Upstream `aiter_bytes()` reads are arbitrary — a single read can contain a

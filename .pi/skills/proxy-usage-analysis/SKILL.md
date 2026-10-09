@@ -473,6 +473,15 @@ run (`Previous outputs archived to …`).
   (restart kills, remote chain exhaustion, one genuine ReadTimeout); this
   taxonomy generalises it and adds the deterministic restart correlation.
 
+  **Client visibility:** the enriched `error` object is emitted in the SSE
+  event, but `@earendil-works/pi-ai`'s `mapStopReason()` collapses
+  `finish_reason: "error"` to the generic `Provider finish_reason: error`
+  and drops `type`/`message`/`suggested_action` before the client sees it.
+  Tracked upstream as
+  [earendil-works/pi#10752](https://github.com/earendil-works/pi/issues/10752);
+  until it lands, the ContextHub recovery extension retries the generic
+  string (WL-0MUQO8AEE003G1Z2, verified by LP-0MUQO862N002559W).
+
 ## Testing
 
 Run the full suite via the test skill (canonical, cached pipeline):
