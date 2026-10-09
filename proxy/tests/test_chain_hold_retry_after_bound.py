@@ -217,3 +217,24 @@ async def test_streaming_hold_still_emits_feedback(monkeypatch):
 
     collected = await _collect_stream(result)
     assert ": chain exhausted" in collected
+
+
+def test_capped_advertisement_still_exceeds_hold_budget():
+    """LP-0MV0MM5R60025XZE AC5: capping the advertised wait must not turn an
+    hours-away exhaustion into a doomed hold. The capped value (3600 s) still
+    exceeds the default hold budget (300 s × 3 = 900 s), so the chain-hold
+    decision is unchanged."""
+    from datetime import UTC, datetime
+    from unittest.mock import patch
+
+    now = datetime(2026, 1, 1, 20, 0, 0, tzinfo=UTC)
+    cfg = {"name": "w", "available_times": ["09:00-17:00"], "type": "remote"}
+    attempts = [{"provider": "w", "status": "outside_time_window"}]
+    with patch("proxy.provider.datetime") as mock_dt:
+        mock_dt.now.return_value = now
+        response = provider._build_time_window_exhausted_response(
+            attempts, {}, False, model_config={"providers": [cfg]}
+        )
+    assert response is not None
+    assert response.headers["Retry-After"] == "3600"
+    assert provider._bounded_hold_seconds(300.0, response, 3) is None

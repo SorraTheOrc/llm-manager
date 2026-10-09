@@ -587,6 +587,20 @@ server:
   # response unchanged. 0 = infinite (keep holding/retrying until the client
   # disconnects).
   chain_hold_max_cycles: 3
+  # Client-facing cap (seconds) on the advertised exhaustion retry timer —
+  # the JSON ``retry_after`` field and the matching ``Retry-After`` header on
+  # both exhaustion 503 variants (``all_exhausted`` /
+  # ``outside_time_window``) (LP-0MV0MM5R60025XZE). The honest computed wait
+  # can be many hours away (the next ``available_times`` window edge or a
+  # usage-limit reset); advertising that verbatim parks an unattended client
+  # far longer than capacity routinely takes to return. Waits at or below the
+  # cap are advertised unchanged; waits above it are clamped to the cap. This
+  # bounds the ADVERTISEMENT only — the true reset stays visible in
+  # ``diagnostics``/``unavailable_providers`` and provider schedules,
+  # cooldowns and quarantine durations are untouched. A missing, malformed or
+  # non-positive value falls back to the default 3600 so the cap is never
+  # accidentally disabled.
+  max_retry_after_seconds: 3600
   # Local slot-exhaustion grace retries before remote fallback.
   # Helps right-after-restart races where slot probes briefly report 0 available.
   local_slot_exhaustion_retry_attempts: 2

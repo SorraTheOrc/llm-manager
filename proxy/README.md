@@ -700,6 +700,25 @@ When all providers are exhausted:
 
 The response contract is **additive-only**: the legacy `error` prose is retained for older clients, the stable `code` discriminator is what new clients should key on, and `retry_after` / the `Retry-After` header, `unavailable_providers` and `diagnostics` remain present where available.
 
+##### Client-facing retry-timer cap (LP-0MV0MM5R60025XZE)
+
+The `retry_after` field and the matching `Retry-After` header are **the same
+value** and are capped at `server.max_retry_after_seconds` (default `3600` = 60
+minutes). The honest computed wait can be many hours (the next `available_times`
+window edge or a usage-limit reset); advertising that verbatim parks an
+unattended client far longer than capacity routinely takes to return. Waits at
+or below the cap are advertised unchanged; waits above it are clamped to the
+cap. This bounds the **advertisement only** — the true reset stays visible in
+`diagnostics` (`reset_in`/`reset_at` for a quota block) and
+`unavailable_providers`, and provider schedules, cooldowns and quarantine
+durations are untouched. A missing, malformed or non-positive value falls back
+to the default `3600` so the cap cannot be accidentally disabled. The trade-off:
+during a genuine long outage a blocked client retries at most once per 60
+minutes, while the operator retains the true reset for diagnosis. The cap is
+well above the chain-hold budget (`chain_hold_seconds × chain_hold_max_cycles` =
+900 s by default), so capping never turns a hours-away exhaustion into a doomed
+hold (LP-0MU56ZKQD005SX08 AC5).
+
 ##### Exhaustion taxonomy (response + log)
 
 | Cause | `diagnostics` status | `unavailable_providers` | Log line |
@@ -714,7 +733,7 @@ The response contract is **additive-only**: the legacy `error` prose is retained
 
 1. **Read the `code`** in the 503 body (or the `Retry-After` header). `all_exhausted` → generic; `outside_time_window` → the schedule is the sole cause; `all_slots_exhausted` → local slot exhaustion (429).
 2. **Check `diagnostics`** for the dominant `status` values and `unavailable_providers` for cooldown/quarantine seconds. A `usage_limit_reset` entry with hours of `reset_in` is a quota block, not a schedule gap.
-3. **Check the `Retry-After` header**: it is the computed time until the soonest real availability (window edge / usage reset / cooldown).
+3. **Check the `Retry-After` header**: it is the computed time until the soonest real availability (window edge / usage reset / cooldown), bounded by `server.max_retry_after_seconds` (default `3600` s). To read the unbounded true wait, use `diagnostics` (`reset_in`/`reset_at`) and `unavailable_providers` (see the retry-timer cap above).
 4. **In `proxy.log`**, follow the `routing_check` / `routing_skip_local` / `compaction_bypass_eval` lines for the session; each carries the model, estimate, cached ratio and — for held requests — `chain_hold_cycle=N`.
 5. **Distinguish a hold cycle from new demand**: a line with `chain_hold_cycle>0` belongs to one held request being retried, not a new client request. `proxy-usage-analysis` should exclude those from demand counts (LP-0MUIEO6IP0030CT3).
 
@@ -740,6 +759,10 @@ than the exhaustion response's real `retry_after`: each hold waits at most
 total budget (`chain_hold_seconds × chain_hold_max_cycles`) the terminal
 response is returned immediately with its accurate `Retry-After` instead of
 sleeping through doomed cycles. A `retry_after` of `0` retries immediately.
+The `retry_after` used here is the client-facing value, so it is also bounded
+by `server.max_retry_after_seconds` (default `3600` s); the default cap stays
+above the default hold budget (`900` s), so the hold decision is unchanged
+(LP-0MV0MM5R60025XZE AC5).
 - **Cycle observability** (LP-0MU5AIAAY003KVM0) — every hold cycle re-runs the
 full chain (local routing + compaction evaluation). `routing_check`,
 `routing_skip_local`, `compaction_bypass_eval` and the hold line carry
