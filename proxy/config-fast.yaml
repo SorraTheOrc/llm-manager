@@ -71,6 +71,16 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
+      # MunitoAI (LP-0MV5UPXKL002MSKB): final remote fallback tier, untimed in
+      # fast mode like the other remote tiers. Declared in full here because
+      # an overlay's provider list replaces the base list wholesale.
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
   author:
     providers:
       - name: local-qwen3
@@ -103,6 +113,14 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
+      # MunitoAI (LP-0MV5UPXKL002MSKB): final remote fallback tier (see plan).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
   code:
     providers:
       - name: local-qwen3
@@ -135,6 +153,14 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
+      # MunitoAI (LP-0MV5UPXKL002MSKB): final remote fallback tier (see plan).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
   compact:
     providers:
       - name: opencode-go-compact

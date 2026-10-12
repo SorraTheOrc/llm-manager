@@ -58,6 +58,15 @@
           "name": "deepseek-flash",
           "provider": "deepseek",
           "type": "remote"
+        },
+        {
+          "name": "munitoai",
+          "type": "remote",
+          "provider": "MunitoAI",
+          "endpoint": "https://api.munito.ai/inference",
+          "api_key_env": "MUNITOAI_API_KEY",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash"
         }
       ],
       "tokenizer": "qwen3"
@@ -107,6 +116,15 @@
           "name": "deepseek-flash",
           "provider": "deepseek",
           "type": "remote"
+        },
+        {
+          "name": "munitoai",
+          "type": "remote",
+          "provider": "MunitoAI",
+          "endpoint": "https://api.munito.ai/inference",
+          "api_key_env": "MUNITOAI_API_KEY",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash"
         }
       ],
       "tokenizer": "qwen3"
@@ -204,6 +222,15 @@
           "name": "deepseek-flash",
           "provider": "deepseek",
           "type": "remote"
+        },
+        {
+          "name": "munitoai",
+          "type": "remote",
+          "provider": "MunitoAI",
+          "endpoint": "https://api.munito.ai/inference",
+          "api_key_env": "MUNITOAI_API_KEY",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash"
         }
       ],
       "tokenizer": "qwen3"
