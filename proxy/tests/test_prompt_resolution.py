@@ -427,3 +427,37 @@ def test_result_dict_has_expected_keys(monkeypatch, tmp_path):
     assert result["content"] == "hello world"
     assert result["mode"] == "prepend"
     assert result["source"] == str(prompt_file)
+
+
+# ---------------------------------------------------------------------------
+# Test: author.txt contains the "Explain names on first mention" rule
+# ---------------------------------------------------------------------------
+
+def test_author_txt_contains_name_introduction_rule():
+    """The author prompt must require project/concept names to be explained on first mention.
+
+    This guards against silent regression of the rule introduced to help
+    readers without deep domain background follow wiki pages.
+    """
+    author_path = Path(__file__).resolve().parent.parent / "prompts" / "author.txt"
+    content = author_path.read_text(encoding="utf-8")
+
+    # Core rule headline must be present
+    assert "Explain names on first mention" in content, \
+        "author.txt must contain the 'Explain names on first mention' rule"
+
+    # Must require explanation of project/tool/framework names
+    assert "project" in content.lower() and "tool" in content.lower(), \
+        "Rule must mention projects and tools"
+
+    # Must reference acronyms and domain-specific terms
+    assert "acronym" in content.lower(), \
+        "Rule must reference acronyms"
+
+    # Must mention widely known terms are exempt
+    assert "python" in content.lower(), \
+        "Rule must name Python as an example of a widely known term"
+
+    # Must require inline explanation (not a separate glossary)
+    assert "inline" in content.lower(), \
+        "Rule must state the explanation is inline at first mention"
