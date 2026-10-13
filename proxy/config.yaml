@@ -614,6 +614,14 @@ server:
   # response unchanged. 0 = infinite (keep holding/retrying until the client
   # disconnects).
   chain_hold_max_cycles: 3
+  # Cumulative budget (seconds) for ALL chain-hold waits across cycles, so
+  # chain_hold_seconds x chain_hold_max_cycles can never hold a request up to
+  # (or past) the client's 900-second queue-timeout deadline — 300 s x 3 = 900 s
+  # raced the client exactly (LP-0MU1S617L002Q9PR AC1). Default 720 s leaves a
+  # 180 s margin below the 900 s deadline; the proxy always responds before the
+  # client gives up. 0 disables the cap (legacy cycle-bounded behaviour).
+  # Values >= 900 are rejected at load as they recreate the exact race.
+  chain_hold_total_seconds: 720
   # Client-facing cap (seconds) on the advertised exhaustion retry timer —
   # the JSON ``retry_after`` field and the matching ``Retry-After`` header on
   # both exhaustion 503 variants (``all_exhausted`` /
@@ -846,6 +854,14 @@ server:
   #   byte within this window is aborted server-side with a retryable 503 +
   #   Retry-After (LP-0MUCEFB8E003YVFF). Checking this ceiling is what makes the
   #   in-flight liveness signal safe (LP-0MUXTW4MD003TVIC).
+  # local_dispatch_first_byte_timeout_seconds: Initial first-byte wait ceiling
+  #   for a local dispatch (default 840s; 0 disables; LP-0MV6BR3HI00957PF). The
+  #   default is STRICTLY BELOW the client's 900-second queue-timeout deadline so
+  #   the proxy always returns a retryable 503 before the client gives up — the
+  #   legacy first-byte default of 900 s (reusing the lifetime wedge knob) raced
+  #   the client exactly and logged ``dispatch_first_byte_timeout ...
+  #   ceiling=900s``. The lifetime wedge bound above is unchanged; a healthy
+  #   stream that delivered its first byte keeps its full lifetime window.
   # local_dispatch_prefill_observability_warn_seconds: Threshold (default 30s) at
   #   which a long initial first-byte wait logs a ``prefill_wait_exceeds_threshold``
   #   warning. While awaiting the SSE response headers, the proxy polls prefill

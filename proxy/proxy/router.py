@@ -115,8 +115,8 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _estimate_tokens_sent,
     _extend_lease_during_prefill,
     _get_chunk_refresh_buffer_seconds,
+    _get_first_byte_timeout_seconds,
     _get_lease_timeout_seconds,
-    _get_max_prefill_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
@@ -1270,16 +1270,19 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
                     # Enter the stream with bounded retries on transient backend failures.
                     # LP-0MUCEFB8E003YVFF: bound the first-byte wait by
-                    # ``local_dispatch_max_prefill_seconds`` so a local request
+                    # ``local_dispatch_first_byte_timeout_seconds`` so a local request
                     # that never reaches first byte is aborted server-side (lease
                     # released by the cleanup path) and the client receives a
-                    # retryable 503 instead of hanging indefinitely.
+                    # retryable 503 instead of hanging indefinitely. The default 840 s
+                    # sits strictly below the client's 900 s queue-timeout deadline; the
+                    # lifetime wedge bound stays ``local_dispatch_max_prefill_seconds``
+                    # (LP-0MV6BR3HI00957PF).
                     # LP-0MUCEFC0T009V7ZY: while awaiting the first byte, poll
                     # prefill progress concurrently so progress is observable
                     # before the SSE headers arrive (previously the poll sat
                     # after ``stream_cm.__aenter__`` and never ran during a real
                     # prefill).
-                    _first_byte_ceiling = _get_max_prefill_seconds(srv)
+                    _first_byte_ceiling = _get_first_byte_timeout_seconds(srv)
                     _first_byte_poll_seconds = float(
                         server_config.get(
                             "local_dispatch_lease_prefill_poll_seconds", 10

@@ -309,6 +309,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 #: files. Merging the base into fast/cheap intentionally inherits exactly
 #: these (the "config.yaml authoritative" behavioural change).
 BASE_ONLY_SERVER_KEYS = {
+    "chain_hold_total_seconds",
     "local_large_context_economic_ceiling_ratio",
     "max_retry_after_seconds",
     "session_single_flight_duplicate_retry_after_seconds",

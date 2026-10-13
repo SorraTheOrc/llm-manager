@@ -2876,6 +2876,35 @@ def _get_chain_hold_max_cycles(config: dict) -> int:
         return 3
 
 
+# Cumulative chain-hold budget across all cycles (see
+# ``_get_chain_hold_total_seconds``): strictly below the client's 900 s
+# queue-timeout deadline so an exhausted chain can never hold a request to
+# (or past) the client limit.
+_CHAIN_HOLD_TOTAL_DEFAULT = 720.0
+
+
+def _get_chain_hold_total_seconds(config: dict) -> float:
+    """Read ``chain_hold_total_seconds`` from config (flat or ``server.*``).
+
+    Cumulative wall-clock budget for ALL chain-hold waits across cycles
+    (streaming + non-streaming). ``chain_hold_seconds * chain_hold_max_cycles``
+    can otherwise reach exactly the client's 900-second queue-timeout deadline
+    (300 s x 3 = 900 s) — the AC1 gap from the LP-0MU1S617L002Q9PR audit. The
+    default 720 s leaves a 180 s margin below that deadline so the proxy always
+    responds before the client gives up. 0 disables the cap (legacy
+    cycle-bounded behaviour).
+    """
+    val = config.get("chain_hold_total_seconds")
+    if val is None:
+        val = config.get("server", {}).get(
+            "chain_hold_total_seconds", _CHAIN_HOLD_TOTAL_DEFAULT
+        )
+    try:
+        return max(0.0, float(val or 0))
+    except (ValueError, TypeError):
+        return _CHAIN_HOLD_TOTAL_DEFAULT
+
+
 def validate_chain_hold_config(config: dict) -> list[str]:
     """Validate the chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5).
 
@@ -2883,6 +2912,11 @@ def validate_chain_hold_config(config: dict) -> list[str]:
     ``server.*``) are non-negative numbers when present, and flags the
     pathological combination of a zero hold interval with an unlimited cycle
     count (an unbounded busy-retry loop).
+
+    ``chain_hold_total_seconds`` (LP-0MV6BR3HI00957PF) must be a non-negative
+    number and, when non-zero, must sit strictly below the client's 900-second
+    queue-timeout deadline — a budget at or above 900 s recreates the exact
+    race the bound exists to prevent.
 
     Returns a list of human-readable problem descriptions (empty when the
     config is consistent).
@@ -2916,6 +2950,26 @@ def validate_chain_hold_config(config: dict) -> list[str]:
         except (ValueError, TypeError):
             problems.append(
                 f"server.chain_hold_max_cycles must be an integer (got {max_cycles!r})"
+            )
+
+    total = config.get("chain_hold_total_seconds")
+    if total is None:
+        total = server_cfg.get("chain_hold_total_seconds")
+    if total is not None:
+        try:
+            total_f = float(total)
+            if total_f < 0:
+                problems.append(
+                    f"server.chain_hold_total_seconds must be >= 0 (got {total!r})"
+                )
+            elif total_f > 0 and total_f >= 900:
+                problems.append(
+                    "server.chain_hold_total_seconds must be strictly below "
+                    f"the client's 900 s queue-timeout deadline (got {total!r})"
+                )
+        except (ValueError, TypeError):
+            problems.append(
+                f"server.chain_hold_total_seconds must be a number (got {total!r})"
             )
 
     # Unbounded busy-retry: zero hold interval with unlimited cycles.
@@ -5369,6 +5423,29 @@ def _get_chain_hold_cycle(request) -> int:
         return 0
 
 
+def _set_chain_hold_consumed(request, consumed: float) -> None:
+    """Record the cumulative chain-hold budget consumed on the request.
+
+    Mirrors ``_set_chain_hold_cycle``: the streaming hold generator and the
+    non-streaming hold loop share the running total via ``request.state`` so
+    the cumulative budget (``chain_hold_total_seconds``) is never exceeded
+    across the two code paths (LP-0MV6BR3HI00957PF). Fail-open: test stubs
+    without a ``state`` do not carry the field.
+    """
+    try:
+        request.state.chain_hold_consumed = float(consumed)
+    except Exception:
+        pass
+
+
+def _get_chain_hold_consumed(request, default: float = 0.0) -> float:
+    """Return the cumulative chain-hold budget consumed (0.0 when unset)."""
+    try:
+        return float(getattr(request.state, "chain_hold_consumed", default))
+    except Exception:
+        return default
+
+
 def _exhaustion_retry_after(response: Response) -> int | None:
     """Return an exhaustion response's ``Retry-After`` in seconds.
 
@@ -5437,6 +5514,8 @@ def _build_streaming_hold_response(
     next_cycle: int,
     max_cycles: int,
     hold_seconds: float,
+    total_budget: float,
+    consumed: float,
     exhaustion_response: Response,
 ) -> StreamingResponse:
     """Build the streaming response that delivers the chain hold (AC3/AC4).
@@ -5448,13 +5527,25 @@ def _build_streaming_hold_response(
     3. on success, replays the cycle's response body after the comments;
     4. on exhaustion, repeats from step 1 until the cycle bound is reached,
        then emits the terminal exhaustion body as an SSE ``data:`` chunk.
+
+    *total_budget* (``chain_hold_total_seconds``) caps the CUMULATIVE hold
+    time across all cycles so the request can never be held to (or past) the
+    client's 900-second queue-timeout deadline; *consumed* carries the budget
+    already spent before this streaming response began (LP-0MV6BR3HI00957PF).
+    A zero/disabled budget preserves the legacy cycle-bounded behaviour.
     """
     first_provider = _first_provider_name(model_config)
 
     async def _gen():
+        nonlocal consumed
         cycle = next_cycle
         current_exhaustion = exhaustion_response
         while True:
+            if total_budget > 0 and consumed >= total_budget:
+                # Cumulative hold budget spent — surface the exhaustion now
+                # instead of holding through doomed cycles.
+                yield _response_to_sse_bytes(current_exhaustion)
+                return
             effective_hold = _bounded_hold_seconds(
                 hold_seconds, current_exhaustion, max_cycles
             )
@@ -5463,6 +5554,10 @@ def _build_streaming_hold_response(
                 # immediately instead of holding through doomed cycles.
                 yield _response_to_sse_bytes(current_exhaustion)
                 return
+            if total_budget > 0 and consumed + effective_hold > total_budget:
+                effective_hold = max(0.0, total_budget - consumed)
+            consumed += effective_hold
+            _set_chain_hold_consumed(request, consumed)
             _log_chain_hold_start(path, effective_hold, cycle, max_cycles)
             comment = _build_chain_hold_comment(
                 first_provider,
@@ -5533,6 +5628,9 @@ async def _run_chain_cycles(
 
     hold_seconds = _get_chain_hold_seconds(config)
     max_cycles = _get_chain_hold_max_cycles(config)
+    total_budget = _get_chain_hold_total_seconds(config)
+    consumed = 0.0
+    _set_chain_hold_consumed(request, 0.0)
 
     # Semantics (LP-0MU5AIAAY003KVM0, option (a) — decided): every hold cycle
     # re-runs the FULL fallback cycle, including local routing and compaction
@@ -5561,6 +5659,17 @@ async def _run_chain_cycles(
                 # response immediately with its accurate Retry-After
                 # (LP-0MU56ZKQD005SX08).
                 return exc.response
+            # Cumulative hold budget (LP-0MV6BR3HI00957PF): ``chain_hold_seconds
+            # * chain_hold_max_cycles`` can reach exactly the client's 900 s
+            # deadline; the total budget caps ALL holds across cycles so the
+            # proxy always responds first. Zero disables the cap.
+            if total_budget > 0:
+                if consumed >= total_budget:
+                    return exc.response
+                if consumed + effective_hold > total_budget:
+                    effective_hold = max(0.0, total_budget - consumed)
+            consumed += effective_hold
+            _set_chain_hold_consumed(request, consumed)
             _log_chain_hold_start(path, effective_hold, cycle, max_cycles)
             if await _request_is_streaming(request):
                 # Streaming: return a streaming response that emits SSE hold
@@ -5575,6 +5684,8 @@ async def _run_chain_cycles(
                     next_cycle=cycle + 1,
                     max_cycles=max_cycles,
                     hold_seconds=hold_seconds,
+                    total_budget=total_budget,
+                    consumed=consumed,
                     exhaustion_response=exc.response,
                 )
             # Non-streaming: silent (deferred) hold, then a new cycle from

@@ -829,6 +829,27 @@ def _get_max_prefill_seconds(srv) -> float:
         return 900.0
 
 
+def _get_first_byte_timeout_seconds(srv) -> float:
+    """Return the initial first-byte wait ceiling in seconds (default 840).
+
+    Bounds how long a local dispatch may wait for its first data chunk before
+    the proxy aborts server-side with a retryable 503 (LP-0MUCEFB8E003YVFF).
+    The default is deliberately STRICTLY BELOW the client's 900-second
+    queue-timeout deadline, so the proxy always responds before the client
+    gives up — the legacy default of ``local_dispatch_max_prefill_seconds``
+    (900) raced the client exactly (``dispatch_first_byte_timeout ...
+    ceiling=900s``, LP-0MU1S617L002Q9PR AC1). The lifetime wedge bound
+    (``local_dispatch_max_prefill_seconds``) is unchanged. Returns 0 to
+    disable the first-byte ceiling entirely.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_dispatch_first_byte_timeout_seconds", 840)
+        return float(raw) if raw is not None else 840.0
+    except Exception:
+        return 840.0
+
+
 async def _query_prefill_progress(
     srv,
     llama_port: int,
