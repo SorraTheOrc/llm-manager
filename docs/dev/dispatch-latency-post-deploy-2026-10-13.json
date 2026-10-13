@@ -1,0 +1,109 @@
+{
+  "meta": {
+    "tool": "scripts/dispatch_latency_verification.py",
+    "work_item": "LP-0MV6BR3PT001WBEI",
+    "generated_at": "2026-10-13T15:59:51",
+    "log_dir": "/var/log/llama-proxy",
+    "files": [
+      "proxy.log",
+      "proxy.log-2026-10-07_00.gz",
+      "proxy.log-2026-10-08_00.gz",
+      "proxy.log-2026-10-09_00.gz",
+      "proxy.log-2026-10-10_00.gz",
+      "proxy.log-2026-10-11_00.gz",
+      "proxy.log-2026-10-12_00.gz",
+      "proxy.log-2026-10-13_00",
+      "proxy.log.2026-10-07_01.gz",
+      "proxy.log.2026-10-09_00.gz",
+      "proxy.log.2026-10-10_02.gz",
+      "proxy.log.2026-10-11_00.gz",
+      "proxy.log.2026-10-11_10.gz",
+      "proxy.log.2026-10-12_00.gz",
+      "proxy.log.2026-10-13_00"
+    ],
+    "since": "2026-10-13 09:00:00",
+    "until": null,
+    "label": "post-deploy-2026-10-13",
+    "targets": {
+      "warm_p99_service_ms_target": 60000.0,
+      "warm_p99_percentile": 99.0,
+      "legacy_ceiling_is_900": 900
+    }
+  },
+  "metrics": {
+    "window": {
+      "first_seen": "2026-10-13 09:00:05",
+      "last_seen": "2026-10-13 15:59:45",
+      "since": "2026-10-13 09:00:00",
+      "until": null
+    },
+    "ac1": {
+      "dispatch_first_byte_timeout_total": 4,
+      "dispatch_first_byte_timeout_ceiling_900s": 0,
+      "dispatch_first_byte_timeout_ceiling_other": 4,
+      "chain_hold_starts": 0,
+      "chain_hold_total_seconds": 0.0,
+      "client_queue_timeout_relays": 0
+    },
+    "ac2": {
+      "warm_service_ms": {
+        "n": 86,
+        "p50": 4332.6,
+        "p90": 88086.3,
+        "p99": 307634.0,
+        "max": 395611.0
+      },
+      "cold_service_ms": {
+        "n": 101,
+        "p50": 51187.9,
+        "p90": 186591.9,
+        "p99": 722601.3,
+        "max": 760782.5
+      },
+      "warm_total_ms": {
+        "n": 86,
+        "p50": 4334.3,
+        "p90": 88086.9,
+        "p99": 307635.6,
+        "max": 395612.6
+      },
+      "cold_total_ms": {
+        "n": 101,
+        "p50": 51188.6,
+        "p90": 186593.3,
+        "p99": 722601.9,
+        "max": 760783.8
+      },
+      "queue_wait_ms": {
+        "n": 187,
+        "p50": 0.9,
+        "p90": 1.6,
+        "p99": 2.6,
+        "max": 3.4
+      }
+    }
+  },
+  "verdict": {
+    "verdict": "WARN",
+    "checks": [
+      {
+        "target": "AC1: zero ceiling=900s dispatch_first_byte_timeout",
+        "observed": 0,
+        "pass": true
+      },
+      {
+        "target": "AC2: warm p99 < 60 s service time",
+        "observed_ms": 307634.0,
+        "pass": false
+      },
+      {
+        "target": "AC2 (context): queue-wait p99 within contention cap",
+        "observed_ms": 2.6,
+        "pass": true
+      }
+    ],
+    "notes": [
+      "AC1 24 h post-change window not yet closed; a zero legacy-ceiling count is a precondition, not proof, until the window elapses."
+    ]
+  }
+}
