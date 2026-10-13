@@ -850,6 +850,48 @@ def _get_first_byte_timeout_seconds(srv) -> float:
         return 840.0
 
 
+#: Cached-token ratio at or above which a local dispatch counts as a
+#: warm-cache request for the re-scoped AC2 first-byte metric
+#: (LP-0MV6CFMU9005WU2E). Matching the routing intent: a request whose prompt
+#: is largely served from the prompt cache is warm.
+_WARM_CACHE_RATIO_THRESHOLD = 0.5
+
+
+def _classify_cache_state(cached_ratio: float) -> str:
+    """Return ``"warm"`` when *cached_ratio* >= _WARM_CACHE_RATIO_THRESHOLD.
+
+    Fail-open: non-numeric / NaN / missing values classify COLD so the
+    warm-cache p99 target is never diluted by unknown cases.
+    """
+    try:
+        return (
+            "warm"
+            if float(cached_ratio) >= _WARM_CACHE_RATIO_THRESHOLD
+            else "cold"
+        )
+    except (TypeError, ValueError):
+        return "cold"
+
+
+def _lookup_dispatch_cache_state(model_name: str, session_id: str | None):
+    """Return ``(cache_state, cached_ratio)`` for a local dispatch.
+
+    Reads the routing cached-token ratio for ``(model_name, session_id)``
+    (``provider._get_cached_ratio`` — 0.0 when absent/unknown). Feeds the
+    ``dispatch_first_byte_ms`` log line so warm-cache dispatches are
+    identifiable and the warm-cache p99 can be measured
+    (LP-0MV6CFMU9005WU2E). Never raises: the metric path must not break the
+    streaming loop (provider failures classify cold/0.0).
+    """
+    try:
+        from proxy.provider import _get_cached_ratio
+
+        ratio = float(_get_cached_ratio(model_name, session_id) or 0.0)
+    except Exception:
+        return "cold", 0.0
+    return _classify_cache_state(ratio), ratio
+
+
 async def _query_prefill_progress(
     srv,
     llama_port: int,

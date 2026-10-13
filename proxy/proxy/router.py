@@ -1191,6 +1191,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
     # Dispatch→first-byte capture (LP-0MTJET616005S7PN: prefill/audit latency).
     _dispatch_start = None
+    _slot_acquired_ts = None
     try:
         _dispatch_start = time.monotonic()
     except Exception:
@@ -1238,6 +1239,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         try:
             async with session_guard:
                 async with slot_guard:
+                    # Queue-wait split (LP-0MV6CFMU9005WU2E): the moment the
+                    # slot lock is held marks the end of the single-slot queue
+                    # wait; ``queue_wait_ms`` = this minus ``_dispatch_start``
+                    # so the warm-cache first-byte metric excludes contention.
+                    try:
+                        _slot_acquired_ts = time.monotonic()
+                    except Exception:
+                        pass
                     if slot_enabled:
                         restored = await _restore_slot_snapshot(
                             llama_port,
@@ -1748,10 +1757,34 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                             _now = time.monotonic()
                                             _delta = (_now - _dispatch_start) if isinstance(_dispatch_start, float) else None
                                             if _delta is not None and _delta >= 0:
+                                                # AC2 re-scope (LP-0MV6CFMU9005WU2E): segment
+                                                # warm/cold from the routing cached_ratio and
+                                                # separate the single-slot queue wait from
+                                                # service time. dispatch_first_byte_ms stays the
+                                                # total (includes queue); dispatch_to_first_byte_ms
+                                                # is the service time once the slot is held, so the
+                                                # warm-cache p99 (excluding contention) is measurable.
+                                                try:
+                                                    from proxy.router_helpers import _lookup_dispatch_cache_state
+                                                except Exception:
+                                                    _cache_state, _cached_ratio = "cold", 0.0
+                                                else:
+                                                    _cache_state, _cached_ratio = _lookup_dispatch_cache_state(
+                                                        model_name, session_id
+                                                    )
+                                                _qwait_ms = 0.0
+                                                if isinstance(_slot_acquired_ts, float) and isinstance(_dispatch_start, float):
+                                                    _qwait_ms = max(0.0, (_slot_acquired_ts - _dispatch_start) * 1000.0)
+                                                _first_byte_total_ms = _delta * 1000.0
+                                                _first_byte_service_ms = max(0.0, _first_byte_total_ms - _qwait_ms)
                                                 srv.logger.info(
-                                                    "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f session=%s model=%s",
-                                                    _delta * 1000.0,
-                                                    _delta * 1000.0,
+                                                    "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f "
+                                                    "cache_state=%s cached_ratio=%.3f queue_wait_ms=%.1f session=%s model=%s",
+                                                    _first_byte_total_ms,
+                                                    _first_byte_service_ms,
+                                                    _cache_state,
+                                                    _cached_ratio,
+                                                    _qwait_ms,
                                                     session_id or "unknown",
                                                     model_name or "unknown",
                                                 )

@@ -131,6 +131,29 @@ exhaustion response is returned instead of holding again. Regression tests:
 The AC1 24-hour post-change measurement for LP-0MU1S617L002Q9PR is tracked
 in LP-0MV6BR3PT001WBEI.
 
+## Re-scoped AC2 measurement surface (LP-0MV6CFMU9005WU2E)
+
+AC2 of LP-0MU1S617L002Q9PR is re-scoped (producer decision, 2026-10-13) to:
+**warm-cache local dispatches first-byte p99 < 60 s plus a queue-wait cap** —
+cold full-prefill and single-slot contention are excluded from the warm
+target. Each local ``dispatch_first_byte_ms`` log line now carries:
+
+| Field | Meaning |
+|---|---|
+| `dispatch_first_byte_ms` | Total dispatch start → first data chunk (unchanged; includes queue wait) |
+| `dispatch_to_first_byte_ms` | **Service time** once the slot is held (first-byte minus `queue_wait_ms`; previously identical to the total, now the re-scoped warm metric) |
+| `cache_state` | `warm` when the routing `cached_ratio` >= 0.5, else `cold`; fail-open (missing/unknown → `cold`) |
+| `cached_ratio` | Cached-token ratio for the (model, session) pair |
+| `queue_wait_ms` | Dispatch start → slot acquired (the single-slot contention/queue segment) |
+
+Queue wait is separately capped by the existing contention-queue policy
+(`server.contention_queue_max_wait_seconds`, default 60 — pinned by
+test_contention_queue.py), so the re-scoped target reads: for warm-cache
+local dispatches, `dispatch_to_first_byte_ms` p99 < 60 s, with the queue
+wait bounded by the cap. Warm/cold classification and lookup helpers live in
+`proxy/test_dispatch_first_byte_metric.py`-covered helpers
+(`_classify_cache_state`, `_lookup_dispatch_cache_state`).
+
 ## Acceptance criteria coverage
 
 - **AC1 — bounded failover:** `upstream_retry_failover_budget_seconds`
