@@ -25,6 +25,15 @@
           "type": "local"
         },
         {
+          "api_key_env": "MUNITOAI_API_KEY",
+          "endpoint": "https://api.munito.ai/inference",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash",
+          "name": "munitoai",
+          "provider": "MunitoAI",
+          "type": "remote"
+        },
+        {
           "api_key_env": "OPENCODE_3_API_KEY",
           "available_times": [
             "00:00-01:00",
@@ -78,15 +87,6 @@
           "name": "deepseek-flash",
           "provider": "deepseek",
           "type": "remote"
-        },
-        {
-          "name": "munitoai",
-          "type": "remote",
-          "provider": "MunitoAI",
-          "endpoint": "https://api.munito.ai/inference",
-          "api_key_env": "MUNITOAI_API_KEY",
-          "forward_session_headers": false,
-          "model": "deepseek-ai/deepseek-v4-flash"
         }
       ],
       "tokenizer": "qwen3"
@@ -103,6 +103,15 @@
           "type": "local"
         },
         {
+          "api_key_env": "MUNITOAI_API_KEY",
+          "endpoint": "https://api.munito.ai/inference",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash",
+          "name": "munitoai",
+          "provider": "MunitoAI",
+          "type": "remote"
+        },
+        {
           "api_key_env": "OPENCODE_3_API_KEY",
           "available_times": [
             "00:00-01:00",
@@ -156,15 +165,6 @@
           "name": "deepseek-flash",
           "provider": "deepseek",
           "type": "remote"
-        },
-        {
-          "name": "munitoai",
-          "type": "remote",
-          "provider": "MunitoAI",
-          "endpoint": "https://api.munito.ai/inference",
-          "api_key_env": "MUNITOAI_API_KEY",
-          "forward_session_headers": false,
-          "model": "deepseek-ai/deepseek-v4-flash"
         }
       ],
       "tokenizer": "qwen3"
@@ -234,6 +234,15 @@
           "type": "local"
         },
         {
+          "api_key_env": "MUNITOAI_API_KEY",
+          "endpoint": "https://api.munito.ai/inference",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash",
+          "name": "munitoai",
+          "provider": "MunitoAI",
+          "type": "remote"
+        },
+        {
           "api_key_env": "OPENCODE_3_API_KEY",
           "available_times": [
             "00:00-01:00",
@@ -287,15 +296,6 @@
           "name": "deepseek-flash",
           "provider": "deepseek",
           "type": "remote"
-        },
-        {
-          "name": "munitoai",
-          "type": "remote",
-          "provider": "MunitoAI",
-          "endpoint": "https://api.munito.ai/inference",
-          "api_key_env": "MUNITOAI_API_KEY",
-          "forward_session_headers": false,
-          "model": "deepseek-ai/deepseek-v4-flash"
         }
       ],
       "tokenizer": "qwen3"
