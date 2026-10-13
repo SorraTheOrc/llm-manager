@@ -342,6 +342,32 @@ def _install_router_harness(monkeypatch, server_cfg: dict):
     monkeypatch.setattr(router_mod, "_resolve_slot_model_name", lambda model, *_: model)
     monkeypatch.setattr(router_mod, "_check_slot_availability", AsyncMock(return_value=None))
 
+    # Hermetic upstream: an admitted (warm) request must never reach a live
+    # llama-server. Without this mock the warm test forwards to whatever is
+    # listening on the port and becomes environment-dependent — a streaming
+    # 200 yields an empty ``resp.body`` and the subsequent ``json.loads``
+    # raises ``JSONDecodeError`` (the flake this item fixes).
+    upstream_response = SimpleNamespace(
+        status_code=200,
+        headers={"content-type": "application/json"},
+        content=(
+            b'{"id":"test","object":"chat.completion","choices":['
+            b'{"index":0,"message":{"role":"assistant","content":"ok"},'
+            b'"finish_reason":"stop"}]}'
+        ),
+    )
+    backend_call = AsyncMock(return_value=upstream_response)
+    monkeypatch.setattr(router_mod, "_call_with_backend_retries", backend_call)
+    monkeypatch.setattr(
+        router_mod,
+        "_call_with_empty_retry",
+        AsyncMock(return_value=upstream_response),
+    )
+    monkeypatch.setattr(
+        router_mod, "_update_session_and_slot", AsyncMock(return_value=None)
+    )
+    return backend_call
+
 
 @pytest.mark.asyncio
 async def test_proxy_to_local_cold_start_returns_retryable_503(monkeypatch):
@@ -361,7 +387,7 @@ async def test_proxy_to_local_cold_start_returns_retryable_503(monkeypatch):
             "local_cold_start_retry_after_seconds": 7,
         }
     }
-    _install_router_harness(monkeypatch, server_cfg)
+    backend_call = _install_router_harness(monkeypatch, server_cfg)
 
     # Simulate the restart: backend just became ready.
     cold_start.note_backend_down()
@@ -384,6 +410,8 @@ async def test_proxy_to_local_cold_start_returns_retryable_503(monkeypatch):
     assert payload["reason"] == "cold_start"
     assert payload["error"]["code"] == "cold_start"
     assert resp.headers.get("Retry-After") == "7"
+    # The deferral happens before dispatch — the backend was never called.
+    assert backend_call.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -421,7 +449,11 @@ async def test_proxy_to_local_warm_bypasses_cold_cap(monkeypatch):
         ).encode("utf-8")
     )
     resp = await proxy_to_local(req, "v1/chat/completions")
-    # The dispatch gate did not defer for cold start.
+    # Warm state admits the request: the hermetic upstream answered 200, so
+    # the cold-start gate did not defer it. Asserting on the concrete status
+    # (rather than only on a parsed body) keeps this deterministic even if a
+    # future change makes the admitted path return a stream.
+    assert resp.status_code == 200
     payload = _json.loads(resp.body)
     assert payload.get("reason") != "cold_start", (
         "Warm state must not cold-defer a request when the pool has room"

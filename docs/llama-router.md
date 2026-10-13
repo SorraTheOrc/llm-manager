@@ -260,11 +260,33 @@ When routing requests to the local llama-server, the proxy applies a two-tier
 context-size check before committing to local, in
 `_should_bypass_local_for_large_context` (proxy/proxy/provider.py):
 
-1. **Warm-cache threshold (hard cap):** If the estimated total prompt context
-   exceeds `local_large_context_warm_cache_threshold` (default `100000` in
-   `proxy/config.yaml`), local is bypassed regardless of cache state. This
-   prevents routing excessively large total contexts to the local model slot
-   even when the KV cache is warm.
+1. **Warm-cache threshold (economic + physical cap):** If the estimated total
+   prompt context exceeds the **effective warm threshold**, local is bypassed
+   regardless of cache state. This prevents routing excessively large total
+   contexts to the local model slot even when the KV cache is warm.
+
+   The effective warm threshold is resolved through a **3-term model**
+   (LP-0MU466L1X003RTHN):
+
+   ```
+   effective_warm = min(physical per-slot clamp, economic ceiling)
+     physical = local_model_ctx_size // slots - 4096   (output headroom)
+     economic = round(local_large_context_economic_ceiling_ratio
+                      x local_model_ctx_size)
+                capped by local_large_context_warm_cache_threshold (when > 0)
+   ```
+
+   The **physical term** is a hard capacity limit (`ctx_size // slots - 4096`),
+   unchanged by this model. The **economic term** is a latency/utilisation
+   limit that scales with the **model** context size (not the slot count), so
+   changing the model or the slot count needs no manual threshold arithmetic.
+   The per-slot clamp dominates when `slots >= 3`; the economic ceiling
+   dominates when `slots == 1`. The absolute
+   `local_large_context_warm_cache_threshold` is retained as an upper bound;
+   a ratio of `0` falls back to the absolute value, and both `0` disables the
+   warm cap. The shipped ratio is `0.3815` (= `100000 / 262144`, the ~37 tok/s
+   @100K prefill floor), which reproduces the previous absolutes
+   (fast 1-slot = 100000, 2-slot = 100000, cheap 3-slot = 83285).
 
 2. **Cold-cache new-token check:** The number of uncached tokens is computed
    as `new_tokens = estimated_tokens × (1 − cached_ratio)`. If
@@ -282,7 +304,8 @@ Config keys (both nested under `server:` and flat forms are supported):
 ```yaml
 server:
   local_large_context_cold_cache_threshold: 38000     # cold-cache new-token cap
-  local_large_context_warm_cache_threshold: 100000    # total-context hard cap
+  local_large_context_warm_cache_threshold: 100000    # absolute warm upper bound
+  local_large_context_economic_ceiling_ratio: 0.3815  # warm scales with model ctx
 ```
 
 > **Mode-aware cold threshold (LP-0MSOMVOPH004ATAK):** the cold threshold is
@@ -303,6 +326,13 @@ server:
 >
 > Prompts above the per-slot warm clamp are **never** routed local
 > (`context_too_large` — physical capacity, unchanged).
+>
+> **Auto-derived warm threshold (LP-0MU466L1X003RTHN):** the effective warm
+> threshold is `min(physical per-slot clamp, economic ceiling)` where the
+> economic ceiling is `round(0.3815 × local_model_ctx_size)` (capped by the
+> absolute warm value). Startup logs the computed physical clamp, economic
+> ceiling and effective warm/cold thresholds so an operator can confirm the
+> runtime value.
 
 ## Per-mode slot counts (operator-directed simplification LP-0MTZRM5HV0007S0V)
 

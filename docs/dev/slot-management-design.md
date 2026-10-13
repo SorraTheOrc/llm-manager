@@ -552,6 +552,34 @@ deadlocks with the existing recovery chain.
 | **Session-owned slot fallback exception** | **New** (LP-0MRNVULW4008DK19) — when a session owns a slot (``session_id in scheduler.active_jobs``), requests bypass the "no idle slots → skip local" guard and proceed to the local provider. This prevents incorrect fallback to remote during the slot-save window (~200–500ms POST). See ``proxy_with_fallback`` in ``provider.py`` for the guard logic and ``_scheduler_session_has_slot()`` in ``router.py``. |
 | **Polling for slot state** | Unchanged |
 
+### 9.1 Dispatch-lease session-id wire contract (WL-0MUKY4MAX0008I0L)
+
+Dispatch leases in `local_dispatch_records` are keyed by the value returned
+from `_dispatch_lease_key(endpoint, session_id)`: a bare session-id string in
+legacy single-server mode, or an `(endpoint, session_id)` tuple in
+per-endpoint (multi-backend) mode (LP-0MRPILSMW004T4H8).
+
+Anything that exposes such a key as a **session id** in an HTTP/JSON or SSE
+payload must normalise it first through `_dispatch_key_session_id()`
+(`proxy/proxy/router_helpers.py`) so the wire value is always the bare
+session-id **string**:
+
+- `_update_processing_slot_assignments()` stores string values in
+  `_processing_slot_assignments`, which flow into each
+  `slots[].session_id` in the status/SSE payload.
+- The status handler in `handlers.py` normalises the key before assigning
+  the top-level `local_owner_session_id`.
+
+Serialising the raw tuple key produced a JSON array
+(`["http://localhost:8080", "<session-id>"]`), which consumers that expect a
+string rejected. Older proxies may still emit the legacy array; the Web UI's
+`normaliseSessionId()` accepts a string or a two-element array and treats any
+other value as “no session”. The only known consumers (the Web UI and herdr's
+`parseLlamaStatus`, WL-0MU88086A0089US4) accept both shapes, so normalising the
+producer is behaviour-preserving.
+
+The record map itself stays tuple-keyed — only the emitted value changes.
+
 ---
 
 ## 10. Open Questions

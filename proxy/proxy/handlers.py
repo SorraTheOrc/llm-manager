@@ -571,16 +571,25 @@ async def get_llama_local_status(request: Request):
             available_slots = total_slots
 
     # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
+    # The owner id is normalised to its bare session-id string: per-endpoint
+    # leases are keyed by ``(endpoint, session_id)`` tuples and the raw key
+    # must never be serialised into the status payload as an array
+    # (WL-0MUKY4MAX0008I0L).
     local_owner_session_id = None
     local_owner_lease_remaining_seconds = None
     try:
+        from proxy.router_helpers import _dispatch_key_session_id
+
         lock = getattr(srv, "local_dispatch_records_lock", None)
         records = getattr(srv, "local_dispatch_records", {})
         if lock is not None:
             async with lock:
                 for sid, rec in list(records.items()):
                     if rec.get("active"):
-                        local_owner_session_id = sid
+                        session_id = _dispatch_key_session_id(sid)
+                        if not isinstance(session_id, str):
+                            continue
+                        local_owner_session_id = session_id
                         remaining = rec.get("expires_at", 0) - time.monotonic()
                         local_owner_lease_remaining_seconds = max(0.0, remaining)
                         break

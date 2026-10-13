@@ -115,8 +115,8 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _estimate_tokens_sent,
     _extend_lease_during_prefill,
     _get_chunk_refresh_buffer_seconds,
+    _get_first_byte_timeout_seconds,
     _get_lease_timeout_seconds,
-    _get_max_prefill_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
@@ -1191,6 +1191,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
     # Dispatch→first-byte capture (LP-0MTJET616005S7PN: prefill/audit latency).
     _dispatch_start = None
+    _slot_acquired_ts = None
     try:
         _dispatch_start = time.monotonic()
     except Exception:
@@ -1238,6 +1239,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         try:
             async with session_guard:
                 async with slot_guard:
+                    # Queue-wait split (LP-0MV6CFMU9005WU2E): the moment the
+                    # slot lock is held marks the end of the single-slot queue
+                    # wait; ``queue_wait_ms`` = this minus ``_dispatch_start``
+                    # so the warm-cache first-byte metric excludes contention.
+                    try:
+                        _slot_acquired_ts = time.monotonic()
+                    except Exception:
+                        pass
                     if slot_enabled:
                         restored = await _restore_slot_snapshot(
                             llama_port,
@@ -1270,16 +1279,19 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
                     # Enter the stream with bounded retries on transient backend failures.
                     # LP-0MUCEFB8E003YVFF: bound the first-byte wait by
-                    # ``local_dispatch_max_prefill_seconds`` so a local request
+                    # ``local_dispatch_first_byte_timeout_seconds`` so a local request
                     # that never reaches first byte is aborted server-side (lease
                     # released by the cleanup path) and the client receives a
-                    # retryable 503 instead of hanging indefinitely.
+                    # retryable 503 instead of hanging indefinitely. The default 840 s
+                    # sits strictly below the client's 900 s queue-timeout deadline; the
+                    # lifetime wedge bound stays ``local_dispatch_max_prefill_seconds``
+                    # (LP-0MV6BR3HI00957PF).
                     # LP-0MUCEFC0T009V7ZY: while awaiting the first byte, poll
                     # prefill progress concurrently so progress is observable
                     # before the SSE headers arrive (previously the poll sat
                     # after ``stream_cm.__aenter__`` and never ran during a real
                     # prefill).
-                    _first_byte_ceiling = _get_max_prefill_seconds(srv)
+                    _first_byte_ceiling = _get_first_byte_timeout_seconds(srv)
                     _first_byte_poll_seconds = float(
                         server_config.get(
                             "local_dispatch_lease_prefill_poll_seconds", 10
@@ -1586,7 +1598,15 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     # session is explicit, poll llama-server for
                                     # observed prefill progress at the configured
                                     # cadence and extend the dispatch lease by
-                                    # the safety buffer while progress advances.
+                                    # the safety buffer while progress advances or
+                                    # the slot is observed processing
+                                    # (LP-0MUXQ5QL40027VZ4: liveness is the only
+                                    # signal b8782 exposes). This branch only
+                                    # runs while no actual data has arrived, so
+                                    # the open stream itself is passed as
+                                    # prefill_in_flight=True — the reliable
+                                    # liveness signal when /slots is blocked
+                                    # (LP-0MUXTW4MD003TVIC).
                                     # This covers very large prefills beyond the
                                     # adaptive token-estimate cap (1500s); the
                                     # existing chunk-refresh path takes over once
@@ -1612,6 +1632,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     model_name=model_name,
                                                     slot_id=slot_id,
                                                     last_progress=_prefill_progress,
+                                                    prefill_in_flight=True,
                                                 )
                                             )
                                     # Build heartbeat JSON with token progress (LP-0MRDFUHMP005SFU2)
@@ -1736,10 +1757,34 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                             _now = time.monotonic()
                                             _delta = (_now - _dispatch_start) if isinstance(_dispatch_start, float) else None
                                             if _delta is not None and _delta >= 0:
+                                                # AC2 re-scope (LP-0MV6CFMU9005WU2E): segment
+                                                # warm/cold from the routing cached_ratio and
+                                                # separate the single-slot queue wait from
+                                                # service time. dispatch_first_byte_ms stays the
+                                                # total (includes queue); dispatch_to_first_byte_ms
+                                                # is the service time once the slot is held, so the
+                                                # warm-cache p99 (excluding contention) is measurable.
+                                                try:
+                                                    from proxy.router_helpers import _lookup_dispatch_cache_state
+                                                except Exception:
+                                                    _cache_state, _cached_ratio = "cold", 0.0
+                                                else:
+                                                    _cache_state, _cached_ratio = _lookup_dispatch_cache_state(
+                                                        model_name, session_id
+                                                    )
+                                                _qwait_ms = 0.0
+                                                if isinstance(_slot_acquired_ts, float) and isinstance(_dispatch_start, float):
+                                                    _qwait_ms = max(0.0, (_slot_acquired_ts - _dispatch_start) * 1000.0)
+                                                _first_byte_total_ms = _delta * 1000.0
+                                                _first_byte_service_ms = max(0.0, _first_byte_total_ms - _qwait_ms)
                                                 srv.logger.info(
-                                                    "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f session=%s model=%s",
-                                                    _delta * 1000.0,
-                                                    _delta * 1000.0,
+                                                    "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f "
+                                                    "cache_state=%s cached_ratio=%.3f queue_wait_ms=%.1f session=%s model=%s",
+                                                    _first_byte_total_ms,
+                                                    _first_byte_service_ms,
+                                                    _cache_state,
+                                                    _cached_ratio,
+                                                    _qwait_ms,
                                                     session_id or "unknown",
                                                     model_name or "unknown",
                                                 )

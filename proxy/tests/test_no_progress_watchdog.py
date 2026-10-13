@@ -19,9 +19,14 @@ The fix introduces:
   on how long any single dispatch record may remain active from its
   ``started_at`` timestamp. Exceeding this ceiling always releases the
   lease regardless of observed progress.
-- Progress-only lease extension: ``_extend_lease_during_prefill`` no
-  longer extends a lease on liveness alone; only a genuine progress
-  advance triggers extension.
+- Progress-or-liveness lease extension: ``_extend_lease_during_prefill``
+  extends a lease on a genuine progress advance OR on observed slot
+  liveness (``is_processing``). Liveness extension was removed in
+  LP-0MUCEFB8E003YVFF on the assumption numeric progress was available —
+  the deployed llama.cpp b8782 exposes none, so removing it made the
+  watchdog kill every prefill longer than the no-progress timeout and
+  clients retried forever (LP-0MUXQ5QL40027VZ4). The max-prefill ceiling
+  below still bounds a wedged slot that keeps reporting ``is_processing``.
 
 These tests verify hermetically (fake server state, no live llama-server):
 
@@ -32,8 +37,8 @@ These tests verify hermetically (fake server state, no live llama-server):
    fires automatically during the periodic cleanup loop.
 5. A record with progress advancing past the timeout is NOT released.
 6. Default config values are correct.
-7. The liveness-only extension path in ``_extend_lease_during_prefill``
-   no longer extends the lease (only progress advances do).
+7. ``_extend_lease_during_prefill`` extends on either signal and preserves
+   the caller's numeric progress baseline.
 """
 
 import asyncio
@@ -320,37 +325,43 @@ async def test_within_max_prefill_not_released():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Lease extension: progress-only (no liveness-only)
+# Lease extension: progress advance OR liveness (LP-0MUXQ5QL40027VZ4)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.asyncio
-async def test_extend_lease_requires_progress_advance():
-    """AC2: Lease extension during prefill only happens on progress advance.
+async def test_extend_lease_on_liveness_signal():
+    """LP-0MUXQ5QL40027VZ4: liveness extends the lease and preserves the
+    numeric progress baseline.
 
-    A slot that is alive (is_processing=True) but has no progress advance
-    must NOT extend the lease. This is the key change: liveness-only
-    extension is removed to prevent indefinite wedging.
+    llama.cpp b8782 reports no numeric prefill progress but still exposes
+    ``is_processing``. A slot that is alive with no progress advance MUST
+    extend the lease (the prefill is genuinely running); the watchdog's
+    max-prefill ceiling is what bounds a genuinely wedged slot. The numeric
+    baseline passed in by the caller is preserved, never overwritten with
+    ``None``.
     """
     from proxy.router_helpers import _extend_lease_during_prefill
 
     srv = _make_srv()
+    initial_expires = time.monotonic() + 30
     srv.local_dispatch_records["test-session"] = {
         "backend": "local",
         "started_at": time.monotonic(),
         "active": True,
-        "expires_at": time.monotonic() + 30,
+        "expires_at": initial_expires,
         "model_name": "test-model",
         "last_progress": 100,
+        "last_progress_ts": time.monotonic() - 500.0,
     }
 
     # _query_prefill_progress returns progress=None, alive=True (liveness,
-    # no progress advance) — this simulates the wedge condition.
+    # no numeric progress advance) — the deployed b8782 shape.
     import proxy.router_helpers as rh
     orig_query = rh._query_prefill_progress
 
     async def fake_query(*args, **kwargs):
-        return None, True  # alive but no progress
+        return None, True  # alive but no numeric progress
 
     rh._query_prefill_progress = fake_query
     try:
@@ -363,10 +374,15 @@ async def test_extend_lease_requires_progress_advance():
             slot_id=0,
             last_progress=100,
         )
-        assert extended is False, (
-            f"Lease should NOT be extended on liveness alone (got extended={extended})"
+        assert extended is True, (
+            f"Lease SHOULD be extended on liveness (got extended={extended})"
         )
-        assert last_progress == 100, "last_progress should be unchanged"
+        assert last_progress == 100, "numeric baseline should be preserved"
+        record = srv.local_dispatch_records["test-session"]
+        assert record["expires_at"] > initial_expires, "expires_at should move out"
+        assert record["last_progress_ts"] > time.monotonic() - 1.0, (
+            "liveness must refresh the watchdog's no-progress clock"
+        )
     finally:
         rh._query_prefill_progress = orig_query
 

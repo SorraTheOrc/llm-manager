@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.1.21 (2026-10-13)
+### Features
+- Extend prompt_cache_analysis.py with throughput + client-visible first-byte latency (AC6) (LP-0MUYFBVHX004Z0UE)
+- Fix: no-progress watchdog releases local lease but never cancels the upstream prefill (wedged llama-server slot) (LP-0MUGQHPJ50046LV8)
+- Local prefill >no-progress-timeout is killed by the watchdog because progress is unobservable (clients retry for hours) (LP-0MUXQ5QL40027VZ4)
+- Multi-backend: support multiple local llama-server instances with provider-level fallback (LP-0MRPILSMW004T4H8)
+### Bug Fixes
+- Prefill liveness extension is a no-op under load: /slots unobservable during long prefills (LP-0MUXTW4MD003TVIC)
+- Cap exhaustion retry timer at 60 minutes for clients (LP-0MV0MM5R60025XZE)
+- [test-failure] tests/test_cold_start_admission.py::test_proxy_to_local_warm_bypasses_cold_cap — failing test (LP-0MUYN2RD800889S2)
+- View Logs Slots tab shows no log output — per-slot SSE streams exceed the browser connection budget (LP-0MUJZHTCN006IZRW)
+- Persist usage-limit quarantine and provider cooldowns across proxy restarts (LP-0MUI6KB67005X44B)
+- WebUI slot status: session_id is a dispatch-lease tuple (endpoint, session_id), breaking slot card rendering (LP-0MUL4ZBQV0002AW8)
+### Other
+- RCA: llama-proxy reported busy for entire 7h09m idle window (2026-08-07/08) — zero herdr downtime dispatch; investigate and design fix (LP-0MSU72I2V009YN79)
+- Verify liveness-based prefill lease extension on a live post-deploy window (LP-0MUXQNPKE008K9MP)
+- Verify prompt-cache right-sizing on a live post-deploy window (LP-0MUPQIEK10079EAW)
+- Add 'explain project and concept names at first use' rule to the author system prompt (LP-0MUYJHQ2W002I0CE)
+- Stream finish errors: adopt recovery-first + informative-error strategy (LP-0MUI5B98B0080CIB)
+- Raise Qwen3 cache-ram to 32768 MiB and verify AC5/AC6 post-deploy (LP-0MUYFC3C5004TCYN)
+- Right-size the llama-server prompt cache (--cache-ram) to stop 8 GiB saturation evictions (LP-0MUPPAC7R0053J8L)
+- Overnight remote-chain exhaustion: accurate diagnostics, quarantine visibility, bounded chain-hold (LP-0MU56Z3XY001I0NO)
+- Add MunitoAI (deepseek-ai/deepseek-v4-flash) to plan/code/author fallback chains (LP-0MV5UPXKL002MSKB)
+- Raise llama-server batch-size to 8192 and ubatch-size to 1024 (router + single-model) (LP-0MTXBPDXM007KOH2)
+- Move the munitoai provider tier directly after local Qwen in plan/author/code chains (LP-0MV6ENYYH006XX0Z)
+
 ## v0.1.20 (2026-10-03)
 ### Features
 - Release post-step ran without a release: 74 items mislabeled 'Shipped in v0.1.18' and v0.1.19 changelog empty (LP-0MUEALIM60037F1S)

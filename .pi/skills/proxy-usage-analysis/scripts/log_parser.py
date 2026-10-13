@@ -164,6 +164,23 @@ RE_MODE_SWITCH = re.compile(r"Mode scheduler: applied scheduled mode (\w+)")
 GRANDFATHERING_PREFIX = "Grandfathering: enabled; other-mode config"
 RE_MANUAL_MODE_CURRENT = re.compile(r"\(current=(\w+)\)")
 
+# Restart markers (LP-0MUQO82LJ008F1FS). A mode switch is a FULL proxy restart
+# that kills in-flight local streams, so a local stream error that lands next
+# to one of these markers is a restart kill, not an upstream fault. Two log
+# lines bracket a restart:
+#
+#   - ``Mode-switch restart spawned: <script> --restart`` (mode.py
+#     ``_spawn_restart``; logged AFTER the bounded drain completes, immediately
+#     before the process is killed)
+#   - ``restart_services: router-mode restart complete (N slots)``
+#     (lifecycle.py; the new process is up)
+#
+# Both are parsed into timestamped ``restart`` events so ``aggregation`` can
+# correlate stream errors. The slot count and script path are corroborating
+# evidence only and are never parsed.
+MODE_SWITCH_RESTART_SPAWNED = "Mode-switch restart spawned:"
+ROUTER_MODE_RESTART_COMPLETE = "restart_services: router-mode restart complete"
+
 # Best-effort provider attribution for ``[remote] upstream error`` lines: the
 # line carries only the target URL, so the provider is inferred from the
 # endpoint path/host. These patterns mirror the remote provider endpoints in
@@ -224,9 +241,9 @@ class LogEvent:
 
     ``kind`` is one of ``stream_started``, ``stream_finished``, ``fallback``,
     ``routing_skip``, ``dispatch_denied``, ``contention_dispatch``,
-    ``contention_fallback_after_queue``, ``compaction_event``,
-    ``compaction_backstop``, ``compaction_churn``, or an error kind
-    (``stream_error``, ``stream_finish_error``, ``slot_save_error``,
+    ``contention_fallback_after_queue``, ``mode_switch``, ``restart``,
+    ``compaction_event``, ``compaction_backstop``, ``compaction_churn``, or an
+    error kind (``stream_error``, ``stream_finish_error``, ``slot_save_error``,
     ``backend_retry``, ``upstream_http_error``). Only the fields relevant to
     each kind are populated.
     """
@@ -265,6 +282,15 @@ class LogEvent:
     raw: str | None = None
     # Operating-mode field (mode_switch kind only): "fast" | "cheap".
     mode: str | None = None
+    # Restart-marker field (restart kind only): "spawned" | "complete"
+    # (LP-0MUQO82LJ008F1FS).
+    restart_kind: str | None = None
+    # Root-cause classification for stream error events
+    # (stream_finish_error / stream_error), set by ``aggregation.aggregate``:
+    # one of ``upstream_stall_after_content``, ``mode_switch_restart``,
+    # ``remote_chain_exhaustion``, ``other``. None for non-stream errors
+    # (LP-0MUQO82LJ008F1FS).
+    root_cause: str | None = None
     # Compaction fields (compaction_event / compaction_backstop / compaction_churn).
     action: str | None = None
     pre_tokens: int | None = None
@@ -427,6 +453,18 @@ def parse_log_line(line: str) -> LogEvent | None:
         if mode not in ("fast", "cheap"):
             return None
         return LogEvent("mode_switch", ts, mode=mode)
+    if msg.startswith(MODE_SWITCH_RESTART_SPAWNED):
+        # "Mode-switch restart spawned: /path/start-proxy.sh --restart" — the
+        # kill is imminent (logged after the bounded drain).
+        return LogEvent(
+            "restart", ts, restart_kind="spawned", raw=line
+        )
+    if msg.startswith(ROUTER_MODE_RESTART_COMPLETE):
+        # "restart_services: router-mode restart complete (2 slots)" — the
+        # restarted proxy is up (corroborating evidence; slot count ignored).
+        return LogEvent(
+            "restart", ts, restart_kind="complete", raw=line
+        )
     if msg.startswith(STREAM_ERROR):
         # "Stream error: session=... provider=... model=... error=NameError"
         return LogEvent(

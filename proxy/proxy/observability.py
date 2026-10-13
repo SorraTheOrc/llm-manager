@@ -627,6 +627,12 @@ progress data (llama-server slot_id) against active dispatch leases
 ``proxy.session``, which tracks *persistence* slot numbers for session
 state save/restore.
 
+The value is always the bare session-id **string**.  Per-endpoint dispatch
+leases are keyed by ``(endpoint, session_id)`` tuples; the tuple key is
+normalised through ``_dispatch_key_session_id()`` before it is stored here,
+so the SSE/status payload never exposes a composite array as a session id
+(WL-0MUKY4MAX0008I0L).
+
 Cleaned up when dispatch leases expire.
 """
 
@@ -1111,10 +1117,21 @@ def _update_processing_slot_assignments(srv, slot_details=None) -> None:
         # Get active dispatch sessions sorted by start time
         records = getattr(srv, "local_dispatch_records", {})
 
-        active_sessions: list[str] = []
+        # Normalise every dispatch-lease key to its bare session-id string
+        # before it is exposed as a session id (WL-0MUKY4MAX0008I0L).
+        # Per-endpoint leases are keyed by ``(endpoint, session_id)`` tuples;
+        # storing the raw key leaked the tuple into the SSE payload as a JSON
+        # array, which the Web UI could not treat as a string. The records
+        # themselves stay tuple-keyed — only the emitted value changes.
+        from proxy.router_helpers import _dispatch_key_session_id
+
+        active_sessions: list[tuple] = []
         for sid_key, info in list(records.items()):
             if info.get("active"):
-                active_sessions.append((info.get("started_at", 0), sid_key))
+                session_id = _dispatch_key_session_id(sid_key)
+                if not isinstance(session_id, str):
+                    continue
+                active_sessions.append((info.get("started_at", 0), session_id))
         active_sessions.sort(key=lambda x: x[0])  # oldest first
 
         # Collect candidate slots from TWO sources:

@@ -564,8 +564,8 @@ test_qwen3_cache_ram_present() {
     found && /^cache-ram/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
     END { if (val != "") print val }' "$MODELS_INI")
 
-    [ "$val" = "23552" ] && pass "[Qwen3] cache-ram=23552 (got: $val)" \
-        || fail "[Qwen3] cache-ram expected 23552, got: '$val'"
+    [ "$val" = "32768" ] && pass "[Qwen3] cache-ram=32768 (got: $val)" \
+        || fail "[Qwen3] cache-ram expected 32768, got: '$val'"
 }
 
 test_qwen3_ctx_checkpoints_present() {

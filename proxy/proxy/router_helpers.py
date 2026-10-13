@@ -829,6 +829,69 @@ def _get_max_prefill_seconds(srv) -> float:
         return 900.0
 
 
+def _get_first_byte_timeout_seconds(srv) -> float:
+    """Return the initial first-byte wait ceiling in seconds (default 840).
+
+    Bounds how long a local dispatch may wait for its first data chunk before
+    the proxy aborts server-side with a retryable 503 (LP-0MUCEFB8E003YVFF).
+    The default is deliberately STRICTLY BELOW the client's 900-second
+    queue-timeout deadline, so the proxy always responds before the client
+    gives up — the legacy default of ``local_dispatch_max_prefill_seconds``
+    (900) raced the client exactly (``dispatch_first_byte_timeout ...
+    ceiling=900s``, LP-0MU1S617L002Q9PR AC1). The lifetime wedge bound
+    (``local_dispatch_max_prefill_seconds``) is unchanged. Returns 0 to
+    disable the first-byte ceiling entirely.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_dispatch_first_byte_timeout_seconds", 840)
+        return float(raw) if raw is not None else 840.0
+    except Exception:
+        return 840.0
+
+
+#: Cached-token ratio at or above which a local dispatch counts as a
+#: warm-cache request for the re-scoped AC2 first-byte metric
+#: (LP-0MV6CFMU9005WU2E). Matching the routing intent: a request whose prompt
+#: is largely served from the prompt cache is warm.
+_WARM_CACHE_RATIO_THRESHOLD = 0.5
+
+
+def _classify_cache_state(cached_ratio: float) -> str:
+    """Return ``"warm"`` when *cached_ratio* >= _WARM_CACHE_RATIO_THRESHOLD.
+
+    Fail-open: non-numeric / NaN / missing values classify COLD so the
+    warm-cache p99 target is never diluted by unknown cases.
+    """
+    try:
+        return (
+            "warm"
+            if float(cached_ratio) >= _WARM_CACHE_RATIO_THRESHOLD
+            else "cold"
+        )
+    except (TypeError, ValueError):
+        return "cold"
+
+
+def _lookup_dispatch_cache_state(model_name: str, session_id: str | None):
+    """Return ``(cache_state, cached_ratio)`` for a local dispatch.
+
+    Reads the routing cached-token ratio for ``(model_name, session_id)``
+    (``provider._get_cached_ratio`` — 0.0 when absent/unknown). Feeds the
+    ``dispatch_first_byte_ms`` log line so warm-cache dispatches are
+    identifiable and the warm-cache p99 can be measured
+    (LP-0MV6CFMU9005WU2E). Never raises: the metric path must not break the
+    streaming loop (provider failures classify cold/0.0).
+    """
+    try:
+        from proxy.provider import _get_cached_ratio
+
+        ratio = float(_get_cached_ratio(model_name, session_id) or 0.0)
+    except Exception:
+        return "cold", 0.0
+    return _classify_cache_state(ratio), ratio
+
+
 async def _query_prefill_progress(
     srv,
     llama_port: int,
@@ -954,6 +1017,7 @@ async def _extend_lease_during_prefill(
     model_name: str | None = None,
     slot_id: int | None = None,
     last_progress: int = 0,
+    prefill_in_flight: bool = False,
 ) -> tuple[int, bool]:
     """Observe prefill state and extend the dispatch lease while advancing.
 
@@ -975,18 +1039,36 @@ async def _extend_lease_during_prefill(
     - **Progress advance** — observed numeric progress (per-slot
       ``n_past``/``n_prompt_tokens_processed`` or aggregate
       ``kv_cache_tokens``) is greater than *last_progress*.
+    - **Liveness** — the slot is observed processing (``is_processing``)
+      while no numeric progress is reported (LP-0MUXQ5QL40027VZ4). This is
+      the only usable signal on the deployed llama.cpp b8782 build, which
+      removed the numeric per-slot fields. Without it, every prefill longer
+      than ``local_dispatch_no_progress_timeout_seconds`` was released by
+      the watchdog, its upstream stream cancelled, and the client retried
+      into a fresh full prefill — an unbounded kill/retry loop.
+    - **In-flight request** — *prefill_in_flight* is True, i.e. the caller
+      still holds an open, error-free upstream request that is awaiting its
+      first byte (LP-0MUXTW4MD003TVIC). This is the *only* reliable
+      prefill-phase liveness signal under load: llama-server holds ``/slots``
+      for the duration of a prompt-processing batch (measured 8.7s, then
+      >15s), so the per-slot query times out at ``STATUS_QUERY_TIMEOUT`` and
+      ``is_processing`` is unobservable; a queued request's slot additionally
+      reports ``is_processing=False``. Relying on ``/slots`` alone left the
+      extension a no-op in exactly the heavy-load case it targets. The hard
+      ``local_dispatch_max_prefill_seconds`` ceiling remains the wedge bound.
 
-    **Liveness-only extension is removed** (LP-0MUCEFB8E003YVFF). A slot
-    observed as alive (``is_processing``) but with no progress advance
-    no longer extends the lease. This prevents stuck requests from holding
-    the lease indefinitely when the backend produces no output. The
-    no-progress watchdog in ``_cleanup_stale_local_dispatch`` will release
-    such records after ``local_dispatch_no_progress_timeout_seconds``.
+    Liveness cannot hold a lease indefinitely: the
+    ``local_dispatch_max_prefill_seconds`` ceiling in
+    ``_watchdog_no_progress`` still releases a record once its total active
+    time exceeds the ceiling, so a wedged slot that keeps reporting
+    ``is_processing`` is bounded (LP-0MUCEFB8E003YVFF wedge protection).
 
     Returns ``(last_progress, extended)``:
 
-    - *last_progress* is the latest observed progress the caller should
-      pass back on the next poll so extension stops when progress stalls.
+    - *last_progress* is the latest numeric progress the caller should pass
+      back on the next poll so numeric extension stops when progress stalls.
+      When only liveness is observable the caller's previous baseline is
+      returned unchanged (never ``None``).
     - *extended* is True when ``expires_at`` was pushed out.
 
     When progress is unobservable AND the slot is not alive, the lease is
@@ -1003,14 +1085,26 @@ async def _extend_lease_during_prefill(
         endpoint=endpoint,
     )
     advancing = progress is not None and progress > last_progress
-    # LP-0MUCEFB8E003YVFF: Only extend on progress advance.  Liveness-only
-    # extension is removed — a slot that is alive but not making progress
-    # will be caught by the no-progress watchdog instead of holding the
-    # lease indefinitely (the wedge condition).
-    if not advancing:
-        # Unobservable or stalled: no extension. Unobservable keeps the
-        # adaptive estimate applied at acquisition (fallback).
+    # LP-0MUXQ5QL40027VZ4: extend on a numeric progress advance OR on
+    # observed liveness during the prefill phase. On the deployed b8782
+    # build numeric progress is unobservable, so liveness is the only usable
+    # signal; the max-prefill ceiling in `_watchdog_no_progress` still bounds
+    # a wedged slot. Liveness-only extension was removed in
+    # LP-0MUCEFB8E003YVFF on the assumption that numeric progress would be
+    # available — it is not, so the removal turned every long prefill into a
+    # watchdog kill.
+    # LP-0MUXTW4MD003TVIC: extend while the upstream request is demonstrably
+    # still in flight (``prefill_in_flight``), even when /slots is unobservable.
+    # `/slots` blocks for the whole prompt-processing batch, so without this
+    # the extension never fired under load and the watchdog killed every
+    # prefill/queue wait at 180s. The max-prefill ceiling still bounds a wedge.
+    if not advancing and not alive and not prefill_in_flight:
+        # Unobservable and not processing: no extension. Keeps the adaptive
+        # estimate applied at acquisition (fallback).
         return last_progress, False
+
+    # Preserve the caller's numeric baseline when only liveness is observed.
+    observed_progress = progress if progress is not None else last_progress
 
     extended = False
     try:
@@ -1022,21 +1116,25 @@ async def _extend_lease_during_prefill(
                 )
                 if record is not None and record.get("active"):
                     record["expires_at"] = time.monotonic() + buffer_seconds
-                    record["last_progress"] = progress
+                    if progress is not None:
+                        record["last_progress"] = progress
                     record["last_progress_ts"] = time.monotonic()
                     extended = True
                     try:
                         srv.logger.info(
-                            "lease_extended_during_prefill session=%s progress=%d buffer=%.0fs",
+                            "lease_extended_during_prefill session=%s progress=%s "
+                            "alive=%s in_flight=%s buffer=%.0fs",
                             session_key if session_key else "unknown",
                             progress,
+                            alive,
+                            prefill_in_flight,
                             buffer_seconds,
                         )
                     except Exception:
                         pass
     except Exception:
         pass
-    return progress, extended
+    return observed_progress, extended
 
 
 async def _await_first_byte_with_prefill_monitor(
@@ -1063,8 +1161,14 @@ async def _await_first_byte_with_prefill_monitor(
     prefill-progress poll, so that:
 
     - Progress observed before the first byte extends the dispatch lease via
-      ``_extend_lease_during_prefill`` (progress-only; liveness alone no
-      longer extends — LP-0MUCEFB8E003YVFF).
+      ``_extend_lease_during_prefill`` (numeric progress advance OR observed
+      slot liveness — LP-0MUXQ5QL40027VZ4; liveness was briefly removed in
+      LP-0MUCEFB8E003YVFF and restored because b8782 exposes no numeric
+      prefill progress). Crucially, because the poll below only runs while
+      *open_task* is still pending, it also passes ``prefill_in_flight=True``
+      — the in-flight request itself is the authoritative prefill-phase
+      liveness signal when ``/slots`` is unobservable under load
+      (LP-0MUXTW4MD003TVIC).
     - A distinct ``prefill_wait_exceeds_threshold`` warning is emitted once
       the initial wait exceeds *warn_seconds*, making a long pre-header wait
       visible in production (previously this path was silent).
@@ -1103,7 +1207,10 @@ async def _await_first_byte_with_prefill_monitor(
 
             waited += step
 
-            # Poll prefill progress and extend the lease on genuine advance.
+            # Poll prefill progress and extend the lease. The request is
+            # still awaiting its first byte (open_task is pending), so it is
+            # in flight: that alone is a valid liveness signal even when
+            # /slots times out (LP-0MUXTW4MD003TVIC).
             if session_id:
                 try:
                     last_progress, _extended = await _extend_lease_during_prefill(
@@ -1114,6 +1221,7 @@ async def _await_first_byte_with_prefill_monitor(
                         model_name=model_name,
                         slot_id=slot_id,
                         last_progress=last_progress,
+                        prefill_in_flight=True,
                     )
                 except Exception:
                     pass
@@ -1813,7 +1921,12 @@ def _watchdog_no_progress(srv, session_key: str, record: dict) -> bool:
 
     # The watchdog only has an opinion about records whose progress clock it
     # owns (``last_progress_ts``). This is set at creation and refreshed on
-    # every observed progress advance / data chunk.
+    # every observed progress advance, every observed prefill liveness signal
+    # (LP-0MUXQ5QL40027VZ4), every in-flight prefill refresh
+    # (LP-0MUXTW4MD003TVIC), and every data chunk. A record that is being
+    # liveness- or in-flight-extended therefore falls through to the
+    # ``max_prefill`` ceiling below, which bounds a wedged slot that keeps
+    # reporting ``is_processing`` or never answers.
     last_progress_ts = record.get("last_progress_ts")
     if last_progress_ts is None:
         return False

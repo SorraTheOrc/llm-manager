@@ -470,3 +470,164 @@ E2E_LINES = [
     f"2026-08-02 14:01:09,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session={S2} provider=opencode-go model=deepseek-v4-flash request=[{{'type': 'text', 'text': 'hello'}}]",
     f"2026-08-02 14:02:00,000 - INFO - local_dispatch_denied session=33333333-3333-3333-3333-333333333333 owner={S2} active=6",
 ]
+
+
+# --- Restart markers and root-cause window (LP-0MUQO82LJ008F1FS) -------------
+#
+# A mode switch is a full proxy restart that kills in-flight local streams.
+# These two markers bracket a restart (real log formats from /var/log/llama-proxy):
+#   - ``Mode-switch restart spawned:`` (mode.py, immediately before the kill)
+#   - ``restart_services: router-mode restart complete (N slots)`` (lifecycle.py)
+from datetime import datetime  # noqa: E402  (kept beside its fixtures below)
+
+RESTART_SCRIPT = "/home/rgardler/projects/llm/proxy/scripts/start-proxy.sh --restart"
+
+
+def _restart_spawned(ts: str) -> str:
+    return f"{ts} - INFO - Mode-switch restart spawned: {RESTART_SCRIPT}"
+
+
+def _restart_complete(ts: str, slots: int = 2) -> str:
+    return f"{ts} - INFO - restart_services: router-mode restart complete ({slots} slots)"
+
+
+RESTART_SPAWNED_LINE = _restart_spawned("2026-09-25 17:27:58,000")
+RESTART_COMPLETE_LINE = _restart_complete("2026-09-25 17:28:05,000")
+RESTART_SERVICES_OTHER_LINE = (
+    "2026-09-25 17:27:58,100 - INFO - restart_services: restarting llama-server "
+    "with 2 slots (reason=mode-switch)"
+)
+
+# Real window: 2026-09-25 05:00 -> 2026-09-26 05:00 (archive
+# ~/proxy-usage-reports/2026-09-27/). ``stream_finish_error`` split =
+# opencode-go stall_after_content 24, local/Qwen3 stream_exception 6,
+# deepseek/deepseek-flash stream_exception 1. The error events below are the
+# real ones from that archive's errors.csv; the restart markers are synthetic
+# (the source logs have rotated out) but mirror the documented correlation:
+# the 10:00 scheduled switch killed 3, a 14:10:19 restart killed 1, and a
+# 17:27:58 restart killed 2 at 17:28:00.
+WINDOW_2026_09_25_START = datetime(2026, 9, 25, 5, 0, 0)
+WINDOW_2026_09_25_END = datetime(2026, 9, 26, 5, 0, 0)
+
+_STALL_MESSAGE = "Upstream idle timeout after content delivered (120s no data)"
+_STALL_ACTION = "Retry the request with full context, or route to a healthier provider"
+_LOCAL_MESSAGE = "Local stream error (RemoteProtocolError); llama-server may be unhealthy"
+_LOCAL_ACTION = "Check llama-server logs; the request may be retried"
+_REMOTE_MESSAGE = "Proxy stream error (ReadError); upstream may be unhealthy"
+_REMOTE_ACTION = "Check proxy/upstream logs; the next provider in the chain may be used"
+
+
+def _stream_finish_error_line(
+    ts: str,
+    session: str,
+    provider: str,
+    model: str,
+    error_type: str,
+    message: str,
+    action: str,
+    entry: str | None = None,
+) -> str:
+    parts = [
+        f"{ts} - INFO - Stream finished: reason=error",
+        f"error_type={error_type}",
+        f"error_message={message}",
+        f"suggested_action={action}",
+        f"session={session}",
+        f"provider={provider}",
+        f"model={model}",
+    ]
+    if entry:
+        parts.append(f"entry={entry}")
+    parts.append("request=[{'type': 'text', 'text': 'Run /skill:implement ...'}]")
+    return " ".join(parts)
+
+
+# The 24 opencode-go stall_after_content errors: (timestamp, session).
+STALL_AFTER_CONTENT_EVENTS_2026_09_25 = [
+    ("2026-09-25 05:05:10,376", "herdr-1790290312-625941-2722"),
+    ("2026-09-25 10:21:03,000", "herdr-1790326920-2116641-18897"),
+    ("2026-09-25 10:22:04,000", "herdr-1790296145-891526-21621"),
+    ("2026-09-25 12:10:01,000", "herdr-1790288091-387518-21192"),
+    ("2026-09-25 13:42:27,000", "herdr-1790335197-2669902-22136"),
+    ("2026-09-25 14:47:23,000", "herdr-1790341558-2918819-31343"),
+    ("2026-09-25 14:50:25,000", "herdr-1790340629-2874806-25757"),
+    ("2026-09-25 15:45:54,000", "herdr-1790341789-2937318-13409"),
+    ("2026-09-25 16:29:17,000", "herdr-1790341789-2937318-13409"),
+    ("2026-09-25 17:23:45,000", "herdr-1790342944-2985357-510"),
+    ("2026-09-25 17:31:50,000", "herdr-1790345194-3185084-30107"),
+    ("2026-09-25 17:33:51,000", "herdr-1790351245-3373146-17771"),
+    ("2026-09-25 17:39:54,000", "herdr-1790350921-3365705-20893"),
+    ("2026-09-25 18:13:13,000", "herdr-1790342944-2985357-510"),
+    ("2026-09-25 18:39:26,000", "herdr-1790357073-3901802-23458"),
+    ("2026-09-25 19:13:44,000", "herdr-1790357814-3908773-29464"),
+    ("2026-09-25 19:22:48,000", "herdr-1790357881-3948427-30122"),
+    ("2026-09-25 20:01:05,000", "herdr-1790357881-3948427-30122"),
+    ("2026-09-25 20:20:17,000", "herdr-1790357881-3948427-30122"),
+    ("2026-09-26 00:58:41,000", "herdr-1790358777-3972773-3112"),
+    ("2026-09-26 01:13:49,000", "herdr-1790358777-3972773-3112"),
+    ("2026-09-26 01:15:50,000", "herdr-1790381248-340648-20627"),
+    ("2026-09-26 01:43:04,000", "herdr-1790382998-3974226-9682"),
+    ("2026-09-26 02:01:14,000", "herdr-1790380029-315542-29623"),
+]
+
+# The 6 local/Qwen3 stream_exception errors, each within seconds of a restart.
+LOCAL_RESTART_KILL_EVENTS_2026_09_25 = [
+    ("2026-09-25 10:00:36,989", "herdr-1790326461-2110867-20865"),
+    ("2026-09-25 10:00:36,997", "herdr-1790324216-2083810-13994"),
+    ("2026-09-25 10:00:37,001", "herdr-1790325268-2096257-939"),
+    ("2026-09-25 14:10:19,141", "herdr-1790340629-2874806-25757"),
+    ("2026-09-25 17:28:00,333", "herdr-1790353495-3459907-22589"),
+    ("2026-09-25 17:28:00,333", "herdr-1790350921-3365705-20893"),
+]
+
+# The single remote (deepseek/deepseek-flash) stream_exception, no restart near.
+REMOTE_STREAM_EXCEPTION_EVENT_2026_09_25 = (
+    "2026-09-26 00:53:09,679",
+    "herdr-1790358777-3972773-3112",
+)
+
+RESTART_MARKERS_2026_09_25 = [
+    _restart_spawned("2026-09-25 10:00:35,500"),
+    _restart_spawned("2026-09-25 14:10:18,500"),
+    _restart_spawned("2026-09-25 17:27:58,000"),
+    _restart_complete("2026-09-25 17:28:05,000"),
+]
+
+
+def window_2026_09_25_lines() -> list[str]:
+    """Raw log lines reproducing the 2026-09-25 -> 2026-09-26 window's
+    ``stream_finish_error`` population (31 events: 24 / 6 / 1) plus the
+    restart markers they correlate with."""
+    lines = list(RESTART_MARKERS_2026_09_25)
+    for ts, session in STALL_AFTER_CONTENT_EVENTS_2026_09_25:
+        lines.append(
+            _stream_finish_error_line(
+                ts, session, "opencode-go", "deepseek-v4.1-flash",
+                "stall_after_content", _STALL_MESSAGE, _STALL_ACTION,
+                entry="opencode-go-3",
+            )
+        )
+    for ts, session in LOCAL_RESTART_KILL_EVENTS_2026_09_25:
+        lines.append(
+            _stream_finish_error_line(
+                ts, session, "local", "Qwen3",
+                "stream_exception", _LOCAL_MESSAGE, _LOCAL_ACTION,
+            )
+        )
+    ts, session = REMOTE_STREAM_EXCEPTION_EVENT_2026_09_25
+    lines.append(
+        _stream_finish_error_line(
+            ts, session, "deepseek", "deepseek-flash",
+            "stream_exception", _REMOTE_MESSAGE, _REMOTE_ACTION,
+            entry="deepseek-flash",
+        )
+    )
+    return lines
+
+
+# A lone local stream error with no restart / mode-switch marker anywhere near
+# it: classification must degrade to ``other`` rather than fabricate a cause.
+LOCAL_ERROR_NO_MARKER_2026_09_25 = _stream_finish_error_line(
+    "2026-09-25 08:30:00,000", "herdr-1790300000-000000-00000",
+    "local", "Qwen3", "stream_exception", _LOCAL_MESSAGE, _LOCAL_ACTION,
+)

@@ -160,6 +160,7 @@ def _archive_existing_outputs(output_dir: Path, now: datetime | None = None) -> 
 
 ERROR_CSV_COLUMNS = [
     "error_type",
+    "root_cause",
     "timestamp",
     "provider",
     "model",
@@ -196,6 +197,7 @@ def _error_row(e: log_parser.LogEvent) -> dict:
             detail += f" ({e.suggested_action})"
     return {
         "error_type": e.kind,
+        "root_cause": e.root_cause or "",
         "timestamp": _fmt_ts(e.ts),
         "provider": e.provider or "",
         "model": e.model or "",
@@ -229,6 +231,21 @@ def error_provider_model_json(summary: AnalysisResult) -> dict:
     return out
 
 
+def root_cause_json(summary: AnalysisResult) -> dict:
+    """Root-cause breakdown ``{error_type: {root_cause: count}}`` for stream
+    errors (LP-0MUQO82LJ008F1FS).
+
+    Only stream errors carry a root cause; kinds with no classified event are
+    omitted. Counts are data-driven (no hardcoded totals) and the inner keys
+    are sorted so the JSON is deterministic.
+    """
+    counts = summary.root_cause_counts
+    return {
+        kind: {rc: n for rc, n in sorted(inner.items())}
+        for kind, inner in sorted(counts.items())
+    }
+
+
 def write_error_artifacts(summary: AnalysisResult, out_dir: Path) -> tuple[Path, Path]:
     """Write ``errors.csv`` (one row per error event) and ``errors.json``
     (aggregated counts by error type); returns their paths."""
@@ -258,6 +275,7 @@ def write_error_artifacts(summary: AnalysisResult, out_dir: Path) -> tuple[Path,
         "total": len(events),
         "by_type": by_type,
         "by_provider_model": error_provider_model_json(summary),
+        "by_root_cause": root_cause_json(summary),
         "upstream_by_status": by_status,
         "upstream_by_status_provider": by_status_provider,
         "window_start": _fmt_ts(summary.window_start),
@@ -872,6 +890,22 @@ def _append_error_section(ap, summary: AnalysisResult) -> None:
             f"payload (types: {', '.join(types) or 'n/a'}) — informative-error fallback is "
             "reaching the log line."
         )
+    # Root-cause breakdown (LP-0MUQO862C004UT7T): render the F1 classification
+    # for stream errors so the operator sees which residual cause dominates
+    # (e.g. a stall-after-content terminal class vs restart kills).
+    root_causes = summary.root_cause_counts
+    if root_causes:
+        ap("### Root-cause breakdown")
+        ap("")
+        ap("| Error type | Root cause | Count |")
+        ap("|---|---|---|")
+        for kind in sorted(root_causes):
+            label = ERROR_TYPE_LABELS.get(kind, kind)
+            for rc, count in sorted(
+                root_causes[kind].items(), key=lambda kv: (-kv[1], kv[0])
+            ):
+                ap(f"| {label} | {rc} | {count} |")
+        ap("")
     ap(
         f"- {len(summary.error_events)} error event(s) in window — see `errors.csv` / `errors.json` "
         "and the remediation recommendations below (recovery-first silent continue, informative-error "
@@ -1492,6 +1526,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "errors": len(summary.error_events),
         "errors_by_type": dict(summary.error_counts.most_common()),
         "errors_by_provider_model": error_provider_model_json(summary),
+        "errors_by_root_cause": root_cause_json(summary),
         "compaction": compaction_json(summary),
         "recommendations": len(recommendations.generate_recommendations(summary, None, mode_map)),
         "local_busy": _busy_json(summary.busy),

@@ -1,0 +1,138 @@
+{
+  "meta": {
+    "work_item": "LP-0MUXQNPKE008K9MP",
+    "generated_at": "2026-10-12T22:16:07",
+    "log_dir": "/var/log/llama-proxy",
+    "tool": "scripts/prefill_lease_verification.py",
+    "reproduce": [
+      "python3 scripts/prefill_lease_verification.py --since '2026-10-06 05:36' --until '2026-10-07 00:00' --json",
+      "python3 scripts/prefill_lease_verification.py --since '2026-10-07 00:00' --until '2026-10-07 07:35' --json",
+      "python3 scripts/prefill_lease_verification.py --since '2026-10-12 06:07' --until '2026-10-12 22:11' --json"
+    ],
+    "fixes_under_test": {
+      "liveness": "2ced52ac LP-0MUXQ5QL40027VZ4",
+      "in_flight": "9b7c505c LP-0MUXTW4MD003TVIC"
+    }
+  },
+  "windows": {
+    "pre_fix_2026-10-06": {
+      "meta": {
+        "generated_at": "2026-10-12T22:15:56",
+        "log_dir": "/var/log/llama-proxy",
+        "files": [
+          "proxy.log"
+        ],
+        "since": "2026-10-06 05:36:00",
+        "until": "2026-10-07 00:00:00",
+        "long_prefill_seconds": 180,
+        "label": "pre-fix-2026-10-06"
+      },
+      "metrics": {
+        "lease_extended_total": 0,
+        "lease_extended_alive_true": 0,
+        "lease_extended_alive_false": 0,
+        "lease_extended_in_flight_true": 0,
+        "no_progress_watchdog_releases": 135,
+        "dispatch_first_byte_timeout": 5,
+        "backend_retry_read_timeout": 67,
+        "prefill_progress_unobservable": 887,
+        "local_stream_finishes": 1552,
+        "long_prefill_local_finishes": 0
+      }
+    },
+    "pre_fix_2026-10-07": {
+      "meta": {
+        "generated_at": "2026-10-12T22:16:02",
+        "log_dir": "/var/log/llama-proxy",
+        "files": [
+          "proxy.log"
+        ],
+        "since": "2026-10-07 00:00:00",
+        "until": "2026-10-07 07:35:00",
+        "long_prefill_seconds": 180,
+        "label": "pre-fix-2026-10-07"
+      },
+      "metrics": {
+        "lease_extended_total": 0,
+        "lease_extended_alive_true": 0,
+        "lease_extended_alive_false": 0,
+        "lease_extended_in_flight_true": 0,
+        "no_progress_watchdog_releases": 58,
+        "dispatch_first_byte_timeout": 10,
+        "backend_retry_read_timeout": 79,
+        "prefill_progress_unobservable": 397,
+        "local_stream_finishes": 757,
+        "long_prefill_local_finishes": 0
+      }
+    },
+    "post_fix_2026-10-12": {
+      "meta": {
+        "generated_at": "2026-10-12T22:16:07",
+        "log_dir": "/var/log/llama-proxy",
+        "files": [
+          "proxy.log"
+        ],
+        "since": "2026-10-12 06:07:00",
+        "until": "2026-10-12 22:11:00",
+        "long_prefill_seconds": 180,
+        "label": "post-fix-2026-10-12"
+      },
+      "metrics": {
+        "lease_extended_total": 6096,
+        "lease_extended_alive_true": 77,
+        "lease_extended_alive_false": 6019,
+        "lease_extended_in_flight_true": 6096,
+        "no_progress_watchdog_releases": 14,
+        "dispatch_first_byte_timeout": 10,
+        "backend_retry_read_timeout": 29,
+        "prefill_progress_unobservable": 690,
+        "local_stream_finishes": 596,
+        "long_prefill_local_finishes": 28
+      }
+    }
+  },
+  "comparison": {
+    "no_progress_watchdog_releases": {
+      "pre_fix_2026-10-06": 135,
+      "pre_fix_2026-10-07": 58,
+      "post_fix_2026-10-12": 14
+    },
+    "backend_retry_read_timeout": {
+      "pre_fix_2026-10-06": 67,
+      "pre_fix_2026-10-07": 79,
+      "post_fix_2026-10-12": 29
+    },
+    "dispatch_first_byte_timeout": {
+      "pre_fix_2026-10-06": 5,
+      "pre_fix_2026-10-07": 10,
+      "post_fix_2026-10-12": 10
+    },
+    "lease_extended_during_prefill": {
+      "pre_fix_2026-10-06": 0,
+      "pre_fix_2026-10-07": 0,
+      "post_fix_2026-10-12": 6096
+    }
+  },
+  "ac_assessment": {
+    "AC1": {
+      "verdict": "met",
+      "note": "lease_extended_during_prefill fired 6096 times, 77 with progress=None alive=True (the b8782 liveness-only shape) and 6096 with in_flight=True; the pre-fix count was 0."
+    },
+    "AC2": {
+      "verdict": "met",
+      "note": "no_progress_watchdog releases fell from 135 and 58 (two pre-fix windows) to 14 in the post-fix window (~8x per hour); backend_retry ReadTimeout fell from 67/79 to 29. dispatch_first_byte_timeout (10) is the deliberate local_dispatch_max_prefill_seconds=900s wedge ceiling, not a kill/retry-loop signal, and stayed bounded."
+    },
+    "AC3": {
+      "verdict": "met",
+      "note": "596 local stream finishes occurred, of which 28 were preceded by a >180s lease-extension run for the same session (0 such completions were possible pre-fix, where every long prefill lost its lease)."
+    },
+    "AC4": {
+      "verdict": "met",
+      "note": "the no-progress watchdog still fired 14 times post-fix; most ~180s after the session's last extension (genuine silence) and two at the 900s max-prefill ceiling \u2014 a genuinely wedged slot is still released."
+    },
+    "AC5": {
+      "verdict": "not_triggered",
+      "note": "AC1-AC4 hold, so no rollback of 2ced52ac."
+    }
+  }
+}

@@ -220,6 +220,24 @@ class TestExhaustionPayloadQuarantine:
         assert body["error"] == "All providers exhausted"
 
     @pytest.mark.asyncio
+    async def test_usage_reset_above_cap_clamped_but_true_reset_visible(self):
+        """LP-0MV0MM5R60025XZE AC6: a usage-limit reset beyond the cap is
+        advertised capped (3600 s) while the true reset stays visible in
+        ``unavailable_providers`` / ``diagnostics``."""
+        p1 = _provider("q1", api_key_env="K1")
+        _quarantine(p1, 9 * 3600)
+
+        result = await _exhaust({"providers": [p1]})
+
+        body = json.loads(result.body)
+        assert body["retry_after"] == 3600
+        assert result.headers.get("retry-after") == "3600"
+        # The true reset is preserved for operators (advertisement only).
+        assert body["unavailable_providers"]["q1"] >= 9 * 3600 - 5
+        q1_diag = next(d for d in body["diagnostics"] if d["provider"] == "q1")
+        assert q1_diag["reset_in"] >= 9 * 3600 - 5
+
+    @pytest.mark.asyncio
     async def test_quarantine_plus_cooldown_reports_both(self):
         p1 = _provider("q1", api_key_env="K1")
         p2 = _provider("c2", api_key_env="K2", endpoint="https://beta.example/v1")
