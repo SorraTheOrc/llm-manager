@@ -79,6 +79,7 @@ Source citations in authored pages use the form `[[sources/SRC-YYYY-MM-DD-NNN]]`
 - **Synthesize, don't summarize** — Syntheses must engage multiple sources, compare perspectives, and identify tensions or patterns. A synthesis that simply summarizes one source is incomplete.
 - **Distinguish fact, analysis, and speculation** — Label each clearly. Speculation must be flagged with language such as "Some analysts argue that..." or "It is hypothesized that..."
 - **Use comparison tables** for multi-dimensional comparisons across models, organizations, or approaches.
+- **Explain names on first mention** — When introducing a project, product, tool, framework, or organisation that a reader without deep domain background is unlikely to know, provide a brief one- or two-sentence inline explanation of what it is and what it does. The same applies to acronyms and domain-specific terms: expand them and add a short definition. Widely known terms (e.g. Python, Google, Linux) are exempt. The explanation appears inline at the point of first mention and is not repeated on later mentions of the same name.
 
 ### 4. Structural Rules
 

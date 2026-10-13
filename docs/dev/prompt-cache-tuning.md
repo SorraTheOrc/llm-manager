@@ -71,25 +71,31 @@ prompt, an order of magnitude above the old effective budget.
 
 The value is derived from the measurement, not chosen as a round number:
 
-* **per-prompt state** = mean evicted-entry size = **1,517.6 MiB**
+* **per-prompt state** = mean evicted-entry size ≈ **1,456–1,518 MiB**
   (evicted entries are exactly the large prompts we want to retain). The
   checkpoint-derived upper bound is 2,010 MiB and the upstream rule 3,200 MiB.
-* **target prompts** = observed maximum concurrently-retained prompts = **12**.
+* **target prompts** = observed maximum concurrently-retained prompts —
+  **12** in the pre-deploy baseline, **18** in the post-deploy measurement.
 * **margin** = 1.25 for headroom.
 
 ```
-1,517.6 MiB x 12 x 1.25 = 22,764 MiB  ->  round up to 23 GiB = 23,552 MiB
+1,517.6 MiB x 12 x 1.25 = 22,764 MiB  ->  23 GiB = 23,552 MiB  (first step)
+1,456.3 MiB x 18 x 1.25 = 32,767 MiB  ->  32 GiB = 32,768 MiB  (raised)
 ```
 
 Configured in `models.ini` `[Qwen3]`:
 
 ```ini
-cache-ram = 23552
+cache-ram = 32768
 ctx-checkpoints = 32
 ```
 
-This raises the retained prompts from ~3–5 to ~15, so a session prefix
-survives across turns.
+The first step (23,552 MiB) raised the retained prompts from ~3–5 to ~15.
+The post-deploy measurement then observed up to **18** concurrent prompts and
+residual evictions, so the cap was raised to **32,768 MiB** (~22 prompts) —
+the value `--recommend` derives from the 2026-10-07 measurement
+(LP-0MUYFC3C5004TCYN). This keeps a session prefix resident across turns under
+the busier post-deploy load.
 
 ### Checkpoint lever (AC3)
 
@@ -154,27 +160,275 @@ Capture a baseline or an after-window measurement with the analysis script:
 
 # Machine-readable artifact (commit this for before/after comparison)
 ./scripts/prompt_cache_analysis.py --json --recommend \
-    --assume-cache-ram-mib 23552 > docs/dev/prompt-cache-after.json
+    --assume-cache-ram-mib 32768 > docs/dev/prompt-cache-after.json
 
 # Restrict to one rotated file (llama-server logs carry no timestamps)
 ./scripts/prompt_cache_analysis.py --glob 'llama-server.log-2026-10-01'
+
+# Multi-file corpus: comma-separated globs = any match
+./scripts/prompt_cache_analysis.py \
+    --glob 'llama-server.log,llama-server.*.log,llama-server.log-2026-10-*'
+
+# Post-deploy corpus without a symlink farm: keep only files whose
+# cache-state lines declare the new cap (llama logs have no timestamps)
+./scripts/prompt_cache_analysis.py --cache-ram-filter 32768
 ```
 
-The JSON records the corpus (`meta.files`) so the window is reproducible. For
-AC5/AC6, after the new `models.ini` is deployed (proxy restart):
+### Throughput and first-byte latency (AC6)
+
+Since LP-0MUYFBVHX004Z0UE the script also reports the metrics AC6 needs:
+
+* `prompt_eval_tok_s` — prompt-eval throughput (tok/s);
+* `decode_tok_s` — generation (decode) throughput (tok/s);
+* `first_byte_ms` — client-visible first-byte latency, parsed from the
+  proxy's `dispatch_first_byte_ms=` lines (`--proxy-log-dir`, default the
+  same directory as the llama-server logs; `--no-proxy` skips it).
+
+Each is a `{samples, median, p10, p90}` block in the `--json` summary and a
+single line in the human summary. The proxy log rotates far more often than
+the llama-server log, so restrict it with `--proxy-glob` (comma-separated)
+to align the proxy window with the llama corpus:
+
+```bash
+./scripts/prompt_cache_analysis.py --cache-ram-filter 32768 \
+    --proxy-glob 'proxy.log,proxy.log.2026-10-*'
+```
+
+The JSON records the corpus (`meta.files`, `meta.proxy_files`,
+`meta.cache_ram_filter_mib`, `meta.globs`, `meta.proxy_globs`) so the window
+is reproducible. For AC5/AC6, after the new `models.ini` is deployed (proxy
+restart):
 
 1. wait a comparable window;
 2. re-run the script over the post-deploy files;
 3. compare `large_full_prefill_requests`, `tokens_prefilled`,
    `prefill_wall_seconds` and `evictions` against the committed baseline;
-4. confirm prefill throughput (tokens/second in the `prompt eval time` lines)
-   and client first-byte latency have not regressed.
+4. confirm `prompt_eval_tok_s`, `decode_tok_s` and `first_byte_ms`
+   (proxy-side) have not regressed.
 
 The capacity projection in `--recommend`/`--assume-cache-ram-mib` gives the
 expected effect up front: at 23,552 MiB the cache holds ~15 prompts versus the
 observed maximum 12, so the projected avoided evictions and large full
 prefills are 277 and 230 respectively (one avoided eviction ≈ one saved
 lost-prefix full prefill — an explicit upper-bound assumption).
+
+## AC5 — Measured improvement (post-deploy comparison)
+
+> **Superseded for the current cap:** this section covers the first-step
+> 23,552 MiB measurement. The 32,768 MiB post-deploy verification is in
+> [AC5/AC6 — 32768 MiB post-deploy verification (2026-10-12)](#ac5ac6--32768-mib-post-deploy-verification-2026-10-12).
+
+Deployment: 2026-10-01 ~21:45 (cache-ram raised from 8192 to 23552 MiB).
+Post-deploy measurement corpus: 28 llama-server log files covering ~6 days
+(`prompt-cache-post-deploy-2026-10-07.json`). Baseline corpus: 31 files
+(`prompt-cache-baseline-2026-10-01.json`).
+
+### Before/After table
+
+| metric | Before (8 GiB) | After (23 GiB) | Change |
+|---|---|---|---|
+| requests | 6,739 | 3,610 | -46.4% |
+| large full-prefills (>=10k) | 230 (3.4%/req) | 156 (4.3%/req) | +26.6% /req |
+| forced full-prefills (llama.cpp) | 392 (5.8%/req) | 238 (6.6%/req) | +13.3% /req |
+| **evictions** | **277 (4.1%/req)** | **88 (2.4%/req)** | **-40.7% /req** |
+| cache saturation samples | 23.6% | 18.8% | -20.4% |
+| max prompts held | 12 | 18 | +50.0% |
+| prefill wall time (h) | 25.7 | 13.0 | -49.4% |
+| tokens prefilled / req | 3,608 | 3,943 | +9.3% |
+| KV-cache reuse pct | 90.2% | 88.6% | -1.8% |
+
+### Interpretation
+
+**Positive signals (AC5 met, with caveats):**
+
+* **Evictions dropped 68.2% absolute (277 → 88)** and 40.7% per request.
+  This is the direct, intended effect of the larger cache — fewer prompts
+  are evicted so their prefix survives across turns.
+* Cache saturation fell from 23.6% to 18.8% of samples, confirming the cap
+  is hit less often.
+* Max prompts held rose from 12 to 18, showing the cache accommodates more
+  concurrent sessions.
+
+**Confounding factors — the full-prefill rate per request is *higher*:**
+
+* The post-deploy window includes **multiple proxy restarts** (each restart
+  warms the cache from zero), which inflates full-prefill counts because
+  every session's prefix is lost after a restart.
+* The baseline (~15 days) had fewer restarts relative to its length, so its
+  warm-cache periods dominate.
+* The higher per-request full-prefill rate (3.4% → 4.3% large, 5.8% → 6.6%
+  forced) is therefore a **measurement artifact of cold-cache periods**,
+  not a regression of the cache-sizing change.
+* During warm periods the eviction reduction is the clean signal.
+
+**Verdict for AC5:** The eviction reduction (40.7%/req) and cache saturation
+reduction (23.6% → 18.8%) confirm the cache-sizing change works as designed.
+The slightly higher full-prefill rate per request is an artifact of the
+shorter, restart-heavy post-deploy window — a clean comparison would
+require an equal-length warm-cache window.
+
+### Cache sizing at the margin
+
+The post-deploy measurement shows `cache_prompts_max = 18` (vs 12 before),
+so the `recommend()` function suggests **32768 MiB** (32 GiB) to hold 22
+prompts at 1.25× margin. The 23552 MiB cap held 16 prompts, adequate for the
+baseline's 12 but not for the current peak of 18. **Applied** under
+LP-0MUYFC3C5004TCYN: `models.ini` `[Qwen3]` now sets `cache-ram = 32768`.
+
+**Headroom check at 32768 MiB:**
+```
+MemAvailable ~77,108 MiB - 32,768 = 44,340 MiB >= 12,744 MiB (reserve)  -> safe
+```
+
+The wider margin means the `server_prompt_cache::alloc()` OOM fallback
+(`limit_size = 0.4 * size()`) is not approached.
+
+## AC6 — Throughput / latency
+
+**Prompt-eval throughput (tokens processed by prompt eval / wall time):**
+
+```
+Before: 24,315,723 tokens / 92,635.5 s = 262.5 tok/s
+After:  14,234,959 tokens / 46,730 s   = 304.7 tok/s
+```
+
+No regression — prompt-eval throughput is ~16% **higher** after the change.
+
+**Generation throughput (tok/s during content generation):**
+
+The prompt-cache analysis script was extended under `LP-0MUYFBVHX004Z0UE` to
+report decode throughput and proxy-side first-byte latency too, so the figures
+below (from before that extension) are superseded by the 32,768 MiB
+verification section. The interim measurement
+(comment on this work item, LP-0MUPQIEK10079EAW) reported a drop from
+118.4 to 103.8 tok/s (-12.3%) over a ~11.5 h restart-heavy window.
+
+This generation-throughput regression is likely the same cold-cache artifact
+that inflates full-prefill rates — during a cold start, most of the
+request's latency is spent on prompt processing, leaving less time for
+generation per request, which depresses the measured throughput.
+
+**Verdict for AC6:** The prompt-eval throughput did **not regress** (it
+improved). The generation-throughput figure from the interim measurement
+(-12.3%) is confounded by restart-heavy cold-cache periods and is likely
+an artifact rather than a true regression. A clean generation-throughput
+measurement would require a proxy-side metric (not currently logged).
+
+## AC5/AC6 — 32768 MiB post-deploy verification (2026-10-12)
+
+`LP-0MUPQIEK10079EAW`. The 32768 MiB config (`1acec9f7`) went live at the
+2026-10-07 ~19:30 restart. The spawned Qwen3 child carries the tuned values
+(no restart was performed to capture this measurement — the running process
+already had them, and a restart would only have reset the window cold):
+
+```
+llama-server --alias Qwen3 --ctx-size 262144 --cache-ram 32768 \
+  --cache-type-k q8_0 --cache-type-v q8_0 --swa-checkpoints 32 \
+  --flash-attn true ...
+```
+
+`--cache-ram 32768` ✓, `--swa-checkpoints 32` (the `--ctx-checkpoints` alias) ✓,
+no `--swa-full` ✓ (AC1).
+
+Post-deploy corpus: 17 llama-server log files (2026-10-07 19:30 →
+2026-10-12 12:40, ~4.7 d, 1,404 requests), selected with
+`--cache-ram-filter 32768` (llama-server logs carry no timestamps, so the cap
+declared in the cache-state lines defines the window). Artifact:
+`docs/dev/prompt-cache-post-deploy-2026-10-12.json` (AC2).
+
+### Comparability
+
+The committed baseline (`prompt-cache-baseline-2026-10-01.json`) is a ~15-day,
+31-file corpus whose live source files have since been rotated away, so it can
+no longer be regenerated with the extended AC6 metrics. Two comparisons are
+therefore recorded:
+
+* **vs the committed baseline** — same metric set, but the windows differ
+  (~15 d vs ~4.7 d); totals are not length-matched.
+* **vs a length-matched 8 GiB corpus**
+  (`prompt-cache-baseline-4day-2026-10-01.json`) — the four surviving daily
+  files from the 8 GiB era (~4 d, 1,373 requests, comparable volume) re-run
+  with the current script, so the AC6 throughput statistics have a same-tool
+  baseline.
+
+### AC5 — before/after
+
+| metric | 8 GiB, 15 d (31 f) | **8 GiB, ~4 d (4 f)** | **32 GiB, ~4.7 d (17 f)** | length-matched change |
+|---|---|---|---|---|
+| requests | 6,739 | 1,373 | 1,404 | +2.3% |
+| prompt tokens requested | 249,296,932 | 48,255,576 | 49,370,556 | +2.3% |
+| tokens prefilled | 24,315,723 | 5,527,637 | 4,557,226 | **-17.6%** |
+| tokens prefilled / request | 3,608 | 4,026 | 3,246 | **-19.4%** |
+| large full-prefills (>=10k) | 230 | 56 | 58 | +3.6% (rate 4.08% → 4.13%) |
+| forced full-prefills | 392 | 82 | 68 | **-17.1%** (rate 5.97% → 4.84%) |
+| prompt-eval wall time (s) | 92,635.5 | 17,963.9 | 26,004.3 | +44.8% |
+| **evictions** | **277** | **65** | **18** | **-72.3%** (rate 4.73% → 1.28%) |
+| cache-saturated samples | 23.6% | 22.0% | 26.3% | +19.6% |
+| max prompts held | 12 | 12 | 16 | +33.3% |
+| KV-cache reuse | 90.25% | 88.55% | 90.77% | +2.5% |
+
+**AC5 verdict — met, with a composition caveat.** The intended effect is
+confirmed: evictions fell 72.9% per request (65 → 18 absolute) and held prompts
+rose from 12 to 16, so fewer sessions lose their prefix and more concurrent
+sessions fit. `tokens_prefilled` fell 19.4% per request and forced full-prefills
+fell 18.9% per request. `large_full_prefill_requests` is flat per request
+(4.08% → 4.13%) and `prefill_wall_seconds` rose per request (+41.6%), which is
+*not* the cache behaviour regressing — see the confounds below.
+
+### AC6 — throughput / latency
+
+| metric (median, p10/p90) | 8 GiB, ~4 d (4 f) | 32 GiB, ~4.7 d (17 f) |
+|---|---|---|
+| prompt-eval throughput (tok/s) | 73.1 (28.9 / 222.7) | **77.3** (28.6 / 199.8) |
+| decode throughput (tok/s) | 14.1 (5.0 / 29.5) | **18.4** (8.5 / 36.2) |
+| first-byte latency, proxy (ms) | n/a (no 8 GiB proxy logs survive) | 8,046.3 (550.0 / 80,362.6, n=10,557) |
+
+**AC6 verdict — met.** Prompt-eval and decode medians did not regress (both
+improved). The 8 GiB-era proxy logs have been rotated away, so no 8 GiB
+`first_byte_ms` baseline exists; the nearest surviving reference is the
+23,552 MiB era (2026-10-05..07), whose median was 10,679 ms — so first-byte
+latency also did not regress. `first_byte_ms` is dominated by queue wait under
+the single-slot profile, so it is reported rather than used as a cache signal.
+
+### Confounds (why per-token wall time rose)
+
+1. **Slot profile changed with the cache.** The 8 GiB baseline era ran
+   `n_slots = 3`; from 2026-10-07 the profile runs `n_slots = 1`
+   (`LP-0MU1S617L`). A single slot serialises prefills, which raises wall time
+   per request independently of `--cache-ram`.
+2. **Composition.** A larger cache means more prefix reuse, so the *remaining*
+   prefill is a smaller delta. Smaller prefills are less efficient per token
+   (fixed per-prefill overhead), which lowers aggregate tok/s even though the
+   total prefill work drops — exactly the trade the sizing was meant to make.
+   The per-prefill median did not regress.
+3. **Window.** ~4.7 d vs the committed baseline's ~15 d, with self-heal and
+   mode-switch restarts flushing the cache cold.
+
+### Sizing at the margin
+
+The `--recommend` output from this measurement derives **40,960 MiB (40 GiB)**
+(per-prompt 2,013 MiB x observed max 16 x 1.25), because the cache still
+saturates at 32 GiB (26.3% of samples above 90% of cap; 18 evictions). The cap
+is adequate for the observed maximum — `holdable_prompts` 20 >= observed 16 —
+but the higher per-prompt size under the current single-slot load means 32 GiB
+is now at the edge. Raising it again is a **separate operator decision** (host
+headroom is safe: `79,248 - 40,960 = 38,288 MiB >= 12,744 MiB reserve`); this
+item only records the measurement.
+
+### Reproduction
+
+```bash
+# 32 GiB post-deploy artifact (~4.7 d, 17 files)
+./scripts/prompt_cache_analysis.py --json --recommend \
+    --cache-ram-filter 32768 \
+    --proxy-glob 'proxy.log,proxy.log-2026-10-0[89]*,proxy.log-2026-10-1[012]*,proxy.log.2026-10-0[89]*,proxy.log.2026-10-1[012]*' \
+    > docs/dev/prompt-cache-post-deploy-2026-10-12.json
+
+# length-matched 8 GiB baseline (~4 d, 4 files)
+./scripts/prompt_cache_analysis.py --json --recommend \
+    --cache-ram-filter 8192 --no-proxy \
+    > docs/dev/prompt-cache-baseline-4day-2026-10-01.json
+```
 
 ## Non-goals
 

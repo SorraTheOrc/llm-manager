@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from unittest.mock import patch
 
 import proxy.provider as provider
+import pytest
 from fastapi import Response
 
 
@@ -149,8 +150,93 @@ class TestBuildExhaustedResponse:
                 model_config={"providers": [cfg]},
             )
         body = json.loads(r.body)
-        # Should reflect window edge, not 0
+        # The 13 h window edge would be 46800 s, but the default client cap
+        # (3600 s) bounds the advertised value (LP-0MV0MM5R60025XZE AC1).
+        assert body["retry_after"] == 3600
+
+
+class TestMaxRetryAfterConfig:
+    """LP-0MV0MM5R60025XZE AC4: the client-facing exhaustion wait is bounded
+    by a configurable cap with a safe default."""
+
+    def test_default_when_missing(self):
+        assert provider._max_retry_after_seconds(None) == 3600
+        assert provider._max_retry_after_seconds({}) == 3600
+        assert provider._max_retry_after_seconds({"server": {}}) == 3600
+
+    def test_nested_value_honoured(self):
+        assert provider._max_retry_after_seconds(
+            {"server": {"max_retry_after_seconds": 1800}}
+        ) == 1800
+
+    def test_flat_value_honoured(self):
+        assert provider._max_retry_after_seconds(
+            {"max_retry_after_seconds": 900}
+        ) == 900
+
+    @pytest.mark.parametrize("bad", ["soon", None, "", 0, -1, True, [], {}])
+    def test_malformed_falls_back_to_default(self, bad):
+        assert provider._max_retry_after_seconds(
+            {"server": {"max_retry_after_seconds": bad}}
+        ) == 3600
+
+
+class TestBuildExhaustedResponseCap:
+    """LP-0MV0MM5R60025XZE AC1/AC2/AC4/AC6: the generic exhaustion 503
+    advertises the smaller of the honest wait and the configured cap, with
+    the JSON body and ``Retry-After`` header always agreeing."""
+
+    def _window_response(self, config=None):
+        now = datetime(2026, 1, 1, 20, 0, 0, tzinfo=UTC)
+        cfg = {"name": "w", "available_times": ["09:00-17:00"]}
+        with patch("proxy.provider.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            return provider._build_exhausted_response(
+                unavailable_providers={},
+                diagnostics=[],
+                model_config={"providers": [cfg]},
+                config=config,
+            )
+
+    def test_above_cap_clamped_to_default(self):
+        r = self._window_response()
+        body = json.loads(r.body)
+        assert body["retry_after"] == 3600
+        assert r.headers.get("retry-after") == "3600"
+
+    def test_below_cap_passthrough(self):
+        r = provider._build_exhausted_response(
+            unavailable_providers={"a": 120}, diagnostics=[]
+        )
+        body = json.loads(r.body)
+        assert body["retry_after"] == 120
+        assert r.headers.get("retry-after") == "120"
+
+    def test_config_override_honoured(self):
+        r = provider._build_exhausted_response(
+            unavailable_providers={"a": 1000},
+            diagnostics=[],
+            config={"server": {"max_retry_after_seconds": 100}},
+        )
+        body = json.loads(r.body)
+        assert body["retry_after"] == 100
+        assert r.headers.get("retry-after") == "100"
+
+    def test_window_edge_passthrough_with_high_cap(self):
+        r = self._window_response(
+            config={"server": {"max_retry_after_seconds": 100000}}
+        )
+        body = json.loads(r.body)
         assert body["retry_after"] == 46800
+        assert r.headers.get("retry-after") == "46800"
+
+    def test_header_and_body_agree_above_cap(self):
+        r = provider._build_exhausted_response(
+            unavailable_providers={"a": 99999}, diagnostics=[]
+        )
+        body = json.loads(r.body)
+        assert body["retry_after"] == 3600
+        assert r.headers.get("retry-after") == str(body["retry_after"])
 
 
 class TestBuildTimeWindowExhaustedResponse:
@@ -165,8 +251,35 @@ class TestBuildTimeWindowExhaustedResponse:
             )
         assert r is not None
         body = json.loads(r.body)
-        assert body["retry_after"] == 46800
-        assert r.headers.get("retry-after") == "46800"
+        # The default cap (3600 s) bounds the time-window variant too (AC3).
+        assert body["retry_after"] == 3600
+        assert r.headers.get("retry-after") == "3600"
+
+    def test_window_variant_clamped_to_cap(self):
+        now = datetime(2026, 1, 1, 20, 0, 0, tzinfo=UTC)
+        cfg = {"name": "w", "available_times": ["09:00-17:00"], "type": "remote"}
+        attempts = [{"provider": "w", "status": "outside_time_window"}]
+        with patch("proxy.provider.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            r = provider._build_time_window_exhausted_response(
+                attempts, {}, False, model_config={"providers": [cfg]}
+            )
+        body = json.loads(r.body)
+        assert body["retry_after"] == 3600
+        assert r.headers.get("retry-after") == str(body["retry_after"])
+
+    def test_window_variant_below_cap_passthrough(self):
+        now = datetime(2026, 1, 1, 19, 55, 0, tzinfo=UTC)
+        cfg = {"name": "w", "available_times": ["20:00-23:00"], "type": "remote"}
+        attempts = [{"provider": "w", "status": "outside_time_window"}]
+        with patch("proxy.provider.datetime") as mock_dt:
+            mock_dt.now.return_value = now
+            r = provider._build_time_window_exhausted_response(
+                attempts, {}, False, model_config={"providers": [cfg]}
+            )
+        body = json.loads(r.body)
+        assert body["retry_after"] == 300
+        assert r.headers.get("retry-after") == "300"
 
     def test_returns_none_when_unavailable(self):
         attempts = [{"provider": "w", "status": "outside_time_window"}]

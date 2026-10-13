@@ -16,10 +16,21 @@ sessions based on **observed prefill progress** (per-slot ``n_past`` /
 ``n_prompt_tokens_processed`` from llama-server ``/slots``, falling back to
 aggregate ``kv_cache_tokens`` from ``query_llama_status()``): while the
 reported progress is advancing, ``expires_at`` is pushed out to
-``now + safety_buffer``. Extension stops when the first actual data chunk
-arrives (the existing chunk-refresh path takes over) or the stream ends.
-When progress is unobservable, the lease keeps the adaptive token-estimate
-value applied at acquisition (fallback) rather than being dropped.
+``now + safety_buffer``. **LP-0MUXQ5QL40027VZ4** additionally extends on
+observed slot *liveness* (``is_processing``), because the deployed
+llama.cpp b8782 exposes no numeric prefill progress; without it every
+prefill longer than ``local_dispatch_no_progress_timeout_seconds`` was
+released, its upstream stream cancelled, and the client retried into a
+full re-prefill forever. **LP-0MUXTW4MD003TVIC** adds the authoritative
+signal: while the upstream request is still in flight awaiting its first
+byte (``prefill_in_flight``), the lease is extended even when ``/slots``
+is unobservable — which it is under load, because llama-server holds it
+for the whole prompt-processing batch. Extension stops when the first
+actual data chunk arrives (the existing chunk-refresh path takes over) or
+the stream ends, and the max-prefill ceiling still bounds a wedge.
+When progress is unobservable AND the slot is not processing, the lease
+keeps the adaptive token-estimate value applied at acquisition (fallback)
+rather than being dropped.
 
 These tests verify hermetically (fake server state, no live llama-server):
 
@@ -239,6 +250,25 @@ async def _collect_streamed_chunks(resp):
 
 def _info_log_lines(logger) -> list[str]:
     return [str(call) for call in logger.info.call_args_list]
+
+
+def _extension_log_calls(logger) -> list:
+    """Return the ``lease_extended_during_prefill`` logger.info calls."""
+    return [
+        call
+        for call in logger.info.call_args_list
+        if call.args and "lease_extended_during_prefill" in str(call.args[0])
+    ]
+
+
+def _logged_in_flight(logger) -> bool:
+    """True when the last prefill-extension log recorded ``in_flight=True``."""
+    calls = _extension_log_calls(logger)
+    if not calls:
+        return False
+    args = calls[-1].args
+    # args = (format, session, progress, alive, in_flight, buffer)
+    return len(args) >= 6 and args[4] is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -470,33 +500,270 @@ async def test_extend_lease_does_not_extend_when_progress_stalls(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_extend_lease_does_not_extend_on_liveness_alone(monkeypatch):
-    """LP-0MUCEFB8E003YVFF: liveness-only extension is removed.
+async def test_extend_lease_on_liveness_alone(monkeypatch):
+    """LP-0MUXQ5QL40027VZ4: liveness-only extension is restored.
 
     llama.cpp b8782 reports no numeric progress but the slot is observed
-    processing (is_processing=True). Previously this extended the lease
-    indefinitely, allowing a stuck (no-progress) request to hold the
-    dispatch pool forever. Now the lease is NOT extended on liveness alone;
-    the no-progress watchdog in ``_cleanup_stale_local_dispatch`` releases
-    such records after ``local_dispatch_no_progress_timeout_seconds``."""
+    processing (is_processing=True). The lease IS extended on that liveness
+    signal (otherwise every prefill longer than
+    ``local_dispatch_no_progress_timeout_seconds`` was killed and retried
+    forever). The numeric progress baseline is preserved (never ``None``) and
+    ``last_progress_ts`` is refreshed so the watchdog does not fire."""
     from proxy.router_helpers import _extend_lease_during_prefill
 
     now = time.monotonic()
     original_expiry = now + 0.3
     srv = _make_srv(records={
-        "sess-1": {"backend": "local", "started_at": now, "active": True, "expires_at": original_expiry},
+        "sess-1": {
+            "backend": "local",
+            "started_at": now,
+            "active": True,
+            "expires_at": original_expiry,
+            "last_progress": 0,
+            "last_progress_ts": now - 500.0,
+        },
     })
     _install_fake_progress(monkeypatch, [(None, True)])
 
     last_progress, extended = await _extend_lease_during_prefill(
-        srv, "sess-1", llama_port=8080, slot_id=None, last_progress=0
+        srv, "sess-1", llama_port=8080, slot_id=0, last_progress=0
     )
-    assert extended is False, (
-        "Lease must NOT be extended on liveness alone (no progress advance)"
+    assert extended is True, (
+        "Lease must be extended on observed liveness when numeric progress "
+        "is unobservable (b8782)"
     )
+    assert last_progress == 0, "Numeric baseline must be preserved, not set to None"
+    record = srv.local_dispatch_records["sess-1"]
+    assert record["expires_at"] > original_expiry
+    assert record["last_progress_ts"] > now - 1.0, (
+        "Liveness must refresh the no-progress clock"
+    )
+    assert any("lease_extended_during_prefill" in line for line in _info_log_lines(srv.logger))
+
+
+@pytest.mark.asyncio
+async def test_watchdog_preserves_liveness_extended_prefill_lease(monkeypatch):
+    """LP-0MUXQ5QL40027VZ4 AC1: a prefill that is alive but reports no numeric
+    progress is extended on liveness and is NOT released by the no-progress
+    watchdog, even after the no-progress timeout has elapsed."""
+    from proxy.router_helpers import (
+        _cleanup_stale_local_dispatch,
+        _extend_lease_during_prefill,
+        _watchdog_no_progress,
+    )
+
+    config = copy.deepcopy(BASE_SERVER_CONFIG)
+    config["server"]["local_dispatch_no_progress_timeout_seconds"] = 180
+    config["server"]["local_dispatch_max_prefill_seconds"] = 900
+    now = time.monotonic()
+    srv = _make_srv(
+        records={
+            "sess-1": {
+                "backend": "local",
+                "started_at": now - 200.0,  # already past the no-progress timeout
+                "active": True,
+                "expires_at": now + 10.0,
+                "last_progress": 0,
+                "last_progress_ts": now - 200.0,
+            },
+        },
+        config=config,
+    )
+
+    # Without a refresh the watchdog considers the record stalled.
+    assert _watchdog_no_progress(
+        srv, "sess-1", srv.local_dispatch_records["sess-1"]
+    ) is True
+
+    _install_fake_progress(monkeypatch, [(None, True)])  # alive, no numeric progress
+    last_progress, extended = await _extend_lease_during_prefill(
+        srv, "sess-1", llama_port=8080, slot_id=0, last_progress=0
+    )
+    assert extended is True
     assert last_progress == 0
-    assert srv.local_dispatch_records["sess-1"]["expires_at"] == original_expiry
-    assert not any("lease_extended_during_prefill" in line for line in _info_log_lines(srv.logger))
+
+    record = srv.local_dispatch_records["sess-1"]
+    assert _watchdog_no_progress(srv, "sess-1", record) is False, (
+        "Liveness-refreshed lease must not be released by the no-progress watchdog"
+    )
+    assert await _cleanup_stale_local_dispatch(srv) == 0
+    assert "sess-1" in srv.local_dispatch_records
+
+
+@pytest.mark.asyncio
+async def test_watchdog_releases_prefill_when_slot_not_alive(monkeypatch):
+    """LP-0MUXQ5QL40027VZ4 AC3: when the slot reports neither numeric progress
+    nor liveness the lease is not extended and the watchdog releases it."""
+    from proxy.router_helpers import (
+        _extend_lease_during_prefill,
+        _watchdog_no_progress,
+    )
+
+    config = copy.deepcopy(BASE_SERVER_CONFIG)
+    config["server"]["local_dispatch_no_progress_timeout_seconds"] = 180
+    config["server"]["local_dispatch_max_prefill_seconds"] = 900
+    now = time.monotonic()
+    srv = _make_srv(
+        records={
+            "sess-1": {
+                "backend": "local",
+                "active": True,
+                "started_at": now - 200.0,
+                "expires_at": now + 10.0,
+                "last_progress": 0,
+                "last_progress_ts": now - 200.0,
+            },
+        },
+        config=config,
+    )
+    _install_fake_progress(monkeypatch, [(None, False)])
+
+    last_progress, extended = await _extend_lease_during_prefill(
+        srv, "sess-1", llama_port=8080, slot_id=0, last_progress=0
+    )
+    assert extended is False
+    assert last_progress == 0
+    assert _watchdog_no_progress(
+        srv, "sess-1", srv.local_dispatch_records["sess-1"]
+    ) is True, "A prefill with no progress and no liveness must be released"
+
+
+@pytest.mark.asyncio
+async def test_watchdog_releases_liveness_extended_lease_at_max_prefill_ceiling(monkeypatch):
+    """LP-0MUXQ5QL40027VZ4: liveness cannot hold a lease forever. A wedged slot
+    that keeps reporting ``is_processing`` is still released once the record's
+    total active time exceeds ``local_dispatch_max_prefill_seconds``."""
+    from proxy.router_helpers import (
+        _extend_lease_during_prefill,
+        _watchdog_no_progress,
+    )
+
+    config = copy.deepcopy(BASE_SERVER_CONFIG)
+    config["server"]["local_dispatch_no_progress_timeout_seconds"] = 180
+    config["server"]["local_dispatch_max_prefill_seconds"] = 900
+    now = time.monotonic()
+    srv = _make_srv(
+        records={
+            "sess-1": {
+                "backend": "local",
+                "active": True,
+                "started_at": now - 1000.0,  # beyond the 900s ceiling
+                "expires_at": now + 10.0,
+                "last_progress": 0,
+                "last_progress_ts": now - 1000.0,
+            },
+        },
+        config=config,
+    )
+    _install_fake_progress(monkeypatch, [(None, True)])
+
+    _, extended = await _extend_lease_during_prefill(
+        srv, "sess-1", llama_port=8080, slot_id=0, last_progress=0
+    )
+    assert extended is True
+    record = srv.local_dispatch_records["sess-1"]
+    assert record["last_progress_ts"] > now - 1.0
+    assert _watchdog_no_progress(srv, "sess-1", record) is True, (
+        "The max-prefill ceiling must still bound a liveness-extended lease"
+    )
+
+
+@pytest.mark.asyncio
+async def test_extend_lease_on_in_flight_when_slots_unobservable(monkeypatch):
+    """LP-0MUXTW4MD003TVIC: when ``/slots`` is totally unobservable
+    (progress=None, alive=False) but the upstream request is still in flight,
+    the lease IS extended and the no-progress clock refreshed.
+
+    This is the heavy-load failure mode: llama-server holds ``/slots`` for the
+    whole prompt-processing batch, so liveness cannot be read. The in-flight
+    request is the authoritative signal.
+    """
+    from proxy.router_helpers import (
+        _extend_lease_during_prefill,
+        _watchdog_no_progress,
+    )
+
+    config = copy.deepcopy(BASE_SERVER_CONFIG)
+    config["server"]["local_dispatch_no_progress_timeout_seconds"] = 180
+    config["server"]["local_dispatch_max_prefill_seconds"] = 900
+    now = time.monotonic()
+    srv = _make_srv(
+        records={
+            "sess-1": {
+                "backend": "local",
+                "started_at": now,
+                "active": True,
+                "expires_at": now + 0.3,
+                "last_progress": 0,
+                "last_progress_ts": now - 500.0,
+            },
+        },
+        config=config,
+    )
+    _install_fake_progress(monkeypatch, [(None, False)])
+
+    last_progress, extended = await _extend_lease_during_prefill(
+        srv,
+        "sess-1",
+        llama_port=8080,
+        slot_id=0,
+        last_progress=0,
+        prefill_in_flight=True,
+    )
+    assert extended is True, "in-flight prefill must extend even when /slots is unobservable"
+    assert last_progress == 0
+
+    record = srv.local_dispatch_records["sess-1"]
+    assert record["expires_at"] > time.monotonic()
+    assert record["last_progress_ts"] > now - 1.0
+    assert _watchdog_no_progress(srv, "sess-1", record) is False
+    assert _extension_log_calls(srv.logger), "expected an in-flight extension log"
+    assert _logged_in_flight(srv.logger), "extension log must record in_flight=True"
+
+
+@pytest.mark.asyncio
+async def test_in_flight_extension_bounded_by_max_prefill_ceiling(monkeypatch):
+    """LP-0MUXTW4MD003TVIC: in-flight liveness cannot hold a lease forever —
+    the ``local_dispatch_max_prefill_seconds`` ceiling still releases a wedged
+    request that never reaches first byte."""
+    from proxy.router_helpers import (
+        _extend_lease_during_prefill,
+        _watchdog_no_progress,
+    )
+
+    config = copy.deepcopy(BASE_SERVER_CONFIG)
+    config["server"]["local_dispatch_no_progress_timeout_seconds"] = 180
+    config["server"]["local_dispatch_max_prefill_seconds"] = 900
+    now = time.monotonic()
+    srv = _make_srv(
+        records={
+            "sess-1": {
+                "backend": "local",
+                "started_at": now - 1000.0,  # beyond the 900s ceiling
+                "active": True,
+                "expires_at": now + 0.3,
+                "last_progress": 0,
+                "last_progress_ts": now - 1000.0,
+            },
+        },
+        config=config,
+    )
+    _install_fake_progress(monkeypatch, [(None, False)])
+
+    _, extended = await _extend_lease_during_prefill(
+        srv,
+        "sess-1",
+        llama_port=8080,
+        slot_id=0,
+        last_progress=0,
+        prefill_in_flight=True,
+    )
+    assert extended is True
+    record = srv.local_dispatch_records["sess-1"]
+    assert record["last_progress_ts"] > now - 1.0
+    assert _watchdog_no_progress(srv, "sess-1", record) is True, (
+        "The max-prefill ceiling must still bound an in-flight-extended lease"
+    )
 
 
 @pytest.mark.asyncio
@@ -858,10 +1125,11 @@ async def test_stream_loop_anonymous_session_not_extended(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_loop_adaptive_fallback_when_status_unobservable(monkeypatch):
-    """Fallback: when progress is unobservable the explicit-session lease is
-    not dropped — it keeps its adaptive acquisition-time expiry and the
-    stream completes normally."""
+async def test_stream_loop_extends_lease_in_flight_when_status_unobservable(monkeypatch):
+    """LP-0MUXTW4MD003TVIC: when progress is unobservable (``/slots`` and the
+    aggregate fallback both fail) the explicit-session lease is still extended
+    by the in-flight signal while the stream is awaiting its first chunk, and
+    the stream completes normally."""
     from proxy.router import proxy_to_local
 
     snapshots = []
@@ -895,21 +1163,78 @@ async def test_stream_loop_adaptive_fallback_when_status_unobservable(monkeypatc
     collected = await _collect_streamed_chunks(response)
     assert b"Hi" in collected
 
-    # The lease was polled but never extended (unobservable), yet the
-    # record persisted with a future expires_at throughout the prefill —
-    # the adaptive estimate from acquisition was not dropped.
+    # The lease was polled and extended via the in-flight signal even though
+    # progress was unobservable; the record keeps a future expires_at and the
+    # watchdog clock is refreshed.
     assert len(snapshots) >= 2, "Expected progress polls during prefill"
     assert all(exp > time.monotonic() - 2.0 for exp in snapshots), (
         "Lease should remain valid (future expires_at) throughout the prefill"
     )
-    assert not any(
-        "lease_extended_during_prefill" in line for line in _info_log_lines(server.logger)
-    ), "Unobservable progress must not log extension events"
+    log = " ".join(_info_log_lines(server.logger))
+    assert "lease_extended_during_prefill" in log, (
+        "In-flight liveness must extend the lease when /slots is unobservable"
+    )
+    assert _logged_in_flight(server.logger), "extension log must record in_flight=True"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Pre-header observability: initial upstream response wait (LP-0MUCEFC0T009V7ZY)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_first_byte_monitor_extends_lease_in_flight_when_slots_unobservable(monkeypatch):
+    """LP-0MUXTW4MD003TVIC (AC1): a long first-byte wait extends the lease via
+    the in-flight signal even when ``/slots`` never returns usable state, so
+    the no-progress watchdog cannot kill a healthy prefill.
+    """
+    from proxy.router_helpers import _await_first_byte_with_prefill_monitor
+
+    config = copy.deepcopy(BASE_SERVER_CONFIG)
+    config["server"]["local_dispatch_no_progress_timeout_seconds"] = 180
+    config["server"]["local_dispatch_max_prefill_seconds"] = 900
+    now = time.monotonic()
+    srv = _make_srv(
+        records={
+            "test-session-id": {
+                "backend": "local",
+                "started_at": now,
+                "active": True,
+                "expires_at": now + 0.2,
+                "last_progress": 0,
+                "last_progress_ts": now - 500.0,
+            },
+        },
+        config=config,
+    )
+
+    # /slots AND the aggregate fallback are permanently unobservable.
+    async def _fake_progress(*args, **kwargs):
+        return (None, False)
+
+    monkeypatch.setattr("proxy.router_helpers._query_prefill_progress", _fake_progress)
+
+    async def _slow_open():
+        await asyncio.sleep(0.25)  # longer than the 0.05s poll cadence
+        return ("cm", "resp")
+
+    result = await _await_first_byte_with_prefill_monitor(
+        srv,
+        _slow_open(),
+        timeout=5.0,
+        poll_seconds=0.05,
+        warn_seconds=0.0,
+        session_id="test-session-id",
+        llama_port=8080,
+        slot_id=0,
+    )
+    assert result == ("cm", "resp")
+
+    record = srv.local_dispatch_records["test-session-id"]
+    assert record["expires_at"] > now + 0.2, "lease must be extended while in flight"
+    assert record["last_progress_ts"] > now - 1.0, "no-progress clock must advance"
+    assert _extension_log_calls(srv.logger), "expected an in-flight extension log"
+    assert _logged_in_flight(srv.logger), "extension log must record in_flight=True"
 
 
 @pytest.mark.asyncio

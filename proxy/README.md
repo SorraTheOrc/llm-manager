@@ -700,6 +700,25 @@ When all providers are exhausted:
 
 The response contract is **additive-only**: the legacy `error` prose is retained for older clients, the stable `code` discriminator is what new clients should key on, and `retry_after` / the `Retry-After` header, `unavailable_providers` and `diagnostics` remain present where available.
 
+##### Client-facing retry-timer cap (LP-0MV0MM5R60025XZE)
+
+The `retry_after` field and the matching `Retry-After` header are **the same
+value** and are capped at `server.max_retry_after_seconds` (default `3600` = 60
+minutes). The honest computed wait can be many hours (the next `available_times`
+window edge or a usage-limit reset); advertising that verbatim parks an
+unattended client far longer than capacity routinely takes to return. Waits at
+or below the cap are advertised unchanged; waits above it are clamped to the
+cap. This bounds the **advertisement only** — the true reset stays visible in
+`diagnostics` (`reset_in`/`reset_at` for a quota block) and
+`unavailable_providers`, and provider schedules, cooldowns and quarantine
+durations are untouched. A missing, malformed or non-positive value falls back
+to the default `3600` so the cap cannot be accidentally disabled. The trade-off:
+during a genuine long outage a blocked client retries at most once per 60
+minutes, while the operator retains the true reset for diagnosis. The cap is
+well above the chain-hold budget (`chain_hold_seconds × chain_hold_max_cycles` =
+900 s by default), so capping never turns a hours-away exhaustion into a doomed
+hold (LP-0MU56ZKQD005SX08 AC5).
+
 ##### Exhaustion taxonomy (response + log)
 
 | Cause | `diagnostics` status | `unavailable_providers` | Log line |
@@ -714,7 +733,7 @@ The response contract is **additive-only**: the legacy `error` prose is retained
 
 1. **Read the `code`** in the 503 body (or the `Retry-After` header). `all_exhausted` → generic; `outside_time_window` → the schedule is the sole cause; `all_slots_exhausted` → local slot exhaustion (429).
 2. **Check `diagnostics`** for the dominant `status` values and `unavailable_providers` for cooldown/quarantine seconds. A `usage_limit_reset` entry with hours of `reset_in` is a quota block, not a schedule gap.
-3. **Check the `Retry-After` header**: it is the computed time until the soonest real availability (window edge / usage reset / cooldown).
+3. **Check the `Retry-After` header**: it is the computed time until the soonest real availability (window edge / usage reset / cooldown), bounded by `server.max_retry_after_seconds` (default `3600` s). To read the unbounded true wait, use `diagnostics` (`reset_in`/`reset_at`) and `unavailable_providers` (see the retry-timer cap above).
 4. **In `proxy.log`**, follow the `routing_check` / `routing_skip_local` / `compaction_bypass_eval` lines for the session; each carries the model, estimate, cached ratio and — for held requests — `chain_hold_cycle=N`.
 5. **Distinguish a hold cycle from new demand**: a line with `chain_hold_cycle>0` belongs to one held request being retried, not a new client request. `proxy-usage-analysis` should exclude those from demand counts (LP-0MUIEO6IP0030CT3).
 
@@ -740,6 +759,10 @@ than the exhaustion response's real `retry_after`: each hold waits at most
 total budget (`chain_hold_seconds × chain_hold_max_cycles`) the terminal
 response is returned immediately with its accurate `Retry-After` instead of
 sleeping through doomed cycles. A `retry_after` of `0` retries immediately.
+The `retry_after` used here is the client-facing value, so it is also bounded
+by `server.max_retry_after_seconds` (default `3600` s); the default cap stays
+above the default hold budget (`900` s), so the hold decision is unchanged
+(LP-0MV0MM5R60025XZE AC5).
 - **Cycle observability** (LP-0MU5AIAAY003KVM0) — every hold cycle re-runs the
 full chain (local routing + compaction evaluation). `routing_check`,
 `routing_skip_local`, `compaction_bypass_eval` and the hold line carry
@@ -751,7 +774,12 @@ is a capacity condition, not a provider failure: with
 `contention_queue_max_wait_seconds` for the protected local slot before
 falling back to the remote chain (`contention_queue_dispatch ...
 reason=local_lease_active` when admitted, `contention_queue_fallback_after_queue`
-on budget expiry).
+on budget expiry). The wait predicate accounts for **both** occupancy gates
+(LP-0MU498TWH008DBCI): the generating-only pool AND the prefill-in-flight count,
+so a request denied solely by the router's prefill-aware guard waits for the
+prefill to finish instead of re-dispatching immediately. Each wait logs
+`contention_queue_wait ... saturation=<generating|prefill|none>` so the two
+saturation kinds are distinguishable in observability.
 
 Behavior:
 - **Streaming requests** (`stream: true`) receive periodic SSE comment lines
@@ -1211,6 +1239,42 @@ impact (recovery-first avoids the pre-content window; informative-error
 covers 100% of client-visible errors), and the emission-site audit
 (`proxy/docs/sse-error-emission-audit.md`).
 
+##### Residual stream-error classes (fix-or-classify, LP-0MUI5B98B0080CIB)
+
+Both strategies above are live, so the residual `finish_reason: error`
+events are no longer "adopt the strategy" work — they break down into a
+deterministic root-cause taxonomy (LP-0MUQO82LJ008F1FS, rendered by the
+`proxy-usage-analysis` skill):
+
+- **`upstream_stall_after_content`** — the upstream stalled *after* content
+  was delivered, so re-route is impossible; the informative error is the
+  correct terminal outcome (by design).
+- **`mode_switch_restart`** — an in-flight **local** stream was killed by a
+  mode-switch / llama-server restart. The bounded drain
+  (`server.mode_switch_drain.max_seconds`, 30s fast/cheap, 90s base) waits
+  for in-flight local streams, but a stream that outlives the bound, or one
+  the proxy no longer tracks when `start-proxy.sh --restart` restarts
+  llama-server, is still killed. The drain outcome is logged
+  (`mode_switch_drain: waited=… remaining=… timed_out=…`) and the
+  `proxy-usage-analysis` skill classifies these deterministically
+  (LP-0MUQO862J001VBWU). The drain is deliberately **not** extended — doing
+  so would reintroduce the long rejection window ruled out by
+  LP-0MSF9RUSQ007M346.
+- **`remote_chain_exhaustion`** — the remote provider chain was exhausted
+  (empty response / stall retries while siblings were in cooldown); correct
+  handling, not a proxy defect.
+
+##### Client-visibility gap: pi-ai drops the enriched error payload
+
+The informative `error` object (`type` / `message` / `suggested_action`) is
+emitted in the SSE event, but `@earendil-works/pi-ai`'s `mapStopReason()`
+collapses `finish_reason: "error"` to the generic string
+`Provider finish_reason: error` and discards the payload before the client
+sees it. Tracked upstream as
+[earendil-works/pi#10752](https://github.com/earendil-works/pi/issues/10752)
+(LP-0MUQO862N002559W). Until it lands, clients retry the generic string (the
+ContextHub recovery extension does this — WL-0MUQO8AEE003G1Z2).
+
 ##### SSE event re-framing guarantee (LP-0MUOBUPBC002GYTL)
 
 Upstream `aiter_bytes()` reads are arbitrary — a single read can contain a
@@ -1427,6 +1491,7 @@ http://localhost:8000/
 **Slot Status**
 - Real-time per-slot status cards for the local llama-server (idle/processing/waiting indicators, decoded-token progress)
 - Updates live via SSE broadcasts from `/events` (per-slot data queried from the llama-server `/slots` endpoint)
+- The per-slot `session_id` (and the top-level `local_owner_session_id`) is always a plain session-id **string**. Per-endpoint dispatch leases are keyed internally by an `(endpoint, session_id)` tuple; the proxy normalises it via `_dispatch_key_session_id()` before it reaches the wire (WL-0MUKY4MAX0008I0L). Older proxies may still send the legacy two-element array (`["<endpoint>", "<session-id>"]`); the UI (`normaliseSessionId()` in `templates/index.html`) tolerates both shapes and never calls `.substring()` on a non-string.
 - Covered by Playwright E2E tests in `tests/slot-status.spec.js`
 
 **Quick Links**
@@ -1998,11 +2063,12 @@ contaminate another session's routing decisions:
 
 - **Cold** — The session's backend KV slot is invalidated or has never been
   populated. Large-context requests bypass local at the **cold threshold**
-  (mode-aware, LP-0MSOMVOPH004ATAK: 38K tokens in fast mode, 60K in cheap
+  (mode-aware, LP-0MSOMVOPH004ATAK: 38K tokens in fast mode, 42K in cheap
   mode; configurable via `local_large_context_cold_cache_threshold`).
 - **Warm** — The session has confirmed cache persistence. Large-context requests
-  bypass local only at the **warm threshold** (default: 100K tokens,
-  configurable via `local_large_context_warm_cache_threshold`).
+  bypass local at the **effective warm threshold** — the minimum of the
+  physical per-slot clamp and a latency-derived economic ceiling
+  (LP-0MU466L1X003RTHN; default effective value: 100K tokens in fast mode).
 - **No session ID** — Falls back to model-level cache state (conservative).
   Sessions without a session_id header default to the same cold behavior.
 
@@ -2023,8 +2089,26 @@ disabled, non-streaming proxy-only mode) does **not** warm the cache.
 
 ```yaml
 local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 = disable cold bypass
-local_large_context_warm_cache_threshold: 100000  # tokens; 0 = disable warm bypass
+local_large_context_warm_cache_threshold: 100000  # absolute warm upper bound; 0 = disable
+local_large_context_economic_ceiling_ratio: 0.3815  # warm economic ceiling = ratio x model ctx
 ```
+
+The effective warm threshold is resolved through a **3-term model**
+(LP-0MU466L1X003RTHN):
+
+```
+effective_warm = min(physical per-slot clamp, economic ceiling)
+  physical = local_model_ctx_size // slots - 4096
+  economic = round(local_large_context_economic_ceiling_ratio x local_model_ctx_size)
+             capped by local_large_context_warm_cache_threshold (when > 0)
+```
+
+The **physical** term is a hard capacity limit; the **economic** term is a
+latency/utilisation limit that scales with the model context size (not the slot
+count). The per-slot clamp dominates at 3+ slots; the economic ceiling
+dominates at 1 slot. The absolute `local_large_context_warm_cache_threshold`,
+when set, remains an upper bound; a ratio of `0` falls back to it and both `0`
+disables the warm cap.
 
 The cold threshold is **mode-aware** (LP-0MSOMVOPH004ATAK) and follows the
 base + overlay model: the base `config.yaml` (and therefore the fast overlay,
@@ -2032,11 +2116,11 @@ which does not override it) uses `38000`; `config-cheap.yaml` overrides it to
 `42000` (LP-0MT50SMU1005ZAD6 / LP-0MT50WCCP000DU00, after the initial 60000
 raise breached the cheap queue guardrails and was reverted —
 LP-0MSRM54YO007YG0K AC7).
-Each value stays below its mode's effective warm clamp (fast resolves to
-`min(100000, 262144//1 − 4096 = 258048) = 100000`; cheap resolves to
-`min(100000, 262144//3 − 4096 = 83285) = 83285`) so the (cold, warm] band never
-collapses (LP-0MSI2M5BT004BCDP). Prompts above the per-slot warm clamp are
-never routed local (`context_too_large` — physical capacity).
+Each value stays below its mode's effective warm threshold (fast resolves to
+`min(258048, min(round(0.3815 x 262144), 100000)) = 100000`; cheap resolves to
+`min(83285, 100000) = 83285`) so the (cold, warm] band never collapses
+(LP-0MSI2M5BT004BCDP). Prompts above the effective warm threshold are never
+routed local (`context_too_large` — physical capacity).
 
 When a threshold is set to `0`, the corresponding bypass is disabled entirely.
 

@@ -1185,6 +1185,22 @@ API Endpoints
             }
         }
 
+        // Normalise a dispatch-lease session identifier to a plain string.
+        // Newer proxies emit a plain session-id string; older proxies may
+        // still emit the legacy (endpoint, session_id) tuple, which JSON
+        // serialises as a two-element array. A string is used as-is, an
+        // array uses its trailing (session-id) element, and any other value
+        // is treated as "no session" so truncation can never throw
+        // (WL-0MUKY4MAX0008I0L).
+        function normaliseSessionId(value) {
+            if (typeof value === 'string') return value;
+            if (Array.isArray(value)) {
+                const last = value[value.length - 1];
+                return typeof last === 'string' ? last : null;
+            }
+            return null;
+        }
+
         // Render slot status cards from SSE slot data
         function renderSlots(slots) {
             const grid = document.getElementById('slotStatusGrid');
@@ -1209,7 +1225,9 @@ API Endpoints
             // Build HTML for each slot card
             let html = '';
             for (const slot of slots) {
-                const hasSession = slot.session_id !== undefined && slot.session_id !== null;
+                const sessionId = normaliseSessionId(slot.session_id);
+                const leaseSessionId = normaliseSessionId(slot.lease_session_id);
+                const hasSession = sessionId !== null;
                 const hasProgress = slot.n_tokens !== undefined && slot.n_tokens !== null &&
                     slot.progress !== undefined && slot.progress !== null;
                 const isProcessing = slot.is_processing === true;
@@ -1244,21 +1262,21 @@ API Endpoints
                 }
                 
                 const sessionDisplay = hasSession
-                    ? '<div class="slot-token-count">Session: ' + slot.session_id.substring(0, 16) + '...</div>'
+                    ? '<div class="slot-token-count">Session: ' + sessionId.substring(0, 16) + '...</div>'
                     : '';
                 
                 // Lease label (LP-0MTCZ35X7009IZKE): shows whether the work
                 // item owns a dispatch lease on this slot, which session owns
                 // it, and how long it has left.
                 let leaseDisplay = '';
-                if (slot.lease_session_id) {
-                    const ownsLease = hasSession && slot.session_id === slot.lease_session_id;
+                if (leaseSessionId !== null) {
+                    const ownsLease = hasSession && sessionId === leaseSessionId;
                     const remaining = slot.lease_remaining_seconds !== undefined && slot.lease_remaining_seconds !== null
                         ? Math.round(slot.lease_remaining_seconds) + 's' : '';
                     const stateLabel = slot.lease_active === true ? 'active' : 'cooldown';
                     const ownerLabel = ownsLease
                         ? 'this work item'
-                        : slot.lease_session_id.substring(0, 16) + '...';
+                        : leaseSessionId.substring(0, 16) + '...';
                     leaseDisplay = '<div class="slot-token-count">Lease: ' + ownerLabel +
                         ' · ' + stateLabel + ' · ' + remaining + ' left</div>';
                 }

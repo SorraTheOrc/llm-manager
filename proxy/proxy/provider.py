@@ -1328,41 +1328,123 @@ def effective_per_slot_threshold(ctx_size: int, slots: int) -> int:
     return per_slot - _LOCAL_ROUTING_OUTPUT_HEADROOM
 
 
+# Default large-context warm economic-ceiling ratio
+# (LP-0MU466L1X003RTHN). The ratio scales the warm routing threshold
+# linearly with the local model's total context size so a profile change
+# (smaller model, different slot count) needs no manual threshold
+# recalculation. 0 disables the ratio — the absolute
+# ``local_large_context_warm_cache_threshold`` is then the only upper bound.
+# The shipped ``config.yaml`` sets 0.3815 (= 100000 / 262144), the
+# latency-derived ceiling calibrated to the ~37 tok/s @100K prefill floor.
+_DEFAULT_ECONOMIC_CEILING_RATIO = 0.0
+
+
+def _get_economic_ceiling_ratio(config: dict) -> float:
+    """Read the large-context warm economic-ceiling ratio.
+
+    Supports both nested (``server.local_large_context_economic_ceiling_ratio``)
+    and flat config keys for production/test compatibility.
+
+    Returns 0.0 when unset/disabled (the absolute
+    ``local_large_context_warm_cache_threshold`` is then the only upper
+    bound). Negative or non-numeric values are treated as 0.0.
+    """
+    val = config.get("local_large_context_economic_ceiling_ratio")
+    if val is None:
+        val = config.get("server", {}).get(
+            "local_large_context_economic_ceiling_ratio",
+            _DEFAULT_ECONOMIC_CEILING_RATIO,
+        )
+    try:
+        return max(0.0, float(val or 0))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def effective_large_context_economic_ceiling(config: dict) -> int:
+    """Compute the latency-derived economic ceiling for the warm threshold.
+
+    The ceiling is ``round(ratio × local_model_ctx_size)`` capped by the
+    absolute ``local_large_context_warm_cache_threshold`` when that is > 0.
+    It scales with the **model** context size (not the slot count): the
+    physical per-slot clamp is the capacity term, this is the economic term
+    (LP-0MU466L1X003RTHN).
+
+    Returns 0 (warm cap disabled) when both the ratio and the absolute warm
+    override are 0. When the ratio is 0 the absolute value is used verbatim
+    (legacy behaviour). When ``local_model_ctx_size`` is 0 (scaling disabled)
+    the absolute value is also returned.
+    """
+    ratio = _get_economic_ceiling_ratio(config)
+    warm_override = _get_warm_cache_threshold(config)
+
+    # Both inputs 0 -> warm cap explicitly disabled.
+    if ratio <= 0 and warm_override <= 0:
+        return 0
+    # Ratio disabled or no ctx to scale with -> fall back to the absolute
+    # (legacy) warm override.
+    if ratio <= 0:
+        return warm_override
+    ctx_size = _get_local_model_ctx_size(config)
+    if ctx_size <= 0:
+        return warm_override
+    ceiling = round(ratio * ctx_size)
+    if warm_override > 0:
+        ceiling = min(ceiling, warm_override)
+    return ceiling
+
+
 def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
-    """Return (cold, warm) thresholds clamped to the actual per-slot context.
+    """Return (cold, warm) thresholds under the 3-term warm model.
 
-    The configured cold/warm thresholds were tuned assuming a fixed per-slot
-    context (e.g. 65000). When the real per-slot context is smaller
-    (``local_model_ctx_size`` / active slots, minus output headroom), prompts
-    larger than the slot capacity would be routed local and truncate with
-    ``finish_reason=length`` (context exhaustion) — surfaced by pi as the
-    misleading "maximum output token limit" error (LP-0MSAZXXDY005AWA1).
+    WARM resolves through the 3-term model (LP-0MU466L1X003RTHN):
 
-    The warm threshold is clamped to the actual per-slot context because it
-    represents a **hard capacity limit**: total context exceeding the slot
-    must be routed remote to prevent context exhaustion.
+        warm = min(physical per-slot clamp, latency-derived economic ceiling)
 
-    The cold threshold is an **economic new-token threshold** and must NOT be
-    clamped — it defines the band (cold, warm] where the cached_ratio routing
-    check (Check 2 in ``_should_skip_local``) operates. Clamping cold to the
-    same cap as warm collapses the band to zero width, making the ratio check
+    - **Physical term** — ``effective_per_slot_threshold(ctx_size, slots)``
+      (= ``ctx_size // slots - _LOCAL_ROUTING_OUTPUT_HEADROOM``): a hard
+      capacity limit. Prompts above it cannot fit the KV slot and must be
+      routed remote to prevent context exhaustion (``finish_reason=length``,
+      surfaced by pi as the misleading "maximum output token limit" error,
+      LP-0MSAZXXDY005AWA1).
+    - **Economic term** — ``effective_large_context_economic_ceiling(config)``:
+      ``round(ratio × local_model_ctx_size)`` capped by the absolute
+      ``local_large_context_warm_cache_threshold``. A latency/utilisation
+      limit that scales with the model context size, so a profile change
+      needs no manual threshold recalculation.
+
+    The per-slot clamp dominates when ``slots >= 3``; the economic ceiling
+    dominates when ``slots == 1``. The absolute warm config, when set, is
+    retained as an upper bound inside the ceiling helper; a ratio of 0 falls
+    back to the absolute value, and both 0 disables the warm cap.
+
+    COLD is an **economic new-token threshold** and is NOT clamped or scaled:
+    it defines the band (cold, warm] where the cached_ratio routing check
+    (Check 2 in ``_should_skip_local``) operates. Clamping cold to the same
+    cap as warm collapses the band to zero width, making the ratio check
     unreachable dead code (LP-0MSI2M5BT004BCDP).
 
     Returns the configured thresholds unchanged when ``local_model_ctx_size``
-    is 0 (clamp disabled) or per-slot context cannot be computed.
+    is 0 (clamp disabled) or per-slot context cannot be computed: the
+    economic ceiling then falls back to the absolute warm override.
     """
     cold = _get_large_context_threshold(config)
-    warm = _get_warm_cache_threshold(config)
     ctx_size = _get_active_local_ctx_size(config)
     slots = _get_active_local_slots(config)
+
+    # WARM: 3-term model (LP-0MU466L1X003RTHN). The economic ceiling replaces
+    # the raw warm config as the economic term and already folds in the
+    # absolute ``local_large_context_warm_cache_threshold`` as an upper bound.
+    warm = effective_large_context_economic_ceiling(config)
 
     cap = effective_per_slot_threshold(ctx_size, slots)
     if cap <= 0:
         return cold, warm
 
-    # Only clamp the WARM threshold to the per-slot cap (hard capacity limit).
-    # COLD stays as the economic new-token threshold so the (cold, warm] band
-    # remains non-empty for Check 2 (cached_ratio routing) to operate in.
+    # The physical per-slot clamp is a hard capacity limit: warm is capped by
+    # it, but only when the warm cap is enabled (> 0). COLD stays as the
+    # economic new-token threshold so the (cold, warm] band remains non-empty
+    # for Check 2 (cached_ratio routing) to operate in.
     if warm > 0:
         warm = min(warm, cap)
         # LP-0MTBOX45O005LD1S AC4: also clamp warm to the hard-routing cap
@@ -2341,6 +2423,48 @@ def _compute_retry_after(
     return int(max(candidates))
 
 
+# Client-facing exhaustion retry-timer cap (LP-0MV0MM5R60025XZE). The honest
+# ``_compute_retry_after`` value can be hours away (the next ``available_times``
+# window edge or a pending usage-limit reset). That is truthful, but parking a
+# client for up to ~6 h for capacity that routinely returns sooner wastes time.
+# The advertised wait (JSON ``retry_after`` + ``Retry-After`` header) is therefore
+# bounded; the true reset remains visible in ``diagnostics`` /
+# ``unavailable_providers`` for operators. Configurable via
+# ``server.max_retry_after_seconds``; a missing, malformed or non-positive value
+# falls back to the default so the cap can never be accidentally disabled.
+_DEFAULT_MAX_RETRY_AFTER_SECONDS = 3600
+
+
+def _max_retry_after_seconds(config: dict | None) -> int:
+    """Return the client-facing exhaustion retry-timer cap in seconds.
+
+    Reads ``max_retry_after_seconds`` from config, supporting both the
+    production nested form (``server.max_retry_after_seconds``) and a flat
+    key for backward compatibility with unit tests — matching
+    ``_get_cooldown_seconds``. Returns
+    :data:`_DEFAULT_MAX_RETRY_AFTER_SECONDS` (3600 s) when the key is absent
+    or its value is not a positive number; a malformed value never disables
+    the cap (LP-0MV0MM5R60025XZE AC4).
+    """
+    default = _DEFAULT_MAX_RETRY_AFTER_SECONDS
+    if not isinstance(config, dict):
+        return default
+    raw = config.get("max_retry_after_seconds")
+    if raw is None:
+        server_cfg = config.get("server")
+        if isinstance(server_cfg, dict):
+            raw = server_cfg.get("max_retry_after_seconds")
+    if isinstance(raw, bool):
+        return default
+    try:
+        seconds = float(raw)
+    except (ValueError, TypeError):
+        return default
+    if seconds <= 0:
+        return default
+    return int(seconds)
+
+
 def _quarantined_providers(model_config: dict) -> list[dict[str, Any]]:
     """Return provider entries quarantined by a pending usage-limit reset.
 
@@ -2752,6 +2876,35 @@ def _get_chain_hold_max_cycles(config: dict) -> int:
         return 3
 
 
+# Cumulative chain-hold budget across all cycles (see
+# ``_get_chain_hold_total_seconds``): strictly below the client's 900 s
+# queue-timeout deadline so an exhausted chain can never hold a request to
+# (or past) the client limit.
+_CHAIN_HOLD_TOTAL_DEFAULT = 720.0
+
+
+def _get_chain_hold_total_seconds(config: dict) -> float:
+    """Read ``chain_hold_total_seconds`` from config (flat or ``server.*``).
+
+    Cumulative wall-clock budget for ALL chain-hold waits across cycles
+    (streaming + non-streaming). ``chain_hold_seconds * chain_hold_max_cycles``
+    can otherwise reach exactly the client's 900-second queue-timeout deadline
+    (300 s x 3 = 900 s) — the AC1 gap from the LP-0MU1S617L002Q9PR audit. The
+    default 720 s leaves a 180 s margin below that deadline so the proxy always
+    responds before the client gives up. 0 disables the cap (legacy
+    cycle-bounded behaviour).
+    """
+    val = config.get("chain_hold_total_seconds")
+    if val is None:
+        val = config.get("server", {}).get(
+            "chain_hold_total_seconds", _CHAIN_HOLD_TOTAL_DEFAULT
+        )
+    try:
+        return max(0.0, float(val or 0))
+    except (ValueError, TypeError):
+        return _CHAIN_HOLD_TOTAL_DEFAULT
+
+
 def validate_chain_hold_config(config: dict) -> list[str]:
     """Validate the chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5).
 
@@ -2759,6 +2912,11 @@ def validate_chain_hold_config(config: dict) -> list[str]:
     ``server.*``) are non-negative numbers when present, and flags the
     pathological combination of a zero hold interval with an unlimited cycle
     count (an unbounded busy-retry loop).
+
+    ``chain_hold_total_seconds`` (LP-0MV6BR3HI00957PF) must be a non-negative
+    number and, when non-zero, must sit strictly below the client's 900-second
+    queue-timeout deadline — a budget at or above 900 s recreates the exact
+    race the bound exists to prevent.
 
     Returns a list of human-readable problem descriptions (empty when the
     config is consistent).
@@ -2792,6 +2950,26 @@ def validate_chain_hold_config(config: dict) -> list[str]:
         except (ValueError, TypeError):
             problems.append(
                 f"server.chain_hold_max_cycles must be an integer (got {max_cycles!r})"
+            )
+
+    total = config.get("chain_hold_total_seconds")
+    if total is None:
+        total = server_cfg.get("chain_hold_total_seconds")
+    if total is not None:
+        try:
+            total_f = float(total)
+            if total_f < 0:
+                problems.append(
+                    f"server.chain_hold_total_seconds must be >= 0 (got {total!r})"
+                )
+            elif total_f > 0 and total_f >= 900:
+                problems.append(
+                    "server.chain_hold_total_seconds must be strictly below "
+                    f"the client's 900 s queue-timeout deadline (got {total!r})"
+                )
+        except (ValueError, TypeError):
+            problems.append(
+                f"server.chain_hold_total_seconds must be a number (got {total!r})"
             )
 
     # Unbounded busy-retry: zero hold interval with unlimited cycles.
@@ -2996,7 +3174,7 @@ EXHAUSTION_CODE_TIME_WINDOW = "outside_time_window"
 EXHAUSTION_CODE_SLOTS = "all_slots_exhausted"
 
 
-def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None) -> Response:
+def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None, config: dict | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
     Args:
@@ -3008,6 +3186,9 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
         unavailable_providers: Optional mapping of provider -> remaining cooldown seconds
                                to include in the 503 JSON payload for diagnostics.
         diagnostics: Optional list of per-provider attempt diagnostics (order-preserving)
+        model_config: Optional model config (used to derive window-edge waits).
+        config: Optional server config; its ``max_retry_after_seconds`` bounds
+                the advertised wait (LP-0MV0MM5R60025XZE).
 
     The JSON body carries a stable ``code`` (``all_exhausted`` or
     ``all_slots_exhausted``) so clients can classify exhaustion without relying
@@ -3029,10 +3210,11 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
         )
 
     retry_after = _compute_retry_after(unavailable_providers, model_config=model_config)
+    client_retry_after = min(retry_after, _max_retry_after_seconds(config))
     payload: dict[str, Any] = {
         "error": "All providers exhausted",
         "code": EXHAUSTION_CODE_ALL,
-        "retry_after": retry_after,
+        "retry_after": client_retry_after,
     }
     if unavailable_providers:
         # Attach diagnostic info about which providers are in cooldown
@@ -3052,7 +3234,7 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
         content=json.dumps(payload).encode("utf-8"),
         status_code=503,
         media_type="application/json",
-        headers={"Retry-After": str(retry_after)},
+        headers={"Retry-After": str(client_retry_after)},
     )
 
 
@@ -3061,6 +3243,7 @@ def _build_time_window_exhausted_response(
     unavailable: dict[str, int],
     any_provider_tried: bool,
     model_config: dict | None = None,
+    config: dict | None = None,
 ) -> Response | None:
     """Return a distinguishable 503 when every provider was skipped solely due
     to its configured ``available_times`` window.
@@ -3099,11 +3282,12 @@ def _build_time_window_exhausted_response(
                 return None
 
     retry_after = _compute_retry_after(unavailable, model_config=model_config)
+    client_retry_after = min(retry_after, _max_retry_after_seconds(config))
     payload: dict[str, Any] = {
         "error": "All providers exhausted",
         "code": EXHAUSTION_CODE_TIME_WINDOW,
         "detail": "no provider is available during the current scheduled time window",
-        "retry_after": retry_after,
+        "retry_after": client_retry_after,
     }
     if attempts:
         try:
@@ -3114,7 +3298,7 @@ def _build_time_window_exhausted_response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=503,
         media_type="application/json",
-        headers={"Retry-After": str(retry_after)},
+        headers={"Retry-After": str(client_retry_after)},
     )
 
 
@@ -3352,6 +3536,57 @@ def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tu
     return (cur_active, max_local)
 
 
+def _local_slot_saturation(
+    config: dict, max_local: int, endpoint: str | None = None
+) -> str | None:
+    """Which local occupancy gate is saturated, or None when a slot is free.
+
+    LP-0MU498TWH008DBCI: the contention queue wake predicate must account for
+    BOTH occupancy gates that ``_try_acquire_local_dispatch`` enforces:
+
+    - ``"generating"`` — the generating-only pool is at capacity
+      (LP-0MTH7JX82000YS5N).
+    - ``"prefill"`` — the prefill-in-flight count is at the slot-pool cap
+      (the router's prefill-aware guard, LP-0MTJET4I5009EHNX).
+    - ``None`` — at least one slot is free for a new dispatch.
+
+    Generating is checked first so a busy generating pool (the common case)
+    is labelled correctly. The prefill counter is global (keyed by session),
+    so it is not endpoint-scoped.
+    """
+    try:
+        cur_local, _ = _local_concurrency_info(config, endpoint=endpoint)
+        if cur_local >= max_local:
+            return "generating"
+    except Exception:
+        pass
+    # Prefill-aware guard (LP-0MTJET4I5009EHNX): a prefill in flight holds a
+    # slot; never admit more concurrent prefills than the slot pool.
+    try:
+        import proxy.server as _srv
+        from proxy.router_helpers import _get_prefill_in_flight_count
+
+        if _get_prefill_in_flight_count(_srv) >= max_local:
+            return "prefill"
+    except Exception:
+        pass
+    return None
+
+
+def _local_slot_free(
+    config: dict, max_local: int, endpoint: str | None = None
+) -> bool:
+    """Whether a local slot is free, accounting for prefill-in-flight.
+
+    A predicate that only watches the generating count would wake a queued
+    request immediately while a prefill is in flight (generating == 0),
+    re-dispatch it, be denied by the router's prefill guard and fall through
+    to a remote provider without ever waiting for the prefill to finish
+    (LP-0MU498TWH008DBCI).
+    """
+    return _local_slot_saturation(config, max_local, endpoint=endpoint) is None
+
+
 # ---------------------------------------------------------------------------
 # Bounded cross-session contention queue (LP-0MSORQVK50012Q4D)
 # ---------------------------------------------------------------------------
@@ -3434,6 +3669,7 @@ async def _maybe_queue_for_local_slot(
     model_config: dict,
     provider_cfg: dict,
     session_id: str | None,
+    endpoint: str | None = None,
 ) -> tuple[str, str | None, float | None]:
     """Queue-wait for a local slot (cheap mode, queue policy) instead of
     immediately falling back to the next remote provider.
@@ -3470,11 +3706,21 @@ async def _maybe_queue_for_local_slot(
 
     from proxy import contention_queue
 
+    # LP-0MU498TWH008DBCI AC5: record which gate the request waits on so
+    # generating-saturation and prefill-saturation waits are distinguishable.
+    _saturation = _local_slot_saturation(config, max_local, endpoint=endpoint)
+    logger.info(
+        "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s",
+        cq["max_wait_seconds"], cq["max_depth"], _saturation or "none",
+    )
+
     _wait_started = _time.monotonic()
     elapsed = await contention_queue.wait_for_local_slot(
         max_wait_seconds=cq["max_wait_seconds"],
         max_depth=cq["max_depth"],
-        slot_free_check=lambda: _get_local_concurrency_info(config)[0] < max_local,
+        slot_free_check=lambda: _local_slot_free(
+            config, max_local, endpoint=endpoint
+        ),
     )
     if elapsed is None:
         # Caps exceeded — the caller falls back. Surface the measured wait so
@@ -5177,6 +5423,29 @@ def _get_chain_hold_cycle(request) -> int:
         return 0
 
 
+def _set_chain_hold_consumed(request, consumed: float) -> None:
+    """Record the cumulative chain-hold budget consumed on the request.
+
+    Mirrors ``_set_chain_hold_cycle``: the streaming hold generator and the
+    non-streaming hold loop share the running total via ``request.state`` so
+    the cumulative budget (``chain_hold_total_seconds``) is never exceeded
+    across the two code paths (LP-0MV6BR3HI00957PF). Fail-open: test stubs
+    without a ``state`` do not carry the field.
+    """
+    try:
+        request.state.chain_hold_consumed = float(consumed)
+    except Exception:
+        pass
+
+
+def _get_chain_hold_consumed(request, default: float = 0.0) -> float:
+    """Return the cumulative chain-hold budget consumed (0.0 when unset)."""
+    try:
+        return float(getattr(request.state, "chain_hold_consumed", default))
+    except Exception:
+        return default
+
+
 def _exhaustion_retry_after(response: Response) -> int | None:
     """Return an exhaustion response's ``Retry-After`` in seconds.
 
@@ -5245,6 +5514,8 @@ def _build_streaming_hold_response(
     next_cycle: int,
     max_cycles: int,
     hold_seconds: float,
+    total_budget: float,
+    consumed: float,
     exhaustion_response: Response,
 ) -> StreamingResponse:
     """Build the streaming response that delivers the chain hold (AC3/AC4).
@@ -5256,13 +5527,25 @@ def _build_streaming_hold_response(
     3. on success, replays the cycle's response body after the comments;
     4. on exhaustion, repeats from step 1 until the cycle bound is reached,
        then emits the terminal exhaustion body as an SSE ``data:`` chunk.
+
+    *total_budget* (``chain_hold_total_seconds``) caps the CUMULATIVE hold
+    time across all cycles so the request can never be held to (or past) the
+    client's 900-second queue-timeout deadline; *consumed* carries the budget
+    already spent before this streaming response began (LP-0MV6BR3HI00957PF).
+    A zero/disabled budget preserves the legacy cycle-bounded behaviour.
     """
     first_provider = _first_provider_name(model_config)
 
     async def _gen():
+        nonlocal consumed
         cycle = next_cycle
         current_exhaustion = exhaustion_response
         while True:
+            if total_budget > 0 and consumed >= total_budget:
+                # Cumulative hold budget spent — surface the exhaustion now
+                # instead of holding through doomed cycles.
+                yield _response_to_sse_bytes(current_exhaustion)
+                return
             effective_hold = _bounded_hold_seconds(
                 hold_seconds, current_exhaustion, max_cycles
             )
@@ -5271,6 +5554,10 @@ def _build_streaming_hold_response(
                 # immediately instead of holding through doomed cycles.
                 yield _response_to_sse_bytes(current_exhaustion)
                 return
+            if total_budget > 0 and consumed + effective_hold > total_budget:
+                effective_hold = max(0.0, total_budget - consumed)
+            consumed += effective_hold
+            _set_chain_hold_consumed(request, consumed)
             _log_chain_hold_start(path, effective_hold, cycle, max_cycles)
             comment = _build_chain_hold_comment(
                 first_provider,
@@ -5341,6 +5628,9 @@ async def _run_chain_cycles(
 
     hold_seconds = _get_chain_hold_seconds(config)
     max_cycles = _get_chain_hold_max_cycles(config)
+    total_budget = _get_chain_hold_total_seconds(config)
+    consumed = 0.0
+    _set_chain_hold_consumed(request, 0.0)
 
     # Semantics (LP-0MU5AIAAY003KVM0, option (a) — decided): every hold cycle
     # re-runs the FULL fallback cycle, including local routing and compaction
@@ -5369,6 +5659,17 @@ async def _run_chain_cycles(
                 # response immediately with its accurate Retry-After
                 # (LP-0MU56ZKQD005SX08).
                 return exc.response
+            # Cumulative hold budget (LP-0MV6BR3HI00957PF): ``chain_hold_seconds
+            # * chain_hold_max_cycles`` can reach exactly the client's 900 s
+            # deadline; the total budget caps ALL holds across cycles so the
+            # proxy always responds first. Zero disables the cap.
+            if total_budget > 0:
+                if consumed >= total_budget:
+                    return exc.response
+                if consumed + effective_hold > total_budget:
+                    effective_hold = max(0.0, total_budget - consumed)
+            consumed += effective_hold
+            _set_chain_hold_consumed(request, consumed)
             _log_chain_hold_start(path, effective_hold, cycle, max_cycles)
             if await _request_is_streaming(request):
                 # Streaming: return a streaming response that emits SSE hold
@@ -5383,6 +5684,8 @@ async def _run_chain_cycles(
                     next_cycle=cycle + 1,
                     max_cycles=max_cycles,
                     hold_seconds=hold_seconds,
+                    total_budget=total_budget,
+                    consumed=consumed,
                     exhaustion_response=exc.response,
                 )
             # Non-streaming: silent (deferred) hold, then a new cycle from
@@ -5760,13 +6063,14 @@ async def _proxy_with_remote_fallback_cycle(
     # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
     time_window_exhausted = _build_time_window_exhausted_response(
         attempts, unavailable, any_provider_tried, model_config=model_config,
+        config=config,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config)
         )
 
     if first_model_loading_response is not None:
@@ -5788,7 +6092,7 @@ async def _proxy_with_remote_fallback_cycle(
         raise ChainExhaustedError(_build_reasoning_content_roundtrip_error())
 
     raise ChainExhaustedError(
-        _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
+        _build_exhausted_response(all_local_slot_exhaustion=all_slot_exhaustion, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config)
     )
 
 
@@ -6056,6 +6360,7 @@ async def _proxy_with_fallback_cycle(
                         await _maybe_queue_for_local_slot(
                             config, cur_local, max_local, request, body_json,
                             model_config, provider_cfg, _session_id,
+                            endpoint=local_endpoint,
                         )
                     )
                     if _cq_action == "dispatch":
@@ -6563,6 +6868,7 @@ async def _proxy_with_fallback_cycle(
                         await _maybe_queue_for_local_slot(
                             config, _lease_cur, _lease_max, request, body_json,
                             model_config, provider_cfg, _session_id,
+                            endpoint=local_endpoint,
                         )
                     )
                     if _lease_action == "dispatch":
@@ -7150,19 +7456,20 @@ async def _proxy_with_fallback_cycle(
     # "All providers exhausted" (LP-0MS4ETBNO0022QAC).
     time_window_exhausted = _build_time_window_exhausted_response(
         attempts, unavailable, any_provider_tried, model_config=model_config,
+        config=config,
     )
     if time_window_exhausted is not None:
         raise ChainExhaustedError(time_window_exhausted)
 
     if not any_provider_tried:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
+            _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config)
         )
 
     # If all failures were slot exhaustion, include total slots in message
     if all_slot_exhaustion:
         raise ChainExhaustedError(
-            _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
+            _build_exhausted_response(all_local_slot_exhaustion=True, total_slots=total_slots_sum, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config)
         )
 
     # When all providers are exhausted, return the first provider's actual
@@ -7204,7 +7511,7 @@ async def _proxy_with_fallback_cycle(
             raise ChainExhaustedError(_first_error_response)
 
     raise ChainExhaustedError(
-        _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config)
+        _build_exhausted_response(all_local_slot_exhaustion=False, unavailable_providers=unavailable, diagnostics=attempts, model_config=model_config, config=config)
     )
 
 

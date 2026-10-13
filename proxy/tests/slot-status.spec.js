@@ -453,4 +453,151 @@ test.describe('Slot Status Section', () => {
     await expect(slotCards.nth(1).locator('.slot-id')).toContainText('Slot 1');
   });
 
+  test('array-shaped session_id renders the session without a console error', async ({ page }) => {
+    // WL-0MUKY4MAX0008I0L: older proxies serialised the dispatch-lease
+    // (endpoint, session_id) tuple as a JSON array. renderSlots() must
+    // normalise it to the trailing session id instead of throwing
+    // `TypeError: slot.session_id.substring is not a function` (which aborted
+    // the whole panel and logged 'Error parsing SSE message').
+    const consoleErrors = [];
+    const pageErrors = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    await page.addInitScript(({ payload, delayMs }) => {
+      const listeners = { message: [] };
+      window.EventSource = function () {
+        const es = {
+          onmessage: null,
+          addEventListener(type, cb) {
+            (listeners[type] || (listeners[type] = [])).push(cb);
+          },
+          dispatchEvent(evt) {
+            if (evt.type === 'message') {
+              if (es.onmessage) es.onmessage.call(es, evt);
+              (listeners.message || []).forEach((cb) => cb.call(es, evt));
+            }
+            return true;
+          },
+          close() {},
+        };
+        setTimeout(() => {
+          es.dispatchEvent(
+            new MessageEvent('message', { data: JSON.stringify(payload) })
+          );
+        }, delayMs);
+        return es;
+      };
+    }, {
+      payload: {
+        type: 'status',
+        slots: [
+          {
+            slot_id: 0,
+            is_processing: true,
+            n_tokens: 2000,
+            progress: 0.5,
+            total_tokens: 4000,
+            session_id: ['http://localhost:8080', '01a0e6f0-38eb-71f2-9961-6d186bac2ded'],
+            lease_session_id: ['http://localhost:8080', '01a0e6f0-38eb-71f2-9961-6d186bac2ded'],
+            lease_active: true,
+            lease_remaining_seconds: 30,
+            generation_done: false,
+          },
+        ],
+        llama_server_running: true,
+        current_model: 'test-model',
+        n_ctx: 4096,
+        kv_cache_tokens: 128,
+        total_sent: 0,
+        total_recv: 0,
+        per_model_queries: {},
+      },
+      delayMs: 100,
+    });
+
+    await page.goto('/');
+
+    // The card renders with the normalised trailing session id.
+    const slotCards = page.locator('.slot-card');
+    await expect(slotCards).toHaveCount(1);
+    const sessionLine = slotCards.nth(0).locator('.slot-token-count').first();
+    await expect(sessionLine).toContainText('Session: 01a0e6f0-38eb-71...');
+    // Both shapes normalise to the same string, so the lease is recognised.
+    await expect(slotCards.nth(0)).toContainText('this work item');
+
+    // No uncaught exception and no SSE parse error.
+    expect(pageErrors).toEqual([]);
+    const sseErrors = consoleErrors.filter(
+      (t) => t.includes('Error parsing SSE message') || t.includes('substring')
+    );
+    expect(sseErrors).toEqual([]);
+  });
+
+  test('string-shaped session_id renders identically to the legacy array shape', async ({ page }) => {
+    // WL-0MUKY4MAX0008I0L: the new normaliser must be behaviour-preserving for
+    // the string shape that current proxies emit.
+    await page.addInitScript(({ payload, delayMs }) => {
+      const listeners = { message: [] };
+      window.EventSource = function () {
+        const es = {
+          onmessage: null,
+          addEventListener(type, cb) {
+            (listeners[type] || (listeners[type] = [])).push(cb);
+          },
+          dispatchEvent(evt) {
+            if (evt.type === 'message') {
+              if (es.onmessage) es.onmessage.call(es, evt);
+              (listeners.message || []).forEach((cb) => cb.call(es, evt));
+            }
+            return true;
+          },
+          close() {},
+        };
+        setTimeout(() => {
+          es.dispatchEvent(
+            new MessageEvent('message', { data: JSON.stringify(payload) })
+          );
+        }, delayMs);
+        return es;
+      };
+    }, {
+      payload: {
+        type: 'status',
+        slots: [
+          {
+            slot_id: 0,
+            is_processing: true,
+            n_tokens: 2000,
+            progress: 0.5,
+            total_tokens: 4000,
+            session_id: '01a0e6f0-38eb-71f2-9961-6d186bac2ded',
+            lease_session_id: '01a0e6f0-38eb-71f2-9961-6d186bac2ded',
+            lease_active: true,
+            lease_remaining_seconds: 30,
+            generation_done: false,
+          },
+        ],
+        llama_server_running: true,
+        current_model: 'test-model',
+        n_ctx: 4096,
+        kv_cache_tokens: 128,
+        total_sent: 0,
+        total_recv: 0,
+        per_model_queries: {},
+      },
+      delayMs: 100,
+    });
+
+    await page.goto('/');
+
+    const slotCards = page.locator('.slot-card');
+    await expect(slotCards).toHaveCount(1);
+    const sessionLine = slotCards.nth(0).locator('.slot-token-count').first();
+    await expect(sessionLine).toContainText('Session: 01a0e6f0-38eb-71...');
+    await expect(slotCards.nth(0)).toContainText('this work item');
+  });
+
 });

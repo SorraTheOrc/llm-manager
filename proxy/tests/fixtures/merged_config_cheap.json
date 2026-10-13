@@ -25,6 +25,15 @@
           "type": "local"
         },
         {
+          "api_key_env": "MUNITOAI_API_KEY",
+          "endpoint": "https://api.munito.ai/inference",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash",
+          "name": "munitoai",
+          "provider": "MunitoAI",
+          "type": "remote"
+        },
+        {
           "api_key_env": "OPENCODE_3_API_KEY",
           "available_times": [
             "00:00-01:00",
@@ -92,6 +101,15 @@
           "llama_model": "Qwen3",
           "name": "local-qwen3",
           "type": "local"
+        },
+        {
+          "api_key_env": "MUNITOAI_API_KEY",
+          "endpoint": "https://api.munito.ai/inference",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash",
+          "name": "munitoai",
+          "provider": "MunitoAI",
+          "type": "remote"
         },
         {
           "api_key_env": "OPENCODE_3_API_KEY",
@@ -216,6 +234,15 @@
           "type": "local"
         },
         {
+          "api_key_env": "MUNITOAI_API_KEY",
+          "endpoint": "https://api.munito.ai/inference",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash",
+          "name": "munitoai",
+          "provider": "MunitoAI",
+          "type": "remote"
+        },
+        {
           "api_key_env": "OPENCODE_3_API_KEY",
           "available_times": [
             "00:00-01:00",
@@ -301,6 +328,7 @@
     "backend_retry_max_delay_seconds": 2.0,
     "chain_hold_max_cycles": 3,
     "chain_hold_seconds": 300,
+    "chain_hold_total_seconds": 720,
     "compaction_dry_run": false,
     "compaction_trigger_ratio": 0,
     "contention_queue_max_depth": 8,
@@ -348,11 +376,13 @@
     "local_dispatch_lease_timeout_seconds": 30,
     "local_large_context_cold_cache_threshold": 42000,
     "local_large_context_economic_bypass_serves_local": true,
+    "local_large_context_economic_ceiling_ratio": 0.3815,
     "local_large_context_warm_cache_threshold": 100000,
     "local_model_ctx_size": 262144,
     "local_slot_exhaustion_retry_attempts": 2,
     "local_slot_exhaustion_retry_delay_seconds": 0.1,
     "max_concurrent_queries": 16,
+    "max_retry_after_seconds": 3600,
     "min_local_routing_threshold": 10000,
     "min_local_routing_threshold_fatal": false,
     "mode_switch_drain": {
@@ -395,7 +425,7 @@
     "session_slot_skip_when_busy": true,
     "session_slot_timeout_per_token_seconds": 0.0015,
     "session_slot_timeout_seconds": 3.0,
-    "sibling_fallback_cooldown_seconds": 600,
+    "sibling_fallback_cooldown_seconds": 300,
     "sibling_fallback_threshold": 2,
     "sibling_fallback_window_seconds": 600,
     "slot_unavailable_retry_after": 5,

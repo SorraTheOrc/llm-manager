@@ -26,6 +26,13 @@
 #
 # Deleting this file makes `mode_config_file()` fall back to `config.yaml`,
 # i.e. the cheap profile degrades to the base profile.
+#
+# Inherited large-context thresholds (LP-0MU466L1X003RTHN): cheap runs 3 slots
+# x 262144 ctx. The warm threshold is auto-derived as
+#   min(physical 262144//3 - 4096 = 83285,
+#       economic min(round(0.3815 x 262144), 100000) = 100000) = 83285
+# and cold is overridden to the fixed economic 42000, so the (42000, 83285]
+# band is non-empty.
 # ---------------------------------------------------------------------------
 
 server:

@@ -240,7 +240,8 @@ models:
     - private
     force_full_prompt: true
     tokenizer: qwen3
-  # Cascading fallback: local Qwen3 first, then OpenCode Go, OpenCode Go #2, then DeepSeek direct.
+  # Cascading fallback: local Qwen3 first, then MunitoAI, then OpenCode Go,
+  # OpenCode Go #2, then DeepSeek direct.
   # Slot exhaustion on the local model falls through to remote tiers.
   # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
   plan:
@@ -248,6 +249,18 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
+      # fallback tier, promoted ahead of the opencode-go tiers. It declares no
+      # available_times window, so it is eligible around the clock (the
+      # opencode/deepseek tiers are windowed here). The API key is resolved
+      # from ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -323,6 +336,15 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
+      # fallback tier (see plan).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -389,6 +411,15 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
+      # fallback tier (see plan).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -559,7 +590,7 @@ server:
   # stream errors. State is in-memory (no persistence), like the other
   # cooldown mechanisms.
   sibling_fallback_threshold: 2
-  sibling_fallback_cooldown_seconds: 600
+  sibling_fallback_cooldown_seconds: 300
   sibling_fallback_window_seconds: 600
   # Chain-hold retry (LP-0MSH94Z7K007VKC9): when EVERY provider in a model's
   # fallback chain is exhausted, hold the request for chain_hold_seconds
@@ -587,6 +618,28 @@ server:
   # response unchanged. 0 = infinite (keep holding/retrying until the client
   # disconnects).
   chain_hold_max_cycles: 3
+  # Cumulative budget (seconds) for ALL chain-hold waits across cycles, so
+  # chain_hold_seconds x chain_hold_max_cycles can never hold a request up to
+  # (or past) the client's 900-second queue-timeout deadline — 300 s x 3 = 900 s
+  # raced the client exactly (LP-0MU1S617L002Q9PR AC1). Default 720 s leaves a
+  # 180 s margin below the 900 s deadline; the proxy always responds before the
+  # client gives up. 0 disables the cap (legacy cycle-bounded behaviour).
+  # Values >= 900 are rejected at load as they recreate the exact race.
+  chain_hold_total_seconds: 720
+  # Client-facing cap (seconds) on the advertised exhaustion retry timer —
+  # the JSON ``retry_after`` field and the matching ``Retry-After`` header on
+  # both exhaustion 503 variants (``all_exhausted`` /
+  # ``outside_time_window``) (LP-0MV0MM5R60025XZE). The honest computed wait
+  # can be many hours away (the next ``available_times`` window edge or a
+  # usage-limit reset); advertising that verbatim parks an unattended client
+  # far longer than capacity routinely takes to return. Waits at or below the
+  # cap are advertised unchanged; waits above it are clamped to the cap. This
+  # bounds the ADVERTISEMENT only — the true reset stays visible in
+  # ``diagnostics``/``unavailable_providers`` and provider schedules,
+  # cooldowns and quarantine durations are untouched. A missing, malformed or
+  # non-positive value falls back to the default 3600 so the cap is never
+  # accidentally disabled.
+  max_retry_after_seconds: 3600
   # Local slot-exhaustion grace retries before remote fallback.
   # Helps right-after-restart races where slot probes briefly report 0 available.
   local_slot_exhaustion_retry_attempts: 2
@@ -634,12 +687,28 @@ server:
   # was a misnomer: this is a context-size cap, not a cache-warmth signal).
   # Set to 0 to disable. Default: 60000.
   #
-  # This is a HARD PHYSICAL CAPACITY LIMIT: it is clamped to the actual
-  # per-slot context (local_model_ctx_size / active_slots, minus output
-  # headroom, LP-0MSAZXXDY005AWA1) so prompts that cannot fit the KV slot are
-  # never routed local. Unlike the cold threshold it is NOT an economic
-  # threshold, so only this value is clamped (LP-0MSI2M5BT004BCDP).
+  # This is the WARM (total-context) upper bound. The effective warm
+  # threshold is resolved through the 3-term model (LP-0MU466L1X003RTHN):
+  #   effective_warm = min(physical per-slot clamp, economic ceiling)
+  #     physical = local_model_ctx_size // slots - 4096 (output headroom)
+  #     economic = round(local_large_context_economic_ceiling_ratio
+  #                      x local_model_ctx_size), capped by this value
+  # The physical term is a hard capacity limit (LP-0MSAZXXDY005AWA1) so
+  # prompts that cannot fit the KV slot are never routed local. The economic
+  # term is the latency/utilisation limit. Only WARM is clamped/capped; COLD
+  # is the economic new-token threshold and is left unchanged so the
+  # (cold, warm] band stays non-empty (LP-0MSI2M5BT004BCDP).
   local_large_context_warm_cache_threshold: 100000
+
+  # Latency-derived economic-ceiling ratio for the WARM threshold
+  # (LP-0MU466L1X003RTHN). The ceiling scales linearly with the model context
+  # size (not the slot count) so a profile change (smaller model, different
+  # slot count) needs no manual threshold recalculation. Shipped 0.3815 =
+  # 100000 / 262144, calibrated to the ~37 tok/s @100K prefill floor: warm
+  # contexts are capped at ~30-38% of the model context. 0 falls back to the
+  # absolute local_large_context_warm_cache_threshold; both 0 disables the
+  # warm cap.
+  local_large_context_economic_ceiling_ratio: 0.3815
 
   # `local_hard_routing_cap_ratio_fast` RETIRED (LP-0MTVXP7DG00613ZB AC3):
   # the single `compaction_trigger_ratio` below is the only session detection
@@ -764,14 +833,39 @@ server:
   #   prefill extension or data chunks) for longer than this, the lease is released
   #   so a wedged request cannot gate the local pool indefinitely. This breaks the
   #   post-restart wedge where sessions hold leases while the backend is
-  #   "processing" but produces no output (LP-0MUCEFB8E003YVFF). Liveness-only
-  #   lease extension was removed in favour of this watchdog.
+  #   "processing" but produces no output (LP-0MUCEFB8E003YVFF).
+  #   NOTE (LP-0MUXQ5QL40027VZ4): the prefill-phase lease extension refreshes
+  #   ``last_progress_ts`` on *liveness* (per-slot ``is_processing``) as well as on
+  #   numeric progress, because the deployed llama.cpp b8782 build exposes no
+  #   numeric prefill progress.
+  #   NOTE (LP-0MUXTW4MD003TVIC): ``/slots`` is NOT usable as the prefill-phase
+  #   signal under load — llama-server holds it for the duration of a
+  #   prompt-processing batch (measured 8.7s, then >15s, versus the 1s
+  #   ``STATUS_QUERY_TIMEOUT``), and a queued request's slot reports
+  #   ``is_processing=False``. The extension therefore also refreshes
+  #   ``last_progress_ts`` whenever the upstream request is still in flight
+  #   with no error (``prefill_in_flight``), which is authoritative and does not
+  #   depend on ``/slots``. Without it every prefill or queue wait longer than
+  #   this timeout was released, its upstream stream cancelled, and the client
+  #   retried into a full re-prefill forever. A genuinely wedged slot (no
+  #   response, no chunks) is still bounded by
+  #   ``local_dispatch_max_prefill_seconds`` below.
   # local_dispatch_max_prefill_seconds: Hard ceiling on a single local dispatch
   #   record's lifetime (default 900s; 0 disables). A record active for longer than
-  #   this is released regardless of observed progress. Also bounds the initial
-  #   first-byte wait: a local request that produces no first byte within this
-  #   window is aborted server-side with a retryable 503 + Retry-After
-  #   (LP-0MUCEFB8E003YVFF).
+  #   this is released regardless of observed progress or in-flight liveness —
+  #   this is the wedge bound that pairs with the prefill extension above. Also
+  #   bounds the initial first-byte wait: a local request that produces no first
+  #   byte within this window is aborted server-side with a retryable 503 +
+  #   Retry-After (LP-0MUCEFB8E003YVFF). Checking this ceiling is what makes the
+  #   in-flight liveness signal safe (LP-0MUXTW4MD003TVIC).
+  # local_dispatch_first_byte_timeout_seconds: Initial first-byte wait ceiling
+  #   for a local dispatch (default 840s; 0 disables; LP-0MV6BR3HI00957PF). The
+  #   default is STRICTLY BELOW the client's 900-second queue-timeout deadline so
+  #   the proxy always returns a retryable 503 before the client gives up — the
+  #   legacy first-byte default of 900 s (reusing the lifetime wedge knob) raced
+  #   the client exactly and logged ``dispatch_first_byte_timeout ...
+  #   ceiling=900s``. The lifetime wedge bound above is unchanged; a healthy
+  #   stream that delivered its first byte keeps its full lifetime window.
   # local_dispatch_prefill_observability_warn_seconds: Threshold (default 30s) at
   #   which a long initial first-byte wait logs a ``prefill_wait_exceeds_threshold``
   #   warning. While awaiting the SSE response headers, the proxy polls prefill

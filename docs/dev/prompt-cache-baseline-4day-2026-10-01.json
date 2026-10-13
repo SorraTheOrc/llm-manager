@@ -1,0 +1,91 @@
+{
+  "meta": {
+    "generated_at": "2026-10-12T12:40:05",
+    "log_dir": "/var/log/llama-proxy",
+    "glob": null,
+    "globs": [],
+    "cache_ram_filter_mib": 8192.0,
+    "proxy_log_dir": "/var/log/llama-proxy",
+    "proxy_glob": null,
+    "proxy_globs": [],
+    "proxy_files": [],
+    "large_tokens_threshold": 10000,
+    "files": [
+      "llama-server.log-2026-09-28.gz",
+      "llama-server.log-2026-09-29.gz",
+      "llama-server.log-2026-09-30.gz",
+      "llama-server.log-2026-10-01.gz"
+    ]
+  },
+  "summary": {
+    "requests": 1373,
+    "prompt_tokens_requested": 48255576,
+    "tokens_reused": 42727939,
+    "reuse_pct": 88.55,
+    "tokens_prefilled": 5527637,
+    "full_prefill_requests": 99,
+    "forced_full_prefills": 82,
+    "small_full_prefill_requests": 43,
+    "small_full_prefill_tokens": 200029,
+    "large_full_prefill_requests": 56,
+    "large_full_prefill_tokens": 1563478,
+    "large_full_prefill_share_of_prefill_pct": 28.28,
+    "large_tokens_threshold": 10000,
+    "prefill_wall_seconds": 17963.9,
+    "prefill_eval_lines": 1078,
+    "evictions": 65,
+    "eviction_mean_mib": 1440.7,
+    "eviction_max_mib": 2839.8,
+    "cache_states": 560,
+    "cache_limit_mib": 8192.0,
+    "cache_peak_mib": 8181.0,
+    "cache_saturated_samples": 123,
+    "cache_saturated_pct": 21.96,
+    "cache_prompts_max": 12,
+    "checkpoint_size_mib": 62.813,
+    "checkpoints_per_slot_max": 32,
+    "checkpoint_overhead_per_prompt_mib": 2010.0,
+    "checkpoints_observed": 2196,
+    "prompt_eval_tok_s": {
+      "samples": 1078,
+      "median": 73.1,
+      "p10": 28.9,
+      "p90": 222.7
+    },
+    "decode_tok_s": {
+      "samples": 1078,
+      "median": 14.1,
+      "p10": 5.0,
+      "p90": 29.5
+    },
+    "first_byte_ms": {
+      "samples": 0,
+      "median": 0.0,
+      "p10": 0.0,
+      "p90": 0.0
+    },
+    "files": 4
+  },
+  "recommendation": {
+    "per_prompt_state_mib": 1440.7,
+    "per_prompt_source": "eviction_size",
+    "target_prompts": 12,
+    "margin": 1.25,
+    "observed_max_prompts": 12,
+    "holdable_prompts": 15,
+    "raw_cache_mib": 21610.5,
+    "recommended_cache_ram_mib": 22528,
+    "recommended_cache_ram_gib": 22.0,
+    "checkpoints_per_slot": 32,
+    "checkpoint_size_mib": 62.813,
+    "checkpoint_overhead_per_prompt_mib": 2010.0,
+    "upstream_rule_per_prompt_mib": 3200.0,
+    "host_total_mib": 127436.5,
+    "host_available_mib": 79233.2,
+    "reserve_mib": 12743.7,
+    "projected_free_after_cache_mib": 56705.2,
+    "headroom_safe": true,
+    "oom_fallback": "server_prompt_cache::alloc() sets limit_size = 0.4 * size() when the allocation fails; entering that path silently caps the cache below the configured value \u2014 size so it is never reached.",
+    "note": "Per-prompt size is dominated by context checkpoints (32 x 62.813 MiB = 2010.0 MiB). Reducing --ctx-checkpoints saves memory but coarsens rollback granularity; on a hybrid/recurrent model fewer checkpoints can itself increase full prefills, so the primary lever is --cache-ram and the checkpoint count is kept unless the host cannot afford the derived cache."
+  }
+}

@@ -46,6 +46,24 @@ SYNTH = """\
 [100] srv        update:  - cache state: 2 prompts, 7900.000 MiB (limits: 8192.000 MiB, 262144 tokens, 393209 est)
 """
 
+# Throughput corpus (AC6): one prompt-eval line and two decode lines, each
+# carrying the tok/s figure in the llama-server eval-timing parenthetical.
+SYNTH_SPEED = """\
+[100] srv        update:  - cache state: 2 prompts, 4000.000 MiB (limits: 8192.000 MiB, 262144 tokens, 393209 est)
+[100] slot update_slots: id  0 | task 0 | new prompt, n_ctx_slot = 262144, n_keep = 0, task.n_tokens = 6000
+[100] slot update_slots: id  0 | task 0 | prompt processing done, n_tokens = 6000, batch.n_tokens = 6000
+[100] prompt eval time =   3000.00 ms / 6000 tokens (    0.50 ms per token,  2000.00 tokens per second)
+[100]        eval time =    500.00 ms /    100 tokens (    5.00 ms per token,    20.00 tokens per second)
+[100]        eval time =    250.00 ms /    100 tokens (    2.50 ms per token,    40.00 tokens per second)
+"""
+
+# Proxy log corpus (AC6): client-visible first-byte latency lines.
+PROXY_SYNTH = """\
+2026-10-07 07:00:00,000 - INFO - dispatch_first_byte_ms=1234.5 dispatch_to_first_byte_ms=1234.5 session=abc model=Qwen3
+2026-10-07 07:00:01,000 - INFO - dispatch_first_byte_ms=765.5 dispatch_to_first_byte_ms=765.5 session=def model=Qwen3
+2026-10-07 07:00:02,000 - INFO - a line without the metric
+"""
+
 
 def _write_logs(tmp_path, text=SYNTH, name="llama-server.log"):
     log_dir = tmp_path / "logs"
@@ -184,3 +202,84 @@ def test_human_summary_renders(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "full-prefill requests" in proc.stdout
     assert "recommended --cache-ram" in proc.stdout
+    assert "decode throughput" in proc.stdout
+    assert "first-byte latency" in proc.stdout
+
+
+def test_prompt_eval_and_decode_throughput(tmp_path):
+    """AC6: prompt-eval and decode tok/s are measured from eval-timing lines."""
+    s = _summary(_write_logs(tmp_path, text=SYNTH_SPEED))["summary"]
+    assert s["prompt_eval_tok_s"]["samples"] == 1
+    assert s["prompt_eval_tok_s"]["median"] == 2000.0
+    assert s["decode_tok_s"]["samples"] == 2
+    assert s["decode_tok_s"]["median"] == 20.0
+    assert s["decode_tok_s"]["p90"] == 40.0
+    # The decode lines must not be counted as prompt-eval wall time.
+    assert s["prefill_wall_seconds"] == 3.0
+
+
+def test_first_byte_latency(tmp_path):
+    """AC6: client-visible first-byte latency is parsed from the proxy log."""
+    log_dir = _write_logs(tmp_path)
+    (log_dir / "proxy.log").write_text(PROXY_SYNTH)
+    data = _summary(log_dir)
+    fb = data["summary"]["first_byte_ms"]
+    assert fb["samples"] == 2
+    assert fb["median"] == 765.5
+    assert fb["p90"] == 1234.5
+    assert data["meta"]["proxy_files"] == ["proxy.log"]
+
+
+def test_first_byte_stats_empty_without_proxy_log(tmp_path):
+    """AC6: a llama-only corpus yields empty (not failing) first-byte stats."""
+    s = _summary(_write_logs(tmp_path))["summary"]
+    assert s["first_byte_ms"]["samples"] == 0
+
+
+def test_proxy_glob_aligns_proxy_window(tmp_path):
+    """AC6/AC3: --proxy-glob restricts the proxy corpus reproducibly."""
+    log_dir = _write_logs(tmp_path)
+    (log_dir / "proxy.log").write_text(PROXY_SYNTH)
+    (log_dir / "proxy.log.2026-10-01_00").write_text(
+        "2026-10-01 00:00:00,000 - INFO - dispatch_first_byte_ms=50.0 session=x model=Qwen3\n"
+    )
+    all_data = _summary(log_dir)
+    assert all_data["summary"]["first_byte_ms"]["samples"] == 3
+    assert all_data["meta"]["proxy_files"] == ["proxy.log", "proxy.log.2026-10-01_00"]
+    narrowed = _summary(log_dir, "--proxy-glob", "proxy.log")
+    assert narrowed["summary"]["first_byte_ms"]["samples"] == 2
+    assert narrowed["meta"]["proxy_files"] == ["proxy.log"]
+
+
+def test_multi_pattern_glob(tmp_path):
+    """AC4: comma-separated globs select a multi-file corpus."""
+    log_dir = _write_logs(tmp_path, text="")
+    for day in ("01", "02"):
+        with gzip.open(log_dir / f"llama-server.log-2026-01-{day}.gz", "wt") as fh:
+            fh.write(SYNTH)
+    both = _summary(
+        log_dir,
+        "--glob",
+        "llama-server.log-2026-01-01.gz,llama-server.log-2026-01-02.gz",
+    )
+    assert both["summary"]["requests"] == 8
+    assert both["meta"]["files"] == [
+        "llama-server.log-2026-01-01.gz",
+        "llama-server.log-2026-01-02.gz",
+    ]
+    one = _summary(log_dir, "--glob", "llama-server.log-2026-01-01.gz")
+    assert one["summary"]["requests"] == 4
+
+
+def test_cache_ram_filter_selects_matching_files(tmp_path):
+    """AC4: --cache-ram-filter isolates the post-deploy corpus by limit."""
+    log_dir = _write_logs(tmp_path, text="")
+    (log_dir / "llama-server.1.log").write_text(SYNTH)
+    (log_dir / "llama-server.2.log").write_text(
+        SYNTH.replace("8192.000 MiB", "23552.000 MiB")
+    )
+    data = _summary(log_dir, "--cache-ram-filter", "23552")
+    assert data["summary"]["requests"] == 4
+    assert data["summary"]["cache_limit_mib"] == 23552.0
+    assert data["meta"]["files"] == ["llama-server.2.log"]
+    assert data["meta"]["cache_ram_filter_mib"] == 23552.0
