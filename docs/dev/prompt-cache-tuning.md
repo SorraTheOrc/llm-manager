@@ -137,7 +137,7 @@ On the measured host:
 ```
 
 (re-checked at deploy time for LP-0MV5HSUHF002MDPG: `MemAvailable` was
-88,244 MiB on 2026-10-13, a stricter bound than the 79,248 MiB recorded at the
+88,244 MiB on 2026-10-14, a stricter bound than the 79,248 MiB recorded at the
 2026-10-12 measurement, so 88,244 − 40,960 = 47,284 MiB ≥ 12,743.7 MiB.)
 
 The failure mode to avoid is the OOM fallback inside
@@ -444,7 +444,7 @@ deploy evidence.
 
 ## 40960 MiB deploy (LP-0MV5HSUHF002MDPG)
 
-Deployment: 2026-10-13 via `/skill:start-proxy --restart` (never kill the
+Deployment: 2026-10-14 ~00:31 IST via `/skill:start-proxy --restart` (never kill the
 proxy manually). The restarted proxy spawned the Qwen3 child carrying the
 tuned values:
 
@@ -461,7 +461,7 @@ Headroom re-checked at deploy time (AC2): `MemAvailable − 40960 >= reserve`
 with `reserve = max(8 GiB, 10% MemTotal) = 12,743.7 MiB`:
 
 ```
-88,244 MiB (MemAvailable, 2026-10-13) − 40,960 = 47,284 MiB  >=  12,743.7 MiB  -> safe
+88,244 MiB (MemAvailable, 2026-10-14) − 40,960 = 47,284 MiB  >=  12,743.7 MiB  -> safe
 ```
 
 The OOM fallback inside `server_prompt_cache::alloc()`
