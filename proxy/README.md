@@ -62,28 +62,29 @@ proxy emits — `Stream started`/`Stream finished` (with authoritative
 `tokens=prompt/completion/total`), `Fallback triggered`, `routing_skip_local`,
 and `local_dispatch_denied` — streaming large logs line by line.
 
-To run it, invoke the skill (`/skill:proxy-usage-analysis`); it writes
-`~/proxy-usage-reports/{fast_sessions,cheap_sessions}.csv` and
-`~/proxy-usage-reports/report.md` by default (override with `--output-dir`).
-Operators can instead call the underlying script directly:
+The analysis pipeline is fully deterministic — no LLM is in the loop. The
+daily report is produced unattended by a cron job at 05:00; the skill is a
+thin, CLI-focused wrapper around the underlying script for on-demand runs:
 
 ```bash
-python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
     --log-dir /var/log/llama-proxy \
     --hours 24 \
     --output-dir ~/proxy-usage-reports
 ```
 
 Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
+`report.md` (the aggregate report plus recommendations),
 `fast_sessions.csv`, `cheap_sessions.csv`
 (one row per session; fast/cheap split derived from the mode timeline
-the active config profile), and `report.md` (aggregates + recommendations). Existing
+of the active config profile), and `errors.csv`/`errors.json`. Existing
 outputs are archived into a dated subdirectory before each run overwrites
-them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. A cron job
-runs the report daily at 05:00 (see SKILL.md).
+them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. The cron
+job at 05:00 runs the report daily and logs to
+`~/proxy-usage-reports/cron.log`.
 
-See `~/.pi/agent/skills/proxy-usage-analysis/SKILL.md` for usage details and
-interpretation guidance.
+See `.pi/skills/proxy-usage-analysis/SKILL.md` for the CLI options and
+`.pi/skills/proxy-usage-analysis/REFERENCE.md` for interpretation guidance.
 
 ## Host-first deployment
 
