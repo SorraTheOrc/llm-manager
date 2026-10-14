@@ -131,6 +131,10 @@ Outputs written to:
   "avg_tokens_saved": n, "stayed_local": N, "fell_back": N,
   "would_have_avoided": N, "would_still_fallback": N, "avoided": N,
   "backstop_sessions": N} — so `python3 scripts/analyze_proxy_usage.py … --json | jq .compaction` is usable without parsing Markdown.
+- `--json` summary field `hold_cycle_routing_skip_events` — number of
+  hold-cycle routing-skip re-emissions (`chain_hold_cycle>0`) in the
+  window, excluded from every demand/local-skip counter
+  (LP-0MUIEO6IP0030CT3): `jq .hold_cycle_routing_skip_events`.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
@@ -155,6 +159,18 @@ Outputs written to:
   `provider=local`), `Fallbacks` (`Fallback triggered` events), and
   `Local-skip` (`routing_skip_local` events); a **Totals** row gives the
   window busy totals plus the sum of each activity column over the window.
+  **Chain-hold de-duplication (LP-0MUIEO6IP0030CT3):** the `Local-skip`
+  columns count only genuine demand — a held request re-emitted across
+  chain-hold cycles (`chain_hold_cycle>0`, LP-0MU5AIAAY003KVM0) is counted
+  once (its cycle-0 occurrence), and the re-emissions are surfaced separately
+  in a **Hold-cycle re-emissions** section (per-session breakdown) plus a
+  header line (`hold-cycle re-emissions (excluded from demand)`). The
+  `routing_skip_local reasons` table and its `% of skips` percentages use the
+  same de-duplicated counts, and the `--json` summary exposes the re-emission
+  volume as `hold_cycle_routing_skip_events`. Historically, local-skip
+  totals for windows containing held requests were inflated (one held
+  request counted N+1 times); the intended count drop is therefore an
+  accuracy fix, not lost data.
   Absolute-hour buckets keep the two edge partials of a rolling window
   distinct, so no busy duration is double-counted and no row exceeds 100%
   (the previous hour-of-day keying could collide them and emit impossible
@@ -227,6 +243,10 @@ run (`Previous outputs archived to …`).
    log `Grandfathering: enabled; other-mode config ...
    (current=fast|cheap)`, LP-0MT1EE315007AKXG) and the error lines (`Stream
    error:`, `slot_save failed`, `backend_retry`, `[remote] upstream error`).
+   A `chain_hold_cycle=<N>` token on a `routing_skip_local` line is parsed
+   into the event's `chain_hold_cycle` field (LP-0MU5AIAAY003KVM0); lines
+   without the token (pre-chain-hold rotated logs) parse with
+   `chain_hold_cycle=None`, which aggregates as cycle 0 (genuine demand).
    Unparseable lines are counted and skipped, never fatal.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the
@@ -498,6 +518,15 @@ lines (`proxy.log` and `llama-server.log`).
 
 ## Limitations
 
+- **Hold-cycle re-emissions are excluded from local-skip demand counters
+  (LP-0MUIEO6IP0030CT3).** A held request re-emitted across chain-hold
+  cycles (`chain_hold_cycle>0`) counts once (its cycle-0 occurrence) in the
+  `Local-skip` columns, the `routing_skip_local reasons` table, and the
+  `--json` counters; the re-emissions appear only in the **Hold-cycle
+  re-emissions** section and the `hold_cycle_routing_skip_events` JSON
+  field. Local-skip totals for windows containing held requests therefore
+  fall versus pre-change reports — this is the intended accuracy fix, not
+  lost data.
 - `Fallback triggered` lines carry no session UUID; per-session attribution
   prefers the session's own `routing_skip_local` line and otherwise the
   nearest fallback event within 60s of the first remote stream.
