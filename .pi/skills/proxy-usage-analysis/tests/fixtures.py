@@ -122,6 +122,26 @@ ROUTING_SKIP_LARGE_CONTEXT = (
     "provider session=aaaaaaaa-1111-2222-3333-444444444444"
 )
 
+# Chain-hold cycle variants (LP-0MU5AIAAY003KVM0 / LP-0MUIEO6IP0030CT3): the
+# proxy stamps ``chain_hold_cycle=<N>`` on ``routing_skip_local`` lines; cycle
+# 0 is the first (pre-hold) cycle and every hold-restart increments it. A held
+# request therefore re-emits its skip once per cycle (up to
+# ``chain_hold_max_cycles``) and must be distinguishable from genuine new
+# client demand downstream.
+ROUTING_SKIP_CHAIN_HOLD_CYCLE_0 = (
+    "2026-08-02 14:02:20,157 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+    "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+    "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+    "provider session=019fc27d-3a46-7e5c-871e-57ab32f875f3 chain_hold_cycle=0"
+)
+
+ROUTING_SKIP_CHAIN_HOLD_CYCLE_2 = (
+    "2026-08-02 14:02:20,157 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+    "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+    "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+    "provider session=019fc27d-3a46-7e5c-871e-57ab32f875f3 chain_hold_cycle=2"
+)
+
 # --- local_dispatch_denied --------------------------------------------------
 
 DISPATCH_DENIED = (

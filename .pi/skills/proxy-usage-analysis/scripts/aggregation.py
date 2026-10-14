@@ -199,6 +199,21 @@ class AnalysisResult:
     # TTFT (Time to First Token) events parsed from log lines
     # (LP-0MTSSM5SO003PKU0).
     ttft_events: list[LogEvent] = field(default_factory=list)
+    # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3):
+    # ``routing_skip`` events with ``chain_hold_cycle > 0`` are re-emissions
+    # of a single held request restarted across chain-hold cycles
+    # (LP-0MU5AIAAY003KVM0), NOT genuine new client demand. They are kept out
+    # of every demand/local-skip aggregate (hourly ``local_skip``,
+    # ``routing_skip_events``, per-session ``routing_skips``,
+    # ``routing_skip_reason_counts``) and surfaced here separately so a stuck
+    # hold is distinguishable from a client retry storm.
+    hold_cycle_routing_skip_events: list[LogEvent] = field(default_factory=list)
+
+    @property
+    def hold_cycle_reemission_count(self) -> int:
+        """Number of hold-cycle routing-skip re-emissions
+        (``chain_hold_cycle > 0``) in the window."""
+        return len(self.hold_cycle_routing_skip_events)
 
     @property
     def total_requests(self) -> int:
@@ -860,6 +875,10 @@ def aggregate(
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
+    # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3):
+    # ``chain_hold_cycle > 0`` routing_skip events, recorded separately from
+    # the demand aggregates.
+    hold_cycle_routing_skip_events: list[LogEvent] = []
     # Per-hour activity counters (LP-0MTYAZFGN003BYQS): absolute top-of-hour
     # datetime -> Counter, counted by each event's own timestamp.
     hourly_activity: dict[datetime, Counter] = {}
@@ -912,7 +931,11 @@ def aggregate(
         elif ev.kind == "fallback":
             hourly_activity.setdefault(hour_key, Counter())["fallbacks"] += 1
         elif ev.kind == "routing_skip":
-            hourly_activity.setdefault(hour_key, Counter())["local_skip"] += 1
+            # Demand counter for genuine skips only: a ``chain_hold_cycle > 0``
+            # event is a hold-cycle re-emission, not new client demand
+            # (LP-0MUIEO6IP0030CT3).
+            if ev.chain_hold_cycle is None or ev.chain_hold_cycle <= 0:
+                hourly_activity.setdefault(hour_key, Counter())["local_skip"] += 1
         if ev.kind in (
             "stream_error",
             "stream_finish_error",
@@ -932,10 +955,16 @@ def aggregate(
                 builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
             continue
         if ev.kind == "routing_skip":
-            routing_skip_events.append(ev)
-            if ev.session:
-                routing_skips.setdefault(ev.session, []).append(ev)
-                builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
+            if ev.chain_hold_cycle is not None and ev.chain_hold_cycle > 0:
+                # Hold-cycle re-emission: keep out of every demand aggregate
+                # (routing_skip_events, per-session routing_skips,
+                # routing_skip_reason_counts) and record separately.
+                hold_cycle_routing_skip_events.append(ev)
+            else:
+                routing_skip_events.append(ev)
+                if ev.session:
+                    routing_skips.setdefault(ev.session, []).append(ev)
+                    builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
             continue
         if ev.kind == "contention_dispatch":
             contention_dispatch_events.append(ev)
@@ -995,4 +1024,5 @@ def aggregate(
         busy=busy,
         hourly_activity=hourly_activity,
         ttft_events=ttft_events,
+        hold_cycle_routing_skip_events=hold_cycle_routing_skip_events,
     )

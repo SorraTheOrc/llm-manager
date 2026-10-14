@@ -333,6 +333,8 @@ def build_report(
        f"(local {summary.local_requests} / remote {summary.remote_requests})")
     ap(f"- Fallback events: **{len(summary.fallback_events)}** "
        f"({fallback_rate * 100:.1f}% of requests) | dispatch denied: {summary.dispatch_denied_count}")
+    ap(f"- Local-skip events: **{len(summary.routing_skip_events)}** | "
+       f"hold-cycle re-emissions (excluded from demand): **{summary.hold_cycle_reemission_count}**")
     ap(f"- Unattributed stream events (no session UUID): {summary.unattributed_events}")
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
 
@@ -413,6 +415,10 @@ def build_report(
             n = profile["cheap"]["routing_skip_reasons"].get(reason, 0)
             ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% | "
                f"{d} ({_pct(d, fast_skips):.1f}%) | {n} ({_pct(n, cheap_skips):.1f}%) |")
+
+    # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3): surfaced
+    # separately so a stuck hold is not read as repeated client retries.
+    _append_hold_cycle_section(ap, summary)
 
     initial = Counter((s.initial_provider, s.initial_model) for s in sessions)
     ap("")
@@ -808,6 +814,49 @@ def _append_compaction_section(
     if all_dry and (would_have_avoided or avoided or would_still_fallback):
         ap("")
         ap("_Impact estimates in this window are hypothetical: no live dispatch change; " "the session history was not mutated._")
+
+
+def _append_hold_cycle_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Hold-cycle re-emissions`` section to the report.
+
+    ``routing_skip_local`` events logged with ``chain_hold_cycle > 0`` are
+    re-emissions of a single held request restarted across chain-hold cycles
+    (LP-0MU5AIAAY003KVM0), not genuine new client demand. Aggregation keeps
+    them out of every demand/local-skip counter (the hourly ``local_skip``
+    totals, the ``routing_skip_local reasons`` table, and its percentages);
+    this section surfaces them separately so an operator can tell a stuck
+    hold from a client retry storm. Omitted when the window has no hold-cycle
+    re-emissions.
+
+    Background on the demand-vs-re-emission distinction: cycle 0 is the first
+    (pre-hold) cycle and is genuine demand; every hold-restart increments the
+    cycle, so ``cycle > 0`` skips are the same request held
+    (``chain_hold_max_cycles`` bounds the re-emissions).
+    """
+    events = summary.hold_cycle_routing_skip_events
+    if not events:
+        return
+    ap("")
+    ap("## Hold-cycle re-emissions")
+    ap("")
+    ap("`routing_skip_local` events with `chain_hold_cycle>0` are re-emissions "
+       "of a request held across chain-hold cycles (LP-0MU5AIAAY003KVM0), not "
+       "genuine new client demand. They are excluded from the local-skip "
+       "counts, the `routing_skip_local reasons` table, and the fallback / "
+       "demand ratios in this report, and surfaced here separately so a stuck "
+       "hold is distinguishable from a client retry storm.")
+    ap("")
+    ap(f"- Hold-cycle routing-skip re-emissions: **{len(events)}** "
+       "(the cycle-0 occurrence of each held request is still counted in the "
+       "demand aggregates above)")
+    by_session: Counter = Counter()
+    for ev in events:
+        by_session[ev.session or UNKNOWN_LABEL] += 1
+    ap("")
+    ap("| Session | Re-emissions |")
+    ap("|---|---|")
+    for session, count in by_session.most_common():
+        ap(f"| {session} | {count} |")
 
 
 def _append_error_section(ap, summary: AnalysisResult) -> None:
@@ -1521,6 +1570,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         ),
         "dispatch_denied": summary.dispatch_denied_count,
         "unattributed_events": summary.unattributed_events,
+        "hold_cycle_routing_skip_events": summary.hold_cycle_reemission_count,
         "fast_sessions": sum(1 for s in sessions if s.bucket != "cheap"),
         "cheap_sessions": sum(1 for s in sessions if s.bucket == "cheap"),
         "errors": len(summary.error_events),

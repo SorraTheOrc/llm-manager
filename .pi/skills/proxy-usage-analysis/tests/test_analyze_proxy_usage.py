@@ -167,6 +167,27 @@ class TestLogLineParsing:
         assert ev.reason == "large_context_bypass"
         assert ev.session == "aaaaaaaa-1111-2222-3333-444444444444"
 
+    def test_routing_skip_chain_hold_cycle_parsed(self):
+        # The proxy stamps chain_hold_cycle=<N> on routing_skip_local lines
+        # (LP-0MU5AIAAY003KVM0); the parser carries it so aggregation can
+        # distinguish hold-cycle re-emissions from genuine demand.
+        ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CHAIN_HOLD_CYCLE_2)
+        assert ev.kind == "routing_skip"
+        assert ev.reason == "context_too_large"
+        assert ev.chain_hold_cycle == 2
+        ev0 = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CHAIN_HOLD_CYCLE_0)
+        assert ev0.kind == "routing_skip"
+        assert ev0.chain_hold_cycle == 0
+
+    def test_routing_skip_without_chain_hold_cycle_field(self):
+        # Backward compatibility (AC4): pre-chain-hold rotated logs carry no
+        # chain_hold_cycle token; the field must default to None (treated as
+        # cycle 0 downstream) and the line must still parse.
+        ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CONTEXT_TOO_LARGE)
+        assert ev.kind == "routing_skip"
+        assert ev.reason == "context_too_large"
+        assert ev.chain_hold_cycle is None
+
     def test_dispatch_denied(self):
         ev = log_parser.parse_log_line(fixtures.DISPATCH_DENIED)
         assert ev.kind == "dispatch_denied"
@@ -2461,6 +2482,96 @@ class TestSummaryByHourActivity:
             {"hour": "2026-08-02 09:00:00", "seconds": 30.0},
             {"hour": "2026-08-02 10:00:00", "seconds": 5.0},
         ]
+        json.dumps(data)  # round-trips
+
+
+class TestChainHoldCycleDedup:
+    """A held request re-emitted across chain-hold cycles is counted exactly
+    once in the demand / local-skip aggregates (its cycle-0 occurrence), with
+    the ``chain_hold_cycle > 0`` re-emissions surfaced separately as
+    hold-cycle activity (LP-0MUIEO6IP0030CT3).
+
+    Fixture: one session whose routing_skip_local fires in cycle 0 (genuine
+    demand) and is then re-emitted in cycles 1-3 by hold restarts.
+    """
+
+    WINDOW_START = datetime(2026, 8, 2, 14, 0, 0)
+    WINDOW_END = datetime(2026, 8, 2, 15, 0, 0)
+    SESSION = "019fc27d-3a46-7e5c-871e-57ab32f875f3"
+    HOUR_KEY = datetime(2026, 8, 2, 14, 0, 0)
+
+    def _lines(self) -> list[str]:
+        started = (
+            "2026-08-02 14:02:00,000 - INFO - Stream started: provider=local "
+            f"model=Qwen3 session={self.SESSION} request=[]"
+        )
+        skip = (
+            "2026-08-02 14:02:20,100 - INFO - routing_skip_local provider=local-qwen3 "
+            "model=Qwen3 estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 "
+            "new_tokens=323 cached_ratio=0.99 reason=context_too_large → skipping local, "
+            "routing to next remote provider session={sid} chain_hold_cycle={cycle}"
+        )
+        return [started] + [
+            skip.format(sid=self.SESSION, cycle=c) for c in (0, 1, 2, 3)
+        ]
+
+    def _summary(self):
+        return aggregation.aggregate(
+            _events(self._lines()), self.WINDOW_START, self.WINDOW_END, _schedule()
+        )
+
+    def test_cycle0_counted_once_in_demand_aggregates(self):
+        # AC2: the cycle-0 occurrence is the ONLY one counted in the demand
+        # aggregates (hourly local_skip, routing_skip_events, per-session
+        # routing_skips, routing_skip_reason_counts).
+        summary = self._summary()
+        assert len(summary.routing_skip_events) == 1
+        assert summary.routing_skip_events[0].chain_hold_cycle == 0
+        assert summary.routing_skip_reason_counts["context_too_large"] == 1
+        assert summary.hourly_activity[self.HOUR_KEY]["local_skip"] == 1
+        assert summary.sessions[self.SESSION].routing_skips == 1
+
+    def test_hold_cycle_reemissions_surfaced_separately(self):
+        # AC2: the chain_hold_cycle>0 occurrences land in the dedicated
+        # hold-cycle list/count, never in the demand aggregates.
+        summary = self._summary()
+        assert summary.hold_cycle_reemission_count == 3
+        events = summary.hold_cycle_routing_skip_events
+        assert [e.chain_hold_cycle for e in events] == [1, 2, 3]
+        assert all(e.session == self.SESSION for e in events)
+
+    def test_backward_compat_no_field_is_cycle0(self):
+        # AC4: pre-chain-hold logs carry no chain_hold_cycle token; the line
+        # parses with chain_hold_cycle=None which aggregates as cycle 0
+        # (genuine demand), leaving historic counts unchanged.
+        summary = aggregation.aggregate(
+            _events([fixtures.ROUTING_SKIP_CONTEXT_TOO_LARGE]),
+            self.WINDOW_START, self.WINDOW_END, _schedule(),
+        )
+        assert len(summary.routing_skip_events) == 1
+        assert summary.routing_skip_events[0].chain_hold_cycle is None
+        assert summary.hold_cycle_reemission_count == 0
+        assert summary.hourly_activity[self.HOUR_KEY]["local_skip"] == 1
+
+    def test_report_surfaces_hold_cycle_and_excludes_from_reasons(self):
+        # AC3: the report surfaces the hold-cycle re-emission volume as its
+        # own metric/section and keeps the routing_skip_local reasons table
+        # (and its percentages) on genuine skips only.
+        md = reporting.build_report(self._summary(), None)
+        header = md.split("\n\n## Session summary", 1)[0]
+        assert "Local-skip events: **1**" in header
+        assert "hold-cycle re-emissions (excluded from demand): **3**" in header
+        section = md.split("## Hold-cycle re-emissions", 1)[1].split("## ", 1)[0]
+        assert "Hold-cycle routing-skip re-emissions: **3**" in section
+        reasons = md.split("## routing_skip_local reasons", 1)[1].split("## ", 1)[0]
+        assert "| context_too_large | 1 | 100.0% |" in reasons
+        assert "| context_too_large | 4 |" not in reasons
+
+    def test_json_summary_surfaces_hold_cycle_metric(self):
+        # AC3: the machine-readable summary exposes the hold-cycle re-emission
+        # volume as its own metric (demand counters stay de-duplicated).
+        data = reporting.summary_to_json(self._summary())
+        assert data["hold_cycle_routing_skip_events"] == 3
         json.dumps(data)  # round-trips
 
 

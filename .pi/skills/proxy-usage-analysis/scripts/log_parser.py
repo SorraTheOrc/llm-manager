@@ -46,6 +46,11 @@ RE_FALLBACK = re.compile(
 )
 # routing_skip_local reason sits between "reason=" and the "→" arrow.
 RE_ROUTING_SKIP_REASON = re.compile(r"\breason=([\w_]+)\s*→")
+# Chain-hold cycle stamp (LP-0MU5AIAAY003KVM0): the proxy tags
+# ``routing_skip_local`` lines with ``chain_hold_cycle=<N>`` (cycle 0 = first
+# pre-hold cycle, incremented on every hold restart). Tolerant: absent on
+# pre-chain-hold rotated logs → None (treated as cycle 0 downstream).
+RE_CHAIN_HOLD_CYCLE = re.compile(r"\bchain_hold_cycle=(\d+)")
 RE_DISPATCH_DENIED = re.compile(r"session=([A-Za-z0-9_.-]+) owner=([A-Za-z0-9_.-]+) active=(\d+)")
 
 # Compaction events (LP-0MTHCTLAF00147IT): the proxy emits ``compaction_event``
@@ -308,6 +313,12 @@ class LogEvent:
     # logging (LP-0MTSSM5SO003PKU0). Populated by dispatch_first_byte_ms=
     # (local) or ttft_seconds= (remote) log lines.
     ttft_ms: float | None = None
+    # Chain-hold cycle stamp (LP-0MU5AIAAY003KVM0): 0 = first (pre-hold)
+    # cycle, incremented on every hold restart; ``None`` when the line does
+    # not carry the token (pre-chain-hold logs). Populated on
+    # ``routing_skip`` events; aggregation treats ``> 0`` as hold-cycle
+    # re-emissions rather than genuine demand.
+    chain_hold_cycle: int | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -396,11 +407,13 @@ def parse_log_line(line: str) -> LogEvent | None:
             "fallback", ts, reason=_normalize_reason(reason), src=src, dst=dst
         )
     if msg.startswith(ROUTING_SKIP):
+        cycle_m = RE_CHAIN_HOLD_CYCLE.search(msg)
         return LogEvent(
             "routing_skip",
             ts,
             session=_session_from(msg),
             reason=_normalize_reason(_first(RE_ROUTING_SKIP_REASON, msg)),
+            chain_hold_cycle=int(cycle_m.group(1)) if cycle_m else None,
         )
     if msg.startswith(DISPATCH_DENIED):
         m2 = RE_DISPATCH_DENIED.search(msg)
