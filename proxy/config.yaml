@@ -405,6 +405,15 @@ models:
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
+    # Wiki authoring guidelines (LP-0MUYJHQ2W002I0CE, LP-0MV5S5IMX0091DZ5):
+    # auto-inject proxy/prompts/author.txt so authoring terminology,
+    # openness classification, citation and first-mention naming rules apply
+    # without any client supplying them. "override" replaces client system
+    # messages; operators can still override per-deployment via
+    # .sorraAgents/prompts/author.txt (see proxy/MODEL_ADD.md).
+    system_prompt:
+      mode: "override"
+      file: "proxy/prompts/author.txt"
 
   code:
     providers:

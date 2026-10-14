@@ -934,6 +934,14 @@ models:
 If `system_prompt` is present but `mode` is missing or invalid, config validation
 fails at startup with a clear error message.
 
+> **Live example (first deployment):** the production `author` model
+> (`proxy/config.yaml`) injects `proxy/prompts/author.txt` — the wiki
+authoring guidelines — with `override` mode on every `model=author` request,
+so authoring terminology, citation and first-mention naming rules apply
+without any client supplying them (LP-0MV5S5IMX0091DZ5). See
+`proxy/MODEL_ADD.md` for the worked example and the local-override escape
+hatch (`.sorraAgents/prompts/author.txt`).
+
 #### Prompt file resolution precedence
 
 When a request arrives, the proxy looks for the prompt file in this order:

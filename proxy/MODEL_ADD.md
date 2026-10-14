@@ -234,6 +234,34 @@ concise, accurate, and well-structured. When asked to write code, include
 comments and follow best practices.
 ```
 
+### Worked example: the `author` model (first live deployment)
+
+The production `proxy/config.yaml` wires the wiki authoring guidelines into the
+`author` model via a `system_prompt` block — this is the **first live use** of
+the feature:
+
+```yaml
+author:
+  providers:
+    # ... existing providers unchanged ...
+  system_prompt:
+    mode: "override"        # replaces any client-supplied system messages
+    file: "proxy/prompts/author.txt"
+```
+
+- The proxy auto-loads `proxy/prompts/author.txt` (the mandatory wiki
+authoring rules: openness terminology, citation, and "explain names on first
+mention") for every `model=author` request, so no client needs to paste the
+guidelines.
+- `override` was chosen because the authoring client sends no client-side system
+prompt — author.txt is intended as the complete system prompt for wiki
+authoring. If a client later sends its own system prompt it will be replaced.
+- Resolution precedence still applies: a per-deployment local override at
+`.sorraAgents/prompts/author.txt` (uncommitted) takes precedence over the
+committed default.
+- Wiring: LP-0MV5S5IMX0091DZ5; prompt content owner: LP-0MUYJHQ2W002I0CE
+(do not change author.txt content here).
+
 ## Alias resolution
 
 - The proxy resolves aliases using `get_model_config()` in `proxy/lifecycle.py`.

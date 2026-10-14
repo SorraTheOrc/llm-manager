@@ -89,6 +89,10 @@
           "type": "remote"
         }
       ],
+      "system_prompt": {
+        "file": "proxy/prompts/author.txt",
+        "mode": "override"
+      },
       "tokenizer": "qwen3"
     },
     "code": {
