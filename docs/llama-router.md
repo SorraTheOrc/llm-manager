@@ -349,7 +349,12 @@ overlay, hashed via `merged_config_sha256`) matches the recorded
 `proxy/.llama_server_signature.json` — keeping the warm KV/prompt cache. A
 base-only change to a local-backend key the overlay omits (for example
 `local_model_ctx_size` or `llama_server_port`) now changes that signature and
-forces a restart (LP-0MUJRVYQH002IEHW).
+forces a restart (LP-0MUJRVYQH002IEHW). The same recorded `config_sha256` also
+guards the adoption path: `_try_adopt_running_llama_server` refuses to adopt a
+reachable llama-server whose recorded merged-config hash differs from the
+current effective config, so a plain start (no `--restart`) or the router
+self-heal path cannot silently adopt a stale-config server
+(LP-0MUPIIDPW009RMLB).
 
 Per-slot context is derived from the profile's static pair:
 ``local_model_ctx_size // session_slot_pool_size`` (262144 across all

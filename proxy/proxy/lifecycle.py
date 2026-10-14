@@ -155,6 +155,12 @@ async def _try_adopt_running_llama_server(
     duplicate and (for router mode) still ensures the requested model is
     loaded. The preserved KV / prompt cache is marked warm.
 
+    The recorded merged-config hash (``config_sha256``) must match the current
+    effective merged config; a mismatch means the running server was launched
+    with a different effective config and must not be adopted
+    (LP-0MUPIIDPW009RMLB). Pre-upgrade signatures without the key are still
+    adopted for backward compatibility.
+
     Returns False when there is no matching running server, in which case the
     caller proceeds with a normal start. Fail-open: any error returns False.
     """
@@ -171,6 +177,24 @@ async def _try_adopt_running_llama_server(
         llama_port = int(server_config.get("llama_server_port", 8080) or 8080)
         if not await _probe_backend_reachable(llama_port):
             return False
+        # LP-0MUPIIDPW009RMLB: reject adoption when the recorded merged-config
+        # hash differs from the current effective config — prevents wrongly
+        # adopting a stale-config llama-server (same bug class as the restart
+        # gate fix LP-0MUJRVYQH002IEHW, but on the adoption path).
+        recorded_config_sha = signature.get("config_sha256")
+        if recorded_config_sha is not None:
+            current_config_sha = _config_file_sha256()
+            if recorded_config_sha != current_config_sha:
+                try:
+                    srv.logger.warning(
+                        "Rejected llama-server adoption: merged-config hash "
+                        "mismatch (recorded=%s current=%s) — likely stale config",
+                        recorded_config_sha,
+                        current_config_sha,
+                    )
+                except Exception:
+                    pass
+                return False
         # Adopt: mark ready and treat the preserved KV / prompt cache as warm
         # so cold-start admission control does not needlessly throttle the
         # first request.

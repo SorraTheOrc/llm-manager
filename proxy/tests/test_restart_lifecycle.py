@@ -256,6 +256,82 @@ async def test_adopt_rejects_router_mode_mismatch(sig_path, monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_adopt_rejects_config_hash_mismatch(sig_path, monkeypatch):
+    """LP-0MUPIIDPW009RMLB: adoption is rejected when the recorded
+    merged-config hash differs from the current effective config (same
+    stale-config bug class as the restart gate)."""
+    lifecycle._write_llama_server_signature("Qwen3", 1, router_mode=False)
+    sig = json.loads(sig_path.read_text(encoding="utf-8"))
+    sig["config_sha256"] = "stale-hash"
+    sig_path.write_text(json.dumps(sig), encoding="utf-8")
+    monkeypatch.setattr(lifecycle, "_config_file_sha256", lambda: "current-hash")
+    monkeypatch.setattr(
+        lifecycle, "_probe_backend_reachable", AsyncMock(return_value=True)
+    )
+    srv = _make_srv(config={"server": {"llama_server_port": 8080}})
+
+    assert (
+        await lifecycle._try_adopt_running_llama_server(srv, "Qwen3", router_mode=False)
+        is False
+    )
+    # Not adopted: no sentinel, backend not marked ready.
+    assert srv.llama_process is None
+    assert srv.backend_ready is False
+
+
+@pytest.mark.asyncio
+async def test_adopt_succeeds_when_config_hash_matches(sig_path, monkeypatch):
+    """LP-0MUPIIDPW009RMLB: adoption still succeeds when the recorded
+    merged-config hash equals the current effective config."""
+    lifecycle._write_llama_server_signature("Qwen3", 1, router_mode=False)
+    sig = json.loads(sig_path.read_text(encoding="utf-8"))
+    sig["config_sha256"] = "matching-hash"
+    sig_path.write_text(json.dumps(sig), encoding="utf-8")
+    monkeypatch.setattr(lifecycle, "_config_file_sha256", lambda: "matching-hash")
+    monkeypatch.setattr(
+        lifecycle, "_probe_backend_reachable", AsyncMock(return_value=True)
+    )
+    srv = _make_srv(config={"server": {"llama_server_port": 8080}})
+
+    assert (
+        await lifecycle._try_adopt_running_llama_server(srv, "Qwen3", router_mode=False)
+        is True
+    )
+    assert getattr(srv.llama_process, "adopted", False) is True
+    assert srv.backend_ready is True
+
+
+@pytest.mark.asyncio
+async def test_adopt_tolerates_missing_config_hash(sig_path, monkeypatch):
+    """LP-0MUPIIDPW009RMLB: pre-upgrade signatures without a
+    ``config_sha256`` key are still adopted (backward-compatible, fail-safe
+    in the preserve direction)."""
+    sig_path.write_text(
+        json.dumps(
+            {
+                "mode": "fast",
+                "model": "Qwen3",
+                "parallel": 1,
+                "router_mode": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert "config_sha256" not in json.loads(sig_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(lifecycle, "_config_file_sha256", lambda: "whatever")
+    monkeypatch.setattr(
+        lifecycle, "_probe_backend_reachable", AsyncMock(return_value=True)
+    )
+    srv = _make_srv(config={"server": {"llama_server_port": 8080}})
+
+    assert (
+        await lifecycle._try_adopt_running_llama_server(srv, "Qwen3", router_mode=False)
+        is True
+    )
+    assert getattr(srv.llama_process, "adopted", False) is True
+
+
 def test_adopted_process_behaves_like_running_process():
     proc = lifecycle._AdoptedLlamaProcess(port=8080)
     assert proc.poll() is None
