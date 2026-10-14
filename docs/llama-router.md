@@ -343,6 +343,14 @@ from LP-0MTZRM5HV0007S0V). There is no ``slot_schedule``; the time-based slot
 scheduler was removed. The slot count changes only when the operating mode
 changes (a mode switch restarts the proxy with the new profile).
 
+The co-located llama-server is preserved across a `start-proxy.sh --restart`
+when the **merged** config signature (base `config.yaml` + the active mode
+overlay, hashed via `merged_config_sha256`) matches the recorded
+`proxy/.llama_server_signature.json` — keeping the warm KV/prompt cache. A
+base-only change to a local-backend key the overlay omits (for example
+`local_model_ctx_size` or `llama_server_port`) now changes that signature and
+forces a restart (LP-0MUJRVYQH002IEHW).
+
 Per-slot context is derived from the profile's static pair:
 ``local_model_ctx_size // session_slot_pool_size`` (262144 across all
 profiles since the operator supersede LP-0MSY0SDAS0031Y7F), so the routing

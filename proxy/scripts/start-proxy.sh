@@ -11,8 +11,12 @@ set -euo pipefail
 #               warm KV / prompt cache survives (LP-0MUCEFCL6001ZXYN). With
 #               --restart and no explicit flag, llama-server is preserved
 #               automatically when its recorded signature matches the selected
-#               config (same mode + config hash); it is restarted when the
-#               model or parallel config actually changes.
+#               config (same mode + merged-config hash, base + overlay); it is
+#               restarted when the effective local-backend config actually
+#               changes. The signature hashes the MERGED config via the shared
+#               merged_config_sha256 helper (LP-0MUJRVYQH002IEHW); pre-upgrade
+#               raw-file-hash signatures mismatch once and conservatively
+#               restart llama-server.
 #   --verbose   Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO level)
 #
 # Automatically resolves required API keys from:
@@ -173,10 +177,18 @@ if [ "$RESTART" -eq 1 ]; then
     fi
     _restart_cfg="$REPO_ROOT/config-$_restart_mode.yaml"
     [ -f "$_restart_cfg" ] || _restart_cfg="$REPO_ROOT/config.yaml"
-    _restart_sha=""
-    if command -v sha256sum >/dev/null 2>&1 && [ -f "$_restart_cfg" ]; then
-      _restart_sha="$(sha256sum "$_restart_cfg" | cut -d' ' -f1)"
-    fi
+    # LP-0MUJRVYQH002IEHW: hash the MERGED config (base + overlay) via the
+    # shared canonical helper — NOT the raw overlay file — so a base-only
+    # local-backend change (e.g. local_model_ctx_size, llama_server_port)
+    # also changes the signature and forces a llama-server restart. When the
+    # overlay file is absent the base is hashed merged with itself. An empty
+    # hash (Python unavailable / helper failure) means "do not preserve".
+    _restart_sha="$("$PY_BIN" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/proxy')
+from config_merge import merged_config_sha256
+print(merged_config_sha256('$REPO_ROOT/config.yaml', '$_restart_cfg'))
+" 2>/dev/null || true)"
     _sig_file="$REPO_ROOT/.llama_server_signature.json"
     if [ -f "$_sig_file" ] && [ -n "$_restart_sha" ]; then
       _sig_mode="$("$PY_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('mode',''))" "$_sig_file" 2>/dev/null || true)"

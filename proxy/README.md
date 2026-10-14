@@ -1045,6 +1045,21 @@ startup, selects the matching config overlay, and exports
 `LLAMA_PROXY_CONFIG` so the server and API-key resolution use the same
 profile.
 
+The **restart signature hashes the *merged* config** (base + overlay), not
+the raw overlay file (LP-0MUJRVYQH002IEHW). Because the mode files are
+overlays that omit base-inherited local-backend keys (`local_model_ctx_size`,
+`session_slot_pool_size`, `llama_server_port`), a base-only change to
+`config.yaml` must still change the signature so `start-proxy.sh --restart`
+restarts the co-located llama-server; an unchanged merged config preserves
+the warm llama-server. Both the shell read path (`start-proxy.sh`) and the
+Python write path (`lifecycle._config_file_sha256`) compute the hash through
+the same canonical helper `proxy/proxy/config_merge.py::merged_config_sha256`
+(sha256 of the merged dict serialised as sorted-key JSON), so the hashes are
+byte-identical for the same config inputs. After upgrading from a pre-change
+signature file (which holds a raw-file hash), the first `--restart` sees a
+mismatch and conservatively restarts llama-server once — fail-safe, because
+a wrong preserve is worse than one cold start.
+
 Switch modes from the web UI (Admin Endpoints card) or via the admin API:
 
 ```bash
@@ -1192,7 +1207,7 @@ before now, wrapping circularly" rule.
 
 | Variable | Description |
 |----------|-------------|
-| `LLAMA_PROXY_CONFIG` | Path to a config file. When set, the file is treated as an overlay and deep-merged onto the authoritative base `proxy/config.yaml`; if it points at `config.yaml` itself the file is loaded once (no second load). When unset, the persisted operating mode selects `config-fast.yaml` / `config-cheap.yaml`, which is merged onto `config.yaml` (default fallback: `./config.yaml`) |
+| `LLAMA_PROXY_CONFIG` | Path to a config file. When set, the file is treated as an overlay and deep-merged onto the authoritative base `proxy/config.yaml`; if it points at `config.yaml` itself the file is loaded once (no second load). When unset, the persisted operating mode selects `config-fast.yaml` / `config-cheap.yaml`, which is merged onto `config.yaml` (default fallback: `./config.yaml`). The restart signature (used by `--restart` to decide whether to preserve the warm llama-server) is derived from this **merged** config via the shared `merged_config_sha256` helper, not from the raw overlay file |
 | `LLAMA_PROXY_DEV` | Set to `1` to enable dev mode (alternative to `--dev` flag) |
 | `LLAMA_START_SCRIPT` | Override the start script path |
 | `OPENAI_API_KEY` | API key for OpenAI |

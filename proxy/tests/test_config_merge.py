@@ -541,6 +541,110 @@ class TestLoadMergedHelper:
 
 
 # ---------------------------------------------------------------------------
+# LP-0MUJRVYQH002IEHW: merged-config restart signature
+# ---------------------------------------------------------------------------
+
+
+class TestMergedConfigSha256:
+    """The restart signature hashes the MERGED config (base + overlay) via
+    one canonical serialisation, so shell and Python sides agree and a
+    base-only change still changes the signature."""
+
+    def _hash(self, base_text, overlay_text, tmp_path):
+        from proxy.config_merge import merged_config_sha256
+
+        base = tmp_path / "base.yaml"
+        base.write_text(base_text, encoding="utf-8")
+        overlay = tmp_path / "overlay.yaml"
+        overlay.write_text(overlay_text, encoding="utf-8")
+        return merged_config_sha256(base, overlay)
+
+    def test_deterministic_across_runs(self, tmp_path):
+        from proxy.config_merge import merged_config_sha256
+
+        base = tmp_path / "base.yaml"
+        base.write_text("server:\n  local_model_ctx_size: 262144\n")
+        overlay = tmp_path / "overlay.yaml"
+        overlay.write_text("server:\n  session_slot_pool_size: 3\n")
+
+        first = merged_config_sha256(base, overlay)
+        second = merged_config_sha256(base, overlay)
+        assert first == second
+        assert len(first) == 64  # sha256 hex digest
+
+    def test_base_only_change_changes_hash(self, tmp_path):
+        """AC2: a base-only local-backend change (overlay unchanged) alters
+        the signature — the raw overlay file would not have changed."""
+        overlay_text = "server:\n  session_slot_pool_size: 1\n"
+        base_before = "server:\n  local_model_ctx_size: 262144\n"
+        base_after = "server:\n  local_model_ctx_size: 131072\n"
+
+        before = self._hash(base_before, overlay_text, tmp_path)
+        after = self._hash(base_after, overlay_text, tmp_path)
+        assert before != after
+
+    def test_overlay_only_change_changes_hash(self, tmp_path):
+        """AC4 (regression guard): an overlay-only change still alters the
+        signature, preserving the pre-change restart-on-overlay behavior."""
+        base_text = "server:\n  local_model_ctx_size: 262144\n"
+        overlay_before = "server:\n  session_slot_pool_size: 1\n"
+        overlay_after = "server:\n  session_slot_pool_size: 3\n"
+
+        before = self._hash(base_text, overlay_before, tmp_path)
+        after = self._hash(base_text, overlay_after, tmp_path)
+        assert before != after
+
+    def test_formatting_and_comments_do_not_change_hash(self, tmp_path):
+        """AC4: only effective values matter — comments/formatting are
+        ignored by the canonical JSON serialisation."""
+        sparse = "server:\n  session_slot_pool_size: 1\n"
+        commented = "# mode overlay for cheap\nserver:\n  session_slot_pool_size: 1  # three slots\n"
+
+        assert self._hash(sparse, commented, tmp_path) == self._hash(
+            commented, sparse, tmp_path
+        )
+        # Same effective values, different key order in the overlay.
+        reordered = "server:\n  session_slot_pool_size: 1\n  extra: 2\n"
+        swapped = "server:\n  extra: 2\n  session_slot_pool_size: 1\n"
+        assert self._hash(sparse, reordered, tmp_path) == self._hash(
+            sparse, swapped, tmp_path
+        )
+
+    def test_missing_overlay_hashes_base_alone(self, tmp_path):
+        """A missing overlay file hashes the base merged with itself (the
+        shell fallback path) and equals hashing the base with an empty
+        overlay."""
+        from proxy.config_merge import merged_config_sha256
+
+        base = tmp_path / "base.yaml"
+        base.write_text("server:\n  local_model_ctx_size: 262144\n")
+        missing = tmp_path / "does-not-exist.yaml"
+
+        merged_with_itself = merged_config_sha256(base, base)
+        with_empty_overlay = merged_config_sha256(base, tmp_path / "empty.yaml")
+        missing_overlay = merged_config_sha256(base, missing)
+
+        assert missing_overlay == merged_with_itself
+        assert missing_overlay == with_empty_overlay
+
+    def test_merged_semantics_are_reflected(self, tmp_path):
+        """The hash covers the effective merged values: overlay scalar
+        replacement AND base-inherited keys both influence it."""
+        base = "server:\n  local_model_ctx_size: 262144\n  llama_server_port: 8080\n"
+        overlay = "server:\n  session_slot_pool_size: 3\n"
+
+        # Overlay wins for session_slot_pool_size -> differs from overlay=1.
+        assert self._hash(base, overlay, tmp_path) != self._hash(
+            base, "server:\n  session_slot_pool_size: 1\n", tmp_path
+        )
+        # A base key not present in the overlay still lands in the hash.
+        base_alt = "server:\n  local_model_ctx_size: 262144\n  llama_server_port: 9090\n"
+        assert self._hash(base, overlay, tmp_path) != self._hash(
+            base_alt, overlay, tmp_path
+        )
+
+
+# ---------------------------------------------------------------------------
 # F5: shared test helper for the merged config surface
 # ---------------------------------------------------------------------------
 

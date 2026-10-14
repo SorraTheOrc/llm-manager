@@ -283,6 +283,86 @@ def test_stop_adopted_server_kills_by_port(sig_path, monkeypatch):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Merged-config restart signature (LP-0MUJRVYQH002IEHW)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_config_file_sha256_matches_shared_merged_helper(monkeypatch, tmp_path):
+    """Write-side parity (parent AC1): the value persisted by
+    ``_config_file_sha256()`` (base config.yaml + ``$LLAMA_PROXY_CONFIG``
+    overlay) is byte-identical to the shared ``merged_config_sha256`` helper
+    on the same inputs."""
+    from proxy.config_merge import merged_config_sha256
+    from proxy.mode import proxy_dir
+
+    overlay = tmp_path / "custom-overlay.yaml"
+    overlay.write_text("server:\n  session_slot_pool_size: 2\n", encoding="utf-8")
+    monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(overlay))
+
+    base_path = proxy_dir() / "config.yaml"
+    expected = merged_config_sha256(base_path, overlay)
+    assert lifecycle._config_file_sha256() == expected
+
+
+def test_config_file_sha256_hashes_merged_not_raw_overlay(monkeypatch, tmp_path):
+    """Sensitivity guard: a base-only change (which cannot be seen in the
+    raw overlay bytes) must change the write-side hash — proxied through the
+    shared helper which reads the merged surface."""
+    from proxy.config_merge import merged_config_sha256
+    from proxy.mode import proxy_dir
+
+    overlay = tmp_path / "custom-overlay.yaml"
+    overlay.write_text("server:\n  session_slot_pool_size: 2\n", encoding="utf-8")
+    monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(overlay))
+
+    base_path = proxy_dir() / "config.yaml"
+    base_hash = merged_config_sha256(base_path, overlay)
+
+    # The helper is shared, so the write side is covered by construction;
+    # assert the base-sensitivity property end-to-end via the helper.
+    import proxy.config_merge as cm
+
+    base_text = base_path.read_text(encoding="utf-8")
+    assert "local_model_ctx_size" in base_text  # base carries local-backend keys
+
+    alt_base = tmp_path / "alt-base.yaml"
+    alt_base.write_text(
+        base_text.replace("local_model_ctx_size: 262144", "local_model_ctx_size: 131072"),
+        encoding="utf-8",
+    )
+    alt_hash = merged_config_sha256(alt_base, overlay)
+    assert alt_hash != base_hash
+
+
+def test_config_file_sha256_falls_back_to_base_without_env(monkeypatch):
+    """With ``$LLAMA_PROXY_CONFIG`` unset the write side hashes the base
+    merged with itself (base still exists), not the empty string."""
+    from proxy.config_merge import merged_config_sha256
+    from proxy.mode import proxy_dir
+
+    monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
+    base_path = proxy_dir() / "config.yaml"
+    assert lifecycle._config_file_sha256() == merged_config_sha256(
+        base_path, base_path
+    )
+
+
+def test_config_file_sha256_tolerates_missing_overlay(monkeypatch, tmp_path):
+    """A ``$LLAMA_PROXY_CONFIG`` pointing at a missing file falls back to
+    the base rather than returning an error/empty string."""
+    from proxy.config_merge import merged_config_sha256
+    from proxy.mode import proxy_dir
+
+    missing = tmp_path / "missing-overlay.yaml"
+    monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(missing))
+    base_path = proxy_dir() / "config.yaml"
+
+    assert lifecycle._config_file_sha256() == merged_config_sha256(
+        base_path, base_path
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # start-proxy.sh
 # ═══════════════════════════════════════════════════════════════════════════════
 

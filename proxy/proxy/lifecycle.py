@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import hashlib
 import json
 import logging
 import os
@@ -67,12 +66,30 @@ def _read_mode_label() -> str:
 
 
 def _config_file_sha256() -> str:
-    """sha256 of the active config file (empty when unknown)."""
+    """sha256 of the effective MERGED config (empty when unknown).
+
+    LP-0MUJRVYQH002IEHW: the restart signature hashes the merged config
+    (``config.yaml`` base + the active mode overlay) via the shared
+    ``merged_config_sha256`` helper, NOT the raw overlay file — the mode
+    files are overlays that omit base-inherited local-backend keys, so a
+    base-only change must still change the signature and force llama-server
+    to restart. Base = ``proxy/config.yaml``; overlay = ``$LLAMA_PROXY_CONFIG``
+    falling back to the base when unset/missing (merged with itself).
+
+    Backward compatibility: pre-upgrade signature files hold a raw-file hash,
+    so the first ``--restart`` after upgrading sees a mismatch and
+    conservatively restarts llama-server once (fail-safe direction).
+    """
     try:
-        config_path = os.environ.get("LLAMA_PROXY_CONFIG")
-        if not config_path:
-            return ""
-        return hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+        from proxy.config_merge import merged_config_sha256
+
+        proxy_dir = Path(__file__).resolve().parent.parent
+        base_path = proxy_dir / "config.yaml"
+        overlay = os.environ.get("LLAMA_PROXY_CONFIG")
+        overlay_path = Path(overlay) if overlay else base_path
+        if not overlay_path.is_file():
+            overlay_path = base_path
+        return merged_config_sha256(base_path, overlay_path)
     except Exception:
         return ""
 
