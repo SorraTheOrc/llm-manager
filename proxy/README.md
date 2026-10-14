@@ -719,6 +719,64 @@ well above the chain-hold budget (`chain_hold_seconds × chain_hold_max_cycles` 
 900 s by default), so capping never turns a hours-away exhaustion into a doomed
 hold (LP-0MU56ZKQD005SX08 AC5).
 
+###### Verified retry contract (LP-0MV728XBH00546FB)
+
+The behaviour above is **end-to-end verified** by the deterministic integration
+test `proxy/tests/test_overnight_exhaustion_e2e.py` (`test_overnight_gap_window_plus_quarantine_contract`,
+`test_overnight_gap_hold_bounded_by_small_retry_after`,
+`test_overnight_sole_cause_window_code_and_timer`, and
+`test_exhausted_zero_when_availability_exists`).  The test pins the following
+contract and serves as a **regression guard** — it fails against the pre-fix
+commit (`52307b7f`) and passes once the epic's children land:
+
+1. **Truthful `retry_after`** — `body["retry_after"]` equals the exact soonest
+   availability (the `available_times` window edge or usage-limit reset), not
+   the capped advertisement.  Under the default config (cap = 3600 s, real
+   wait = ~40 000 s) the test asserts the value is clamped to the cap.
+2. **Matching `Retry-After` header** — the HTTP header and the JSON body field
+   carry the **same integer** value.
+3. **Both `code` variants** — `all_exhausted` (mixed blockers) and
+   `outside_time_window` (schedule-only) are each tested with the same
+   `retry_after`/header assertions.
+4. **`retry_after = 0` edge** — asserted exactly when a provider can serve
+   immediately.
+5. **Bounded hold** — when `retry_after` is large (hours away) the hold never
+   sleeps through `chain_hold_max_cycles`; it returns the terminal response
+   immediately with its accurate `Retry-After`.
+6. **Small `retry_after`** — the hold tracks the real `retry_after` (2 s) and
+   sleeps for exactly that duration, never exceeding it.
+
+The test uses an injected UTC clock and monkeypatches hold sleeps to record
+requested durations — no real sleep > 1 s.  Regression evidence is maintained
+in the test docstring.
+
+###### Client expectation: ContextHub honours the full advertised hint
+
+The ContextHub client (`ContextHub/packages/tui/extensions/Worklog/lib/recovery/retry-logic.ts`)
+honours the proxy's `Retry-After` / `retry_after` via `calculateDelay()`, which
+uses the server hint as **authoritative** — the local exponential backoff does
+not override it.  The delay tracks the server-requested value with upward-only
+jitter (default 25 %), and is bounded by `serverHintMaxDelayMs` (default
+`6 * 60 * 60 * 1000` = **6 hours**) rather than the local exponential ceiling
+(`maxDelayMs` = 10 min).
+
+This means:
+
+- The client **honours the full advertised hint** (the capped value) up to its
+  own 6 h ceiling.  A `Retry-After: 3600` is waited for up to 60 minutes
+  (plus jitter); a truthful multi-hour `Retry-After` (when the cap is raised
+  or absent) is waited out in full.
+- The local exponential backoff cap (600 s = 10 min) **does not clamp**
+  server-hint-derived delays — the server's recommendation is authoritative.
+- The wait is **interruptible** by ESC / session switch via `interruptibleSleep`.
+
+The proxy's advertisement cap (default 3600 s) and the client's ceiling
+(default 6 h) are **independent knobs** — the client's ceiling is the upper
+bound for honest hints, not a clamp on the proxy's advertisement.  The 6 h
+client ceiling absorbs an overnight provider gap (the proxy's availability
+window can span several hours) while still bounding a malformed or hostile
+hint.
+
 ##### Exhaustion taxonomy (response + log)
 
 | Cause | `diagnostics` status | `unavailable_providers` | Log line |

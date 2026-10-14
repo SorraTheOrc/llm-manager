@@ -3194,6 +3194,11 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     ``all_slots_exhausted``) so clients can classify exhaustion without relying
     on the ``error`` prose, whose meaning is preserved for older clients
     (LP-0MU56ZM0K005F69G).
+
+    Verified end-to-end by ``proxy/tests/test_overnight_exhaustion_e2e.py``
+    (LP-0MV728XBH00546FB): ``Retry-After`` / ``retry_after`` are identical,
+    the stable ``code`` discriminator is present, the advertisement cap is
+    applied, and the hold is bounded by the real ``retry_after``.
     """
     if all_local_slot_exhaustion:
         # total_slots may be 0 if unknown; still format per acceptance criteria.
@@ -3257,6 +3262,11 @@ def _build_time_window_exhausted_response(
     Otherwise ``None`` is returned and the caller falls through to the generic
     exhausted response (whose diagnostics still expose any
     ``outside_time_window`` skips).
+
+    The ``outside_time_window`` variant is verified end-to-end by
+    ``proxy/tests/test_overnight_exhaustion_e2e.py`` (LP-0MV728XBH00546FB):
+    truthful ``retry_after`` + matching header, capped advertisement, and the
+    stable ``code`` discriminator.
     """
     if any_provider_tried or unavailable:
         return None
