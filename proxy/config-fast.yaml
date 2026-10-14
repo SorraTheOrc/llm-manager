@@ -21,8 +21,9 @@
 #       `config.yaml` are intentionally omitted.
 #   * server.contention_queue_policy / contention_queue_max_wait_seconds /
 #     contention_queue_max_depth
-#       Smaller queue (depth 3, 45s) than cheap mode, so bursts spill to
-#       remote providers sooner during peak hours.
+#       Queue (depth 8, 120s), matching cheap mode (LP-0MV881O5C007PSL4): a
+#       burst of local-eligible requests waits for a slot instead of spilling
+#       to remote while the average local stream (~31s) is still running.
 #   * server.mode_switch_drain.max_seconds  (30; base 90)
 #   * server.upstream_idle_timeout_seconds  (240; base 30)
 #
@@ -182,8 +183,8 @@ models:
         model: deepseek-flash
 server:
   contention_queue_policy: queue
-  contention_queue_max_wait_seconds: 45
-  contention_queue_max_depth: 3
+  contention_queue_max_wait_seconds: 120
+  contention_queue_max_depth: 8
   mode_switch_drain:
     max_seconds: 30
   upstream_idle_timeout_seconds: 240

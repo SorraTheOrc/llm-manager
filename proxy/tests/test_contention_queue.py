@@ -1002,33 +1002,37 @@ def test_cheap_config_declares_queue_policy():
     assert server["contention_queue_max_depth"] == 8
 
 
-def test_fast_config_declares_small_queue_policy():
-    """The merged fast profile declares a small queue (depth 3, wait 45s) — LP-0MTQYIK4Z008XF2V.
+def test_fast_config_declares_queue_policy():
+    """The merged fast profile declares queue policy + the same tuned caps as
+    cheap (depth 8, wait 120s) since LP-0MV881O5C007PSL4.
 
-    Fast mode uses a smaller queue than cheap (depth 3 vs 8, wait 45s vs 120s)
-    so burst traffic spills to remotes sooner during peak hours.
+    Fast mode originally used a smaller queue (depth 3 vs 8, wait 45s vs 120s,
+    LP-0MTQYIK4Z008XF2V) so burst traffic spilled to remotes sooner during
+    peak hours.  LP-0MV881O5C007PSL4 raised fast to the cheap caps so a burst
+    of local-eligible requests waits for a slot instead of spilling while the
+    average local stream (~31s) is still running.
     """
     from tests.config_test_utils import get_merged_config
 
     server = get_merged_config("fast")["server"]
     assert server["contention_queue_policy"] == "queue"
-    assert server["contention_queue_max_wait_seconds"] == 45
-    assert server["contention_queue_max_depth"] == 3
+    assert server["contention_queue_max_wait_seconds"] == 120
+    assert server["contention_queue_max_depth"] == 8
 
 
-def test_fast_queue_caps_strictly_less_than_cheap():
-    """Fast mode queue caps are strictly less than cheap (LP-0MTQYIK4Z008XF2V AC1)."""
+def test_fast_queue_caps_match_cheap():
+    """Fast and cheap share identical queue caps (LP-0MV881O5C007PSL4)."""
     from tests.config_test_utils import get_merged_config
 
     cheap = get_merged_config("cheap")["server"]
     fast = get_merged_config("fast")["server"]
 
-    assert fast["contention_queue_max_depth"] < cheap["contention_queue_max_depth"], (
-        f"fast depth {fast['contention_queue_max_depth']} must be < cheap depth "
+    assert fast["contention_queue_max_depth"] == cheap["contention_queue_max_depth"], (
+        f"fast depth {fast['contention_queue_max_depth']} must equal cheap depth "
         f"{cheap['contention_queue_max_depth']}"
     )
-    assert fast["contention_queue_max_wait_seconds"] < cheap["contention_queue_max_wait_seconds"], (
-        f"fast wait {fast['contention_queue_max_wait_seconds']} must be < cheap wait "
+    assert fast["contention_queue_max_wait_seconds"] == cheap["contention_queue_max_wait_seconds"], (
+        f"fast wait {fast['contention_queue_max_wait_seconds']} must equal cheap wait "
         f"{cheap['contention_queue_max_wait_seconds']}"
     )
 

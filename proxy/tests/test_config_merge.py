@@ -686,7 +686,13 @@ class TestConfigTestUtilsHelper:
             "local_large_context_cold_cache_threshold"
         ] == 42000
         assert get_merged_config("fast")["server"]["session_slot_pool_size"] == 1
-        assert get_merged_config("fast")["server"]["contention_queue_max_depth"] == 3
+        assert get_merged_config("fast")["server"]["contention_queue_max_depth"] == 8
+        assert (
+            get_merged_config("fast")["server"][
+                "contention_queue_max_wait_seconds"
+            ]
+            == 120
+        )
 
 
 # ---------------------------------------------------------------------------
