@@ -38,6 +38,15 @@ ds4/
 proxy/session-recordings/
 proxy/proxy/session-recordings/
 
+# proxy/node_modules: the implement framework auto-symlinks the main
+# checkout's node_modules into worktrees; this path was accidentally committed
+# four times as a broken self-referential symlink (LP-0MTCZ35X7009IZKE,
+# LP-0MUIEK47X000WL2C, LP-0MUI56OCI008EGML) despite proxy/.gitignore
+# hardening. Ignore it at the repo root too — no trailing slash, so both the
+# symlink and a real install directory match — as a belt-and-braces guard
+# across every branch (LP-0MV81ZIL8008RS9J).
+proxy/node_modules
+
 # Operating-mode state file (fast/cheap) — runtime state, not committed
 proxy/.mode
 proxy/.mode.override-until

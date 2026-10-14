@@ -2959,6 +2959,20 @@ npm install
 npx playwright install chromium
 ```
 
+> **`node_modules` must never be committed.** The implement framework
+> auto-symlinks the main checkout's `node_modules` into worktrees, so inside a
+> worktree `proxy/node_modules` is a symlink to the main checkout's dependency
+> tree (running `npm install` there writes through to the main checkout).
+> It was accidentally committed four times as a broken self-referential
+> symlink, which breaks `npm install` and Playwright in `proxy/`; it is
+> git-ignored at the repo root (`.gitignore`) and in `proxy/.gitignore` and is
+> guarded by `tests/test_no_tracked_dependency_symlinks.py` (LP-0MV81ZIL8008RS9J).
+> To obtain a fresh dependency tree in the main checkout:
+>
+> ```bash
+> rm -rf proxy/node_modules && cd proxy && npm install
+> ```
+
 ### Running Tests
 
 ```bash
