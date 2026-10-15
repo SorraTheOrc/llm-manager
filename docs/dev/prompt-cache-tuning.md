@@ -468,7 +468,24 @@ The OOM fallback inside `server_prompt_cache::alloc()`
 (`limit_size = 0.4 * size()`) is not approached.
 
 The live post-deploy validation of this cap is a separate follow-up
-(LP-0MV5HSZ51005CM7A).
+(LP-0MV5HSZ51005CM7A). Preliminary findings captured at
+`docs/dev/prompt-cache-post-deploy-2026-10-15-partial.json` (partial window,
+~55 min / 50 requests):
+
+| Metric | 32,768 MiB (1,404 req) | 40,960 MiB (50 req) | Change |
+|--------|------------------------|----------------------|--------|
+| Evictions | 18 | 0 | Eliminated |
+| Cache saturated % | 26.27% | 0.0% | Eliminated |
+| Cache peak (MiB) | 32,765.6 | 5,651.2 | Well under cap |
+| Forced full prefills | 68 (4.8%/req) | 5 (10.0%/req) | Higher % (small n) |
+| Prompt eval tok/s med | 77.3 | 131.6 | Improved |
+| Decode tok/s median | 18.4 | 26.0 | Improved |
+| First byte ms median | 8,046.3 | 8,106.7 | Comparable |
+| Max prompts held | 16 | 6 | Fewer held |
+
+`--recommend` output: only 20,480 MiB needed — 40,960 MiB provides ample
+headroom. A full measurement window (~4.7 d / 1,404+ requests) is needed for
+definitive comparison. See LP-0MV5HSZ51005CM7A.
 
 ## Non-goals
 
