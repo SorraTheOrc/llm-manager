@@ -39,6 +39,7 @@ import httpx
 from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from proxy import cold_start
 from proxy.utils import _is_empty_response
 
 logger = logging.getLogger("llama-proxy.provider")
@@ -4835,6 +4836,7 @@ def _handle_connection_error_in_fallback(
     provider_type: str,
     cooldown_seconds: float,
     attempts: list[dict[str, Any]],
+    config: dict | None = None,
 ) -> bool:
     """If *exc* is a connection error, mark the provider unavailable, record
     a diagnostic attempt entry, and return ``True`` (caller should ``continue``
@@ -4843,10 +4845,26 @@ def _handle_connection_error_in_fallback(
     Applies exponential backoff for remote providers (capped at configured
     *cooldown_seconds*, so setting it to 0 disables backoff entirely).
 
+    Grace-period immunity (LP-0MV9UNIOZ009RIAN): while ``cold_start.is_cold()``
+    is True and *provider_type* is ``"local"``, a connection error reflects the
+    backend still warming up after a restart, not a provider fault — so it is
+    DEFERRED instead of quarantined.  The attempt is recorded as
+    ``cold_start_deferral``, no cooldown is applied and the failure counter is
+    not bumped, letting the next chain cycle try local again immediately.
+
     Returns ``False`` if *exc* is **not** a connection error (caller should
     re-raise or handle differently).
     """
     if _is_connection_error(exc):
+        if provider_type == "local" and cold_start.is_cold(config):
+            _record_attempt(
+                attempts,
+                provider=provider_name,
+                type=provider_type,
+                status="cold_start_deferral",
+                error=str(type(exc).__name__),
+            )
+            return True
         cooldown = cooldown_seconds
         if provider_type == "remote" and cooldown_seconds > 0:
             count = _provider_failure_count.get(provider_name, 0)
@@ -4875,6 +4893,7 @@ def _handle_http_error_with_cooldown(
     cooldown_seconds: float,
     attempts: list[dict[str, Any]],
     body_text: str,
+    config: dict | None = None,
 ) -> float:
     """Handle an HTTP error response: compute effective cooldown, mark the
     provider unavailable, record a diagnostic attempt entry, and return the
@@ -4882,10 +4901,35 @@ def _handle_http_error_with_cooldown(
 
     Applies exponential backoff for remote providers.
 
+    Grace-period immunity (LP-0MV9UNIOZ009RIAN): while ``cold_start.is_cold()``
+    is True and *provider_type* is ``"local"``, an HTTP 503 reflects llama-server
+    still warming up after a restart, not a provider fault — so it is DEFERRED
+    instead of quarantined.  The attempt is recorded as ``cold_start_deferral``
+    (with the configured Retry-After hint), no cooldown is applied, the failure
+    counter is not bumped, and the retry hint is returned so the caller can
+    surface Retry-After.  Any other status code during the window still
+    quarantines normally so genuine faults are not masked.
+
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
     ``continue``.
     """
+    if (
+        provider_type == "local"
+        and cold_start.is_cold(config)
+        and int(response.status_code) == 503
+    ):
+        retry_hint = cold_start.retry_after_seconds(config)
+        _record_attempt(
+            attempts,
+            provider=provider_name,
+            type=provider_type,
+            status="cold_start_deferral",
+            status_code=int(response.status_code),
+            retry_after_seconds=retry_hint,
+        )
+        return float(retry_hint)
+
     # Parse Retry-After separately so we can respect it alongside backoff
     retry_after = _parse_retry_after(response)
 
@@ -5964,7 +6008,7 @@ async def _proxy_with_remote_fallback_cycle(
                 # Shared primitive: HTTP error with cooldown
                 _handle_http_error_with_cooldown(
                     response, provider_name, provider_type,
-                    cooldown_seconds, attempts, body_text,
+                    cooldown_seconds, attempts, body_text, config,
                 )
                 # AC3 (LP-0MSGU3JNU0092AFQ): remember this specific 400 so the
                 # exhausted path can return a synthetic error instead of the
@@ -6038,7 +6082,7 @@ async def _proxy_with_remote_fallback_cycle(
         except Exception as exc:
             # Shared primitive: handle connection errors
             if _handle_connection_error_in_fallback(
-                exc, provider_name, provider_type, cooldown_seconds, attempts,
+                exc, provider_name, provider_type, cooldown_seconds, attempts, config,
             ):
                 any_provider_tried = True
                 attempted_domains.add(_connection_error_domain_key(provider_cfg, exc))
@@ -7212,7 +7256,7 @@ async def _proxy_with_fallback_cycle(
                     # Shared primitive: HTTP error with cooldown
                     _handle_http_error_with_cooldown(
                         response, provider_name, provider_type,
-                        cooldown_seconds, attempts, body_text,
+                        cooldown_seconds, attempts, body_text, config,
                     )
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = f"HTTP {response.status_code}"
@@ -7340,7 +7384,7 @@ async def _proxy_with_fallback_cycle(
         except Exception as exc:
             # Shared primitive: handle connection errors
             if _handle_connection_error_in_fallback(
-                exc, provider_name, provider_type, cooldown_seconds, attempts,
+                exc, provider_name, provider_type, cooldown_seconds, attempts, config,
             ):
                 any_provider_tried = True
                 attempted_domains.add(_connection_error_domain_key(provider_cfg, exc))
