@@ -66,8 +66,14 @@ Quick start (development)
    ```
 2. Install Python test/runtime deps:
    ```
-   pip install -r requirements.txt || pip install pytest pytest-asyncio httpx fastapi requests pyyaml
+   pip install -r proxy/requirements.txt || pip install pytest pytest-asyncio httpx fastapi requests pyyaml tiktoken tokenizers
    ```
+   The root checkout has no `requirements.txt` of its own — the proxy's
+   `proxy/requirements.txt` is the single source of truth, and it includes the
+   native-tokenizer deps (`tiktoken`, `tokenizers`) required by the full
+   suite (vendored Qwen3 `proxy/tokenizers.py`, see
+   `proxy/tests/test_qwen3_tokenizer.py`). Omitting them makes
+   `get_tokenizer('qwen3')` fall back to `None` and the tokenizer tests fail.
 3. Run the proxy server (from repo root):
    ```
    cd proxy
