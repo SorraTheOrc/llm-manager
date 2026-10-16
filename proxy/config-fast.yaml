@@ -185,6 +185,7 @@ server:
   contention_queue_policy: queue
   contention_queue_max_wait_seconds: 120
   contention_queue_max_depth: 8
+  local_dispatch_lease_timeout_seconds: 15
   mode_switch_drain:
     max_seconds: 30
   upstream_idle_timeout_seconds: 240

@@ -305,6 +305,10 @@ class TestCheapConfigProfile:
         # key (default false).  Intended cheap-only difference.
         cheap_srv.pop("local_large_context_economic_bypass_serves_local", None)
         fast_srv.pop("local_large_context_economic_bypass_serves_local", None)
+        # Fast-only idle dispatch lease (LP-0MV881OG4003YMM3): fast 15,
+        # cheap inherits base 30 — intended fast-only difference.
+        cheap_srv.pop("local_dispatch_lease_timeout_seconds", None)
+        fast_srv.pop("local_dispatch_lease_timeout_seconds", None)
         # Persistence cap derived per profile from each mode's hard-routing
         # cap (LP-0MTBTCB8D000OQ0C → LP-0MTBOX45O005LD1S AC4): static 0
         # (derive) in both.
@@ -336,6 +340,10 @@ class TestCheapConfigProfile:
         assert fast["server"]["contention_queue_max_depth"] == cheap["server"]["contention_queue_max_depth"]
         assert fast["server"]["contention_queue_max_wait_seconds"] == cheap["server"]["contention_queue_max_wait_seconds"]
         assert cheap["server"]["local_large_context_cold_cache_threshold"] == 42000
+        # Fast-only idle dispatch lease (LP-0MV881OG4003YMM3): fast 15,
+        # cheap inherits base 30.
+        assert fast["server"]["local_dispatch_lease_timeout_seconds"] == 15
+        assert cheap["server"]["local_dispatch_lease_timeout_seconds"] == 30
         # Economic-bypass recovery flag (LP-0MU5A4QBR003YJM0): cheap enables
         # local recovery; fast omits the key (defaults to false).
         assert (

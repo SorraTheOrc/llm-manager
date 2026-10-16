@@ -307,7 +307,7 @@
     "llama_start_script": "start-llama.sh",
     "llama_startup_timeout": 300,
     "llama_watchdog_interval_seconds": 5,
-    "local_dispatch_lease_timeout_seconds": 30,
+    "local_dispatch_lease_timeout_seconds": 15,
     "local_large_context_cold_cache_threshold": 38000,
     "local_large_context_warm_cache_threshold": 100000,
     "local_model_ctx_size": 262144,

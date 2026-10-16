@@ -475,6 +475,7 @@ class TestDeduplicatedModeFiles:
                     "contention_queue_policy",
                     "contention_queue_max_wait_seconds",
                     "contention_queue_max_depth",
+                    "local_dispatch_lease_timeout_seconds",
                     "mode_switch_drain",
                     "upstream_idle_timeout_seconds",
                 },
