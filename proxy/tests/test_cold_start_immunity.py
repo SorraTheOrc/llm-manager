@@ -167,7 +167,6 @@ class TestColdStart503Deferral:
 
     def test_cold_start_503_remote_still_quarantines(self):
         """Remote provider 503 during cold window still quarantines normally."""
-        config = _local_config()
         cold_start.note_model_loaded()
 
         attempts = []
