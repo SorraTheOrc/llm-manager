@@ -350,3 +350,253 @@ class TestSlotCounts:
 
     def test_slot_counts_sorted(self):
         assert sb.SLOT_COUNTS == sorted(sb.SLOT_COUNTS)
+
+
+# ---------------------------------------------------------------------------
+# Configurable workload parameters (concurrency / prompt size)
+# ---------------------------------------------------------------------------
+
+class TestWorkloadParameters:
+    """CLI parameters for concurrency and prompt size (AC1)."""
+
+    def test_cli_parses_concurrency_and_prompt_tokens(self):
+        args = sb.parse_args([
+            "--slots", "1", "--concurrency", "3", "--prompt-tokens", "2000",
+        ])
+        assert args.concurrency == 3
+        assert args.prompt_tokens == 2000
+
+    def test_cli_defaults_preserve_existing_behaviour(self):
+        args = sb.parse_args(["--slots", "1"])
+        assert args.concurrency == sb.TOTAL_REQUESTS_PER_RUN
+        assert args.prompt_tokens == sb.TARGET_PROMPT_TOKENS
+
+    def test_health_sampling_on_by_default_with_opt_out(self):
+        assert sb.parse_args(["--slots", "1"]).no_health_samples is False
+        assert sb.parse_args(["--slots", "1", "--no-health-samples"]).no_health_samples is True
+
+    def test_all_flag_still_accepted(self):
+        args = sb.parse_args(["--all"])
+        assert args.all is True
+        assert args.concurrency == sb.TOTAL_REQUESTS_PER_RUN
+        assert args.prompt_tokens == sb.TARGET_PROMPT_TOKENS
+
+    def test_prompt_tokens_scales_shared_and_varied_content(self):
+        small = sb.build_shared_content(prompt_tokens=2_000)
+        large = sb.build_shared_content(prompt_tokens=12_000)
+        assert len(small) < len(large)
+
+        varied_small = sb.build_varied_content(0, prompt_tokens=2_000)
+        varied_large = sb.build_varied_content(0, prompt_tokens=12_000)
+        assert varied_small.count(",") < varied_large.count(",")
+
+    def test_prompt_tokens_default_matches_global_target(self):
+        # Default must reproduce the historical ~6k split exactly.
+        assert sb.build_varied_content(0).count(",") == 999
+
+    def test_run_metadata_records_workload(self):
+        r = sb.SlotRunResult(slot_count=2, concurrency=3, prompt_tokens_target=2_000)
+        d = r.to_dict()
+        assert d["config"]["concurrency"] == 3
+        assert d["config"]["prompt_tokens_target"] == 2_000
+
+
+# ---------------------------------------------------------------------------
+# Contention metric derivation
+# ---------------------------------------------------------------------------
+
+TS = "2026-08-23 01:18:32,000"
+
+
+def _dispatch_line(ts: str, wait: float, session: str = "s-1") -> str:
+    return (
+        f"{ts} INFO router.routing: contention_queue_dispatch "
+        f"provider=local session={session} queued_duration={wait:.2f}s policy=queue depth=0"
+    )
+
+
+def _fallback_line(ts: str, wait: float, session: str = "s-1") -> str:
+    return (
+        f"{ts} INFO router.routing: contention_queue_fallback_after_queue "
+        f"provider=local session={session} queued_duration={wait:.2f}s"
+    )
+
+
+class TestLocalStreamShare:
+    def test_mixed_results(self):
+        results = [
+            sb.RequestResult(0, "completed", 1.0, resolved_model="local/Qwen3"),
+            sb.RequestResult(1, "completed", 1.0, resolved_model="local-qwen3/Qwen3"),
+            sb.RequestResult(2, "completed", 1.0, resolved_model="deepseek/v4"),
+        ]
+        local, observed, share, reason = sb.derive_local_stream_share(results)
+        assert (local, observed) == (2, 3)
+        assert share == pytest.approx(2 / 3)
+        assert reason is None
+
+    def test_ignores_errors_without_resolved_model(self):
+        results = [
+            sb.RequestResult(0, "completed", 1.0, resolved_model="local/Qwen3"),
+            sb.RequestResult(1, "error", 1.0, error="timeout"),
+        ]
+        local, observed, share, reason = sb.derive_local_stream_share(results)
+        assert (local, observed) == (1, 1)
+        assert share == 1.0
+        assert reason is None
+
+    def test_no_resolved_models_reports_reason(self):
+        results = [sb.RequestResult(0, "error", 1.0, error="timeout")]
+        local, observed, share, reason = sb.derive_local_stream_share(results)
+        assert share is None
+        assert observed == 0
+        assert reason
+
+
+class TestQuarantineEpisodes:
+    def _snap(self, reachable: bool, healing: bool = False, running: bool = True):
+        return {
+            "llama_server_running": running,
+            "backend_reachable": reachable,
+            "self_healing_in_progress": healing,
+        }
+
+    def test_counts_available_to_unavailable_transitions(self):
+        samples = [
+            self._snap(True),
+            self._snap(False),
+            self._snap(False),
+            self._snap(True),
+            self._snap(True),
+            self._snap(False),
+        ]
+        count, reason = sb.count_quarantine_episodes(samples)
+        assert count == 2
+        assert reason is None
+
+    def test_self_healing_counts_as_unavailable(self):
+        samples = [self._snap(True), self._snap(True, healing=True), self._snap(True)]
+        count, reason = sb.count_quarantine_episodes(samples)
+        assert count == 1
+        assert reason is None
+
+    def test_unknown_samples_are_skipped(self):
+        samples = [self._snap(True), {}, self._snap(False)]
+        count, reason = sb.count_quarantine_episodes(samples)
+        assert count == 1
+        assert reason is None
+
+    def test_no_samples_reports_reason(self):
+        count, reason = sb.count_quarantine_episodes([])
+        assert count is None
+        assert reason
+
+    def test_all_unknown_samples_reports_reason(self):
+        # None sentinels (network failures) carry no availability signal.
+        count, reason = sb.count_quarantine_episodes([None, None])
+        assert count is None
+        assert reason
+
+
+class TestBuildContentionMetrics:
+    def test_derives_queue_metrics_from_logs(self, tmp_path: Path):
+        log = tmp_path / "proxy.log"
+        log.write_text(
+            _dispatch_line(TS, 5.0) + "\n"
+            + _dispatch_line(TS, 2.0) + "\n"
+            + _fallback_line(TS, 60.0) + "\n"
+        )
+        metrics = sb.build_contention_metrics(
+            [sb.RequestResult(0, "completed", 1.0, resolved_model="local/Qwen3")],
+            log_files=[str(log)],
+            start_ts=0.0,
+            end_ts=2_000_000_000.0,
+            health_snapshots=[{
+                "llama_server_running": True,
+                "backend_reachable": True,
+                "self_healing_in_progress": False,
+            }],
+        )
+        assert metrics.queue_timeout_count == 1
+        assert metrics.queue_dispatch_count == 2
+        assert metrics.queue_timeout_rate == pytest.approx(1 / 3)
+        assert metrics.local_stream_share == 1.0
+        assert metrics.quarantine_episode_count == 0
+        assert metrics.unavailable == {}
+
+    def test_missing_logs_reports_null_and_reason(self):
+        metrics = sb.build_contention_metrics(
+            [], log_files=["/nonexistent/proxy.log*"], start_ts=0.0, end_ts=1.0,
+        )
+        d = metrics.to_dict()
+        assert d["queue_timeout_count"] is None
+        assert d["queue_timeout_rate"] is None
+        assert "queue_timeout" in d["unavailable"]
+        assert d["local_stream_share"] is None
+        assert "local_stream_share" in d["unavailable"]
+        assert d["quarantine_episode_count"] is None
+        assert "quarantine_episodes" in d["unavailable"]
+
+    def test_no_queue_events_counts_zero_but_rate_null(self, tmp_path: Path):
+        log = tmp_path / "proxy.log"
+        log.write_text("2026-08-23 01:18:32,000 INFO router.routing: unrelated x=1\n")
+        metrics = sb.build_contention_metrics(
+            [], log_files=[str(log)], start_ts=0.0, end_ts=2_000_000_000.0,
+        )
+        assert metrics.queue_timeout_count == 0
+        assert metrics.queue_dispatch_count == 0
+        assert metrics.queue_timeout_rate is None
+        assert metrics.unavailable.get("queue_timeout")
+
+    def test_metrics_surface_in_summary_and_dict(self, tmp_path: Path):
+        log = tmp_path / "proxy.log"
+        log.write_text(_fallback_line(TS, 60.0) + "\n")
+        metrics = sb.build_contention_metrics(
+            [sb.RequestResult(0, "completed", 1.0, resolved_model="local/Qwen3")],
+            log_files=[str(log)], start_ts=0.0, end_ts=2_000_000_000.0,
+        )
+        r = sb.SlotRunResult(slot_count=2, contention=metrics)
+        s = r.summary()
+        assert s["contention"]["queue_timeout_count"] == 1
+        assert s["contention"]["local_stream_share"] == 1.0
+        assert s["contention"]["quarantine_episode_count"] is None
+        assert r.to_dict()["contention"]["queue_timeout_count"] == 1
+        assert r.to_dict()["summary"]["contention"]["queue_timeout_count"] == 1
+
+
+class TestReportContentionMetrics:
+    def test_summary_text_includes_contention_section(self, tmp_path: Path):
+        run = sb.SlotRunResult(
+            slot_count=2,
+            contention=sb.ContentionMetrics(
+                queue_timeout_count=3,
+                queue_dispatch_count=7,
+                queue_timeout_rate=0.3,
+                local_stream_count=4,
+                observed_stream_count=5,
+                local_stream_share=0.8,
+                quarantine_episode_count=1,
+            ),
+        )
+        run.results = [sb.RequestResult(0, "completed", 600.0, 2.0, 16000, 18000, 30.0)]
+        sb.generate_report([run], tmp_path)
+        summary = (tmp_path / "slot_benchmark_summary.txt").read_text()
+        assert "CONTENTION METRICS" in summary
+        assert "queue-timeout" in summary.lower()
+        assert "local stream share" in summary.lower()
+        assert "quarantine" in summary.lower()
+
+    def test_absent_metrics_render_reason(self, tmp_path: Path):
+        run = sb.SlotRunResult(
+            slot_count=2,
+            contention=sb.ContentionMetrics(
+                unavailable={
+                    "queue_timeout": "no proxy log files matched",
+                    "local_stream_share": "no completed requests reported a resolved model",
+                    "quarantine_episodes": "no health snapshots collected",
+                },
+            ),
+        )
+        sb.generate_report([run], tmp_path)
+        summary = (tmp_path / "slot_benchmark_summary.txt").read_text()
+        assert "no proxy log files matched" in summary
+        assert "no health snapshots collected" in summary
