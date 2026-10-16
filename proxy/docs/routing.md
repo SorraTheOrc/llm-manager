@@ -257,6 +257,28 @@ LP-0MSDFKCK4007CPMY; see `proxy/docs/error-analysis-2026-08-03.md`):
 Emission sites and the single-helper enrichment point are documented in
 `proxy/docs/sse-error-emission-audit.md`.
 
+## Local cold-start immunity (LP-0MV9UNIOZ009RIAN)
+
+After a proxy restart, requests that race llama-server warm-up receive
+HTTP 503 (or connection errors) and previously entered the standard
+per-failure 60s provider cooldown — the dominant source of post-restart
+local quarantines (~12 of 45 cooldown episodes in one analysed 24h window).
+
+**Exemption, strictly scoped:** while the cold-start grace window is active
+(`cold_start.is_cold()` is True — the single immunity-boundary signal), a
+**local** HTTP 503 or connection error is **deferred** with the
+`local_cold_start_retry_after_seconds` Retry-After hint instead of being
+quarantined: no `provider_cooldown_seconds` cooldown is applied, the
+exponential-backoff failure counter is not bumped, and the next fallback/
+chain cycle can try local again immediately. The deferral is recorded as a
+`cold_start_deferral` attempt entry for observability.
+
+**Genuine faults are never masked:** any other 5xx during the window (e.g.
+500/502), and any HTTP 503 or connection error after the window expires,
+still quenches normally. The window is re-armed per restart by
+`cold_start.note_model_loaded()`; router-level concurrent-dispatch gating
+(`local_cold_start_max_concurrent`) is unchanged.
+
 ## Usage-limit reset quarantine (GoUsageLimitError)
 
 HTTP 429 responses whose error type is `GoUsageLimitError` (a usage-limit

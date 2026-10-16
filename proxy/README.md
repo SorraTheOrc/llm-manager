@@ -599,6 +599,17 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
 - **Default cooldown**: 60 seconds
 - **Configuration**: Set `server.provider_cooldown_seconds` in `config.yaml`
 - **Retry-After**: If the upstream response includes a `Retry-After` header, the larger of the configured cooldown and the header value is used
+- **Local cold-start exemption (LP-0MV9UNIOZ009RIAN)**: While the cold-start
+  window is active (`cold_start.is_cold()` — see the `local_cold_start_*`
+  knobs in `config.yaml` and the Local cold-start immunity section in
+  `docs/routing.md`), a **local** request that receives HTTP 503
+  (llama-server still warming up after a restart) or a connection error is
+  **deferred** with the `local_cold_start_retry_after_seconds` hint — the
+  60s cooldown is **not** applied and the failure counter is untouched, so
+  local recovers immediately instead of quarantining for up to a minute per
+  restart. The exemption is strictly bounded: any other 5xx during the
+  window, or any error after the window expires, is still quarantined
+  normally so genuine local faults are never masked.
 - **FreeUsageLimitError (HTTP 429, LP-0MRGU0I91006ODFD)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s). No per-provider overrides are active (the last override, `opencode-big-pickle`'s 24h entry, was removed with the provider in LP-0MT652JRM004ZLSI). 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
 - **Usage-limit quarantine (LP-0MSLJPOCC0001ROJ, bounded by LP-0MUQTCMW2001VXH8)**: A 429 usage-limit error (`GoUsageLimitError`, or a `FreeUsageLimitError` carrying a reset time) quarantines only the failing **API-key account**, not the whole gateway. An **explicit** `Resets in …` duration is honoured in full (plus a 2-minute margin). A **guessed** duration — derived from `metadata.limitName` alone when the gateway omits the reset time, which is the common opencode case — is capped at **24 hours** (`server.usage_limit_guess_cap_seconds`, or the `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` env override) and is **never persisted**, so a duration-less 429 can no longer lock a healthy account out for the full 7/30-day period. Guessed quarantines are also re-validated by a cheap self-healing probe (at most one probe per 5 minutes per account); the first successful probe clears the quarantine and the account is routed to within the same request cycle. An operator can clear any quarantine immediately with `POST /admin/clear-usage-limit`.
 - **State**: Cooldown state is persisted across restarts (see Provider Availability Persistence below) — a cooldown set before a restart is still honoured after it.

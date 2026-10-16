@@ -1042,6 +1042,16 @@ server:
   #   cold (default 1, minimum 1).
   # local_cold_start_retry_after_seconds: Retry-After hint for a cold-start
   #   deferral (default 15).
+  #
+  # Grace-period immunity (LP-0MV9UNIOZ009RIAN): while the cold window is
+  # active (``is_cold()`` True), a LOCAL request that receives HTTP 503 (the
+  # backend is still warming up) or a connection error is DEFERRED with the
+  # Retry-After hint above — no provider_cooldown_seconds (60s) quarantine is
+  # applied and the failure counter is untouched, so local recovers
+  # immediately after a restart. Any other 5xx during the window, or any
+  # error after the window expires, is still quarantined normally (genuine
+  # faults are never masked). These knobs are unchanged; they only document
+  # the deferral semantics.
 
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).
