@@ -4147,6 +4147,54 @@ def _is_free_usage_limit_error(response: Response, body_text: str) -> bool:
     return False
 
 
+def _is_account_rate_limit_error(response: Response, body_text: str) -> bool:
+    """Return True when a 429 response is a per-ACCOUNT rate-limit error.
+
+    Detects upstream responses whose JSON body identifies the rate limit as
+    bound to a specific API-key account -- ``type == "rate_limit_error"`` or
+    ``code == "rate_limit_exceeded"`` (case-insensitive), either top-level
+    (observed api.munito.ai body) or nested under an ``error`` dict.
+
+    A per-account rate limit is consumed by ONE API key: entries that share a
+    gateway but use different ``api_key_env`` values have independent quota
+    (LP-0MSMBWB23009XYPW), so the failing entry must poison only its ACCOUNT
+    key in the per-request exclusion set, NOT the shared endpoint failure
+    domain -- otherwise paid sibling keys on the same gateway are skipped for
+    the rest of the request despite having independent quota
+    (LP-0MVCX0E2V001VB5N).
+
+    Expected upstream format (observed from api.munito.ai):
+        HTTP 429
+        Body: {"code": "rate_limit_exceeded", "type": "rate_limit_error"}
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status != 429:
+        return False
+
+    try:
+        payload = json.loads(body_text) if body_text else None
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        # Check the top level first, then a nested ``error`` dict (OpenAI-style
+        # bodies nest the markers under ``error``; the observed api.munito.ai
+        # body is top-level).
+        candidates = [payload]
+        error = payload.get("error")
+        if isinstance(error, dict):
+            candidates.append(error)
+        for cand in candidates:
+            err_type = str(cand.get("type", "")).strip().lower()
+            code = str(cand.get("code", "")).strip().lower()
+            if err_type == "rate_limit_error" or code == "rate_limit_exceeded":
+                return True
+
+    # Fallback: check raw body text for the identifying markers
+    lowered_body = (body_text or "").strip().lower()
+    return "rate_limit_error" in lowered_body or "rate_limit_exceeded" in lowered_body
+
+
 def _parse_resets_in(message: str) -> float | None:
     """Parse a ``Resets in ...`` duration from an upstream error message.
 
@@ -6034,7 +6082,18 @@ async def _proxy_with_remote_fallback_cycle(
                 # raw upstream body / exhausted-503-with-diagnostics.
                 if _reasoning_roundtrip_response is None and _is_reasoning_content_roundtrip_error(response):
                     _reasoning_roundtrip_response = response
-                attempted_domains.add(_failure_domain_key(provider_cfg))
+                # Per-account rate limit (LP-0MVCX0E2V001VB5N): a 429 with
+                # body type=rate_limit_error / code=rate_limit_exceeded is a
+                # per-ACCOUNT quota event (independent per api_key_env), NOT an
+                # endpoint-level failure. Poison only the failing account key in
+                # the per-request exclusion set so paid siblings on the same
+                # gateway stay eligible (e.g. munitoai-free 429 must not skip
+                # the paid munitoai key). Other HTTP errors keep poisoning the
+                # shared failure domain (AC2).
+                if _is_account_rate_limit_error(response, body_text):
+                    attempted_domains.add(_usage_limit_account_key(provider_cfg))
+                else:
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = f"HTTP {response.status_code}"
                 prev_provider = provider_name
                 if response.status_code != 429:
@@ -7277,7 +7336,18 @@ async def _proxy_with_fallback_cycle(
                         response, provider_name, provider_type,
                         cooldown_seconds, attempts, body_text, config,
                     )
-                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    # Per-account rate limit (LP-0MVCX0E2V001VB5N): a 429 with
+                    # body type=rate_limit_error / code=rate_limit_exceeded is a
+                    # per-ACCOUNT quota event (independent per api_key_env), NOT
+                    # an endpoint-level failure. Poison only the failing account
+                    # key in the per-request exclusion set so paid siblings on
+                    # the same gateway stay eligible (e.g. munitoai-free 429
+                    # must not skip the paid munitoai key). Other HTTP errors
+                    # keep poisoning the shared failure domain (AC2).
+                    if _is_account_rate_limit_error(response, body_text):
+                        attempted_domains.add(_usage_limit_account_key(provider_cfg))
+                    else:
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = f"HTTP {response.status_code}"
                     prev_provider = provider_name
                     if response.status_code != 429:
