@@ -23,10 +23,14 @@ from proxy.provider import _build_resolved_model_value
 from tests.config_test_utils import get_merged_config, load_profile
 
 #: The exact provider entry the chains must carry right after local.
+#: ``display_name`` marks the free tier (``MunitoAI Free``) so the
+#: X-Resolved-Model header distinguishes it from the paid sibling
+#: (LP-0MVCQ36QV009QX8K).
 MUNITOAI_FREE_ENTRY = {
     "name": "munitoai-free",
     "type": "remote",
     "provider": "MunitoAI",
+    "display_name": "MunitoAI Free",
     "endpoint": "https://api.munito.ai/inference",
     "api_key_env": "MUNITOAI_FREE_API_KEY",
     "forward_session_headers": False,
@@ -121,12 +125,20 @@ def test_munitoai_free_is_always_available():
 
 @pytest.mark.parametrize("model", CHAINS)
 def test_munitoai_resolved_model_header(model):
-    """The tiers report ``MunitoAI/<upstream model id>`` when they serve."""
+    """The tiers report tier-distinct resolved-model values when they serve.
+
+    Free resolves to ``MunitoAI Free/<upstream model id>`` (via the entry's
+    ``display_name``), the paid tier keeps ``MunitoAI/<upstream model id>``
+    (LP-0MVCQ36QV009QX8K). The two strings must never be identical.
+    """
     providers = _providers(get_merged_config("fast"), model)
     free_entry = providers[1]
     paid_entry = next(p for p in providers if p["name"] == "munitoai")
-    assert _build_resolved_model_value(free_entry) == "MunitoAI/deepseek-ai/deepseek-v4-flash"
-    assert _build_resolved_model_value(paid_entry) == "MunitoAI/deepseek-ai/deepseek-v4-flash"
+    free_value = _build_resolved_model_value(free_entry)
+    paid_value = _build_resolved_model_value(paid_entry)
+    assert free_value == "MunitoAI Free/deepseek-ai/deepseek-v4-flash"
+    assert paid_value == "MunitoAI/deepseek-ai/deepseek-v4-flash"
+    assert free_value != paid_value
 
 
 def test_munitoai_api_key_resolves_from_pi_auth_json(tmp_path):

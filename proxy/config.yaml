@@ -256,7 +256,11 @@ models:
       # _API_KEY from MUNITOAI_FREE_API_KEY and tries both the underscore
       # and hyphenated stems (LP-0MVBJXZY5002UW10). No ``available_times``
       # window — eligible around the clock.
+      # ``display_name`` marks the free tier so X-Resolved-Model shows
+      # ``MunitoAI Free/<model>`` vs the paid ``MunitoAI/<model>`` in Pi
+      # (LP-0MVCQ36QV009QX8K).
       - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
@@ -354,6 +358,7 @@ models:
       # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
       # around the clock.
       - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
@@ -451,6 +456,7 @@ models:
       # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
       # around the clock.
       - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference

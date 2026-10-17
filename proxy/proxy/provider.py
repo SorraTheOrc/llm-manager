@@ -3064,6 +3064,24 @@ def _add_provider_header(response: Response, provider_name: str) -> Response:
     return response
 
 
+def _resolve_display_provider_name(provider_cfg: dict) -> str | None:
+    """Resolve the human-readable provider component used in X-Resolved-Model.
+
+    Priority: ``display_name`` (opt-in tier-aware label, e.g. ``MunitoAI
+    Free``) -> ``provider`` (actual provider brand name) -> ``name``
+    (provider entry name). The ``display_name`` field lets operators
+    distinguish provider tiers (free vs paid) that share a brand + model,
+    without touching failure-domain, cooldown, or usage-limit keys (which key
+    on endpoint, model, api_key_env, brand and entry name upstream of this
+    display string) (LP-0MVCQ36QV009QX8K).
+    """
+    return (
+        provider_cfg.get("display_name")
+        or provider_cfg.get("provider")
+        or provider_cfg.get("name")
+    )
+
+
 def _build_resolved_model_value(provider_cfg: dict) -> str | None:
     """Build the X-Resolved-Model header value from a provider config.
 
@@ -3073,12 +3091,13 @@ def _build_resolved_model_value(provider_cfg: dict) -> str | None:
     For local providers, uses ``llama_model`` as the model ID.
     For remote providers, uses ``model`` (upstream model ID).
 
-    The provider name is taken from the ``provider`` field first (actual
-    provider brand name), falling back to ``name`` (provider entry name)
-    for backward compatibility.  A warning is logged when a remote provider
-    entry lacks the ``provider`` field.
+    The provider name is resolved by ``_resolve_display_provider_name()``:
+    ``display_name`` first (opt-in tier-aware label, e.g. ``MunitoAI Free``),
+    then the ``provider`` field (actual provider brand name), falling back
+    to ``name`` (provider entry name) for backward compatibility.  A warning
+    is logged when a remote provider entry lacks the ``provider`` field.
     """
-    provider_name = provider_cfg.get("provider") or provider_cfg.get("name")
+    provider_name = _resolve_display_provider_name(provider_cfg)
     if not provider_name:
         return None
     model_id = provider_cfg.get("llama_model") or provider_cfg.get("model")

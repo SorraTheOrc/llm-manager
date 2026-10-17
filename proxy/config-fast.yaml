@@ -52,6 +52,7 @@ models:
       # Untimed in fast mode like the other
       # remote tiers.
       - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
@@ -107,6 +108,7 @@ models:
       # Untimed in fast mode like the other
       # remote tiers.
       - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
@@ -160,8 +162,10 @@ models:
       # (underscore — resolver strips _API_KEY from MUNITOAI_FREE_API_KEY;
       # hyphenated ``munitoai-free`` tracked in LP-0MVBJXZY5002UW10).
       # Untimed in fast mode like the other
-      # remote tiers.
+      # remote tiers. ``display_name`` marks the free tier for a distinct
+      # X-Resolved-Model label (LP-0MVCQ36QV009QX8K).
       - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
