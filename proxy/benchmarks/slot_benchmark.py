@@ -57,7 +57,14 @@ except ImportError:  # pragma: no cover - exercised when run as a script
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # /home/rgardler/projects/llm
+# The repo root whose live proxy/config is benchmarked. Defaults to the repo
+# this harness lives in; ``LLAMA_PROXY_BENCHMARK_ROOT`` overrides it so the
+# harness code can live in a git worktree while it operates on the live
+# checkout (the running proxy reads that checkout's config.yaml and
+# start-proxy.sh).
+PROJECT_ROOT = Path(
+    os.environ.get("LLAMA_PROXY_BENCHMARK_ROOT") or Path(__file__).resolve().parent.parent.parent
+)
 CONFIG_YAML = PROJECT_ROOT / "proxy" / "config.yaml"
 LOG_DIR = Path("/var/log/llama-proxy")
 BENCHMARK_LOG = PROJECT_ROOT / "logs" / "proxy-benchmark.log"
@@ -99,6 +106,10 @@ def _generate_extra_numbers(idx: int, turn: int) -> str:
 # Slot counts to test
 # ---------------------------------------------------------------------------
 SLOT_COUNTS = [1, 2, 4, 6, 8, 12]
+
+#: The 1/2/3-slot sweep mandated by LP-0MVAZPQUM006EAC7 (AC1) — run via
+#: ``--sweep``. Distinct from ``--all`` (historical full set: 1,2,4,6,8,12).
+SWEEP_SLOT_COUNTS = [1, 2, 3]
 
 # ---------------------------------------------------------------------------
 # Long padding document (~500 words, repeated to hit token target)
@@ -325,10 +336,72 @@ def restart_services(slot_count: int) -> None:
     print(f"  New proxy started via start-proxy.sh (PID {new_proc.pid})")
 
     # 6. Wait for proxy to be ready
-    _wait_for_proxy()
+    proxy_ok = _wait_for_proxy()
 
     # 7. Wait for llama-server to be ready
-    _wait_for_llama_server()
+    llama_ok = _wait_for_llama_server()
+    return llama_ok and proxy_ok
+
+
+def _read_slot_pool_size_from_config() -> int:
+    """Return the current ``session_slot_pool_size`` in config.yaml (base)."""
+    try:
+        m = re.search(r'^\s*session_slot_pool_size:\s*(\d+)', _read_config(), re.MULTILINE)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 1
+
+
+#: Output headroom subtracted from per-slot ctx (mirrors provider.py routing
+#: clamp: ``physical = local_model_ctx_size // slots - 4096``).
+PHYSICAL_CTX_HEADROOM = 4096
+
+
+def _read_ctx_size_from_config() -> int | None:
+    """Return ``local_model_ctx_size`` from config.yaml, else None."""
+    try:
+        m = re.search(r'^\s*local_model_ctx_size:\s*(\d+)', _read_config(), re.MULTILINE)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _capture_system_memory() -> int | None:
+    """Return available system memory (MemAvailable) in bytes, else None."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                return int(parts[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _observe_llama_parallel() -> int | None:
+    """Observe llama-server --parallel via /slots (count of slots), else None."""
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen(
+            f"http://localhost:{LLAMA_SERVER_PORT}/slots?model=Qwen3", timeout=5
+        )
+        data = json.loads(resp.read().decode())
+        if isinstance(data, list):
+            return len(data)
+    except Exception:
+        pass
+    return None
+
+
+def _format_viability_gb(value: int | None) -> str:
+    """Render a byte count as GiB text, or '--' when None."""
+    if value is None:
+        return "--"
+    return f"{value / (1024**3):.1f}GB"
 
 
 def _kill_llama_server() -> None:
@@ -375,25 +448,32 @@ def _kill_llama_server() -> None:
             pass
 
 
-def _wait_for_llama_server(timeout: int = 300) -> None:
-    """Wait until llama-server responds on its health endpoint."""
+def _wait_for_llama_server(timeout: int = 300) -> bool:
+    """Wait until llama-server responds on its health endpoint.
+
+    Returns True when ready, False on timeout (caller records it as a
+    viability-failure signal rather than silently continuing; AC4 of
+    LP-0MVAZPQUM006EAC7).
+    """
     from urllib.error import URLError
     from urllib.request import urlopen
 
     deadline = time.monotonic() + timeout
+    last_err = None
     while time.monotonic() < deadline:
         try:
             resp = urlopen(f"http://localhost:{LLAMA_SERVER_PORT}/health", timeout=5)
             if resp.status == 200:
                 print("  llama-server ready")
-                return
-        except (URLError, OSError):
-            pass
+                return True
+        except (URLError, OSError) as e:
+            last_err = e
         time.sleep(2)
-    print("  WARNING: llama-server did not become ready within timeout")
+    print(f"  WARNING: llama-server did not become ready within {timeout}s (last error: {last_err})")
+    return False
 
 
-def _wait_for_proxy(timeout: int = 120) -> None:
+def _wait_for_proxy(timeout: int = 120) -> bool:
     """Wait until the proxy responds to a health check."""
     from urllib.request import URLError, urlopen
 
@@ -405,11 +485,12 @@ def _wait_for_proxy(timeout: int = 120) -> None:
             resp = urlopen(f"http://localhost:{PROXY_PORT}/", timeout=5)
             if resp.status == 200:
                 print("  Proxy ready")
-                return
+                return True
         except URLError:
             pass
         time.sleep(2)
     print("  WARNING: proxy did not become ready within timeout")
+    return False
 
 
 def _slot_cache_dir() -> Path:
@@ -556,6 +637,16 @@ class SlotRunResult:
     start_unix: float | None = None  # monotonic-ish window start (log filtering)
     end_unix: float | None = None  # window end (log filtering)
     contention: ContentionMetrics | None = None  # contention metrics for the run
+    # --- Reproducibility / viability metadata (LP-0MVAZPQUM006EAC7) ---
+    command: str = ""  # exact CLI invocation for this run
+    config_diff: dict = field(default_factory=dict)  # session_slot_pool_size before/after
+    model: str = ""  # model name benchmarked (e.g. "plan" -> local Qwen3)
+    context_size: int | None = None  # local_model_ctx_size (total, across slots)
+    per_slot_ctx: int | None = None  # physical per-slot ctx: ctx // slots - headroom
+    observed_slots: int | None = None  # llama-server --parallel actually observed
+    system_memory_bytes: int | None = None  # MemAvailable at run end
+    llama_started: bool | None = None  # None = n/a (skip-restart), True/False = restart
+    viability_warnings: list[str] = field(default_factory=list)  # OOM/start-failure/ctx-reduction
 
     def summary(self) -> dict:
         completed = [r for r in self.results if r.status == "completed"]
@@ -601,9 +692,30 @@ class SlotRunResult:
                 proxy_restart_time=self.proxy_restart_time,
                 llama_ready_time=self.llama_ready_time,
             ),
+            reproducibility=self.reproducibility_dict(),
+            viability=self.viability_dict(),
             requests=[r.to_dict() for r in self.results],
             summary=self.summary(),
             contention=self.contention.to_dict() if self.contention else {},
+        )
+
+    def reproducibility_dict(self) -> dict:
+        """Exact command / config diff / model / ctx for this run (AC1)."""
+        return dict(
+            command=self.command,
+            config_diff=dict(self.config_diff),
+            model=self.model,
+            context_size=self.context_size,
+            per_slot_ctx=self.per_slot_ctx,
+        )
+
+    def viability_dict(self) -> dict:
+        """Viability-failure signals for this run: OOM/start-failure/ctx (AC4)."""
+        return dict(
+            observed_slots=self.observed_slots,
+            system_memory_bytes=self.system_memory_bytes,
+            llama_started=self.llama_started,
+            warnings=list(self.viability_warnings),
         )
 
 
@@ -1072,12 +1184,17 @@ async def run_slot_benchmark(
     prompt_tokens: int = TARGET_PROMPT_TOKENS,
     health_samples: list | None = None,
     health_interval_s: float = HEALTH_SAMPLE_INTERVAL_S,
+    clean_cache: bool = False,
 ) -> SlotRunResult:
     """Execute a benchmark run for a given slot count.
 
     When *health_samples* is a list, /health snapshots are appended to it for
     the duration of the run (used for quarantine-episode counting by
     :func:`build_contention_metrics`).
+
+    Slot cache is cleared ONLY when *clean_cache* is True (explicit opt-in via
+    ``--clean-cache``); a live production proxy's warm KV cache must never be
+    dropped by a benchmark default (AC5 config-drift guard, LP-0MVAZPQUM006EAC7).
     """
     result = SlotRunResult(slot_count=slot_count, concurrency=num_requests,
                            prompt_tokens_target=prompt_tokens)
@@ -1093,8 +1210,10 @@ async def run_slot_benchmark(
         result.error = "httpx not installed"
         return result
 
-    # Clear slot cache for clean measurements
-    clear_slot_cache()
+    # Clear slot cache ONLY on explicit opt-in (--clean-cache); the default
+    # preserves the live proxy's warm KV cache (AC5, LP-0MVAZPQUM006EAC7).
+    if clean_cache:
+        clear_slot_cache()
 
     health_task = None
     if health_samples is not None:
@@ -1210,23 +1329,81 @@ async def run_slot_benchmark(
 
 
 def _capture_gpu_memory() -> int | None:
-    """Try to capture GPU memory usage from /admin/metrics."""
+    """Try to capture GPU memory usage.
+
+    Sources, in order:
+    1. ``/admin/metrics`` — JSON keys ``rocm_vram_used_bytes`` /
+       ``cuda_vram_used_bytes`` (modern proxy emits JSON rather than the
+       historic Prometheus text lines the original parser scanned).
+    2. ``rocm-smi --showmeminfo vram --json`` — used bytes on ROCm hosts
+       (APU/GTT platforms); ``LLAMA_PROXY_ROCSMI_BIN`` overrides the binary.
+    3. ``nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits``.
+
+    Returns None when nothing is available (recorded as an explicit
+    non-available metric rather than a hidden failure; LP-0MVAZPQUM006EAC7
+    records memory where available).
+    """
+    # 1. Proxy /admin/metrics (JSON).
     try:
+        import json as _json
         import urllib.request
         resp = urllib.request.urlopen(
             f"http://localhost:{PROXY_PORT}/admin/metrics", timeout=5
         )
-        for line in resp.read().decode().split("\n"):
-            if "rocm_vram_used_bytes" in line:
+        text = resp.read().decode()
+        try:
+            data = _json.loads(text)
+        except _json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            for key in ("rocm_vram_used_bytes", "cuda_vram_used_bytes"):
+                val = data.get(key) or data.get("gpu", {}).get(key)
+                if isinstance(val, (int, float)) and val > 0:
+                    return int(val)
+        else:
+            for line in text.split("\n"):
                 parts = line.split()
-                if len(parts) >= 2:
-                    return int(parts[-1])
-            if "cuda_vram_used_bytes" in line:
-                parts = line.split()
-                if len(parts) >= 2:
-                    return int(parts[-1])
+                if len(parts) >= 2 and (
+                    "rocm_vram_used_bytes" in parts[0]
+                    or "cuda_vram_used_bytes" in parts[0]
+                ):
+                    try:
+                        return int(parts[-1])
+                    except ValueError:
+                        pass
     except Exception:
         pass
+
+    # 2. rocm-smi (ROCm GPUs / APUs).
+    rocsmi = os.environ.get("LLAMA_PROXY_ROCSMI_BIN", "rocm-smi")
+    try:
+        result = subprocess.run(
+            [rocsmi, "--showmeminfo", "vram", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            import json as _json
+            data = _json.loads(result.stdout)
+            for card in data.values() or []:
+                used = card.get("VRAM Total Used Memory (B)")
+                if isinstance(used, str) and used.strip().isdigit():
+                    return int(used)
+    except Exception:
+        pass
+
+    # 3. nvidia-smi.
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            value = result.stdout.strip().splitlines()[0].strip()
+            if value.isdigit():
+                return int(value) * 1024 * 1024
+    except Exception:
+        pass
+
     return None
 
 
@@ -1251,6 +1428,10 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         "output_tokens_target": TARGET_OUTPUT_TOKENS,
         "target_response_time_seconds": TARGET_RESPONSE_TIME_S,
         "timestamp": datetime.now(UTC).isoformat(),
+        # Reproducibility / environmental context for each run is recorded
+        # per-run (command, config diff, model, ctx size, per-slot ctx,
+        # observed slots, system memory, viability warnings) so a third party
+        # can re-derive the comparison without re-running (LP-0MVAZPQUM006EAC7).
         "runs": [
             dict(
                 slot_count=r.slot_count,
@@ -1259,6 +1440,8 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
                 summary=r.summary(),
                 requests=[req.to_dict() for req in r.results],
                 contention=r.contention.to_dict() if r.contention else {},
+                reproducibility=r.reproducibility_dict(),
+                viability=r.viability_dict(),
                 start_time=r.start_time,
                 end_time=r.end_time,
             )
@@ -1379,6 +1562,29 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         lines += ["-" * 80, "", "  Metrics not measurable (explicit reasons):"]
         lines += reasons_seen
 
+    # Repro context + viability signals (LP-0MVAZPQUM006EAC7 AC1/AC4)
+    lines += ["-" * 80, "", "  REPRODUCIBILITY + VIABILITY (per slot count)"]
+    for r in all_results:
+        lines.append(f"    slots={r.slot_count}:")
+        lines.append(f"      command: {r.command or '--'}")
+        diff = r.config_diff.get("session_slot_pool_size", {})
+        lines.append(
+            f"      config: session_slot_pool_size {diff.get('before', '?')} -> "
+            f"{diff.get('after', '?')}  |  model: {r.model or '--'}"
+        )
+        lines.append(
+            f"      ctx: total={r.context_size or '--'}  "
+            f"per-slot(physical)={r.per_slot_ctx or '--'}  "
+            f"observed slots={r.observed_slots or '--'}"
+        )
+        mem = _format_viability_gb(r.system_memory_bytes)
+        lines.append(f"      system MemAvailable: {mem}  llama_started: {r.llama_started}")
+        if r.viability_warnings:
+            for w in r.viability_warnings:
+                lines.append(f"      ! VIABILITY: {w}")
+        else:
+            lines.append("      viability: no warnings")
+
     summary_path.write_text("\n".join(lines))
     print("\n" + "\n".join(lines[5:]))
 
@@ -1386,7 +1592,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
 
 
 async def run_test_mode(
-    slot_count: int = 6,
+    slot_count: int | None = None,
     base_url: str = f"http://localhost:{PROXY_PORT}",
     skip_restart: bool = False,
     clean_cache: bool = False,
@@ -1398,7 +1604,9 @@ async def run_test_mode(
     restart services unless ``skip_restart`` is False (the default).
 
     Args:
-        slot_count: Slot count to configure (only used when restarting).
+        slot_count: Slot count to configure (only used when restarting). When
+            None, the current config value is used and restored afterwards, so
+            the connectivity check never changes the running config.
         base_url: Proxy base URL.
         skip_restart: If True, skip config update and service restart.
         clean_cache: If True, clear slot cache before restart. Default: False.
@@ -1408,15 +1616,22 @@ async def run_test_mode(
     print(f"  TEST MODE: Sending a single small prompt (phase={phase})")
     print(f"{'='*60}")
 
+    original_slot = None
+    original_config = None
     if not skip_restart:
-        print(f"  Updating config to slot count {slot_count}...")
-        set_slot_count(slot_count)
+        # Never write a hard-coded value; snapshot what is there and restore it
+        # afterwards so the proxy is left untouched (LP-0MVAZPQUM006EAC7 AC5).
+        original_config = _read_config()
+        original_slot = _read_slot_pool_size_from_config()
+        target = slot_count if slot_count is not None else original_slot
+        print(f"  Updating config to slot count {target}...")
+        set_slot_count(target)
         # Only clear slot cache when --clean-cache is explicitly set
         if clean_cache:
             clear_slot_cache()
         else:
             print("  Slot cache preserved (--clean-cache not set)")
-        restart_services(slot_count)
+        restart_services(target)
     else:
         print("  Skipping config update and restart (--skip-restart)")
 
@@ -1448,6 +1663,12 @@ async def run_test_mode(
     else:
         print(f"  ✗ Test FAILED: {req.error}")
 
+    # Restore the config we changed (test mode must never leave drift)
+    if not skip_restart and original_config is not None:
+        print(f"  Restoring original config (session_slot_pool_size: {original_slot})...")
+        _write_config(original_config)
+        restart_services(original_slot or 1)
+
     print(f"\n{'='*60}")
     print("  TEST MODE COMPLETE")
     print(f"{'='*60}")
@@ -1470,8 +1691,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Run all slot counts: {SLOT_COUNTS}",
     )
     group.add_argument(
-        "--slots", type=int, choices=SLOT_COUNTS,
-        help=f"Run a single slot count: {SLOT_COUNTS}",
+        "--sweep", action="store_true",
+        help=f"Run the 1/2/3-slot sweep only: {SWEEP_SLOT_COUNTS}",
+    )
+    group.add_argument(
+        "--slots", type=int, choices=sorted(set(SLOT_COUNTS) | set(SWEEP_SLOT_COUNTS)),
+        help=f"Run a single slot count: {sorted(set(SLOT_COUNTS) | set(SWEEP_SLOT_COUNTS))}",
     )
     group.add_argument(
         "--test", action="store_true",
@@ -1487,7 +1712,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Output directory for results (default: ./benchmark-results)",
     )
     parser.add_argument(
-        "--resume", type=int, choices=SLOT_COUNTS, default=None,
+        "--resume", type=int,
+        choices=sorted(set(SLOT_COUNTS) | set(SWEEP_SLOT_COUNTS)), default=None,
         help="Resume from given slot count (skip earlier ones)",
     )
     parser.add_argument(
@@ -1578,7 +1804,7 @@ def main(argv: list[str] | None = None) -> None:
     # Handle --test mode: send a single small request to verify connectivity
     if args.test:
         asyncio.run(run_test_mode(
-            slot_count=args.slots or SLOT_COUNTS[0],
+            slot_count=None,
             base_url=f"http://localhost:{PROXY_PORT}",
             skip_restart=args.skip_restart,
             clean_cache=args.clean_cache,
@@ -1587,7 +1813,10 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     # Determine slot counts to run
-    slot_counts = SLOT_COUNTS.copy()
+    if args.sweep:
+        slot_counts = SWEEP_SLOT_COUNTS.copy()
+    else:
+        slot_counts = SLOT_COUNTS.copy()
     if args.slots is not None:
         slot_counts = [args.slots]
     if args.resume:
@@ -1596,111 +1825,180 @@ def main(argv: list[str] | None = None) -> None:
             print(f"No slot counts >= {args.resume} in {SLOT_COUNTS}")
             sys.exit(1)
 
+    # Snapshot the ORIGINAL slot count + full config so the sweep restores
+    # exactly what it found (production value here is 1, not the historical 6;
+    # never hard-code the restore value).
+    original_slot = _read_slot_pool_size_from_config()
+    original_config = _read_config()
+    command_line = " ".join(sys.argv)
+
     all_results: list[SlotRunResult] = []
+    report_path: Path | None = None
+    error: Exception | None = None
+    try:
+        for slot_count in slot_counts:
+            print(f"\n{'#'*60}")
+            print(f"#  Slot count: {slot_count}")
+            print(f"{'#'*60}")
 
-    for slot_count in slot_counts:
-        print(f"\n{'#'*60}")
-        print(f"#  Slot count: {slot_count}")
-        print(f"{'#'*60}")
+            # 1. Update config
+            set_slot_count(slot_count)
 
-        # 1. Update config
-        set_slot_count(slot_count)
+            # 2. Restart services
+            restart_ok: bool | None = None
+            if not args.skip_restart:
+                # Only clear slot cache when --clean-cache is explicitly set
+                # Default is OFF to preserve warm cache for realistic measurements
+                if args.clean_cache:
+                    clear_slot_cache()
+                else:
+                    print("  Slot cache preserved (--clean-cache not set)")
 
-        # 2. Restart services
-        if not args.skip_restart:
-            # Only clear slot cache when --clean-cache is explicitly set
-            # Default is OFF to preserve warm cache for realistic measurements
-            if args.clean_cache:
-                clear_slot_cache()
+                # Record restart timestamps for reproducible measurements
+                from datetime import datetime
+                proxy_restart_time = datetime.now(UTC).isoformat()
+                print(f"  Proxy restart recorded at: {proxy_restart_time}")
+
+                restart_ok = restart_services(slot_count)
+
+                # Record llama-server ready timestamp
+                llama_ready_time = datetime.now(UTC).isoformat()
+                print(f"  Llama-server ready at: {llama_ready_time}")
             else:
-                print("  Slot cache preserved (--clean-cache not set)")
+                print("  Skipping restart (--skip-restart)")
+                proxy_restart_time = None
+                llama_ready_time = None
 
-            # Record restart timestamps for reproducible measurements
-            from datetime import datetime
-            proxy_restart_time = datetime.now(UTC).isoformat()
-            print(f"  Proxy restart recorded at: {proxy_restart_time}")
+            # Determine warmup count
+            warmup_count = WARMUP_REQUESTS if args.warmup else 0
 
-            restart_services(slot_count)
+            # 3. Run benchmark
+            health_samples: list | None = None if args.no_health_samples else []
+            run_result = asyncio.run(run_slot_benchmark(
+                slot_count=slot_count,
+                shared_content=shared,
+                user_prompt=user_prompt,
+                warmup=warmup_count,
+                num_requests=args.concurrency,
+                prompt_tokens=args.prompt_tokens,
+                health_samples=health_samples,
+                clean_cache=args.clean_cache,
+            ))
+            # Attach metadata for JSON output
+            run_result.phase = args.phase
+            run_result.proxy_restart_time = proxy_restart_time
+            run_result.llama_ready_time = llama_ready_time
+            # --- Reproducibility + viability metadata (LP-0MVAZPQUM006EAC7) ---
+            run_result.command = command_line
+            run_result.config_diff = {
+                "session_slot_pool_size": {"before": original_slot, "after": slot_count},
+            }
+            run_result.model = "plan -> local-qwen3/Qwen3"
+            run_result.context_size = _read_ctx_size_from_config()
+            # Physical per-slot ctx mirrors provider.py: ctx // slots - output headroom.
+            if run_result.context_size:
+                run_result.per_slot_ctx = max(
+                    1, run_result.context_size // slot_count - PHYSICAL_CTX_HEADROOM
+                )
+            run_result.observed_slots = _observe_llama_parallel()
+            run_result.system_memory_bytes = _capture_system_memory()
+            if args.skip_restart:
+                run_result.llama_started = None
+            else:
+                run_result.llama_started = bool(restart_ok)
+                if restart_ok is False:
+                    run_result.viability_warnings.append(
+                        f"llama-server failed to become ready at {slot_count} slots "
+                        f"(OOM / start failure) — requests may all error"
+                    )
+            if (run_result.observed_slots is not None
+                    and run_result.observed_slots != slot_count):
+                run_result.viability_warnings.append(
+                    f"observed llama-server slot count {run_result.observed_slots} != "
+                    f"requested {slot_count}"
+                )
+            if (run_result.per_slot_ctx and run_result.context_size
+                    and slot_count > 1
+                    and run_result.per_slot_ctx < run_result.context_size // 4):
+                run_result.viability_warnings.append(
+                    f"per-slot context {run_result.per_slot_ctx} < 25% of model ctx "
+                    f"{run_result.context_size} — may change routing behaviour"
+                )
+            if run_result.viability_warnings:
+                for w in run_result.viability_warnings:
+                    print(f"  ! VIABILITY: {w}")
+            # Derive contention metrics from proxy observability: queue-timeout
+            # and local stream share always derive (logs + response headers);
+            # quarantine episodes derive from /health snapshots when the
+            # --health-samples flag collected them. Absent metrics are reported
+            # explicitly with a reason rather than silently omitted.
+            run_result.contention = build_contention_metrics(
+                run_result.results,
+                log_files=[str(Path(args.log_dir) / "proxy.log*")],
+                start_ts=run_result.start_unix,
+                end_ts=run_result.end_unix,
+                health_snapshots=health_samples or [],
+            )
+            all_results.append(run_result)
 
-            # Record llama-server ready timestamp
-            llama_ready_time = datetime.now(UTC).isoformat()
-            print(f"  Llama-server ready at: {llama_ready_time}")
+            # 4. Quick inline summary
+            s = run_result.summary()
+            print(f"\n  --- Slot count {slot_count} summary ---")
+            print(f"  Completed: {s['completed']}/{s['total_requests']}  "
+                  f"Errors: {s['errors']}")
+            if s['avg_duration']:
+                print(f"  Avg duration: {s['avg_duration']:.0f}s  "
+                      f"Avg TTFT: {s['avg_ttft']:.2f}s  "
+                      f"Avg TPS: {s['avg_tps']:.1f}")
+                gpu_str = ""
+                if s.get("gpu_memory_bytes"):
+                    gb = s["gpu_memory_bytes"] / (1024**3)
+                    gpu_str = f"  GPU memory: {gb:.1f}GB"
+                print(f"  Total tokens generated: {s['total_completion_tokens']}{gpu_str}")
+
+            # 5. Write intermediate result
+            run_file = output_dir / f"slot_{slot_count}.json"
+            run_file.write_text(json.dumps(run_result.to_dict(), indent=2))
+            print(f"  Intermediate result saved to: {run_file}")
+
+            # Brief pause between runs for GPU to idle
+            if slot_count != slot_counts[-1]:
+                print("  Cooling down (30s)...")
+                time.sleep(30)
+
+            # Generate final report
+            report_path = generate_report(all_results, output_dir)
+    except KeyboardInterrupt:
+        print("\nInterrupted — restoring original config before exit.")
+    except Exception as e:  # noqa: BLE001 - restore must run on ANY failure (AC5)
+        error = e
+        print(f"\nERROR during sweep: {e}")
+        print("Restoring original config before exit.")
+    finally:
+        # Restore the ORIGINAL slot count / config (production value here is 1;
+        # never hard-code it). Config must be left exactly as found so the proxy
+        # runs the correct scheduled mode afterwards (AC5). This must run even
+        # if the sweep failed or was interrupted mid-way.
+        print(f"\nRestoring original config (session_slot_pool_size: {original_slot})...")
+        try:
+            _write_config(original_config)
+        except Exception:  # noqa: BLE001
+            print("  WARNING: could not restore config file")
+        if not args.skip_restart:
+            try:
+                restart_services(original_slot)
+            except Exception as re_:  # noqa: BLE001
+                print(f"  WARNING: restart with original slot failed: {re_}")
         else:
-            print("  Skipping restart (--skip-restart)")
-            proxy_restart_time = None
-            llama_ready_time = None
+            print("  WARNING: slot count left at last tested value. Restart manually.")
 
-        # Determine warmup count
-        warmup_count = WARMUP_REQUESTS if args.warmup else 0
-
-        # 3. Run benchmark
-        health_samples: list | None = None if args.no_health_samples else []
-        run_result = asyncio.run(run_slot_benchmark(
-            slot_count=slot_count,
-            shared_content=shared,
-            user_prompt=user_prompt,
-            warmup=warmup_count,
-            num_requests=args.concurrency,
-            prompt_tokens=args.prompt_tokens,
-            health_samples=health_samples,
-        ))
-        # Attach metadata for JSON output
-        run_result.phase = args.phase
-        run_result.proxy_restart_time = proxy_restart_time
-        run_result.llama_ready_time = llama_ready_time
-        # Derive contention metrics from proxy observability: queue-timeout
-        # and local stream share always derive (logs + response headers);
-        # quarantine episodes derive from /health snapshots when the
-        # --health-samples flag collected them. Absent metrics are reported
-        # explicitly with a reason rather than silently omitted.
-        run_result.contention = build_contention_metrics(
-            run_result.results,
-            log_files=[str(Path(args.log_dir) / "proxy.log*")],
-            start_ts=run_result.start_unix,
-            end_ts=run_result.end_unix,
-            health_snapshots=health_samples or [],
-        )
-        all_results.append(run_result)
-
-        # 4. Quick inline summary
-        s = run_result.summary()
-        print(f"\n  --- Slot count {slot_count} summary ---")
-        print(f"  Completed: {s['completed']}/{s['total_requests']}  "
-              f"Errors: {s['errors']}")
-        if s['avg_duration']:
-            print(f"  Avg duration: {s['avg_duration']:.0f}s  "
-                  f"Avg TTFT: {s['avg_ttft']:.2f}s  "
-                  f"Avg TPS: {s['avg_tps']:.1f}")
-            gpu_str = ""
-            if s.get("gpu_memory_bytes"):
-                gb = s["gpu_memory_bytes"] / (1024**3)
-                gpu_str = f"  GPU memory: {gb:.1f}GB"
-            print(f"  Total tokens generated: {s['total_completion_tokens']}{gpu_str}")
-
-        # 5. Write intermediate result
-        run_file = output_dir / f"slot_{slot_count}.json"
-        run_file.write_text(json.dumps(run_result.to_dict(), indent=2))
-        print(f"  Intermediate result saved to: {run_file}")
-
-        # Brief pause between runs for GPU to idle
-        if slot_count != slot_counts[-1]:
-            print("  Cooling down (30s)...")
-            time.sleep(30)
-
-    # Generate final report
-    report_path = generate_report(all_results, output_dir)
-
-    # Restore original slot count (6 = current production value)
-    print("\nRestoring slot count to 6...")
-    set_slot_count(6)
-    if not args.skip_restart:
-        restart_services(6)
-    else:
-        print("  WARNING: slot count left at last tested value. Restart manually.")
+    if error is not None:
+        raise error
 
     print(f"\n{'='*72}")
     print("  BENCHMARK COMPLETE")
     print(f"  Report: {report_path}")
+    print(f"  Restored config: {CONFIG_YAML} -> session_slot_pool_size: {original_slot}")
     print(f"  Summary: {output_dir / 'slot_benchmark_summary.txt'}")
     print(f"{'='*72}")
 

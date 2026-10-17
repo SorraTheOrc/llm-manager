@@ -351,6 +351,30 @@ class TestSlotCounts:
     def test_slot_counts_sorted(self):
         assert sb.SLOT_COUNTS == sorted(sb.SLOT_COUNTS)
 
+    def test_sweep_slot_counts_are_1_2_3(self):
+        # LP-0MVAZPQUM006EAC7 AC1: the sweep runs N = 1, 2 and 3.
+        assert sb.SWEEP_SLOT_COUNTS == [1, 2, 3]
+
+    def test_sweep_is_distinct_from_all(self):
+        # --all keeps the historical set (1,2,4,6,8,12); --sweep is exactly 1/2/3.
+        # The sweep set is NOT a subset of --all's set: it deliberately adds 3.
+        assert set(sb.SWEEP_SLOT_COUNTS) != set(sb.SLOT_COUNTS)
+        assert 3 not in sb.SLOT_COUNTS
+        assert 3 in sb.SWEEP_SLOT_COUNTS
+
+    def test_cli_parses_sweep_flag(self):
+        args = sb.parse_args(["--sweep"])
+        assert args.sweep is True
+
+    def test_cli_accepts_slot_three(self):
+        # --slots 3 must be valid (AC1 sweep includes 3).
+        args = sb.parse_args(["--slots", "3"])
+        assert args.slots == 3
+
+    def test_resume_accepts_slot_three(self):
+        args = sb.parse_args(["--slots", "2", "--resume", "3"])
+        assert args.resume == 3
+
 
 # ---------------------------------------------------------------------------
 # Configurable workload parameters (concurrency / prompt size)
@@ -600,3 +624,89 @@ class TestReportContentionMetrics:
         summary = (tmp_path / "slot_benchmark_summary.txt").read_text()
         assert "no proxy log files matched" in summary
         assert "no health snapshots collected" in summary
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility + viability metadata (LP-0MVAZPQUM006EAC7 AC1/AC4)
+# ---------------------------------------------------------------------------
+
+class TestReproducibilityMetadata:
+    """Run metadata must make the run re-derivable: exact command, config diff,
+    model, ctx size, per-slot ctx, observed slots, memory, viability."""
+
+    def test_to_dict_contains_reproducibility(self):
+        r = sb.SlotRunResult(slot_count=2)
+        r.command = "slot_benchmark.py --sweep --concurrency 3"
+        r.config_diff = {"session_slot_pool_size": {"before": 1, "after": 2}}
+        r.model = "plan -> local-qwen3/Qwen3"
+        r.context_size = 262144
+        r.per_slot_ctx = 262144 // 2 - 4096
+        d = r.to_dict()
+        rep = d["reproducibility"]
+        assert rep["command"] == r.command
+        assert rep["config_diff"]["session_slot_pool_size"]["after"] == 2
+        assert rep["model"] == r.model
+        assert rep["context_size"] == 262144
+        assert rep["per_slot_ctx"] == 262144 // 2 - 4096
+
+    def test_to_dict_contains_viability(self):
+        r = sb.SlotRunResult(slot_count=3)
+        r.observed_slots = 3
+        r.system_memory_bytes = 85 * 1024**3
+        r.llama_started = True
+        r.viability_warnings.append("per-slot context reduced")
+        d = r.to_dict()
+        v = d["viability"]
+        assert v["observed_slots"] == 3
+        assert v["system_memory_bytes"] == 85 * 1024**3
+        assert v["llama_started"] is True
+        assert v["warnings"] == ["per-slot context reduced"]
+
+    def test_reproducibility_dict_round_trip(self):
+        r = sb.SlotRunResult(slot_count=1)
+        r.command = "cmd"
+        assert r.reproducibility_dict()["command"] == "cmd"
+        assert r.viability_dict()["warnings"] == []
+
+
+class TestContextHelpers:
+    def test_read_slot_pool_size_from_config(self, temp_config):
+        assert sb._read_slot_pool_size_from_config() == 6
+
+    def test_read_ctx_size_from_config(self, tmp_path):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("server:\n  local_model_ctx_size: 262144\n  port: 8000\n")
+        with patch.object(sb, "CONFIG_YAML", cfg):
+            assert sb._read_ctx_size_from_config() == 262144
+
+    def test_read_ctx_size_absent_returns_none(self, tmp_path):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("server:\n  port: 8000\n")
+        with patch.object(sb, "CONFIG_YAML", cfg):
+            assert sb._read_ctx_size_from_config() is None
+
+    def test_physical_per_slot_ctx_matches_provider_clamp(self):
+        # provider.py: physical = local_model_ctx_size // slots - 4096
+        assert (262144 // 1 - 4096) == 258048
+        assert (262144 // 3 - 4096) == 83285
+
+    def test_format_viability_gb(self):
+        assert sb._format_viability_gb(None) == "--"
+        assert sb._format_viability_gb(2 * 1024**3) == "2.0GB"
+
+
+class TestProjectRootOverride:
+    """LLAMA_PROXY_BENCHMARK_ROOT lets the harness code live in a worktree
+    while it operates on the live checkout the proxy reads from."""
+
+    def test_env_override_changes_project_root(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("LLAMA_PROXY_BENCHMARK_ROOT", str(tmp_path))
+        try:
+            # Recompute the module-level PROJECT_ROOT from the env
+            root = sb.Path(
+                sb.os.environ.get("LLAMA_PROXY_BENCHMARK_ROOT")
+                or sb.Path(__file__).parent.parent.parent
+            )
+            assert root == tmp_path
+        finally:
+            monkeypatch.delenv("LLAMA_PROXY_BENCHMARK_ROOT", raising=False)
