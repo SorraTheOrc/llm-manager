@@ -3,9 +3,10 @@
 The proxy runs in one of two operator-selected operating modes:
 
 - **fast** — cloud-backed: remote providers are eligible and the server
-  behaves as before (current day settings; ``config-fast.yaml``, 1-slot
-  pool; LP-0MU03AL730000B5W).
-- **cheap** — 3-slot local pool with the SAME models/provider chains as
+  behaves as before (current day settings; ``config-fast.yaml``, 2-slot
+  pool inherited from the base after the N=2 verdict, LP-0MV9UNGEB009XUZ5).
+- **cheap** — 3-slot local pool (converging to 2, LP-0MVCGYAI80084PCZ) with
+  the SAME models/provider chains as
   fast: remote providers (including paid tiers) stay enabled and are used
   when local slots are exhausted (``config-cheap.yaml``, LP-0MSMIPPJI007GU9N;
   3 slots per LP-0MU03AL730000B5W).

@@ -1024,9 +1024,10 @@ localhost (127.0.0.1).
 The proxy runs in one of two operator-selected operating modes:
 
 - **fast** — cloud-backed: remote providers are eligible and requests can
-  fall back to cloud tiers (`proxy/config-fast.yaml`, a 1-slot pool inherited
+  fall back to cloud tiers (`proxy/config-fast.yaml`, a 2-slot pool inherited
   from the base).
-- **cheap** — 3-slot local pool with the same models/provider chains as
+- **cheap** — 3-slot local pool (slated to converge to 2, LP-0MVCGYAI80084PCZ)
+  with the same models/provider chains as
   fast: remote providers (including paid tiers) stay enabled and are used
   when local slots are exhausted (`proxy/config-cheap.yaml`,
   LP-0MSMIPPJI007GU9N). The only intended difference from fast mode is the
@@ -1247,9 +1248,17 @@ resolved after the base + overlay merge:
 
 | Profile | Slots | Notes |
 |---------|-------|-------|
-| `config.yaml` (default/fallback) | 1 | authoritative base |
-| `config-fast.yaml` | 1 | inherits the base value |
-| `config-cheap.yaml` | 3 | overlay override |
+| `config.yaml` (default/fallback) | 2 | authoritative base (LP-0MVCBMERY004SHCK) |
+| `config-fast.yaml` | 2 | inherits the base value |
+| `config-cheap.yaml` | 3 | overlay override — convergence to 2 tracked by LP-0MVCGYAI80084PCZ |
+
+> **Slot-count equalisation verdict (LP-0MV9UNGEB009XUZ5): N=2 for both modes.**
+> A single slot count of 2 is viable: it keeps the same effective
+> local-eligible WARM context ceiling as the previous 1-slot fast profile
+> (100,000, the economic ceiling) while halving the queue-timeout contention
+> rate versus 1 slot, and avoids the 3-slot physical clamp (83,285). The
+> mode profiles are being converged to 2 (LP-0MVCGYAI80084PCZ) so a fast/cheap
+> switch becomes a proxy-only restart that adopts the running llama-server.
 
 There is **no time-based slot schedule** (the previous `slot_schedule`
 mechanism was removed, LP-0MTZRM5HV0007S0V): the slot count changes only
@@ -1261,10 +1270,11 @@ always `local_model_ctx_size // session_slot_pool_size`.
 #### Changing the slot count
 
 Edit the profile's `session_slot_pool_size` and restart the proxy (no hot
-reload). Fast/default use 1 slot; cheap uses 3. The slot count feeds
-llama-server's `--parallel` (via `LLAMA_PARALLEL`, set by the lifecycle)
-and the local dispatch lease pool — keep `session_slot_pool_size` aligned
-with what llama-server actually runs.### Upstream Timeout Configuration
+reload). Fast/default and cheap both run 2 slots after the convergence
+(LP-0MVCGYAI80084PCZ). The slot count feeds llama-server's `--parallel`
+(via `LLAMA_PARALLEL`, set by the lifecycle) and the local dispatch lease
+pool — keep `session_slot_pool_size` aligned with what llama-server
+actually runs.### Upstream Timeout Configuration
 
 The proxy uses two separate timeout values for upstream remote connections:
 

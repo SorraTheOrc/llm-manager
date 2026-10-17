@@ -984,12 +984,12 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  # Operator-directed 2026-09-13 (LP-0MU03AL730000B5W): default profile
-  # runs a single slot.
+  # Base/default profile runs 2 slots (fast inherits 2; cheap converges to
+  # 2 per the slot-count verdict, LP-0MV9UNGEB009XUZ5 / LP-0MVCGYAI80084PCZ).
   session_slot_pool_size: 2
 
   # Slot count is defined ONCE per mode profile via ``session_slot_pool_size``
-  # above (default/fast: 3, cheap: 2). There is no time-based slot schedule:
+  # above (default/fast: 2, cheap: 3 — converging to 2, LP-0MVCGYAI80084PCZ). There is no time-based slot schedule:
   # the slot count changes only when the operating mode changes. The
   # mode-switch schedule (when to switch fast<->cheap) lives in the
   # standalone ``proxy/mode_schedule.yaml`` file, not in this model profile.
