@@ -43,7 +43,7 @@ class TestConfigResolution:
         mode_file.write_text("cheap\n")
         monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(mode_module.proxy_dir() / "config.yaml"))
         cfg = load_config()
-        assert cfg["server"]["session_slot_pool_size"] == 1
+        assert cfg["server"]["session_slot_pool_size"] == 2
 
     def test_cheap_mode_selects_cheap_config(self, mode_file, monkeypatch):
         """Persisted cheap mode -> load_config reads config-cheap.yaml (3 slots)."""
@@ -54,19 +54,21 @@ class TestConfigResolution:
         assert cfg["server"]["session_slot_pool_size"] == 3
 
     def test_fast_mode_selects_fast_config(self, mode_file, monkeypatch):
-        """Persisted fast mode -> load_config reads config-fast.yaml (1 slot)."""
+        """Persisted fast mode -> load_config reads config-fast.yaml (2 slots).
+        Base/default slot count is 2 (LP-0MVCBMERY004SHCK carries the
+        operator-directed config; fixtures regenerated accordingly)."""
         monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
         mode_file.write_text("fast\n")
         monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
         cfg = load_config()
-        assert cfg["server"]["session_slot_pool_size"] == 1
+        assert cfg["server"]["session_slot_pool_size"] == 2
 
     def test_no_mode_file_defaults_to_fast(self, mode_file, monkeypatch):
         """No persisted mode -> load_config reads the fast profile (default)."""
         monkeypatch.setattr(mode_module, "mode_state_file", lambda: mode_file)
         monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
         cfg = load_config()
-        assert cfg["server"]["session_slot_pool_size"] == 1
+        assert cfg["server"]["session_slot_pool_size"] == 2
 
     def test_resolve_config_path_precedence(self, mode_file, monkeypatch):
         """resolve_config_path follows env > mode > default."""
@@ -147,12 +149,14 @@ def _strip_available_times(models: dict) -> dict:
 
 
 class TestFastConfigProfile:
-    def test_fast_config_is_1_slot(self):
-        """config-fast.yaml defines its slot count once (1) and has no
-        time-based slot schedule (LP-0MTZRM5HV0007S0V)."""
+    def test_fast_config_is_2_slots(self):
+        """config-fast.yaml defines its slot count once (2, inherited from the
+        base/default profile after the operator-directed 1->2 bump carried by
+        LP-0MVCBMERY004SHCK) and has no time-based slot schedule
+        (LP-0MTZRM5HV0007S0V)."""
         cfg = _load("config-fast.yaml")
         srv = cfg["server"]
-        assert srv["session_slot_pool_size"] == 1
+        assert srv["session_slot_pool_size"] == 2
         assert "slot_schedule" not in srv
         assert "mode_schedule" not in srv
 
@@ -323,7 +327,7 @@ class TestCheapConfigProfile:
 
         # The intended diffs, asserted explicitly:
         assert cheap["server"]["session_slot_pool_size"] == 3
-        assert fast["server"]["session_slot_pool_size"] == 1
+        assert fast["server"]["session_slot_pool_size"] == 2
         assert "slot_schedule" not in cheap["server"]
         assert "slot_schedule" not in fast["server"]
         assert cheap["server"]["contention_queue_policy"] == "queue"
@@ -384,8 +388,8 @@ class TestSlotCountSingleSourceOfTruth:
     @pytest.mark.parametrize(
         "profile,expected_slots",
         [
-            ("config.yaml", 1),
-            ("config-fast.yaml", 1),
+            ("config.yaml", 2),
+            ("config-fast.yaml", 2),
             ("config-cheap.yaml", 3),
         ],
     )

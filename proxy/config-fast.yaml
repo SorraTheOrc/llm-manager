@@ -45,15 +45,17 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
-      # fallback tier, untimed in fast mode like the other remote tiers.
-      # Declared in full here because an overlay's provider list replaces the
-      # base list wholesale.
-      - name: munitoai
+      # MunitoAI Free: free-tier remote fallback, sits immediately after
+      # local. Key resolved from ~/.pi/agent/auth.json under ``munitoai_free``
+      # (underscore — resolver strips _API_KEY from MUNITOAI_FREE_API_KEY;
+      # hyphenated ``munitoai-free`` tracked in LP-0MVBJXZY5002UW10).
+      # Untimed in fast mode like the other
+      # remote tiers.
+      - name: munitoai-free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_API_KEY
+        api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
       - name: opencode-go-3
@@ -77,6 +79,16 @@ models:
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
         model: deepseek-v4.1-flash
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
+      # after the opencode-go chain. Untimed in fast mode. The API key is
+      # resolved from ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: deepseek-flash
         type: remote
         provider: deepseek
@@ -88,13 +100,17 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
-      # fallback tier (see plan).
-      - name: munitoai
+      # MunitoAI Free: free-tier remote fallback, sits immediately after
+      # local. Key resolved from ~/.pi/agent/auth.json under ``munitoai_free``
+      # (underscore — resolver strips _API_KEY from MUNITOAI_FREE_API_KEY;
+      # hyphenated ``munitoai-free`` tracked in LP-0MVBJXZY5002UW10).
+      # Untimed in fast mode like the other
+      # remote tiers.
+      - name: munitoai-free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_API_KEY
+        api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
       - name: opencode-go-3
@@ -118,6 +134,16 @@ models:
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
         model: deepseek-v4.1-flash
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
+      # after the opencode-go chain. Untimed in fast mode. The API key is
+      # resolved from ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: deepseek-flash
         type: remote
         provider: deepseek
@@ -129,13 +155,17 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
-      # fallback tier (see plan).
-      - name: munitoai
+      # MunitoAI Free: free-tier remote fallback, sits immediately after
+      # local. Key resolved from ~/.pi/agent/auth.json under ``munitoai_free``
+      # (underscore — resolver strips _API_KEY from MUNITOAI_FREE_API_KEY;
+      # hyphenated ``munitoai-free`` tracked in LP-0MVBJXZY5002UW10).
+      # Untimed in fast mode like the other
+      # remote tiers.
+      - name: munitoai-free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_API_KEY
+        api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
       - name: opencode-go-3
@@ -159,6 +189,16 @@ models:
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
         model: deepseek-v4.1-flash
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
+      # after the opencode-go chain. Untimed in fast mode. The API key is
+      # resolved from ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: deepseek-flash
         type: remote
         provider: deepseek

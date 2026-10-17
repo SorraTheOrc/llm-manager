@@ -686,7 +686,7 @@ class TestConfigTestUtilsHelper:
         assert get_merged_config("cheap")["server"][
             "local_large_context_cold_cache_threshold"
         ] == 42000
-        assert get_merged_config("fast")["server"]["session_slot_pool_size"] == 1
+        assert get_merged_config("fast")["server"]["session_slot_pool_size"] == 2
         assert get_merged_config("fast")["server"]["contention_queue_max_depth"] == 8
         assert (
             get_merged_config("fast")["server"][
