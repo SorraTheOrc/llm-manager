@@ -1835,7 +1835,38 @@ restart in the background. Invalid modes return `400`; a switch while a
 restart is pending returns `409` when the mode differs; a manual
 `fast`→`cheap` switch less than 30 minutes after a `fast` switch returns
 `429` with `Retry-After` and a `retry_after_seconds` body field (see
-[Fast → cheap cooldown](#fast--cheap-cooldown)).
+[Fast → cheap cooldown](#fast--cheap-cooldown)); a switch made while the
+**mode-switch lock** is engaged returns `423` (see below).
+
+#### Mode-switch lock (performance investigations)
+
+Lock mode switching so a slot sweep / benchmark cannot be corrupted by a
+fast↔cheap change mid-run (the automatic schedule and the herdr
+mode-switch worker both switch modes, each triggering a proxy restart):
+
+```bash
+# Engage (reject any CHANGE to the mode; normal operation is unaffected
+# while off — the default)
+curl -X POST http://localhost:8000/admin/mode-switch-lock \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled": true, "reason": "1/2/3 slot sweep"}'
+
+# Inspect
+curl http://localhost:8000/admin/mode-switch-lock
+# {"enabled": true, "source": "runtime"}
+
+# Release
+curl -X POST http://localhost:8000/admin/mode-switch-lock \
+  -H 'Content-Type: application/json' -d '{"enabled": false}'
+```
+
+While engaged: a request to change the mode is rejected (`423 Locked`) with
+no state mutation and no restart, and the mode scheduler stands down (the
+current mode is held). A request for the already-active mode is still a
+harmless noop. The state persists in `proxy/.mode-switch-lock`, so it
+survives the proxy restart the investigation itself may trigger. The
+default is **off** (normal operation) and can also be pinned per deployment
+via `server.mode_switch_lock.enabled` in `config.yaml`.
 
 #### Stop LLama Server
 ```bash

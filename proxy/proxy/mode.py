@@ -36,6 +36,12 @@ instead of being reverted on the next scheduler tick. The override expiry is
 persisted in a companion state file (``proxy/.mode.override-until``) so it
 survives proxy restarts and reboots; once the next scheduled change passes,
 the schedule reasserts control (LP-0MSMF25V9002AY1J).
+
+A **mode-switch lock** (``POST /admin/mode-switch-lock``,
+``proxy/.mode-switch-lock``) can be engaged to reject any change to the
+operating mode and make the scheduler stand down — used during slot sweeps /
+performance investigations so a mid-run fast<->cheap switch cannot corrupt
+the measurement (LP-0MVCBMLP7009MN81). Off (the default) = normal operation.
 """
 
 import logging
@@ -271,6 +277,25 @@ def _live_server_config() -> dict | None:
     except Exception:
         pass
     return None
+
+
+def _mode_switch_lock_config_section(server_config: dict | None) -> dict:
+    """Resolve the ``server.mode_switch_lock`` config with defaults.
+
+    Args:
+        server_config: The ``server`` section of the server config dict, or
+            None to read it from the live server module lazily.
+
+    Returns:
+        A dict with ``enabled`` (bool) and ``reason`` (str) keys.
+    """
+    if server_config is None:
+        server_config = {}
+    section = server_config.get("mode_switch_lock") or {}
+    return {
+        "enabled": bool(section.get("enabled", False)),
+        "reason": str(section.get("reason") or ""),
+    }
 
 
 def _begin_drain() -> None:
@@ -609,8 +634,13 @@ def _mode_scheduler_step(
     scheduled transition. Once the override expires the scheduled mode is
     applied regardless of the current setting. Returns True when a mode
     change was applied. A pending mode-switch restart (e.g. a manual switch
-    in flight) is left alone and retried on the next cycle.
+    in flight) is left alone and retried on the next cycle. When the
+    mode-switch lock is engaged (LP-0MVCBMLP7009MN81) the scheduler stands
+    down entirely: no scheduled switch is applied while a performance
+    investigation is running.
     """
+    if mode_switch_locked():
+        return False
     expected = schedule.active_mode(now)
     if expected is None:
         return False
@@ -859,6 +889,77 @@ def restart_pending() -> bool:
         return _restart_pending
 
 
+class ModeSwitchLockedError(RuntimeError):
+    """Raised when a fast<->cheap mode switch is attempted while the
+    mode-switch lock is engaged.
+
+    The lock is an investigation-time guard (LP-0MVCBMLP7009MN81): while it
+    is on, requests to CHANGE the operating mode are rejected with no state
+    mutation and no restart, so a slot-sweep / performance measurement cannot
+    be corrupted by an automatic or manual fast<->cheap switch mid-run. In
+    normal operation (lock off, the default) mode changes proceed exactly as
+    before.
+    """
+
+
+def set_mode_switch_lock(enabled: bool, reason: str = "") -> None:
+    """Engage (or release) the mode-switch lock at runtime.
+
+    Persists to ``proxy/.mode-switch-lock`` so the lock survives a proxy
+    restart (including the mode-switch restart a pre-lock change would have
+    armed). ``enabled=False`` removes the file, restoring normal operation.
+    The *reason* is recorded for diagnostics (e.g. "1/2/3 slot sweep").
+    """
+    path = mode_switch_lock_file()
+    if not enabled:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Failed to remove mode-switch-lock state file")
+        return
+    import json as _json
+
+    path.write_text(
+        _json.dumps({"enabled": True, "reason": reason, "since": datetime.now().isoformat()}),
+        encoding="utf-8",
+    )
+
+
+def mode_switch_lock_file() -> Path:
+    """Path to the runtime mode-switch lock state file."""
+    return proxy_dir() / ".mode-switch-lock"
+
+
+def mode_switch_locked() -> bool:
+    """Whether the mode-switch lock is engaged (runtime state or config).
+
+    The runtime state file written by ``set_mode_switch_lock`` is
+    authoritative; when absent, the ``server.mode_switch_lock`` config
+    section is consulted (default off), so a deployment can also pin the
+    lock in config. Returns True only when a lock is actually in effect.
+    """
+    import json as _json
+
+    try:
+        text = mode_switch_lock_file().read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        text = ""
+    if text:
+        try:
+            data = _json.loads(text)
+            if isinstance(data, dict) and data.get("enabled"):
+                return True
+        except ValueError:
+            logger.warning(
+                "Ignoring unparsable mode-switch-lock state %r", text[:80]
+            )
+        return False
+    cfg = _mode_switch_lock_config_section(_live_server_config())
+    return bool(cfg.get("enabled"))
+
+
 class ModeSwitchCooldownError(Exception):
     """Raised when a manual fast->cheap switch arrives inside the cooldown.
 
@@ -934,7 +1035,10 @@ def set_mode(
       restart (``proxy/scripts/start-proxy.sh --restart``) in the background.
 
     Raises ``RuntimeError`` when a mode-switch restart is already pending
-    and the requested mode differs (rejected to avoid restart loops), and
+    and the requested mode differs (rejected to avoid restart loops),
+    ``ModeSwitchLockedError`` when the mode-switch lock is engaged
+    (LP-0MVCBMLP7009MN81; checked before any mutation, so a rejected
+    request never arms a restart), and
     ``ModeSwitchCooldownError`` when a manual fast->cheap switch arrives
     inside ``MODE_SWITCH_COOLDOWN_SECONDS`` of the last real transition to
     ``fast`` (checked before any state mutation, so a rejected request never
@@ -943,6 +1047,15 @@ def set_mode(
     """
     global _restart_pending
     with _mode_lock:
+        if mode_switch_locked() and mode != read_mode():
+            # Investigation guard (LP-0MVCBMLP7009MN81): reject the switch
+            # BEFORE any state mutation so no .mode write, drain or restart
+            # is armed. A same-mode request stays a noop (matches the
+            # "requests to CHANGE mode are rejected" semantics).
+            raise ModeSwitchLockedError(
+                "mode switching is locked (performance investigation in "
+                f"progress); refusing switch to {mode!r}"
+            )
         if _restart_pending:
             if read_mode() == mode:
                 if manual:

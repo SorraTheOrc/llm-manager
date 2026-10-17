@@ -938,6 +938,12 @@ async def set_operating_mode(request: Request):
             },
             headers={"Retry-After": str(exc.retry_after_seconds)},
         )
+    except mode_module.ModeSwitchLockedError as exc:
+        # 423 Locked: a performance investigation has engaged the
+        # mode-switch lock (LP-0MVCBMLP7009MN81). No state was mutated and
+        # no restart was armed. Must precede the generic RuntimeError arm
+        # (ModeSwitchLockedError subclasses RuntimeError).
+        raise HTTPException(status_code=423, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -950,6 +956,61 @@ async def set_operating_mode(request: Request):
             if not restart
             else f"Switched to {persisted} mode; proxy restarting"
         ),
+    }
+
+
+@router.get("/admin/mode-switch-lock")
+async def get_mode_switch_lock():
+    """Return the current mode-switch lock state (LP-0MVCBMLP7009MN81).
+
+    Returns ``{"enabled": bool, "source": "runtime|config|off"}``. The
+    runtime lock (persisted state file) wins over the config default.
+    """
+    locked = mode_module.mode_switch_locked()
+    source = "off"
+    if locked:
+        import json as _json
+
+        text = ""
+        try:
+            text = mode_module.mode_switch_lock_file().read_text(
+                encoding="utf-8"
+            ).strip()
+        except (FileNotFoundError, OSError):
+            pass
+        if text:
+            try:
+                data = _json.loads(text)
+                if isinstance(data, dict) and data.get("enabled"):
+                    source = "runtime"
+            except ValueError:
+                pass
+        if source == "off":
+            source = "config"
+    return {"enabled": locked, "source": source}
+
+
+@router.post("/admin/mode-switch-lock")
+async def set_mode_switch_lock(request: Request):
+    """Engage or release the mode-switch lock (LP-0MVCBMLP7009MN81).
+
+    Accepts a JSON body ``{"enabled": bool, "reason": str?}``. While
+    enabled, ``POST /admin/set-mode`` and the mode scheduler reject any
+    fast<->cheap change (423 / stand down) so a performance investigation
+    cannot be corrupted mid-sweep. Normal operation is restored by posting
+    ``{"enabled": false}``. The state persists across proxy restarts.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    enabled = bool(body.get("enabled"))
+    reason = str(body.get("reason") or "")
+    mode_module.set_mode_switch_lock(enabled, reason=reason)
+    return {
+        "enabled": mode_module.mode_switch_locked(),
+        "source": "runtime" if enabled else "off",
     }
 
 

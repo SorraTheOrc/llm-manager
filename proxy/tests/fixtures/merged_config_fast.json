@@ -358,6 +358,9 @@
     "mode_switch_grandfathering": {
       "enabled": true
     },
+    "mode_switch_lock": {
+      "enabled": false
+    },
     "port": 8000,
     "provider_cooldown_seconds": 60,
     "remote_http_client": {

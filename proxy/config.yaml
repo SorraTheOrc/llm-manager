@@ -1038,6 +1038,26 @@ server:
     retry_after_margin_seconds: 15
 
   # -----------------------------------------------------------------------
+  # Mode-switch lock for performance investigations (LP-0MVCBMLP7009MN81)
+  # -----------------------------------------------------------------------
+  # A slot sweep or other performance investigation must not be corrupted
+  # by a fast<->cheap mode switch mid-run (the herdr mode-switch worker and
+  # the schedule can both flip modes, each triggering a proxy restart).
+  # When the lock is ON, every request that would CHANGE the mode is
+  # rejected (POST /admin/set-mode -> 423 Locked) and the mode scheduler
+  # stands down; the current mode is held. Normal operation is unaffected
+  # when the lock is OFF (the default).
+  #
+  # The lock is normally toggled at runtime WITHOUT a restart via
+  # POST /admin/mode-switch-lock {"enabled": true|false, "reason": "..."}
+  # (state persisted in proxy/.mode-switch-lock, so it survives the restart
+  # a pre-lock change would have armed). This config key sets the default
+  # for a fresh deployment; absent = OFF.
+  mode_switch_lock:
+    enabled: false
+    # reason: "1/2/3 slot sweep"   # optional, for diagnostics only
+
+  # -----------------------------------------------------------------------
   # Post-restart startup ramp (LP-0MU9ZXFQS0023DXT)
   # -----------------------------------------------------------------------
   # After a mode-switch restart, competing herdr/agent workers reconnect

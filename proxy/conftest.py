@@ -193,3 +193,25 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     terminalreporter.section("plan live e2e summary", sep="=")
     terminalreporter.write_line(summary_text)
 
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mode_switch_lock(tmp_path, monkeypatch):
+    """Isolate the mode-switch lock state between tests.
+
+    ``proxy.mode.mode_switch_locked()`` reads a runtime state file
+    (``proxy/.mode-switch-lock``) written by ``set_mode_switch_lock()`` /
+    ``POST /admin/mode-switch-lock`` (LP-0MVCBMLP7009MN81). An autouse
+    fixture in the API/mode test modules already redirects it for their own
+    tests, but a leftover/ambient lock file (e.g. engaged for a live sweep)
+    must not leak into unrelated tests: point the state file at a per-test
+    temp path so every test starts unlocked (normal operation).
+    """
+    import proxy.mode as mode_module
+
+    monkeypatch.setattr(
+        mode_module, "mode_switch_lock_file", lambda: tmp_path / ".mode-switch-lock"
+    )
+    # Default the config fallback off so a live config pin cannot leak either.
+    monkeypatch.setattr(mode_module, "_live_server_config", lambda: {})
+    yield
