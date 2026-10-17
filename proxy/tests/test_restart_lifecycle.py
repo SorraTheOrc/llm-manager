@@ -462,3 +462,91 @@ def test_start_proxy_help_documents_keep_llama_server():
     header = _script_path().read_text(encoding="utf-8").splitlines()[:12]
     joined = "\n".join(header)
     assert "--keep-llama-server" in joined
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# api_key_resolver (LP-0MVBJPQE50017BGL)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _auth_fixture(**keys) -> dict:
+    """Build an auth.json-style mapping from name -> key-value pairs."""
+    return {k: {"type": "api_key", "key": v} for k, v in keys.items()}
+
+
+def test_resolver_maps_hyphenated_stem():
+    """MUNITOAI_FREE_API_KEY must resolve the hyphenated auth.json stem
+    ``munitoai-free`` (blocker AC1/AC3: documented name has a hyphen while
+    the api_key_env stem is underscore-separated)."""
+    from proxy.api_key_resolver import resolve_from_auth_json
+
+    auth = _auth_fixture(**{"munitoai-free": "FREE_KEY", "munitoai": "PAID_KEY"})
+    assert resolve_from_auth_json(auth, "MUNITOAI_FREE_API_KEY") == "FREE_KEY"
+
+
+def test_resolver_underscore_stem_still_matches():
+    """A plain underscore stem (e.g. ``opencode_2``) keeps resolving."""
+    from proxy.api_key_resolver import resolve_from_auth_json
+
+    auth = _auth_fixture(opencode_2="O2", opencode="O")
+    assert resolve_from_auth_json(auth, "OPENCODE_2_API_KEY") == "O2"
+
+
+def test_resolver_prefers_opencode_go():
+    """OPENCODE_API_KEY preference order is opencode-go then opencode."""
+    from proxy.api_key_resolver import resolve_from_auth_json
+
+    both = _auth_fixture(**{"opencode-go": "GO", "opencode": "BASE"})
+    assert resolve_from_auth_json(both, "OPENCODE_API_KEY") == "GO"
+    only_base = _auth_fixture(opencode="BASE")
+    assert resolve_from_auth_json(only_base, "OPENCODE_API_KEY") == "BASE"
+
+
+def test_resolver_missing_key_returns_none():
+    from proxy.api_key_resolver import resolve_from_auth_json
+
+    auth = _auth_fixture(munitoai="PAID")
+    assert resolve_from_auth_json(auth, "SOME_UNKNOWN_KEY") is None
+
+
+def test_resolver_cli_roundtrip(tmp_path):
+    """CLI prints the key for a resolvable env var and exits 0/1."""
+    import subprocess
+    import sys
+
+    from proxy.api_key_resolver import main
+
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(json.dumps(_auth_fixture(**{"munitoai-free": "FREE_KEY"})))
+
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = main([str(auth_file), "MUNITOAI_FREE_API_KEY"])
+    assert rc == 0
+    assert out.getvalue().strip() == "FREE_KEY"
+
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = main([str(auth_file), "MISSING_ENV_KEY"])
+    assert rc == 1
+    assert "could not be resolved" in err.getvalue()
+
+
+def test_resolver_failure_message_names_candidate_keys():
+    """An unresolved key must name the auth.json key(s) that would have
+    satisfied it (LP-0MVBJXZY5002UW10 AC: self-diagnosing mismatch)."""
+    from proxy.api_key_resolver import _candidate_key_names
+
+    assert _candidate_key_names("MUNITOAI_FREE_API_KEY") == [
+        "munitoai_free_api_key",
+        "munitoai_free",
+        "munitoai-free",
+    ]
+    assert _candidate_key_names("OPENCODE_API_KEY") == [
+        "opencode_api_key",
+        "opencode-go",
+        "opencode",
+    ]

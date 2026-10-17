@@ -368,43 +368,29 @@ for k in sorted(keys):
 }
 
 # Map api_key_env name to auth.json key.
-# Prefers opencode-go over opencode when resolving OPENCODE_API_KEY.
+# Prefers opencode-go over opencode when resolving OPENCODE_API_KEY, and
+# falls back to the hyphenated stem (e.g. ``munitoai-free`` for
+# ``MUNITOAI_FREE_API_KEY``) so documented auth.json names resolve on a
+# fresh start (LP-0MVBJPQE50017BGL). Logic lives in proxy/proxy/api_key_resolver.py.
 resolve_from_auth_json() {
   local env_var="$1"
 
-  $PY_BIN -c "
-import json, sys
+  "$PY_BIN" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/proxy')
+from api_key_resolver import load_auth, resolve_from_auth_json
 
-key_name = '$env_var'
+import json
 
 try:
-    with open('$AUTH_FILE') as f:
-        auth = json.load(f)
+    auth = load_auth('$AUTH_FILE')
 except (FileNotFoundError, json.JSONDecodeError):
     sys.exit(1)
 
-# Lowercase key for lookup
-key = key_name.lower()
-
-# Prefer opencode-go over opencode for OPENCODE_API_KEY
-if key == 'opencode_api_key':
-    for preferred in ('opencode-go', 'opencode'):
-        if preferred in auth and auth[preferred].get('type') == 'api_key':
-            print(auth[preferred]['key'])
-            sys.exit(0)
-
-# Exact lowercase match
-if key in auth and auth[key].get('type') == 'api_key':
-    print(auth[key]['key'])
+resolved = resolve_from_auth_json(auth, '$env_var')
+if resolved:
+    print(resolved)
     sys.exit(0)
-
-# Strip _API_KEY suffix
-if key.endswith('_api_key'):
-    stem = key[:-8]
-    if stem in auth and auth[stem].get('type') == 'api_key':
-        print(auth[stem]['key'])
-        sys.exit(0)
-
 sys.exit(1)
 "
 }

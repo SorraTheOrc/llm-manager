@@ -251,11 +251,11 @@ models:
         llama_model: Qwen3
       # MunitoAI Free (LP-0MV5UPXKL002MSKB): free-tier remote fallback, sits
       # immediately after local. Uses a separate key resolved from
-      # ~/.pi/agent/auth.json under ``munitoai_free`` (underscore — the
-      # resolver strips _API_KEY from MUNITOAI_FREE_API_KEY to derive it;
-      # the hyphenated ``munitoai-free`` name is tracked in
-      # LP-0MVBJXZY5002UW10). No ``available_times`` window — eligible
-      # around the clock.
+      # ~/.pi/agent/auth.json under either ``munitoai_free`` or the
+      # documented hyphenated ``munitoai-free`` — the resolver strips
+      # _API_KEY from MUNITOAI_FREE_API_KEY and tries both the underscore
+      # and hyphenated stems (LP-0MVBJXZY5002UW10). No ``available_times``
+      # window — eligible around the clock.
       - name: munitoai-free
         type: remote
         provider: MunitoAI
