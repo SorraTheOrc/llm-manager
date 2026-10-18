@@ -107,8 +107,10 @@ session already on the free tier keeps its provider, while a batch of new
 agent sessions passes straight through instead of queueing behind an exhausted
 allowance.
 
-`munitoai-free` ships with `rate_limit_rpm: 15` in `config.yaml` (and the fast
-overlay); tune the value from the `remaining=` field in the skip logs.
+`munitoai-free` ships with `rate_limit_rpm: 15` in `config.yaml` (the former
+fast/cheap overlay files were removed with priority-based routing,
+LP-0MVDT94F0003VHUA); tune the value from the `remaining=` field in the skip
+logs.
 
 **Value history (LP-0MVDVJYN5001BMG4):** raised from 10 to 15 on 2026-10-18
 following the measured budget evaluation. Pre-gate proxy-log evidence showed
