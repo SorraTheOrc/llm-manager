@@ -42,20 +42,22 @@ def test_parse_timestamp_accepts_proxy_line():
 
 
 def test_parse_event_classifies_every_marker():
-    assert parse_event(T + "Starting LLama Proxy Server") == ("start", None)
+    assert parse_event(T + "Starting LLama Proxy Server") == ("start", None, None)
     assert parse_event(T + "Mode-switch restart spawned: /x/start-proxy.sh --restart") == (
         "spawn",
+        None,
         None,
     )
     assert parse_event(T + "Mode scheduler: applied scheduled mode fast") == (
         "sched",
         "fast",
+        None,
     )
     assert (
         parse_event(
             T + "Grandfathering: enabled; other-mode config config-fast.yaml (current=cheap)"
         )
-        == ("mode", "cheap")
+        == ("mode", "cheap", None)
     )
     # The frequent pruning lines must not be misclassified as startup mode.
     assert parse_event(T + "Grandfathering: pruned 1 expired binding(s)") is None
@@ -84,10 +86,10 @@ def test_collect_events_sorts_chronologically(tmp_path):
 
 def test_build_restarts_attaches_startup_mode_within_window():
     events = [
-        (datetime(2026, 10, 14, 12, 50, 0), "start", None),
-        (datetime(2026, 10, 14, 12, 50, 1), "mode", "fast"),  # 1 s later -> attached
-        (datetime(2026, 10, 14, 14, 0, 0), "start", None),
-        (datetime(2026, 10, 14, 14, 0, 40), "mode", "cheap"),  # 40 s later -> NOT attached
+        (datetime(2026, 10, 14, 12, 50, 0), "start", None, None),
+        (datetime(2026, 10, 14, 12, 50, 1), "mode", "fast", None),  # 1 s later -> attached
+        (datetime(2026, 10, 14, 14, 0, 0), "start", None, None),
+        (datetime(2026, 10, 14, 14, 0, 40), "mode", "cheap", None),  # 40 s later -> NOT attached
     ]
     restarts = build_restarts(events)
     assert restarts[0]["mode"] == "fast"
@@ -107,10 +109,10 @@ def test_attach_schedule_markers_one_to_one_nearest():
 
 def test_compute_flips_only_on_mode_change():
     restarts = [
-        {"ts": datetime(2026, 10, 14, 10, 0), "mode": "fast", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 10, 30), "mode": "fast", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 11, 0), "mode": "cheap", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 11, 2), "mode": "fast", "sched_marker": None},
+        {"ts": datetime(2026, 10, 14, 10, 0), "mode": "fast", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 10, 30), "mode": "fast", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 11, 0), "mode": "cheap", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 11, 2), "mode": "fast", "sched_marker": None, "source": None},
     ]
     flips = compute_flips(restarts)
     assert len(flips) == 2
@@ -126,11 +128,11 @@ def test_classify_trigger_schedule_vs_direction():
 
 def test_summarise_per_day_trigger_totals_and_window():
     restarts = [
-        {"ts": datetime(2026, 10, 14, 9, 0), "mode": "cheap", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 10, 0), "mode": "fast", "sched_marker": "fast"},
-        {"ts": datetime(2026, 10, 14, 10, 35), "mode": "cheap", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 10, 36), "mode": "fast", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 12, 0), "mode": "cheap", "sched_marker": None},
+        {"ts": datetime(2026, 10, 14, 9, 0), "mode": "cheap", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 10, 0), "mode": "fast", "sched_marker": "fast", "source": None},
+        {"ts": datetime(2026, 10, 14, 10, 35), "mode": "cheap", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 10, 36), "mode": "fast", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 12, 0), "mode": "cheap", "sched_marker": None, "source": None},
     ]
     flips = compute_flips(restarts)
     summary = summarise(restarts, flips)
@@ -141,9 +143,9 @@ def test_summarise_per_day_trigger_totals_and_window():
 
 def test_summarise_studied_window_restricts_counts():
     restarts = [
-        {"ts": datetime(2026, 10, 14, 13, 0), "mode": "cheap", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 14, 30), "mode": "fast", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 15, 0), "mode": "cheap", "sched_marker": None},
+        {"ts": datetime(2026, 10, 14, 13, 0), "mode": "cheap", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 14, 30), "mode": "fast", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 15, 0), "mode": "cheap", "sched_marker": None, "source": None},
     ]
     flips = compute_flips(restarts)
     summary = summarise(
@@ -165,17 +167,127 @@ def test_summarise_counts_cooldown_boundary_and_wasted_dwells():
     # A cheap->fast flip, then 29.5 min later a fast->cheap flip (boundary
     # band), and a sub-5-min cheap dwell right after.
     restarts = [
-        {"ts": datetime(2026, 10, 14, 9, 30), "mode": "cheap", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 10, 0), "mode": "fast", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 10, 29, 30), "mode": "cheap", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 10, 30, 0), "mode": "fast", "sched_marker": None},
-        {"ts": datetime(2026, 10, 14, 11, 30), "mode": "cheap", "sched_marker": None},
+        {"ts": datetime(2026, 10, 14, 9, 30), "mode": "cheap", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 10, 0), "mode": "fast", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 10, 29, 30), "mode": "cheap", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 10, 30, 0), "mode": "fast", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 11, 30), "mode": "cheap", "sched_marker": None, "source": None},
     ]
     flips = compute_flips(restarts)
     summary = summarise(restarts, flips)
     assert summary["cooldown_breaches"] == []  # 29.5 min is not a breach
     assert summary["cooldown_boundary_hits"] == 1
     assert summary["cheap_dwells"]["wasted_under_5m"] == 1  # 30 s dwell
+
+
+def test_classify_trigger_source_scheduler():
+    """source=scheduler always maps to schedule regardless of direction."""
+    assert classify_trigger({"to": "fast", "source": "scheduler"}) == "schedule"
+    assert classify_trigger({"to": "cheap", "source": "scheduler"}) == "schedule"
+
+
+def test_classify_trigger_source_worker():
+    """source=worker maps to to-fast/to-cheap by direction."""
+    assert classify_trigger({"to": "fast", "source": "worker"}) == "to-fast"
+    assert classify_trigger({"to": "cheap", "source": "worker"}) == "to-cheap"
+
+
+def test_classify_trigger_source_api():
+    """source=api maps to to-fast/to-cheap by direction."""
+    assert classify_trigger({"to": "fast", "source": "api"}) == "to-fast"
+    assert classify_trigger({"to": "cheap", "source": "api"}) == "to-cheap"
+
+
+def test_classify_trigger_source_manual():
+    """source=manual maps to to-fast/to-cheap by direction."""
+    assert classify_trigger({"to": "fast", "source": "manual"}) == "to-fast"
+    assert classify_trigger({"to": "cheap", "source": "manual"}) == "to-cheap"
+
+
+def test_classify_trigger_source_absent_falls_back_to_heuristic():
+    """When source is absent, fall back to direction-based heuristic."""
+    assert classify_trigger({"to": "fast", "source": None}) == "to-fast"
+    assert classify_trigger({"to": "cheap", "source": None}) == "to-cheap"
+    assert classify_trigger({"to": "fast", "source": None, "sched_marker": "fast"}) == "schedule"
+
+
+def test_classify_trigger_source_overrides_heuristic():
+    """Source attribution takes precedence over sched_marker heuristic."""
+    # source=worker should classify as to-fast even when sched_marker would say schedule
+    assert classify_trigger({"to": "fast", "source": "worker", "sched_marker": "fast"}) == "to-fast"
+    # source=api should classify as to-cheap even when sched_marker would say schedule
+    assert classify_trigger({"to": "cheap", "source": "api", "sched_marker": "fast"}) == "to-cheap"
+
+
+def test_build_restarts_captures_source_from_mode_event():
+    """Source attribution on the mode event flows into the restart record."""
+    events = [
+        (datetime(2026, 10, 14, 12, 50, 0), "start", None, None),
+        (datetime(2026, 10, 14, 12, 50, 1), "mode", "fast", "worker"),
+        (datetime(2026, 10, 14, 14, 0, 0), "start", None, None),
+        (datetime(2026, 10, 14, 14, 0, 1), "mode", "cheap", "scheduler"),
+    ]
+    restarts = build_restarts(events)
+    assert restarts[0]["source"] == "worker"
+    assert restarts[1]["source"] == "scheduler"
+
+
+def test_parse_event_extracts_source_marker():
+    """parse_event returns source= value when present on spawn/sched/mode lines."""
+    # Spawn with source
+    result = parse_event(
+        T + 'Mode-switch restart spawned: /x/start-proxy.sh --restart source=worker actor=mode-switch-worker'
+    )
+    assert result is not None
+    assert result[0] == "spawn"
+    assert result[2] == "worker"
+
+    # Sched with source
+    result = parse_event(T + "Mode scheduler: applied scheduled mode fast source=scheduler actor=mode-scheduler")
+    assert result is not None
+    assert result[0] == "sched"
+    assert result[1] == "fast"
+    assert result[2] == "scheduler"
+
+    # Mode with source
+    result = parse_event(
+        T + "Grandfathering: enabled; other-mode config config-fast.yaml (current=cheap) source=worker actor=mode-switch-worker reason=idle"
+    )
+    assert result is not None
+    assert result[0] == "mode"
+    assert result[1] == "cheap"
+    assert result[2] == "worker"
+
+    # No source marker -> None
+    result = parse_event(T + "Mode-switch restart spawned: /x/start-proxy.sh --restart")
+    assert result is not None
+    assert result[2] is None
+
+
+def test_attach_schedule_markers_sets_source_scheduler():
+    """When a schedule marker's mode is 'scheduler', set source=scheduler on the restart."""
+    restarts = [
+        {"ts": datetime(2026, 10, 14, 10, 0, 30), "mode": "fast", "sched_marker": None, "source": None},
+        {"ts": datetime(2026, 10, 14, 10, 30, 0), "mode": "cheap", "sched_marker": None, "source": "worker"},
+    ]
+    scheds = [(datetime(2026, 10, 14, 10, 0, 25), "scheduler")]
+    attach_schedule_markers(restarts, scheds)
+    assert restarts[0]["sched_marker"] == "scheduler"
+    assert restarts[0]["source"] == "scheduler"
+    # The second restart already has source=worker, should NOT be overwritten
+    assert restarts[1]["source"] == "worker"
+
+
+def test_compute_flips_includes_source():
+    """Flips carry the source field from the *current* (target) restart."""
+    restarts = [
+        {"ts": datetime(2026, 10, 14, 10, 0), "mode": "fast", "sched_marker": None, "source": "worker"},
+        {"ts": datetime(2026, 10, 14, 10, 30), "mode": "cheap", "sched_marker": None, "source": "scheduler"},
+    ]
+    flips = compute_flips(restarts)
+    assert len(flips) == 1
+    # source comes from the current (target) restart, not the previous one
+    assert flips[0]["source"] == "scheduler"
 
 
 def test_kind_priority_orders_spawn_before_start_before_mode():

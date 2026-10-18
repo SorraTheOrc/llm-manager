@@ -63,6 +63,9 @@ _SCHED_RE = re.compile(r"Mode scheduler: applied scheduled mode (\w+)")
 _MODE_RE = re.compile(
     r"other-mode config config-(\w+)\.yaml \(current=(\w+)\)"
 )
+#: Attribution marker ``source=<value>`` appended to scheduler / grandfathering /
+#: restart-spawned lines (LP-0MVC1450O000LJHV).  Values are lower-case tokens.
+_RE_ATTRIBUTION_SOURCE = re.compile(r"\bsource=([a-z0-9_]+)")
 
 #: A startup mode line follows its start marker within this many seconds.
 MODE_ATTACH_WINDOW_SECONDS = 30
@@ -87,32 +90,41 @@ def parse_timestamp(line: str) -> datetime | None:
     return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
 
 
-def parse_event(line: str) -> tuple[str, object] | None:
-    """Classify a log line into ``(kind, payload)`` or None.
+def parse_event(line: str) -> tuple[str, object, str | None] | None:
+    """Classify a log line into ``(kind, payload, source)`` or None.
 
     Kinds: ``start`` (process start), ``spawn`` (mode-switch restart spawned),
     ``sched`` (scheduler applied a scheduled mode -> payload is the mode),
     ``mode`` (startup active mode -> payload is the current mode).
+
+    *source* is the attribution marker (``scheduler`` / ``worker`` / ``api`` /
+    ``manual``) when present on the line, else ``None``.
     """
     if _START_RE.search(line):
-        return "start", None
+        return "start", None, None
     if _SPAWN_RE.search(line):
-        return "spawn", None
+        src = _RE_ATTRIBUTION_SOURCE.search(line)
+        return "spawn", None, src.group(1) if src else None
     if m := _SCHED_RE.search(line):
-        return "sched", m.group(1)
+        src = _RE_ATTRIBUTION_SOURCE.search(line)
+        return "sched", m.group(1), src.group(1) if src else None
     if m := _MODE_RE.search(line):
-        return "mode", m.group(2)
+        src = _RE_ATTRIBUTION_SOURCE.search(line)
+        return "mode", m.group(2), src.group(1) if src else None
     return None
 
 
-def collect_events(log_dir: Path) -> list[tuple[datetime, str, object]]:
+def collect_events(log_dir: Path) -> list[tuple[datetime, str, object, str | None]]:
     """Parse every event from the proxy logs under *log_dir*, time-sorted.
 
     Uses the shared ``lib.proxy_logs`` discovery/opening helper so both
     rotation schemes (``proxy.log.*`` / ``proxy.log-*``) and gzip compression
     are handled. Untimestamped or non-matching lines are skipped.
+
+    Returns ``(ts, kind, payload, source)`` tuples; *source* is the
+    attribution marker when present, else ``None``.
     """
-    events: list[tuple[datetime, str, object]] = []
+    events: list[tuple[datetime, str, object, str | None]] = []
     for _path, line in iter_proxy_log_lines(log_dir):
         ts = parse_timestamp(line)
         if ts is None:
@@ -120,31 +132,34 @@ def collect_events(log_dir: Path) -> list[tuple[datetime, str, object]]:
         parsed = parse_event(line)
         if parsed is None:
             continue
-        kind, payload = parsed
-        events.append((ts, kind, payload))
+        kind, payload, source = parsed
+        events.append((ts, kind, payload, source))
     events.sort(key=lambda e: (e[0], KIND_PRIORITY[e[1]]))
     return events
 
 
 def build_restarts(
-    events: list[tuple[datetime, str, object]],
+    events: list[tuple[datetime, str, object, str | None]],
 ) -> list[dict]:
-    """Group events into restart records ``{ts, mode, sched_marker}``.
+    """Group events into restart records ``{ts, mode, sched_marker, source}``.
 
     A ``start`` event opens a record; the first ``mode`` event within
     ``MODE_ATTACH_WINDOW_SECONDS`` fills its ``mode``. Records without a mode
-    (window-boundary truncation) keep ``mode=None``.
+    (window-boundary truncation) keep ``mode=None``. The *source* attribution
+    (``scheduler`` / ``worker`` / ``api`` / ``manual``) is carried through from
+    the ``mode`` event when present (LP-0MVC1450O000LJHV).
     """
     restarts: list[dict] = []
-    for ts, kind, payload in events:
+    for ts, kind, payload, source in events:
         if kind == "start":
-            restarts.append({"ts": ts, "mode": None, "sched_marker": None})
+            restarts.append({"ts": ts, "mode": None, "sched_marker": None, "source": None})
         elif kind == "mode" and restarts:
             rec = restarts[-1]
             if rec["mode"] is None and (ts - rec["ts"]).total_seconds() <= (
                 MODE_ATTACH_WINDOW_SECONDS
             ):
                 rec["mode"] = payload
+                rec["source"] = source
     return restarts
 
 
@@ -175,6 +190,10 @@ def attach_schedule_markers(
         if best_idx is not None:
             used.add(best_idx)
             rec["sched_marker"] = scheds[best_idx][1]
+            # When the schedule marker itself carries source=scheduler, also
+            # record it on the restart for classify_trigger().
+            if rec.get("source") is None and scheds[best_idx][1] == "scheduler":
+                rec["source"] = "scheduler"
 
 
 def compute_flips(restarts: list[dict]) -> list[dict]:
@@ -189,13 +208,31 @@ def compute_flips(restarts: list[dict]) -> list[dict]:
                     "prev_from": prev["mode"],
                     "to": cur["mode"],
                     "sched_marker": cur.get("sched_marker"),
+                    "source": cur.get("source"),
                 }
             )
     return flips
 
 
 def classify_trigger(flip: dict) -> str:
-    """Return ``schedule`` / ``to-fast`` / ``to-cheap`` for a flip."""
+    """Classify a flip using deterministic attribution when available.
+
+    Uses the ``source`` field (LP-0MVC1450O000LJHV) when present:
+
+    - ``source=scheduler`` → ``schedule``
+    - ``source=worker`` → ``to-cheap`` when flipping to cheap, ``to-fast`` otherwise
+    - ``source=api`` → ``to-fast`` when flipping to fast, ``to-cheap`` otherwise
+    - ``source=manual`` → ``to-fast`` when flipping to fast, ``to-cheap`` otherwise
+
+    Falls back to the existing heuristic (sched_marker / direction-based) when
+    no attribution is available.
+    """
+    source = flip.get("source")
+    if source == "scheduler":
+        return "schedule"
+    if source in ("worker", "api", "manual"):
+        return "to-fast" if flip["to"] == "fast" else "to-cheap"
+    # Heuristic fallback: sched_marker or direction-based classification.
     if flip.get("sched_marker"):
         return "schedule"
     return "to-fast" if flip["to"] == "fast" else "to-cheap"
