@@ -1107,6 +1107,33 @@ the old "just restart" behavior. A second switch while a restart is pending
 is a noop if the mode matches, otherwise rejected with `409` (avoids
 restart loops).
 
+#### Restart attribution
+
+Every restart is attributable from the logs alone
+(LP-0MVAPNC2900145RH): the `Mode-switch restart spawned: … --restart`
+line carries `source=… actor=… mode=… reason=…` markers captured at
+`set_mode()` time, and `start-proxy.sh --restart` echoes its reason into
+the new process's startup log just before the `Starting LLama Proxy
+Server` marker (`Proxy restart attribution: source=… actor=… reason=…`).
+
+- **`/admin/set-mode`** accepts optional body fields `source`
+  (`scheduler|worker|api|manual`; absent/unknown → `api`), `actor` and
+  `reason` so the web UI, the ContextHub mode-switch worker and operator
+  scripts can self-identify.
+- **`start-proxy.sh --restart --reason "<text>"`** records the reason;
+  precedence is `--reason` flag > `LLAMA_PROXY_RESTART_REASON` env var >
+  the default of `manual (no reason provided)`.
+- The **scheduler** attributes its own transitions as
+  `source=scheduler actor=mode-scheduler` (`Mode scheduler: applied
+  scheduled mode … source=scheduler actor=mode-scheduler`).
+
+A reproducible grep that attributes every marker-carrying restart:
+
+```bash
+zgrep -h "Mode-switch restart spawned:.* source=" proxy.log* | wc -l
+# every Mode-switch line carries a source= marker on the new logging path
+```
+
 #### Fast → cheap cooldown
 
 Because every switch is a **full proxy restart** that kills in-flight

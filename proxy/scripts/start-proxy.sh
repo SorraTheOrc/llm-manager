@@ -2,10 +2,13 @@
 set -euo pipefail
 
 # Start the proxy application
-# Usage: ./scripts/start-proxy.sh [--restart] [--verbose] [uvicorn-args...]
+# Usage: ./scripts/start-proxy.sh [--restart] [--reason "<text>"] [--verbose] [uvicorn-args...]
 #
 # Flags:
 #   --restart   Kill all running proxy/llama-server/TTS processes before starting
+#   --reason    Restart reason echoed into the new process's startup log
+#               (LP-0MVAPNC2900145RH; flag > LLAMA_PROXY_RESTART_REASON >
+#               `manual (no reason provided)`).
 #   --keep-llama-server
 #               Proxy-only restart: preserve the co-located llama-server so its
 #               warm KV / prompt cache survives (LP-0MUCEFCL6001ZXYN). With
@@ -61,10 +64,15 @@ PORT="${PROXY_PORT:-${PORT:-8000}}"
 RESTART=0
 VERBOSE=0
 KEEP_LLAMA_SERVER=0
+RESTART_REASON=""
 UVICORN_ARGS=()
 prev=""
 for arg in "$@"; do
-  if [ "$prev" = "--port" ] || [ "$prev" = "-p" ]; then
+  if [ "$prev" = "--reason" ]; then
+    # --reason <text>: consumed here, never forwarded to uvicorn
+    RESTART_REASON="$arg"
+    prev=""
+  elif [ "$prev" = "--port" ] || [ "$prev" = "-p" ]; then
     PORT="$arg"
     UVICORN_ARGS+=("--port" "$arg")
     prev=""
@@ -82,6 +90,12 @@ for arg in "$@"; do
         ;;
       --restart)
         RESTART=1
+        ;;
+      --reason)
+        prev="--reason"
+        ;;
+      --reason=*)
+        RESTART_REASON="${arg#*=}"
         ;;
       --keep-llama-server)
         # LP-0MUCEFCL6001ZXYN: proxy-only restart — preserve the co-located
@@ -159,7 +173,14 @@ _wait_for_port_release() {
 
 # --restart: kill all running proxy-related processes before starting
 if [ "$RESTART" -eq 1 ]; then
+  # LP-0MVAPNC2900145RH: resolve the restart reason (--reason flag beats
+  # LLAMA_PROXY_RESTART_REASON env, which beats the default) and export it so
+  # the new server process can echo it into its startup log right before the
+  # `Starting LLama Proxy Server` marker.
+  RESTART_REASON="${RESTART_REASON:-${LLAMA_PROXY_RESTART_REASON:-manual (no reason provided)}}"
+  export LLAMA_PROXY_RESTART_REASON="$RESTART_REASON"
   echo "Restart requested: stopping running proxy services..."
+  echo "Restart reason: $RESTART_REASON"
 
   # LP-0MUCEFCL6001ZXYN: decide whether to preserve the co-located
   # llama-server. A proxy-only restart (unchanged local backend config) must

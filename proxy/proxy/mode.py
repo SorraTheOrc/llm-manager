@@ -652,11 +652,20 @@ def _mode_scheduler_step(
         # change; stand down instead of reverting it.
         return False
     try:
-        set_mode(expected, bypass_cooldown=True)
+        set_mode(
+            expected,
+            bypass_cooldown=True,
+            source="scheduler",
+            actor="mode-scheduler",
+            reason="scheduled mode change",
+        )
     except RuntimeError:
         logger.debug("Mode scheduler: restart pending, retrying next cycle")
         return False
-    logger.info("Mode scheduler: applied scheduled mode %s", expected)
+    logger.info(
+        "Mode scheduler: applied scheduled mode %s source=scheduler actor=mode-scheduler",
+        expected,
+    )
     return True
 
 
@@ -695,6 +704,15 @@ def start_mode_scheduler(
 # (avoids restart loops).
 _mode_lock = threading.Lock()
 _restart_pending = False
+
+# Attribution captured at set_mode() time for the forthcoming restart
+# (LP-0MVAPNC2900145RH): ``(source, actor, reason, requested_mode)``. The
+# spawn thread reads it to mark the ``Mode-switch restart spawned`` line and
+# to pass the reason through to ``start-proxy.sh --restart`` (argv/env), so
+# every restart is attributable from the logs alone.
+_restart_attribution: tuple[
+    str | None, str | None, str | None, str
+] = (None, None, None, MODE_FAST)
 
 
 def proxy_dir() -> Path:
@@ -1017,6 +1035,10 @@ def set_mode(
     manual: bool = False,
     schedule: ModeScheduleConfig | None = None,
     bypass_cooldown: bool = False,
+    *,
+    source: str | None = None,
+    actor: str | None = None,
+    reason: str | None = None,
 ) -> tuple[str, bool]:
     """Persist *mode* and arm a background restart when it changes.
 
@@ -1026,6 +1048,13 @@ def set_mode(
     time change instead of reverting it on the next tick
     (LP-0MSMF25V9002AY1J). A non-manual call (the scheduler enforcing the
     schedule) persists the mode and clears any pending override.
+
+    Attribution (LP-0MVAPNC2900145RH): callers identify themselves with
+    the optional keyword-only ``source``/``actor``/``reason`` kwargs so the
+    spawned restart is attributable. ``source`` selects the restart class:
+    ``scheduler`` (schedule enforcement), ``worker`` (ContextHub mode-switch
+    worker), ``api`` (web UI / direct API call), or ``manual`` (operator).
+    Defaults remain unattributed (None) for backward compatibility.
 
     Returns ``(persisted_mode, restart_triggered)``:
 
@@ -1046,7 +1075,7 @@ def set_mode(
     arms a restart). ``bypass_cooldown`` skips that gate (used by the
     scheduler, which must always apply the configured schedule).
     """
-    global _restart_pending
+    global _restart_pending, _restart_attribution
     with _mode_lock:
         if mode_switch_locked() and mode != read_mode():
             # Investigation guard (LP-0MVCBMLP7009MN81): reject the switch
@@ -1081,6 +1110,7 @@ def set_mode(
         else:
             write_override_until(None)
         _restart_pending = True
+        _restart_attribution = (source, actor, reason, mode)
         # AC2 bounded drain: arm it synchronously so new chat requests are
         # deferred from the moment the restart is triggered (LP-0MT631JKW008WAKE).
         _begin_drain()
@@ -1130,14 +1160,44 @@ def _spawn_restart() -> None:
                 logger.exception("Mode-switch drain wait failed; restarting anyway")
                 _end_drain()
             script = proxy_dir() / "scripts" / "start-proxy.sh"
+            # LP-0MVAPNC2900145RH: the attribution captured at set_mode() time
+            # marks this restart. ``--reason`` argv (start-proxy.sh flag wins
+            # over the env var) plus caller-sourced env vars survive into the
+            # new process so its startup log can echo the reason.
+            source, actor, reason, requested_mode = _restart_attribution
+            cmd = ["bash", str(script), "--restart"]
+            env = dict(os.environ)
+            if reason:
+                cmd += ["--reason", reason]
+                env["LLAMA_PROXY_RESTART_REASON"] = reason
+            if source:
+                env["LLAMA_PROXY_RESTART_SOURCE"] = source
+            if actor:
+                env["LLAMA_PROXY_RESTART_ACTOR"] = actor
             subprocess.Popen(
-                ["bash", str(script), "--restart"],
+                cmd,
                 cwd=str(proxy_dir()),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=env,
             )
-            logger.info("Mode-switch restart spawned: %s --restart", script)
+            if source or actor or reason:
+                markers = " ".join(
+                    part
+                    for part in (
+                        f"source={source}" if source else None,
+                        f"actor={actor}" if actor else None,
+                        f"mode={requested_mode}" if requested_mode else None,
+                        f"reason={reason}" if reason else None,
+                    )
+                    if part
+                )
+                logger.info(
+                    "Mode-switch restart spawned: %s --restart %s", script, markers
+                )
+            else:
+                logger.info("Mode-switch restart spawned: %s --restart", script)
         except Exception:
             logger.exception("Failed to spawn mode-switch restart")
 

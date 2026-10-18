@@ -56,13 +56,14 @@ Trigger attribution (`scripts/analyze_mode_flips.py`):
 - **to-cheap** — any other flip INTO cheap: the worker's leader-only idle POST,
   or a manual switch.
 
-> **Attribution limit.** The proxy does **not** log the `/admin/set-mode`
-> caller, so *worker vs manual* is not separable from the proxy log alone. The
-> worker dominates because (a) the fast-on-command path fires on **every**
-> agent-route command, (b) the inter-flip gap distribution is exactly the
-> worker's idle(15 min)+cooldown(30 min) signature, and (c) any *manual* switch
-> would be a rare operator action, far rarer than ~23/day. Logging the caller is
-> tracked by LP-0MVAPNC2900145RH.
+> **Attribution (since LP-0MVAPNC2900145RH).** The proxy now logs the
+> `/admin/set-mode` caller: every `Mode-switch restart spawned` line carries
+> `source=scheduler|worker|api|manual`, `actor`, requested `mode` and an
+> optional `reason`, and `start-proxy.sh --restart` echoes its reason into
+> the new process's startup log. Worker-vs-manual is therefore separable
+> from the proxy log alone on the new logging path, and the mode-flip
+> classifier (`analyze_mode_flips.py`) can drop its heuristic fallback for
+> marker-carrying lines.
 
 The classifier uses the shared `scripts/lib/proxy_logs.py` helper, so both
 rotation schemes (`proxy.log.*` and `proxy.log-*`, plain and `.gz`) are read.

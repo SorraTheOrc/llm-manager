@@ -893,7 +893,12 @@ async def set_operating_mode(request: Request):
     """Switch the proxy between fast and cheap operating modes.
 
     Accepts a JSON body with a ``mode`` parameter (``"fast"`` or
-    ``"cheap"``). Requesting the mode that is already active returns
+    ``"cheap"``) and optional attribution fields ``source``
+    (``scheduler|worker|api|manual``), ``actor`` and ``reason`` so callers
+    (web UI/API, ContextHub mode-switch worker, operator scripts) can
+    self-identify and the spawned restart is attributable in the logs
+    (LP-0MVAPNC2900145RH). An absent or unknown ``source`` defaults to
+    ``api``. Requesting the mode that is already active returns
     success with **no restart** (noop). Requesting a different mode
     persists the new mode and triggers a **full proxy restart**
     (``scripts/start-proxy.sh --restart``) in the background — the
@@ -918,13 +923,28 @@ async def set_operating_mode(request: Request):
     if mode not in mode_module.VALID_MODES:
         raise HTTPException(status_code=400, detail="mode must be 'fast' or 'cheap'")
 
+    # LP-0MVAPNC2900145RH: optional caller identity. A missing/unknown
+    # source defaults to api so the restart attribution stays classifiable.
+    source = (body.get("source") or "api").strip().lower() or "api"
+    if source not in ("scheduler", "worker", "api", "manual"):
+        source = "api"
+    actor = (body.get("actor") or "").strip() or None
+    reason = (body.get("reason") or "").strip() or None
+
     try:
         # A manual switch is respected until the next scheduled mode change
         # (LP-0MSMF25V9002AY1J): derive the schedule from the standalone
         # mode_schedule.yaml so set_mode can persist the override expiry
         # alongside the mode.
         schedule = mode_module.ModeScheduleConfig.from_file()
-        persisted, restart = mode_module.set_mode(mode, manual=True, schedule=schedule)
+        persisted, restart = mode_module.set_mode(
+            mode,
+            manual=True,
+            schedule=schedule,
+            source=source,
+            actor=actor,
+            reason=reason,
+        )
     except mode_module.ModeSwitchCooldownError as exc:
         # 429 Too Many Requests is the only status for which Retry-After is
         # defined; the body repeats the hint machine-readably so the caller

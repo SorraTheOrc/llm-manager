@@ -464,6 +464,39 @@ def test_start_proxy_help_documents_keep_llama_server():
     assert "--keep-llama-server" in joined
 
 
+def test_start_proxy_documents_reason_flag():
+    """The --reason restart flag is documented in the usage header."""
+    header = _script_path().read_text(encoding="utf-8").splitlines()[:8]
+    joined = "\n".join(header)
+    assert "--reason" in joined
+
+
+def test_start_proxy_reason_resolution_precedence():
+    """The restart-reason resolution is FLAG > ENV > default (LP-0MVAPNC2900145RH).
+
+    Runs the script's own resolution expression in a hermetic bash subshell
+    (no proxy processes are touched).
+    """
+    expr = "${x:-${LLAMA_PROXY_RESTART_REASON:-manual (no reason provided)}}"
+    code = (
+        f'x="flag reason"; echo "flag: {expr}"; '
+        f'unset x; unset LLAMA_PROXY_RESTART_REASON; echo "env: {expr}"; '
+        f'unset x; unset LLAMA_PROXY_RESTART_REASON; echo "default: {expr}"; '
+        f"unset x; LLAMA_PROXY_RESTART_REASON='env reason'; echo \"env-wins: {expr}\";"
+    )
+    result = subprocess.run(["bash", "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    out = dict(
+        (k.strip(), v.strip())
+        for line in result.stdout.strip().splitlines()
+        for k, v in [line.split(":", 1)]
+    )
+    assert out["flag"] == "flag reason"
+    assert out["env"] == "manual (no reason provided)"
+    assert out["default"] == "manual (no reason provided)"
+    assert out["env-wins"] == "env reason"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # api_key_resolver (LP-0MVBJPQE50017BGL)
 # ═══════════════════════════════════════════════════════════════════════════════
