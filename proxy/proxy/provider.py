@@ -3122,12 +3122,13 @@ def _resolve_display_provider_name(provider_cfg: dict) -> str | None:
     """Resolve the human-readable provider component used in X-Resolved-Model.
 
     Priority: ``display_name`` (opt-in tier-aware label, e.g. ``MunitoAI
-    Free``) -> ``provider`` (actual provider brand name) -> ``name``
-    (provider entry name). The ``display_name`` field lets operators
-    distinguish provider tiers (free vs paid) that share a brand + model,
-    without touching failure-domain, cooldown, or usage-limit keys (which key
-    on endpoint, model, api_key_env, brand and entry name upstream of this
-    display string) (LP-0MVCQ36QV009QX8K).
+    Free`` / ``OpenCode Go 3``) -> ``provider`` (actual provider brand name)
+    -> ``name`` (provider entry name). The ``display_name`` field lets
+    operators distinguish provider tiers (free vs paid; same-brand accounts
+    such as the OpenCode Go tiers -- LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62)
+    that share a brand + model, without touching failure-domain, cooldown,
+    or usage-limit keys (which key on endpoint, model, api_key_env, brand
+    and entry name upstream of this display string).
     """
     return (
         provider_cfg.get("display_name")

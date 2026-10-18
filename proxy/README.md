@@ -504,6 +504,7 @@ When a request arrives for a model with a `providers` list, the proxy tries each
 | `llama_model` | string | local | Name of the local model |
 | `available_times` | list | no | List of `"HH:MM-HH:MM"` UTC windows during which this provider may be used (timed access, see below) |
 | `rate_limit_rpm` | int | no | Maximum dispatches to this entry per rolling 60-second window (free-tier request budget — see [Free-tier request budgets](#free-tier-request-budgets-rate_limit_rpm)) |
+| `display_name` | string | no | Human-readable tier label for the X-Resolved-Model header (e.g. `MunitoAI Free`, `OpenCode Go 3`). Overrides the `provider` brand in the display string only — failure-domain, cooldown and usage-limit keying still use `provider`. Use it to distinguish same-brand tiers/accounts (LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62). |
 
 #### Free-tier request budgets (`rate_limit_rpm`)
 

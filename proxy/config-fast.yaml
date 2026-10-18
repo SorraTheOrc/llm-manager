@@ -68,6 +68,7 @@ models:
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
         rate_limit_rpm: 15
       - name: opencode-go-3
+        display_name: OpenCode Go 3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -75,6 +76,7 @@ models:
         forward_session_headers: false
         model: deepseek-v4.1-flash
       - name: opencode-go-2
+        display_name: OpenCode Go 2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -82,6 +84,7 @@ models:
         forward_session_headers: false
         model: deepseek-v4.1-flash
       - name: opencode-go
+        display_name: OpenCode Go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -132,6 +135,7 @@ models:
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
         rate_limit_rpm: 15
       - name: opencode-go-3
+        display_name: OpenCode Go 3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -139,6 +143,7 @@ models:
         forward_session_headers: false
         model: deepseek-v4.1-flash
       - name: opencode-go-2
+        display_name: OpenCode Go 2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -146,6 +151,7 @@ models:
         forward_session_headers: false
         model: deepseek-v4.1-flash
       - name: opencode-go
+        display_name: OpenCode Go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -197,6 +203,7 @@ models:
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
         rate_limit_rpm: 15
       - name: opencode-go-3
+        display_name: OpenCode Go 3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -204,6 +211,7 @@ models:
         forward_session_headers: false
         model: deepseek-v4.1-flash
       - name: opencode-go-2
+        display_name: OpenCode Go 2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -211,6 +219,7 @@ models:
         forward_session_headers: false
         model: deepseek-v4.1-flash
       - name: opencode-go
+        display_name: OpenCode Go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -236,6 +245,7 @@ models:
   compact:
     providers:
       - name: opencode-go-compact
+        display_name: OpenCode Go Compact
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go

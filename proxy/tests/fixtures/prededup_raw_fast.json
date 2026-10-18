@@ -37,6 +37,7 @@
         },
         {
           "api_key_env": "OPENCODE_3_API_KEY",
+          "display_name": "OpenCode Go 3",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -46,6 +47,7 @@
         },
         {
           "api_key_env": "OPENCODE_2_API_KEY",
+          "display_name": "OpenCode Go 2",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -55,6 +57,7 @@
         },
         {
           "api_key_env": "OPENCODE_API_KEY",
+          "display_name": "OpenCode Go",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -110,6 +113,7 @@
         },
         {
           "api_key_env": "OPENCODE_3_API_KEY",
+          "display_name": "OpenCode Go 3",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -119,6 +123,7 @@
         },
         {
           "api_key_env": "OPENCODE_2_API_KEY",
+          "display_name": "OpenCode Go 2",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -128,6 +133,7 @@
         },
         {
           "api_key_env": "OPENCODE_API_KEY",
+          "display_name": "OpenCode Go",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -160,6 +166,7 @@
         {
           "api": "openai-responses",
           "api_key_env": "OPENCODE_API_KEY",
+          "display_name": "OpenCode Go Compact",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "muse-spark-1.3-contributor",
@@ -227,6 +234,7 @@
         },
         {
           "api_key_env": "OPENCODE_3_API_KEY",
+          "display_name": "OpenCode Go 3",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -236,6 +244,7 @@
         },
         {
           "api_key_env": "OPENCODE_2_API_KEY",
+          "display_name": "OpenCode Go 2",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -245,6 +254,7 @@
         },
         {
           "api_key_env": "OPENCODE_API_KEY",
+          "display_name": "OpenCode Go",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
