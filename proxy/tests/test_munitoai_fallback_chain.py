@@ -1,9 +1,10 @@
-"""Tests for the MunitoAI (``deepseek-ai/deepseek-v4-flash``) fallback tier
+"""Tests for the MunitoAI (``deepseek-ai/deepseek-v4-flash``) fallback tiers
 (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z).
 
-The MunitoAI tier is the *first remote* fallback of the ``plan`` / ``author`` /
-``code`` chains: it is listed directly after the local Qwen3 provider and
-before the first opencode-go tier, in both the authoritative base config
+The MunitoAI tiers are the remote fallbacks of the ``plan`` / ``author`` /
+``code`` chains: ``munitoai-free`` sits directly after the local Qwen3
+provider (first remote tier), and ``munitoai`` sits directly before the
+``deepseek-flash`` final tier, in both the authoritative base config
 (``config.yaml``) and the fast overlay (``config-fast.yaml``); cheap inherits
 the base chains. These tests assert the *resolved* runtime config through the
 production merge path, so the tier cannot silently drop out of a profile or
@@ -11,7 +12,8 @@ drift in the chain order.
 
 They also pin the two runtime facts the tier depends on: the resolved-model
 header value derived from the entry, and resolution of the ``MUNITOAI_API_KEY``
-environment variable from the ``munitoai`` entry in pi's ``auth.json``.
+/ ``MUNITOAI_FREE_API_KEY`` environment variables from the ``munitoai`` /
+``munitoai-free`` entries in pi's ``auth.json``.
 """
 
 import json
@@ -20,7 +22,25 @@ import pytest
 from proxy.provider import _build_resolved_model_value
 from tests.config_test_utils import get_merged_config, load_profile
 
-#: The exact provider entry the chains must carry.
+#: The exact provider entry the chains must carry right after local.
+#: ``display_name`` marks the free tier (``MunitoAI Free``) so the
+#: X-Resolved-Model header distinguishes it from the paid sibling
+#: (LP-0MVCQ36QV009QX8K).
+MUNITOAI_FREE_ENTRY = {
+    "name": "munitoai-free",
+    "type": "remote",
+    "provider": "MunitoAI",
+    "display_name": "MunitoAI Free",
+    "endpoint": "https://api.munito.ai/inference",
+    "api_key_env": "MUNITOAI_FREE_API_KEY",
+    "forward_session_headers": False,
+    "model": "deepseek-ai/deepseek-v4-flash",
+    # Free-tier request budget (LP-0MVDQ1GMO00801PL): a small per-60s window,
+    # so the tier is only used while it has capacity.
+    "rate_limit_rpm": 10,
+}
+
+#: The exact (paid) munitoai entry that must sit directly before deepseek-flash.
 MUNITOAI_ENTRY = {
     "name": "munitoai",
     "type": "remote",
@@ -46,53 +66,82 @@ def _first_opencode_index(providers: list[dict]) -> int:
 
 
 @pytest.mark.parametrize("model", CHAINS)
-def test_base_chain_places_munitoai_after_local_qwen3(model):
-    """config.yaml lists MunitoAI directly after the local Qwen3 provider."""
+def test_base_chain_places_munitoai_free_after_local_qwen3(model):
+    """config.yaml lists munitoai-free directly after the local Qwen3 provider."""
     providers = _providers(load_profile("config.yaml"), model)
     assert providers[0]["name"] == "local-qwen3"
-    assert providers[1] == MUNITOAI_ENTRY
+    assert providers[1] == MUNITOAI_FREE_ENTRY
 
 
 @pytest.mark.parametrize("model", CHAINS)
-def test_munitoai_precedes_the_first_opencode_tier(model):
-    """MunitoAI is the first remote tier, ahead of every opencode-go tier."""
+def test_munitoai_free_precedes_the_first_opencode_tier(model):
+    """munitoai-free is the first remote tier, ahead of every opencode-go tier."""
     providers = _providers(load_profile("config.yaml"), model)
     munitoai_index = next(
-        index for index, provider in enumerate(providers) if provider["name"] == "munitoai"
+        index for index, provider in enumerate(providers) if provider["name"] == "munitoai-free"
     )
     assert munitoai_index == 1
     assert munitoai_index < _first_opencode_index(providers)
 
 
 @pytest.mark.parametrize("model", CHAINS)
-def test_munitoai_is_not_the_final_tier(model):
-    """The reorder must leave a real remote fallback after MunitoAI."""
+def test_munitoai_sits_directly_before_deepseek_flash(model):
+    """The paid munitoai tier sits immediately before the deepseek-flash tier."""
     providers = _providers(load_profile("config.yaml"), model)
-    assert providers[-1]["name"] != "munitoai"
+    paid_index = next(
+        index for index, provider in enumerate(providers) if provider["name"] == "munitoai"
+    )
+    assert providers[paid_index] == MUNITOAI_ENTRY
+    assert paid_index >= _first_opencode_index(providers)
+    assert paid_index + 1 == len(providers) - 1
+    assert providers[paid_index + 1]["name"] == "deepseek-flash"
+
+
+@pytest.mark.parametrize("model", CHAINS)
+def test_deepseek_flash_is_the_final_tier(model):
+    """The chain still ends with the direct deepseek-flash fallback."""
+    providers = _providers(load_profile("config.yaml"), model)
     assert providers[-1]["name"] == "deepseek-flash"
 
 
 @pytest.mark.parametrize("mode", ["fast", "cheap"])
 @pytest.mark.parametrize("model", CHAINS)
-def test_merged_profile_places_munitoai_after_local_qwen3(mode, model):
+def test_merged_profile_places_munitoai_free_after_local_qwen3(mode, model):
     """The position survives the mode merge (fast overlay + base inheritance)."""
     providers = _providers(get_merged_config(mode), model)
     assert providers[0]["name"] == "local-qwen3"
-    assert providers[1] == MUNITOAI_ENTRY
+    assert providers[1] == MUNITOAI_FREE_ENTRY
+    paid_index = next(
+        index for index, provider in enumerate(providers) if provider["name"] == "munitoai"
+    )
+    assert providers[paid_index] == MUNITOAI_ENTRY
+    assert paid_index + 1 == len(providers) - 1
+    assert providers[paid_index + 1]["name"] == "deepseek-flash"
 
 
-def test_munitoai_is_always_available():
+def test_munitoai_free_is_always_available():
     """No available_times window means the tier is eligible around the clock."""
     entry = _providers(load_profile("config.yaml"), "plan")[1]
-    assert entry["name"] == "munitoai"
+    assert entry["name"] == "munitoai-free"
     assert "available_times" not in entry
 
 
 @pytest.mark.parametrize("model", CHAINS)
 def test_munitoai_resolved_model_header(model):
-    """The tier reports ``MunitoAI/<upstream model id>`` when it serves."""
-    entry = _providers(get_merged_config("fast"), model)[1]
-    assert _build_resolved_model_value(entry) == "MunitoAI/deepseek-ai/deepseek-v4-flash"
+    """The tiers report tier-distinct resolved-model values when they serve.
+
+    Free resolves to ``MunitoAI Free/<upstream model id>`` (via the entry's
+    ``display_name``), the paid tier keeps ``MunitoAI/<upstream model id>``
+    (LP-0MVCQ36QV009QX8K). The two strings must never be identical.
+    """
+    providers = _providers(get_merged_config("fast"), model)
+    free_entry = providers[1]
+    paid_entry = next(p for p in providers if p["name"] == "munitoai")
+    free_value = _build_resolved_model_value(free_entry)
+    paid_value = _build_resolved_model_value(paid_entry)
+    assert free_value == "MunitoAI Free/deepseek-ai/deepseek-v4-flash"
+    assert paid_value == "MunitoAI/deepseek-ai/deepseek-v4-flash"
+    assert free_value != paid_value
 
 
 def test_munitoai_api_key_resolves_from_pi_auth_json(tmp_path):

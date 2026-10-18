@@ -893,7 +893,12 @@ async def set_operating_mode(request: Request):
     """Switch the proxy between fast and cheap operating modes.
 
     Accepts a JSON body with a ``mode`` parameter (``"fast"`` or
-    ``"cheap"``). Requesting the mode that is already active returns
+    ``"cheap"``) and optional attribution fields ``source``
+    (``scheduler|worker|api|manual``), ``actor`` and ``reason`` so callers
+    (web UI/API, ContextHub mode-switch worker, operator scripts) can
+    self-identify and the spawned restart is attributable in the logs
+    (LP-0MVAPNC2900145RH). An absent or unknown ``source`` defaults to
+    ``api``. Requesting the mode that is already active returns
     success with **no restart** (noop). Requesting a different mode
     persists the new mode and triggers a **full proxy restart**
     (``scripts/start-proxy.sh --restart``) in the background — the
@@ -918,13 +923,28 @@ async def set_operating_mode(request: Request):
     if mode not in mode_module.VALID_MODES:
         raise HTTPException(status_code=400, detail="mode must be 'fast' or 'cheap'")
 
+    # LP-0MVAPNC2900145RH: optional caller identity. A missing/unknown
+    # source defaults to api so the restart attribution stays classifiable.
+    source = (body.get("source") or "api").strip().lower() or "api"
+    if source not in ("scheduler", "worker", "api", "manual"):
+        source = "api"
+    actor = (body.get("actor") or "").strip() or None
+    reason = (body.get("reason") or "").strip() or None
+
     try:
         # A manual switch is respected until the next scheduled mode change
         # (LP-0MSMF25V9002AY1J): derive the schedule from the standalone
         # mode_schedule.yaml so set_mode can persist the override expiry
         # alongside the mode.
         schedule = mode_module.ModeScheduleConfig.from_file()
-        persisted, restart = mode_module.set_mode(mode, manual=True, schedule=schedule)
+        persisted, restart = mode_module.set_mode(
+            mode,
+            manual=True,
+            schedule=schedule,
+            source=source,
+            actor=actor,
+            reason=reason,
+        )
     except mode_module.ModeSwitchCooldownError as exc:
         # 429 Too Many Requests is the only status for which Retry-After is
         # defined; the body repeats the hint machine-readably so the caller
@@ -938,6 +958,12 @@ async def set_operating_mode(request: Request):
             },
             headers={"Retry-After": str(exc.retry_after_seconds)},
         )
+    except mode_module.ModeSwitchLockedError as exc:
+        # 423 Locked: a performance investigation has engaged the
+        # mode-switch lock (LP-0MVCBMLP7009MN81). No state was mutated and
+        # no restart was armed. Must precede the generic RuntimeError arm
+        # (ModeSwitchLockedError subclasses RuntimeError).
+        raise HTTPException(status_code=423, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -950,6 +976,61 @@ async def set_operating_mode(request: Request):
             if not restart
             else f"Switched to {persisted} mode; proxy restarting"
         ),
+    }
+
+
+@router.get("/admin/mode-switch-lock")
+async def get_mode_switch_lock():
+    """Return the current mode-switch lock state (LP-0MVCBMLP7009MN81).
+
+    Returns ``{"enabled": bool, "source": "runtime|config|off"}``. The
+    runtime lock (persisted state file) wins over the config default.
+    """
+    locked = mode_module.mode_switch_locked()
+    source = "off"
+    if locked:
+        import json as _json
+
+        text = ""
+        try:
+            text = mode_module.mode_switch_lock_file().read_text(
+                encoding="utf-8"
+            ).strip()
+        except (FileNotFoundError, OSError):
+            pass
+        if text:
+            try:
+                data = _json.loads(text)
+                if isinstance(data, dict) and data.get("enabled"):
+                    source = "runtime"
+            except ValueError:
+                pass
+        if source == "off":
+            source = "config"
+    return {"enabled": locked, "source": source}
+
+
+@router.post("/admin/mode-switch-lock")
+async def set_mode_switch_lock(request: Request):
+    """Engage or release the mode-switch lock (LP-0MVCBMLP7009MN81).
+
+    Accepts a JSON body ``{"enabled": bool, "reason": str?}``. While
+    enabled, ``POST /admin/set-mode`` and the mode scheduler reject any
+    fast<->cheap change (423 / stand down) so a performance investigation
+    cannot be corrupted mid-sweep. Normal operation is restored by posting
+    ``{"enabled": false}``. The state persists across proxy restarts.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    enabled = bool(body.get("enabled"))
+    reason = str(body.get("reason") or "")
+    mode_module.set_mode_switch_lock(enabled, reason=reason)
+    return {
+        "enabled": mode_module.mode_switch_locked(),
+        "source": "runtime" if enabled else "off",
     }
 
 

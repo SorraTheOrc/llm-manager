@@ -103,7 +103,20 @@ test.describe('Slot Logs Tab', () => {
     await expect(page.locator('#slotSections .slot-section')).toHaveCount(2);
     const slot2 = page.locator('.slot-section[data-slot-id="2"]');
     await expect(slot2.locator('.slot-id')).toContainText('Slot 2');
-    await expect(slot2.locator('.slot-session')).toContainText(SESSION_A.substring(0, 8));
+    // Full session ID is shown in the slot header badge — no truncation or
+    // ellipsis (LP-0MV6CZGN6003Z5QI AC1).
+    await expect(slot2.locator('.slot-session')).toHaveText(SESSION_A);
+    // The full-ID badge must not overflow or break the header flex row
+    // (LP-0MV6CZGN6003Z5QI AC2): it stays within the header's horizontal
+    // bounds and the trailing header controls remain visible.
+    const sessionBadgeBox = await slot2.locator('.slot-session').boundingBox();
+    const headerBox = await slot2.locator('.slot-section-header').boundingBox();
+    expect(sessionBadgeBox).not.toBeNull();
+    expect(headerBox).not.toBeNull();
+    expect(sessionBadgeBox.x + sessionBadgeBox.width)
+      .toBeLessThanOrEqual(headerBox.x + headerBox.width + 1);
+    await expect(slot2.locator('.slot-expand-hint')).toBeVisible();
+    await expect(slot2.locator('.slot-autoscroll-label')).toBeVisible();
     await expect(slot2.locator('.slot-status-badge')).toContainText('Processed');
   });
 

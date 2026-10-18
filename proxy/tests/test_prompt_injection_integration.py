@@ -398,3 +398,134 @@ async def test_no_system_prompt_passes_through(monkeypatch):
     assert resp is not None
     assert resp.status_code == 200
     assert captured_body.get("messages") == original_messages
+
+
+# ---------------------------------------------------------------------------
+# Integration test: real config author alias applies author.txt (override)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_real_author_config_injects_author_txt(monkeypatch):
+    """The real config's author entry injects author.txt via proxy_openai_api.
+
+    First live use of the ``system_prompt`` feature (LP-0MV5S5IMX0091DZ5): a
+    ``model=author`` request must have its system messages replaced by the
+    resolved author.txt content (mode ``override``) on the proxy auto-loading
+    path, using the actual config.yaml author entry rather than a fixture.
+    """
+    from pathlib import Path
+
+    from tests.config_test_utils import load_profile
+
+    real_author_cfg = load_profile("config.yaml")["models"]["author"]
+
+    mock_config = {
+        "models": {"author": real_author_cfg},
+        "server": {
+            "llama_router_mode": False,
+            "llama_server_port": 9999,
+            "llama_embed_load_timeout": 5,
+            "llama_model_load_timeout": 10,
+            "llama_startup_timeout": 5,
+            "max_concurrent_queries": 16,
+        },
+    }
+    monkeypatch.setattr(server, 'config', mock_config)
+
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    monkeypatch.setattr(server, 'llama_process', fake_proc)
+    monkeypatch.setattr(server, 'backend_ready', True)
+    server.current_model = "Qwen3"
+
+    captured_body = {}
+
+    def backend_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_body
+        try:
+            captured_body = json.loads(request.content.decode("utf-8") if request.content else "{}")
+        except Exception:
+            captured_body = {"error": "parse_failed"}
+        return httpx.Response(200, json={"id": "test", "choices": [{"message": {"content": "OK"}}]})
+
+    transport = httpx.MockTransport(backend_handler)
+    client = httpx.AsyncClient(transport=transport)
+    monkeypatch.setattr(server, '_http_client', client)
+
+    from fastapi import Request as FastAPIRequest
+    from proxy.ui import proxy_openai_api
+
+    body = json.dumps({
+        "model": "author",
+        "messages": [
+            {"role": "system", "content": "Client-supplied system message that must be replaced"},
+            {"role": "user", "content": "Write a wiki page about vLLM."},
+        ],
+        "stream": False,
+    }).encode("utf-8")
+
+    mock_request = MagicMock(spec=FastAPIRequest)
+    mock_request.method = "POST"
+    mock_request.url = type("U", (), {"path": "/v1/chat/completions"})()
+    mock_request.headers = {}
+    mock_request._body = body
+
+    async def mock_body():
+        return mock_request._body
+
+    mock_request.body = mock_body
+
+    async def fake_proxy_to_local(request, path):
+        body_bytes = await request.body()
+        body_json = json.loads(body_bytes) if body_bytes else {}
+
+        # Forward to mock backend (prompt already applied by proxy_openai_api)
+        new_body = json.dumps(body_json).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        resp = await client.post(
+            f"http://localhost:9999/{path}",
+            content=new_body,
+            headers=headers,
+        )
+        return resp
+
+    # Mock proxy_with_fallback to delegate to the backend mock
+    from proxy import provider as provider_module
+
+    async def fake_proxy_with_fallback(request, path, model_cfg, config):
+        body_bytes = await request.body()
+        body_json = json.loads(body_bytes) if body_bytes else {}
+        new_body = json.dumps(body_json).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        resp = await client.post(
+            f"http://localhost:9999/{path}",
+            content=new_body,
+            headers=headers,
+        )
+        return resp
+
+    monkeypatch.setattr(provider_module, 'proxy_with_fallback', fake_proxy_with_fallback)
+    from proxy import router as router_module
+    monkeypatch.setattr(router_module, 'proxy_to_local', fake_proxy_to_local)
+    monkeypatch.setattr(server, 'proxy_to_local', fake_proxy_to_local)
+
+    resp = await proxy_openai_api(mock_request, "chat/completions")
+    await client.aclose()
+
+    assert resp is not None
+    assert resp.status_code == 200
+    assert "messages" in captured_body
+    messages = captured_body["messages"]
+
+    # Override mode replaces the client-supplied system message with author.txt.
+    system_msgs = [m for m in messages if m["role"] == "system"]
+    assert len(system_msgs) == 1
+
+    author_txt = (Path(__file__).resolve().parent.parent / "prompts" / "author.txt").read_text(encoding="utf-8")
+    assert system_msgs[0]["content"] == author_txt
+    assert "Client-supplied system message" not in system_msgs[0]["content"]
+
+    # Non-system messages preserved.
+    user_msgs = [m for m in messages if m["role"] == "user"]
+    assert len(user_msgs) == 1
+    assert user_msgs[0]["content"] == "Write a wiki page about vLLM."

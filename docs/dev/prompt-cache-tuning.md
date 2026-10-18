@@ -81,12 +81,13 @@ The value is derived from the measurement, not chosen as a round number:
 ```
 1,517.6 MiB x 12 x 1.25 = 22,764 MiB  ->  23 GiB = 23,552 MiB  (first step)
 1,456.3 MiB x 18 x 1.25 = 32,767 MiB  ->  32 GiB = 32,768 MiB  (raised)
+2,013.3 MiB x 16 x 1.25 = 40,266 MiB  ->  40 GiB = 40,960 MiB  (raised, LP-0MV5HSUHF002MDPG)
 ```
 
 Configured in `models.ini` `[Qwen3]`:
 
 ```ini
-cache-ram = 32768
+cache-ram = 40960
 ctx-checkpoints = 32
 ```
 
@@ -94,8 +95,12 @@ The first step (23,552 MiB) raised the retained prompts from ~3–5 to ~15.
 The post-deploy measurement then observed up to **18** concurrent prompts and
 residual evictions, so the cap was raised to **32,768 MiB** (~22 prompts) —
 the value `--recommend` derives from the 2026-10-07 measurement
-(LP-0MUYFC3C5004TCYN). This keeps a session prefix resident across turns under
-the busier post-deploy load.
+(LP-0MUYFC3C5004TCYN). The 2026-10-12 post-deploy measurement still showed
+saturation under the single-slot load (18 evictions over ~4.7 d, 26.3% of
+samples above 90% of the 32,768 MiB cap, observed max 16 concurrently-retained
+prompts), so the cap was raised again to **40,960 MiB** (~20 prompts) — the
+value `--recommend` derives from the 2026-10-12 measurement
+(`docs/dev/prompt-cache-post-deploy-2026-10-12.json`, LP-0MV5HSUHF002MDPG).
 
 ### Checkpoint lever (AC3)
 
@@ -127,8 +132,13 @@ MemAvailable - cache-ram >= margin   (margin = max(8 GiB, 10% MemTotal))
 On the measured host:
 
 ```
-77,679.5 MiB - 23,552 MiB = 54,127 MiB  >=  12,743.7 MiB   -> safe
+77,679.5 MiB - 23,552 MiB = 54,127 MiB  >=  12,743.7 MiB   -> safe (23 GiB)
+79,248.3 MiB - 40,960 MiB = 38,288.3 MiB  >=  12,743.7 MiB  -> safe (40 GiB)
 ```
+
+(re-checked at deploy time for LP-0MV5HSUHF002MDPG: `MemAvailable` was
+88,244 MiB on 2026-10-14, a stricter bound than the 79,248 MiB recorded at the
+2026-10-12 measurement, so 88,244 − 40,960 = 47,284 MiB ≥ 12,743.7 MiB.)
 
 The failure mode to avoid is the OOM fallback inside
 `server_prompt_cache::alloc()`:
@@ -411,9 +421,11 @@ The `--recommend` output from this measurement derives **40,960 MiB (40 GiB)**
 saturates at 32 GiB (26.3% of samples above 90% of cap; 18 evictions). The cap
 is adequate for the observed maximum — `holdable_prompts` 20 >= observed 16 —
 but the higher per-prompt size under the current single-slot load means 32 GiB
-is now at the edge. Raising it again is a **separate operator decision** (host
-headroom is safe: `79,248 - 40,960 = 38,288 MiB >= 12,744 MiB reserve`); this
-item only records the measurement.
+is now at the edge. **Applied** under LP-0MV5HSUHF002MDPG: `models.ini`
+`[Qwen3]` now sets `cache-ram = 40960` (host headroom is safe:
+`79,248 − 40,960 = 38,288 MiB >= 12,744 MiB reserve`). See the
+[40,960 MiB deploy note](#40960-mib-deploy-lp-0mv5hshf002mdpg) below for the
+deploy evidence.
 
 ### Reproduction
 
@@ -429,6 +441,51 @@ item only records the measurement.
     --cache-ram-filter 8192 --no-proxy \
     > docs/dev/prompt-cache-baseline-4day-2026-10-01.json
 ```
+
+## 40960 MiB deploy (LP-0MV5HSUHF002MDPG)
+
+Deployment: 2026-10-14 ~00:31 IST via `/skill:start-proxy --restart` (never kill the
+proxy manually). The restarted proxy spawned the Qwen3 child carrying the
+tuned values:
+
+```
+llama-server --alias Qwen3 --ctx-size 262144 --cache-ram 40960 \
+  --cache-type-k q8_0 --cache-type-v q8_0 --swa-checkpoints 32 \
+  --flash-attn true ...
+```
+
+`--cache-ram 40960` ✓, `--swa-checkpoints 32` (the `--ctx-checkpoints` alias) ✓,
+no `--swa-full` ✓ (AC3 of LP-0MV5HSUHF002MDPG).
+
+Headroom re-checked at deploy time (AC2): `MemAvailable − 40960 >= reserve`
+with `reserve = max(8 GiB, 10% MemTotal) = 12,743.7 MiB`:
+
+```
+88,244 MiB (MemAvailable, 2026-10-14) − 40,960 = 47,284 MiB  >=  12,743.7 MiB  -> safe
+```
+
+The OOM fallback inside `server_prompt_cache::alloc()`
+(`limit_size = 0.4 * size()`) is not approached.
+
+The live post-deploy validation of this cap is a separate follow-up
+(LP-0MV5HSZ51005CM7A). Preliminary findings captured at
+`docs/dev/prompt-cache-post-deploy-2026-10-15-partial.json` (partial window,
+~55 min / 50 requests):
+
+| Metric | 32,768 MiB (1,404 req) | 40,960 MiB (50 req) | Change |
+|--------|------------------------|----------------------|--------|
+| Evictions | 18 | 0 | Eliminated |
+| Cache saturated % | 26.27% | 0.0% | Eliminated |
+| Cache peak (MiB) | 32,765.6 | 5,651.2 | Well under cap |
+| Forced full prefills | 68 (4.8%/req) | 5 (10.0%/req) | Higher % (small n) |
+| Prompt eval tok/s med | 77.3 | 131.6 | Improved |
+| Decode tok/s median | 18.4 | 26.0 | Improved |
+| First byte ms median | 8,046.3 | 8,106.7 | Comparable |
+| Max prompts held | 16 | 6 | Fewer held |
+
+`--recommend` output: only 20,480 MiB needed — 40,960 MiB provides ample
+headroom. A full measurement window (~4.7 d / 1,404+ requests) is needed for
+definitive comparison. See LP-0MV5HSZ51005CM7A.
 
 ## Non-goals
 

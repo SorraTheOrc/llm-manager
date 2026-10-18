@@ -470,6 +470,32 @@ def _log_effective_routing_thresholds(config: dict) -> None:
         pass  # Logging is best-effort; don't block startup
 
 
+def _log_restart_attribution() -> None:
+    """Echo the restart attribution supplied by the starting process.
+
+    LP-0MVAPNC2900145RH: ``start-proxy.sh --restart`` (and mode.py's spawn
+    path) export ``LLAMA_PROXY_RESTART_REASON`` (plus optional
+    ``LLAMA_PROXY_RESTART_SOURCE``/``LLAMA_PROXY_RESTART_ACTOR``) into the new
+    process's environment. When present, log them right before the
+    ``Starting LLama Proxy Server`` marker so every restart is attributable
+    from the logs alone. A fresh unattributed start logs nothing (backwards
+    compatible).
+    """
+    import os
+
+    reason = os.environ.get("LLAMA_PROXY_RESTART_REASON")
+    if not reason:
+        return
+    source = os.environ.get("LLAMA_PROXY_RESTART_SOURCE") or "manual"
+    actor = os.environ.get("LLAMA_PROXY_RESTART_ACTOR") or "unknown"
+    logger.info(
+        "Proxy restart attribution: source=%s actor=%s reason=%s",
+        source,
+        actor,
+        reason,
+    )
+
+
 def _startup_config_logging():
     """Load configuration and set up logging.
 
@@ -506,6 +532,10 @@ def _startup_config_logging():
     # runtime threshold matches expectations for their slot count and context
     # size, including the computed economic ceiling.
     _log_effective_routing_thresholds(config)
+
+    # LP-0MVAPNC2900145RH: operator/initiator restart reason (if supplied)
+    # must appear before the startup marker so restarts are attributable.
+    _log_restart_attribution()
 
     logger.info("Starting LLama Proxy Server")
     return config, logger

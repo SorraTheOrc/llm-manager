@@ -15,6 +15,13 @@ window local dispatch concurrency is capped (default 1) so only one large
 prefill runs at a time; the cache warms after the first request completes
 prefill and the cap lifts immediately (``mark_warm``).
 
+The cold window is ALSO the grace-period-immunity boundary for the error
+handlers in ``provider.py`` (LP-0MV9UNIOZ009RIAN): while ``is_cold()`` is
+True, a local HTTP 503 (backend still warming up) or a connection error is
+deferred with the Retry-After hint instead of triggering the 60s provider
+cooldown. ``is_cold()`` is the single immunity-boundary signal — no separate
+window plumbing.
+
 The state machine is intentionally tiny and fail-open:
 
 - ``note_model_loaded()`` — called by the lifecycle load paths when a model

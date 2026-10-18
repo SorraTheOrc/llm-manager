@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import bucketing
+from bucketing import ModeTransition
 from log_parser import (
     BUSY_WINDOW_MARGIN,
     FALLBACK_ATTRIBUTION_WINDOW_SECONDS,
@@ -199,6 +200,35 @@ class AnalysisResult:
     # TTFT (Time to First Token) events parsed from log lines
     # (LP-0MTSSM5SO003PKU0).
     ttft_events: list[LogEvent] = field(default_factory=list)
+    # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3):
+    # ``routing_skip`` events with ``chain_hold_cycle > 0`` are re-emissions
+    # of a single held request restarted across chain-hold cycles
+    # (LP-0MU5AIAAY003KVM0), NOT genuine new client demand. They are kept out
+    # of every demand/local-skip aggregate (hourly ``local_skip``,
+    # ``routing_skip_events``, per-session ``routing_skips``,
+    # ``routing_skip_reason_counts``) and surfaced here separately so a stuck
+    # hold is distinguishable from a client retry storm.
+    hold_cycle_routing_skip_events: list[LogEvent] = field(default_factory=list)
+    # Restart events (``restart`` kind, LP-0MUQO82LJ008F1FS) observed inside
+    # the window, carrying the attribution markers (source/actor/reason,
+    # LP-0MVC0S6U5003SEDJ) parsed from the log lines so the report can render
+    # restart causes deterministically instead of heuristically
+    # (LP-0MVC144KS001PDR4). Includes spawn/complete markers and the
+    # start-proxy.sh --restart startup attribution line. Restart events
+    # already contribute their timestamp to ``restart_signals`` for
+    # root-cause correlation (unchanged).
+    restart_events: list[LogEvent] = field(default_factory=list)
+
+    @property
+    def restart_events_sorted(self) -> list[LogEvent]:
+        """Restart events sorted by timestamp (report rendering order)."""
+        return sorted(self.restart_events, key=lambda e: e.ts)
+
+    @property
+    def hold_cycle_reemission_count(self) -> int:
+        """Number of hold-cycle routing-skip re-emissions
+        (``chain_hold_cycle > 0``) in the window."""
+        return len(self.hold_cycle_routing_skip_events)
 
     @property
     def total_requests(self) -> int:
@@ -860,6 +890,10 @@ def aggregate(
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
+    # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3):
+    # ``chain_hold_cycle > 0`` routing_skip events, recorded separately from
+    # the demand aggregates.
+    hold_cycle_routing_skip_events: list[LogEvent] = []
     # Per-hour activity counters (LP-0MTYAZFGN003BYQS): absolute top-of-hour
     # datetime -> Counter, counted by each event's own timestamp.
     hourly_activity: dict[datetime, Counter] = {}
@@ -872,18 +906,32 @@ def aggregate(
     # so boundary-crossing streams pair correctly (clipped in compute_busy_stats).
     local_stream_events: list[LogEvent] = []
     # Operating-mode transitions across the (margin-widened) event stream:
-    # the mode timeline used for fast/cheap session bucketing.
-    mode_transitions: list[tuple[datetime, str]] = []
+    # the mode timeline used for fast/cheap session bucketing. Carries the
+    # attribution markers (source/actor/reason) parsed by log_parser
+    # (LP-0MVC0S6U5003SEDJ) so the report can render who/what requested the
+    # switch (LP-0MVC144KS001PDR4).
+    mode_transitions: list[ModeTransition] = []
     # Restart / mode-switch marker timestamps across the (margin-widened)
     # event stream (LP-0MUQO82LJ008F1FS): used to correlate local stream
     # errors with the restart that killed them. Collected before the window
     # filter so an error near the window edge still finds its marker.
     restart_signals: list[datetime] = []
+    # In-window restart events carrying attribution (LP-0MVC144KS001PDR4),
+    # collected alongside the restart-signal markers above.
+    restart_events: list[LogEvent] = []
 
     for ev in events:
         if ev.kind == "mode_switch":
             if ev.mode in ("fast", "cheap"):
-                mode_transitions.append((ev.ts, ev.mode))
+                mode_transitions.append(
+                    ModeTransition(
+                        ts=ev.ts,
+                        mode=ev.mode,
+                        source=ev.source,
+                        actor=ev.actor,
+                        reason=ev.reason,
+                    )
+                )
             restart_signals.append(ev.ts)
             if window_start <= ev.ts <= window_end:
                 total_lines += 1
@@ -892,6 +940,9 @@ def aggregate(
             restart_signals.append(ev.ts)
             if window_start <= ev.ts <= window_end:
                 total_lines += 1
+                # Surface attribution (LP-0MVC144KS001PDR4): keep the restart
+                # event (with its source/actor/reason markers) for the report.
+                restart_events.append(ev)
             continue
         if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
             local_stream_events.append(ev)
@@ -912,7 +963,11 @@ def aggregate(
         elif ev.kind == "fallback":
             hourly_activity.setdefault(hour_key, Counter())["fallbacks"] += 1
         elif ev.kind == "routing_skip":
-            hourly_activity.setdefault(hour_key, Counter())["local_skip"] += 1
+            # Demand counter for genuine skips only: a ``chain_hold_cycle > 0``
+            # event is a hold-cycle re-emission, not new client demand
+            # (LP-0MUIEO6IP0030CT3).
+            if ev.chain_hold_cycle is None or ev.chain_hold_cycle <= 0:
+                hourly_activity.setdefault(hour_key, Counter())["local_skip"] += 1
         if ev.kind in (
             "stream_error",
             "stream_finish_error",
@@ -932,10 +987,16 @@ def aggregate(
                 builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
             continue
         if ev.kind == "routing_skip":
-            routing_skip_events.append(ev)
-            if ev.session:
-                routing_skips.setdefault(ev.session, []).append(ev)
-                builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
+            if ev.chain_hold_cycle is not None and ev.chain_hold_cycle > 0:
+                # Hold-cycle re-emission: keep out of every demand aggregate
+                # (routing_skip_events, per-session routing_skips,
+                # routing_skip_reason_counts) and record separately.
+                hold_cycle_routing_skip_events.append(ev)
+            else:
+                routing_skip_events.append(ev)
+                if ev.session:
+                    routing_skips.setdefault(ev.session, []).append(ev)
+                    builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
             continue
         if ev.kind == "contention_dispatch":
             contention_dispatch_events.append(ev)
@@ -995,4 +1056,6 @@ def aggregate(
         busy=busy,
         hourly_activity=hourly_activity,
         ttft_events=ttft_events,
+        hold_cycle_routing_skip_events=hold_cycle_routing_skip_events,
+        restart_events=restart_events,
     )

@@ -21,8 +21,9 @@
 #       `config.yaml` are intentionally omitted.
 #   * server.contention_queue_policy / contention_queue_max_wait_seconds /
 #     contention_queue_max_depth
-#       Smaller queue (depth 3, 45s) than cheap mode, so bursts spill to
-#       remote providers sooner during peak hours.
+#       Queue (depth 8, 120s), matching cheap mode (LP-0MV881O5C007PSL4): a
+#       burst of local-eligible requests waits for a slot instead of spilling
+#       to remote while the average local stream (~31s) is still running.
 #   * server.mode_switch_drain.max_seconds  (30; base 90)
 #   * server.upstream_idle_timeout_seconds  (240; base 30)
 #
@@ -44,17 +45,28 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
-      # fallback tier, untimed in fast mode like the other remote tiers.
-      # Declared in full here because an overlay's provider list replaces the
-      # base list wholesale.
-      - name: munitoai
+      # MunitoAI Free: free-tier remote fallback, sits immediately after
+      # local. Key resolved from ~/.pi/agent/auth.json under ``munitoai_free``
+      # (underscore — resolver strips _API_KEY from MUNITOAI_FREE_API_KEY;
+      # hyphenated ``munitoai-free`` tracked in LP-0MVBJXZY5002UW10).
+      # Untimed in fast mode like the other
+      # remote tiers.
+      - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_API_KEY
+        api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -76,6 +88,16 @@ models:
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
         model: deepseek-v4.1-flash
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
+      # after the opencode-go chain. Untimed in fast mode. The API key is
+      # resolved from ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: deepseek-flash
         type: remote
         provider: deepseek
@@ -87,15 +109,28 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
-      # fallback tier (see plan).
-      - name: munitoai
+      # MunitoAI Free: free-tier remote fallback, sits immediately after
+      # local. Key resolved from ~/.pi/agent/auth.json under ``munitoai_free``
+      # (underscore — resolver strips _API_KEY from MUNITOAI_FREE_API_KEY;
+      # hyphenated ``munitoai-free`` tracked in LP-0MVBJXZY5002UW10).
+      # Untimed in fast mode like the other
+      # remote tiers.
+      - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_API_KEY
+        api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -117,6 +152,16 @@ models:
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
         model: deepseek-v4.1-flash
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
+      # after the opencode-go chain. Untimed in fast mode. The API key is
+      # resolved from ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: deepseek-flash
         type: remote
         provider: deepseek
@@ -128,15 +173,29 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
-      # fallback tier (see plan).
-      - name: munitoai
+      # MunitoAI Free: free-tier remote fallback, sits immediately after
+      # local. Key resolved from ~/.pi/agent/auth.json under ``munitoai_free``
+      # (underscore — resolver strips _API_KEY from MUNITOAI_FREE_API_KEY;
+      # hyphenated ``munitoai-free`` tracked in LP-0MVBJXZY5002UW10).
+      # Untimed in fast mode like the other
+      # remote tiers. ``display_name`` marks the free tier for a distinct
+      # X-Resolved-Model label (LP-0MVCQ36QV009QX8K).
+      - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_API_KEY
+        api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -158,6 +217,16 @@ models:
         api_key_env: OPENCODE_API_KEY
         forward_session_headers: false
         model: deepseek-v4.1-flash
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
+      # after the opencode-go chain. Untimed in fast mode. The API key is
+      # resolved from ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: deepseek-flash
         type: remote
         provider: deepseek
@@ -182,8 +251,9 @@ models:
         model: deepseek-flash
 server:
   contention_queue_policy: queue
-  contention_queue_max_wait_seconds: 45
-  contention_queue_max_depth: 3
+  contention_queue_max_wait_seconds: 120
+  contention_queue_max_depth: 8
+  local_dispatch_lease_timeout_seconds: 15
   mode_switch_drain:
     max_seconds: 30
   upstream_idle_timeout_seconds: 240

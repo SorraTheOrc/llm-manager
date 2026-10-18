@@ -18,6 +18,13 @@ Merge semantics
   provider list replaces the base provider list entirely.
 * The inputs are never mutated; a new dict is returned.
 
+Restart signature
+-----------------
+The shared restart-signature helper :func:`merged_config_sha256` hashes the
+effective (merged) config as canonical JSON — deterministic, key-sorted,
+formatting-agnostic — so both the shell read path and the Python write path
+produce byte-identical hashes for the same config inputs (LP-0MUJRVYQH002IEHW).
+
 Typical use::
 
     from proxy.config_merge import deep_merge
@@ -29,6 +36,8 @@ Typical use::
 
 from __future__ import annotations
 
+import hashlib
+import json
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -94,3 +103,43 @@ def load_merged(base_path, overlay_path) -> dict:
         load_yaml_config(Path(base_path)),
         load_yaml_config(Path(overlay_path)),
     )
+
+
+def merged_config_sha256(base_path, overlay_path) -> str:
+    """Canonical sha256 of the merged (base + overlay) config.
+
+    The restart signature (LP-0MUJRVYQH002IEHW) must reflect the *effective*
+    config: after the mode files became overlays (LP-0MUI67ZNM008627E),
+    base-inherited local-backend keys (e.g. ``local_model_ctx_size``,
+    ``session_slot_pool_size``, ``llama_server_port``) no longer appear in
+    them, so a base-only change would not change the hash of the raw overlay.
+    Hashing the merged dict instead makes a base-only change alter the
+    signature and forces llama-server to restart when a ``--restart`` is
+    issued.
+
+    The canonical serialisation is ``json.dumps(merged, sort_keys=True,
+    separators=(",", ":"))`` — deterministic key ordering makes the hash
+    stable across Python runs and independent of YAML formatting/comments
+    (only effective values matter). Both ``start-proxy.sh`` (shell read
+    path) and ``lifecycle._config_file_sha256`` (Python write path) must use
+    this exact helper so their hashes are byte-identical for the same config
+    inputs; do not change the serialisation on one side only.
+
+    Args:
+        base_path: Path of the authoritative base ``config.yaml``.
+        overlay_path: Path of the mode overlay (``config-<mode>.yaml``). When
+            the overlay file is absent, the base is merged with itself
+            (equivalent to an empty overlay).
+
+    Returns:
+        Hex sha256 of the canonical JSON serialisation of the merged dict.
+    """
+    base_path = Path(base_path)
+    overlay_path = Path(overlay_path)
+    if overlay_path.is_file():
+        merged = load_merged(base_path, overlay_path)
+    else:
+        # Missing overlay -> the effective config is the base alone.
+        merged = load_yaml_config(base_path)
+    canonical = json.dumps(merged, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

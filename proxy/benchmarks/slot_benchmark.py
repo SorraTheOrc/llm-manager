@@ -33,6 +33,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,10 +43,28 @@ try:
 except ImportError:
     httpx = None
 
+# Reuse the log-parsing helpers from the contention-queue simulation harness
+# (same proxy log markers: contention_queue_dispatch /
+# contention_queue_fallback_after_queue).
+try:
+    from proxy.benchmarks import contention_queue_simulation as _cqs
+except ImportError:  # pragma: no cover - exercised when run as a script
+    try:
+        from benchmarks import contention_queue_simulation as _cqs
+    except ImportError:
+        _cqs = None
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # /home/rgardler/projects/llm
+# The repo root whose live proxy/config is benchmarked. Defaults to the repo
+# this harness lives in; ``LLAMA_PROXY_BENCHMARK_ROOT`` overrides it so the
+# harness code can live in a git worktree while it operates on the live
+# checkout (the running proxy reads that checkout's config.yaml and
+# start-proxy.sh).
+PROJECT_ROOT = Path(
+    os.environ.get("LLAMA_PROXY_BENCHMARK_ROOT") or Path(__file__).resolve().parent.parent.parent
+)
 CONFIG_YAML = PROJECT_ROOT / "proxy" / "config.yaml"
 LOG_DIR = Path("/var/log/llama-proxy")
 BENCHMARK_LOG = PROJECT_ROOT / "logs" / "proxy-benchmark.log"
@@ -69,6 +88,10 @@ PROGRESS_POLL_URL = f"http://localhost:{PROXY_PORT}/health"  # polled for kv_cac
 TOTAL_SESSION_TURNS = 4              # turns per session (initial + 3 follow-ups)
 EXTRA_NUMBERS_PER_TURN = 100        # random numbers added each follow-up turn
 
+#: Default health-snapshot cadence during a run (used for local quarantine
+#: episode counting and local stream availability).
+HEALTH_SAMPLE_INTERVAL_S = 30
+
 
 def _generate_extra_numbers(idx: int, turn: int) -> str:
     """Generate comma-separated random numbers for a follow-up turn.
@@ -83,6 +106,10 @@ def _generate_extra_numbers(idx: int, turn: int) -> str:
 # Slot counts to test
 # ---------------------------------------------------------------------------
 SLOT_COUNTS = [1, 2, 4, 6, 8, 12]
+
+#: The 1/2/3-slot sweep mandated by LP-0MVAZPQUM006EAC7 (AC1) — run via
+#: ``--sweep``. Distinct from ``--all`` (historical full set: 1,2,4,6,8,12).
+SWEEP_SLOT_COUNTS = [1, 2, 3]
 
 # ---------------------------------------------------------------------------
 # Long padding document (~500 words, repeated to hit token target)
@@ -117,33 +144,38 @@ def _build_padding(target_tokens: int) -> str:
     return (_PROMPT_PADDING * repeats).strip()
 
 
-def build_shared_content() -> str:
-    """Build the fixed ~8k token preamble shared across all requests.
+def build_shared_content(prompt_tokens: int = TARGET_PROMPT_TOKENS) -> str:
+    """Build the fixed preamble shared across all requests.
 
-    Returns text with a preamble plus ~8k tokens of padding, followed by
-    a marker where the varied content will be appended.
+    The shared portion is half the target prompt size (defaults preserve the
+    historical ~3k shared tokens when ``prompt_tokens`` is the 6k default).
+    Returns text with a preamble plus padding, followed by a marker where the
+    varied content will be appended.
     """
     preamble = (
         "You are a data processing assistant. Below are two parts.\n\n"
         "PART 1 (fixed reference): A background document for context.\n"
         "---PART 1 START---\n"
     )
-    padding = _build_padding(TARGET_SHARED_TOKENS - 20)  # leave room for preamble
+    shared_tokens = max(20, prompt_tokens // 2)
+    padding = _build_padding(shared_tokens - 20)  # leave room for preamble
     marker = "\n---PART 1 END---\n\nPART 2 (data): Below is a list of comma-separated numbers.\n---PART 2 START---\n"
     return preamble + padding + marker
 
 
-def build_varied_content(index: int) -> str:
-    """Build ~8k tokens of comma-separated random numbers, unique per request.
+def build_varied_content(index: int, prompt_tokens: int = TARGET_PROMPT_TOKENS) -> str:
+    """Build comma-separated random numbers, unique per request.
 
-    The output is a single line of comma-separated integers.  The model
-    must count how many numbers appear and report the total.
+    The output is a single line of comma-separated integers.  The varied
+    portion is half the target prompt size (~3 tokens per number); defaults
+    preserve the historical ~1000-number varied block when ``prompt_tokens``
+    is the 6k default.
     """
     import random
     rng = random.Random(42 + index)  # seeded per index for reproducibility
 
-    # ~3k tokens; each number can be multiple subword tokens, so use ~1000 numbers
-    count = 1000
+    varied_tokens = max(20, prompt_tokens - prompt_tokens // 2)
+    count = max(1, varied_tokens // 3)
     numbers = [str(rng.randint(1, 999999)) for _ in range(count)]
     closing = "\n---PART 2 END---"
     return ",".join(numbers) + closing
@@ -304,10 +336,72 @@ def restart_services(slot_count: int) -> None:
     print(f"  New proxy started via start-proxy.sh (PID {new_proc.pid})")
 
     # 6. Wait for proxy to be ready
-    _wait_for_proxy()
+    proxy_ok = _wait_for_proxy()
 
     # 7. Wait for llama-server to be ready
-    _wait_for_llama_server()
+    llama_ok = _wait_for_llama_server()
+    return llama_ok and proxy_ok
+
+
+def _read_slot_pool_size_from_config() -> int:
+    """Return the current ``session_slot_pool_size`` in config.yaml (base)."""
+    try:
+        m = re.search(r'^\s*session_slot_pool_size:\s*(\d+)', _read_config(), re.MULTILINE)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 1
+
+
+#: Output headroom subtracted from per-slot ctx (mirrors provider.py routing
+#: clamp: ``physical = local_model_ctx_size // slots - 4096``).
+PHYSICAL_CTX_HEADROOM = 4096
+
+
+def _read_ctx_size_from_config() -> int | None:
+    """Return ``local_model_ctx_size`` from config.yaml, else None."""
+    try:
+        m = re.search(r'^\s*local_model_ctx_size:\s*(\d+)', _read_config(), re.MULTILINE)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _capture_system_memory() -> int | None:
+    """Return available system memory (MemAvailable) in bytes, else None."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                return int(parts[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _observe_llama_parallel() -> int | None:
+    """Observe llama-server --parallel via /slots (count of slots), else None."""
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen(
+            f"http://localhost:{LLAMA_SERVER_PORT}/slots?model=Qwen3", timeout=5
+        )
+        data = json.loads(resp.read().decode())
+        if isinstance(data, list):
+            return len(data)
+    except Exception:
+        pass
+    return None
+
+
+def _format_viability_gb(value: int | None) -> str:
+    """Render a byte count as GiB text, or '--' when None."""
+    if value is None:
+        return "--"
+    return f"{value / (1024**3):.1f}GB"
 
 
 def _kill_llama_server() -> None:
@@ -354,25 +448,32 @@ def _kill_llama_server() -> None:
             pass
 
 
-def _wait_for_llama_server(timeout: int = 300) -> None:
-    """Wait until llama-server responds on its health endpoint."""
+def _wait_for_llama_server(timeout: int = 300) -> bool:
+    """Wait until llama-server responds on its health endpoint.
+
+    Returns True when ready, False on timeout (caller records it as a
+    viability-failure signal rather than silently continuing; AC4 of
+    LP-0MVAZPQUM006EAC7).
+    """
     from urllib.error import URLError
     from urllib.request import urlopen
 
     deadline = time.monotonic() + timeout
+    last_err = None
     while time.monotonic() < deadline:
         try:
             resp = urlopen(f"http://localhost:{LLAMA_SERVER_PORT}/health", timeout=5)
             if resp.status == 200:
                 print("  llama-server ready")
-                return
-        except (URLError, OSError):
-            pass
+                return True
+        except (URLError, OSError) as e:
+            last_err = e
         time.sleep(2)
-    print("  WARNING: llama-server did not become ready within timeout")
+    print(f"  WARNING: llama-server did not become ready within {timeout}s (last error: {last_err})")
+    return False
 
 
-def _wait_for_proxy(timeout: int = 120) -> None:
+def _wait_for_proxy(timeout: int = 120) -> bool:
     """Wait until the proxy responds to a health check."""
     from urllib.request import URLError, urlopen
 
@@ -384,11 +485,12 @@ def _wait_for_proxy(timeout: int = 120) -> None:
             resp = urlopen(f"http://localhost:{PROXY_PORT}/", timeout=5)
             if resp.status == 200:
                 print("  Proxy ready")
-                return
+                return True
         except URLError:
             pass
         time.sleep(2)
     print("  WARNING: proxy did not become ready within timeout")
+    return False
 
 
 def _slot_cache_dir() -> Path:
@@ -465,6 +567,60 @@ class RequestResult:
         )
 
 
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContentionMetrics:
+    """Contention metrics derived from proxy observability for one slot run.
+
+    Every metric is nullable — when a metric cannot be derived (no logs, no
+    health snapshots, no resolved models) the field stays ``None`` and the
+    reason is recorded in :attr:`unavailable`, so absent metrics are reported
+    explicitly rather than silently omitted (parent AC1).
+
+    Sources (constraint: no new production instrumentation):
+
+    - ``queue_timeout_*``  — proxy log parsing of the
+      ``contention_queue_fallback_after_queue`` / ``contention_queue_dispatch``
+      markers (reusing ``contention_queue_simulation``).
+    - ``local_stream_*``   — per-request ``resolved_model`` from the proxy's
+      ``X-Resolved-Model`` response header (local provider prefix).
+    - ``quarantine_*``     — ``/health`` endpoint snapshots taken during the
+      run (transitions into local-unavailable states).
+    """
+
+    queue_timeout_count: int | None = None
+    queue_dispatch_count: int | None = None
+    queue_timeout_rate: float | None = None
+    local_stream_count: int | None = None
+    observed_stream_count: int | None = None
+    local_stream_share: float | None = None
+    quarantine_episode_count: int | None = None
+    health_samples: int = 0
+    log_files: list[str] = field(default_factory=list)
+    unavailable: dict[str, str] = field(default_factory=dict)
+
+    def summary(self) -> dict:
+        return dict(
+            queue_timeout_count=self.queue_timeout_count,
+            queue_timeout_rate=(
+                round(self.queue_timeout_rate, 4)
+                if self.queue_timeout_rate is not None else None
+            ),
+            local_stream_share=(
+                round(self.local_stream_share, 4)
+                if self.local_stream_share is not None else None
+            ),
+            local_stream_count=self.local_stream_count,
+            observed_stream_count=self.observed_stream_count,
+            quarantine_episode_count=self.quarantine_episode_count,
+            unavailable=dict(self.unavailable),
+        )
+
+    def to_dict(self) -> dict:
+        return self.summary()
+
+
 @dataclass
 class SlotRunResult:
     slot_count: int
@@ -476,6 +632,21 @@ class SlotRunResult:
     phase: str = "cold"  # 'cold' or 'warm' measurement phase
     proxy_restart_time: str | None = None  # ISO timestamp of proxy restart
     llama_ready_time: str | None = None  # ISO timestamp of llama-server ready
+    concurrency: int | None = None  # concurrent requests configured for the run
+    prompt_tokens_target: int | None = None  # prompt-token target for the run
+    start_unix: float | None = None  # monotonic-ish window start (log filtering)
+    end_unix: float | None = None  # window end (log filtering)
+    contention: ContentionMetrics | None = None  # contention metrics for the run
+    # --- Reproducibility / viability metadata (LP-0MVAZPQUM006EAC7) ---
+    command: str = ""  # exact CLI invocation for this run
+    config_diff: dict = field(default_factory=dict)  # session_slot_pool_size before/after
+    model: str = ""  # model name benchmarked (e.g. "plan" -> local Qwen3)
+    context_size: int | None = None  # local_model_ctx_size (total, across slots)
+    per_slot_ctx: int | None = None  # physical per-slot ctx: ctx // slots - headroom
+    observed_slots: int | None = None  # llama-server --parallel actually observed
+    system_memory_bytes: int | None = None  # MemAvailable at run end
+    llama_started: bool | None = None  # None = n/a (skip-restart), True/False = restart
+    viability_warnings: list[str] = field(default_factory=list)  # OOM/start-failure/ctx-reduction
 
     def summary(self) -> dict:
         completed = [r for r in self.results if r.status == "completed"]
@@ -503,6 +674,7 @@ class SlotRunResult:
             start_time=self.start_time,
             end_time=self.end_time,
             error=self.error,
+            contention=self.contention.summary() if self.contention else None,
         )
 
     def to_dict(self) -> dict:
@@ -510,15 +682,199 @@ class SlotRunResult:
             config=dict(
                 slot_count=self.slot_count,
                 total_requests=len(self.results),
-                prompt_tokens_target=TARGET_PROMPT_TOKENS,
+                concurrency=self.concurrency,
+                prompt_tokens_target=(
+                    self.prompt_tokens_target if self.prompt_tokens_target is not None
+                    else TARGET_PROMPT_TOKENS
+                ),
                 output_tokens_target=TARGET_OUTPUT_TOKENS,
                 phase=self.phase,
                 proxy_restart_time=self.proxy_restart_time,
                 llama_ready_time=self.llama_ready_time,
             ),
+            reproducibility=self.reproducibility_dict(),
+            viability=self.viability_dict(),
             requests=[r.to_dict() for r in self.results],
             summary=self.summary(),
+            contention=self.contention.to_dict() if self.contention else {},
         )
+
+    def reproducibility_dict(self) -> dict:
+        """Exact command / config diff / model / ctx for this run (AC1)."""
+        return dict(
+            command=self.command,
+            config_diff=dict(self.config_diff),
+            model=self.model,
+            context_size=self.context_size,
+            per_slot_ctx=self.per_slot_ctx,
+        )
+
+    def viability_dict(self) -> dict:
+        """Viability-failure signals for this run: OOM/start-failure/ctx (AC4)."""
+        return dict(
+            observed_slots=self.observed_slots,
+            system_memory_bytes=self.system_memory_bytes,
+            llama_started=self.llama_started,
+            warnings=list(self.viability_warnings),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Contention metric derivation helpers
+# ---------------------------------------------------------------------------
+
+#: Provider-name prefixes that denote the local model in ``X-Resolved-Model``
+#: header values (e.g. ``local/Qwen3``, ``local-qwen3/Qwen3``).
+_LOCAL_PROVIDER_PREFIXES = ("local", "local-")
+
+
+def is_local_resolved_model(resolved_model: str | None) -> bool:
+    """True when an X-Resolved-Model header value denotes the local model."""
+    if not resolved_model:
+        return False
+    provider = resolved_model.split("/", 1)[0].strip()
+    return provider.startswith(_LOCAL_PROVIDER_PREFIXES)
+
+
+def derive_local_stream_share(
+    results: Sequence[RequestResult],
+) -> tuple[int, int, float | None, str | None]:
+    """Derive local stream share from per-request resolved models.
+
+    Returns ``(local_count, observed_count, share, unavailable_reason)``.
+    ``observed`` counts completed requests that reported a resolved model;
+    ``share`` is ``local_count / observed``, or ``None`` with a reason when
+    no request reported a resolved model.
+    """
+    observed = [r for r in results if r.status == "completed" and r.resolved_model]
+    if not observed:
+        return 0, 0, None, "no completed requests reported a resolved model"
+    local = sum(1 for r in observed if is_local_resolved_model(r.resolved_model))
+    return local, len(observed), local / len(observed), None
+
+
+def _local_backend_available(snapshot: dict) -> bool | None:
+    """Interpret one /health snapshot as local-backend availability.
+
+    Returns True when the local backend is up, False when it is quarantined /
+    unavailable (self-healing, GPU wedge, not running, or unreachable), and
+    None when the snapshot carries no availability signals (unknown).
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    if snapshot.get("self_healing_in_progress"):
+        return False
+    if snapshot.get("gpu_wedge_detected"):
+        return False
+    running = snapshot.get("llama_server_running")
+    reachable = snapshot.get("backend_reachable")
+    if running is None and reachable is None:
+        return None
+    return bool(running) and bool(reachable)
+
+
+def count_quarantine_episodes(
+    health_snapshots: Sequence[dict],
+) -> tuple[int | None, str | None]:
+    """Count local quarantine episodes from /health snapshots.
+
+    An episode is a transition from a known-available state to a known-
+    unavailable state between consecutive snapshots (a contiguous period of
+    local unavailability). Returns ``(count, unavailable_reason)``; the count
+    is ``None`` (with a reason) when no snapshots were collected.
+    """
+    if not health_snapshots:
+        return None, "no health snapshots collected"
+    episodes = 0
+    prev_known: bool | None = None
+    usable = 0
+    for snap in health_snapshots:
+        available = _local_backend_available(snap)
+        if available is None:
+            continue  # unknown state — neither starts nor ends an episode
+        usable += 1
+        if prev_known is True and available is False:
+            episodes += 1
+        prev_known = available
+    if usable == 0:
+        return None, "no usable health snapshots collected"
+    return episodes, None
+
+
+def derive_queue_metrics(
+    log_files: Sequence[str],
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+) -> tuple[int | None, int | None, float | None, list[str], str | None]:
+    """Derive queue-timeout metrics from proxy logs in a run window.
+
+    Returns ``(timeout_count, dispatch_count, timeout_rate, matched_files,
+    unavailable_reason)``. The rate is ``timeout / (dispatch + timeout)`` — the
+    fraction of queue-path arrivals that exceeded the contention-queue caps and
+    fell back. When no queue-path events occurred in the window the counts are
+    0 but the rate is ``None`` (a rate is meaningless with no arrivals).
+    """
+    if _cqs is None:
+        return None, None, None, [], "contention_queue_simulation import unavailable"
+    resolved_files = [str(p) for p in log_files]
+    try:
+        loaded = _cqs.load_events(resolved_files, start=start_ts, end=end_ts)
+    except FileNotFoundError:
+        return None, None, None, [], "no proxy log files matched in run window"
+    except Exception:
+        return None, None, None, [], "proxy log parsing failed"
+    timeouts = sum(1 for e in loaded.events if e.type == "fallback_after_queue")
+    dispatches = sum(1 for e in loaded.events if e.type == "dispatch")
+    arrivals = timeouts + dispatches
+    if arrivals == 0:
+        return timeouts, dispatches, None, loaded.files, (
+            "no queue-path events in run window"
+        )
+    return timeouts, dispatches, timeouts / arrivals, loaded.files, None
+
+
+def build_contention_metrics(
+    results: Sequence[RequestResult],
+    *,
+    log_files: Sequence[str] | None = None,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    health_snapshots: Sequence[dict] | None = None,
+) -> ContentionMetrics:
+    """Assemble contention metrics for one slot run.
+
+    Each metric derives from its own observability source independently so a
+    failure in one (e.g. missing logs) does not mask the others; every absent
+    metric carries an explicit reason in ``unavailable``.
+    """
+    metrics = ContentionMetrics()
+    metrics.log_files = [str(p) for p in (log_files or [])]
+
+    timeouts, dispatches, rate, matched, reason = derive_queue_metrics(
+        metrics.log_files, start_ts=start_ts, end_ts=end_ts
+    )
+    metrics.queue_timeout_count = timeouts
+    metrics.queue_dispatch_count = dispatches
+    metrics.queue_timeout_rate = rate
+    metrics.log_files = matched or metrics.log_files
+    if reason:
+        metrics.unavailable["queue_timeout"] = reason
+
+    local, observed, share, reason = derive_local_stream_share(results)
+    metrics.local_stream_count = local
+    metrics.observed_stream_count = observed
+    metrics.local_stream_share = share
+    if reason:
+        metrics.unavailable["local_stream_share"] = reason
+
+    snapshots = list(health_snapshots or [])
+    metrics.health_samples = len(snapshots)
+    episodes, reason = count_quarantine_episodes(snapshots)
+    metrics.quarantine_episode_count = episodes
+    if reason:
+        metrics.unavailable["quarantine_episodes"] = reason
+
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +939,31 @@ async def _poll_health() -> dict:
         pass
 
     return result
+
+
+def _fetch_health_snapshot() -> dict | None:
+    """Blocking fetch of the raw /health JSON, or None on any failure."""
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen(PROGRESS_POLL_URL, timeout=3)
+        return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+async def _sample_health_loop(
+    snapshots: list,
+    interval_s: float = HEALTH_SAMPLE_INTERVAL_S,
+) -> None:
+    """Append /health snapshots to *snapshots* every *interval_s* seconds.
+
+    Runs until cancelled; failures are appended as ``None`` sentinels so the
+    quarantine-episode derivation can tell a genuine quarantine from a
+    sampling gap (sentinels are skipped as "unknown" states).
+    """
+    while True:
+        snapshots.append(await asyncio.to_thread(_fetch_health_snapshot))
+        await asyncio.sleep(interval_s)
 
 
 async def _heartbeat_progress(
@@ -800,10 +1181,25 @@ async def run_slot_benchmark(
     num_requests: int = TOTAL_REQUESTS_PER_RUN,
     warmup: int = WARMUP_REQUESTS,
     base_url: str = f"http://localhost:{PROXY_PORT}",
+    prompt_tokens: int = TARGET_PROMPT_TOKENS,
+    health_samples: list | None = None,
+    health_interval_s: float = HEALTH_SAMPLE_INTERVAL_S,
+    clean_cache: bool = False,
 ) -> SlotRunResult:
-    """Execute a benchmark run for a given slot count."""
-    result = SlotRunResult(slot_count=slot_count)
+    """Execute a benchmark run for a given slot count.
+
+    When *health_samples* is a list, /health snapshots are appended to it for
+    the duration of the run (used for quarantine-episode counting by
+    :func:`build_contention_metrics`).
+
+    Slot cache is cleared ONLY when *clean_cache* is True (explicit opt-in via
+    ``--clean-cache``); a live production proxy's warm KV cache must never be
+    dropped by a benchmark default (AC5 config-drift guard, LP-0MVAZPQUM006EAC7).
+    """
+    result = SlotRunResult(slot_count=slot_count, concurrency=num_requests,
+                           prompt_tokens_target=prompt_tokens)
     result.start_time = datetime.now(UTC).isoformat()
+    result.start_unix = time.time()
 
     print(f"\n{'='*60}")
     print(f"  Slot count: {slot_count}")
@@ -814,100 +1210,117 @@ async def run_slot_benchmark(
         result.error = "httpx not installed"
         return result
 
-    # Clear slot cache for clean measurements
-    clear_slot_cache()
+    # Clear slot cache ONLY on explicit opt-in (--clean-cache); the default
+    # preserves the live proxy's warm KV cache (AC5, LP-0MVAZPQUM006EAC7).
+    if clean_cache:
+        clear_slot_cache()
 
-    async with httpx.AsyncClient(timeout=TARGET_RESPONSE_TIME_S * 2) as client:
-        # Create all tasks with staggered start delays.
-        # Each task independently sleeps for stagger * index seconds before
-        # sending, so requests start 60s apart but run concurrently.
-        async def _run_session(idx):
-            """Run a 4-turn session for one benchmark request.
+    health_task = None
+    if health_samples is not None:
+        health_task = asyncio.create_task(
+            _sample_health_loop(health_samples, health_interval_s)
+        )
 
-            Turn 1: Send initial system prompt (shared + varied ~8k numbers)
-                    + user prompt asking to count.
-            Turns 2-4: Send 100 new random numbers each, ask updated count.
-            """
-            is_warmup = idx < 0
-            session_id = f"benchmark-{slot_count}-{idx}-{uuid.uuid4().hex[:8]}"
-            label = "Warmup" if is_warmup else f"Request {idx+1}/{num_requests}"
+    try:
+        async with httpx.AsyncClient(timeout=TARGET_RESPONSE_TIME_S * 2) as client:
+            # Create all tasks with staggered start delays.
+            # Each task independently sleeps for stagger * index seconds before
+            # sending, so requests start 60s apart but run concurrently.
+            async def _run_session(idx):
+                """Run a 4-turn session for one benchmark request.
 
-            # Stagger: delay start by INTER_REQUEST_GAP_S * position
-            if idx > 0 and not is_warmup:
-                await asyncio.sleep(INTER_REQUEST_GAP_S * idx)
+                Turn 1: Send initial system prompt (shared + varied ~8k numbers)
+                        + user prompt asking to count.
+                Turns 2-4: Send 100 new random numbers each, ask updated count.
+                """
+                is_warmup = idx < 0
+                session_id = f"benchmark-{slot_count}-{idx}-{uuid.uuid4().hex[:8]}"
+                label = "Warmup" if is_warmup else f"Request {idx+1}/{num_requests}"
 
-            # Build initial system prompt with varied content
-            varied = build_varied_content(idx)
-            full_system = shared_content + varied
+                # Stagger: delay start by INTER_REQUEST_GAP_S * position
+                if idx > 0 and not is_warmup:
+                    await asyncio.sleep(INTER_REQUEST_GAP_S * idx)
 
-            headers = {"X-Session-Id": session_id}
-            session_base = max(idx, 0) * TOTAL_SESSION_TURNS
-            turn_results: list[RequestResult] = []
+                # Build initial system prompt with varied content
+                varied = build_varied_content(idx, prompt_tokens)
+                full_system = shared_content + varied
 
-            for turn in range(1, TOTAL_SESSION_TURNS + 1):
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                turn_label = f"{label} turn {turn}/{TOTAL_SESSION_TURNS}"
+                headers = {"X-Session-Id": session_id}
+                session_base = max(idx, 0) * TOTAL_SESSION_TURNS
+                turn_results: list[RequestResult] = []
 
-                # Build messages for this turn
-                if turn == 1:
-                    messages = [
-                        {"role": "system", "content": full_system},
-                        {"role": "user", "content": user_prompt},
-                    ]
-                else:
-                    extra = _generate_extra_numbers(idx, turn)
-                    follow_up = (
-                        f"Here are {EXTRA_NUMBERS_PER_TURN} more numbers: {extra}. "
-                        f"Count them too and tell me the total so far."
+                for turn in range(1, TOTAL_SESSION_TURNS + 1):
+                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    turn_label = f"{label} turn {turn}/{TOTAL_SESSION_TURNS}"
+
+                    # Build messages for this turn
+                    if turn == 1:
+                        messages = [
+                            {"role": "system", "content": full_system},
+                            {"role": "user", "content": user_prompt},
+                        ]
+                    else:
+                        extra = _generate_extra_numbers(idx, turn)
+                        follow_up = (
+                            f"Here are {EXTRA_NUMBERS_PER_TURN} more numbers: {extra}. "
+                            f"Count them too and tell me the total so far."
+                        )
+                        messages = [{"role": "user", "content": follow_up}]
+
+                    print(f"  [{now_str}] Sending {turn_label}...")
+
+                    req = await send_request(
+                        client, messages,
+                        index=session_base + turn,
+                        base_url=base_url,
+                        progress_label=turn_label,
+                        extra_headers=headers,
                     )
-                    messages = [{"role": "user", "content": follow_up}]
+                    turn_results.append(req)
 
-                print(f"  [{now_str}] Sending {turn_label}...")
+                    status_char = "✓" if req.status == "completed" else "✗"
+                    model_info = f"  via={req.resolved_model}" if req.resolved_model else ""
+                    print(f"    {turn_label}: {status_char}  "
+                          f"dur={req.total_duration_seconds:.0f}s  "
+                          f"tokens={req.completion_tokens}{model_info}"
+                          + (f"  error={req.error}" if req.error else ""))
 
-                req = await send_request(
-                    client, messages,
-                    index=session_base + turn,
-                    base_url=base_url,
-                    progress_label=turn_label,
-                    extra_headers=headers,
-                )
-                turn_results.append(req)
+                # Summarize the session
+                if is_warmup:
+                    total_dur = sum(r.total_duration_seconds for r in turn_results)
+                    print(f"  Warmup: ✓ ({total_dur:.0f}s total, {TOTAL_SESSION_TURNS} turns)")
+                else:
+                    for r in turn_results:
+                        result.results.append(r)
+                    total_dur = sum(r.total_duration_seconds for r in turn_results)
+                    total_tok = sum(r.completion_tokens for r in turn_results if r.status == "completed")
+                    print(f"  {label}: ✓  "
+                          f"dur={total_dur:.0f}s  "
+                          f"tokens={total_tok}  "
+                          f"({TOTAL_SESSION_TURNS} turns)")
 
-                status_char = "✓" if req.status == "completed" else "✗"
-                model_info = f"  via={req.resolved_model}" if req.resolved_model else ""
-                print(f"    {turn_label}: {status_char}  "
-                      f"dur={req.total_duration_seconds:.0f}s  "
-                      f"tokens={req.completion_tokens}{model_info}"
-                      + (f"  error={req.error}" if req.error else ""))
+            # Build task list
+            tasks = []
+            if warmup > 0:
+                tasks.append(_run_session(-1))
+            for i in range(num_requests):
+                tasks.append(_run_session(i))
 
-            # Summarize the session
-            if is_warmup:
-                total_dur = sum(r.total_duration_seconds for r in turn_results)
-                print(f"  Warmup: ✓ ({total_dur:.0f}s total, {TOTAL_SESSION_TURNS} turns)")
-            else:
-                for r in turn_results:
-                    result.results.append(r)
-                total_dur = sum(r.total_duration_seconds for r in turn_results)
-                total_tok = sum(r.completion_tokens for r in turn_results if r.status == "completed")
-                print(f"  {label}: ✓  "
-                      f"dur={total_dur:.0f}s  "
-                      f"tokens={total_tok}  "
-                      f"({TOTAL_SESSION_TURNS} turns)")
+            # Run all tasks concurrently, processing results as they complete
+            await asyncio.gather(*tasks)
 
-        # Build task list
-        tasks = []
-        if warmup > 0:
-            tasks.append(_run_session(-1))
-        for i in range(num_requests):
-            tasks.append(_run_session(i))
-
-        # Run all tasks concurrently, processing results as they complete
-        await asyncio.gather(*tasks)
-
-        # Sort results back to request_index order
-        result.results.sort(key=lambda r: r.request_index)
+            # Sort results back to request_index order
+            result.results.sort(key=lambda r: r.request_index)
+    finally:
+        if health_task is not None:
+            health_task.cancel()
+            try:
+                await health_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     result.end_time = datetime.now(UTC).isoformat()
+    result.end_unix = time.time()
 
     # Capture GPU memory snapshot
     result.gpu_memory_bytes = _capture_gpu_memory()
@@ -916,23 +1329,81 @@ async def run_slot_benchmark(
 
 
 def _capture_gpu_memory() -> int | None:
-    """Try to capture GPU memory usage from /admin/metrics."""
+    """Try to capture GPU memory usage.
+
+    Sources, in order:
+    1. ``/admin/metrics`` — JSON keys ``rocm_vram_used_bytes`` /
+       ``cuda_vram_used_bytes`` (modern proxy emits JSON rather than the
+       historic Prometheus text lines the original parser scanned).
+    2. ``rocm-smi --showmeminfo vram --json`` — used bytes on ROCm hosts
+       (APU/GTT platforms); ``LLAMA_PROXY_ROCSMI_BIN`` overrides the binary.
+    3. ``nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits``.
+
+    Returns None when nothing is available (recorded as an explicit
+    non-available metric rather than a hidden failure; LP-0MVAZPQUM006EAC7
+    records memory where available).
+    """
+    # 1. Proxy /admin/metrics (JSON).
     try:
+        import json as _json
         import urllib.request
         resp = urllib.request.urlopen(
             f"http://localhost:{PROXY_PORT}/admin/metrics", timeout=5
         )
-        for line in resp.read().decode().split("\n"):
-            if "rocm_vram_used_bytes" in line:
+        text = resp.read().decode()
+        try:
+            data = _json.loads(text)
+        except _json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            for key in ("rocm_vram_used_bytes", "cuda_vram_used_bytes"):
+                val = data.get(key) or data.get("gpu", {}).get(key)
+                if isinstance(val, (int, float)) and val > 0:
+                    return int(val)
+        else:
+            for line in text.split("\n"):
                 parts = line.split()
-                if len(parts) >= 2:
-                    return int(parts[-1])
-            if "cuda_vram_used_bytes" in line:
-                parts = line.split()
-                if len(parts) >= 2:
-                    return int(parts[-1])
+                if len(parts) >= 2 and (
+                    "rocm_vram_used_bytes" in parts[0]
+                    or "cuda_vram_used_bytes" in parts[0]
+                ):
+                    try:
+                        return int(parts[-1])
+                    except ValueError:
+                        pass
     except Exception:
         pass
+
+    # 2. rocm-smi (ROCm GPUs / APUs).
+    rocsmi = os.environ.get("LLAMA_PROXY_ROCSMI_BIN", "rocm-smi")
+    try:
+        result = subprocess.run(
+            [rocsmi, "--showmeminfo", "vram", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            import json as _json
+            data = _json.loads(result.stdout)
+            for card in data.values() or []:
+                used = card.get("VRAM Total Used Memory (B)")
+                if isinstance(used, str) and used.strip().isdigit():
+                    return int(used)
+    except Exception:
+        pass
+
+    # 3. nvidia-smi.
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            value = result.stdout.strip().splitlines()[0].strip()
+            if value.isdigit():
+                return int(value) * 1024 * 1024
+    except Exception:
+        pass
+
     return None
 
 
@@ -948,19 +1419,29 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
     report = {
         "benchmark": "Slot-count optimization for local Qwen3",
         "description": (
-            "Measures throughput, latency, and GPU memory across varying "
-            "session_slot_pool_size values for ~10-min queries with ~16k token "
-            "system prompts."
+            "Measures throughput, latency, GPU memory, and contention metrics "
+            "(queue-timeout rate, local stream share, local quarantine "
+            "episodes) across varying session_slot_pool_size values for "
+            "~10-min queries."
         ),
         "prompt_tokens_target": TARGET_PROMPT_TOKENS,
         "output_tokens_target": TARGET_OUTPUT_TOKENS,
         "target_response_time_seconds": TARGET_RESPONSE_TIME_S,
         "timestamp": datetime.now(UTC).isoformat(),
+        # Reproducibility / environmental context for each run is recorded
+        # per-run (command, config diff, model, ctx size, per-slot ctx,
+        # observed slots, system memory, viability warnings) so a third party
+        # can re-derive the comparison without re-running (LP-0MVAZPQUM006EAC7).
         "runs": [
             dict(
                 slot_count=r.slot_count,
+                concurrency=r.concurrency,
+                prompt_tokens_target=(r.prompt_tokens_target or TARGET_PROMPT_TOKENS),
                 summary=r.summary(),
                 requests=[req.to_dict() for req in r.results],
+                contention=r.contention.to_dict() if r.contention else {},
+                reproducibility=r.reproducibility_dict(),
+                viability=r.viability_dict(),
                 start_time=r.start_time,
                 end_time=r.end_time,
             )
@@ -973,12 +1454,13 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
     report_path.write_text(json.dumps(report, indent=2))
 
     # Write human-readable summary
+    concurrency = all_results[0].concurrency if all_results else TOTAL_REQUESTS_PER_RUN
     lines = [
         "=" * 72,
         "  SLOT-COUNT BENCHMARK REPORT",
         "=" * 72,
         f"  Target: {TARGET_PROMPT_TOKENS:,} prompt tokens, ~{TARGET_RESPONSE_TIME_S}s response",
-        f"  Requests per run: {TOTAL_REQUESTS_PER_RUN}  |  Warmup: 0 (use --warmup to enable)",
+        f"  Concurrency: {concurrency}  |  Requests per run: {TOTAL_REQUESTS_PER_RUN}  |  Warmup: 0 (use --warmup to enable)",
         f"  Date: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
         f"{'Slots':>6}  {'Completed':>10}  {'Errors':>7}  {'Avg Dur':>8}  {'Min Dur':>8}  {'Max Dur':>8}  {'Avg TPS':>8}  {'Avg TTFT':>9}  {'GPU Mem':>10}",
@@ -1025,6 +1507,84 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
             f"{t} tokens generated"
         )
 
+    # Contention metrics section (queue-timeout, local stream share,
+    # quarantine episodes) — parent AC1. Every metric is reported; absent
+    # metrics show the explicit reason instead of being silently omitted.
+    lines += [
+        "-" * 80,
+        "",
+        "  CONTENTION METRICS (per slot count)",
+        "    Queue-timeout = contention_queue_fallback_after_queue count",
+        "    Queue rate    = queue-timeouts / queue-path arrivals (dispatch+timeout)",
+        "    Local share   = local stream share (local / observed resolved streams)",
+        "    Quarantine    = local quarantine episodes (from /health snapshots)",
+        "",
+        f"{'Slots':>6}  {'Queue t/o':>10}  {'Queue rate':>10}  {'Local share':>12}  {'Local streams':>14}  {'Quarant. episodes':>18}",
+        "-" * 80,
+    ]
+
+    for r in all_results:
+        c = r.contention.summary() if r.contention else {}
+        q_count = c.get("queue_timeout_count")
+        q_rate = c.get("queue_timeout_rate")
+        l_share = c.get("local_stream_share")
+        l_count = c.get("local_stream_count")
+        l_observed = c.get("observed_stream_count")
+        q_epi = c.get("quarantine_episode_count")
+
+        q_count_str = '--' if q_count is None else f"{q_count}"
+        q_rate_str = '--' if q_rate is None else f"{q_rate:.1%}"
+        l_share_str = '--' if l_share is None else f"{l_share:.1%}"
+        l_count_str = '--' if l_count is None else (
+            f"{l_count}/{l_observed or 0}"
+        )
+        q_epi_str = '--' if q_epi is None else f"{q_epi}"
+
+        lines.append(
+            f"{r.slot_count:>6}  "
+            f"{q_count_str:>10}  "
+            f"{q_rate_str:>10}  "
+            f"{l_share_str:>12}  "
+            f"{l_count_str:>14}  "
+            f"{q_epi_str:>18}"
+        )
+
+    # Explicit absent-metric reasons (rather than silent omission)
+    reasons_seen: list[str] = []
+    for r in all_results:
+        if not r.contention:
+            continue
+        for metric, reason in r.contention.unavailable.items():
+            entry = f"    slots={r.slot_count}: {metric} — {reason}"
+            if entry not in reasons_seen:
+                reasons_seen.append(entry)
+    if reasons_seen:
+        lines += ["-" * 80, "", "  Metrics not measurable (explicit reasons):"]
+        lines += reasons_seen
+
+    # Repro context + viability signals (LP-0MVAZPQUM006EAC7 AC1/AC4)
+    lines += ["-" * 80, "", "  REPRODUCIBILITY + VIABILITY (per slot count)"]
+    for r in all_results:
+        lines.append(f"    slots={r.slot_count}:")
+        lines.append(f"      command: {r.command or '--'}")
+        diff = r.config_diff.get("session_slot_pool_size", {})
+        lines.append(
+            f"      config: session_slot_pool_size {diff.get('before', '?')} -> "
+            f"{diff.get('after', '?')}  |  model: {r.model or '--'}"
+        )
+        lines.append(
+            f"      ctx: total={r.context_size or '--'}  "
+            f"per-slot(physical)={r.per_slot_ctx or '--'}  "
+            f"observed slots={r.observed_slots or '--'}"
+        )
+        mem = _format_viability_gb(r.system_memory_bytes)
+        lines.append(f"      system MemAvailable: {mem}  llama_started: {r.llama_started}")
+        if r.viability_warnings:
+            for w in r.viability_warnings:
+                lines.append(f"      ! VIABILITY: {w}")
+        else:
+            lines.append("      viability: no warnings")
+
     summary_path.write_text("\n".join(lines))
     print("\n" + "\n".join(lines[5:]))
 
@@ -1032,7 +1592,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
 
 
 async def run_test_mode(
-    slot_count: int = 6,
+    slot_count: int | None = None,
     base_url: str = f"http://localhost:{PROXY_PORT}",
     skip_restart: bool = False,
     clean_cache: bool = False,
@@ -1044,7 +1604,9 @@ async def run_test_mode(
     restart services unless ``skip_restart`` is False (the default).
 
     Args:
-        slot_count: Slot count to configure (only used when restarting).
+        slot_count: Slot count to configure (only used when restarting). When
+            None, the current config value is used and restored afterwards, so
+            the connectivity check never changes the running config.
         base_url: Proxy base URL.
         skip_restart: If True, skip config update and service restart.
         clean_cache: If True, clear slot cache before restart. Default: False.
@@ -1054,15 +1616,22 @@ async def run_test_mode(
     print(f"  TEST MODE: Sending a single small prompt (phase={phase})")
     print(f"{'='*60}")
 
+    original_slot = None
+    original_config = None
     if not skip_restart:
-        print(f"  Updating config to slot count {slot_count}...")
-        set_slot_count(slot_count)
+        # Never write a hard-coded value; snapshot what is there and restore it
+        # afterwards so the proxy is left untouched (LP-0MVAZPQUM006EAC7 AC5).
+        original_config = _read_config()
+        original_slot = _read_slot_pool_size_from_config()
+        target = slot_count if slot_count is not None else original_slot
+        print(f"  Updating config to slot count {target}...")
+        set_slot_count(target)
         # Only clear slot cache when --clean-cache is explicitly set
         if clean_cache:
             clear_slot_cache()
         else:
             print("  Slot cache preserved (--clean-cache not set)")
-        restart_services(slot_count)
+        restart_services(target)
     else:
         print("  Skipping config update and restart (--skip-restart)")
 
@@ -1094,6 +1663,12 @@ async def run_test_mode(
     else:
         print(f"  ✗ Test FAILED: {req.error}")
 
+    # Restore the config we changed (test mode must never leave drift)
+    if not skip_restart and original_config is not None:
+        print(f"  Restoring original config (session_slot_pool_size: {original_slot})...")
+        _write_config(original_config)
+        restart_services(original_slot or 1)
+
     print(f"\n{'='*60}")
     print("  TEST MODE COMPLETE")
     print(f"{'='*60}")
@@ -1116,8 +1691,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Run all slot counts: {SLOT_COUNTS}",
     )
     group.add_argument(
-        "--slots", type=int, choices=SLOT_COUNTS,
-        help=f"Run a single slot count: {SLOT_COUNTS}",
+        "--sweep", action="store_true",
+        help=f"Run the 1/2/3-slot sweep only: {SWEEP_SLOT_COUNTS}",
+    )
+    group.add_argument(
+        "--slots", type=int, choices=sorted(set(SLOT_COUNTS) | set(SWEEP_SLOT_COUNTS)),
+        help=f"Run a single slot count: {sorted(set(SLOT_COUNTS) | set(SWEEP_SLOT_COUNTS))}",
     )
     group.add_argument(
         "--test", action="store_true",
@@ -1133,7 +1712,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Output directory for results (default: ./benchmark-results)",
     )
     parser.add_argument(
-        "--resume", type=int, choices=SLOT_COUNTS, default=None,
+        "--resume", type=int,
+        choices=sorted(set(SLOT_COUNTS) | set(SWEEP_SLOT_COUNTS)), default=None,
         help="Resume from given slot count (skip earlier ones)",
     )
     parser.add_argument(
@@ -1152,6 +1732,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--phase", type=str, choices=["cold", "warm"], default="cold",
         help="Measurement phase: 'cold' (first runs post-restart) or 'warm' (steady-state). Default: cold",
     )
+    parser.add_argument(
+        "--concurrency", type=int, default=TOTAL_REQUESTS_PER_RUN,
+        help=(
+            f"Number of concurrent benchmark requests per slot-count run "
+            f"(default: {TOTAL_REQUESTS_PER_RUN}, preserving existing behaviour)"
+        ),
+    )
+    parser.add_argument(
+        "--prompt-tokens", type=int, default=TARGET_PROMPT_TOKENS,
+        help=(
+            f"Target total prompt size in tokens (default: {TARGET_PROMPT_TOKENS}, "
+            f"preserving existing behaviour; split ~50/50 shared/varied)"
+        ),
+    )
+    parser.add_argument(
+        "--log-dir", type=str, default=str(LOG_DIR),
+        help=f"Proxy log directory scanned for contention metrics (default: {LOG_DIR})",
+    )
+    parser.add_argument(
+        "--no-health-samples", action="store_true",
+        help=(
+            "Disable /health sampling. By default /health is sampled during "
+            "each run to derive local quarantine episodes"
+        ),
+    )
 
     return parser.parse_args(argv)
 
@@ -1166,21 +1771,31 @@ def main(argv: list[str] | None = None) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.concurrency < 1:
+        print("Error: --concurrency must be >= 1", file=sys.stderr)
+        sys.exit(2)
+    if args.prompt_tokens < 1:
+        print("Error: --prompt-tokens must be >= 1", file=sys.stderr)
+        sys.exit(2)
+
     # Build prompt materials
     print("Building prompt materials...")
-    shared = build_shared_content()
+    shared = build_shared_content(args.prompt_tokens)
     user_prompt = build_user_prompt()
 
     # Rough token estimates using character heuristics
     # English prose: ~4 chars/token. Numbers+commas: ~5 chars/token.
     # Actual tokenization is more expensive (numbers are subword tokens).
     # Use conservative estimates: ~3 chars/token for prose, ~4 for numbers.
-    sample_varied = build_varied_content(0)
+    sample_varied = build_varied_content(0, args.prompt_tokens)
     shared_est = len(shared) // 3
     varied_est = len(sample_varied) // 4
-    print(f"  Shared content: ~{shared_est:,} tokens (target: {TARGET_SHARED_TOKENS:,})  [{len(shared):,} chars]")
-    print(f"  Varied content: ~{varied_est:,} tokens (target: {TARGET_VARIED_TOKENS:,})  [{len(sample_varied):,} chars]  [generated per request]")
-    print(f"  Total: ~{shared_est + varied_est:,} tokens (target: {TARGET_PROMPT_TOKENS:,})")
+    shared_target = max(20, args.prompt_tokens // 2)
+    varied_target = max(20, args.prompt_tokens - args.prompt_tokens // 2)
+    print(f"  Shared content: ~{shared_est:,} tokens (target: {shared_target:,})  [{len(shared):,} chars]")
+    print(f"  Varied content: ~{varied_est:,} tokens (target: {varied_target:,})  [{len(sample_varied):,} chars]  [generated per request]")
+    print(f"  Total: ~{shared_est + varied_est:,} tokens (target: {args.prompt_tokens:,})")
+    print(f"  Concurrency: {args.concurrency} concurrent requests")
 
     if args.dry_run:
         print("\nDry run — config looks valid. Run without --dry-run to execute.")
@@ -1189,7 +1804,7 @@ def main(argv: list[str] | None = None) -> None:
     # Handle --test mode: send a single small request to verify connectivity
     if args.test:
         asyncio.run(run_test_mode(
-            slot_count=args.slots or SLOT_COUNTS[0],
+            slot_count=None,
             base_url=f"http://localhost:{PROXY_PORT}",
             skip_restart=args.skip_restart,
             clean_cache=args.clean_cache,
@@ -1198,7 +1813,10 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     # Determine slot counts to run
-    slot_counts = SLOT_COUNTS.copy()
+    if args.sweep:
+        slot_counts = SWEEP_SLOT_COUNTS.copy()
+    else:
+        slot_counts = SLOT_COUNTS.copy()
     if args.slots is not None:
         slot_counts = [args.slots]
     if args.resume:
@@ -1207,95 +1825,180 @@ def main(argv: list[str] | None = None) -> None:
             print(f"No slot counts >= {args.resume} in {SLOT_COUNTS}")
             sys.exit(1)
 
+    # Snapshot the ORIGINAL slot count + full config so the sweep restores
+    # exactly what it found (production value here is 1, not the historical 6;
+    # never hard-code the restore value).
+    original_slot = _read_slot_pool_size_from_config()
+    original_config = _read_config()
+    command_line = " ".join(sys.argv)
+
     all_results: list[SlotRunResult] = []
+    report_path: Path | None = None
+    error: Exception | None = None
+    try:
+        for slot_count in slot_counts:
+            print(f"\n{'#'*60}")
+            print(f"#  Slot count: {slot_count}")
+            print(f"{'#'*60}")
 
-    for slot_count in slot_counts:
-        print(f"\n{'#'*60}")
-        print(f"#  Slot count: {slot_count}")
-        print(f"{'#'*60}")
+            # 1. Update config
+            set_slot_count(slot_count)
 
-        # 1. Update config
-        set_slot_count(slot_count)
+            # 2. Restart services
+            restart_ok: bool | None = None
+            if not args.skip_restart:
+                # Only clear slot cache when --clean-cache is explicitly set
+                # Default is OFF to preserve warm cache for realistic measurements
+                if args.clean_cache:
+                    clear_slot_cache()
+                else:
+                    print("  Slot cache preserved (--clean-cache not set)")
 
-        # 2. Restart services
-        if not args.skip_restart:
-            # Only clear slot cache when --clean-cache is explicitly set
-            # Default is OFF to preserve warm cache for realistic measurements
-            if args.clean_cache:
-                clear_slot_cache()
+                # Record restart timestamps for reproducible measurements
+                from datetime import datetime
+                proxy_restart_time = datetime.now(UTC).isoformat()
+                print(f"  Proxy restart recorded at: {proxy_restart_time}")
+
+                restart_ok = restart_services(slot_count)
+
+                # Record llama-server ready timestamp
+                llama_ready_time = datetime.now(UTC).isoformat()
+                print(f"  Llama-server ready at: {llama_ready_time}")
             else:
-                print("  Slot cache preserved (--clean-cache not set)")
+                print("  Skipping restart (--skip-restart)")
+                proxy_restart_time = None
+                llama_ready_time = None
 
-            # Record restart timestamps for reproducible measurements
-            from datetime import datetime
-            proxy_restart_time = datetime.now(UTC).isoformat()
-            print(f"  Proxy restart recorded at: {proxy_restart_time}")
+            # Determine warmup count
+            warmup_count = WARMUP_REQUESTS if args.warmup else 0
 
-            restart_services(slot_count)
+            # 3. Run benchmark
+            health_samples: list | None = None if args.no_health_samples else []
+            run_result = asyncio.run(run_slot_benchmark(
+                slot_count=slot_count,
+                shared_content=shared,
+                user_prompt=user_prompt,
+                warmup=warmup_count,
+                num_requests=args.concurrency,
+                prompt_tokens=args.prompt_tokens,
+                health_samples=health_samples,
+                clean_cache=args.clean_cache,
+            ))
+            # Attach metadata for JSON output
+            run_result.phase = args.phase
+            run_result.proxy_restart_time = proxy_restart_time
+            run_result.llama_ready_time = llama_ready_time
+            # --- Reproducibility + viability metadata (LP-0MVAZPQUM006EAC7) ---
+            run_result.command = command_line
+            run_result.config_diff = {
+                "session_slot_pool_size": {"before": original_slot, "after": slot_count},
+            }
+            run_result.model = "plan -> local-qwen3/Qwen3"
+            run_result.context_size = _read_ctx_size_from_config()
+            # Physical per-slot ctx mirrors provider.py: ctx // slots - output headroom.
+            if run_result.context_size:
+                run_result.per_slot_ctx = max(
+                    1, run_result.context_size // slot_count - PHYSICAL_CTX_HEADROOM
+                )
+            run_result.observed_slots = _observe_llama_parallel()
+            run_result.system_memory_bytes = _capture_system_memory()
+            if args.skip_restart:
+                run_result.llama_started = None
+            else:
+                run_result.llama_started = bool(restart_ok)
+                if restart_ok is False:
+                    run_result.viability_warnings.append(
+                        f"llama-server failed to become ready at {slot_count} slots "
+                        f"(OOM / start failure) — requests may all error"
+                    )
+            if (run_result.observed_slots is not None
+                    and run_result.observed_slots != slot_count):
+                run_result.viability_warnings.append(
+                    f"observed llama-server slot count {run_result.observed_slots} != "
+                    f"requested {slot_count}"
+                )
+            if (run_result.per_slot_ctx and run_result.context_size
+                    and slot_count > 1
+                    and run_result.per_slot_ctx < run_result.context_size // 4):
+                run_result.viability_warnings.append(
+                    f"per-slot context {run_result.per_slot_ctx} < 25% of model ctx "
+                    f"{run_result.context_size} — may change routing behaviour"
+                )
+            if run_result.viability_warnings:
+                for w in run_result.viability_warnings:
+                    print(f"  ! VIABILITY: {w}")
+            # Derive contention metrics from proxy observability: queue-timeout
+            # and local stream share always derive (logs + response headers);
+            # quarantine episodes derive from /health snapshots when the
+            # --health-samples flag collected them. Absent metrics are reported
+            # explicitly with a reason rather than silently omitted.
+            run_result.contention = build_contention_metrics(
+                run_result.results,
+                log_files=[str(Path(args.log_dir) / "proxy.log*")],
+                start_ts=run_result.start_unix,
+                end_ts=run_result.end_unix,
+                health_snapshots=health_samples or [],
+            )
+            all_results.append(run_result)
 
-            # Record llama-server ready timestamp
-            llama_ready_time = datetime.now(UTC).isoformat()
-            print(f"  Llama-server ready at: {llama_ready_time}")
+            # 4. Quick inline summary
+            s = run_result.summary()
+            print(f"\n  --- Slot count {slot_count} summary ---")
+            print(f"  Completed: {s['completed']}/{s['total_requests']}  "
+                  f"Errors: {s['errors']}")
+            if s['avg_duration']:
+                print(f"  Avg duration: {s['avg_duration']:.0f}s  "
+                      f"Avg TTFT: {s['avg_ttft']:.2f}s  "
+                      f"Avg TPS: {s['avg_tps']:.1f}")
+                gpu_str = ""
+                if s.get("gpu_memory_bytes"):
+                    gb = s["gpu_memory_bytes"] / (1024**3)
+                    gpu_str = f"  GPU memory: {gb:.1f}GB"
+                print(f"  Total tokens generated: {s['total_completion_tokens']}{gpu_str}")
+
+            # 5. Write intermediate result
+            run_file = output_dir / f"slot_{slot_count}.json"
+            run_file.write_text(json.dumps(run_result.to_dict(), indent=2))
+            print(f"  Intermediate result saved to: {run_file}")
+
+            # Brief pause between runs for GPU to idle
+            if slot_count != slot_counts[-1]:
+                print("  Cooling down (30s)...")
+                time.sleep(30)
+
+            # Generate final report
+            report_path = generate_report(all_results, output_dir)
+    except KeyboardInterrupt:
+        print("\nInterrupted — restoring original config before exit.")
+    except Exception as e:  # restore must run on ANY failure (AC5)
+        error = e
+        print(f"\nERROR during sweep: {e}")
+        print("Restoring original config before exit.")
+    finally:
+        # Restore the ORIGINAL slot count / config (production value here is 1;
+        # never hard-code it). Config must be left exactly as found so the proxy
+        # runs the correct scheduled mode afterwards (AC5). This must run even
+        # if the sweep failed or was interrupted mid-way.
+        print(f"\nRestoring original config (session_slot_pool_size: {original_slot})...")
+        try:
+            _write_config(original_config)
+        except Exception:  # restore best-effort — never mask the primary failure
+            print("  WARNING: could not restore config file")
+        if not args.skip_restart:
+            try:
+                restart_services(original_slot)
+            except Exception as re_:  # restart best-effort — never mask the primary failure
+                print(f"  WARNING: restart with original slot failed: {re_}")
         else:
-            print("  Skipping restart (--skip-restart)")
-            proxy_restart_time = None
-            llama_ready_time = None
+            print("  WARNING: slot count left at last tested value. Restart manually.")
 
-        # Determine warmup count
-        warmup_count = WARMUP_REQUESTS if args.warmup else 0
-
-        # 3. Run benchmark
-        run_result = asyncio.run(run_slot_benchmark(
-            slot_count=slot_count,
-            shared_content=shared,
-            user_prompt=user_prompt,
-            warmup=warmup_count,
-        ))
-        # Attach metadata for JSON output
-        run_result.phase = args.phase
-        run_result.proxy_restart_time = proxy_restart_time
-        run_result.llama_ready_time = llama_ready_time
-        all_results.append(run_result)
-
-        # 4. Quick inline summary
-        s = run_result.summary()
-        print(f"\n  --- Slot count {slot_count} summary ---")
-        print(f"  Completed: {s['completed']}/{s['total_requests']}  "
-              f"Errors: {s['errors']}")
-        if s['avg_duration']:
-            print(f"  Avg duration: {s['avg_duration']:.0f}s  "
-                  f"Avg TTFT: {s['avg_ttft']:.2f}s  "
-                  f"Avg TPS: {s['avg_tps']:.1f}")
-            gpu_str = ""
-            if s.get("gpu_memory_bytes"):
-                gb = s["gpu_memory_bytes"] / (1024**3)
-                gpu_str = f"  GPU memory: {gb:.1f}GB"
-            print(f"  Total tokens generated: {s['total_completion_tokens']}{gpu_str}")
-
-        # 5. Write intermediate result
-        run_file = output_dir / f"slot_{slot_count}.json"
-        run_file.write_text(json.dumps(run_result.to_dict(), indent=2))
-        print(f"  Intermediate result saved to: {run_file}")
-
-        # Brief pause between runs for GPU to idle
-        if slot_count != slot_counts[-1]:
-            print("  Cooling down (30s)...")
-            time.sleep(30)
-
-    # Generate final report
-    report_path = generate_report(all_results, output_dir)
-
-    # Restore original slot count (6 = current production value)
-    print("\nRestoring slot count to 6...")
-    set_slot_count(6)
-    if not args.skip_restart:
-        restart_services(6)
-    else:
-        print("  WARNING: slot count left at last tested value. Restart manually.")
+    if error is not None:
+        raise error
 
     print(f"\n{'='*72}")
     print("  BENCHMARK COMPLETE")
     print(f"  Report: {report_path}")
+    print(f"  Restored config: {CONFIG_YAML} -> session_slot_pool_size: {original_slot}")
     print(f"  Summary: {output_dir / 'slot_benchmark_summary.txt'}")
     print(f"{'='*72}")
 

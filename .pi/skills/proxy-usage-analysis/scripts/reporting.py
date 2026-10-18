@@ -333,6 +333,8 @@ def build_report(
        f"(local {summary.local_requests} / remote {summary.remote_requests})")
     ap(f"- Fallback events: **{len(summary.fallback_events)}** "
        f"({fallback_rate * 100:.1f}% of requests) | dispatch denied: {summary.dispatch_denied_count}")
+    ap(f"- Local-skip events: **{len(summary.routing_skip_events)}** | "
+       f"hold-cycle re-emissions (excluded from demand): **{summary.hold_cycle_reemission_count}**")
     ap(f"- Unattributed stream events (no session UUID): {summary.unattributed_events}")
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
 
@@ -414,6 +416,10 @@ def build_report(
             ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% | "
                f"{d} ({_pct(d, fast_skips):.1f}%) | {n} ({_pct(n, cheap_skips):.1f}%) |")
 
+    # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3): surfaced
+    # separately so a stuck hold is not read as repeated client retries.
+    _append_hold_cycle_section(ap, summary)
+
     initial = Counter((s.initial_provider, s.initial_model) for s in sessions)
     ap("")
     ap("## Per-model breakdown (initial assignment)")
@@ -439,6 +445,8 @@ def build_report(
     _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
 
     _append_busy_section(ap, summary, schedule)
+
+    _append_mode_timeline_section(ap, summary, mode_map)
 
     ap("")
     ap("## Recommendations")
@@ -498,6 +506,74 @@ def build_report(
         "(LP-0MTNIJQ8U007AGVW)."
     )
     return "\n".join(lines) + "\n"
+
+
+def _append_mode_timeline_section(
+    ap: callable, summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None
+) -> None:
+    """Append the ``## Mode timeline & restarts`` section to the report.
+
+    Lists every observed mode transition and restart event in timestamp
+    order, displaying the attribution (source / actor / reason) when
+    available. Restart rows show the restart kind (``spawned`` /
+    ``complete`` / ``startup``) plus the requested operating mode when the
+    log line carried one (``mode=`` marker); mode-switch rows show the
+    applied/requested mode. Events without markers render ``unknown`` for
+    the absent fields so historical logs degrade gracefully (backward
+    compatible, LP-0MVC0S6U5003SEDJ).
+
+    Source values display consistently as the canonical ``scheduler`` /
+    ``worker`` / ``api`` / ``manual`` labels (LP-0MVC144KS001PDR4).
+    """
+    transitions = mode_map.transitions if mode_map else []
+    restarts = summary.restart_events_sorted
+
+    # Merge mode transitions and restart events into a single timeline.
+    # (timestamp, event_type, mode_or_kind, source, actor, reason)
+    timeline: list[tuple[datetime, str, str, str | None, str | None, str | None]] = []
+    for tr in transitions:
+        timeline.append((tr.ts, "mode_switch", tr.mode, tr.source, tr.actor, tr.reason))
+    for ev in restarts:
+        if ev.kind != "restart":
+            continue
+        kind = ev.restart_kind or "-"
+        if ev.mode:
+            # The set_mode() spawn carries the mode being switched to;
+            # surface it as the requested mode next to the restart kind
+            # (LP-0MVC144KS001PDR4 AC2).
+            kind = f"{kind} → {ev.mode}"
+        timeline.append((ev.ts, "restart", kind, ev.source, ev.actor, ev.reason))
+
+    timeline.sort(key=lambda x: x[0])
+    if not timeline:
+        return
+
+    ap("")
+    ap("## Mode timeline & restarts")
+    ap("")
+    ap(
+        "Each line shows the timestamp, event type, and attribution "
+        "(source / actor / reason) when available. Restart rows also show the "
+        "restart kind and, when logged, the requested operating mode; "
+        "mode-switch rows show the applied mode. Events without markers show "
+        "\"unknown\" for attribution (historical logs degrade gracefully, "
+        "LP-0MVC0S6U5003SEDJ)."
+    )
+    ap("")
+    ap("| Timestamp | Event | Mode / Kind | Source | Actor | Reason |")
+    ap("|---|---|---|---|---|---|")
+
+    for ts, event_type, mode_or_kind, source, actor, reason in timeline:
+        ts_str = _fmt_dt(ts)
+        # Source renders verbatim as parsed — already one of the canonical
+        # ``scheduler`` / ``worker`` / ``api`` / ``manual`` labels (the
+        # tolerant extractor in log_parser only accepts ``[a-z0-9_]+``
+        # tokens); ``None`` (no marker) renders "unknown" so historical
+        # logs degrade gracefully (LP-0MVC144KS001PDR4 AC4).
+        src = source if source else "unknown"
+        act = actor if actor else "unknown"
+        rsn = reason if reason else "unknown"
+        ap(f"| {ts_str} | {event_type} | {mode_or_kind} | {src} | {act} | {rsn} |")
 
 
 def _resolve_trigger_for(ctx_size: int, slots: int) -> int:
@@ -808,6 +884,49 @@ def _append_compaction_section(
     if all_dry and (would_have_avoided or avoided or would_still_fallback):
         ap("")
         ap("_Impact estimates in this window are hypothetical: no live dispatch change; " "the session history was not mutated._")
+
+
+def _append_hold_cycle_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Hold-cycle re-emissions`` section to the report.
+
+    ``routing_skip_local`` events logged with ``chain_hold_cycle > 0`` are
+    re-emissions of a single held request restarted across chain-hold cycles
+    (LP-0MU5AIAAY003KVM0), not genuine new client demand. Aggregation keeps
+    them out of every demand/local-skip counter (the hourly ``local_skip``
+    totals, the ``routing_skip_local reasons`` table, and its percentages);
+    this section surfaces them separately so an operator can tell a stuck
+    hold from a client retry storm. Omitted when the window has no hold-cycle
+    re-emissions.
+
+    Background on the demand-vs-re-emission distinction: cycle 0 is the first
+    (pre-hold) cycle and is genuine demand; every hold-restart increments the
+    cycle, so ``cycle > 0`` skips are the same request held
+    (``chain_hold_max_cycles`` bounds the re-emissions).
+    """
+    events = summary.hold_cycle_routing_skip_events
+    if not events:
+        return
+    ap("")
+    ap("## Hold-cycle re-emissions")
+    ap("")
+    ap("`routing_skip_local` events with `chain_hold_cycle>0` are re-emissions "
+       "of a request held across chain-hold cycles (LP-0MU5AIAAY003KVM0), not "
+       "genuine new client demand. They are excluded from the local-skip "
+       "counts, the `routing_skip_local reasons` table, and the fallback / "
+       "demand ratios in this report, and surfaced here separately so a stuck "
+       "hold is distinguishable from a client retry storm.")
+    ap("")
+    ap(f"- Hold-cycle routing-skip re-emissions: **{len(events)}** "
+       "(the cycle-0 occurrence of each held request is still counted in the "
+       "demand aggregates above)")
+    by_session: Counter = Counter()
+    for ev in events:
+        by_session[ev.session or UNKNOWN_LABEL] += 1
+    ap("")
+    ap("| Session | Re-emissions |")
+    ap("|---|---|")
+    for session, count in by_session.most_common():
+        ap(f"| {session} | {count} |")
 
 
 def _append_error_section(ap, summary: AnalysisResult) -> None:
@@ -1521,6 +1640,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         ),
         "dispatch_denied": summary.dispatch_denied_count,
         "unattributed_events": summary.unattributed_events,
+        "hold_cycle_routing_skip_events": summary.hold_cycle_reemission_count,
         "fast_sessions": sum(1 for s in sessions if s.bucket != "cheap"),
         "cheap_sessions": sum(1 for s in sessions if s.bucket == "cheap"),
         "errors": len(summary.error_events),

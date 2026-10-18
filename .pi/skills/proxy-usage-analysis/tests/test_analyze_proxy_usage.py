@@ -1,4 +1,10 @@
 
+# <!-- REFACTOR-LP-0MVDFQC2X005S7WE
+# smell: formatting
+# severity: high
+# description: Ambiguous variable name: `l`
+# -->
+
 # <!-- REFACTOR-LP-0MTHLGVPO004DZ56
 # smell: unused_import
 # severity: critical
@@ -166,6 +172,27 @@ class TestLogLineParsing:
         assert ev.kind == "routing_skip"
         assert ev.reason == "large_context_bypass"
         assert ev.session == "aaaaaaaa-1111-2222-3333-444444444444"
+
+    def test_routing_skip_chain_hold_cycle_parsed(self):
+        # The proxy stamps chain_hold_cycle=<N> on routing_skip_local lines
+        # (LP-0MU5AIAAY003KVM0); the parser carries it so aggregation can
+        # distinguish hold-cycle re-emissions from genuine demand.
+        ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CHAIN_HOLD_CYCLE_2)
+        assert ev.kind == "routing_skip"
+        assert ev.reason == "context_too_large"
+        assert ev.chain_hold_cycle == 2
+        ev0 = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CHAIN_HOLD_CYCLE_0)
+        assert ev0.kind == "routing_skip"
+        assert ev0.chain_hold_cycle == 0
+
+    def test_routing_skip_without_chain_hold_cycle_field(self):
+        # Backward compatibility (AC4): pre-chain-hold rotated logs carry no
+        # chain_hold_cycle token; the field must default to None (treated as
+        # cycle 0 downstream) and the line must still parse.
+        ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CONTEXT_TOO_LARGE)
+        assert ev.kind == "routing_skip"
+        assert ev.reason == "context_too_large"
+        assert ev.chain_hold_cycle is None
 
     def test_dispatch_denied(self):
         ev = log_parser.parse_log_line(fixtures.DISPATCH_DENIED)
@@ -552,6 +579,152 @@ class TestErrorLineParsing:
         # src_file reflects the actual source path
         assert from_plain[0].src_file == "proxy.log.2026-08-03_13"
         assert from_gz[0].src_file == "proxy.log.2026-08-03_13.gz"
+
+
+class TestAttributionMarkers:
+    """Parsing of the actor/source/reason attribution markers added by
+    LP-0MVAPNC2900145RH (LP-0MVC0S6U5003SEDJ).
+
+    The markers ride on the restart/mode-switch/startup log paths; absent
+    markers (historical logs) must degrade gracefully to the pre-attribution
+    behaviour (new fields stay ``None``).
+    """
+
+    def test_spawned_restart_with_attribution(self):
+        """A mode-switch restart spawned line carrying the attribution captured
+        at set_mode() time populates source/actor/reason."""
+        ev = log_parser.parse_log_line(fixtures.RESTART_SPAWNED_ATTRIBUTED)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "spawned"
+        assert ev.source == "scheduler"
+        assert ev.actor == "mode-scheduler"
+        assert ev.reason == "scheduled mode change"
+
+    def test_spawned_restart_without_attribution_preserves_old_behaviour(self):
+        """Historical spawned lines carry no markers: new fields stay None and
+        the raw line is still retained (backward compatible)."""
+        ev = log_parser.parse_log_line(fixtures.RESTART_SPAWNED_LINE)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "spawned"
+        assert ev.source is None
+        assert ev.actor is None
+        assert ev.reason is None
+        assert ev.raw and "Mode-switch restart spawned" in ev.raw
+
+    def test_spawned_restart_missing_individual_keys(self):
+        """Only a subset of the attribution keys present: the others stay None
+        (never fatal)."""
+        line = (
+            "2026-10-18 05:00:00,000 - INFO - Mode-switch restart spawned: "
+            f"{fixtures.RESTART_SCRIPT} source=manual"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.source == "manual"
+        assert ev.actor is None
+        assert ev.reason is None
+
+    def test_router_mode_restart_complete_with_attribution(self):
+        """Tolerant: markers on the restart-complete line are extracted too
+        (the proxy does not emit them today; future-proof and never fatal)."""
+        ev = log_parser.parse_log_line(fixtures.RESTART_COMPLETE_ATTRIBUTED)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "complete"
+        assert ev.source == "api"
+        assert ev.actor == "herdr"
+        assert ev.reason == "maintenance window"
+
+    def test_router_mode_restart_complete_without_attribution(self):
+        ev = log_parser.parse_log_line(fixtures.RESTART_COMPLETE_LINE)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "complete"
+        assert ev.source is None
+        assert ev.actor is None
+        assert ev.reason is None
+
+    def test_mode_switch_line_with_attribution(self):
+        """The scheduler logstamped its applied-mode line with
+        source=scheduler actor=mode-scheduler."""
+        ev = log_parser.parse_log_line(fixtures.MODE_SWITCH_ATTRIBUTED)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.source == "scheduler"
+        assert ev.actor == "mode-scheduler"
+
+    def test_mode_switch_line_without_attribution(self):
+        """Historical applied-mode lines carry no markers: fields stay None."""
+        ev = log_parser.parse_log_line(fixtures.MODE_SWITCH_CHEAP)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.source is None
+        assert ev.actor is None
+        assert ev.reason is None
+
+    def test_grandfathering_line_without_attribution(self):
+        """Grandfathering lines do not carry markers today; fields stay None."""
+        ev = log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_GRANDFATHERING_CHEAP)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.source is None
+        assert ev.actor is None
+        assert ev.reason is None
+
+    def test_startup_attribution_line(self):
+        """start-proxy.sh --restart reasons are echoed into the new process
+        startup log before the ``Starting LLama Proxy Server`` marker; parsed
+        as a ``restart`` startup event carrying the definitive attribution."""
+        ev = log_parser.parse_log_line(fixtures.STARTUP_ATTRIBUTION_LINE)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "startup"
+        assert ev.source == "api"
+        assert ev.actor == "herdr"
+        assert ev.reason == "manual (no reason provided)"
+        assert ev.ts == datetime(2026, 10, 18, 5, 0, 1, 500000)
+
+    def test_startup_attribution_line_is_a_restart_signal(self):
+        """The startup line widens the restart-signal set: a local stream error
+        adjacent to it is classified as a restart kill."""
+        local = (
+            "2026-10-18 05:00:02,000 - WARNING - Stream error: "
+            "session=019fc754-d847-75af-86ea-991480e799d0 provider=local "
+            "model=Qwen3 error=RemoteProtocolError"
+        )
+        window_start = datetime(2026, 10, 18, 5, 0, 0)
+        window_end = datetime(2026, 10, 18, 5, 1, 0)
+        events = [
+            e
+            for e in (
+                log_parser.parse_log_line(fixtures.STARTUP_ATTRIBUTION_LINE),
+                log_parser.parse_log_line(local),
+            )
+            if e is not None
+        ]
+        res = aggregation.aggregate(events, window_start, window_end, _schedule())
+        (ev,) = res.error_events
+        assert ev.root_cause == "mode_switch_restart"
+
+    def test_attribution_extractors_tolerate_arbitrary_lines(self):
+        """The tolerant extractors pull source=/actor=/reason= out of arbitrary
+        log lines, stopping the reason at the next known key (or line end) so
+        space-containing reasons survive."""
+        assert log_parser._attribution_from(
+            "routing_check reason=context_too_large source=scheduler session=abc"
+        ) == ("scheduler", None, "context_too_large")
+        assert log_parser._attribution_from(
+            "some line actor=herdr reason=rebalanced after maintenance window end"
+        ) == (None, "herdr", "rebalanced after maintenance window end")
+        assert log_parser._attribution_from(
+            "unattributed historical line"
+        ) == (None, None, None)
 
 
 class TestDiscoverLogFiles:
@@ -1257,11 +1430,18 @@ class TestModeTimelineBucketing:
             bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
             mm,
         )
-        # Timeline reconstructed from the applied-mode lines.
+        # Timeline reconstructed from the applied-mode lines
+        # (now ModeTransition objects, LP-0MVC144KS001PDR4).
         assert mm.transitions == [
-            (datetime(2026, 8, 14, 10, 0, 2), "fast"),
-            (datetime(2026, 8, 15, 1, 0, 8, 679000), "cheap"),
-            (datetime(2026, 8, 15, 10, 0, 18, 41000), "fast"),
+            bucketing.ModeTransition(
+                datetime(2026, 8, 14, 10, 0, 2), "fast", None, None, None
+            ),
+            bucketing.ModeTransition(
+                datetime(2026, 8, 15, 1, 0, 8, 679000), "cheap", None, None, None
+            ),
+            bucketing.ModeTransition(
+                datetime(2026, 8, 15, 10, 0, 18, 41000), "fast", None, None, None
+            ),
         ]
         s = res.sessions["cheap-sess"]
         assert s.bucket == "cheap"
@@ -1302,8 +1482,12 @@ class TestModeTimelineBucketing:
             bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
             mm,
         )
-        # Manual switch reconstructed as a cheap transition.
-        assert (datetime(2026, 8, 19, 18, 20, 16, 684000), "cheap") in mm.transitions
+        # Manual switch reconstructed as a cheap transition
+        # (ModeTransition object, LP-0MVC144KS001PDR4).
+        cheap_trans = bucketing.ModeTransition(
+            datetime(2026, 8, 19, 18, 20, 16, 684000), "cheap", None, None, None
+        )
+        assert cheap_trans in mm.transitions
         assert res.sessions["manual-fast"].bucket == "fast"
         assert res.sessions["manual-fast"].slots == 3
         assert res.sessions["manual-cheap"].bucket == "cheap"
@@ -2461,6 +2645,96 @@ class TestSummaryByHourActivity:
             {"hour": "2026-08-02 09:00:00", "seconds": 30.0},
             {"hour": "2026-08-02 10:00:00", "seconds": 5.0},
         ]
+        json.dumps(data)  # round-trips
+
+
+class TestChainHoldCycleDedup:
+    """A held request re-emitted across chain-hold cycles is counted exactly
+    once in the demand / local-skip aggregates (its cycle-0 occurrence), with
+    the ``chain_hold_cycle > 0`` re-emissions surfaced separately as
+    hold-cycle activity (LP-0MUIEO6IP0030CT3).
+
+    Fixture: one session whose routing_skip_local fires in cycle 0 (genuine
+    demand) and is then re-emitted in cycles 1-3 by hold restarts.
+    """
+
+    WINDOW_START = datetime(2026, 8, 2, 14, 0, 0)
+    WINDOW_END = datetime(2026, 8, 2, 15, 0, 0)
+    SESSION = "019fc27d-3a46-7e5c-871e-57ab32f875f3"
+    HOUR_KEY = datetime(2026, 8, 2, 14, 0, 0)
+
+    def _lines(self) -> list[str]:
+        started = (
+            "2026-08-02 14:02:00,000 - INFO - Stream started: provider=local "
+            f"model=Qwen3 session={self.SESSION} request=[]"
+        )
+        skip = (
+            "2026-08-02 14:02:20,100 - INFO - routing_skip_local provider=local-qwen3 "
+            "model=Qwen3 estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 "
+            "new_tokens=323 cached_ratio=0.99 reason=context_too_large → skipping local, "
+            "routing to next remote provider session={sid} chain_hold_cycle={cycle}"
+        )
+        return [started] + [
+            skip.format(sid=self.SESSION, cycle=c) for c in (0, 1, 2, 3)
+        ]
+
+    def _summary(self):
+        return aggregation.aggregate(
+            _events(self._lines()), self.WINDOW_START, self.WINDOW_END, _schedule()
+        )
+
+    def test_cycle0_counted_once_in_demand_aggregates(self):
+        # AC2: the cycle-0 occurrence is the ONLY one counted in the demand
+        # aggregates (hourly local_skip, routing_skip_events, per-session
+        # routing_skips, routing_skip_reason_counts).
+        summary = self._summary()
+        assert len(summary.routing_skip_events) == 1
+        assert summary.routing_skip_events[0].chain_hold_cycle == 0
+        assert summary.routing_skip_reason_counts["context_too_large"] == 1
+        assert summary.hourly_activity[self.HOUR_KEY]["local_skip"] == 1
+        assert summary.sessions[self.SESSION].routing_skips == 1
+
+    def test_hold_cycle_reemissions_surfaced_separately(self):
+        # AC2: the chain_hold_cycle>0 occurrences land in the dedicated
+        # hold-cycle list/count, never in the demand aggregates.
+        summary = self._summary()
+        assert summary.hold_cycle_reemission_count == 3
+        events = summary.hold_cycle_routing_skip_events
+        assert [e.chain_hold_cycle for e in events] == [1, 2, 3]
+        assert all(e.session == self.SESSION for e in events)
+
+    def test_backward_compat_no_field_is_cycle0(self):
+        # AC4: pre-chain-hold logs carry no chain_hold_cycle token; the line
+        # parses with chain_hold_cycle=None which aggregates as cycle 0
+        # (genuine demand), leaving historic counts unchanged.
+        summary = aggregation.aggregate(
+            _events([fixtures.ROUTING_SKIP_CONTEXT_TOO_LARGE]),
+            self.WINDOW_START, self.WINDOW_END, _schedule(),
+        )
+        assert len(summary.routing_skip_events) == 1
+        assert summary.routing_skip_events[0].chain_hold_cycle is None
+        assert summary.hold_cycle_reemission_count == 0
+        assert summary.hourly_activity[self.HOUR_KEY]["local_skip"] == 1
+
+    def test_report_surfaces_hold_cycle_and_excludes_from_reasons(self):
+        # AC3: the report surfaces the hold-cycle re-emission volume as its
+        # own metric/section and keeps the routing_skip_local reasons table
+        # (and its percentages) on genuine skips only.
+        md = reporting.build_report(self._summary(), None)
+        header = md.split("\n\n## Session summary", 1)[0]
+        assert "Local-skip events: **1**" in header
+        assert "hold-cycle re-emissions (excluded from demand): **3**" in header
+        section = md.split("## Hold-cycle re-emissions", 1)[1].split("## ", 1)[0]
+        assert "Hold-cycle routing-skip re-emissions: **3**" in section
+        reasons = md.split("## routing_skip_local reasons", 1)[1].split("## ", 1)[0]
+        assert "| context_too_large | 1 | 100.0% |" in reasons
+        assert "| context_too_large | 4 |" not in reasons
+
+    def test_json_summary_surfaces_hold_cycle_metric(self):
+        # AC3: the machine-readable summary exposes the hold-cycle re-emission
+        # volume as its own metric (demand counters stay de-duplicated).
+        data = reporting.summary_to_json(self._summary())
+        assert data["hold_cycle_routing_skip_events"] == 3
         json.dumps(data)  # round-trips
 
 
@@ -4476,3 +4750,292 @@ class TestTtftReportSection:
         ttft_pos = report.index("## Time to first token")
         ttc_pos = report.index("## Time to completion")
         assert ttft_pos < ttc_pos
+
+
+class TestAttributionInReport:
+    """LP-0MVC144KS001PDR4 — attribution surfaces in the report."""
+
+    MODE_WINDOW_START = datetime(2026, 10, 18, 0, 0, 0)
+    MODE_WINDOW_END = datetime(2026, 10, 19, 0, 0, 0)
+
+    def _events(self, lines: list[str]) -> list[log_parser.LogEvent]:
+        return [e for e in (log_parser.parse_log_line(ln) for ln in lines) if e is not None]
+
+    # -- aggregation: mode transitions carry attribution ---------------------
+
+    def test_aggregate_collects_mode_switch_attribution(self):
+        """A mode-switch line carrying source/actor/reason is collected with
+        those fields in the mode_map transitions."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.MODE_SWITCH_ATTRIBUTED,
+        ]
+        aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        assert len(mm.transitions) == 1
+        tr = mm.transitions[0]
+        assert isinstance(tr, bucketing.ModeTransition)
+        assert tr.mode == "cheap"
+        assert tr.source == "scheduler"
+        assert tr.actor == "mode-scheduler"
+        assert tr.reason is None
+
+    def test_aggregate_collects_restart_events_with_attribution(self):
+        """Restart events are collected in AnalysisResult.restart_events
+        carrying their attribution markers."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,
+            fixtures.RESTART_COMPLETE_ATTRIBUTED,
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        assert len(res.restart_events) == 2
+        # First event: spawned
+        spawned = res.restart_events[0]
+        assert spawned.kind == "restart"
+        assert spawned.restart_kind == "spawned"
+        assert spawned.source == "scheduler"
+        assert spawned.actor == "mode-scheduler"
+        assert spawned.reason == "scheduled mode change"
+        # Second event: complete
+        complete = res.restart_events[1]
+        assert complete.kind == "restart"
+        assert complete.restart_kind == "complete"
+        assert complete.source == "api"
+        assert complete.actor == "herdr"
+        assert complete.reason == "maintenance window"
+
+    def test_aggregate_restart_events_sorted(self):
+        """restart_events_sorted returns events in timestamp order."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_COMPLETE_ATTRIBUTED,
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        sorted_events = res.restart_events_sorted
+        assert sorted_events[0].ts < sorted_events[1].ts
+
+    # -- report section: attribution rendered --------------------------------
+
+    def test_report_section_shows_attribution_when_present(self):
+        """The mode-timeline section lists events with source/actor/reason
+        when markers are present."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.MODE_SWITCH_ATTRIBUTED,
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "## Mode timeline & restarts" in report
+        assert "scheduler" in report
+        assert "mode-scheduler" in report
+        assert "scheduled mode change" in report
+
+    def test_report_section_fallback_to_unknown_without_attribution(self):
+        """Events without markers show 'unknown' for attribution fields.
+        Backward compatible — no attribution present means historical logs."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.MODE_SWITCH_CHEAP,  # no attribution
+            fixtures.RESTART_SPAWNED_LINE,  # no attribution
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "## Mode timeline & restarts" in report
+        assert "unknown" in report
+
+    def test_report_section_zero_unknown_for_attributed_events(self):
+        """When every restart carries full attribution, no restart table row
+        shows 'unknown' (AC: zero 'unknown/unattributable' restarts that carry
+        a marker)."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,  # source/actor/reason all present
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        section_start = report.index("## Mode timeline & restarts")
+        next_heading = report.find("\n## ", section_start + 1)
+        section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
+        # Table rows (timestamp-prefixed) — every restart row must be fully
+        # attributed.
+        rows = [line for line in section_text.splitlines() if line.startswith("| 2026-")]
+        assert rows, "expected at least one timeline table row"
+        assert all("unknown" not in row for row in rows)
+        # And the restart's markers are present verbatim.
+        assert "scheduler" in rows[0]
+        assert "mode-scheduler" in rows[0]
+        assert "scheduled mode change" in rows[0]
+
+    def test_report_section_source_normalised(self):
+        """Source values render as the canonical labels: scheduler, worker, api, manual."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_COMPLETE_ATTRIBUTED,  # source=api
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "api" in report
+
+    def test_report_section_omitted_when_no_events(self):
+        """The section is omitted when there are no mode transitions or restarts."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            "2026-08-14 10:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "## Mode timeline & restarts" not in report
+
+    def test_restart_rows_show_requested_mode(self):
+        """A restart spawned by set_mode() carries the requested mode
+        (``mode=cheap`` on the line); the timeline row surfaces it.
+        (AC2: ... requested mode when attribution is present)."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,  # mode=cheap on the line
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        section_start = report.index("## Mode timeline & restarts")
+        next_heading = report.find("\n## ", section_start + 1)
+        section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
+        # The restart row shows kind → requested mode.
+        assert "spawned → cheap" in section_text
+        assert "scheduler" in section_text
+        assert "mode-scheduler" in section_text
+        assert "scheduled mode change" in section_text
+
+    def test_log_parser_extracts_mode_on_restart_lines(self):
+        """The tolerant mode= extractor populates ev.mode on restart events
+        that carry the marker (additive; None otherwise)."""
+        ev = log_parser.parse_log_line(fixtures.RESTART_SPAWNED_ATTRIBUTED)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.mode == "cheap"
+        # Historical unattributed spawns carry no mode.
+        ev2 = log_parser.parse_log_line(fixtures.RESTART_SPAWNED_LINE)
+        assert ev2 is not None
+        assert ev2.mode is None
+
+    def test_report_section_mixed_attribution(self):
+        """A mix of attributed and non-attributed events shows attribution
+        where present and 'unknown' where absent."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.MODE_SWITCH_CHEAP,  # no attribution
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "## Mode timeline & restarts" in report
+        # Should contain both 'unknown' (for the mode switch) and 'scheduler'
+        # (for the restart)
+        assert "scheduler" in report
+        # The section text should contain 'unknown' once (for the mode switch)
+        section_start = report.index("## Mode timeline & restarts")
+        next_heading = report.find("\n## ", section_start + 1)
+        section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
+        # 'unknown' should appear (for the mode_switch without attribution)
+        assert "unknown" in section_text

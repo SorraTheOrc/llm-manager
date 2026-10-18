@@ -39,9 +39,41 @@ import httpx
 from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from proxy import cold_start
+from proxy.provider_budget import (
+    RATE_LIMIT_WINDOW_SECONDS,
+    acquire_provider_budget,
+    record_provider_affinity,
+)
 from proxy.utils import _is_empty_response
 
 logger = logging.getLogger("llama-proxy.provider")
+
+
+def _maybe_record_provider_affinity(
+    provider_cfg: dict,
+    session_id: str | None,
+    response,
+    config: dict | None = None,
+) -> None:
+    """Record session -> gated-entry affinity after a successful dispatch.
+
+    The free-tier budget gate (LP-0MVDQ1GMO00801PL) only lets a session *wait*
+    for capacity if that session was already served by the entry, so the record
+    must reflect a real success: a 4xx/5xx response (e.g. the upstream 429 that
+    proves the allowance is spent) must never create affinity. Entries without
+    ``rate_limit_rpm`` are not gated and record nothing.
+    """
+    try:
+        if int(getattr(response, "status_code", 0) or 0) >= 400:
+            return
+        if int(provider_cfg.get("rate_limit_rpm", 0) or 0) <= 0:
+            return
+        record_provider_affinity(
+            session_id, str(provider_cfg.get("name") or ""), config
+        )
+    except Exception:  # pragma: no cover - affinity is best-effort telemetry
+        pass
 
 # ---------------------------------------------------------------------------
 # Cooldown / circuit-breaker state
@@ -2569,6 +2601,29 @@ def format_available_times(provider_cfg: dict) -> str:
     return ", ".join(parts) + " (UTC)"
 
 
+def format_budget_status(provider_cfg: dict) -> str:
+    """Format a provider entry's remaining request budget for display.
+
+    Returns ``"budget 7/10 per 60s"`` for an entry with ``rate_limit_rpm``
+    (remaining/limit within the current rolling window), or an empty string
+    when the entry is not budget-gated (LP-0MVDQ1GMO00801PL). Used by the
+    provider diagnostics table so operators can see how much free-tier
+    capacity is left instead of inferring it from skip logs.
+    """
+    try:
+        rpm = int(provider_cfg.get("rate_limit_rpm", 0) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if rpm <= 0:
+        return ""
+    from proxy.rate_limiter import get_rate_limiter
+
+    remaining = get_rate_limiter().remaining(
+        str(provider_cfg.get("name") or ""), rpm, RATE_LIMIT_WINDOW_SECONDS
+    )
+    return f"budget {remaining}/{rpm} per {RATE_LIMIT_WINDOW_SECONDS}s"
+
+
 def format_active_status(provider_cfg: dict, now_utc: datetime | None = None) -> str:
     """Format a provider's active status for display.
 
@@ -3063,6 +3118,24 @@ def _add_provider_header(response: Response, provider_name: str) -> Response:
     return response
 
 
+def _resolve_display_provider_name(provider_cfg: dict) -> str | None:
+    """Resolve the human-readable provider component used in X-Resolved-Model.
+
+    Priority: ``display_name`` (opt-in tier-aware label, e.g. ``MunitoAI
+    Free``) -> ``provider`` (actual provider brand name) -> ``name``
+    (provider entry name). The ``display_name`` field lets operators
+    distinguish provider tiers (free vs paid) that share a brand + model,
+    without touching failure-domain, cooldown, or usage-limit keys (which key
+    on endpoint, model, api_key_env, brand and entry name upstream of this
+    display string) (LP-0MVCQ36QV009QX8K).
+    """
+    return (
+        provider_cfg.get("display_name")
+        or provider_cfg.get("provider")
+        or provider_cfg.get("name")
+    )
+
+
 def _build_resolved_model_value(provider_cfg: dict) -> str | None:
     """Build the X-Resolved-Model header value from a provider config.
 
@@ -3072,12 +3145,13 @@ def _build_resolved_model_value(provider_cfg: dict) -> str | None:
     For local providers, uses ``llama_model`` as the model ID.
     For remote providers, uses ``model`` (upstream model ID).
 
-    The provider name is taken from the ``provider`` field first (actual
-    provider brand name), falling back to ``name`` (provider entry name)
-    for backward compatibility.  A warning is logged when a remote provider
-    entry lacks the ``provider`` field.
+    The provider name is resolved by ``_resolve_display_provider_name()``:
+    ``display_name`` first (opt-in tier-aware label, e.g. ``MunitoAI Free``),
+    then the ``provider`` field (actual provider brand name), falling back
+    to ``name`` (provider entry name) for backward compatibility.  A warning
+    is logged when a remote provider entry lacks the ``provider`` field.
     """
-    provider_name = provider_cfg.get("provider") or provider_cfg.get("name")
+    provider_name = _resolve_display_provider_name(provider_cfg)
     if not provider_name:
         return None
     model_id = provider_cfg.get("llama_model") or provider_cfg.get("model")
@@ -3194,6 +3268,11 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     ``all_slots_exhausted``) so clients can classify exhaustion without relying
     on the ``error`` prose, whose meaning is preserved for older clients
     (LP-0MU56ZM0K005F69G).
+
+    Verified end-to-end by ``proxy/tests/test_overnight_exhaustion_e2e.py``
+    (LP-0MV728XBH00546FB): ``Retry-After`` / ``retry_after`` are identical,
+    the stable ``code`` discriminator is present, the advertisement cap is
+    applied, and the hold is bounded by the real ``retry_after``.
     """
     if all_local_slot_exhaustion:
         # total_slots may be 0 if unknown; still format per acceptance criteria.
@@ -3257,6 +3336,11 @@ def _build_time_window_exhausted_response(
     Otherwise ``None`` is returned and the caller falls through to the generic
     exhausted response (whose diagnostics still expose any
     ``outside_time_window`` skips).
+
+    The ``outside_time_window`` variant is verified end-to-end by
+    ``proxy/tests/test_overnight_exhaustion_e2e.py`` (LP-0MV728XBH00546FB):
+    truthful ``retry_after`` + matching header, capped advertisement, and the
+    stable ``code`` discriminator.
     """
     if any_provider_tried or unavailable:
         return None
@@ -4117,6 +4201,54 @@ def _is_free_usage_limit_error(response: Response, body_text: str) -> bool:
     return False
 
 
+def _is_account_rate_limit_error(response: Response, body_text: str) -> bool:
+    """Return True when a 429 response is a per-ACCOUNT rate-limit error.
+
+    Detects upstream responses whose JSON body identifies the rate limit as
+    bound to a specific API-key account -- ``type == "rate_limit_error"`` or
+    ``code == "rate_limit_exceeded"`` (case-insensitive), either top-level
+    (observed api.munito.ai body) or nested under an ``error`` dict.
+
+    A per-account rate limit is consumed by ONE API key: entries that share a
+    gateway but use different ``api_key_env`` values have independent quota
+    (LP-0MSMBWB23009XYPW), so the failing entry must poison only its ACCOUNT
+    key in the per-request exclusion set, NOT the shared endpoint failure
+    domain -- otherwise paid sibling keys on the same gateway are skipped for
+    the rest of the request despite having independent quota
+    (LP-0MVCX0E2V001VB5N).
+
+    Expected upstream format (observed from api.munito.ai):
+        HTTP 429
+        Body: {"code": "rate_limit_exceeded", "type": "rate_limit_error"}
+    """
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status != 429:
+        return False
+
+    try:
+        payload = json.loads(body_text) if body_text else None
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        # Check the top level first, then a nested ``error`` dict (OpenAI-style
+        # bodies nest the markers under ``error``; the observed api.munito.ai
+        # body is top-level).
+        candidates = [payload]
+        error = payload.get("error")
+        if isinstance(error, dict):
+            candidates.append(error)
+        for cand in candidates:
+            err_type = str(cand.get("type", "")).strip().lower()
+            code = str(cand.get("code", "")).strip().lower()
+            if err_type == "rate_limit_error" or code == "rate_limit_exceeded":
+                return True
+
+    # Fallback: check raw body text for the identifying markers
+    lowered_body = (body_text or "").strip().lower()
+    return "rate_limit_error" in lowered_body or "rate_limit_exceeded" in lowered_body
+
+
 def _parse_resets_in(message: str) -> float | None:
     """Parse a ``Resets in ...`` duration from an upstream error message.
 
@@ -4825,6 +4957,7 @@ def _handle_connection_error_in_fallback(
     provider_type: str,
     cooldown_seconds: float,
     attempts: list[dict[str, Any]],
+    config: dict | None = None,
 ) -> bool:
     """If *exc* is a connection error, mark the provider unavailable, record
     a diagnostic attempt entry, and return ``True`` (caller should ``continue``
@@ -4833,10 +4966,26 @@ def _handle_connection_error_in_fallback(
     Applies exponential backoff for remote providers (capped at configured
     *cooldown_seconds*, so setting it to 0 disables backoff entirely).
 
+    Grace-period immunity (LP-0MV9UNIOZ009RIAN): while ``cold_start.is_cold()``
+    is True and *provider_type* is ``"local"``, a connection error reflects the
+    backend still warming up after a restart, not a provider fault — so it is
+    DEFERRED instead of quarantined.  The attempt is recorded as
+    ``cold_start_deferral``, no cooldown is applied and the failure counter is
+    not bumped, letting the next chain cycle try local again immediately.
+
     Returns ``False`` if *exc* is **not** a connection error (caller should
     re-raise or handle differently).
     """
     if _is_connection_error(exc):
+        if provider_type == "local" and cold_start.is_cold(config):
+            _record_attempt(
+                attempts,
+                provider=provider_name,
+                type=provider_type,
+                status="cold_start_deferral",
+                error=str(type(exc).__name__),
+            )
+            return True
         cooldown = cooldown_seconds
         if provider_type == "remote" and cooldown_seconds > 0:
             count = _provider_failure_count.get(provider_name, 0)
@@ -4865,6 +5014,7 @@ def _handle_http_error_with_cooldown(
     cooldown_seconds: float,
     attempts: list[dict[str, Any]],
     body_text: str,
+    config: dict | None = None,
 ) -> float:
     """Handle an HTTP error response: compute effective cooldown, mark the
     provider unavailable, record a diagnostic attempt entry, and return the
@@ -4872,10 +5022,35 @@ def _handle_http_error_with_cooldown(
 
     Applies exponential backoff for remote providers.
 
+    Grace-period immunity (LP-0MV9UNIOZ009RIAN): while ``cold_start.is_cold()``
+    is True and *provider_type* is ``"local"``, an HTTP 503 reflects llama-server
+    still warming up after a restart, not a provider fault — so it is DEFERRED
+    instead of quarantined.  The attempt is recorded as ``cold_start_deferral``
+    (with the configured Retry-After hint), no cooldown is applied, the failure
+    counter is not bumped, and the retry hint is returned so the caller can
+    surface Retry-After.  Any other status code during the window still
+    quarantines normally so genuine faults are not masked.
+
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
     ``continue``.
     """
+    if (
+        provider_type == "local"
+        and cold_start.is_cold(config)
+        and int(response.status_code) == 503
+    ):
+        retry_hint = cold_start.retry_after_seconds(config)
+        _record_attempt(
+            attempts,
+            provider=provider_name,
+            type=provider_type,
+            status="cold_start_deferral",
+            status_code=int(response.status_code),
+            retry_after_seconds=retry_hint,
+        )
+        return float(retry_hint)
+
     # Parse Retry-After separately so we can respect it alongside backoff
     retry_after = _parse_retry_after(response)
 
@@ -5761,6 +5936,18 @@ async def _proxy_with_remote_fallback_cycle(
     # do not collapse into generic "All providers exhausted".
     first_model_loading_response: Response | None = None
 
+    # Session identity for the free-tier budget gate's in-progress check
+    # (LP-0MVDQ1GMO00801PL). Resolved once; per-request affinity never leaks
+    # between sessions.
+    _budget_session_id: str | None = None
+    try:
+        from proxy.session import _resolve_session_id_header
+        _budget_session_id, _ = _resolve_session_id_header(
+            getattr(request, "headers", {}) or {}
+        )
+    except Exception:
+        pass
+
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
@@ -5775,28 +5962,51 @@ async def _proxy_with_remote_fallback_cycle(
             # Mark that we attempted this provider
             any_provider_tried = True
 
-            # Proactive rate-limit check for remote providers
-            provider_rpm = int(provider_cfg.get("rate_limit_rpm", 0) or 0)
-            if provider_rpm > 0:
-                from proxy.rate_limiter import get_rate_limiter
-                allowed = await get_rate_limiter().check_and_increment(
-                    provider_name, provider_rpm, window_seconds=60
+            # Capacity-aware request budget for free-tier style entries
+            # (LP-0MVDQ1GMO00801PL): dispatches only while the rolling window
+            # has capacity. A NEW session is never parked — it passes straight
+            # through to the next provider — while a session already using the
+            # entry waits a bounded time for the window to reset so it keeps
+            # its prompt cache/prefix continuity.
+            _budget = await acquire_provider_budget(
+                provider_cfg, config, _budget_session_id, request,
+            )
+            if not _budget.allowed:
+                _record_attempt(
+                    attempts,
+                    provider=provider_name,
+                    type="remote",
+                    status="rate_limited",
+                    status_code=429,
+                    reason=_budget.reason,
+                    limit_rpm=_budget.limit_rpm,
+                    effective_limit=_budget.effective_limit,
+                    reserve_slots=_budget.reserve_slots,
+                    remaining=_budget.remaining,
+                    elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                 )
-                if not allowed:
-                    logger.warning(
-                        "Rate limited: skipping provider=%s model=%s (limit=%d rpm)",
-                        provider_name, path, provider_rpm,
-                    )
-                    _record_attempt(
-                        attempts,
-                        provider=provider_name,
-                        type="remote",
-                        status="rate_limited",
-                        status_code=429,
-                    )
-                    continue
+                fallback_reason = "rate_limited"
+                prev_provider = provider_name
+                all_slot_exhaustion = False
+                continue
+            if _budget.waited:
+                _record_attempt(
+                    attempts,
+                    provider=provider_name,
+                    type="remote",
+                    status="rate_limited_waited",
+                    reason=_budget.reason,
+                    limit_rpm=_budget.limit_rpm,
+                    effective_limit=_budget.effective_limit,
+                    reserve_slots=_budget.reserve_slots,
+                    remaining=_budget.remaining,
+                    elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                )
 
             response = await ptr(request, path, provider_cfg)
+            _maybe_record_provider_affinity(
+                provider_cfg, _budget_session_id, response, config,
+            )
 
             # Pre-flight remote streaming responses: detect a pre-content
             # finish_reason: error / empty / stream-exception so the fallback
@@ -5954,14 +6164,25 @@ async def _proxy_with_remote_fallback_cycle(
                 # Shared primitive: HTTP error with cooldown
                 _handle_http_error_with_cooldown(
                     response, provider_name, provider_type,
-                    cooldown_seconds, attempts, body_text,
+                    cooldown_seconds, attempts, body_text, config,
                 )
                 # AC3 (LP-0MSGU3JNU0092AFQ): remember this specific 400 so the
                 # exhausted path can return a synthetic error instead of the
                 # raw upstream body / exhausted-503-with-diagnostics.
                 if _reasoning_roundtrip_response is None and _is_reasoning_content_roundtrip_error(response):
                     _reasoning_roundtrip_response = response
-                attempted_domains.add(_failure_domain_key(provider_cfg))
+                # Per-account rate limit (LP-0MVCX0E2V001VB5N): a 429 with
+                # body type=rate_limit_error / code=rate_limit_exceeded is a
+                # per-ACCOUNT quota event (independent per api_key_env), NOT an
+                # endpoint-level failure. Poison only the failing account key in
+                # the per-request exclusion set so paid siblings on the same
+                # gateway stay eligible (e.g. munitoai-free 429 must not skip
+                # the paid munitoai key). Other HTTP errors keep poisoning the
+                # shared failure domain (AC2).
+                if _is_account_rate_limit_error(response, body_text):
+                    attempted_domains.add(_usage_limit_account_key(provider_cfg))
+                else:
+                    attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = f"HTTP {response.status_code}"
                 prev_provider = provider_name
                 if response.status_code != 429:
@@ -6028,7 +6249,7 @@ async def _proxy_with_remote_fallback_cycle(
         except Exception as exc:
             # Shared primitive: handle connection errors
             if _handle_connection_error_in_fallback(
-                exc, provider_name, provider_type, cooldown_seconds, attempts,
+                exc, provider_name, provider_type, cooldown_seconds, attempts, config,
             ):
                 any_provider_tried = True
                 attempted_domains.add(_connection_error_domain_key(provider_cfg, exc))
@@ -6703,32 +6924,49 @@ async def _proxy_with_fallback_cycle(
                     return response
 
             else:
-                # Proactive rate-limit check for remote providers
-                # (LP-0MQNRDUP4008KT6T: rate limiter for remote models)
-                provider_rpm = int(provider_cfg.get("rate_limit_rpm", 0) or 0)
-                if provider_rpm > 0:
-                    from proxy.rate_limiter import get_rate_limiter
-                    allowed = await get_rate_limiter().check_and_increment(
-                        provider_name, provider_rpm, window_seconds=60
+                # Capacity-aware request budget for free-tier style entries
+                # (LP-0MVDQ1GMO00801PL). See _proxy_with_remote_fallback_cycle:
+                # new sessions pass straight through, in-progress sessions wait
+                # a bounded time for the window to reset.
+                _budget = await acquire_provider_budget(
+                    provider_cfg, config, _session_id, request,
+                )
+                if not _budget.allowed:
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type="remote",
+                        status="rate_limited",
+                        status_code=429,
+                        reason=_budget.reason,
+                        limit_rpm=_budget.limit_rpm,
+                        effective_limit=_budget.effective_limit,
+                        reserve_slots=_budget.reserve_slots,
+                        remaining=_budget.remaining,
+                        elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                     )
-                    if not allowed:
-                        logger.warning(
-                            "Rate limited: skipping provider=%s model=%s (limit=%d rpm)",
-                            provider_name, path, provider_rpm,
-                        )
-                        _record_attempt(
-                            attempts,
-                            provider=provider_name,
-                            type="remote",
-                            status="rate_limited",
-                            status_code=429,
-                        )
-                        fallback_reason = "rate_limited"
-                        prev_provider = provider_name
-                        all_slot_exhaustion = False
-                        continue
+                    fallback_reason = "rate_limited"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
+                if _budget.waited:
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type="remote",
+                        status="rate_limited_waited",
+                        reason=_budget.reason,
+                        limit_rpm=_budget.limit_rpm,
+                        effective_limit=_budget.effective_limit,
+                        reserve_slots=_budget.reserve_slots,
+                        remaining=_budget.remaining,
+                        elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                    )
 
                 response = await ptr_remote(request, path, provider_cfg)
+                _maybe_record_provider_affinity(
+                    provider_cfg, _session_id, response, config,
+                )
 
             # Pre-flight remote streaming responses: detect a pre-content
             # finish_reason: error / empty / stream-exception so the fallback
@@ -7202,9 +7440,20 @@ async def _proxy_with_fallback_cycle(
                     # Shared primitive: HTTP error with cooldown
                     _handle_http_error_with_cooldown(
                         response, provider_name, provider_type,
-                        cooldown_seconds, attempts, body_text,
+                        cooldown_seconds, attempts, body_text, config,
                     )
-                    attempted_domains.add(_failure_domain_key(provider_cfg))
+                    # Per-account rate limit (LP-0MVCX0E2V001VB5N): a 429 with
+                    # body type=rate_limit_error / code=rate_limit_exceeded is a
+                    # per-ACCOUNT quota event (independent per api_key_env), NOT
+                    # an endpoint-level failure. Poison only the failing account
+                    # key in the per-request exclusion set so paid siblings on
+                    # the same gateway stay eligible (e.g. munitoai-free 429
+                    # must not skip the paid munitoai key). Other HTTP errors
+                    # keep poisoning the shared failure domain (AC2).
+                    if _is_account_rate_limit_error(response, body_text):
+                        attempted_domains.add(_usage_limit_account_key(provider_cfg))
+                    else:
+                        attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = f"HTTP {response.status_code}"
                     prev_provider = provider_name
                     if response.status_code != 429:
@@ -7330,7 +7579,7 @@ async def _proxy_with_fallback_cycle(
         except Exception as exc:
             # Shared primitive: handle connection errors
             if _handle_connection_error_in_fallback(
-                exc, provider_name, provider_type, cooldown_seconds, attempts,
+                exc, provider_name, provider_type, cooldown_seconds, attempts, config,
             ):
                 any_provider_tried = True
                 attempted_domains.add(_connection_error_domain_key(provider_cfg, exc))

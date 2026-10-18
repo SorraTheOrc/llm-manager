@@ -10,6 +10,16 @@ needs (``Stream started``, ``Stream finished``, ``Fallback triggered``,
 ignored. Parsing is tolerant: missing fields default to ``None`` and a line
 that cannot be parsed is skipped (never fatal), so truncated request payloads
 and log-format drift do not break the analysis.
+
+Attribution markers (LP-0MVAPNC2900145RH) are appended to restart and
+mode-switch log lines, carrying ``source=<value>``, ``actor=<value>``, and
+``reason=<value>`` key=value pairs. The parser extracts these from
+``Mode scheduler``, ``Grandfathering``, ``Mode-switch restart spawned``,
+``restart_services``, and ``Proxy restart attribution:`` lines and stores
+them on the resulting :class:`LogEvent` as ``source``, ``actor``, and
+``reason`` fields — ``None`` when no markers are present (backward
+compatible with historical unattributed logs). See also
+:func:`_attribution_from` for the extraction logic.
 """
 
 from __future__ import annotations
@@ -46,6 +56,11 @@ RE_FALLBACK = re.compile(
 )
 # routing_skip_local reason sits between "reason=" and the "→" arrow.
 RE_ROUTING_SKIP_REASON = re.compile(r"\breason=([\w_]+)\s*→")
+# Chain-hold cycle stamp (LP-0MU5AIAAY003KVM0): the proxy tags
+# ``routing_skip_local`` lines with ``chain_hold_cycle=<N>`` (cycle 0 = first
+# pre-hold cycle, incremented on every hold restart). Tolerant: absent on
+# pre-chain-hold rotated logs → None (treated as cycle 0 downstream).
+RE_CHAIN_HOLD_CYCLE = re.compile(r"\bchain_hold_cycle=(\d+)")
 RE_DISPATCH_DENIED = re.compile(r"session=([A-Za-z0-9_.-]+) owner=([A-Za-z0-9_.-]+) active=(\d+)")
 
 # Compaction events (LP-0MTHCTLAF00147IT): the proxy emits ``compaction_event``
@@ -181,6 +196,32 @@ RE_MANUAL_MODE_CURRENT = re.compile(r"\(current=(\w+)\)")
 MODE_SWITCH_RESTART_SPAWNED = "Mode-switch restart spawned:"
 ROUTER_MODE_RESTART_COMPLETE = "restart_services: router-mode restart complete"
 
+# Attribution markers (LP-0MVC0S6U5003SEDJ): LP-0MVAPNC2900145RH appended
+# ``source=``/``actor=``/``reason=`` key=value markers to the restart and
+# mode-switch log paths (and the startup attribution line below). Values are
+# matched tolerantly: ``source``/``actor`` are single tokens (no spaces);
+# ``reason`` captures non-greedily up to the next known ``key=`` token (or
+# end of line) so space-containing reasons survive (e.g. the
+# ``manual (no reason provided)`` start-proxy.sh default).
+RE_ATTRIBUTION_SOURCE = re.compile(r"\bsource=([a-z0-9_]+)")
+RE_ATTRIBUTION_ACTOR = re.compile(r"\bactor=([A-Za-z0-9_.-]+)")
+RE_ATTRIBUTION_REASON = re.compile(
+    r"\breason=(.*?)(?=\s+[A-Za-z_][A-Za-z0-9_]*=|$)"
+)
+# Tolerant ``mode=<fast|cheap>`` extractor for attribution-bearing restart
+# lines (the set_mode() spawn carries the mode being switched to,
+# LP-0MVAPNC2900145RH). Reused on restart kinds so the report can surface
+# the requested mode (LP-0MVC144KS001PDR4); stays ``None`` when absent.
+RE_MODE_KV = re.compile(r"\bmode=(\w+)")
+
+# Startup attribution line (LP-0MVAPNC2900145RH): the restarted process
+# (server.py ``_log_restart_attribution``) echoes the reason — and optional
+# source/actor — exported into its environment by the starting process
+# (start-proxy.sh --restart / mode.py ``_spawn_restart``) right before the
+# ``Starting LLama Proxy Server`` marker. A fresh unattributed start logs
+# nothing (backward compatible).
+RESTART_ATTRIBUTION_PREFIX = "Proxy restart attribution:"
+
 # Best-effort provider attribution for ``[remote] upstream error`` lines: the
 # line carries only the target URL, so the provider is inferred from the
 # endpoint path/host. These patterns mirror the remote provider endpoints in
@@ -253,6 +294,25 @@ class LogEvent:
     provider: str | None = None
     model: str | None = None
     session: str | None = None
+    # Attribution markers (LP-0MVAPNC2900145RH): populated on ``mode_switch``,
+    # ``restart`` (all sub-kinds), and ``stream_started`` events that carry
+    # attribution key=value markers. Three fields, each ``None`` when absent:
+    #
+    # - ``source`` (LP-0MVC0S6U5003SEDJ, LP-0MVAPNC2900145RH): lower-case token
+    #   identifying the trigger origin — one of ``scheduler``, ``worker``,
+    #   ``api``, or ``manual``. Set on mode-switch, restart-spawned,
+    #   restart-complete, and startup-attribution lines.
+    # - ``actor`` (LP-0MVC0S6U5003SEDJ, LP-0MVAPNC2900145RH): the actor
+    #   identifier (session UUID or service name) that initiated the action.
+    #   Always ``None`` on ``stream_started`` events.
+    # - ``reason`` (LP-0MVAPNC2900145RH): free-form attribution reason.
+    #   On restart events this carries the ``reason=`` value from
+    #   ``start-proxy.sh --restart`` (e.g. "manual (no reason provided)").
+    #   On mode-switch events this carries the scheduler/actor reason.
+    #   Always ``None`` on non-attribution kinds (stream_started, fallback,
+    #   stream_finished, etc.).
+    source: str | None = None
+    actor: str | None = None
     reason: str | None = None
     prompt: int | None = None
     completion: int | None = None
@@ -308,6 +368,12 @@ class LogEvent:
     # logging (LP-0MTSSM5SO003PKU0). Populated by dispatch_first_byte_ms=
     # (local) or ttft_seconds= (remote) log lines.
     ttft_ms: float | None = None
+    # Chain-hold cycle stamp (LP-0MU5AIAAY003KVM0): 0 = first (pre-hold)
+    # cycle, incremented on every hold restart; ``None`` when the line does
+    # not carry the token (pre-chain-hold logs). Populated on
+    # ``routing_skip`` events; aggregation treats ``> 0`` as hold-cycle
+    # re-emissions rather than genuine demand.
+    chain_hold_cycle: int | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -320,6 +386,21 @@ def _session_from(text: str) -> str | None:
     if token is None or token == "unknown":
         return None
     return token
+
+
+def _attribution_from(msg: str) -> tuple[str | None, str | None, str | None]:
+    """Tolerantly extract the ``source=``/``actor=``/``reason=`` attribution
+    markers (LP-0MVAPNC2900145RH) from a log message.
+
+    Any of the three may be absent (historical logs) — each then stays
+    ``None``. ``reason`` captures greedily to the next known ``key=`` token
+    (or end of line) so reasons containing spaces survive.
+    """
+    return (
+        _first(RE_ATTRIBUTION_SOURCE, msg),
+        _first(RE_ATTRIBUTION_ACTOR, msg),
+        _first(RE_ATTRIBUTION_REASON, msg),
+    )
 
 
 def parse_log_line(line: str) -> LogEvent | None:
@@ -396,11 +477,13 @@ def parse_log_line(line: str) -> LogEvent | None:
             "fallback", ts, reason=_normalize_reason(reason), src=src, dst=dst
         )
     if msg.startswith(ROUTING_SKIP):
+        cycle_m = RE_CHAIN_HOLD_CYCLE.search(msg)
         return LogEvent(
             "routing_skip",
             ts,
             session=_session_from(msg),
             reason=_normalize_reason(_first(RE_ROUTING_SKIP_REASON, msg)),
+            chain_hold_cycle=int(cycle_m.group(1)) if cycle_m else None,
         )
     if msg.startswith(DISPATCH_DENIED):
         m2 = RE_DISPATCH_DENIED.search(msg)
@@ -432,14 +515,17 @@ def parse_log_line(line: str) -> LogEvent | None:
         )
     if msg.startswith(MODE_SWITCH_PREFIX):
         # "Mode scheduler: applied scheduled mode cheap" — the mode that the
-        # scheduler applied at this timestamp (LP-0MSM5K4TX004MICX).
+        # scheduler applied at this timestamp (LP-0MSM5K4TX004MICX). Since
+        # LP-0MVAPNC2900145RH the scheduler also stamps the line with
+        # ``source=scheduler actor=mode-scheduler`` (LP-0MVC0S6U5003SEDJ).
         m = RE_MODE_SWITCH.search(msg)
         if m is None:
             return None
         mode = m.group(1).lower()
         if mode not in ("fast", "cheap"):
             return None
-        return LogEvent("mode_switch", ts, mode=mode)
+        source, actor, reason = _attribution_from(msg)
+        return LogEvent("mode_switch", ts, mode=mode, source=source, actor=actor, reason=reason)
     if msg.startswith(GRANDFATHERING_PREFIX):
         # "Grandfathering: enabled; other-mode config config-fast.yaml
         # (current=cheap)" — the actually-active mode after a restart. Manual
@@ -452,18 +538,66 @@ def parse_log_line(line: str) -> LogEvent | None:
         mode = m.group(1).lower()
         if mode not in ("fast", "cheap"):
             return None
-        return LogEvent("mode_switch", ts, mode=mode)
+        # No attribution markers are emitted on this line today; the tolerant
+        # extractors pick them up if a future format adds them
+        # (LP-0MVC0S6U5003SEDJ, LP-0MVAPNC2900145RH).
+        source, actor, reason = _attribution_from(msg)
+        return LogEvent("mode_switch", ts, mode=mode, source=source, actor=actor, reason=reason)
     if msg.startswith(MODE_SWITCH_RESTART_SPAWNED):
         # "Mode-switch restart spawned: /path/start-proxy.sh --restart" — the
-        # kill is imminent (logged after the bounded drain).
+        # kill is imminent (logged after the bounded drain). Since
+        # LP-0MVAPNC2900145RH the line carries the attribution captured at
+        # set_mode() time (``source=``/``actor=``/``mode=``/``reason=``
+        # markers) when callers self-identify (LP-0MVC0S6U5003SEDJ).
+        source, actor, reason = _attribution_from(msg)
+        mode = (_first(RE_MODE_KV, msg) or "").lower() or None
         return LogEvent(
-            "restart", ts, restart_kind="spawned", raw=line
+            "restart",
+            ts,
+            restart_kind="spawned",
+            raw=line,
+            source=source,
+            actor=actor,
+            reason=reason,
+            mode=mode,
         )
     if msg.startswith(ROUTER_MODE_RESTART_COMPLETE):
         # "restart_services: router-mode restart complete (2 slots)" — the
         # restarted proxy is up (corroborating evidence; slot count ignored).
+        # Tolerant: no attribution markers (or mode=) are emitted on this
+        # line today, but the extractors pick them up if a future format adds
+        # them (LP-0MVC0S6U5003SEDJ, LP-0MVAPNC2900145RH).
+        source, actor, reason = _attribution_from(msg)
+        mode = (_first(RE_MODE_KV, msg) or "").lower() or None
         return LogEvent(
-            "restart", ts, restart_kind="complete", raw=line
+            "restart",
+            ts,
+            restart_kind="complete",
+            raw=line,
+            source=source,
+            actor=actor,
+            reason=reason,
+            mode=mode,
+        )
+    if msg.startswith(RESTART_ATTRIBUTION_PREFIX):
+        # "Proxy restart attribution: source=api actor=herdr reason=manual
+        # (no reason provided)" — echoed by the restarted process right
+        # before the ``Starting LLama Proxy Server`` marker; carries the
+        # definitive source/actor/reason of this restart
+        # (LP-0MVAPNC2900145RH, LP-0MVC0S6U5003SEDJ). A ``mode=`` marker
+        # (when exported by the starting process) is extracted too so the
+        # report can surface the requested mode (LP-0MVC144KS001PDR4).
+        source, actor, reason = _attribution_from(msg)
+        mode = (_first(RE_MODE_KV, msg) or "").lower() or None
+        return LogEvent(
+            "restart",
+            ts,
+            restart_kind="startup",
+            raw=line,
+            source=source,
+            actor=actor,
+            reason=reason,
+            mode=mode,
         )
     if msg.startswith(STREAM_ERROR):
         # "Stream error: session=... provider=... model=... error=NameError"

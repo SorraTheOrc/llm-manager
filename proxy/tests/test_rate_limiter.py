@@ -178,6 +178,10 @@ async def test_rate_limiter_check_called_in_provider_fallback():
     }
 
     # Patch the remote proxy function so we don't hit the network
+    # NOTE (LP-0MVDUN5CY009VD20): with ``provider_rate_limit_reserve_ratio``
+    # unset, the reserve defaults to 0.3, so a session with no affinity (these
+    # requests carry no session header) may use only ``rpm - reserve`` = 4 of
+    # the 5 slots; the 5th request is skipped and the chain is exhausted.
     with patch("proxy.provider._get_proxy_to_remote") as mock_get_ptr:
         mock_ptr = AsyncMock()
         mock_get_ptr.return_value = mock_ptr
@@ -203,26 +207,30 @@ async def test_rate_limiter_check_called_in_provider_fallback():
         _resp = await proxy_with_remote_fallback(request, "v1/chat/completions", model_config, config)
 
         # The rate limiter should have been checked and incremented for
-        # "test-rl-provider" (5 rpm).  We can verify by checking remaining count.
+        # "test-rl-provider". The reserve (default 3/10 → floor(5*0.3)=1 slot
+        # here) keeps a slot free for in-progress sessions, so an anonymous
+        # request may only use 4 of the 5 slots.
         remaining = get_rate_limiter().remaining("test-rl-provider", max_rpm=5)
         assert remaining == 4, (
             f"Expected 4 remaining requests after first call, got {remaining}"
         )
 
-        # Now exhaust the rate limit by repeating the call 4 more times
-        for i in range(4):
+        # Now exhaust the unreserved part of the window with 3 more calls
+        for i in range(3):
             await proxy_with_remote_fallback(request, "v1/chat/completions", model_config, config)
 
         remaining = get_rate_limiter().remaining("test-rl-provider", max_rpm=5)
-        assert remaining == 0, (
-            f"Expected 0 remaining requests after exhausting limit, got {remaining}"
+        assert remaining == 1, (
+            f"Expected the reserved slot to remain free, got {remaining}"
         )
 
-        # The rate limiter tracked all 5 requests, so check_and_increment was
-        # called each time before the remote proxy call
-        # (call count = 5 attempts to the single provider)
-        assert mock_ptr.call_count == 5, (
-            f"Expected 5 remote calls (one per request before rate limit hit), "
+        # A 5th anonymous call is skipped (the reserved slot is not for it)
+        await proxy_with_remote_fallback(request, "v1/chat/completions", model_config, config)
+
+        # The rate limiter tracked 4 requests: check_and_increment was called
+        # before each remote dispatch; the reserved slot was never used.
+        assert mock_ptr.call_count == 4, (
+            f"Expected 4 remote calls (one per request before the reserve blocked), "
             f"got {mock_ptr.call_count}"
         )
 

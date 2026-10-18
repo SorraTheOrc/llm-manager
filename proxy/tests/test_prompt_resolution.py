@@ -461,3 +461,34 @@ def test_author_txt_contains_name_introduction_rule():
     # Must require inline explanation (not a separate glossary)
     assert "inline" in content.lower(), \
         "Rule must state the explanation is inline at first mention"
+
+
+# ---------------------------------------------------------------------------
+# Test: Real config wires author.txt as the author system prompt
+# ---------------------------------------------------------------------------
+
+def test_author_alias_resolves_author_txt_from_real_config():
+    """The real config.yaml wires proxy/prompts/author.txt for the author model.
+
+    This is the first live use of the ``system_prompt`` feature
+    (LP-0MV5S5IMX0091DZ5): the ``author`` entry must resolve to author.txt in
+    ``override`` mode so the proxy auto-injects the wiki authoring guidelines
+    without any client supplying them.
+    """
+    from proxy.prompt_resolver import REPO_ROOT, resolve_system_prompt
+    from tests.config_test_utils import load_profile
+
+    cfg = load_profile("config.yaml")
+    model_cfg = cfg["models"]["author"]
+
+    result = resolve_system_prompt("author", model_cfg)
+
+    assert result is not None, "author model must resolve a system prompt"
+    assert result["mode"] == "override"
+
+    author_path = (REPO_ROOT / "proxy" / "prompts" / "author.txt").resolve()
+    assert result["source"] == str(author_path)
+    assert result["content"] == author_path.read_text(encoding="utf-8")
+
+    # The resolved prompt is the real authoring guideline, not an empty stub.
+    assert "Explain names on first mention" in result["content"]

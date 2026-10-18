@@ -184,7 +184,15 @@ representative measurements:
 |------|---------|---------|
 | `--clean-cache` | OFF | Clear slot cache before a run. Default OFF preserves production's warm `slot-save-path` persistence; use `--clean-cache` only for cold-start characterization. |
 | `--phase cold\|warm` | `cold` | Records which measurement phase produced the JSON output. Warm = steady-state (≥30 min live traffic / ≥20 completed local turns); cold = first runs post-restart. |
+| `--concurrency N` | `6` (`TOTAL_REQUESTS_PER_RUN`) | Number of concurrent requests per slot-count run. Default preserves existing behaviour; use `--concurrency 3` for the observed small-request concurrency (2–3 concurrent sessions plus queue depth). |
+| `--prompt-tokens N` | `6000` (`TARGET_PROMPT_TOKENS`) | Target total prompt size in tokens, split ~50/50 shared/varied. Default preserves existing behaviour; use a small value (e.g. `--prompt-tokens 2000`) for the small-request workload. |
+| `--log-dir PATH` | `/var/log/llama-proxy` | Proxy log directory scanned for queue-timeout metrics. |
+| `--no-health-samples` | OFF (sampling ON) | By default `/health` is sampled during each run to count local quarantine episodes; pass this flag to disable sampling. |
 | restart timestamps | — | `proxy_restart_time` and `llama_ready_time` ISO timestamps are recorded in each run's JSON `config` for reproducible measurement windows. |
+
+Both `--concurrency` and `--prompt-tokens` are recorded in the JSON
+artefact (`runs[].config`) and in the summary report header, so a run is
+reproducible from the artefact alone.
 
 ```bash
 # Warm steady-state run, preserving the live slot cache:
@@ -192,6 +200,38 @@ python -m proxy.benchmarks.slot_benchmark --slots 6 --phase warm
 
 # Cold-start run with a clean slate:
 python -m proxy.benchmarks.slot_benchmark --slots 6 --phase cold --clean-cache
+
+# Small-request contention run at the observed concurrency:
+python -m proxy.benchmarks.slot_benchmark --slots 3 \
+    --concurrency 3 --prompt-tokens 2000
+```
+
+### slot_benchmark.py contention metrics
+
+The harness reports the contention metrics the 1/2/3-slot verdict depends
+on (parent AC1), derived from existing proxy observability — no new
+production instrumentation:
+
+| Metric | Source | JSON key |
+|--------|--------|----------|
+| Queue-timeout count / rate | Proxy log parsing of the `contention_queue_fallback_after_queue` and `contention_queue_dispatch` markers in the run window (reusing `contention_queue_simulation`). The rate is `timeout / (dispatch + timeout)`. | `contention.queue_timeout_count`, `contention.queue_timeout_rate` |
+| Local stream share | Per-request `X-Resolved-Model` response header; the fraction of completed streams served by a local provider (`local/…`, `local-qwen3/…`). | `contention.local_stream_share`, `contention.local_stream_count`, `contention.observed_stream_count` |
+| Local quarantine episodes | `/health` snapshots taken during the run (sampling is on by default; disable with `--no-health-samples`); a count of transitions from a known-available local backend into `self_healing_in_progress` / `gpu_wedge_detected` / `llama_server_running=false` / `backend_reachable=false`. | `contention.quarantine_episode_count`, `contention.health_samples` |
+
+Every metric appears in both the JSON artefact (`contention` block plus the
+flattened `summary.contention`) and the human-readable summary. **Absent
+metrics are reported explicitly** — the value is `null` and the reason is
+recorded under `contention.unavailable` (and printed in the summary's
+"Metrics not measurable" section) rather than silently omitted. For example,
+when no proxy logs match the run window the queue-timeout fields are `null`
+with `unavailable.queue_timeout = "no proxy log files matched in run window"`;
+when no queue-path events occurred the count is `0` but the rate is `null`
+with an explicit reason (a rate is meaningless with no arrivals).
+
+```bash
+# Inspect the contention block of the report
+python -c "import json; d=json.load(open('benchmark-results/slot_benchmark_report.json')); \
+  [print(r['slot_count'], r['contention']) for r in d['runs']]"
 ```
 
 ### Measured findings (ctx-size eval F2/F3, 2026-08-04)

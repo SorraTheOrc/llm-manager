@@ -1410,3 +1410,270 @@ async def test_usage_limit_different_gateway_falls_through():
     first = chain["providers"][0]
     assert provider._usage_limit_account_key(first) in provider._usage_reset_at
     assert not provider._is_provider_unavailable(provider._gateway_domain_key(first))
+
+
+# ===========================================================================
+# Per-account rate-limit 429 vs shared failure domain (LP-0MVCX0E2V001VB5N)
+#
+# munitoai-free and munitoai share endpoint https://api.munito.ai/inference
+# AND model deepseek-ai/deepseek-v4-flash, so they share one failure-domain
+# key. A per-ACCOUNT rate limit (HTTP 429 with body type=rate_limit_error /
+# code=rate_limit_exceeded) is consumed by the API-key ACCOUNT (independent
+# quota per api_key_env, LP-0MSMBWB23009XYPW), so it must poison only the
+# account key in the per-request exclusion set — the paid sibling on the same
+# endpoint stays eligible for the SAME request. Endpoint-level failures
+# (HTTP 5xx) still poison the shared failure domain (AC2).
+# ===========================================================================
+
+
+@pytest.fixture
+def munitoai_free_paid_chain():
+    """Mirrors the real plan/author/code chain: MunitoAI FREE then the
+    opencode-go router chain, then paid MunitoAI on the SAME endpoint + model
+    (shared failure domain, different api_key_env), then deepseek on a
+    different gateway (LP-0MVCX0E2V001VB5N)."""
+    return {
+        "providers": [
+            {
+                "name": "munitoai-free",
+                "type": "remote",
+                "provider": "MunitoAI",
+                "endpoint": "https://api.munito.ai/inference",
+                "api_key_env": "MUNITOAI_FREE_API_KEY",
+                "model": "deepseek-ai/deepseek-v4-flash",
+            },
+            {
+                "name": "opencode-go-3",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "OPENCODE_3_API_KEY",
+                "model": "deepseek-v4.1-flash",
+            },
+            {
+                "name": "munitoai",
+                "type": "remote",
+                "provider": "MunitoAI",
+                "endpoint": "https://api.munito.ai/inference",
+                "api_key_env": "MUNITOAI_API_KEY",
+                "model": "deepseek-ai/deepseek-v4-flash",
+            },
+            {
+                "name": "deepseek-flash",
+                "type": "remote",
+                "provider": "deepseek",
+                "endpoint": "https://api.deepseek.com",
+                "api_key_env": "DEEPSEEK_API_KEY",
+                "model": "deepseek-flash",
+            },
+        ],
+        "aliases": ["test*"],
+    }
+
+
+def _rate_limit_exceeded_429() -> Response:
+    """The observed api.munito.ai per-account 429 body (LP-0MVCX0E2V001VB5N)."""
+    return Response(
+        content=json.dumps({
+            "code": "rate_limit_exceeded",
+            "type": "rate_limit_error",
+        }).encode("utf-8"),
+        status_code=429,
+        media_type="application/json",
+    )
+
+
+def _server_error_502() -> Response:
+    """A genuine endpoint-level failure (HTTP 5xx)."""
+    return Response(content=b"bad gateway", status_code=502)
+
+
+def _auth_error_401() -> Response:
+    """An expired-key rejection (observed when the opencode keys were
+    expired, LP-0MVCX0E2V001VB5N)."""
+    return Response(content=b"invalid api key", status_code=401)
+
+
+@pytest.mark.asyncio
+async def test_account_429_rate_limit_exceeded_keeps_paid_sibling_eligible(
+    munitoai_free_paid_chain,
+):
+    """AC1: a per-account 429 (code=rate_limit_exceeded) on munitoai-free must
+    NOT poison the shared failure domain — the paid munitoai entry on the same
+    endpoint+model stays eligible in the SAME request, so the chain tries
+    opencode-go-* then munitoai (paid) in order."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "munitoai-free":
+            return _rate_limit_exceeded_429()
+        if name == "opencode-go-3":
+            # Router key expired (as observed) — different failure domain.
+            return _auth_error_401()
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions", munitoai_free_paid_chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["munitoai-free", "opencode-go-3", "munitoai"], (
+        f"Paid sibling must remain eligible after account-keyed 429, got {call_order}"
+    )
+    assert result.status_code == 200
+    body = json.loads(result.body.decode()) if isinstance(result.body, bytes) else json.loads(result.body)
+    assert body["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_account_429_rate_limit_exceeded_keeps_paid_sibling_eligible_in_full_chain(
+    munitoai_free_paid_chain,
+):
+    """AC1/AC4: same behaviour through the combined local+remote fallback loop
+    (``proxy_with_fallback``): the free-tier 429 falls through to the paid key
+    without re-contacting the free key."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "munitoai-free":
+            return _rate_limit_exceeded_429()
+        if name == "opencode-go-3":
+            return _auth_error_401()
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", munitoai_free_paid_chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["munitoai-free", "opencode-go-3", "munitoai"], (
+        f"Paid sibling must remain eligible in full chain, got {call_order}"
+    )
+    assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_endpoint_5xx_still_excludes_shared_failure_domain(
+    munitoai_free_paid_chain,
+):
+    """AC2: a genuine endpoint-level failure (HTTP 502) on munitoai-free still
+    poisons the shared failure domain for the request — the paid munitoai
+    entry is skipped, chain falls to deepseek-flash (behaviour unchanged)."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "munitoai-free":
+            return _server_error_502()
+        if name == "opencode-go-3":
+            return _auth_error_401()
+        if name == "munitoai":
+            raise AssertionError("paid munitoai must be skipped on endpoint-level 5xx")
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions", munitoai_free_paid_chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["munitoai-free", "opencode-go-3", "deepseek-flash"], (
+        f"5xx must skip the paid sibling (same failure domain), got {call_order}"
+    )
+    assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_account_429_poisons_account_key_not_failure_domain(
+    munitoai_free_paid_chain,
+):
+    """AC3: after the account-keyed 429 the per-request exclusion set contains
+    the failing ACCOUNT key but NOT the shared failure-domain key — the paid
+    sibling shares no account key so it is not skipped; the free key itself is
+    still excluded (name + account key)."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "munitoai-free":
+            return _rate_limit_exceeded_429()
+        if name == "opencode-go-3":
+            return _auth_error_401()
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions", munitoai_free_paid_chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    free_cfg = munitoai_free_paid_chain["providers"][0]
+    paid_cfg = munitoai_free_paid_chain["providers"][2]
+    domain = provider._failure_domain_key(free_cfg)
+    assert provider._failure_domain_key(paid_cfg) == domain, "fixture must share failure domain"
+
+    # The account key is the api_key_env-scoped key; it differs from the
+    # endpoint:model failure-domain key and from the paid account's key.
+    free_account = provider._usage_limit_account_key(free_cfg)
+    paid_account = provider._usage_limit_account_key(paid_cfg)
+    assert free_account != paid_account
+    assert free_account != domain
+
+    # After the 429 the FREE key (by name) is in cooldown; the paid sibling is
+    # NOT quarantined cross-request (AC3 — only the per-request exclusion
+    # changes, the per-account cooldown of the free key is unchanged).
+    assert provider._is_provider_unavailable("munitoai-free")
+    assert not provider._is_provider_unavailable("munitoai")
+    assert not provider._is_provider_unavailable(domain)
+    assert free_account not in provider._usage_reset_at, (
+        "rate_limit_exceeded is not a Go/FreeUsageLimitError: no cross-request "
+        "usage-limit quarantine should be set"
+    )
+    assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_account_429_detection_helper():
+    """AC5: the detection helper recognises the observed api.munito.ai 429 body
+    (type=rate_limit_error / code=rate_limit_exceeded) but NOT endpoint-level
+    failures (5xx) nor FreeUsageLimitError bodies (which take the dedicated
+    cooldown branch)."""
+    assert provider._is_account_rate_limit_error(
+        _rate_limit_exceeded_429(),
+        json.dumps({"code": "rate_limit_exceeded", "type": "rate_limit_error"}),
+    ) is True
+    assert provider._is_account_rate_limit_error(
+        _rate_limit_exceeded_429(),
+        json.dumps({"type": "rate_limit_error", "code": "rate_limit_exceeded"}),
+    ) is True
+    # Endpoint-level failures are not account rate limits.
+    assert provider._is_account_rate_limit_error(
+        _server_error_502(), b"bad gateway"
+    ) is False
+    assert provider._is_account_rate_limit_error(
+        _server_error_502(),
+        json.dumps({"code": "rate_limit_exceeded", "type": "rate_limit_error"}),
+    ) is False
+    # FreeUsageLimitError bodies take the 3-hour-cooldown branch, not this one.
+    assert provider._is_account_rate_limit_error(
+        Response(
+            content=json.dumps({
+                "type": "error",
+                "error": {"type": "FreeUsageLimitError", "message": "Free limit reached"},
+            }).encode("utf-8"),
+            status_code=429,
+            media_type="application/json",
+        ),
+        json.dumps({
+            "type": "error",
+            "error": {"type": "FreeUsageLimitError", "message": "Free limit reached"},
+        }),
+    ) is False

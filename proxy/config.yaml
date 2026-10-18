@@ -85,6 +85,25 @@
 #                         model: deepseek-v4.1-flash
 #                         available_times: ["10:00-12:00", "14:00-16:00"]
 #
+# Per-entry request budget (optional, remote providers only):
+#   rate_limit_rpm - maximum dispatches to this provider entry per rolling
+#                    60-second window (LP-0MVDQ1GMO00801PL). Intended for
+#                    free tiers with a per-minute allowance (e.g.
+#                    `munitoai-free`). New sessions may use at most
+#                    `rate_limit_rpm - reserve` dispatches (reserve configured
+#                    by server.provider_rate_limit_reserve_ratio) and pass
+#                    through immediately when that is spent — they are never
+#                    parked; a session already served by the entry may use the
+#                    reserved slots and, if the window is still full, waits a
+#                    bounded time (server.provider_rate_limit_wait_max_seconds,
+#                    default 15) so it keeps its prompt cache. Omit the field
+#                    (or use 0) to leave the entry ungated. Example:
+#                      - name: some-free-tier
+#                        type: remote
+#                        endpoint: https://api.example.com/v1
+#                        api_key_env: SOME_FREE_KEY
+#                        rate_limit_rpm: 10
+#
 # Responses-API mode (optional, remote providers only):
 #   api - "openai-completions" (default) or "openai-responses". Some
 #        upstreams (opencode.ai zen/go for the muse model family) expose
@@ -249,18 +268,32 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
-      # fallback tier, promoted ahead of the opencode-go tiers. It declares no
-      # available_times window, so it is eligible around the clock (the
-      # opencode/deepseek tiers are windowed here). The API key is resolved
-      # from ~/.pi/agent/auth.json (key ``munitoai``).
-      - name: munitoai
+      # MunitoAI Free (LP-0MV5UPXKL002MSKB): free-tier remote fallback, sits
+      # immediately after local. Uses a separate key resolved from
+      # ~/.pi/agent/auth.json under either ``munitoai_free`` or the
+      # documented hyphenated ``munitoai-free`` — the resolver strips
+      # _API_KEY from MUNITOAI_FREE_API_KEY and tries both the underscore
+      # and hyphenated stems (LP-0MVBJXZY5002UW10). No ``available_times``
+      # window — eligible around the clock.
+      # ``display_name`` marks the free tier so X-Resolved-Model shows
+      # ``MunitoAI Free/<model>`` vs the paid ``MunitoAI/<model>`` in Pi
+      # (LP-0MVCQ36QV009QX8K).
+      - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_API_KEY
+        api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -316,6 +349,17 @@ models:
         #
         # model: muse-spark-1.3-contributor
         # api: openai-responses
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
+      # after the opencode-go chain. It declares no available_times window,
+      # so it is eligible around the clock. The API key is resolved from
+      # ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: deepseek-flash
         type: remote
         provider: deepseek
@@ -336,15 +380,26 @@ models:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
-      # fallback tier (see plan).
-      - name: munitoai
+      # MunitoAI Free: free-tier remote fallback, sits immediately after
+      # local. Uses a separate auth.json key (``munitoai-free`` →
+      # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
+      # around the clock.
+      - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_API_KEY
+        api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -393,6 +448,17 @@ models:
         #
         # model: muse-spark-1.3-contributor
         # api: openai-responses
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
+      # after the opencode-go chain. It declares no available_times window,
+      # so it is eligible around the clock. The API key is resolved from
+      # ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: deepseek-flash
         type: remote
         provider: deepseek
@@ -405,21 +471,41 @@ models:
     force_full_prompt: true
     # Native tokenizer (LP-0MSEQ71IF0003FRT): exact Qwen3-native counts.
     tokenizer: qwen3
+    # Wiki authoring guidelines (LP-0MUYJHQ2W002I0CE, LP-0MV5S5IMX0091DZ5):
+    # auto-inject proxy/prompts/author.txt so authoring terminology,
+    # openness classification, citation and first-mention naming rules apply
+    # without any client supplying them. "override" replaces client system
+    # messages; operators can still override per-deployment via
+    # .sorraAgents/prompts/author.txt (see proxy/MODEL_ADD.md).
+    system_prompt:
+      mode: "override"
+      file: "proxy/prompts/author.txt"
 
   code:
     providers:
       - name: local-qwen3
         type: local
         llama_model: Qwen3
-      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): first remote
-      # fallback tier (see plan).
-      - name: munitoai
+      # MunitoAI Free: free-tier remote fallback, sits immediately after
+      # local. Uses a separate auth.json key (``munitoai-free`` →
+      # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
+      # around the clock.
+      - name: munitoai-free
+        display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
-        api_key_env: MUNITOAI_API_KEY
+        api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -468,6 +554,17 @@ models:
         #
         # model: muse-spark-1.3-contributor
         # api: openai-responses
+      # MunitoAI (LP-0MV5UPXKL002MSKB, LP-0MV6ENYYH006XX0Z): fallback tier
+      # after the opencode-go chain. It declares no available_times window,
+      # so it is eligible around the clock. The API key is resolved from
+      # ~/.pi/agent/auth.json (key ``munitoai``).
+      - name: munitoai
+        type: remote
+        provider: MunitoAI
+        endpoint: https://api.munito.ai/inference
+        api_key_env: MUNITOAI_API_KEY
+        forward_session_headers: false
+        model: deepseek-ai/deepseek-v4-flash
       - name: deepseek-flash
         type: remote
         provider: deepseek
@@ -570,6 +667,41 @@ server:
   llama_request_timeout: 1500
   # Provider fallback cooldown: seconds to wait before retrying a failed provider
   provider_cooldown_seconds: 60
+
+  # Free-tier request budget (LP-0MVDQ1GMO00801PL).
+  # A provider entry that declares `rate_limit_rpm` (e.g. `munitoai-free`) is
+  # dispatched to at most that many times in any rolling 60s window. When the
+  # window is full:
+  #   - a NEW session (no affinity record for the entry) skips the entry
+  #     immediately and continues down the fallback chain — it is never parked,
+  #     so waiting requests cannot compound the contention;
+  #   - a session already served by the entry (affinity recorded on a 2xx
+  #     dispatch) waits for the window to reset, keeping the same upstream
+  #     provider and its prompt cache/prefix continuity.
+  # The wait is bounded by the remaining window and
+  # provider_rate_limit_wait_max_seconds, depth-capped so waiters cannot pile
+  # up, and aborted as soon as the client disconnects.
+  #   - provider_rate_limit_reserve_ratio: fraction of the window held back for
+  #     in-progress sessions (default 0.3). New sessions may consume at most
+  #     `rate_limit_rpm - reserve` slots; sessions that already use the entry
+  #     may consume the whole window. Without a reserve, established sessions
+  #     queue behind new-session traffic and wait 15-55s per turn, which
+  #     dominated first-token latency (p99 21s -> 53s, LP-0MVDUN5CY009VD20).
+  #     Clamped to [0, 1] and to `rate_limit_rpm - 1`, so new sessions are
+  #     never locked out; 0 disables the reserve.
+  #   - provider_rate_limit_wait_max_seconds: max wait for an in-progress
+  #     session (default 15; 0 disables waiting entirely -> always pass through).
+  #     Lowered from 60 (LP-0MVDUN5CY009VD20): waits of 30-60s caused ~50% of the
+  #     observed first-token latency regression.
+  #   - provider_rate_limit_wait_max_waiters: max concurrent waiters across all
+  #     gated entries (default 8; 0 denies every wait).
+  #   - provider_affinity_ttl_seconds: how long a session counts as "in
+  #     progress" on a gated entry (default 900 = 15 min; 0 disables affinity,
+  #     so every request is treated as new).
+  provider_rate_limit_reserve_ratio: 0.3
+  provider_rate_limit_wait_max_seconds: 15
+  provider_rate_limit_wait_max_waiters: 8
+  provider_affinity_ttl_seconds: 900
   # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote
   # provider repeatedly returns an EMPTY response / stalls (no usable content)
   # across retry cycles, the provider is quarantined for an EXTENDED cooldown
@@ -936,12 +1068,12 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  # Operator-directed 2026-09-13 (LP-0MU03AL730000B5W): default profile
-  # runs a single slot.
-  session_slot_pool_size: 1
+  # Base/default profile runs 2 slots (fast inherits 2; cheap converges to
+  # 2 per the slot-count verdict, LP-0MV9UNGEB009XUZ5 / LP-0MVCGYAI80084PCZ).
+  session_slot_pool_size: 2
 
   # Slot count is defined ONCE per mode profile via ``session_slot_pool_size``
-  # above (default/fast: 3, cheap: 2). There is no time-based slot schedule:
+  # above (default/fast: 2, cheap: 3 — converging to 2, LP-0MVCGYAI80084PCZ). There is no time-based slot schedule:
   # the slot count changes only when the operating mode changes. The
   # mode-switch schedule (when to switch fast<->cheap) lives in the
   # standalone ``proxy/mode_schedule.yaml`` file, not in this model profile.
@@ -990,6 +1122,26 @@ server:
     retry_after_margin_seconds: 15
 
   # -----------------------------------------------------------------------
+  # Mode-switch lock for performance investigations (LP-0MVCBMLP7009MN81)
+  # -----------------------------------------------------------------------
+  # A slot sweep or other performance investigation must not be corrupted
+  # by a fast<->cheap mode switch mid-run (the herdr mode-switch worker and
+  # the schedule can both flip modes, each triggering a proxy restart).
+  # When the lock is ON, every request that would CHANGE the mode is
+  # rejected (POST /admin/set-mode -> 423 Locked) and the mode scheduler
+  # stands down; the current mode is held. Normal operation is unaffected
+  # when the lock is OFF (the default).
+  #
+  # The lock is normally toggled at runtime WITHOUT a restart via
+  # POST /admin/mode-switch-lock {"enabled": true|false, "reason": "..."}
+  # (state persisted in proxy/.mode-switch-lock, so it survives the restart
+  # a pre-lock change would have armed). This config key sets the default
+  # for a fresh deployment; absent = OFF.
+  mode_switch_lock:
+    enabled: false
+    # reason: "1/2/3 slot sweep"   # optional, for diagnostics only
+
+  # -----------------------------------------------------------------------
   # Post-restart startup ramp (LP-0MU9ZXFQS0023DXT)
   # -----------------------------------------------------------------------
   # After a mode-switch restart, competing herdr/agent workers reconnect
@@ -1033,6 +1185,16 @@ server:
   #   cold (default 1, minimum 1).
   # local_cold_start_retry_after_seconds: Retry-After hint for a cold-start
   #   deferral (default 15).
+  #
+  # Grace-period immunity (LP-0MV9UNIOZ009RIAN): while the cold window is
+  # active (``is_cold()`` True), a LOCAL request that receives HTTP 503 (the
+  # backend is still warming up) or a connection error is DEFERRED with the
+  # Retry-After hint above — no provider_cooldown_seconds (60s) quarantine is
+  # applied and the failure counter is untouched, so local recovers
+  # immediately after a restart. Any other 5xx during the window, or any
+  # error after the window expires, is still quarantined normally (genuine
+  # faults are never masked). These knobs are unchanged; they only document
+  # the deferral semantics.
 
 
   # Base slot save/restore timeout in seconds (LP-0MS91DHPZ001VWQO).

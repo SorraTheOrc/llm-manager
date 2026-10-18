@@ -22,6 +22,7 @@ from proxy.prompt_resolver import compose_messages, resolve_system_prompt
 from proxy.provider import (
     format_active_status,
     format_available_times,
+    format_budget_status,
     get_local_model_name_from_providers,
     get_model_type,
     get_remote_endpoint,
@@ -155,6 +156,13 @@ def _build_home_model_rows(srv) -> str:
             else:
                 status_cell = '<span class="badge-inactive">Inactive</span>'
             active_times_cell = f'<span class="active-times">{active_times}</span>'
+            # Remaining request budget for gated (free-tier) entries
+            # (LP-0MVDQ1GMO00801PL) — empty for ungated providers.
+            budget_status = format_budget_status(p)
+            if budget_status:
+                active_times_cell += (
+                    f' <span class="provider-budget">{budget_status}</span>'
+                )
 
             if is_first:
                 rows += f"""
