@@ -36,7 +36,6 @@ import bisect
 import gzip
 import json
 import re
-import statistics
 import sys
 from collections import Counter, deque
 from datetime import datetime, timedelta
@@ -147,7 +146,6 @@ def rolling_counts(timestamps, window_s=60):
     start = timestamps[0]
     end = timestamps[-1]
     counts = []
-    cursor = start - timedelta(seconds=window_s)
     minute = start.replace(second=0, microsecond=0)
     while minute <= end:
         lo = minute - timedelta(seconds=window_s)
@@ -282,8 +280,10 @@ def analyze(log_dir: Path, gate_start: datetime, reserve_start: datetime, end: d
         rc = rolling_counts(arrivals)
         rd = {"count": len(rc)}
         if rc:
-            rd["p50"] = percentile(rc, 50); rd["p95"] = percentile(rc, 95)
-            rd["p99"] = percentile(rc, 99); rd["max"] = max(rc)
+            rd["p50"] = percentile(rc, 50)
+            rd["p95"] = percentile(rc, 95)
+            rd["p99"] = percentile(rc, 99)
+            rd["max"] = max(rc)
             rd["minutes_gt_10"] = sum(1 for c in rc if c > 10)
             rd["minutes_gt_15"] = sum(1 for c in rc if c > 15)
             rd["minutes_gt_20"] = sum(1 for c in rc if c > 20)
@@ -386,18 +386,18 @@ def analyze(log_dir: Path, gate_start: datetime, reserve_start: datetime, end: d
 
 
 def render(result) -> str:
-    W = result["windows_detail"]
+    detail = result["windows_detail"]
     lines = []
     lines.append("# munitoai-free rate_limit_rpm evaluation (LP-0MVDVJYN5001BMG4)\n")
     lines.append("## Windows")
-    for name, info in W.items():
+    for name, info in detail.items():
         lines.append(
             f"- **{name}** ({info['hours']:.1f} h): dispatches={info['dispatches_munitoai']} "
             f"arrivals={info['arrivals']} upstream_429={info['upstream_429s']}"
         )
     lines.append("")
     lines.append("## Demand (rolling-60 s arrivals to munitoai-free)")
-    for name, info in W.items():
+    for name, info in detail.items():
         rd = info["rolling_demand_per_min"]
         lines.append(
             f"- {name}: minutes={rd['count']} p50={rd.get('p50')} p95={rd.get('p95')} "
@@ -406,7 +406,7 @@ def render(result) -> str:
         )
     lines.append("")
     lines.append("## What-if spill at candidate budgets (sliding-60 s, limiter semantics)")
-    for name, info in W.items():
+    for name, info in detail.items():
         if name == "base":
             continue
         lines.append(f"### {name}")
@@ -432,14 +432,14 @@ def render(result) -> str:
         )
     lines.append("")
     lines.append("## Spill attribution (fallback from munitoai-free)")
-    for name, info in W.items():
+    for name, info in detail.items():
         if name == "base":
             continue
         fb = info["fallback_reasons_munitoai_free"]
         lines.append(f"- {name}: {fb}")
     lines.append("")
     lines.append("## Remote dispatch share by host")
-    for name, info in W.items():
+    for name, info in detail.items():
         lines.append(f"- {name}: {info['remote_dispatch_share_by_host']}")
     lines.append("")
     lines.append("## Latency")
