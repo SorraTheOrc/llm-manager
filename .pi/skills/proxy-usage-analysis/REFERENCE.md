@@ -81,6 +81,14 @@ Outputs written to:
   (error type × provider × model × count), and an
   **Upstream HTTP error breakdown by status** table (status × count ×
   provider breakdown),
+  **Mode timeline & restarts** (when the window contains mode transitions
+  or restart markers): one row per mode-switch / restart event with the
+  attribution (source / actor / reason) when present in the logs, plus the
+  applied/requested operating mode (mode-switch rows show the applied mode;
+  restart rows show the restart kind and, when logged, the requested mode).
+  Events without markers fall back to `unknown` display values so historical
+  logs degrade gracefully; source values render as the canonical
+  `scheduler` / `worker` / `api` / `manual` labels (LP-0MVC144KS001PDR4).
   **Summary by hour** (rendered at the top of the report, before the
   Session summary and always — regardless of local traffic): one row per
   **absolute wall-clock hour** of the report window (partial first/last hours
@@ -205,7 +213,10 @@ entry is a local runtime edit, not a committed artifact.
    (LP-0MUQO82LJ008F1FS, LP-0MVC0S6U5003SEDJ). Attribution markers
    (`source=`, `actor=`, `reason=`) appended by LP-0MVAPNC2900145RH to
    restart/mode-switch/startup lines are extracted into structured
-   fields; absent markers degrade gracefully to `None`. A
+   fields; absent markers degrade gracefully to `None`. A `mode=`
+   marker on restart lines (the set_mode() spawn carries the mode being
+   switched to) is extracted into the event's `mode` field
+   (LP-0MVC144KS001PDR4) so the report can surface the requested mode. A
    `chain_hold_cycle=<N>` token on a `routing_skip_local` line is parsed
    into the event's `chain_hold_cycle` field (LP-0MU5AIAAY003KVM0); lines
    without the token (pre-chain-hold rotated logs) parse with

@@ -1,4 +1,10 @@
 
+# <!-- REFACTOR-LP-0MVDFQC2X005S7WE
+# smell: formatting
+# severity: high
+# description: Ambiguous variable name: `l`
+# -->
+
 # <!-- REFACTOR-LP-0MTHLGVPO004DZ56
 # smell: unused_import
 # severity: critical
@@ -1424,11 +1430,18 @@ class TestModeTimelineBucketing:
             bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
             mm,
         )
-        # Timeline reconstructed from the applied-mode lines.
+        # Timeline reconstructed from the applied-mode lines
+        # (now ModeTransition objects, LP-0MVC144KS001PDR4).
         assert mm.transitions == [
-            (datetime(2026, 8, 14, 10, 0, 2), "fast"),
-            (datetime(2026, 8, 15, 1, 0, 8, 679000), "cheap"),
-            (datetime(2026, 8, 15, 10, 0, 18, 41000), "fast"),
+            bucketing.ModeTransition(
+                datetime(2026, 8, 14, 10, 0, 2), "fast", None, None, None
+            ),
+            bucketing.ModeTransition(
+                datetime(2026, 8, 15, 1, 0, 8, 679000), "cheap", None, None, None
+            ),
+            bucketing.ModeTransition(
+                datetime(2026, 8, 15, 10, 0, 18, 41000), "fast", None, None, None
+            ),
         ]
         s = res.sessions["cheap-sess"]
         assert s.bucket == "cheap"
@@ -1469,8 +1482,12 @@ class TestModeTimelineBucketing:
             bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
             mm,
         )
-        # Manual switch reconstructed as a cheap transition.
-        assert (datetime(2026, 8, 19, 18, 20, 16, 684000), "cheap") in mm.transitions
+        # Manual switch reconstructed as a cheap transition
+        # (ModeTransition object, LP-0MVC144KS001PDR4).
+        cheap_trans = bucketing.ModeTransition(
+            datetime(2026, 8, 19, 18, 20, 16, 684000), "cheap", None, None, None
+        )
+        assert cheap_trans in mm.transitions
         assert res.sessions["manual-fast"].bucket == "fast"
         assert res.sessions["manual-fast"].slots == 3
         assert res.sessions["manual-cheap"].bucket == "cheap"
@@ -4733,3 +4750,292 @@ class TestTtftReportSection:
         ttft_pos = report.index("## Time to first token")
         ttc_pos = report.index("## Time to completion")
         assert ttft_pos < ttc_pos
+
+
+class TestAttributionInReport:
+    """LP-0MVC144KS001PDR4 — attribution surfaces in the report."""
+
+    MODE_WINDOW_START = datetime(2026, 10, 18, 0, 0, 0)
+    MODE_WINDOW_END = datetime(2026, 10, 19, 0, 0, 0)
+
+    def _events(self, lines: list[str]) -> list[log_parser.LogEvent]:
+        return [e for e in (log_parser.parse_log_line(ln) for ln in lines) if e is not None]
+
+    # -- aggregation: mode transitions carry attribution ---------------------
+
+    def test_aggregate_collects_mode_switch_attribution(self):
+        """A mode-switch line carrying source/actor/reason is collected with
+        those fields in the mode_map transitions."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.MODE_SWITCH_ATTRIBUTED,
+        ]
+        aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        assert len(mm.transitions) == 1
+        tr = mm.transitions[0]
+        assert isinstance(tr, bucketing.ModeTransition)
+        assert tr.mode == "cheap"
+        assert tr.source == "scheduler"
+        assert tr.actor == "mode-scheduler"
+        assert tr.reason is None
+
+    def test_aggregate_collects_restart_events_with_attribution(self):
+        """Restart events are collected in AnalysisResult.restart_events
+        carrying their attribution markers."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,
+            fixtures.RESTART_COMPLETE_ATTRIBUTED,
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        assert len(res.restart_events) == 2
+        # First event: spawned
+        spawned = res.restart_events[0]
+        assert spawned.kind == "restart"
+        assert spawned.restart_kind == "spawned"
+        assert spawned.source == "scheduler"
+        assert spawned.actor == "mode-scheduler"
+        assert spawned.reason == "scheduled mode change"
+        # Second event: complete
+        complete = res.restart_events[1]
+        assert complete.kind == "restart"
+        assert complete.restart_kind == "complete"
+        assert complete.source == "api"
+        assert complete.actor == "herdr"
+        assert complete.reason == "maintenance window"
+
+    def test_aggregate_restart_events_sorted(self):
+        """restart_events_sorted returns events in timestamp order."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_COMPLETE_ATTRIBUTED,
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        sorted_events = res.restart_events_sorted
+        assert sorted_events[0].ts < sorted_events[1].ts
+
+    # -- report section: attribution rendered --------------------------------
+
+    def test_report_section_shows_attribution_when_present(self):
+        """The mode-timeline section lists events with source/actor/reason
+        when markers are present."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.MODE_SWITCH_ATTRIBUTED,
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "## Mode timeline & restarts" in report
+        assert "scheduler" in report
+        assert "mode-scheduler" in report
+        assert "scheduled mode change" in report
+
+    def test_report_section_fallback_to_unknown_without_attribution(self):
+        """Events without markers show 'unknown' for attribution fields.
+        Backward compatible — no attribution present means historical logs."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.MODE_SWITCH_CHEAP,  # no attribution
+            fixtures.RESTART_SPAWNED_LINE,  # no attribution
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "## Mode timeline & restarts" in report
+        assert "unknown" in report
+
+    def test_report_section_zero_unknown_for_attributed_events(self):
+        """When every restart carries full attribution, no restart table row
+        shows 'unknown' (AC: zero 'unknown/unattributable' restarts that carry
+        a marker)."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,  # source/actor/reason all present
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        section_start = report.index("## Mode timeline & restarts")
+        next_heading = report.find("\n## ", section_start + 1)
+        section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
+        # Table rows (timestamp-prefixed) — every restart row must be fully
+        # attributed.
+        rows = [line for line in section_text.splitlines() if line.startswith("| 2026-")]
+        assert rows, "expected at least one timeline table row"
+        assert all("unknown" not in row for row in rows)
+        # And the restart's markers are present verbatim.
+        assert "scheduler" in rows[0]
+        assert "mode-scheduler" in rows[0]
+        assert "scheduled mode change" in rows[0]
+
+    def test_report_section_source_normalised(self):
+        """Source values render as the canonical labels: scheduler, worker, api, manual."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_COMPLETE_ATTRIBUTED,  # source=api
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "api" in report
+
+    def test_report_section_omitted_when_no_events(self):
+        """The section is omitted when there are no mode transitions or restarts."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            "2026-08-14 10:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "## Mode timeline & restarts" not in report
+
+    def test_restart_rows_show_requested_mode(self):
+        """A restart spawned by set_mode() carries the requested mode
+        (``mode=cheap`` on the line); the timeline row surfaces it.
+        (AC2: ... requested mode when attribution is present)."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,  # mode=cheap on the line
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        section_start = report.index("## Mode timeline & restarts")
+        next_heading = report.find("\n## ", section_start + 1)
+        section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
+        # The restart row shows kind → requested mode.
+        assert "spawned → cheap" in section_text
+        assert "scheduler" in section_text
+        assert "mode-scheduler" in section_text
+        assert "scheduled mode change" in section_text
+
+    def test_log_parser_extracts_mode_on_restart_lines(self):
+        """The tolerant mode= extractor populates ev.mode on restart events
+        that carry the marker (additive; None otherwise)."""
+        ev = log_parser.parse_log_line(fixtures.RESTART_SPAWNED_ATTRIBUTED)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.mode == "cheap"
+        # Historical unattributed spawns carry no mode.
+        ev2 = log_parser.parse_log_line(fixtures.RESTART_SPAWNED_LINE)
+        assert ev2 is not None
+        assert ev2.mode is None
+
+    def test_report_section_mixed_attribution(self):
+        """A mix of attributed and non-attributed events shows attribution
+        where present and 'unknown' where absent."""
+        mm = bucketing.ModeScheduleMap.from_profiles(
+            {"fast": fixtures.MODE_FAST_CONFIG, "cheap": fixtures.MODE_CHEAP_CONFIG},
+            "fast",
+            3,
+        )
+        lines = [
+            fixtures.MODE_SWITCH_CHEAP,  # no attribution
+            fixtures.RESTART_SPAWNED_ATTRIBUTED,
+        ]
+        res = aggregation.aggregate(
+            self._events(lines),
+            self.MODE_WINDOW_START,
+            self.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
+        assert "## Mode timeline & restarts" in report
+        # Should contain both 'unknown' (for the mode switch) and 'scheduler'
+        # (for the restart)
+        assert "scheduler" in report
+        # The section text should contain 'unknown' once (for the mode switch)
+        section_start = report.index("## Mode timeline & restarts")
+        next_heading = report.find("\n## ", section_start + 1)
+        section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
+        # 'unknown' should appear (for the mode_switch without attribution)
+        assert "unknown" in section_text

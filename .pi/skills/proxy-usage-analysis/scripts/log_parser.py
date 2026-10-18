@@ -198,6 +198,11 @@ RE_ATTRIBUTION_ACTOR = re.compile(r"\bactor=([A-Za-z0-9_.-]+)")
 RE_ATTRIBUTION_REASON = re.compile(
     r"\breason=(.*?)(?=\s+[A-Za-z_][A-Za-z0-9_]*=|$)"
 )
+# Tolerant ``mode=<fast|cheap>`` extractor for attribution-bearing restart
+# lines (the set_mode() spawn carries the mode being switched to,
+# LP-0MVAPNC2900145RH). Reused on restart kinds so the report can surface
+# the requested mode (LP-0MVC144KS001PDR4); stays ``None`` when absent.
+RE_MODE_KV = re.compile(r"\bmode=(\w+)")
 
 # Startup attribution line (LP-0MVAPNC2900145RH): the restarted process
 # (server.py ``_log_restart_attribution``) echoes the reason — and optional
@@ -524,6 +529,7 @@ def parse_log_line(line: str) -> LogEvent | None:
         # set_mode() time (``source=``/``actor=``/``mode=``/``reason=``
         # markers) when callers self-identify (LP-0MVC0S6U5003SEDJ).
         source, actor, reason = _attribution_from(msg)
+        mode = (_first(RE_MODE_KV, msg) or "").lower() or None
         return LogEvent(
             "restart",
             ts,
@@ -532,13 +538,16 @@ def parse_log_line(line: str) -> LogEvent | None:
             source=source,
             actor=actor,
             reason=reason,
+            mode=mode,
         )
     if msg.startswith(ROUTER_MODE_RESTART_COMPLETE):
         # "restart_services: router-mode restart complete (2 slots)" — the
         # restarted proxy is up (corroborating evidence; slot count ignored).
-        # Tolerant: no attribution markers are emitted on this line today,
-        # but the extractors pick them up if a future format adds them.
+        # Tolerant: no attribution markers (or mode=) are emitted on this
+        # line today, but the extractors pick them up if a future format adds
+        # them.
         source, actor, reason = _attribution_from(msg)
+        mode = (_first(RE_MODE_KV, msg) or "").lower() or None
         return LogEvent(
             "restart",
             ts,
@@ -547,14 +556,18 @@ def parse_log_line(line: str) -> LogEvent | None:
             source=source,
             actor=actor,
             reason=reason,
+            mode=mode,
         )
     if msg.startswith(RESTART_ATTRIBUTION_PREFIX):
         # "Proxy restart attribution: source=api actor=herdr reason=manual
         # (no reason provided)" — echoed by the restarted process right
         # before the ``Starting LLama Proxy Server`` marker; carries the
         # definitive source/actor/reason of this restart
-        # (LP-0MVAPNC2900145RH, LP-0MVC0S6U5003SEDJ).
+        # (LP-0MVAPNC2900145RH, LP-0MVC0S6U5003SEDJ). A ``mode=`` marker
+        # (when exported by the starting process) is extracted too so the
+        # report can surface the requested mode (LP-0MVC144KS001PDR4).
         source, actor, reason = _attribution_from(msg)
+        mode = (_first(RE_MODE_KV, msg) or "").lower() or None
         return LogEvent(
             "restart",
             ts,
@@ -563,6 +576,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             source=source,
             actor=actor,
             reason=reason,
+            mode=mode,
         )
     if msg.startswith(STREAM_ERROR):
         # "Stream error: session=... provider=... model=... error=NameError"

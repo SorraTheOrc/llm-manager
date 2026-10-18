@@ -21,6 +21,22 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
+
+@dataclass(order=True)
+class ModeTransition:
+    """A single operating-mode transition with optional attribution.
+
+    ``source``, ``actor``, and ``reason`` are populated when the log line
+    carries attribution markers (LP-0MVC0S6U5003SEDJ) and stay ``None``
+    for historical unattributed lines.
+    """
+
+    ts: datetime
+    mode: str = field(compare=False)  # "fast" | "cheap"
+    source: str | None = field(default=None, compare=False)
+    actor: str | None = field(default=None, compare=False)
+    reason: str | None = field(default=None, compare=False)
+
 MINUTES_PER_DAY = 24 * 60
 
 
@@ -186,7 +202,7 @@ class ModeScheduleMap:
     schedules: dict[str, SlotSchedule]
     ctx_sizes: dict[str, int | None]
     default_mode: str
-    transitions: list[tuple[datetime, str]] = field(default_factory=list)
+    transitions: list[ModeTransition] = field(default_factory=list)
 
     @classmethod
     def from_profiles(
@@ -239,7 +255,9 @@ class ModeScheduleMap:
         """The mode active at ``dt``: the most recent transition at/before it;
         sessions before the earliest observed transition use the analysis-time
         mode (the documented fallback)."""
-        for ts, mode in reversed(self.transitions):
+        for tr in reversed(self.transitions):
+            ts = tr.ts if isinstance(tr, ModeTransition) else tr[0]
+            mode = tr.mode if isinstance(tr, ModeTransition) else tr[1]
             if ts <= dt:
                 return mode
         return self.default_mode

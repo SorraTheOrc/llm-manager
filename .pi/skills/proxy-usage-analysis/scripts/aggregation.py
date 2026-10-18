@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import bucketing
+from bucketing import ModeTransition
 from log_parser import (
     BUSY_WINDOW_MARGIN,
     FALLBACK_ATTRIBUTION_WINDOW_SECONDS,
@@ -208,6 +209,20 @@ class AnalysisResult:
     # ``routing_skip_reason_counts``) and surfaced here separately so a stuck
     # hold is distinguishable from a client retry storm.
     hold_cycle_routing_skip_events: list[LogEvent] = field(default_factory=list)
+    # Restart events (``restart`` kind, LP-0MUQO82LJ008F1FS) observed inside
+    # the window, carrying the attribution markers (source/actor/reason,
+    # LP-0MVC0S6U5003SEDJ) parsed from the log lines so the report can render
+    # restart causes deterministically instead of heuristically
+    # (LP-0MVC144KS001PDR4). Includes spawn/complete markers and the
+    # start-proxy.sh --restart startup attribution line. Restart events
+    # already contribute their timestamp to ``restart_signals`` for
+    # root-cause correlation (unchanged).
+    restart_events: list[LogEvent] = field(default_factory=list)
+
+    @property
+    def restart_events_sorted(self) -> list[LogEvent]:
+        """Restart events sorted by timestamp (report rendering order)."""
+        return sorted(self.restart_events, key=lambda e: e.ts)
 
     @property
     def hold_cycle_reemission_count(self) -> int:
@@ -891,18 +906,32 @@ def aggregate(
     # so boundary-crossing streams pair correctly (clipped in compute_busy_stats).
     local_stream_events: list[LogEvent] = []
     # Operating-mode transitions across the (margin-widened) event stream:
-    # the mode timeline used for fast/cheap session bucketing.
-    mode_transitions: list[tuple[datetime, str]] = []
+    # the mode timeline used for fast/cheap session bucketing. Carries the
+    # attribution markers (source/actor/reason) parsed by log_parser
+    # (LP-0MVC0S6U5003SEDJ) so the report can render who/what requested the
+    # switch (LP-0MVC144KS001PDR4).
+    mode_transitions: list[ModeTransition] = []
     # Restart / mode-switch marker timestamps across the (margin-widened)
     # event stream (LP-0MUQO82LJ008F1FS): used to correlate local stream
     # errors with the restart that killed them. Collected before the window
     # filter so an error near the window edge still finds its marker.
     restart_signals: list[datetime] = []
+    # In-window restart events carrying attribution (LP-0MVC144KS001PDR4),
+    # collected alongside the restart-signal markers above.
+    restart_events: list[LogEvent] = []
 
     for ev in events:
         if ev.kind == "mode_switch":
             if ev.mode in ("fast", "cheap"):
-                mode_transitions.append((ev.ts, ev.mode))
+                mode_transitions.append(
+                    ModeTransition(
+                        ts=ev.ts,
+                        mode=ev.mode,
+                        source=ev.source,
+                        actor=ev.actor,
+                        reason=ev.reason,
+                    )
+                )
             restart_signals.append(ev.ts)
             if window_start <= ev.ts <= window_end:
                 total_lines += 1
@@ -911,6 +940,9 @@ def aggregate(
             restart_signals.append(ev.ts)
             if window_start <= ev.ts <= window_end:
                 total_lines += 1
+                # Surface attribution (LP-0MVC144KS001PDR4): keep the restart
+                # event (with its source/actor/reason markers) for the report.
+                restart_events.append(ev)
             continue
         if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
             local_stream_events.append(ev)
@@ -1025,4 +1057,5 @@ def aggregate(
         hourly_activity=hourly_activity,
         ttft_events=ttft_events,
         hold_cycle_routing_skip_events=hold_cycle_routing_skip_events,
+        restart_events=restart_events,
     )
