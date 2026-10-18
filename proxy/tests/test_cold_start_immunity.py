@@ -171,7 +171,7 @@ class TestColdStart503Deferral:
 
         attempts = []
         response = _make_http_response(503)
-        cooldown = provider._handle_http_error_with_cooldown(
+        provider._handle_http_error_with_cooldown(
             response,
             "remote-primary",
             "remote",
@@ -314,7 +314,6 @@ class TestColdStartConnectionError:
         """Connection error after warm-up → normal quarantine."""
         config = _local_config(local_cold_start_grace_seconds=10)
         cold_start.note_model_loaded()
-        loaded_at = cold_start._state.loaded_at
 
         # Simulate time passing past the grace window (loaded_at in the past,
         # relative to the real monotonic clock the handler uses).

@@ -1970,7 +1970,7 @@ def main(argv: list[str] | None = None) -> None:
             report_path = generate_report(all_results, output_dir)
     except KeyboardInterrupt:
         print("\nInterrupted — restoring original config before exit.")
-    except Exception as e:  # noqa: BLE001 - restore must run on ANY failure (AC5)
+    except Exception as e:  # restore must run on ANY failure (AC5)
         error = e
         print(f"\nERROR during sweep: {e}")
         print("Restoring original config before exit.")
@@ -1982,12 +1982,12 @@ def main(argv: list[str] | None = None) -> None:
         print(f"\nRestoring original config (session_slot_pool_size: {original_slot})...")
         try:
             _write_config(original_config)
-        except Exception:  # noqa: BLE001
+        except Exception:  # restore best-effort — never mask the primary failure
             print("  WARNING: could not restore config file")
         if not args.skip_restart:
             try:
                 restart_services(original_slot)
-            except Exception as re_:  # noqa: BLE001
+            except Exception as re_:  # restart best-effort — never mask the primary failure
                 print(f"  WARNING: restart with original slot failed: {re_}")
         else:
             print("  WARNING: slot count left at last tested value. Restart manually.")
