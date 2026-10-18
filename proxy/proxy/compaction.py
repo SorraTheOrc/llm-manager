@@ -96,6 +96,15 @@ _SUMMARY_MARKER = "The conversation history before this point was compacted into
 _SUMMARY_MARKER_END = "\n</summary>"
 
 
+def _budget_to_priority(mode_or_priority: Any) -> str:
+    """Map a compaction budget key (retired "fast"/"cheap" or priority) to
+    priority terminology for observability (LP-0MVDT94F0003VHUA AC6):
+    ``cheap``/``low`` -> "low", ``fast``/``medium``/``high`` -> "standard".
+    """
+    v = str(mode_or_priority or "").strip().lower()
+    return "low" if v in ("cheap", "low") else "standard"
+
+
 def _is_compaction_summary_message(message: dict[str, Any]) -> bool:
     """True when *message* is a compaction summary marker message.
 
@@ -181,26 +190,32 @@ TokenEstimator = Callable[[list[dict[str, Any]]], int]
 
 
 def compaction_target_tokens(mode: str) -> int:
-    """Return the compaction target budget (max compacted tokens) for *mode*.
+    """Return the compaction target budget (max compacted tokens).
 
-    Unknown modes resolve to the cheap budget to stay conservative.
+    Accepts either the retired mode vocabulary (``"fast"``/``"cheap"``) or
+    the priority vocabulary (``"low"``/``"medium"``/``"high"``,
+    LP-0MVDT94F0003VHUA): ``low``/``cheap`` resolve to the conservative
+    30 000-token budget; everything else (including unknown values) to the
+    38 000-token budget. Unknown values stay conservative (cheap) to match
+    the pre-existing fail-safe.
     """
-    if mode == "fast":
+    if str(mode or "").strip().lower() in ("fast", "medium", "high"):
         return FAST_COMPACTION_TARGET_TOKENS
+    # low / cheap (and unknown values, fail-safe) → the conservative budget.
     return CHEAP_COMPACTION_TARGET_TOKENS
 
 
 def compaction_trigger_tokens(mode: str, config: dict) -> int:
-    """Resolve the compaction trigger (tokens) for *mode*.
+    """Resolve the compaction trigger (tokens).
 
     ``trigger = compaction_trigger_ratio × effective_per_slot_threshold``
     where the per-slot threshold uses the same clamp as the routing
     machinery (``ctx_size // slots - 4096`` headroom, LP-0MSAZXXDY005AWA1).
     The product is rounded half-up so the operator-approved constants
-    resolve exactly:
-
-    - fast  schedule (3 slots × 262144): round(0.70 × 83285) = 58300
-    - cheap schedule (2 slots × 131072): round(0.70 × 61440) = 43008 (≈43K)
+    resolve exactly. With the mode axis removed the slot pool is fixed at 2
+    (LP-0MVDT94F0003VHUA); the *mode* argument is accepted for backward
+    compatibility (compaction is disabled in the shipped config,
+    ``compaction_trigger_ratio: 0``).
 
     Returns 0 when compaction is disabled (ratio ≤ 0 or per-slot clamp
     not computable). Lazy-imports the provider helpers to avoid a circular
@@ -229,9 +244,8 @@ def compaction_trigger_tokens(mode: str, config: dict) -> int:
 def should_compact_session(estimated_tokens: int, mode: str, config: dict) -> bool:
     """True when a session at *estimated_tokens* should be compacted.
 
-    Fires strictly above the trigger (``est_tokens > trigger``), matching
-    the operator-approved thresholds (fast 58,300 / cheap ≈43K). Disabled
-    (trigger 0) never fires.
+    Fires strictly above the trigger (``est_tokens > trigger``, operator-
+    approved thresholds). Disabled (trigger 0) never fires.
     """
     trigger = compaction_trigger_tokens(mode, config)
     if trigger <= 0:
@@ -442,7 +456,7 @@ def log_compaction_event(
 
     fields: dict[str, Any] = {
         "session": str(session_id)[:8],
-        "mode": plan_result.get("mode", "fast"),
+        "priority": _budget_to_priority(plan_result.get("mode", "fast")),
         "action": action,
         "reason": plan_result.get("reason"),
         "pre_tokens": int(plan_result.get("estimated_before", 0) or 0),

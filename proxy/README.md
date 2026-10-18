@@ -15,7 +15,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
-- **Base + overlay config model**: `config.yaml` is the authoritative base; `config-fast.yaml` / `config-cheap.yaml` are overlays deep-merged on top of it by `load_config()`. The resolved profile defines its local llama-server slot count via `session_slot_pool_size` (fast inherits 1 from the base, cheap overrides 3) — no time-based slot schedule. See [Config model: base + mode overlays](#config-model-base--mode-overlays) and [Slot configuration](#slot-configuration) below.
+- **Priority-based routing**: every request carries an effective priority (`X-Priority: low|medium|high`, default `medium`; capped to `low` during the configured cheap window, `server.priority_window`, default 01:00–10:00 local). The effective priority selects the model's `priority_routes` provider chain and gates the routing knobs (contention-queue entry, economic-bypass recovery, local-vs-remote preference) — LP-0MVDT94F0003VHUA AC1–AC3. The slot pool is fixed at 2 (`session_slot_pool_size`); no routing-policy change ever restarts the proxy. The fast/cheap mode machinery (overlays, `proxy/.mode`, `mode_schedule.yaml`, `/admin/set-mode`) was removed (AC4).
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view. Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in). Each slot header badge shows the **full session ID** (untruncated, with the full ID also on hover) — slot session IDs are no longer shortened to 8 characters (LP-0MV6CZGN6003Z5QI).
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
@@ -55,9 +55,9 @@ The body preview automatically filters out messages with `role: "system"` to pre
 ### Usage analysis (proxy-usage-analysis skill)
 
 The `proxy-usage-analysis` skill turns the last 24h of proxy logs into
-per-session fast/cheap CSVs and a Markdown report with data-backed
+per-session standard/low CSVs and a Markdown report with data-backed
 configuration recommendations (fallback reasons, slot contention, context
-pressure, fast/cheap comparison). It parses the structured INFO lines the
+pressure, priority-window comparison). It parses the structured INFO lines the
 proxy emits — `Stream started`/`Stream finished` (with authoritative
 `tokens=prompt/completion/total`), `Fallback triggered`, `routing_skip_local`,
 and `local_dispatch_denied` — streaming large logs line by line.
@@ -75,9 +75,9 @@ python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 
 Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
 `report.md` (the aggregate report plus recommendations),
-`fast_sessions.csv`, `cheap_sessions.csv`
-(one row per session; fast/cheap split derived from the mode timeline
-of the active config profile), and `errors.csv`/`errors.json`. Existing
+`standard_sessions.csv`, `low_priority_sessions.csv`
+(one row per session; standard/low split derived from the priority
+window, LP-0MVDT94F0003VHUA AC6), and `errors.csv`/`errors.json`. Existing
 outputs are archived into a dated subdirectory before each run overwrites
 them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. The cron
 job at 05:00 runs the report daily and logs to
@@ -1071,7 +1071,38 @@ The proxy runs in one of two operator-selected operating modes:
   LP-0MSMIPPJI007GU9N). The only intended difference from fast mode is the
   local slot pool (1 vs 3).
 
-#### Config model: base + mode overlays
+#### Config model: single authoritative config + priority routing
+
+`proxy/config.yaml` is the **single authoritative config**: the fast/cheap
+mode overlays (`proxy/config-fast.yaml`, `proxy/config-cheap.yaml`), the
+persisted mode file (`proxy/.mode`), the mode schedule
+(`proxy/mode_schedule.yaml`) and the `LLAMA_PROXY_CONFIG` overlay selection
+were removed with the mode axis (LP-0MVDT94F0003VHUA AC4). The overlay values
+were merged into the base: the slot pool is fixed at 2, the contention queue
+policy/caps are single server keys, and the cheap-window routing policy is
+declared as `server.priority_window`.
+
+Routing policy now lives **per request**, not per machine state:
+
+- `X-Priority: low|medium|high` (absent/invalid → `medium`) is parsed per
+  request; during the configured cheap window (`server.priority_window`,
+  default local 01:00–10:00) every request routes as `low` — the header is
+  never modified and no 503/Retry-After deferral is applied (AC1).
+- Each model may declare `priority_routes` (AC2) — a map from priority to an
+  ordered provider list (names resolve against the model's `providers`).
+  A config without `priority_routes` behaves exactly as today (`medium`
+  semantics), so the existing base config is 100% backward compatible.
+- The routing knobs (contention-queue entry, economic-bypass recovery,
+  local-vs-remote preference) are keyed to the effective priority (AC3) —
+  see the README "Per-priority contention-queue tuning" section.
+
+Because `config.yaml` is the only config, the restart signature simply hashes
+the base config (still via the shared canonical helper
+`proxy/proxy/config_merge.py::merged_config_sha256`, so a base-only
+local-backend change forces the co-located llama-server to restart; the
+signature no longer carries a mode label).
+
+### Config model: base + mode overlays
 
 `proxy/config.yaml` is the **authoritative base** config. The mode profiles
 `proxy/config-fast.yaml` and `proxy/config-cheap.yaml` are **overlays**: a

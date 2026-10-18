@@ -2,12 +2,11 @@
 
 Outputs (per acceptance criteria):
 
-- ``fast_sessions.csv`` — one row per **fast** session (the period(s)
-  with the fewest slots per the configured ``slot_schedule`` in the active
-  config profile) covering ALL sessions in the window.
-- ``cheap_sessions.csv`` — one row per **cheap** session (the period(s)
-  with the most slots; produced only when the schedule has differing slot
-  counts).
+- ``standard_sessions.csv`` — one row per **standard** session (started
+  outside the configured priority window) covering ALL sessions in the
+  window.
+- ``low_priority_sessions.csv`` — one row per **low** session (started
+  inside the cheap priority window; LP-0MVDT94F0003VHUA AC6).
 - ``report.md`` — the aggregate Markdown report with highlighted,
   data-backed recommendations.
 """
@@ -107,16 +106,16 @@ def _write_csv(path: Path, rows: list[dict], fieldnames: list[str] | None = None
 
 
 def write_csvs(summary: AnalysisResult, out_dir: Path) -> tuple[Path, Path]:
-    """Write the fast and cheap session CSVs; returns their paths."""
-    fast_rows, cheap_rows = [], []
+    """Write the standard and low-priority session CSVs; returns their paths."""
+    standard_rows, low_rows = [], []
     for s in sorted(summary.sessions.values(), key=lambda x: x.start):
         row = _session_row(s)
-        (fast_rows if s.bucket != "cheap" else cheap_rows).append(row)
-    fast_path = out_dir / "fast_sessions.csv"
-    cheap_path = out_dir / "cheap_sessions.csv"
-    _write_csv(fast_path, fast_rows)
-    _write_csv(cheap_path, cheap_rows)
-    return fast_path, cheap_path
+        (standard_rows if s.bucket != "cheap" else low_rows).append(row)
+    standard_path = out_dir / "standard_sessions.csv"
+    low_path = out_dir / "low_priority_sessions.csv"
+    _write_csv(standard_path, standard_rows)
+    _write_csv(low_path, low_rows)
+    return standard_path, low_path
 
 
 # Output artifacts that get archived (moved into a dated subdirectory)
@@ -124,8 +123,8 @@ def write_csvs(summary: AnalysisResult, out_dir: Path) -> tuple[Path, Path]:
 # (e.g. cron.log) is left untouched.
 ARCHIVE_ARTIFACTS = [
     "report.md",
-    "fast_sessions.csv",
-    "cheap_sessions.csv",
+    "standard_sessions.csv",
+    "low_priority_sessions.csv",
     "errors.csv",
     "errors.json",
 ]
@@ -343,7 +342,7 @@ def build_report(
     ap("")
     ap("## Session summary")
     ap("")
-    ap("| Metric | Total | Fast | Cheap |")
+    ap("| Metric | Total | Standard | Low |")
     ap("|---|---|---|---|")
     d, n = profile["fast"], profile["cheap"]
     ap(f"| Sessions | {len(sessions)} | {d['sessions']} ({_pct(d['sessions'], len(sessions)):.1f}%) | "
@@ -392,7 +391,7 @@ def build_report(
         ap("")
         ap("## Fallback reasons")
         ap("")
-        ap("| Reason | Total | % of fallbacks | Fast | Cheap |")
+        ap("| Reason | Total | % of fallbacks | Standard | Low |")
         ap("|---|---|---|---|---|")
         for reason, count in summary.fallback_reason_counts.most_common():
             d = profile["fast"]["fallback_reasons"].get(reason, 0)
@@ -408,7 +407,7 @@ def build_report(
         ap("")
         ap("## routing_skip_local reasons")
         ap("")
-        ap("| Reason | Total | % of skips | Fast | Cheap |")
+        ap("| Reason | Total | % of skips | Standard | Low |")
         ap("|---|---|---|---|---|")
         for reason, count in summary.routing_skip_reason_counts.most_common():
             d = profile["fast"]["routing_skip_reasons"].get(reason, 0)
@@ -424,7 +423,7 @@ def build_report(
     ap("")
     ap("## Per-model breakdown (initial assignment)")
     ap("")
-    ap("| Provider | Model | Sessions | Fast | Cheap | Requests | Fell back |")
+    ap("| Provider | Model | Sessions | Standard | Low | Requests | Fell back |")
     ap("|---|---|---|---|---|---|---|")
     total_fast_sessions = profile["fast"]["sessions"]
     total_cheap_sessions = profile["cheap"]["sessions"]
@@ -511,7 +510,7 @@ def build_report(
 def _append_mode_timeline_section(
     ap: callable, summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None
 ) -> None:
-    """Append the ``## Mode timeline & restarts`` section to the report.
+    """Append the ``## Priority window timeline & restarts`` section to the report.
 
     Lists every observed mode transition and restart event in timestamp
     order, displaying the attribution (source / actor / reason) when
@@ -549,7 +548,7 @@ def _append_mode_timeline_section(
         return
 
     ap("")
-    ap("## Mode timeline & restarts")
+    ap("## Priority window timeline & restarts")
     ap("")
     ap(
         "Each line shows the timestamp, event type, and attribution "
@@ -790,13 +789,13 @@ def _append_compaction_section(
     if unknown_bucket:
         ap(f"Total compaction events: **{total_compactions}** (" f"Total {total_compactions} / Fast {fast_total} / Cheap {cheap_total} / unknown-mode {unknown_bucket})")
     else:
-        ap(f"Total compaction events: **{total_compactions}** (Total {total_compactions} / Fast {fast_total} / Cheap {cheap_total})")
+        ap(f"Total compaction events: **{total_compactions}** (Total {total_compactions} / Standard {fast_total} / Low {cheap_total})")
     ap(f"- Sessions with compaction: {sessions_with_compaction} / {len(summary.sessions)} "
        f"({(_pct(sessions_with_compaction, len(summary.sessions)) if len(summary.sessions) else 0):.1f}%)")
 
     # Bucket × action × dry_run breakdown.
     ap("")
-    ap("| Metric | Total | Fast | Cheap |")
+    ap("| Metric | Total | Standard | Low |")
     ap("|---|---|---|---|")
     # Combine compaction_event + backstop actions for the action breakdown.
     # Count per action per bucket from the raw events (includes dry-run flag).
@@ -1191,7 +1190,7 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap("Busy = at least one local slot actively generating (local streams paired "
        "per session, clipped to the window, overlapping streams merged).")
     ap("")
-    ap("| Metric | Total | Fast | Cheap |")
+    ap("| Metric | Total | Standard | Low |")
     ap("|---|---|---|---|")
     fast_win = b.fast_window_seconds or 0.0
     cheap_win = b.cheap_window_seconds or 0.0
@@ -1255,7 +1254,7 @@ def _append_total_tokens_section(ap, summary) -> None:
     ap("Total = prompt (input) + completion (output) summed from authoritative "
        "``tokens=prompt/completion/total`` on ``Stream finished`` lines.  "
        "Input = sum(prompt), Output = sum(completion), Total = Input + Output.  "
-       "Shares are of the grand Total Tokens, so fast% + cheap% = 100% and model "
+       "Shares are of the grand Total Tokens, so standard% + low% = 100% and model "
        "%s sum to 100%.  Streams without ``tokens=`` contribute ``0``; sessions "
        "without a bucket (unattributed) are excluded from the bucket share.")
     ap("")
@@ -1265,7 +1264,7 @@ def _append_total_tokens_section(ap, summary) -> None:
     ap(f"| Output (completion) | {_fmt_tokens(grand_output)} | {_pct(grand_output, grand_total):.1f}% |")
     ap(f"| Total | **{_fmt_tokens(grand_total)}** | 100.0% |")
     ap("")
-    ap("### Tokens — fast vs cheap")
+    ap("### Tokens — standard vs low")
     ap("")
     ap("Bucketing follows the existing mode-aware fast/cheap logic (mode timeline / "
        "slot schedule keyed by session start; unattributed streams are excluded from "
@@ -1273,10 +1272,10 @@ def _append_total_tokens_section(ap, summary) -> None:
     ap("")
     ap("| Bucket | Input | % input | Output | % output | Total | % total |")
     ap("|---|---|---|---|---|---|---|")
-    ap(f"| Fast | {_fmt_tokens(fast_in)} | {_pct(fast_in, grand_input):.1f}% | "
+    ap(f"| Standard | {_fmt_tokens(fast_in)} | {_pct(fast_in, grand_input):.1f}% | "
        f"{_fmt_tokens(fast_out)} | {_pct(fast_out, grand_output):.1f}% | "
        f"{_fmt_tokens(fast_total)} | {_pct(fast_total, grand_total):.1f}% |")
-    ap(f"| Cheap | {_fmt_tokens(cheap_in)} | {_pct(cheap_in, grand_input):.1f}% | "
+    ap(f"| Low | {_fmt_tokens(cheap_in)} | {_pct(cheap_in, grand_input):.1f}% | "
        f"{_fmt_tokens(cheap_out)} | {_pct(cheap_out, grand_output):.1f}% | "
        f"{_fmt_tokens(cheap_total)} | {_pct(cheap_total, grand_total):.1f}% |")
     ap("")
@@ -1641,8 +1640,8 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "dispatch_denied": summary.dispatch_denied_count,
         "unattributed_events": summary.unattributed_events,
         "hold_cycle_routing_skip_events": summary.hold_cycle_reemission_count,
-        "fast_sessions": sum(1 for s in sessions if s.bucket != "cheap"),
-        "cheap_sessions": sum(1 for s in sessions if s.bucket == "cheap"),
+        "standard_sessions": sum(1 for s in sessions if s.bucket != "cheap"),
+        "low_priority_sessions": sum(1 for s in sessions if s.bucket == "cheap"),
         "errors": len(summary.error_events),
         "errors_by_type": dict(summary.error_counts.most_common()),
         "errors_by_provider_model": error_provider_model_json(summary),

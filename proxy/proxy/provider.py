@@ -40,6 +40,13 @@ from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy import cold_start
+from proxy.priority import (
+    PRIORITY_HIGH,
+    PRIORITY_LOW,
+    effective_chain_for_request,
+    priority_routing_profile,
+    request_priority,
+)
 from proxy.provider_budget import (
     RATE_LIMIT_WINDOW_SECONDS,
     acquire_provider_budget,
@@ -833,24 +840,35 @@ def _get_warm_cache_threshold(config: dict) -> int:
         return 0
 
 
-def _economic_bypass_serves_local(config: dict) -> bool:
+def _economic_bypass_serves_local(config: dict, priority: str | None = None) -> bool:
     """Whether the economic cold-cache bypass should be recovered locally.
 
-    Mode-gated via the active mode-profile config (LP-0MU5A4QBR003YJM0):
-    ``config-cheap.yaml`` sets
-    ``local_large_context_economic_bypass_serves_local: true`` so economic
-    bypasses (``new_tokens > cold_threshold`` while the prompt still fits the
-    per-slot KV capacity) are served locally — entering the contention queue
-    when all slots are busy — instead of falling back to a paid remote.
+    Priority-gated (AC3, LP-0MVDT94F0003VHUA): the flag replaces the retired
+    mode-profile gate (``config-cheap.yaml`` set
+    ``local_large_context_economic_bypass_serves_local: true``):
 
-    Fast/default profiles omit the key (or set it false), preserving the
-    remote-fallback behaviour for tail latency.  This is an explicit
-    mode-aware flag, not a hardcoded mode string branch: the active config
-    file selected by the mode decides the behaviour.
+    - ``low``: always True — economic bypasses are served locally (entering
+      the contention queue when all slots are busy) instead of falling back
+      to a paid remote (cheap-mode semantics in both windows).
+    - ``high``: always False — economic bypass routes remote (fast-mode
+      semantics).
+    - ``medium``: the merged base config flag
+      (``server.local_large_context_economic_bypass_serves_local``; the
+      merged base omits it, preserving today's remote-fallback behaviour).
 
     Supports both nested (``server:``) and flat config keys for test
     compatibility.  Default: false.
     """
+    profile = (
+        priority_routing_profile(
+            priority,
+            config.get("server", config) if isinstance(config, dict) else None,
+        )
+        if priority is not None
+        else None
+    )
+    if profile is not None:
+        return bool(profile.get("economic_bypass_serves_local"))
     val = config.get("local_large_context_economic_bypass_serves_local")
     if val is None:
         val = config.get("server", {}).get(
@@ -1480,17 +1498,18 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     if warm > 0:
         warm = min(warm, cap)
         # LP-0MTBOX45O005LD1S AC4: also clamp warm to the hard-routing cap
-        # (mode-aware; the cap is expressed as a per-mode ratio) so
+        # (the ratio keys were mode-aware; with the mode axis removed
+        # LP-0MVDT94F0003VHUA the cap is a single unified ratio) so
         # ``context_too_large`` fires exactly at the hard cap — the SAME
         # single source as ``session_slot_max_prompt_tokens`` persistence.
         # No circularity: ``compute_hard_routing_cap`` derives its denominator
         # from the RAW warm config + per-slot threshold, not this clamped warm.
+        # The per-mode ratios are retired (0 → disabled) and the slot pool is
+        # fixed at 2, so the unified profile is used unconditionally.
         try:
-            from proxy.mode import read_mode as _read_mode
-            _mode = _read_mode()
+            _hard_cap = compute_hard_routing_cap("fast", config)
         except Exception:
-            _mode = "fast"  # default mode, matching read_mode()
-        _hard_cap = compute_hard_routing_cap(_mode, config)
+            _hard_cap = 0
         if _hard_cap > 0:
             warm = min(warm, _hard_cap)
     return cold, warm
@@ -1663,13 +1682,14 @@ def check_hard_routing_cap(
 
 
 def _build_compaction_gate_response(
-    estimated_tokens: int, cap: int, mode: str, session_id: str | None,
+    estimated_tokens: int, cap: int, priority: str, session_id: str | None,
     model_name: str | None,
 ) -> Response:
     """Build a 429 response that gates the request for client-side compaction.
 
-    Used only in cheap mode when the hard-routing cap is exceeded.  The
-    response includes:
+    Used when the hard-routing cap is exceeded by a low-priority request
+    (cheap semantics, AC3 — the client compacts instead of spending on a
+    paid remote).  The response includes:
     - HTTP 429 status code
     - ``X-Compaction-Gate: true`` header
     - ``X-Compaction-Estimated-Tokens`` header
@@ -1682,7 +1702,7 @@ def _build_compaction_gate_response(
     Args:
         estimated_tokens: The estimated token count that triggered the gate.
         cap: The hard-routing cap that was exceeded.
-        mode: Operating mode ("cheap").
+        priority: Effective priority ("low") that triggered the gate.
         session_id: Session ID for the request (may be None).
         model_name: Model name for the request.
 
@@ -1694,7 +1714,7 @@ def _build_compaction_gate_response(
         "X-Compaction-Gate": "true",
         "X-Compaction-Estimated-Tokens": str(estimated_tokens),
         "X-Compaction-Cap": str(cap),
-        "X-Compaction-Mode": mode,
+        "X-Compaction-Priority": priority,
     }
     if session_id:
         headers["X-Session-Id"] = session_id
@@ -1704,8 +1724,8 @@ def _build_compaction_gate_response(
             "type": "compaction_gate",
             "code": "context_too_large_for_local",
             "message": (
-                f"Context ({estimated_tokens} tokens) exceeds the "
-                f"{mode}-mode local routing cap ({cap} tokens). "
+                f"Context ({estimated_tokens} tokens) exceeds the local "
+                f"routing cap ({cap} tokens) at priority {priority!r}. "
                 "Compact the session before retrying (see the "
                 "context_pressure guidance signal)."
             ),
@@ -1713,13 +1733,13 @@ def _build_compaction_gate_response(
         "status": 429,
         "estimated_tokens": estimated_tokens,
         "cap": cap,
-        "mode": mode,
+        "priority": priority,
     }
     return JSONResponse(status_code=429, content=payload, headers=headers)
 
 
 def _is_compaction_gate_response(response) -> bool:
-    """Whether *response* is the cheap-mode compaction gate (429).
+    """Whether *response* is the low-priority compaction gate (429).
 
     The gate is a TERMINAL response (LP-0MTBOX45O005LD1S AC2): it must
     reach the client as-is and must never trigger the fallback cycle's
@@ -3676,19 +3696,32 @@ def _local_slot_free(
 # Bounded cross-session contention queue (LP-0MSORQVK50012Q4D)
 # ---------------------------------------------------------------------------
 
-def _contention_queue_enabled(config: dict) -> bool:
-    """True when the contention queue should engage: queue policy.
+def _contention_queue_enabled(config: dict, priority: str | None = None) -> bool:
+    """True when the contention queue should engage for *priority* (AC3).
 
-    The per-mode policy comes from the active mode config
-    (``contention_queue_policy``; config-cheap.yaml declares ``queue`` with
-    depth 8 / wait 120s, config-fast.yaml declares ``queue`` with depth 3 /
-    wait 45s — LP-0MTQYIK4Z008XF2V). The active mode's config determines
-    the depth and wait caps; the policy gate ensures ``fallback`` config
-    files never engage the queue. Fail-open: any error → queue disabled.
+    The queue policy was a per-mode knob known to the active mode config
+    (``contention_queue_policy``; the retired config-fast.yaml /
+    config-cheap.yaml both declared ``queue`` depth 8 / wait 120s). With the
+    mode axis removed the policy is a server-level knob and priority gates
+    entry:
+
+    - ``high``  — never queues (immediate remote fallback when local slots
+      are busy).
+    - ``low``   — always queues (bounded by the configured caps): prefer a
+      local slot over a paid remote call.
+    - ``medium`` — today's behaviour: engages when the merged base config's
+      ``contention_queue_policy`` is ``queue``.
+
+    The configured depth/wait caps always bound the queue. Fail-open: any
+    error → queue disabled (a broken policy never parks a request).
     """
     try:
         from proxy.router import _get_contention_queue_config
 
+        if priority is not None:
+            profile = priority_routing_profile(priority, config.get("server", config))
+            if priority in (PRIORITY_HIGH, PRIORITY_LOW):
+                return bool(profile.get("queue"))
         server_cfg = config.get("server", config) if isinstance(config, dict) else {}
         cq = _get_contention_queue_config(server_cfg)
         if cq["policy"] != "queue":
@@ -3705,12 +3738,14 @@ async def _queue_context_bypass(
     request,
     body_json: dict,
     session_id: str | None,
+    priority: str | None = None,
 ) -> tuple[bool, str | None]:
     """Mirror of the smart-routing large-context skip decision.
 
-    Used ONLY at the contention-queue decision point.  In cheap mode,
-    ``large_context_bypass`` is recovered (the request proceeds to local
-    and may queue); only ``context_too_large`` is a hard bypass
+    Used ONLY at the contention-queue decision point.  Priority-gated (AC3):
+    for ``low`` (cheap semantics) ``large_context_bypass`` is recovered (the
+    request proceeds to local and may queue); ``high`` and ``medium`` keep
+    today's behaviour where only ``context_too_large`` is a hard bypass
     (LP-0MU5A4QBR003YJM0).  Keeps the same
     thresholds/tokenizer/estimate/``_should_skip_local`` pipeline as the main
     smart-routing block below; returns ``(skip_local, skip_reason)``.
@@ -3723,9 +3758,9 @@ async def _queue_context_bypass(
     )
     if _multiplier != 1.0:
         _estimated_tokens = int(_estimated_tokens * _multiplier)
-    # Pass the config-driven recovery flag so the cheap profile can recover
-    # economic bypasses (LP-0MU5A4QBR003YJM0)
-    _recover_economic = _economic_bypass_serves_local(config)
+    # Pass the priority-driven recovery flag (AC3): low priority recovers
+    # economic bypasses locally even when the base config flag is off.
+    _recover_economic = _economic_bypass_serves_local(config, priority)
     _skip_local, _skip_reason = _should_skip_local(
         _llama_model, session_id, body_json, _cold_threshold,
         estimated_tokens=_estimated_tokens,
@@ -3755,9 +3790,10 @@ async def _maybe_queue_for_local_slot(
     provider_cfg: dict,
     session_id: str | None,
     endpoint: str | None = None,
+    priority: str | None = None,
 ) -> tuple[str, str | None, float | None]:
-    """Queue-wait for a local slot (cheap mode, queue policy) instead of
-    immediately falling back to the next remote provider.
+    """Queue-wait for a local slot (low/medium priority, queue policy)
+    instead of immediately falling back to the next remote provider.
 
     Returns ``(action, reason, elapsed_seconds)`` where action is one of:
 
@@ -3769,15 +3805,17 @@ async def _maybe_queue_for_local_slot(
       - ``"context_bypass"`` — the request cannot fit a KV slot; it was
         never queued; the caller records ``cached_tokens_skip`` with the
         returned *reason*.
-      - ``"fallback_policy"`` — policy is fallback / not cheap mode; the
-        caller keeps today's ``local_concurrency_limit`` behavior.
+      - ``"fallback_policy"`` — policy is fallback / high priority never
+        queues; the caller keeps today's ``local_concurrency_limit``
+        behavior.
     """
-    if not _contention_queue_enabled(config):
+    if not _contention_queue_enabled(config, priority):
         return ("fallback_policy", None, None)
     # Context bypasses never queue (AC4): a request that cannot fit the KV
     # slot must fall back exactly as today.
     skip_local, skip_reason = await _queue_context_bypass(
         config, model_config, provider_cfg, request, body_json, session_id,
+        priority=priority,
     )
     if skip_local:
         return ("context_bypass", skip_reason, None)
@@ -5949,6 +5987,25 @@ async def _proxy_with_remote_fallback_cycle(
     except Exception:
         pass
 
+    # Effective priority (AC1/AC2): cheap-window capped header value, stamped
+    # on the request; the remote-only chain is selected by it (priority_routes)
+    # just like the local+remote cycle, so a ``low`` request on a remote-only
+    # model uses its low chain (e.g. free-tier-first).
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+    _priority = request_priority(request, server_cfg)
+    from proxy.priority import set_request_priority
+
+    set_request_priority(request, _priority)
+    _chain = effective_chain_for_request(request, model_config, server_cfg)
+    if _chain:
+        model_config = {**model_config, "providers": _chain}
+    logger.info(
+        "priority_routing model=%s priority=%s providers=%d",
+        model_config.get("name") or "unknown",
+        _priority,
+        len(_chain or model_config.get("providers") or []),
+    )
+
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
@@ -6513,6 +6570,25 @@ async def _proxy_with_fallback_cycle(
     except Exception:
         pass
 
+    # Effective priority (AC1/AC2): cheap-window capped header value, stamped
+    # on the request; the provider chain is selected by it (priority_routes).
+    # Rebound local ``model_config`` so the whole cycle (including the
+    # lease-active fallback below) iterates the priority-selected chain.
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+    _priority = request_priority(request, server_cfg)
+    from proxy.priority import set_request_priority
+
+    set_request_priority(request, _priority)
+    _chain = effective_chain_for_request(request, model_config, server_cfg)
+    if _chain:
+        model_config = {**model_config, "providers": _chain}
+    logger.info(
+        "priority_routing model=%s priority=%s providers=%d",
+        model_config.get("name") or "unknown",
+        _priority,
+        len(_chain or model_config.get("providers") or []),
+    )
+
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: list[dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
@@ -6583,6 +6659,7 @@ async def _proxy_with_fallback_cycle(
                             config, cur_local, max_local, request, body_json,
                             model_config, provider_cfg, _session_id,
                             endpoint=local_endpoint,
+                            priority=_priority,
                         )
                     )
                     if _cq_action == "dispatch":
@@ -6732,10 +6809,11 @@ async def _proxy_with_fallback_cycle(
                         ),
                         _get_context_pressure_warn_ratio(config),
                     )
-                # Resolve the config-driven economic-bypass recovery flag
-                # (LP-0MU5A4QBR003YJM0): set by config-cheap.yaml, absent/
-                # false in fast/default profiles.
-                _recover_economic = _economic_bypass_serves_local(config)
+                # Resolve the priority-driven economic-bypass recovery flag
+                # (AC3, LP-0MVDT94F0003VHUA): low priority recovers economic
+                # bypasses locally (cheap semantics); high routes remote;
+                # medium uses the merged base config flag (absent — false).
+                _recover_economic = _economic_bypass_serves_local(config, _priority)
                 _skip_local, _skip_reason = _should_skip_local(
                     _llama_model,
                     _session_id,

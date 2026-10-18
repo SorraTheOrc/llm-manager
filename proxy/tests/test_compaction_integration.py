@@ -356,7 +356,7 @@ class TestLoggingFields:
         line = rec.getMessage()
         assert line.startswith("compaction_event")
         for field in (
-            "session=", "mode=", "action=", "reason=", "pre_tokens=",
+            "session=", "priority=", "action=", "reason=", "pre_tokens=",
             "post_tokens=", "turns_summarized=", "turns_dropped=",
             "summary_tokens=", "dry_run=",
         ):

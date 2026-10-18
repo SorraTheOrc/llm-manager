@@ -450,7 +450,7 @@ S2 = "22222222-2222-2222-2222-222222222222"
 COMPACTION_EVENT_FAST = (
     "2026-08-02 14:12:00,000 - INFO - compaction_event "
     "session=019fc2be-eb73-7830-a55e-c8bd5d21c927 "
-    "mode=fast action=compact reason=context_window "
+    "priority=standard action=compact reason=context_window "
     "pre_tokens=55000 post_tokens=42000 turns_summarized=3 turns_dropped=1 "
     "summary_tokens=800 dry_run=false"
 )
@@ -458,7 +458,7 @@ COMPACTION_EVENT_FAST = (
 COMPACTION_EVENT_CHEAP = (
     "2026-08-02 14:12:30,000 - INFO - compaction_event "
     "session=019fc2be-eb73-7830-a55e-c8bd5d21c928 "
-    "mode=cheap action=remote_with_guidance reason=context_window "
+    "priority=low action=remote_with_guidance reason=context_window "
     "pre_tokens=60000 post_tokens=35000 turns_summarized=2 turns_dropped=0 "
     "summary_tokens=1200 dry_run=true"
 )

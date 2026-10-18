@@ -188,10 +188,9 @@ def find_config_base_path(explicit: str | None = None, start: Path | None = None
     """Locate ``proxy/config.yaml`` (without the mode preference).
 
     An explicit ``--config`` path wins. Otherwise walk up from ``start``
-    (default: the current working directory) looking for ``proxy/config.yaml``.
-    Unlike :func:`find_config_path`, this returns the *base* config so the
-    caller can discover the sibling mode profiles (``config-fast.yaml`` /
-    ``config-cheap.yaml``) and the persisted ``proxy/.mode``.
+    (default: the current working directory) looking for ``proxy/config.yaml``
+    (the single authoritative config; the mode profiles and persisted
+    ``proxy/.mode`` were removed, LP-0MVDT94F0003VHUA AC4).
     """
     if explicit:
         p = Path(explicit).expanduser()
@@ -207,97 +206,74 @@ def find_config_base_path(explicit: str | None = None, start: Path | None = None
     return None
 
 
-def read_mode(config_yaml: Path) -> str | None:
-    """Return the persisted operating mode (``proxy/.mode``), or ``None``.
+def priority_window_label(config_yaml: Path) -> str | None:
+    """Return the priority-window state label (``"low"``/``"standard"``).
 
-    Only ``fast``/``cheap`` are valid; anything else (missing file, garbage)
-    returns ``None`` (fail-open, LP-0MSLMYEEU002IBH6).
+    The fast/cheap mode axis was removed (LP-0MVDT94F0003VHUA AC4): there is
+    no persisted ``.mode`` file. The label is derived from the unified
+    config's ``server.priority_window`` (cheap window) at call time.
     """
-    mode_file = config_yaml.parent / ".mode"
-    try:
-        mode = mode_file.read_text(encoding="utf-8").strip().lower()
-    except OSError:
-        return None
-    return mode if mode in ("fast", "cheap") else None
+    cfg = load_proxy_config(config_yaml) or {}
+    window = (cfg.get("server") or {}).get("priority_window") or {}
+    if not window.get("enabled", True):
+        return "standard"
+    from datetime import datetime as _dt
+    from datetime import time as _time
+
+    def _parse(v, default):
+        try:
+            hh, mm = str(v).strip().split(":")
+            return _time(int(hh), int(mm))
+        except (ValueError, AttributeError):
+            return default
+
+    start = _parse(window.get("start", "01:00"), _time(1, 0))
+    end = _parse(window.get("end", "10:00"), _time(10, 0))
+    now = _dt.now().time()
+    inside = (start <= now < end) if start <= end else (now >= start or now < end)
+    return "low" if inside else "standard"
 
 
 def discover_configs(explicit: str | None = None, start: Path | None = None) -> dict:
     """Locate ``proxy/config.yaml`` and load everything the analysis needs.
 
-    Returns a dict with:
+    ``config.yaml`` is the single authoritative config (the fast/cheap mode
+    overlays were removed, LP-0MVDT94F0003VHUA AC4). Returns a dict with:
 
-    - ``base``: the base ``proxy/config.yaml`` path (or ``None``);
-    - ``profiles``: ``{"default": <parsed>, "fast": <parsed>, "cheap":
-      <parsed>}`` (mode profiles are ``None`` when the file is absent);
-    - ``analysis_mode``: the persisted ``proxy/.mode`` value when it selects
-      an existing profile (else ``None``);
-    - ``analysis_config``: the mode-selected config (the profile for
-      ``analysis_mode``, else the default) — the backward-compatible
-      single-config view used by the recommendations.
+    - ``base``: the ``proxy/config.yaml`` path (or ``None``);
+    - ``profiles``: ``{"default": <parsed>}`` (historical shape retained);
+    - ``analysis_mode``: legacy key retained as ``None`` (there is no mode);
+    - ``analysis_config``: the unified config;
+    - ``priority_window``: the current cheap-window label (``low`` inside,
+      else ``standard``).
     """
     base = find_config_base_path(explicit, start)
-    profiles: dict[str, dict | None] = {"default": None, "fast": None, "cheap": None}
+    profiles: dict[str, dict | None] = {"default": None}
     analysis_mode: str | None = None
+    label: str | None = None
     if base is not None:
         profiles["default"] = load_proxy_config(base)
-        for mode in ("fast", "cheap"):
-            profile_path = base.parent / f"config-{mode}.yaml"
-            if profile_path.is_file():
-                profiles[mode] = load_proxy_config(profile_path)
-        mode = read_mode(base)
-        if mode is not None and profiles[mode] is not None:
-            analysis_mode = mode
-    analysis_config = profiles.get(analysis_mode) if analysis_mode else profiles["default"]
+        label = priority_window_label(base)
     return {
         "base": base,
         "profiles": profiles,
         "analysis_mode": analysis_mode,
-        "analysis_config": analysis_config,
+        "priority_window": label,
+        "analysis_config": profiles["default"],
     }
 
 
 def find_config_path(explicit: str | None = None, start: Path | None = None) -> Path | None:
-    """Locate ``proxy/config.yaml`` (mode-aware).
-
-    An explicit ``--config`` path wins. Otherwise walk up from ``start``
-    (default: the current working directory) looking for ``proxy/config.yaml``.
-    When the persisted operating mode (``proxy/.mode``, LP-0MSLMYEEU002IBH6)
-    selects a profile, the mode-selected file (``config-fast.yaml`` /
-    ``config-cheap.yaml``) is returned instead so bucketing/recommendations
-    read the config the running proxy actually uses; ``config.yaml`` remains
-    the default when no mode is persisted (or the mode file is missing).
-    """
-    base = find_config_base_path(explicit, start)
-    if base is None:
-        return None
-    return _mode_preferred_config(base)
-
-
-def _mode_preferred_config(config_yaml: Path) -> Path:
-    """Return the mode-selected profile when a valid mode is persisted.
-
-    Reads ``proxy/.mode`` next to ``config.yaml``; ``fast``/``cheap`` select
-    ``config-fast.yaml``/``config-cheap.yaml`` when those files exist.
-    Anything else (missing/invalid mode, missing profile) falls back to
-    ``config.yaml`` (the default/fallback profile).
-    """
-    mode_file = config_yaml.parent / ".mode"
-    try:
-        mode = mode_file.read_text(encoding="utf-8").strip().lower()
-    except OSError:
-        return config_yaml
-    if mode in ("fast", "cheap"):
-        selected = config_yaml.parent / f"config-{mode}.yaml"
-        if selected.is_file():
-            return selected
-    return config_yaml
+    """Locate ``proxy/config.yaml`` (the single unified config)."""
+    return find_config_base_path(explicit, start)
 
 
 def load_proxy_config(path: Path | None) -> dict | None:
     """Load and normalize the proxy config from ``path`` (``None`` if absent).
 
-    A deduplicated mode overlay (``config-fast.yaml`` / ``config-cheap.yaml``)
-    is deep-merged onto its sibling ``config.yaml`` base first, so inherited
+    ``config.yaml`` is the single authoritative config (the mode overlays
+    were removed, LP-0MVDT94F0003VHUA AC4). A legacy custom overlay path is
+    deep-merged onto the base first, so inherited
     values such as ``local_model_ctx_size`` are present.
     """
     if path is None or not Path(path).is_file():

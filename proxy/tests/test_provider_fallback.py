@@ -61,7 +61,7 @@ def pin_fast_mode(monkeypatch):
     (``local_large_context_economic_bypass_serves_local``), so it is not
     enabled by this fixture.
     """
-    monkeypatch.setattr("proxy.mode.read_mode", lambda: "fast")
+    monkeypatch.setattr("proxy.priority.request_priority", lambda *a, **k: "medium")
 
 
 @pytest.fixture

@@ -5,8 +5,8 @@ The MunitoAI tiers are the remote fallbacks of the ``plan`` / ``author`` /
 ``code`` chains: ``munitoai-free`` sits directly after the local Qwen3
 provider (first remote tier), and ``munitoai`` sits directly before the
 ``deepseek-flash`` final tier, in both the authoritative base config
-(``config.yaml``) and the fast overlay (``config-fast.yaml``); cheap inherits
-the base chains. These tests assert the *resolved* runtime config through the
+(``config.yaml``, the single authoritative config after the mode axis was
+removed, LP-0MVDT94F0003VHUA AC4). These tests assert the *resolved* runtime config through the
 production merge path, so the tier cannot silently drop out of a profile or
 drift in the chain order.
 
@@ -20,7 +20,7 @@ import json
 
 import pytest
 from proxy.provider import _build_resolved_model_value
-from tests.config_test_utils import get_merged_config, load_profile
+from config_test_utils import get_merged_config, load_profile
 
 #: The exact provider entry the chains must carry right after local.
 #: ``display_name`` marks the free tier (``MunitoAI Free``) so the

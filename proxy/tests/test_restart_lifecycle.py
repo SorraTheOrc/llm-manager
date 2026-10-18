@@ -54,84 +54,17 @@ def _make_srv(**overrides) -> SimpleNamespace:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def test_count_in_flight_counts_active_records_when_counter_zero(monkeypatch):
-    """The drain sees real streams even when ``local_active_queries`` is 0."""
-    import proxy.server as srv
+def test_mode_switch_drain_removed():
+    """The bounded mode-switch drain was removed with the fast/cheap mode
+    axis (LP-0MVDT94F0003VHUA AC4): the proxy never restarts for a routing
+    policy change, so no drain exists. The drain helpers lived in
+    ``proxy.mode``, which is gone.
+    """
+    import importlib
 
-    monkeypatch.setattr(srv, "local_active_queries", 0)
-    monkeypatch.setattr(
-        srv,
-        "local_dispatch_records",
-        {
-            "sess-a": {"active": True},
-            "sess-b": {"active": False},
-            "sess-c": {"active": True},
-        },
-    )
-    from proxy import mode
+    with pytest.raises(ImportError):
+        importlib.import_module("proxy.mode")
 
-    assert mode._count_in_flight_local_streams() == 2
-
-
-def test_count_in_flight_uses_counter_when_higher(monkeypatch):
-    """The counter wins when it exceeds the active-record count."""
-    import proxy.server as srv
-
-    monkeypatch.setattr(srv, "local_active_queries", 5)
-    monkeypatch.setattr(srv, "local_dispatch_records", {"sess-a": {"active": True}})
-    from proxy import mode
-
-    assert mode._count_in_flight_local_streams() == 5
-
-
-def test_count_in_flight_fail_open(monkeypatch):
-    """A missing/invalid records dict falls back to the counter."""
-    import proxy.server as srv
-
-    monkeypatch.setattr(srv, "local_active_queries", 3)
-    monkeypatch.setattr(srv, "local_dispatch_records", None)
-    from proxy import mode
-
-    assert mode._count_in_flight_local_streams() == 3
-
-
-def test_wait_for_in_flight_waits_for_active_records(monkeypatch):
-    """A drain deadline holds while an active dispatch record is present."""
-    import proxy.server as srv
-
-    from proxy import mode
-
-    # Counter is 0 but a real stream is active; then it clears.
-    state = {"calls": 0}
-
-    def _count():
-        state["calls"] += 1
-        return 1 if state["calls"] < 3 else 0
-
-    monkeypatch.setattr(mode, "_count_in_flight_local_streams", _count)
-    monkeypatch.setattr(mode.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(mode, "_end_drain", lambda: None)
-
-    deadline = time.monotonic() + 5
-    mode._wait_for_in_flight_local_streams(deadline=deadline)
-    assert state["calls"] >= 3, "Drain must poll until the real stream clears"
-
-
-def test_wait_for_in_flight_bounded_by_deadline(monkeypatch):
-    """A stuck stream cannot hold the restart past the deadline."""
-    from proxy import mode
-
-    monkeypatch.setattr(mode, "_count_in_flight_local_streams", lambda: 99)
-    monkeypatch.setattr(mode.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(mode, "_end_drain", lambda: None)
-
-    # Already-expired deadline returns immediately.
-    mode._wait_for_in_flight_local_streams(deadline=time.monotonic() - 1)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Signature
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @pytest.fixture
@@ -142,13 +75,13 @@ def sig_path(tmp_path, monkeypatch):
 
 
 def test_write_and_read_signature(sig_path, monkeypatch):
-    monkeypatch.setattr(lifecycle, "_read_mode_label", lambda: "fast")
+    monkeypatch.setattr(lifecycle, "_read_mode_label", lambda: "unified")
     monkeypatch.setattr(lifecycle, "_config_file_sha256", lambda: "abc123")
     lifecycle._write_llama_server_signature("Qwen3", 1, router_mode=True)
 
     sig = lifecycle._read_llama_server_signature()
     assert sig is not None
-    assert sig["mode"] == "fast"
+    assert sig["mode"] == "unified"
     assert sig["model"] == "router"
     assert sig["parallel"] == 1
     assert sig["router_mode"] is True
@@ -369,7 +302,7 @@ def test_config_file_sha256_matches_shared_merged_helper(monkeypatch, tmp_path):
     overlay) is byte-identical to the shared ``merged_config_sha256`` helper
     on the same inputs."""
     from proxy.config_merge import merged_config_sha256
-    from proxy.mode import proxy_dir
+    from proxy.priority import proxy_dir
 
     overlay = tmp_path / "custom-overlay.yaml"
     overlay.write_text("server:\n  session_slot_pool_size: 2\n", encoding="utf-8")
@@ -385,7 +318,7 @@ def test_config_file_sha256_hashes_merged_not_raw_overlay(monkeypatch, tmp_path)
     raw overlay bytes) must change the write-side hash — proxied through the
     shared helper which reads the merged surface."""
     from proxy.config_merge import merged_config_sha256
-    from proxy.mode import proxy_dir
+    from proxy.priority import proxy_dir
 
     overlay = tmp_path / "custom-overlay.yaml"
     overlay.write_text("server:\n  session_slot_pool_size: 2\n", encoding="utf-8")
@@ -414,7 +347,7 @@ def test_config_file_sha256_falls_back_to_base_without_env(monkeypatch):
     """With ``$LLAMA_PROXY_CONFIG`` unset the write side hashes the base
     merged with itself (base still exists), not the empty string."""
     from proxy.config_merge import merged_config_sha256
-    from proxy.mode import proxy_dir
+    from proxy.priority import proxy_dir
 
     monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
     base_path = proxy_dir() / "config.yaml"
@@ -427,7 +360,7 @@ def test_config_file_sha256_tolerates_missing_overlay(monkeypatch, tmp_path):
     """A ``$LLAMA_PROXY_CONFIG`` pointing at a missing file falls back to
     the base rather than returning an error/empty string."""
     from proxy.config_merge import merged_config_sha256
-    from proxy.mode import proxy_dir
+    from proxy.priority import proxy_dir
 
     missing = tmp_path / "missing-overlay.yaml"
     monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(missing))

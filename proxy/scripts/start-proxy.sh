@@ -13,13 +13,13 @@ set -euo pipefail
 #               Proxy-only restart: preserve the co-located llama-server so its
 #               warm KV / prompt cache survives (LP-0MUCEFCL6001ZXYN). With
 #               --restart and no explicit flag, llama-server is preserved
-#               automatically when its recorded signature matches the selected
-#               config (same mode + merged-config hash, base + overlay); it is
-#               restarted when the effective local-backend config actually
-#               changes. The signature hashes the MERGED config via the shared
-#               merged_config_sha256 helper (LP-0MUJRVYQH002IEHW); pre-upgrade
-#               raw-file-hash signatures mismatch once and conservatively
-#               restart llama-server.
+#               automatically when its recorded signature matches the effective
+#               config; it is restarted when the local-backend config actually
+#               changes. The signature hashes the merged config (the base alone
+#               since the mode overlays were removed, LP-0MVDT94F0003VHUA AC4)
+#               via the shared merged_config_sha256 helper
+#               (LP-0MUJRVYQH002IEHW); pre-upgrade raw-file-hash signatures
+#               mismatch once and conservatively restart llama-server.
 #   --verbose   Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO level)
 #
 # Automatically resolves required API keys from:
@@ -185,25 +185,20 @@ if [ "$RESTART" -eq 1 ]; then
   # LP-0MUCEFCL6001ZXYN: decide whether to preserve the co-located
   # llama-server. A proxy-only restart (unchanged local backend config) must
   # keep it running so the warm KV / prompt cache survives; a genuine
-  # model/parallel change (e.g. a mode switch) must restart it.
+  # model/parallel change must restart it.
   KEEP_LLAMA=0
   if [ "$KEEP_LLAMA_SERVER" -eq 1 ]; then
     KEEP_LLAMA=1
   else
-    _sig_mode=""
     _sig_sha=""
-    _restart_mode="fast"
-    if [ -f "$REPO_ROOT/.mode" ]; then
-      _restart_mode="$(tr -d '[:space:]' < "$REPO_ROOT/.mode")"
-    fi
-    _restart_cfg="$REPO_ROOT/config-$_restart_mode.yaml"
-    [ -f "$_restart_cfg" ] || _restart_cfg="$REPO_ROOT/config.yaml"
+    _restart_cfg="$REPO_ROOT/config.yaml"
     # LP-0MUJRVYQH002IEHW: hash the MERGED config (base + overlay) via the
-    # shared canonical helper — NOT the raw overlay file — so a base-only
+    # shared canonical helper — NOT the raw file — so a base-only
     # local-backend change (e.g. local_model_ctx_size, llama_server_port)
-    # also changes the signature and forces a llama-server restart. When the
-    # overlay file is absent the base is hashed merged with itself. An empty
-    # hash (Python unavailable / helper failure) means "do not preserve".
+    # also changes the signature and forces a llama-server restart. With the
+    # mode axis removed (LP-0MVDT94F0003VHUA AC4) the effective config is
+    # the base alone. An empty hash (Python unavailable / helper failure)
+    # means "do not preserve".
     _restart_sha="$("$PY_BIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT/proxy')
@@ -212,10 +207,9 @@ print(merged_config_sha256('$REPO_ROOT/config.yaml', '$_restart_cfg'))
 " 2>/dev/null || true)"
     _sig_file="$REPO_ROOT/.llama_server_signature.json"
     if [ -f "$_sig_file" ] && [ -n "$_restart_sha" ]; then
-      _sig_mode="$("$PY_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('mode',''))" "$_sig_file" 2>/dev/null || true)"
       _sig_sha="$("$PY_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('config_sha256',''))" "$_sig_file" 2>/dev/null || true)"
     fi
-    if [ -n "$_sig_mode" ] && [ "$_sig_mode" = "$_restart_mode" ] && [ "$_sig_sha" = "$_restart_sha" ]; then
+    if [ -n "$_sig_sha" ] && [ "$_sig_sha" = "$_restart_sha" ]; then
       KEEP_LLAMA=1
     fi
   fi
@@ -284,42 +278,16 @@ if [ "$PORT_IN_USE" -eq 1 ]; then
   exit 1
 fi
 
-# ---- Resolve operating mode and config file -----------------------------
-# The persisted mode (proxy/.mode, written by POST /admin/set-mode) selects
-# the config profile: fast -> config-fast.yaml, cheap -> config-cheap.yaml.
-# Absent/invalid state defaults to fast (current behavior). LLAMA_PROXY_CONFIG
-# is exported so the server's load_config() uses the same profile, and API
-# keys are resolved from the MERGED config (base config.yaml + the selected
-# mode overlay), so keys declared only in the base are still resolved; a key
-# that is genuinely absent everywhere still fails startup loudly. The mode
-# overlays no longer repeat inherited values, so reading the raw mode file
-# alone would miss every base-declared api_key_env.
-
-MODE_FILE="$REPO_ROOT/.mode"
-MODE="fast"
-if [ -f "$MODE_FILE" ]; then
-  MODE_CONTENT="$(tr -d '[:space:]' < "$MODE_FILE")"
-  case "$MODE_CONTENT" in
-    fast|cheap) MODE="$MODE_CONTENT" ;;
-    *) echo "Warning: unknown mode '$MODE_CONTENT' in $MODE_FILE, defaulting to fast" >&2 ;;
-  esac
-fi
-
-CONFIG_FILE="$REPO_ROOT/config-$MODE.yaml"
-if [ ! -f "$CONFIG_FILE" ]; then
-  echo "Warning: $CONFIG_FILE not found, falling back to config.yaml" >&2
-  CONFIG_FILE="$REPO_ROOT/config.yaml"
-fi
-export LLAMA_PROXY_CONFIG="$CONFIG_FILE"
-echo "Operating mode: $MODE (config: $CONFIG_FILE)" >&2
+CONFIG_FILE="$REPO_ROOT/config.yaml"
+echo "Using config: $CONFIG_FILE" >&2
 
 AUTH_FILE="$HOME/.pi/agent/auth.json"
 
 resolve_api_keys() {
   local missing=()
 
-  # Extract all unique api_key_env values from the MERGED config
-  # (base config.yaml + the selected mode overlay).
+  # Extract all unique api_key_env values from the config
+  # (proxy/config.yaml, the single authoritative config).
   while IFS='' read -r env_var; do
     [[ -z "$env_var" ]] && continue
 

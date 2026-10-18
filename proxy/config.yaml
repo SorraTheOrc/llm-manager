@@ -375,6 +375,18 @@ models:
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    # Per-priority provider chains (LP-0MVDT94F0003VHUA AC2). Each entry is
+    # an ordered provider list (names resolved against ``providers``); the
+    # chain used for a request is selected by its effective priority. A
+    # missing priority falls back to the full ``providers`` chain (today's
+    # behaviour = ``medium`` semantics). ``low`` prefers local and the free
+    # tier, never spending on the paid remote tiers; ``medium``/``high`` use
+    # the full chain — high differs only in the routing knobs (never queues,
+    # economic bypass routes remote), not the chain (AC3).
+    priority_routes:
+      low:
+        - local-qwen3
+        - munitoai-free
     aliases:
     - plan*
     force_full_prompt: true
@@ -477,6 +489,10 @@ models:
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    priority_routes:
+      low:
+        - local-qwen3
+        - munitoai-free
     aliases:
     - author
     force_full_prompt: true
@@ -586,6 +602,10 @@ models:
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    priority_routes:
+      low:
+        - local-qwen3
+        - munitoai-free
     aliases:
     - code
     force_full_prompt: true
@@ -619,6 +639,14 @@ models:
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    # Remote-only chain has no local tier, so every priority uses the same
+    # chain (summarisation never contends with the GPU slots;
+    # LP-0MTT0O74N009E7N2). Declared explicitly to satisfy the
+    # per-model ``priority_routes`` schema (AC2).
+    priority_routes:
+      low:
+        - opencode-go-compact
+        - deepseek-flash-compact
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
@@ -1083,91 +1111,53 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  # Base/default profile runs 2 slots (fast inherits 2; cheap converges to
-  # 2 per the slot-count verdict, LP-0MV9UNGEB009XUZ5 / LP-0MVCGYAI80084PCZ).
+  # Slot pool is FIXED at 2 (the N=2 verdict LP-0MV9UNGEB009XUZ5 /
+  # LP-0MVCGYAI80084PCZ); bursts are absorbed by the bounded contention
+  # queue below. No routing policy change ever restarts the proxy or
+  # llama-server again (LP-0MVDT94F0003VHUA AC4).
   session_slot_pool_size: 2
 
-  # Slot count is defined ONCE per mode profile via ``session_slot_pool_size``
-  # above (default/fast: 2, cheap: 3 — converging to 2, LP-0MVCGYAI80084PCZ). There is no time-based slot schedule:
-  # the slot count changes only when the operating mode changes. The
-  # mode-switch schedule (when to switch fast<->cheap) lives in the
-  # standalone ``proxy/mode_schedule.yaml`` file, not in this model profile.
-  #
   # -----------------------------------------------------------------------
-  # Session grandfathering across mode switches (LP-0MSMF5LXO006YDNM)
+  # Contention queue (merged from the retired config-fast/cheap overlays)
   # -----------------------------------------------------------------------
-  # When the proxy switches fast<->cheap, sessions that were ALREADY active
-  # (recorded session->model bindings persisted beside proxy/.mode) may keep
-  # using their model - including its full provider chain (local-first, with
-  # the opencode/opencode-go/deepseek remote fallbacks, or remote-only for
-  # github) - until the EARLIER of the next scheduled mode transition or the
-  # session idle TTL. This deliberately RELAXES the cheap-mode "no paid calls"
-  # guarantee for those grandfathered sessions only, and only within the grace
-  # deadline. New sessions (and requests without a session id) are never
-  # grandfathered. Set enabled: false to turn the whole feature off.
-  # fallback_grace_seconds: only used when the mode schedule is disabled
-  # (default = session TTL, 3h).
-  mode_switch_grandfathering:
-    enabled: true
-    # fallback_grace_seconds: 10800
+  # The per-mode queue policy was declared by the mode overlays
+  # (config-fast.yaml / config-cheap.yaml, both ``queue`` depth 8 / wait 120s);
+  # with the mode axis removed the policy is a single server-level knob.
+  # Circuit: a request that finds all local slots busy QUEUES (bounded by
+  # these caps) instead of immediately falling back to a paid remote
+  # provider. ``medium`` priority engages the queue when the policy is
+  # ``queue``; ``low`` always queues (cheap semantics); ``high`` never
+  # queues (immediate remote fallback) — see proxy/proxy/priority.py.
+  contention_queue_policy: queue
+  contention_queue_max_wait_seconds: 120
+  contention_queue_max_depth: 8
 
   # -----------------------------------------------------------------------
-  # Bounded drain before a mode-switch restart (LP-0MT631JKW008WAKE)
+  # Priority routing cheap window (LP-0MVDT94F0003VHUA AC1)
   # -----------------------------------------------------------------------
-  # A mode switch (scheduled 01:00/10:00 or manual POST /admin/set-mode)
-  # restarts the proxy process. Historically the restart killed in-flight
-  # local streams mid-generation, surfacing a synthetic `finish_reason:
-  # error` to clients; the bounded drain fixes that:
-  #   - NEW chat requests are deferred with a short 503 + Retry-After while
-  #     the drain is active (no new stream starts that would be killed),
-  #   - the process kill is delayed until in-flight local streams finish,
-  #     bounded by max_seconds,
-  #   - enabled: false (or max_seconds: 0) restores the old "just restart"
-  #     behavior.
-  # The window is SHORT and bounded, preserving the "no long rejection
-  # window" property of slot-schedule transitions (LP-0MSF9RUSQ007M346).
-  mode_switch_drain:
+  # During this local-time window EVERY request is routed as ``low`` priority
+  # regardless of its X-Priority header. The header value is never modified
+  # and no 503/Retry-After deferral is applied — a spoofed ``high`` during
+  # cheap hours simply routes as low. Defaults to the retired mode-schedule
+  # cheap window (01:00–10:00). A window with start > end wraps across
+  # midnight (e.g. 22:00–06:00). Set enabled: false to disable the cap.
+  priority_window:
     enabled: true
-    # Maximum seconds to wait for in-flight local streams before the restart
-    # kills the process. Increased from 30s to 90s so more complex
-    # grandfathering + slot-save operations can complete gracefully.
-    max_seconds: 90
-    # Extra seconds added to the "Retry-After" header past the drain deadline
-    # so clients retry after the restart has had time to complete.
-    retry_after_margin_seconds: 15
-
-  # -----------------------------------------------------------------------
-  # Mode-switch lock for performance investigations (LP-0MVCBMLP7009MN81)
-  # -----------------------------------------------------------------------
-  # A slot sweep or other performance investigation must not be corrupted
-  # by a fast<->cheap mode switch mid-run (the herdr mode-switch worker and
-  # the schedule can both flip modes, each triggering a proxy restart).
-  # When the lock is ON, every request that would CHANGE the mode is
-  # rejected (POST /admin/set-mode -> 423 Locked) and the mode scheduler
-  # stands down; the current mode is held. Normal operation is unaffected
-  # when the lock is OFF (the default).
-  #
-  # The lock is normally toggled at runtime WITHOUT a restart via
-  # POST /admin/mode-switch-lock {"enabled": true|false, "reason": "..."}
-  # (state persisted in proxy/.mode-switch-lock, so it survives the restart
-  # a pre-lock change would have armed). This config key sets the default
-  # for a fresh deployment; absent = OFF.
-  mode_switch_lock:
-    enabled: false
-    # reason: "1/2/3 slot sweep"   # optional, for diagnostics only
+    start: "01:00"
+    end: "10:00"
 
   # -----------------------------------------------------------------------
   # Post-restart startup ramp (LP-0MU9ZXFQS0023DXT)
   # -----------------------------------------------------------------------
-  # After a mode-switch restart, competing herdr/agent workers reconnect
-  # simultaneously, creating a thundering herd that overwhelms the freshly-
-  # started proxy. This gate returns 503 + random Retry-After (uniform
-  # jitter) so reconnects spread across the ramp window instead of hitting
-  # the server at once. Clients simply retry with the given delay. The 503
-  # body also includes ``ramp_ends_at`` (ISO-8601 UTC, the guaranteed ceiling)
-  # and ``ramp_remaining_seconds`` (whole seconds) so clients can sleep for a
-  # deterministic upper bound instead of inferring one from the jitter
-  # (LP-0MU9Z7O8M0053Y0K).
+  # After any proxy restart (operator restart, model switch), competing
+  # herdr/agent workers reconnect simultaneously, creating a thundering herd
+  # that overwhelms the freshly-started proxy. This gate returns 503 + random
+  # Retry-After (uniform jitter) so reconnects spread across the ramp window
+  # instead of hitting the server at once. Clients simply retry with the
+  # given delay. The 503 body also includes ``ramp_ends_at`` (ISO-8601 UTC,
+  # the guaranteed ceiling) and ``ramp_remaining_seconds`` (whole seconds) so
+  # clients can sleep for a deterministic upper bound instead of inferring
+  # one from the jitter (LP-0MU9Z7O8M0053Y0K).
   startup_ramp:
     enabled: true
     # Short safety ceiling (seconds) after process start. New chat requests
@@ -1307,7 +1297,9 @@ server:
   # Trade-off: true failures are detected more slowly (up to 30s of silence).
   # Bounded by upstream_request_timeout_seconds (120s) — the idle timeout
   # never exceeds the total request timeout. See LP-0MU1RXEPL005CK97.
-  upstream_idle_timeout_seconds: 30
+  # 240s (merged from the retired config-fast/cheap overlays, which both
+  # set 240s; the pre-overlay base default was 30s).
+  upstream_idle_timeout_seconds: 240
 
   # Remote-stream watchdog budgets (LP-0MSVP7ZML003XZTJ).
   # The per-chunk idle timeout above only fires on SILENCE — an upstream

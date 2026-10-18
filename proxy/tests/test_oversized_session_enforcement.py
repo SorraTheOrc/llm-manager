@@ -162,10 +162,10 @@ class TestUnifiedDetectionKnob:
 
     @pytest.mark.parametrize(
         "config_file",
-        ["config.yaml", "config-fast.yaml", "config-cheap.yaml"],
+        ["config.yaml"],
     )
     def test_live_configs_expose_one_detection_knob(self, config_file):
-        from tests.config_test_utils import load_profile
+        from config_test_utils import load_profile
 
         cfg = load_profile(config_file)
         server = cfg["server"]

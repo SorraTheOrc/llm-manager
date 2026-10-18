@@ -476,7 +476,7 @@ def test_author_alias_resolves_author_txt_from_real_config():
     without any client supplying them.
     """
     from proxy.prompt_resolver import REPO_ROOT, resolve_system_prompt
-    from tests.config_test_utils import load_profile
+    from config_test_utils import load_profile
 
     cfg = load_profile("config.yaml")
     model_cfg = cfg["models"]["author"]

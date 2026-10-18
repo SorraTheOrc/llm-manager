@@ -16,8 +16,9 @@ limitations. The skill itself is a thin, CLI-focused wrapper — see
 - Config (reference only, for slot schedule + thresholds):
   `proxy/config.yaml` in the llm project (auto-discovered by walking up from
   the current directory, or pass `--config`). When the persisted operating
-  mode (`proxy/.mode`) selects a profile, the mode-selected config
-  (`config-fast.yaml` / `config-cheap.yaml`) is read instead, so bucketing
+  mode axis was removed (LP-0MVDT94F0003VHUA AC4), so the single unified
+  `proxy/config.yaml` is read, and the priority window
+  (`server.priority_window`) drives the standard/low session bucketing
   and recommendations match the config the running proxy actually uses.
 
 ## Outputs
@@ -30,19 +31,20 @@ when previous outputs were moved aside):
 ```text
 Outputs written to:
   /home/user/proxy-usage-reports/report.md
-  /home/user/proxy-usage-reports/fast_sessions.csv
-  /home/user/proxy-usage-reports/cheap_sessions.csv
+  /home/user/proxy-usage-reports/standard_sessions.csv
+  /home/user/proxy-usage-reports/low_priority_sessions.csv
   /home/user/proxy-usage-reports/errors.csv
   /home/user/proxy-usage-reports/errors.json
 ```
 
 - `report.md` — the aggregate report (primary deliverable, listed first).
-- `fast_sessions.csv` — one row per **fast** session (sessions whose start
-  fell in a fast-mode period; the period(s) with the fewest slots per the
-  mode's `slot_schedule`). One row per session, covering ALL sessions in the
+- `standard_sessions.csv` — one row per **standard** session (sessions
+  whose start fell outside the cheap priority window). One row per session,
+  covering ALL sessions in the
   window (local-only and fallback).
-- `cheap_sessions.csv` — one row per **cheap** session (sessions whose start
-  fell in a cheap-mode period; produced only when the window contains cheap
+- `low_priority_sessions.csv` — one row per **low** session (sessions whose
+  start fell inside the cheap priority window; produced only when the window
+  contains low-priority periods,
   hours).
 - `errors.csv` — one row per **error event** in the window (stream finish
   errors, stream errors, `slot_save` failures, `backend_retry` timeouts,

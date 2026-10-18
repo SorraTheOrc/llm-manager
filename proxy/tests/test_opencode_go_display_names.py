@@ -13,15 +13,16 @@ Each account now carries a distinct ``display_name`` (``OpenCode Go 3`` /
 (LP-0MVCQ36QV009QX8K). The change is display-only: ``provider`` (which feeds
 failure-domain, cooldown and usage-limit keying) is untouched.
 
-These tests assert the *resolved* runtime config through the production merge
-path (base ``config.yaml`` and the merged fast/cheap profiles), so a tier
-cannot silently drop out of a profile or drift in the chain order, and that
-the resolved-model header values are pairwise distinct.
+These tests assert the *resolved* runtime config through the production
+loader (``config.yaml`` is the single authoritative config after the
+fast/cheap mode overlays were removed, LP-0MVDT94F0003VHUA AC4), so a tier
+cannot silently drop out or drift in the chain order, and that the
+resolved-model header values are pairwise distinct.
 """
 
 import pytest
 import yaml
-from proxy.mode import proxy_dir
+from proxy.priority import proxy_dir
 from proxy.provider import (
     _build_resolved_model_value,
     _entry_cooldown_key,
@@ -86,26 +87,26 @@ def test_merged_chain_opencode_entries_carry_distinct_display_names(mode, model)
         assert entry["provider"] == "opencode-go"
 
 
-def test_fast_overlay_declares_display_names_directly():
-    """config-fast.yaml repeats the entries in full, so it must carry the labels.
+def test_base_config_declares_display_names_directly():
+    """config.yaml (the single authoritative config) declares the labels.
 
-    AC5: the overlay file itself (not just the base) declares display_name.
-    Lists replace the base wholesale in deep_merge, so a label missing here
-    would be missing from the merged fast config too.
+    AC5: the base file itself carries display_name directly (the fast/cheap
+    overlay that previously repeated the entries was removed,
+    LP-0MVDT94F0003VHUA AC4).
     """
-    with open(proxy_dir() / "config-fast.yaml") as fh:
-        overlay = yaml.safe_load(fh)
+    with open(proxy_dir() / "config.yaml") as fh:
+        base = yaml.safe_load(fh)
     for model in CHAINS:
-        providers = overlay["models"][model]["providers"]
+        providers = base["models"][model]["providers"]
         entries = {
             p["name"]: p for p in providers if str(p["name"]).startswith("opencode")
         }
         for name, display in OPENCODE_GO_TIERS.items():
             assert entries[name]["display_name"] == display, (
-                f"config-fast.yaml {model}/{name} must carry display_name {display!r}"
+                f"config.yaml {model}/{name} must carry display_name {display!r}"
             )
     compact_entries = {
-        p["name"]: p for p in overlay["models"]["compact"]["providers"]
+        p["name"]: p for p in base["models"]["compact"]["providers"]
     }
     compact = compact_entries["opencode-go-compact"]
     assert compact["display_name"] == OPENCODE_GO_COMPACT_DISPLAY

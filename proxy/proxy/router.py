@@ -168,8 +168,9 @@ def _get_contention_queue_config(server_config: dict) -> dict:
       - ``max_depth``: clamped to [1, 16]
 
     Invalid values are logged and clamped, never crash (LP-0MSORQVK50012Q4D
-    F2 AC3/AC4). The policy applies during cheap operating mode only (the
-    caller gates on proxy.mode.read_mode() == "cheap").
+    F2 AC3/AC4). Entry is gated per request by the effective priority (AC3,
+    LP-0MVDT94F0003VHUA): ``low`` always queues, ``high`` never queues,
+    ``medium`` engages when the merged base config's policy is ``queue``.
     """
     policy = str(
         server_config.get("contention_queue_policy", "fallback") or "fallback"
@@ -706,11 +707,11 @@ async def _route_remote_with_compaction_guidance(
     reason = session_result.get("compaction_reason") or "remote_with_guidance"
     guidance = _compaction_guidance_value(server_config, estimated)
     try:
-        from proxy.mode import read_mode as _read_mode
+        from proxy import priority as _priority_mod
 
-        mode = _read_mode()
+        priority = _priority_mod.request_priority(request, server_config)
     except Exception:
-        mode = "fast"
+        priority = "medium"
 
     model_cfg = None
     if model_name:
@@ -725,12 +726,12 @@ async def _route_remote_with_compaction_guidance(
     ]
 
     srv.logger.warning(
-        "compaction_remote_with_guidance session=%s model=%s mode=%s "
+        "compaction_remote_with_guidance session=%s model=%s priority=%s "
         "estimated_tokens=%d reason=%s remote_providers=%d; refusing local "
         "near-full-slot dispatch",
         session_id or "unknown",
         model_name or "unknown",
-        mode,
+        priority,
         estimated,
         reason,
         len(remote_providers),
@@ -745,13 +746,13 @@ async def _route_remote_with_compaction_guidance(
         )
 
         try:
-            cap = compute_hard_routing_cap(mode, server_config)
+            cap = compute_hard_routing_cap("fast", server_config)
         except Exception:
             cap = 0
         if cap <= 0:
             cap = estimated
         gate = _build_compaction_gate_response(
-            estimated, cap, mode, session_id, model_name,
+            estimated, cap, priority, session_id, model_name,
         )
         try:
             gate.headers["X-Session-Compaction-Guidance"] = guidance
@@ -969,37 +970,46 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         # provider smart-routing block re-estimates per attempt anyway.
         _estimated_tokens = 0
     try:
-        from proxy.mode import read_mode as _read_mode
-        _mode = _read_mode()
+        from proxy import priority as _priority_mod
+
+        _priority = _priority_mod.request_priority(request, server_config)
     except Exception:
-        _mode = "fast"
+        _priority = "medium"
     from proxy.provider import (
         check_hard_routing_cap,
         compute_hard_routing_cap,
     )
-    if check_hard_routing_cap(_estimated_tokens, _mode, server_config):
-        _cap = compute_hard_routing_cap(_mode, server_config)
-        if _mode == "cheap":
-            # Cheap mode: return a 429 compaction-gate response.
+    # Effective priority replaces the retired fast/cheap mode (AC3). The
+    # unified config keeps both ratio keys as legacy labels: a ``low``
+    # priority uses the conservative (cheap) ratio and, over-cap, is gated
+    # with a 429 compaction response (never spends on a paid remote);
+    # ``medium``/``high`` use the fast ratio and escalate remote with
+    # ``context_too_large``. Both ratios are retired in the shipped config
+    # (0 → disabled).
+    _cap_mode = "cheap" if _priority == "low" else "fast"
+    if check_hard_routing_cap(_estimated_tokens, _cap_mode, server_config):
+        _cap = compute_hard_routing_cap(_cap_mode, server_config)
+        if _priority == "low":
+            # Low priority: return a 429 compaction-gate response.
             srv.logger.info(
-                "compaction_gate session=%s tokens=%d cap=%d mode=%s",
+                "compaction_gate session=%s tokens=%d cap=%d priority=%s",
                 session_id or "anonymous",
                 _estimated_tokens,
                 _cap,
-                _mode,
+                _priority,
             )
             from proxy.provider import _build_compaction_gate_response
             return _build_compaction_gate_response(
-                _estimated_tokens, _cap, _mode, session_id, model_name,
+                _estimated_tokens, _cap, _priority, session_id, model_name,
             )
         else:
-            # Fast mode: skip local with context_too_large.
+            # Medium/high priority: skip local with context_too_large.
             srv.logger.info(
-                "context_too_large session=%s tokens=%d cap=%d mode=%s",
+                "context_too_large session=%s tokens=%d cap=%d priority=%s",
                 session_id or "anonymous",
                 _estimated_tokens,
                 _cap,
-                _mode,
+                _priority,
             )
             _record_backend_signal("context_too_large")
             raise HTTPException(
@@ -1007,7 +1017,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                 detail=(
                     f"Context ({_estimated_tokens} tokens) exceeds the "
                     f"{model_name or 'model'} local routing cap ({_cap} tokens) "
-                    "in fast mode. Compact the session and retry."
+                    "for this priority tier. Compact the session and retry."
                 ),
                 headers={"X-Context-Too-Large": "true"},
             )

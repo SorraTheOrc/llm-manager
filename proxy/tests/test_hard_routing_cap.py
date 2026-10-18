@@ -56,13 +56,12 @@ def provider_mod():
 @pytest.fixture
 def real_config():
     """Loaded real config profiles (AC5: ratio surface resolves to absolutes)."""
-    from tests.config_test_utils import load_profile
+    from config_test_utils import load_profile
 
-    return {
-        "fast": load_profile("config-fast.yaml"),
-        "cheap": load_profile("config-cheap.yaml"),
-        "base": load_profile("config.yaml"),
-    }
+    # The mode overlays were removed (LP-0MVDT94F0003VHUA AC4); all labels
+    # resolve to the single unified config.
+    unified = load_profile("config.yaml")
+    return {"fast": unified, "cheap": unified, "base": unified}
 
 
 def _cfg(
@@ -359,9 +358,13 @@ class TestRouterCapGate:
             "local_hard_routing_cap_ratio_cheap": 0.6144,
             "max_concurrent_queries": 16,
         }
-        import proxy.mode as mode_mod
+        import proxy.priority as priority_patch_mod
 
-        monkeypatch.setattr(mode_mod, "read_mode", lambda: mode)
+        monkeypatch.setattr(
+            priority_patch_mod,
+            "request_priority",
+            lambda *a, **k: "low" if mode == "cheap" else "medium",
+        )
         import proxy.provider as provider_mod
 
         if cached_ratio is not None:
@@ -404,9 +407,11 @@ class TestRouterCapGate:
             "local_hard_routing_cap_ratio_cheap": 0.6144,
             "max_concurrent_queries": 16,
         }
-        import proxy.mode as mode_mod
+        import proxy.priority as priority_patch_mod
 
-        monkeypatch.setattr(mode_mod, "read_mode", lambda: "fast")
+        monkeypatch.setattr(
+            priority_patch_mod, "request_priority", lambda *a, **k: "medium"
+        )
         proxy_to_local, router_mod = _patch_router_harness(monkeypatch, server_cfg)
         _patch_estimate(monkeypatch, 75000)
         req = _DummyRequest(
@@ -486,26 +491,26 @@ class TestCompactionGateResponse:
 
     def test_response_is_429(self, provider_mod):
         resp = provider_mod._build_compaction_gate_response(
-            estimated_tokens=70000, cap=60000, mode="cheap",
+            estimated_tokens=70000, cap=60000, priority="low",
             session_id="test-session", model_name="qwen3",
         )
         assert resp.status_code == 429
 
     def test_response_headers(self, provider_mod):
         resp = provider_mod._build_compaction_gate_response(
-            estimated_tokens=70000, cap=60000, mode="cheap",
+            estimated_tokens=70000, cap=60000, priority="low",
             session_id="test-session", model_name="qwen3",
         )
         assert resp.headers["X-Compaction-Gate"] == "true"
         assert resp.headers["X-Compaction-Estimated-Tokens"] == "70000"
         assert resp.headers["X-Compaction-Cap"] == "60000"
-        assert resp.headers["X-Compaction-Mode"] == "cheap"
+        assert resp.headers["X-Compaction-Priority"] == "low"
         assert resp.headers["X-Session-Id"] == "test-session"
         assert resp.headers["X-Resolved-Model"] == "local/qwen3"
 
     def test_response_body(self, provider_mod):
         resp = provider_mod._build_compaction_gate_response(
-            estimated_tokens=70000, cap=60000, mode="cheap",
+            estimated_tokens=70000, cap=60000, priority="low",
             session_id="test-session", model_name="qwen3",
         )
         body = json.loads(resp.body.decode())
@@ -515,12 +520,12 @@ class TestCompactionGateResponse:
         assert "60000" in body["error"]["message"]
         assert body["estimated_tokens"] == 70000
         assert body["cap"] == 60000
-        assert body["mode"] == "cheap"
+        assert body["priority"] == "low"
 
     def test_compaction_gate_never_remote(self, provider_mod):
         """AC2: The gate response is local-only (429), never a silent remote."""
         resp = provider_mod._build_compaction_gate_response(
-            estimated_tokens=70000, cap=60000, mode="cheap",
+            estimated_tokens=70000, cap=60000, priority="low",
             session_id=None, model_name="qwen3",
         )
         assert resp.status_code == 429
@@ -535,7 +540,7 @@ class TestCompactionGateResponse:
 
     def test_is_compaction_gate_response_detects(self, provider_mod):
         resp = provider_mod._build_compaction_gate_response(
-            estimated_tokens=70000, cap=60000, mode="cheap",
+            estimated_tokens=70000, cap=60000, priority="low",
             session_id=None, model_name="qwen3",
         )
         assert provider_mod._is_compaction_gate_response(resp) is True
@@ -552,7 +557,7 @@ class TestCompactionGateResponse:
         a gate response is never routed to the next provider.
         """
         resp = provider_mod._build_compaction_gate_response(
-            estimated_tokens=70000, cap=60000, mode="cheap",
+            estimated_tokens=70000, cap=60000, priority="low",
             session_id=None, model_name="qwen3",
         )
         # The cycle check is _is_compaction_gate_response; when the local
@@ -601,9 +606,11 @@ class TestWarmClampToHardCap:
         # Hard-routing cap still enforces a clamp when configured via test fixture
         # (0.84049 → 70000) — the live configs disable it, so warm falls back
         # to the per-slot clamp (83285). This test verifies the mechanism.
-        import proxy.mode as mode_mod
+        import proxy.priority as priority_patch_mod
 
-        monkeypatch.setattr(mode_mod, "read_mode", lambda: "fast")
+        monkeypatch.setattr(
+            priority_patch_mod, "request_priority", lambda *a, **k: "medium"
+        )
         cfg = _cfg(ctx_size=262144, slots=3, fast_ratio=0.84049, warm_threshold=100000)
         cold, warm = provider_mod._effective_large_context_thresholds(
             cfg.get("server", cfg)
@@ -654,10 +661,7 @@ class TestSessionSlotMaxPromptDerivation:
         (F2: 38/48 sessions, ~22.8M tokens/day). Hard caps remain the ROUTING
         gate only (see _effective_large_context_thresholds / check_hard_routing_cap).
         """
-        import proxy.mode as mode_mod
         from proxy.session import _build_slot_context
-
-        monkeypatch.setattr(mode_mod, "read_mode", lambda: "fast")
         server_cfg = {
             "session_slot_save_path": "/tmp/slot-cache",
             "session_slot_pool_size": 3,

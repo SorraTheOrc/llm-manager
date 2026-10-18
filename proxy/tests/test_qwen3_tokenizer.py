@@ -313,10 +313,10 @@ class TestConfigTokenizerPlumbing:
     """The live config wires tokenizer: qwen3 onto the local Qwen3 models
     and drops the now-redundant server-level token_estimate_multiplier."""
 
-    @pytest.mark.parametrize("config_file", ["config.yaml", "config-fast.yaml"])
+    @pytest.mark.parametrize("config_file", ["config.yaml"])
     def test_local_qwen3_models_have_tokenizer(self, config_file):
         """plan/author/code (all local Qwen3) carry tokenizer: qwen3."""
-        from tests.config_test_utils import load_profile
+        from config_test_utils import load_profile
 
         cfg = load_profile(config_file)
         for model in ("plan", "author", "code"):
@@ -325,11 +325,11 @@ class TestConfigTokenizerPlumbing:
                 f"{model} must reference tokenizer: qwen3 in {config_file}"
             )
 
-    @pytest.mark.parametrize("config_file", ["config.yaml", "config-fast.yaml"])
+    @pytest.mark.parametrize("config_file", ["config.yaml"])
     def test_server_level_multiplier_removed(self, config_file):
         """The server-level token_estimate_multiplier is gone — the native
         tokenizer replaces it (AC4: removing it causes no behavior change)."""
-        from tests.config_test_utils import load_profile
+        from config_test_utils import load_profile
 
         cfg = load_profile(config_file)
         server = cfg.get("server", {})

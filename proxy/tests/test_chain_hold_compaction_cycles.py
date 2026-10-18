@@ -87,7 +87,7 @@ def reset_state():
 
 @pytest.fixture(autouse=True)
 def pin_fast_mode(monkeypatch):
-    monkeypatch.setattr("proxy.mode.read_mode", lambda: "fast")
+    monkeypatch.setattr("proxy.provider.request_priority", lambda *a, **k: "medium")
 
 
 async def _remote_fail(_req, _path, _cfg):

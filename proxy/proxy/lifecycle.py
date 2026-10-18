@@ -52,17 +52,14 @@ def _llama_server_signature_path() -> Path:
 
 
 def _read_mode_label() -> str:
-    """Read the persisted mode label (``proxy/.mode``); defaults to ``fast``."""
-    try:
-        return (
-            Path(__file__).resolve().parent.parent
-            .joinpath(".mode")
-            .read_text(encoding="utf-8")
-            .strip()
-            or "fast"
-        )
-    except Exception:
-        return "fast"
+    """Legacy no-op retained for signature-file compatibility.
+
+    The persisted mode file (``proxy/.mode``) and the fast/cheap mode axis
+    were removed (LP-0MVDT94F0003VHUA AC4); signatures written by older
+    deployments carry a ``mode`` key that newer readers ignore. The
+    signature never depends on an operating mode anymore.
+    """
+    return "unified"
 
 
 def _config_file_sha256() -> str:

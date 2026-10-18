@@ -543,20 +543,25 @@ class TestEconomicBypassRecoveryFlag:
             {"server": {"local_large_context_economic_bypass_serves_local": False}}
         ) is False
 
-    # AC4: the shipped mode profiles declare the intended flag values
-    def test_shipped_profiles_declare_flag(self):
-        """The merged cheap profile enables the flag; merged fast omits it."""
-        from tests.config_test_utils import get_merged_config
+    # AC3 (LP-0MVDT94F0003VHUA): priority replaces the mode-profile flag. The
+    # merged unified config omits the flag (medium routes remote); ``low``
+    # priority recovers the economic bypass locally in either window and
+    # ``high`` never does.
+    def test_priority_overrides_shipped_flag(self):
+        """The shipped unified config omits the flag; priority decides."""
+        from proxy.provider import _economic_bypass_serves_local
+        from config_test_utils import get_merged_config
 
-        cheap = get_merged_config("cheap")
-        fast = get_merged_config("fast")
-        assert cheap["server"][
-            "local_large_context_economic_bypass_serves_local"
-        ] is True
+        unified = get_merged_config("fast")
         assert (
             "local_large_context_economic_bypass_serves_local"
-            not in fast["server"]
-        ), "fast profile must not enable economic-bypass local recovery"
+            not in unified["server"]
+        ), "the unified config must not enable economic-bypass local recovery"
+        # Medium (default) follows the config (off); low recovers; high routes
+        # remote.
+        assert _economic_bypass_serves_local(unified, "medium") is False
+        assert _economic_bypass_serves_local(unified, "low") is True
+        assert _economic_bypass_serves_local(unified, "high") is False
 
 
 # ---------------------------------------------------------------------------
