@@ -10,6 +10,16 @@ needs (``Stream started``, ``Stream finished``, ``Fallback triggered``,
 ignored. Parsing is tolerant: missing fields default to ``None`` and a line
 that cannot be parsed is skipped (never fatal), so truncated request payloads
 and log-format drift do not break the analysis.
+
+Attribution markers (LP-0MVAPNC2900145RH) are appended to restart and
+mode-switch log lines, carrying ``source=<value>``, ``actor=<value>``, and
+``reason=<value>`` key=value pairs. The parser extracts these from
+``Mode scheduler``, ``Grandfathering``, ``Mode-switch restart spawned``,
+``restart_services``, and ``Proxy restart attribution:`` lines and stores
+them on the resulting :class:`LogEvent` as ``source``, ``actor``, and
+``reason`` fields — ``None`` when no markers are present (backward
+compatible with historical unattributed logs). See also
+:func:`_attribution_from` for the extraction logic.
 """
 
 from __future__ import annotations
@@ -284,12 +294,23 @@ class LogEvent:
     provider: str | None = None
     model: str | None = None
     session: str | None = None
-    # Attribution markers (LP-0MVC0S6U5003SEDJ): the actor/source that
-    # requested this restart / mode switch, carried on the restart,
-    # mode-switch and startup lines (LP-0MVAPNC2900145RH). ``reason`` is
-    # reused to carry the attribution ``reason=`` value on these kinds (it
-    # was always ``None`` for them before, so reuse is backward compatible);
-    # all three stay ``None`` on historical unattributed lines.
+    # Attribution markers (LP-0MVAPNC2900145RH): populated on ``mode_switch``,
+    # ``restart`` (all sub-kinds), and ``stream_started`` events that carry
+    # attribution key=value markers. Three fields, each ``None`` when absent:
+    #
+    # - ``source`` (LP-0MVC0S6U5003SEDJ, LP-0MVAPNC2900145RH): lower-case token
+    #   identifying the trigger origin — one of ``scheduler``, ``worker``,
+    #   ``api``, or ``manual``. Set on mode-switch, restart-spawned,
+    #   restart-complete, and startup-attribution lines.
+    # - ``actor`` (LP-0MVC0S6U5003SEDJ, LP-0MVAPNC2900145RH): the actor
+    #   identifier (session UUID or service name) that initiated the action.
+    #   Always ``None`` on ``stream_started`` events.
+    # - ``reason`` (LP-0MVAPNC2900145RH): free-form attribution reason.
+    #   On restart events this carries the ``reason=`` value from
+    #   ``start-proxy.sh --restart`` (e.g. "manual (no reason provided)").
+    #   On mode-switch events this carries the scheduler/actor reason.
+    #   Always ``None`` on non-attribution kinds (stream_started, fallback,
+    #   stream_finished, etc.).
     source: str | None = None
     actor: str | None = None
     reason: str | None = None
@@ -519,7 +540,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             return None
         # No attribution markers are emitted on this line today; the tolerant
         # extractors pick them up if a future format adds them
-        # (LP-0MVC0S6U5003SEDJ).
+        # (LP-0MVC0S6U5003SEDJ, LP-0MVAPNC2900145RH).
         source, actor, reason = _attribution_from(msg)
         return LogEvent("mode_switch", ts, mode=mode, source=source, actor=actor, reason=reason)
     if msg.startswith(MODE_SWITCH_RESTART_SPAWNED):
@@ -545,7 +566,7 @@ def parse_log_line(line: str) -> LogEvent | None:
         # restarted proxy is up (corroborating evidence; slot count ignored).
         # Tolerant: no attribution markers (or mode=) are emitted on this
         # line today, but the extractors pick them up if a future format adds
-        # them.
+        # them (LP-0MVC0S6U5003SEDJ, LP-0MVAPNC2900145RH).
         source, actor, reason = _attribution_from(msg)
         mode = (_first(RE_MODE_KV, msg) or "").lower() or None
         return LogEvent(

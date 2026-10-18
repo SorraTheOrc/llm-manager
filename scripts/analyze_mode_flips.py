@@ -15,7 +15,26 @@ Attribution model (see
   ``Grandfathering: enabled; other-mode config config-<other>.yaml
   (current=<mode>)`` line that follows each "Starting LLama Proxy Server"
   marker. A flip is a change of startup mode between consecutive restarts.
-- Trigger classification:
+- Trigger classification (deterministic, ``source``-based since
+  LP-0MVAPNC2900145RH):
+
+  The proxy now logs attribution markers on restart and mode-switch lines
+  (``source=``/``actor=``/``reason=``). The ``classify_trigger()`` function
+  uses these markers when present, falling back to heuristic classification
+  for historical unattributed lines:
+
+  | ``source`` value | Flip direction | Classification |
+  |------------------|----------------|----------------|
+  | ``scheduler``    | any            | ``schedule``   |
+  | ``worker``       | to-fast        | ``to-fast``    |
+  | ``worker``       | to-cheap       | ``to-cheap``   |
+  | ``api``          | to-fast        | ``to-fast``    |
+  | ``api``          | to-cheap       | ``to-cheap``   |
+  | ``manual``       | to-fast        | ``to-fast``    |
+  | ``manual``       | to-cheap       | ``to-cheap``   |
+  | *absent*         | any            | Heuristic fallback (sched_marker / direction-based) |
+
+  Prior to attribution markers, classification used these heuristics:
   - **schedule**: a "Mode scheduler: applied scheduled mode <mode>" marker
     within +/-10 min of the flip (the built-in 01:00 cheap / 10:00 fast
     schedule). Markers appear only when the scheduled mode *differs* from the
@@ -29,10 +48,12 @@ Attribution model (see
     only) POSTs ``cheap`` when the operator has been idle >= 15 min AND the
     proxy reports idle AND no model cooldown is active.
 
-  The proxy does not log the ``/admin/set-mode`` caller, so worker vs manual
-  is not separable from the proxy log alone; the report argues worker
-  dominance from the timing signature (median inter-flip gap == the 30-min
-  fast->cheap cooldown) and the shared ``mode-activity.json`` broadcast.
+  Without markers the proxy did not log the ``/admin/set-mode`` caller, so
+  worker vs manual was not separable from the proxy log alone (the original
+  report argued worker dominance from the timing signature — median inter-flip
+  gap == the 30-min fast->cheap cooldown — and the shared
+  ``mode-activity.json`` broadcast). With the attribution markers those two
+  sources are now distinguished directly.
 
 The pure functions below (``parse_event`` .. ``summarise``) are unit-tested in
 ``tests/test_mode_flip_analysis.py``; ``main`` only does I/O and rendering.
@@ -64,7 +85,8 @@ _MODE_RE = re.compile(
     r"other-mode config config-(\w+)\.yaml \(current=(\w+)\)"
 )
 #: Attribution marker ``source=<value>`` appended to scheduler / grandfathering /
-#: restart-spawned lines (LP-0MVC1450O000LJHV).  Values are lower-case tokens.
+#: restart-spawned lines (LP-0MVC1450O000LJHV, LP-0MVAPNC2900145RH).  Values
+#: are lower-case tokens.
 _RE_ATTRIBUTION_SOURCE = re.compile(r"\bsource=([a-z0-9_]+)")
 
 #: A startup mode line follows its start marker within this many seconds.
@@ -147,7 +169,7 @@ def build_restarts(
     ``MODE_ATTACH_WINDOW_SECONDS`` fills its ``mode``. Records without a mode
     (window-boundary truncation) keep ``mode=None``. The *source* attribution
     (``scheduler`` / ``worker`` / ``api`` / ``manual``) is carried through from
-    the ``mode`` event when present (LP-0MVC1450O000LJHV).
+    the ``mode`` event when present (LP-0MVC1450O000LJHV, LP-0MVAPNC2900145RH).
     """
     restarts: list[dict] = []
     for ts, kind, payload, source in events:
@@ -217,7 +239,8 @@ def compute_flips(restarts: list[dict]) -> list[dict]:
 def classify_trigger(flip: dict) -> str:
     """Classify a flip using deterministic attribution when available.
 
-    Uses the ``source`` field (LP-0MVC1450O000LJHV) when present:
+    Uses the ``source`` field (LP-0MVC1450O000LJHV, LP-0MVAPNC2900145RH) when
+    present:
 
     - ``source=scheduler`` → ``schedule``
     - ``source=worker`` → ``to-cheap`` when flipping to cheap, ``to-fast`` otherwise
