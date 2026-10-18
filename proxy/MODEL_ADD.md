@@ -113,15 +113,18 @@ a paid tier. Setting `rate_limit_rpm` on such an entry makes dispatch
 capacity-aware:
 
 - while the rolling 60-second window has capacity, the entry is used normally;
-- once the window is full, a request from a **new** session (no affinity for
-  the entry) skips it **immediately** and the fallback chain moves on — it is
-  never parked waiting, so waiting requests cannot compound the contention;
+- a fraction of the window (`server.provider_rate_limit_reserve_ratio`, default
+  `0.3`) is reserved for sessions already using the entry, so a request from a
+  **new** session may use at most `rate_limit_rpm - reserve` dispatches and then
+  skips the entry **immediately** — it is never parked waiting, so waiting
+  requests cannot compound the contention;
 - a session that was already served by the entry (affinity recorded on a 2xx
-  dispatch) may wait for the window to reset, keeping the same upstream
-  provider and its prompt cache/prefix continuity. The wait is bounded by the
-  remaining window and `server.provider_rate_limit_wait_max_seconds`, capped
-  in concurrency by `server.provider_rate_limit_wait_max_waiters`, and aborted
-  as soon as the client disconnects;
+  dispatch) may use the reserved slots and, if the window is still full, wait a
+  short bounded time for it to reset (`server.provider_rate_limit_wait_max_seconds`,
+  default 15 s), keeping the same upstream provider and its prompt cache/prefix
+  continuity. Waiting is capped in concurrency by
+  `server.provider_rate_limit_wait_max_waiters` and aborted as soon as the
+  client disconnects;
 - affinity expires after `server.provider_affinity_ttl_seconds`, so a session
   returning much later counts as new again.
 
@@ -134,6 +137,12 @@ capacity-aware:
         model: some-model
         rate_limit_rpm: 10
 ```
+
+Tuning knobs (all under `server:`): `provider_rate_limit_reserve_ratio` (share
+of the window reserved for in-progress sessions, default 0.3),
+`provider_rate_limit_wait_max_seconds` (default 15), 
+`provider_rate_limit_wait_max_waiters` (default 8) and
+`provider_affinity_ttl_seconds` (default 900).
 
 Skip decisions are logged as `Provider budget exhausted: skipping provider=…`
 (with limit, remaining and reason) and recorded in the request diagnostics as

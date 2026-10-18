@@ -89,13 +89,15 @@
 #   rate_limit_rpm - maximum dispatches to this provider entry per rolling
 #                    60-second window (LP-0MVDQ1GMO00801PL). Intended for
 #                    free tiers with a per-minute allowance (e.g.
-#                    `munitoai-free`). Over-budget requests from NEW sessions
-#                    skip the entry immediately (pass through, never parked); a
-#                    session already served by the entry waits a bounded time
-#                    for the window to reset (server.provider_rate_limit_wait_*
-#                    / server.provider_affinity_ttl_seconds) to keep its prompt
-#                    cache. Omit the field (or use 0) to leave the entry
-#                    ungated. Example:
+#                    `munitoai-free`). New sessions may use at most
+#                    `rate_limit_rpm - reserve` dispatches (reserve configured
+#                    by server.provider_rate_limit_reserve_ratio) and pass
+#                    through immediately when that is spent — they are never
+#                    parked; a session already served by the entry may use the
+#                    reserved slots and, if the window is still full, waits a
+#                    bounded time (server.provider_rate_limit_wait_max_seconds,
+#                    default 15) so it keeps its prompt cache. Omit the field
+#                    (or use 0) to leave the entry ungated. Example:
 #                      - name: some-free-tier
 #                        type: remote
 #                        endpoint: https://api.example.com/v1
@@ -679,14 +681,25 @@ server:
   # The wait is bounded by the remaining window and
   # provider_rate_limit_wait_max_seconds, depth-capped so waiters cannot pile
   # up, and aborted as soon as the client disconnects.
+  #   - provider_rate_limit_reserve_ratio: fraction of the window held back for
+  #     in-progress sessions (default 0.3). New sessions may consume at most
+  #     `rate_limit_rpm - reserve` slots; sessions that already use the entry
+  #     may consume the whole window. Without a reserve, established sessions
+  #     queue behind new-session traffic and wait 15-55s per turn, which
+  #     dominated first-token latency (p99 21s -> 53s, LP-0MVDUN5CY009VD20).
+  #     Clamped to [0, 1] and to `rate_limit_rpm - 1`, so new sessions are
+  #     never locked out; 0 disables the reserve.
   #   - provider_rate_limit_wait_max_seconds: max wait for an in-progress
-  #     session (default 60; 0 disables waiting entirely -> always pass through).
+  #     session (default 15; 0 disables waiting entirely -> always pass through).
+  #     Lowered from 60 (LP-0MVDUN5CY009VD20): waits of 30-60s caused ~50% of the
+  #     observed first-token latency regression.
   #   - provider_rate_limit_wait_max_waiters: max concurrent waiters across all
   #     gated entries (default 8; 0 denies every wait).
   #   - provider_affinity_ttl_seconds: how long a session counts as "in
   #     progress" on a gated entry (default 900 = 15 min; 0 disables affinity,
   #     so every request is treated as new).
-  provider_rate_limit_wait_max_seconds: 60
+  provider_rate_limit_reserve_ratio: 0.3
+  provider_rate_limit_wait_max_seconds: 15
   provider_rate_limit_wait_max_waiters: 8
   provider_affinity_ttl_seconds: 900
   # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote

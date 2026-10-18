@@ -314,6 +314,7 @@ BASE_ONLY_SERVER_KEYS = {
     "max_retry_after_seconds",
     "mode_switch_lock",
     "provider_affinity_ttl_seconds",
+    "provider_rate_limit_reserve_ratio",
     "provider_rate_limit_wait_max_seconds",
     "provider_rate_limit_wait_max_waiters",
     "session_single_flight_duplicate_retry_after_seconds",

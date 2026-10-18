@@ -513,11 +513,14 @@ Declaring `rate_limit_rpm` on such an entry makes dispatch **capacity-aware**
 retrying into it:
 
 - while the rolling 60-second window has capacity the entry is used normally;
-- an over-budget request from a **new** session skips the entry immediately and
-  the chain moves on — it never waits, so parked requests cannot compound the
-  contention;
-- an over-budget request from a session already served by the entry may wait
-  (bounded by the window and `server.provider_rate_limit_wait_max_seconds`,
+- a fraction of the window (`server.provider_rate_limit_reserve_ratio`,
+  default `0.3`) is **reserved for in-progress sessions**: a **new** session may
+  use at most `rate_limit_rpm - reserve` dispatches (7 of 10 for
+  `munitoai-free`) and, once that is spent, skips the entry immediately — it
+  never waits, so parked requests cannot compound the contention;
+- a session already served by the entry may use the reserved slots, and if the
+  window is still full it may wait a short, bounded time
+  (`server.provider_rate_limit_wait_max_seconds`, **default 15 s**,
   depth-capped by `server.provider_rate_limit_wait_max_waiters`, aborted on
   client disconnect) so it keeps its prompt cache/prefix continuity;
 - affinity expires after `server.provider_affinity_ttl_seconds` (default 900),

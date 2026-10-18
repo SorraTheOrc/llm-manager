@@ -14,11 +14,18 @@ This module turns the existing proactive sliding-window limiter
 - **New sessions pass through** — a request whose session has never been served
   by the gated entry is never parked: when the window is full it is denied
   immediately and the fallback chain moves on (AC2).
+- **Reserve for in-progress sessions** — a fraction of the window
+  (``server.provider_rate_limit_reserve_ratio``, default 0.3) is reserved for
+  sessions that already use the entry: new sessions may consume at most
+  ``rate_limit_rpm - reserve`` slots while affinity sessions may use the whole
+  window (LP-0MVDUN5CY009VD20). Without the reserve, affinity sessions queue
+  behind new-session traffic and wait 15–55 s per turn, which dominated
+  first-token latency (p99 21 s → 53 s).
 - **In-progress sessions wait, bounded** — a request whose session *has* been
   served by the entry (recorded affinity) may wait for the window to drain, so
   it keeps the same upstream provider and its prompt cache/prefix continuity.
   The wait is bounded by the remaining window and
-  ``server.provider_rate_limit_wait_max_seconds``, depth-capped by
+  ``server.provider_rate_limit_wait_max_seconds`` (default 15), depth-capped by
   ``server.provider_rate_limit_wait_max_waiters`` so waiters cannot pile up, and
   aborted as soon as the client disconnects (AC3).
 - **Affinity** — ``session -> entry`` records expire after
@@ -33,8 +40,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 logger = logging.getLogger("llama-proxy.provider_budget")
 
@@ -42,9 +50,11 @@ logger = logging.getLogger("llama-proxy.provider_budget")
 #: always uses a 60-second rolling window.
 RATE_LIMIT_WINDOW_SECONDS = 60
 
-_DEFAULT_WAIT_MAX_SECONDS = 60.0
+_DEFAULT_WAIT_MAX_SECONDS = 15.0
 _DEFAULT_WAIT_MAX_WAITERS = 8
 _DEFAULT_AFFINITY_TTL_SECONDS = 900.0
+#: Fraction of a gated entry's window reserved for sessions that already use it.
+_DEFAULT_RESERVE_RATIO = 0.3
 
 #: Minimum sleep slice while waiting, so a zero-length recomputation cannot
 #: spin the event loop.
@@ -82,6 +92,11 @@ class BudgetDecision:
     limit_rpm: int = 0
     remaining: int = 0
     waited_seconds: float = 0.0
+    #: Slots held back for in-progress sessions on this entry (0 = no reserve).
+    reserve_slots: int = 0
+    #: Per-window cap actually applied to this request (``limit_rpm`` for an
+    #: affinity session, ``limit_rpm - reserve_slots`` for a new one).
+    effective_limit: int = 0
 
     @property
     def waited(self) -> bool:
@@ -134,6 +149,40 @@ def affinity_ttl_seconds(config: dict | None) -> float:
         )
     except (TypeError, ValueError):
         return _DEFAULT_AFFINITY_TTL_SECONDS
+
+
+def reserve_ratio(config: dict | None) -> float:
+    """Fraction of a gated entry's window reserved for in-progress sessions.
+
+    Clamped to ``[0.0, 1.0]``; malformed values fall back to the default.
+    """
+    try:
+        ratio = float(
+            _config_value(config, "provider_rate_limit_reserve_ratio", _DEFAULT_RESERVE_RATIO)
+        )
+    except (TypeError, ValueError):
+        ratio = _DEFAULT_RESERVE_RATIO
+    return min(1.0, max(0.0, ratio))
+
+
+def reserved_slots(rpm: int, config: dict | None) -> int:
+    """Slots in a ``rpm``-sized window held back for in-progress sessions.
+
+    ``0`` when the reserve is disabled, when the budget is too small to split
+    (``rpm <= 1``), and always at most ``rpm - 1`` so new sessions can never be
+    locked out of the tier entirely.
+    """
+    if rpm <= 1:
+        return 0
+    ratio = reserve_ratio(config)
+    if ratio <= 0.0:
+        return 0
+    return max(0, min(int(math.floor(rpm * ratio)), rpm - 1))
+
+
+def new_session_limit(rpm: int, config: dict | None) -> int:
+    """Per-window cap for a session with no affinity for the entry."""
+    return max(1, rpm - reserved_slots(rpm, config))
 
 
 def _provider_rpm(provider_cfg: dict) -> int:
@@ -369,11 +418,14 @@ async def acquire_provider_budget(
 ) -> BudgetDecision:
     """Decide whether *provider_cfg* may be dispatched for *session_id*.
 
-    The first call reserves a slot (the limiter increments on allow). When the
-    window is full:
+    A successful decision reserves a slot (the limiter increments on allow).
+    New sessions may only use the unreserved part of the window
+    (``rpm - reserved_slots``) so the reserve is always available to sessions
+    that are already using the entry:
 
-    - an **in-progress** session (recorded affinity) waits a bounded time for
-      capacity and reserves a slot if one frees;
+    - an **in-progress** session (recorded affinity) may use the whole window;
+      when even that is full it waits a bounded time for capacity and reserves
+      a slot if one frees;
     - any other request (new session, anonymous request, wait cap reached) is
       denied immediately so the fallback chain can move on without waiting.
 
@@ -395,26 +447,36 @@ async def acquire_provider_budget(
     from proxy.rate_limiter import get_rate_limiter
 
     limiter = get_rate_limiter()
+    reserve = reserved_slots(rpm, config)
+    in_progress = provider_affinity_active(session_id, entry_name, config)
+    # In-progress sessions may use the whole window; new sessions stop at the
+    # unreserved part so slots are always waiting for established sessions.
+    effective_limit = rpm if in_progress else new_session_limit(rpm, config)
+
     if await limiter.check_and_increment(
-        entry_name, rpm, window_seconds=RATE_LIMIT_WINDOW_SECONDS
+        entry_name, effective_limit, window_seconds=RATE_LIMIT_WINDOW_SECONDS
     ):
         return BudgetDecision(
             allowed=True,
             reason="allowed",
             limit_rpm=rpm,
             remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
+            reserve_slots=reserve,
+            effective_limit=effective_limit,
         )
+
+    if in_progress:
+        decision = await _wait_for_capacity(entry_name, rpm, config, request)
+        return replace(decision, reserve_slots=reserve, effective_limit=effective_limit)
 
     remaining = limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS)
 
-    if provider_affinity_active(session_id, entry_name, config):
-        return await _wait_for_capacity(entry_name, rpm, config, request)
-
     logger.warning(
-        "Provider budget exhausted: skipping provider=%s limit=%d remaining=%d "
-        "reason=rate_limited session_affinity=false session=%s",
+        "Provider budget exhausted: skipping provider=%s limit=%d reserve=%d "
+        "remaining=%d reason=rate_limited session_affinity=false session=%s",
         entry_name,
-        rpm,
+        effective_limit,
+        reserve,
         remaining,
         str(session_id or "")[:8] or "anonymous",
     )
@@ -423,4 +485,6 @@ async def acquire_provider_budget(
         reason="rate_limited",
         limit_rpm=rpm,
         remaining=remaining,
+        reserve_slots=reserve,
+        effective_limit=effective_limit,
     )

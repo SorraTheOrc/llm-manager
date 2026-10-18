@@ -370,7 +370,8 @@
     "port": 8000,
     "provider_affinity_ttl_seconds": 900,
     "provider_cooldown_seconds": 60,
-    "provider_rate_limit_wait_max_seconds": 60,
+    "provider_rate_limit_reserve_ratio": 0.3,
+    "provider_rate_limit_wait_max_seconds": 15,
     "provider_rate_limit_wait_max_waiters": 8,
     "remote_http_client": {
       "connect_timeout_seconds": 30,

@@ -597,3 +597,212 @@ def test_home_page_shows_free_tier_budget():
 
     html = _build_home_model_rows(_Srv())
     assert "budget 7/10 per 60s" in html
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVDUN5CY009VD20 — reserve for in-progress sessions + 15s wait cap
+# ---------------------------------------------------------------------------
+
+
+def _reserve_config(**server_overrides) -> dict:
+    server = {
+        "provider_rate_limit_wait_max_seconds": 15,
+        "provider_affinity_ttl_seconds": 900,
+        "provider_rate_limit_reserve_ratio": 0.3,
+    }
+    server.update(server_overrides)
+    return {"server": server}
+
+
+@pytest.mark.asyncio
+async def test_reserve_limits_new_sessions_but_not_in_progress_sessions():
+    """AC1: new sessions stop at rpm-reserve; an affinity session gets the rest."""
+    cfg = _free_provider_cfg(rpm=10)
+    config = _reserve_config()
+
+    for i in range(7):
+        decision = await acquire_provider_budget(cfg, config, session_id=f"new-{i}")
+        assert decision.allowed, f"new session {i} should fit inside the unreserved window"
+
+    blocked = await acquire_provider_budget(cfg, config, session_id="new-blocked")
+    assert not blocked.allowed, "the 8th new-session dispatch must be refused (3 slots reserved)"
+    assert blocked.reason == "rate_limited"
+    assert blocked.effective_limit == 7
+    assert blocked.reserve_slots == 3
+
+    record_provider_affinity("veteran", FREE_ENTRY, config=config)
+    for i in range(3):
+        decision = await acquire_provider_budget(cfg, config, session_id="veteran")
+        assert decision.allowed, f"in-progress session should use reserved slot {i + 1}"
+
+    exhausted = await acquire_provider_budget(cfg, config, session_id="veteran")
+    assert not exhausted.allowed
+    assert exhausted.reason == "rate_limited_after_wait"
+
+
+@pytest.mark.asyncio
+async def test_zero_reserve_ratio_preserves_full_window_for_new_sessions():
+    """AC2: ratio 0 disables the reserve (previous behaviour)."""
+    cfg = _free_provider_cfg(rpm=4)
+    config = _reserve_config(provider_rate_limit_reserve_ratio=0)
+
+    for i in range(4):
+        assert (await acquire_provider_budget(cfg, config, session_id=f"s-{i}")).allowed
+    assert not (await acquire_provider_budget(cfg, config, session_id="s-4")).allowed
+
+
+@pytest.mark.asyncio
+async def test_reserve_is_clamped_for_small_and_saturated_budgets():
+    """AC2: rpm=1 reserves nothing; ratio 1.0 still leaves one slot for new sessions."""
+    one_rpm = _free_provider_cfg(rpm=1)
+    config = _reserve_config()
+    assert (await acquire_provider_budget(one_rpm, config, session_id="first")).allowed
+    denied = await acquire_provider_budget(one_rpm, config, session_id="second")
+    assert not denied.allowed and denied.reserve_slots == 0
+
+    get_rate_limiter().reset(FREE_ENTRY)
+    saturating = _free_provider_cfg(rpm=4)
+    config = _reserve_config(provider_rate_limit_reserve_ratio=1.0)
+    assert (await acquire_provider_budget(saturating, config, session_id="only")).allowed
+    denied = await acquire_provider_budget(saturating, config, session_id="next")
+    assert not denied.allowed
+    assert denied.reserve_slots == 3
+    assert denied.effective_limit == 1
+
+
+@pytest.mark.asyncio
+async def test_wait_cap_defaults_to_15_seconds(clock, sleeps):
+    """AC3: the default wait cap is 15s and no wait exceeds it."""
+    assert provider_budget.wait_max_seconds({}) == 15.0
+
+    cfg = _free_provider_cfg(rpm=1)
+    config = {"server": {"provider_affinity_ttl_seconds": 900}}
+
+    assert (await acquire_provider_budget(cfg, config, session_id="busy")).allowed
+    record_provider_affinity("busy", FREE_ENTRY, config=config)
+
+    # The single slot is held for the full 60s window, so a 15s cap cannot
+    # succeed: the request must give up at the cap and pass through.
+    decision = await acquire_provider_budget(cfg, config, session_id="busy")
+    assert not decision.allowed
+    assert decision.reason == "rate_limited_after_wait"
+    assert decision.waited_seconds == pytest.approx(15.0)
+    assert sleeps and all(w <= 15.0 for w in sleeps)
+
+
+@pytest.mark.asyncio
+async def test_in_progress_session_waits_and_wins_within_the_15s_cap(clock, sleeps):
+    """AC3: a wait that can succeed inside the cap still dispatches on the tier."""
+    cfg = _free_provider_cfg(rpm=1)
+    config = {"server": {"provider_affinity_ttl_seconds": 900}}
+
+    # Seed the window so the single slot frees 5s from now (55s already elapsed).
+    get_rate_limiter()._windows[FREE_ENTRY].append(clock["now"] - 55.0)
+    record_provider_affinity("busy", FREE_ENTRY, config=config)
+
+    decision = await acquire_provider_budget(cfg, config, session_id="busy")
+
+    assert decision.allowed
+    assert decision.reason == "allowed_after_wait"
+    assert decision.waited_seconds == pytest.approx(5.0, abs=0.2)
+    assert sleeps and sleeps[0] <= 15.0
+
+
+@pytest.mark.asyncio
+async def test_in_progress_session_passes_through_when_cap_expires(clock, sleeps):
+    """AC3: once the (short) cap expires the in-progress request passes through."""
+    cfg = _free_provider_cfg(rpm=1)
+    config = {"server": {"provider_affinity_ttl_seconds": 900,
+                         "provider_rate_limit_wait_max_seconds": 5}}
+
+    assert (await acquire_provider_budget(cfg, config, session_id="busy")).allowed
+    record_provider_affinity("busy", FREE_ENTRY, config=config)
+
+    decision = await acquire_provider_budget(cfg, config, session_id="busy")
+    assert not decision.allowed
+    assert decision.reason == "rate_limited_after_wait"
+    assert decision.waited_seconds <= 5.0
+
+
+@pytest.mark.asyncio
+async def test_new_session_never_waits_even_with_a_reserve():
+    """AC4: the reserve must not introduce waiting for new sessions."""
+    sleeps: list[float] = []
+
+    async def _record_sleep(request, seconds):
+        sleeps.append(seconds)
+        return False
+
+    cfg = _free_provider_cfg(rpm=10)
+    config = _reserve_config()
+
+    with patch.object(provider_budget, "_sleep_with_disconnect", _record_sleep):
+        for i in range(7):
+            assert (await acquire_provider_budget(cfg, config, session_id=f"n-{i}")).allowed
+        denied = await acquire_provider_budget(cfg, config, session_id="n-over")
+
+    assert not denied.allowed
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_reserve_recorded_in_attempt_diagnostics(caplog):
+    """AC5: the skip log names the effective cap and the reserve."""
+    cfg = _free_provider_cfg(rpm=10)
+    config = _reserve_config()
+
+    with caplog.at_level("WARNING", logger="llama-proxy.provider_budget"):
+        for i in range(7):
+            await acquire_provider_budget(cfg, config, session_id=f"d-{i}")
+        await acquire_provider_budget(cfg, config, session_id="d-over")
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "limit=7" in text
+    assert "reserve=3" in text
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_keeps_slots_free_for_in_progress_sessions():
+    """AC1 end-to-end: the 8th new session reaches the paid tier, not the free one."""
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        call_order.append(provider_cfg["name"])
+        return _ok_json_response()
+
+    model_config = {
+        "providers": [
+            {
+                "name": FREE_ENTRY,
+                "type": "remote",
+                "endpoint": "https://free.example.com/v1",
+                "rate_limit_rpm": 10,
+            },
+            {
+                "name": PAID_ENTRY,
+                "type": "remote",
+                "endpoint": "https://paid.example.com/v1",
+            },
+        ]
+    }
+    config = {
+        "provider_cooldown_seconds": 0,
+        "provider_rate_limit_reserve_ratio": 0.3,
+        "provider_rate_limit_wait_max_seconds": 15,
+    }
+
+    with patch("proxy.provider._get_proxy_to_remote", return_value=_mock_proxy_to_remote):
+        for i in range(8):
+            call_order.clear()
+            await provider.proxy_with_remote_fallback(
+                _DummyRequest(session_id=f"agent-{i}"),
+                "v1/chat/completions",
+                model_config,
+                config,
+            )
+            if i < 7:
+                assert call_order == [FREE_ENTRY], f"session {i} should use the free tier"
+            else:
+                assert call_order == [PAID_ENTRY], (
+                    f"session {i} must skip to the paid tier, got {call_order}"
+                )

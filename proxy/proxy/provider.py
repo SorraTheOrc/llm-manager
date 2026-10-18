@@ -5980,6 +5980,8 @@ async def _proxy_with_remote_fallback_cycle(
                     status_code=429,
                     reason=_budget.reason,
                     limit_rpm=_budget.limit_rpm,
+                    effective_limit=_budget.effective_limit,
+                    reserve_slots=_budget.reserve_slots,
                     remaining=_budget.remaining,
                     elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                 )
@@ -5995,6 +5997,8 @@ async def _proxy_with_remote_fallback_cycle(
                     status="rate_limited_waited",
                     reason=_budget.reason,
                     limit_rpm=_budget.limit_rpm,
+                    effective_limit=_budget.effective_limit,
+                    reserve_slots=_budget.reserve_slots,
                     remaining=_budget.remaining,
                     elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                 )
@@ -6936,6 +6940,8 @@ async def _proxy_with_fallback_cycle(
                         status_code=429,
                         reason=_budget.reason,
                         limit_rpm=_budget.limit_rpm,
+                        effective_limit=_budget.effective_limit,
+                        reserve_slots=_budget.reserve_slots,
                         remaining=_budget.remaining,
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                     )
@@ -6951,6 +6957,8 @@ async def _proxy_with_fallback_cycle(
                         status="rate_limited_waited",
                         reason=_budget.reason,
                         limit_rpm=_budget.limit_rpm,
+                        effective_limit=_budget.effective_limit,
+                        reserve_slots=_budget.reserve_slots,
                         remaining=_budget.remaining,
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                     )
