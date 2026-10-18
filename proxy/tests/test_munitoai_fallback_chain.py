@@ -35,6 +35,9 @@ MUNITOAI_FREE_ENTRY = {
     "api_key_env": "MUNITOAI_FREE_API_KEY",
     "forward_session_headers": False,
     "model": "deepseek-ai/deepseek-v4-flash",
+    # Free-tier request budget (LP-0MVDQ1GMO00801PL): a small per-60s window,
+    # so the tier is only used while it has capacity.
+    "rate_limit_rpm": 10,
 }
 
 #: The exact (paid) munitoai entry that must sit directly before deepseek-flash.

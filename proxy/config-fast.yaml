@@ -59,6 +59,14 @@ models:
         api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -115,6 +123,14 @@ models:
         api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -172,6 +188,14 @@ models:
         api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go

@@ -32,6 +32,7 @@
           "model": "deepseek-ai/deepseek-v4-flash",
           "name": "munitoai-free",
           "provider": "MunitoAI",
+          "rate_limit_rpm": 10,
           "type": "remote"
         },
         {
@@ -104,6 +105,7 @@
           "model": "deepseek-ai/deepseek-v4-flash",
           "name": "munitoai-free",
           "provider": "MunitoAI",
+          "rate_limit_rpm": 10,
           "type": "remote"
         },
         {
@@ -220,6 +222,7 @@
           "model": "deepseek-ai/deepseek-v4-flash",
           "name": "munitoai-free",
           "provider": "MunitoAI",
+          "rate_limit_rpm": 10,
           "type": "remote"
         },
         {

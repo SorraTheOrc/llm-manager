@@ -58,8 +58,12 @@ class SlidingWindowRateLimiter:
         async with self._lock:
             window = self._windows[key]
 
-            # Prune entries outside the window
-            while window and window[0] < cutoff:
+            # Prune entries outside the window. ``<=`` (not ``<``) so an
+            # entry that is exactly ``window_seconds`` old has left the
+            # window: a bounded waiter that sleeps until the oldest entry
+            # expires (LP-0MVDQ1GMO00801PL) must find the slot free when it
+            # wakes, instead of losing an exact-boundary race.
+            while window and window[0] <= cutoff:
                 window.popleft()
 
             if len(window) >= max_rpm:
@@ -93,11 +97,43 @@ class SlidingWindowRateLimiter:
 
         cutoff = time.monotonic() - window_seconds
         window = self._windows.get(key, deque())
-        # Count entries still inside the window (pruning expired on read)
-        while window and window[0] < cutoff:
+        # Count entries still inside the window (pruning expired on read;
+        # ``<=`` matches check_and_increment's boundary semantics)
+        while window and window[0] <= cutoff:
             window.popleft()
         used = len(window)
         return max(0, max_rpm - used)
+
+    def seconds_until_capacity(
+        self,
+        key: str,
+        max_rpm: int,
+        window_seconds: int = 60,
+    ) -> float:
+        """Return how long until one more request fits in the window.
+
+        ``0.0`` means capacity is available *now* (or the key is unlimited),
+        so a caller that is waiting can retry immediately. A positive value is
+        the time until the oldest in-window entry expires and frees a slot.
+
+        Unlike :meth:`remaining` this is the value a bounded waiter sleeps on:
+        the free-tier budget gate (LP-0MVDQ1GMO00801PL) waits exactly until the
+        window drains instead of polling.
+        """
+        if max_rpm <= 0:
+            return 0.0
+
+        now = time.monotonic()
+        cutoff = now - window_seconds
+        window = self._windows.get(key)
+        if not window:
+            return 0.0
+
+        while window and window[0] <= cutoff:
+            window.popleft()
+        if len(window) < max_rpm:
+            return 0.0
+        return max(0.0, window[0] + window_seconds - now)
 
     def reset(self, key: str) -> None:
         """Remove all tracked data for *key* (useful in tests)."""

@@ -503,6 +503,39 @@ When a request arrives for a model with a `providers` list, the proxy tries each
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
 | `available_times` | list | no | List of `"HH:MM-HH:MM"` UTC windows during which this provider may be used (timed access, see below) |
+| `rate_limit_rpm` | int | no | Maximum dispatches to this entry per rolling 60-second window (free-tier request budget — see [Free-tier request budgets](#free-tier-request-budgets-rate_limit_rpm)) |
+
+#### Free-tier request budgets (`rate_limit_rpm`)
+
+Free tiers (e.g. `munitoai-free`) allow only a handful of requests per minute.
+Declaring `rate_limit_rpm` on such an entry makes dispatch **capacity-aware**
+(LP-0MVDQ1GMO00801PL), so a burst of agents cannot exhaust the allowance by
+retrying into it:
+
+- while the rolling 60-second window has capacity the entry is used normally;
+- an over-budget request from a **new** session skips the entry immediately and
+  the chain moves on — it never waits, so parked requests cannot compound the
+  contention;
+- an over-budget request from a session already served by the entry may wait
+  (bounded by the window and `server.provider_rate_limit_wait_max_seconds`,
+  depth-capped by `server.provider_rate_limit_wait_max_waiters`, aborted on
+  client disconnect) so it keeps its prompt cache/prefix continuity;
+- affinity expires after `server.provider_affinity_ttl_seconds` (default 900),
+  after which the session counts as new again.
+
+Skips log `Provider budget exhausted: skipping provider=<p> limit=<n>
+remaining=<n> reason=rate_limited …` and appear in the exhaustion
+`diagnostics` as `status: "rate_limited"`; a waited dispatch records
+`status: "rate_limited_waited"` with `elapsed_wait_seconds`. An entry without
+`rate_limit_rpm` is never gated (behaviour unchanged).
+
+```yaml
+      - name: some-free-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FREE_KEY
+        rate_limit_rpm: 10
+```
 
 #### Example: Remote Fallback
 
@@ -796,6 +829,7 @@ hint.
 | Outside `available_times` window | `outside_time_window` | — (window-skipped) | `Skipping provider=<p>: outside its available_times window (UTC)` |
 | Usage-limit quarantine | `usage_limit_reset` (+ `reset_in`/`reset_at`) | `<provider>: <reset seconds>` | `Skipping provider=<p>: usage_limit_reset_pending` / `usage_limit_reset=` on the exhaustion line |
 | Local slot held by another session | `local_lease_active` / `fallback_after_queue` | — | `local_dispatch_denied session=… owner=… active=…` |
+| Free-tier request budget exhausted (`rate_limit_rpm`) | `rate_limited` / `rate_limited_waited` | — | `Provider budget exhausted: skipping provider=<p> limit=<n> remaining=<n> reason=rate_limited …` |
 | All local slots busy (slot exhaustion) | `slot_exhaustion` | — | `Model server busy: 0/N slots available` (429) |
 | Provider / brand cooldown | `http_exception` / `empty_response` / etc. | `<name or brand>: <seconds>` | `marking provider unavailable` / `unavailable={…}` on the exhaustion line |
 

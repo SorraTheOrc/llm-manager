@@ -40,9 +40,40 @@ from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy import cold_start
+from proxy.provider_budget import (
+    RATE_LIMIT_WINDOW_SECONDS,
+    acquire_provider_budget,
+    record_provider_affinity,
+)
 from proxy.utils import _is_empty_response
 
 logger = logging.getLogger("llama-proxy.provider")
+
+
+def _maybe_record_provider_affinity(
+    provider_cfg: dict,
+    session_id: str | None,
+    response,
+    config: dict | None = None,
+) -> None:
+    """Record session -> gated-entry affinity after a successful dispatch.
+
+    The free-tier budget gate (LP-0MVDQ1GMO00801PL) only lets a session *wait*
+    for capacity if that session was already served by the entry, so the record
+    must reflect a real success: a 4xx/5xx response (e.g. the upstream 429 that
+    proves the allowance is spent) must never create affinity. Entries without
+    ``rate_limit_rpm`` are not gated and record nothing.
+    """
+    try:
+        if int(getattr(response, "status_code", 0) or 0) >= 400:
+            return
+        if int(provider_cfg.get("rate_limit_rpm", 0) or 0) <= 0:
+            return
+        record_provider_affinity(
+            session_id, str(provider_cfg.get("name") or ""), config
+        )
+    except Exception:  # pragma: no cover - affinity is best-effort telemetry
+        pass
 
 # ---------------------------------------------------------------------------
 # Cooldown / circuit-breaker state
@@ -2568,6 +2599,29 @@ def format_available_times(provider_cfg: dict) -> str:
         eh, em = divmod(end_min, 60)
         parts.append(f"{sh:02d}:{sm:02d}-{eh:02d}:{em:02d}")
     return ", ".join(parts) + " (UTC)"
+
+
+def format_budget_status(provider_cfg: dict) -> str:
+    """Format a provider entry's remaining request budget for display.
+
+    Returns ``"budget 7/10 per 60s"`` for an entry with ``rate_limit_rpm``
+    (remaining/limit within the current rolling window), or an empty string
+    when the entry is not budget-gated (LP-0MVDQ1GMO00801PL). Used by the
+    provider diagnostics table so operators can see how much free-tier
+    capacity is left instead of inferring it from skip logs.
+    """
+    try:
+        rpm = int(provider_cfg.get("rate_limit_rpm", 0) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if rpm <= 0:
+        return ""
+    from proxy.rate_limiter import get_rate_limiter
+
+    remaining = get_rate_limiter().remaining(
+        str(provider_cfg.get("name") or ""), rpm, RATE_LIMIT_WINDOW_SECONDS
+    )
+    return f"budget {remaining}/{rpm} per {RATE_LIMIT_WINDOW_SECONDS}s"
 
 
 def format_active_status(provider_cfg: dict, now_utc: datetime | None = None) -> str:
@@ -5882,6 +5936,18 @@ async def _proxy_with_remote_fallback_cycle(
     # do not collapse into generic "All providers exhausted".
     first_model_loading_response: Response | None = None
 
+    # Session identity for the free-tier budget gate's in-progress check
+    # (LP-0MVDQ1GMO00801PL). Resolved once; per-request affinity never leaks
+    # between sessions.
+    _budget_session_id: str | None = None
+    try:
+        from proxy.session import _resolve_session_id_header
+        _budget_session_id, _ = _resolve_session_id_header(
+            getattr(request, "headers", {}) or {}
+        )
+    except Exception:
+        pass
+
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
@@ -5896,28 +5962,47 @@ async def _proxy_with_remote_fallback_cycle(
             # Mark that we attempted this provider
             any_provider_tried = True
 
-            # Proactive rate-limit check for remote providers
-            provider_rpm = int(provider_cfg.get("rate_limit_rpm", 0) or 0)
-            if provider_rpm > 0:
-                from proxy.rate_limiter import get_rate_limiter
-                allowed = await get_rate_limiter().check_and_increment(
-                    provider_name, provider_rpm, window_seconds=60
+            # Capacity-aware request budget for free-tier style entries
+            # (LP-0MVDQ1GMO00801PL): dispatches only while the rolling window
+            # has capacity. A NEW session is never parked — it passes straight
+            # through to the next provider — while a session already using the
+            # entry waits a bounded time for the window to reset so it keeps
+            # its prompt cache/prefix continuity.
+            _budget = await acquire_provider_budget(
+                provider_cfg, config, _budget_session_id, request,
+            )
+            if not _budget.allowed:
+                _record_attempt(
+                    attempts,
+                    provider=provider_name,
+                    type="remote",
+                    status="rate_limited",
+                    status_code=429,
+                    reason=_budget.reason,
+                    limit_rpm=_budget.limit_rpm,
+                    remaining=_budget.remaining,
+                    elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                 )
-                if not allowed:
-                    logger.warning(
-                        "Rate limited: skipping provider=%s model=%s (limit=%d rpm)",
-                        provider_name, path, provider_rpm,
-                    )
-                    _record_attempt(
-                        attempts,
-                        provider=provider_name,
-                        type="remote",
-                        status="rate_limited",
-                        status_code=429,
-                    )
-                    continue
+                fallback_reason = "rate_limited"
+                prev_provider = provider_name
+                all_slot_exhaustion = False
+                continue
+            if _budget.waited:
+                _record_attempt(
+                    attempts,
+                    provider=provider_name,
+                    type="remote",
+                    status="rate_limited_waited",
+                    reason=_budget.reason,
+                    limit_rpm=_budget.limit_rpm,
+                    remaining=_budget.remaining,
+                    elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                )
 
             response = await ptr(request, path, provider_cfg)
+            _maybe_record_provider_affinity(
+                provider_cfg, _budget_session_id, response, config,
+            )
 
             # Pre-flight remote streaming responses: detect a pre-content
             # finish_reason: error / empty / stream-exception so the fallback
@@ -6835,32 +6920,45 @@ async def _proxy_with_fallback_cycle(
                     return response
 
             else:
-                # Proactive rate-limit check for remote providers
-                # (LP-0MQNRDUP4008KT6T: rate limiter for remote models)
-                provider_rpm = int(provider_cfg.get("rate_limit_rpm", 0) or 0)
-                if provider_rpm > 0:
-                    from proxy.rate_limiter import get_rate_limiter
-                    allowed = await get_rate_limiter().check_and_increment(
-                        provider_name, provider_rpm, window_seconds=60
+                # Capacity-aware request budget for free-tier style entries
+                # (LP-0MVDQ1GMO00801PL). See _proxy_with_remote_fallback_cycle:
+                # new sessions pass straight through, in-progress sessions wait
+                # a bounded time for the window to reset.
+                _budget = await acquire_provider_budget(
+                    provider_cfg, config, _session_id, request,
+                )
+                if not _budget.allowed:
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type="remote",
+                        status="rate_limited",
+                        status_code=429,
+                        reason=_budget.reason,
+                        limit_rpm=_budget.limit_rpm,
+                        remaining=_budget.remaining,
+                        elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                     )
-                    if not allowed:
-                        logger.warning(
-                            "Rate limited: skipping provider=%s model=%s (limit=%d rpm)",
-                            provider_name, path, provider_rpm,
-                        )
-                        _record_attempt(
-                            attempts,
-                            provider=provider_name,
-                            type="remote",
-                            status="rate_limited",
-                            status_code=429,
-                        )
-                        fallback_reason = "rate_limited"
-                        prev_provider = provider_name
-                        all_slot_exhaustion = False
-                        continue
+                    fallback_reason = "rate_limited"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
+                if _budget.waited:
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type="remote",
+                        status="rate_limited_waited",
+                        reason=_budget.reason,
+                        limit_rpm=_budget.limit_rpm,
+                        remaining=_budget.remaining,
+                        elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                    )
 
                 response = await ptr_remote(request, path, provider_cfg)
+                _maybe_record_provider_affinity(
+                    provider_cfg, _session_id, response, config,
+                )
 
             # Pre-flight remote streaming responses: detect a pre-content
             # finish_reason: error / empty / stream-exception so the fallback

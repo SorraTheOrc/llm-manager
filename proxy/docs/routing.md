@@ -71,6 +71,35 @@ For remote models (`proxy_to_remote()`):
 - Adds custom headers from config
 - Forwards the request via `httpx` (streaming for SSE responses)
 
+### Free-tier request budgets (`rate_limit_rpm`, LP-0MVDQ1GMO00801PL)
+
+Remote entries may declare `rate_limit_rpm`, a per-entry request budget for a
+rolling 60-second window. It is enforced by
+`proxy.provider_budget.acquire_provider_budget()` *before* dispatch in both
+fallback entry points (`_proxy_with_remote_fallback_cycle` and
+`_proxy_with_fallback`), on top of the cooldown / `available_times` /
+failure-domain gates (which only react *after* a failure).
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Window has capacity | Entry is dispatched normally (slot reserved up front). |
+| Window full — **new** session (no recorded affinity for the entry) | Skip immediately, log `Provider budget exhausted: … reason=rate_limited`, record attempt `status=rate_limited`, continue to the next provider. **No waiting.** |
+| Window full — **in-progress** session (affinity recorded on a 2xx dispatch) | Wait up to `server.provider_rate_limit_wait_max_seconds` (default 60) for the window to drain, then dispatch on this entry (`status=rate_limited_waited`); if it never drains, pass through like a new session (`reason=rate_limited_after_wait`). |
+| Waiters already at `server.provider_rate_limit_wait_max_waiters` (default 8) | Pass through (`reason=rate_limited_waiters`) so waiters cannot pile up. |
+| Client disconnects during the wait | Wait aborts promptly (`reason=rate_limited_disconnect`). |
+| `rate_limit_rpm` unset or `0` | Ungated: behaviour exactly as before; no affinity recorded. |
+
+Affinity is `session → entry`, TTL-scoped by
+`server.provider_affinity_ttl_seconds` (default 900), and is **never** shared
+across sessions or between sibling entries (e.g. free `munitoai-free` vs paid
+`munitoai`). The point of the split behaviour is prompt-cache continuity: a
+session already on the free tier keeps its provider, while a batch of new
+agent sessions passes straight through instead of queueing behind an exhausted
+allowance.
+
+`munitoai-free` ships with `rate_limit_rpm: 10` in `config.yaml` (and the fast
+overlay); tune the value from the `remaining=` field in the skip logs.
+
 ### Responses-API providers (`api: openai-responses`)
 
 Some upstreams expose **only** the OpenAI Responses API (`/v1/responses`) and

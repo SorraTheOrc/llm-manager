@@ -102,6 +102,43 @@ Models can define an ordered list of `providers` for automatic failover. The `pr
 | `api_key_env` | string | remote | Environment variable containing the API key |
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
+| `rate_limit_rpm` | int | optional | Maximum dispatches to this entry per rolling **60-second** window (LP-0MVDQ1GMO00801PL). Intended for free tiers with a per-minute allowance (e.g. `munitoai-free`). Default: unset/`0` = ungated. |
+
+#### Free-tier request budgets (`rate_limit_rpm`)
+
+A free tier that allows only a handful of requests per minute is exhausted
+almost immediately when several agents share it, and blindly dispatching into
+it produces upstream `429`s and long stalls before the chain falls through to
+a paid tier. Setting `rate_limit_rpm` on such an entry makes dispatch
+capacity-aware:
+
+- while the rolling 60-second window has capacity, the entry is used normally;
+- once the window is full, a request from a **new** session (no affinity for
+  the entry) skips it **immediately** and the fallback chain moves on — it is
+  never parked waiting, so waiting requests cannot compound the contention;
+- a session that was already served by the entry (affinity recorded on a 2xx
+  dispatch) may wait for the window to reset, keeping the same upstream
+  provider and its prompt cache/prefix continuity. The wait is bounded by the
+  remaining window and `server.provider_rate_limit_wait_max_seconds`, capped
+  in concurrency by `server.provider_rate_limit_wait_max_waiters`, and aborted
+  as soon as the client disconnects;
+- affinity expires after `server.provider_affinity_ttl_seconds`, so a session
+  returning much later counts as new again.
+
+```yaml
+      - name: some-free-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FREE_KEY
+        forward_session_headers: false
+        model: some-model
+        rate_limit_rpm: 10
+```
+
+Skip decisions are logged as `Provider budget exhausted: skipping provider=…`
+(with limit, remaining and reason) and recorded in the request diagnostics as
+an attempt with `status=rate_limited`; an in-progress session that waited is
+recorded as `status=rate_limited_waited` with its `elapsed_wait_seconds`.
 
 ### Multiple local backends (LP-0MRPILSMW004T4H8)
 

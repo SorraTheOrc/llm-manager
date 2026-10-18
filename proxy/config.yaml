@@ -85,6 +85,23 @@
 #                         model: deepseek-v4.1-flash
 #                         available_times: ["10:00-12:00", "14:00-16:00"]
 #
+# Per-entry request budget (optional, remote providers only):
+#   rate_limit_rpm - maximum dispatches to this provider entry per rolling
+#                    60-second window (LP-0MVDQ1GMO00801PL). Intended for
+#                    free tiers with a per-minute allowance (e.g.
+#                    `munitoai-free`). Over-budget requests from NEW sessions
+#                    skip the entry immediately (pass through, never parked); a
+#                    session already served by the entry waits a bounded time
+#                    for the window to reset (server.provider_rate_limit_wait_*
+#                    / server.provider_affinity_ttl_seconds) to keep its prompt
+#                    cache. Omit the field (or use 0) to leave the entry
+#                    ungated. Example:
+#                      - name: some-free-tier
+#                        type: remote
+#                        endpoint: https://api.example.com/v1
+#                        api_key_env: SOME_FREE_KEY
+#                        rate_limit_rpm: 10
+#
 # Responses-API mode (optional, remote providers only):
 #   api - "openai-completions" (default) or "openai-responses". Some
 #        upstreams (opencode.ai zen/go for the muse model family) expose
@@ -267,6 +284,14 @@ models:
         api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -365,6 +390,14 @@ models:
         api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -463,6 +496,14 @@ models:
         api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
+        # only a small number of requests per rolling 60s window, so the proxy
+        # dispatches to it only while that window has capacity. Over-budget
+        # requests from NEW sessions pass straight through to the next tier
+        # (never parked); a session already served by this entry waits a
+        # bounded time for the window to reset, preserving its prompt cache.
+        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        rate_limit_rpm: 10
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -624,6 +665,30 @@ server:
   llama_request_timeout: 1500
   # Provider fallback cooldown: seconds to wait before retrying a failed provider
   provider_cooldown_seconds: 60
+
+  # Free-tier request budget (LP-0MVDQ1GMO00801PL).
+  # A provider entry that declares `rate_limit_rpm` (e.g. `munitoai-free`) is
+  # dispatched to at most that many times in any rolling 60s window. When the
+  # window is full:
+  #   - a NEW session (no affinity record for the entry) skips the entry
+  #     immediately and continues down the fallback chain — it is never parked,
+  #     so waiting requests cannot compound the contention;
+  #   - a session already served by the entry (affinity recorded on a 2xx
+  #     dispatch) waits for the window to reset, keeping the same upstream
+  #     provider and its prompt cache/prefix continuity.
+  # The wait is bounded by the remaining window and
+  # provider_rate_limit_wait_max_seconds, depth-capped so waiters cannot pile
+  # up, and aborted as soon as the client disconnects.
+  #   - provider_rate_limit_wait_max_seconds: max wait for an in-progress
+  #     session (default 60; 0 disables waiting entirely -> always pass through).
+  #   - provider_rate_limit_wait_max_waiters: max concurrent waiters across all
+  #     gated entries (default 8; 0 denies every wait).
+  #   - provider_affinity_ttl_seconds: how long a session counts as "in
+  #     progress" on a gated entry (default 900 = 15 min; 0 disables affinity,
+  #     so every request is treated as new).
+  provider_rate_limit_wait_max_seconds: 60
+  provider_rate_limit_wait_max_waiters: 8
+  provider_affinity_ttl_seconds: 900
   # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote
   # provider repeatedly returns an EMPTY response / stalls (no usable content)
   # across retry cycles, the provider is quarantined for an EXTENDED cooldown
