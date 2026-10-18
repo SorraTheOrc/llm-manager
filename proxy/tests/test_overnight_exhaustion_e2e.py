@@ -11,6 +11,13 @@ then asserts: truthful 503, stable machine-readable ``code``, quarantine
 visible in diagnostics, truthful ``Retry-After``, and a bounded hold that never
 sleeps through ``chain_hold_max_cycles`` when ``retry_after`` is hours away.
 
+The retry-timer contract is pinned (LP-0MV728V6M0013J4G): under the injected
+clock the asserted ``retry_after`` equals the exact soonest availability (the
+``available_times`` window edge), the ``Retry-After`` header and ``retry_after``
+body field carry the same integer, both exhaustion variants (``all_exhausted``
+and ``outside_time_window``) are covered through the fallback chain, and ``0``
+is asserted exactly when a provider can serve immediately.
+
 Determinism: the UTC clock is injected and the hold sleep is monkeypatched to
 record requested durations instead of sleeping (no real sleep > 1s).
 
@@ -146,7 +153,11 @@ async def test_overnight_gap_window_plus_quarantine_contract(monkeypatch):
         result = await provider.proxy_with_remote_fallback(
             _DummyRequest(), "v1/chat/completions", model,
             {"provider_cooldown_seconds": 60,
-             "chain_hold_seconds": 300, "chain_hold_max_cycles": 3},
+             "chain_hold_seconds": 300, "chain_hold_max_cycles": 3,
+             # Raise the client cap so the pinned honest wait is advertised
+             # unclamped (AC2: retry_after equals the real soonest
+             # availability, not the default 3600 s ceiling).
+             "max_retry_after_seconds": 100000},
         )
 
     assert result.status_code == 503
@@ -163,10 +174,18 @@ async def test_overnight_gap_window_plus_quarantine_contract(monkeypatch):
     assert statuses["opencode-go-3"]["status"] == "usage_limit_reset"
     assert statuses["opencode-go-2"]["status"] == "outside_time_window"
 
-    # Truthful Retry-After: soonest real availability is the window edge
-    # (~11h), which exceeds the hold budget, so the response is prompt.
-    assert body["retry_after"] > 0
+    # Truthful Retry-After, pinned to the real soonest availability (AC2):
+    # under _FixedDateTime (13:00 UTC) the next "00:00-01:00" window edge is
+    # 11 h away, ahead of the 9 h usage-limit reset, so the advertised wait is
+    # exactly that window edge.
+    window_edge = 11 * 3600
+    assert provider._compute_retry_after(
+        model_config=model, now_utc=_FIXED_NOW
+    ) == window_edge
+    assert body["retry_after"] == window_edge
     assert result.headers.get("retry-after") == str(body["retry_after"])
+    # AC5: the 11 h timer exceeds the 300 s × 3 hold budget, so the exhaustion
+    # is surfaced immediately with the timer, never held beyond it.
     assert hold_requests == [], "a >budget retry_after must not hold/cycle"
 
 
@@ -268,3 +287,82 @@ async def test_overnight_gap_hold_bounded_by_small_retry_after(monkeypatch):
     assert result.status_code == 200
     assert holds == [2.0], "the hold must equal the real retry_after (2s)"
     assert max(holds) <= 2, "hold must never exceed the computed retry_after"
+
+
+@pytest.mark.asyncio
+async def test_overnight_sole_cause_window_code_and_timer(monkeypatch):
+    """Sole-cause time-window exhaustion through the fallback chain: the
+    distinguished ``outside_time_window`` 503 (LP-0MV728V6M0013J4G AC3)
+    carries the same pinned retry-timer contract as the generic variant."""
+    model = _remote_providers_for_overnight()  # both remotes outside the window
+    hold_requests: list[float] = []
+
+    async def _record_hold(_req, seconds):
+        hold_requests.append(seconds)
+        return False
+
+    monkeypatch.setattr(provider, "_hold_sleep", _record_hold)
+    monkeypatch.setattr(
+        "proxy.server.proxy_to_remote",
+        AsyncMock(side_effect=AssertionError("out-of-window remote must not run")),
+    )
+
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions", model,
+            {"provider_cooldown_seconds": 60,
+             "chain_hold_seconds": 300, "chain_hold_max_cycles": 3,
+             "max_retry_after_seconds": 100000},
+        )
+
+    assert result.status_code == 503
+    body = json.loads(result.body)
+    # AC4: the human-readable prose is retained; AC3: the stable code
+    # discriminates the time-window variant.
+    assert body["error"] == "All providers exhausted"
+    assert body["code"] == "outside_time_window"
+    assert all(
+        d["status"] == "outside_time_window" for d in body["diagnostics"]
+    )
+
+    # AC2: the pinned timer equals the real window-edge wait under
+    # _FixedDateTime, and the wire advertises the same value in header and
+    # body (AC1).
+    window_edge = 11 * 3600
+    assert provider._compute_retry_after(
+        model_config=model, now_utc=_FIXED_NOW
+    ) == window_edge
+    assert body["retry_after"] == window_edge
+    assert result.headers.get("retry-after") == str(body["retry_after"])
+
+    # AC5: the timer exceeds the hold budget (900 s), so no hold is attempted.
+    assert hold_requests == [], "window-only exhaustion must not hold/cycle"
+
+
+def test_exhausted_zero_when_availability_exists():
+    """AC2 edge: ``retry_after`` is 0 exactly when a provider can serve now.
+
+    Even with ``available_times`` configured, a provider currently inside its
+    window contributes no wait, so the pinned clock and the built response
+    agree on 0 (deterministic under ``_FixedDateTime``).
+    """
+    in_window = {
+        "name": "opencode-go-2",
+        "type": "remote",
+        "provider": "opencode-go",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_2_API_KEY",
+        "model": "deepseek-v4-flash",
+        "available_times": ["12:00-14:00"],  # contains _FIXED_NOW (13:00 UTC)
+    }
+    model = {"providers": [in_window]}
+    assert provider._compute_retry_after(
+        model_config=model, now_utc=_FIXED_NOW
+    ) == 0
+    with patch("proxy.provider.datetime", _FixedDateTime):
+        r = provider._build_exhausted_response(
+            unavailable_providers={}, diagnostics=[], model_config=model,
+        )
+    body = json.loads(r.body)
+    assert body["retry_after"] == 0
+    assert r.headers.get("retry-after") == "0"

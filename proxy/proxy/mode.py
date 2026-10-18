@@ -3,9 +3,10 @@
 The proxy runs in one of two operator-selected operating modes:
 
 - **fast** — cloud-backed: remote providers are eligible and the server
-  behaves as before (current day settings; ``config-fast.yaml``, 1-slot
-  pool; LP-0MU03AL730000B5W).
-- **cheap** — 3-slot local pool with the SAME models/provider chains as
+  behaves as before (current day settings; ``config-fast.yaml``, 2-slot
+  pool inherited from the base after the N=2 verdict, LP-0MV9UNGEB009XUZ5).
+- **cheap** — 3-slot local pool (converging to 2, LP-0MVCGYAI80084PCZ) with
+  the SAME models/provider chains as
   fast: remote providers (including paid tiers) stay enabled and are used
   when local slots are exhausted (``config-cheap.yaml``, LP-0MSMIPPJI007GU9N;
   3 slots per LP-0MU03AL730000B5W).
@@ -36,6 +37,12 @@ instead of being reverted on the next scheduler tick. The override expiry is
 persisted in a companion state file (``proxy/.mode.override-until``) so it
 survives proxy restarts and reboots; once the next scheduled change passes,
 the schedule reasserts control (LP-0MSMF25V9002AY1J).
+
+A **mode-switch lock** (``POST /admin/mode-switch-lock``,
+``proxy/.mode-switch-lock``) can be engaged to reject any change to the
+operating mode and make the scheduler stand down — used during slot sweeps /
+performance investigations so a mid-run fast<->cheap switch cannot corrupt
+the measurement (LP-0MVCBMLP7009MN81). Off (the default) = normal operation.
 """
 
 import logging
@@ -271,6 +278,25 @@ def _live_server_config() -> dict | None:
     except Exception:
         pass
     return None
+
+
+def _mode_switch_lock_config_section(server_config: dict | None) -> dict:
+    """Resolve the ``server.mode_switch_lock`` config with defaults.
+
+    Args:
+        server_config: The ``server`` section of the server config dict, or
+            None to read it from the live server module lazily.
+
+    Returns:
+        A dict with ``enabled`` (bool) and ``reason`` (str) keys.
+    """
+    if server_config is None:
+        server_config = {}
+    section = server_config.get("mode_switch_lock") or {}
+    return {
+        "enabled": bool(section.get("enabled", False)),
+        "reason": str(section.get("reason") or ""),
+    }
 
 
 def _begin_drain() -> None:
@@ -609,8 +635,13 @@ def _mode_scheduler_step(
     scheduled transition. Once the override expires the scheduled mode is
     applied regardless of the current setting. Returns True when a mode
     change was applied. A pending mode-switch restart (e.g. a manual switch
-    in flight) is left alone and retried on the next cycle.
+    in flight) is left alone and retried on the next cycle. When the
+    mode-switch lock is engaged (LP-0MVCBMLP7009MN81) the scheduler stands
+    down entirely: no scheduled switch is applied while a performance
+    investigation is running.
     """
+    if mode_switch_locked():
+        return False
     expected = schedule.active_mode(now)
     if expected is None:
         return False
@@ -621,11 +652,20 @@ def _mode_scheduler_step(
         # change; stand down instead of reverting it.
         return False
     try:
-        set_mode(expected, bypass_cooldown=True)
+        set_mode(
+            expected,
+            bypass_cooldown=True,
+            source="scheduler",
+            actor="mode-scheduler",
+            reason="scheduled mode change",
+        )
     except RuntimeError:
         logger.debug("Mode scheduler: restart pending, retrying next cycle")
         return False
-    logger.info("Mode scheduler: applied scheduled mode %s", expected)
+    logger.info(
+        "Mode scheduler: applied scheduled mode %s source=scheduler actor=mode-scheduler",
+        expected,
+    )
     return True
 
 
@@ -664,6 +704,15 @@ def start_mode_scheduler(
 # (avoids restart loops).
 _mode_lock = threading.Lock()
 _restart_pending = False
+
+# Attribution captured at set_mode() time for the forthcoming restart
+# (LP-0MVAPNC2900145RH): ``(source, actor, reason, requested_mode)``. The
+# spawn thread reads it to mark the ``Mode-switch restart spawned`` line and
+# to pass the reason through to ``start-proxy.sh --restart`` (argv/env), so
+# every restart is attributable from the logs alone.
+_restart_attribution: tuple[
+    str | None, str | None, str | None, str
+] = (None, None, None, MODE_FAST)
 
 
 def proxy_dir() -> Path:
@@ -859,6 +908,77 @@ def restart_pending() -> bool:
         return _restart_pending
 
 
+class ModeSwitchLockedError(RuntimeError):
+    """Raised when a fast<->cheap mode switch is attempted while the
+    mode-switch lock is engaged.
+
+    The lock is an investigation-time guard (LP-0MVCBMLP7009MN81): while it
+    is on, requests to CHANGE the operating mode are rejected with no state
+    mutation and no restart, so a slot-sweep / performance measurement cannot
+    be corrupted by an automatic or manual fast<->cheap switch mid-run. In
+    normal operation (lock off, the default) mode changes proceed exactly as
+    before.
+    """
+
+
+def set_mode_switch_lock(enabled: bool, reason: str = "") -> None:
+    """Engage (or release) the mode-switch lock at runtime.
+
+    Persists to ``proxy/.mode-switch-lock`` so the lock survives a proxy
+    restart (including the mode-switch restart a pre-lock change would have
+    armed). ``enabled=False`` removes the file, restoring normal operation.
+    The *reason* is recorded for diagnostics (e.g. "1/2/3 slot sweep").
+    """
+    path = mode_switch_lock_file()
+    if not enabled:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Failed to remove mode-switch-lock state file")
+        return
+    import json as _json
+
+    path.write_text(
+        _json.dumps({"enabled": True, "reason": reason, "since": datetime.now().isoformat()}),
+        encoding="utf-8",
+    )
+
+
+def mode_switch_lock_file() -> Path:
+    """Path to the runtime mode-switch lock state file."""
+    return proxy_dir() / ".mode-switch-lock"
+
+
+def mode_switch_locked() -> bool:
+    """Whether the mode-switch lock is engaged (runtime state or config).
+
+    The runtime state file written by ``set_mode_switch_lock`` is
+    authoritative; when absent, the ``server.mode_switch_lock`` config
+    section is consulted (default off), so a deployment can also pin the
+    lock in config. Returns True only when a lock is actually in effect.
+    """
+    import json as _json
+
+    try:
+        text = mode_switch_lock_file().read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        text = ""
+    if text:
+        try:
+            data = _json.loads(text)
+            if isinstance(data, dict) and data.get("enabled"):
+                return True
+        except ValueError:
+            logger.warning(
+                "Ignoring unparsable mode-switch-lock state %r", text[:80]
+            )
+        return False
+    cfg = _mode_switch_lock_config_section(_live_server_config())
+    return bool(cfg.get("enabled"))
+
+
 class ModeSwitchCooldownError(Exception):
     """Raised when a manual fast->cheap switch arrives inside the cooldown.
 
@@ -915,6 +1035,10 @@ def set_mode(
     manual: bool = False,
     schedule: ModeScheduleConfig | None = None,
     bypass_cooldown: bool = False,
+    *,
+    source: str | None = None,
+    actor: str | None = None,
+    reason: str | None = None,
 ) -> tuple[str, bool]:
     """Persist *mode* and arm a background restart when it changes.
 
@@ -925,6 +1049,13 @@ def set_mode(
     (LP-0MSMF25V9002AY1J). A non-manual call (the scheduler enforcing the
     schedule) persists the mode and clears any pending override.
 
+    Attribution (LP-0MVAPNC2900145RH): callers identify themselves with
+    the optional keyword-only ``source``/``actor``/``reason`` kwargs so the
+    spawned restart is attributable. ``source`` selects the restart class:
+    ``scheduler`` (schedule enforcement), ``worker`` (ContextHub mode-switch
+    worker), ``api`` (web UI / direct API call), or ``manual`` (operator).
+    Defaults remain unattributed (None) for backward compatibility.
+
     Returns ``(persisted_mode, restart_triggered)``:
 
     - Requesting the mode that is already active is a **noop**: nothing is
@@ -934,15 +1065,27 @@ def set_mode(
       restart (``proxy/scripts/start-proxy.sh --restart``) in the background.
 
     Raises ``RuntimeError`` when a mode-switch restart is already pending
-    and the requested mode differs (rejected to avoid restart loops), and
+    and the requested mode differs (rejected to avoid restart loops),
+    ``ModeSwitchLockedError`` when the mode-switch lock is engaged
+    (LP-0MVCBMLP7009MN81; checked before any mutation, so a rejected
+    request never arms a restart), and
     ``ModeSwitchCooldownError`` when a manual fast->cheap switch arrives
     inside ``MODE_SWITCH_COOLDOWN_SECONDS`` of the last real transition to
     ``fast`` (checked before any state mutation, so a rejected request never
     arms a restart). ``bypass_cooldown`` skips that gate (used by the
     scheduler, which must always apply the configured schedule).
     """
-    global _restart_pending
+    global _restart_pending, _restart_attribution
     with _mode_lock:
+        if mode_switch_locked() and mode != read_mode():
+            # Investigation guard (LP-0MVCBMLP7009MN81): reject the switch
+            # BEFORE any state mutation so no .mode write, drain or restart
+            # is armed. A same-mode request stays a noop (matches the
+            # "requests to CHANGE mode are rejected" semantics).
+            raise ModeSwitchLockedError(
+                "mode switching is locked (performance investigation in "
+                f"progress); refusing switch to {mode!r}"
+            )
         if _restart_pending:
             if read_mode() == mode:
                 if manual:
@@ -967,6 +1110,7 @@ def set_mode(
         else:
             write_override_until(None)
         _restart_pending = True
+        _restart_attribution = (source, actor, reason, mode)
         # AC2 bounded drain: arm it synchronously so new chat requests are
         # deferred from the moment the restart is triggered (LP-0MT631JKW008WAKE).
         _begin_drain()
@@ -1016,14 +1160,44 @@ def _spawn_restart() -> None:
                 logger.exception("Mode-switch drain wait failed; restarting anyway")
                 _end_drain()
             script = proxy_dir() / "scripts" / "start-proxy.sh"
+            # LP-0MVAPNC2900145RH: the attribution captured at set_mode() time
+            # marks this restart. ``--reason`` argv (start-proxy.sh flag wins
+            # over the env var) plus caller-sourced env vars survive into the
+            # new process so its startup log can echo the reason.
+            source, actor, reason, requested_mode = _restart_attribution
+            cmd = ["bash", str(script), "--restart"]
+            env = dict(os.environ)
+            if reason:
+                cmd += ["--reason", reason]
+                env["LLAMA_PROXY_RESTART_REASON"] = reason
+            if source:
+                env["LLAMA_PROXY_RESTART_SOURCE"] = source
+            if actor:
+                env["LLAMA_PROXY_RESTART_ACTOR"] = actor
             subprocess.Popen(
-                ["bash", str(script), "--restart"],
+                cmd,
                 cwd=str(proxy_dir()),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=env,
             )
-            logger.info("Mode-switch restart spawned: %s --restart", script)
+            if source or actor or reason:
+                markers = " ".join(
+                    part
+                    for part in (
+                        f"source={source}" if source else None,
+                        f"actor={actor}" if actor else None,
+                        f"mode={requested_mode}" if requested_mode else None,
+                        f"reason={reason}" if reason else None,
+                    )
+                    if part
+                )
+                logger.info(
+                    "Mode-switch restart spawned: %s --restart %s", script, markers
+                )
+            else:
+                logger.info("Mode-switch restart spawned: %s --restart", script)
         except Exception:
             logger.exception("Failed to spawn mode-switch restart")
 

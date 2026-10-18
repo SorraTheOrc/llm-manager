@@ -1,0 +1,201 @@
+{
+  "config": {
+    "slot_count": 1,
+    "total_requests": 12,
+    "concurrency": 3,
+    "prompt_tokens_target": 2000,
+    "output_tokens_target": 18000,
+    "phase": "cold",
+    "proxy_restart_time": "2026-10-17T13:21:40.239688+00:00",
+    "llama_ready_time": "2026-10-17T13:21:50.543331+00:00"
+  },
+  "reproducibility": {
+    "command": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVAZPQUM006EAC7-slot-sweep-1-2-3-with-recorded-results/proxy/benchmarks/slot_benchmark.py --sweep --concurrency 3 --prompt-tokens 2000 --output-dir proxy/benchmarks/results/slot_sweep_1_2_3_20261017_1421",
+    "config_diff": {
+      "session_slot_pool_size": {
+        "before": 2,
+        "after": 1
+      }
+    },
+    "model": "plan -> local-qwen3/Qwen3",
+    "context_size": 262144,
+    "per_slot_ctx": 258048
+  },
+  "viability": {
+    "observed_slots": 1,
+    "system_memory_bytes": 57726787584,
+    "llama_started": true,
+    "warnings": []
+  },
+  "requests": [
+    {
+      "request_index": 1,
+      "status": "completed",
+      "total_duration_seconds": 497.266,
+      "time_to_first_token_seconds": 0.104,
+      "prompt_tokens": 1908,
+      "completion_tokens": 7184,
+      "tokens_per_second": 14.45,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 2,
+      "status": "completed",
+      "total_duration_seconds": 22.826,
+      "time_to_first_token_seconds": 0.007,
+      "prompt_tokens": 402,
+      "completion_tokens": 4782,
+      "tokens_per_second": 209.49,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 3,
+      "status": "completed",
+      "total_duration_seconds": 6.862,
+      "time_to_first_token_seconds": 0.008,
+      "prompt_tokens": 402,
+      "completion_tokens": 1215,
+      "tokens_per_second": 177.07,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 4,
+      "status": "completed",
+      "total_duration_seconds": 5.917,
+      "time_to_first_token_seconds": 0.008,
+      "prompt_tokens": 402,
+      "completion_tokens": 1051,
+      "tokens_per_second": 177.64,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 5,
+      "status": "completed",
+      "total_duration_seconds": 147.56,
+      "time_to_first_token_seconds": 0.04,
+      "prompt_tokens": 1909,
+      "completion_tokens": 5563,
+      "tokens_per_second": 37.7,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 6,
+      "status": "completed",
+      "total_duration_seconds": 127.952,
+      "time_to_first_token_seconds": 0.118,
+      "prompt_tokens": 402,
+      "completion_tokens": 1631,
+      "tokens_per_second": 12.75,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 7,
+      "status": "completed",
+      "total_duration_seconds": 124.247,
+      "time_to_first_token_seconds": 0.207,
+      "prompt_tokens": 402,
+      "completion_tokens": 901,
+      "tokens_per_second": 7.25,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 8,
+      "status": "completed",
+      "total_duration_seconds": 124.039,
+      "time_to_first_token_seconds": 0.202,
+      "prompt_tokens": 402,
+      "completion_tokens": 921,
+      "tokens_per_second": 7.43,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 9,
+      "status": "completed",
+      "total_duration_seconds": 399.585,
+      "time_to_first_token_seconds": 0.079,
+      "prompt_tokens": 1909,
+      "completion_tokens": 7570,
+      "tokens_per_second": 18.94,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 10,
+      "status": "completed",
+      "total_duration_seconds": 10.259,
+      "time_to_first_token_seconds": 0.008,
+      "prompt_tokens": 402,
+      "completion_tokens": 1901,
+      "tokens_per_second": 185.29,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 11,
+      "status": "completed",
+      "total_duration_seconds": 13.981,
+      "time_to_first_token_seconds": 0.006,
+      "prompt_tokens": 402,
+      "completion_tokens": 3303,
+      "tokens_per_second": 236.26,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 12,
+      "status": "completed",
+      "total_duration_seconds": 135.092,
+      "time_to_first_token_seconds": 0.064,
+      "prompt_tokens": 402,
+      "completion_tokens": 3184,
+      "tokens_per_second": 23.57,
+      "resolved_model": "MunitoAI/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    }
+  ],
+  "summary": {
+    "slot_count": 1,
+    "total_requests": 12,
+    "completed": 12,
+    "errors": 0,
+    "total_duration_seconds": 1615.585863824468,
+    "avg_duration": 134.6,
+    "min_duration": 5.9,
+    "max_duration": 497.3,
+    "median_duration": 124.2,
+    "avg_ttft": 0.071,
+    "avg_tps": 92.3,
+    "total_prompt_tokens": 9344,
+    "total_completion_tokens": 39206,
+    "gpu_memory_bytes": 200847360,
+    "start_time": "2026-10-17T13:21:50.543594+00:00",
+    "end_time": "2026-10-17T13:33:09.516961+00:00",
+    "error": null,
+    "contention": {
+      "queue_timeout_count": 12,
+      "queue_timeout_rate": 0.7059,
+      "local_stream_share": 0.0,
+      "local_stream_count": 0,
+      "observed_stream_count": 12,
+      "quarantine_episode_count": 0,
+      "unavailable": {}
+    }
+  },
+  "contention": {
+    "queue_timeout_count": 12,
+    "queue_timeout_rate": 0.7059,
+    "local_stream_share": 0.0,
+    "local_stream_count": 0,
+    "observed_stream_count": 12,
+    "quarantine_episode_count": 0,
+    "unavailable": {}
+  }
+}

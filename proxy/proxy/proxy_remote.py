@@ -20,6 +20,10 @@ import httpx
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 
+# Tier-aware provider display name resolution (shared with
+# provider._build_resolved_model_value so the two sites cannot diverge).
+from proxy.provider import _resolve_display_provider_name
+
 # Import utils functions used by this module
 from proxy.utils import SSEEventReframer, count_text_tokens
 
@@ -914,9 +918,11 @@ async def proxy_to_remote(
     is_streaming = body_json.get("stream", False)
 
     # LP-0MR4ZIGDT004A3E1: Build resolved model string for X-Resolved-Model header
-    # Use the ``provider`` field (actual provider brand name) if present,
-    # falling back to ``name`` (provider entry name) for backward compatibility.
-    _provider_name = model_config.get("provider") or model_config.get("name", "unknown")
+    # Tier-aware via the shared helper (LP-0MVCQ36QV009QX8K): ``display_name``
+    # (opt-in, e.g. "MunitoAI Free") takes priority, then ``provider`` (actual
+    # provider brand name), then ``name`` (provider entry name). Same logic as
+    # ``provider._build_resolved_model_value``, so the two sites cannot diverge.
+    _provider_name = _resolve_display_provider_name(model_config) or "unknown"
     _resolved_model_id = body_json.get("model", "unknown")
     _resolved_model_header = f"{_provider_name}/{_resolved_model_id}"
     # Warn when a remote provider entry is missing the ``provider`` field

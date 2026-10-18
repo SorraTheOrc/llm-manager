@@ -553,7 +553,8 @@ FAKE
 
 # ---------------------------------------------------------------
 # Test: [Qwen3] carries the derived prompt-cache sizing and no dead
-# swa-full flag (LP-0MUPPAC7R0053J8L AC2/AC3/AC7/AC8)
+# swa-full flag (LP-0MUPPAC7R0053J8L AC2/AC3/AC7/AC8; raised to 40960 under
+# LP-0MV5HSUHF002MDPG)
 # ---------------------------------------------------------------
 test_qwen3_cache_ram_present() {
     echo "Test: Production models.ini [Qwen3] has derived cache-ram"
@@ -564,8 +565,8 @@ test_qwen3_cache_ram_present() {
     found && /^cache-ram/ { gsub(/.*=/, ""); gsub(/^[ \t]+|[ \t]+$/, ""); val=$0; exit }
     END { if (val != "") print val }' "$MODELS_INI")
 
-    [ "$val" = "32768" ] && pass "[Qwen3] cache-ram=32768 (got: $val)" \
-        || fail "[Qwen3] cache-ram expected 32768, got: '$val'"
+    [ "$val" = "40960" ] && pass "[Qwen3] cache-ram=40960 (got: $val)" \
+        || fail "[Qwen3] cache-ram expected 40960, got: '$val'"
 }
 
 test_qwen3_ctx_checkpoints_present() {

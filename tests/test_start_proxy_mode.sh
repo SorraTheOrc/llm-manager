@@ -196,6 +196,58 @@ exec /usr/bin/python3 "$@"
 PY
 chmod +x "$FAKE_PY"
 
+# ---- Sandboxed restart-signature fakes (LP-0MUJRVYQH002IEHW) --------------
+# The --restart tests must never touch live processes or ports. These fakes
+# are found first on PATH (the sandbox dir also holds the fake python shim)
+# and merely log their invocation; no live pkill/fuser ever runs.
+KILL_LOG="$SANDBOX/kill.log"
+
+for _fake in pkill fuser; do
+    cat > "$SANDBOX/$_fake" <<SH
+#!/usr/bin/env bash
+echo "$_fake \$*" >> "$KILL_LOG"
+exit 0
+SH
+    chmod +x "$SANDBOX/$_fake"
+done
+
+# Fake ss/netstat report no listeners so _wait_for_port_release() returns
+# immediately and never probes the live proxy ports (8080/8081).
+for _fake in ss netstat; do
+    cat > "$SANDBOX/$_fake" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+    chmod +x "$SANDBOX/$_fake"
+done
+
+# Compute the merged-config sha256 exactly as start-proxy.sh does (via the
+# shared config_merge helper mirrored into the sandbox).
+merged_hash() {
+    # $1 = base path, $2 = overlay path
+    /usr/bin/python3 -c "
+import sys
+sys.path.insert(0, '$PROXY_DIR/proxy')
+from config_merge import merged_config_sha256
+print(merged_config_sha256('$1', '$2'))
+"
+}
+
+_write_signature() {
+    # $1 = mode label, $2 = config_sha256
+    cat > "$PROXY_DIR/.llama_server_signature.json" <<JSON
+{"mode": "$1", "model": "router", "parallel": 1, "router_mode": true, "config_sha256": "$2"}
+JSON
+}
+
+run_restart() {
+    # Sandboxed --restart run; resets the fake-kill log first.
+    : > "$KILL_LOG"
+    local out
+    out=$(cd "$PROXY_DIR" && PATH="$SANDBOX:$PATH" bash scripts/start-proxy.sh --restart --port "$TEST_PORT" 2>&1)
+    echo "$out"
+}
+
 TEST_PORT=8457
 
 run_script() {
@@ -389,6 +441,108 @@ test_web_ui_slots_text() {
     fi
 }
 
+# ---- Restart-signature tests (LP-0MUJRVYQH002IEHW) -------------------------
+# The sandbox base carries a base-only local-backend key the overlays omit
+# (llama_server_port), so a base-only change is invisible in the raw overlay
+# bytes but must still change the merged-config signature.
+
+_ensure_base_base_only_key() {
+    # Give the sandbox base a local-backend key absent from both overlays.
+    if ! grep -q "^  llama_server_port:" "$PROXY_DIR/config.yaml"; then
+        printf '  llama_server_port: 8080\n' >> "$PROXY_DIR/config.yaml"
+    fi
+}
+
+# AC3: unchanged merged config preserves the warm llama-server.
+test_restart_preserves_unchanged_merged_config() {
+    echo "--- Test: --restart preserves llama-server when merged config unchanged ---"
+    _ensure_base_base_only_key
+    printf 'fast\n' > "$PROXY_DIR/.mode"
+    local sha
+    sha="$(merged_hash "$PROXY_DIR/config.yaml" "$PROXY_DIR/config-fast.yaml")"
+    _write_signature fast "$sha"
+
+    local out
+    out="$(run_restart)"
+    if echo "$out" | grep -q "Preserving running llama-server"; then
+        pass "unchanged merged config: llama-server preserved"
+    else
+        fail "unchanged merged config: expected preserve, got: $out"
+    fi
+    if grep -q "llama-server" "$KILL_LOG"; then
+        fail "unchanged merged config: fake pkill saw a llama-server kill ($(cat "$KILL_LOG"))"
+    else
+        pass "unchanged merged config: fake pkill never saw a llama-server kill"
+    fi
+}
+
+# AC2: a base-only local-backend change forces a restart (overlay bytes
+# unchanged — the raw-file hash would have matched).
+test_restart_on_base_only_change() {
+    echo "--- Test: --restart restarts llama-server on a base-only change ---"
+    _ensure_base_base_only_key
+    printf 'fast\n' > "$PROXY_DIR/.mode"
+    local sha_before
+    sha_before="$(merged_hash "$PROXY_DIR/config.yaml" "$PROXY_DIR/config-fast.yaml")"
+    _write_signature fast "$sha_before"
+
+    # Base-only edit; the fast overlay (and its raw bytes) are untouched.
+    sed -i 's/^  llama_server_port: .*/  llama_server_port: 9090/' "$PROXY_DIR/config.yaml"
+    local sha_after
+    sha_after="$(merged_hash "$PROXY_DIR/config.yaml" "$PROXY_DIR/config-fast.yaml")"
+    if [ "$sha_before" = "$sha_after" ]; then
+        fail "base-only change did not change the merged hash"
+        return
+    fi
+
+    local out
+    out="$(run_restart)"
+    if echo "$out" | grep -q "Preserving running llama-server"; then
+        fail "base-only change: llama-server wrongly preserved: $out"
+    else
+        pass "base-only change: llama-server not preserved (KEEP_LLAMA=0)"
+    fi
+    if grep -q "llama-server" "$KILL_LOG"; then
+        pass "base-only change: fake pkill killed llama-server"
+    else
+        fail "base-only change: llama-server kill not observed"
+    fi
+
+    # Restore the pre-change base value for later tests.
+    sed -i 's/^  llama_server_port: .*/  llama_server_port: 8080/' "$PROXY_DIR/config.yaml"
+}
+
+# AC4: an overlay-only change still forces a restart (regression guard).
+test_restart_on_overlay_only_change() {
+    echo "--- Test: --restart restarts llama-server on an overlay-only change ---"
+    printf 'cheap\n' > "$PROXY_DIR/.mode"
+    local sha_before
+    sha_before="$(merged_hash "$PROXY_DIR/config.yaml" "$PROXY_DIR/config-cheap.yaml")"
+    _write_signature cheap "$sha_before"
+
+    # Overlay-only edit: session_slot_pool_size lives in config-cheap.yaml.
+    sed -i 's/^  session_slot_pool_size: .*/  session_slot_pool_size: 7/' "$PROXY_DIR/config-cheap.yaml"
+    local sha_after
+    sha_after="$(merged_hash "$PROXY_DIR/config.yaml" "$PROXY_DIR/config-cheap.yaml")"
+    if [ "$sha_before" = "$sha_after" ]; then
+        fail "overlay-only change did not change the merged hash"
+        return
+    fi
+
+    local out
+    out="$(run_restart)"
+    if echo "$out" | grep -q "Preserving running llama-server"; then
+        fail "overlay-only change: llama-server wrongly preserved: $out"
+    else
+        pass "overlay-only change: llama-server not preserved (KEEP_LLAMA=0)"
+    fi
+    if grep -q "llama-server" "$KILL_LOG"; then
+        pass "overlay-only change: fake pkill killed llama-server"
+    else
+        fail "overlay-only change: llama-server kill not observed"
+    fi
+}
+
 # ---- Run -------------------------------------------------------------------
 
 echo "=== start-proxy.sh Operating-Mode Resolution Tests ==="
@@ -402,3 +556,6 @@ test_api_keys_resolve_from_selected_config
 test_api_keys_from_merged_base
 test_per_slot_context
 test_web_ui_slots_text
+test_restart_preserves_unchanged_merged_config
+test_restart_on_base_only_change
+test_restart_on_overlay_only_change

@@ -102,6 +102,52 @@ Models can define an ordered list of `providers` for automatic failover. The `pr
 | `api_key_env` | string | remote | Environment variable containing the API key |
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
+| `rate_limit_rpm` | int | optional | Maximum dispatches to this entry per rolling **60-second** window (LP-0MVDQ1GMO00801PL). Intended for free tiers with a per-minute allowance (e.g. `munitoai-free`). Default: unset/`0` = ungated. |
+
+#### Free-tier request budgets (`rate_limit_rpm`)
+
+A free tier that allows only a handful of requests per minute is exhausted
+almost immediately when several agents share it, and blindly dispatching into
+it produces upstream `429`s and long stalls before the chain falls through to
+a paid tier. Setting `rate_limit_rpm` on such an entry makes dispatch
+capacity-aware:
+
+- while the rolling 60-second window has capacity, the entry is used normally;
+- a fraction of the window (`server.provider_rate_limit_reserve_ratio`, default
+  `0.3`) is reserved for sessions already using the entry, so a request from a
+  **new** session may use at most `rate_limit_rpm - reserve` dispatches and then
+  skips the entry **immediately** — it is never parked waiting, so waiting
+  requests cannot compound the contention;
+- a session that was already served by the entry (affinity recorded on a 2xx
+  dispatch) may use the reserved slots and, if the window is still full, wait a
+  short bounded time for it to reset (`server.provider_rate_limit_wait_max_seconds`,
+  default 15 s), keeping the same upstream provider and its prompt cache/prefix
+  continuity. Waiting is capped in concurrency by
+  `server.provider_rate_limit_wait_max_waiters` and aborted as soon as the
+  client disconnects;
+- affinity expires after `server.provider_affinity_ttl_seconds`, so a session
+  returning much later counts as new again.
+
+```yaml
+      - name: some-free-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FREE_KEY
+        forward_session_headers: false
+        model: some-model
+        rate_limit_rpm: 10
+```
+
+Tuning knobs (all under `server:`): `provider_rate_limit_reserve_ratio` (share
+of the window reserved for in-progress sessions, default 0.3),
+`provider_rate_limit_wait_max_seconds` (default 15), 
+`provider_rate_limit_wait_max_waiters` (default 8) and
+`provider_affinity_ttl_seconds` (default 900).
+
+Skip decisions are logged as `Provider budget exhausted: skipping provider=…`
+(with limit, remaining and reason) and recorded in the request diagnostics as
+an attempt with `status=rate_limited`; an in-progress session that waited is
+recorded as `status=rate_limited_waited` with its `elapsed_wait_seconds`.
 
 ### Multiple local backends (LP-0MRPILSMW004T4H8)
 
@@ -233,6 +279,34 @@ You are a helpful and knowledgeable assistant. Your responses should be
 concise, accurate, and well-structured. When asked to write code, include
 comments and follow best practices.
 ```
+
+### Worked example: the `author` model (first live deployment)
+
+The production `proxy/config.yaml` wires the wiki authoring guidelines into the
+`author` model via a `system_prompt` block — this is the **first live use** of
+the feature:
+
+```yaml
+author:
+  providers:
+    # ... existing providers unchanged ...
+  system_prompt:
+    mode: "override"        # replaces any client-supplied system messages
+    file: "proxy/prompts/author.txt"
+```
+
+- The proxy auto-loads `proxy/prompts/author.txt` (the mandatory wiki
+authoring rules: openness terminology, citation, and "explain names on first
+mention") for every `model=author` request, so no client needs to paste the
+guidelines.
+- `override` was chosen because the authoring client sends no client-side system
+prompt — author.txt is intended as the complete system prompt for wiki
+authoring. If a client later sends its own system prompt it will be replaced.
+- Resolution precedence still applies: a per-deployment local override at
+`.sorraAgents/prompts/author.txt` (uncommitted) takes precedence over the
+committed default.
+- Wiring: LP-0MV5S5IMX0091DZ5; prompt content owner: LP-0MUYJHQ2W002I0CE
+(do not change author.txt content here).
 
 ## Alias resolution
 

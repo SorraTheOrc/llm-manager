@@ -25,12 +25,14 @@
           "type": "local"
         },
         {
-          "api_key_env": "MUNITOAI_API_KEY",
+          "api_key_env": "MUNITOAI_FREE_API_KEY",
+          "display_name": "MunitoAI Free",
           "endpoint": "https://api.munito.ai/inference",
           "forward_session_headers": false,
           "model": "deepseek-ai/deepseek-v4-flash",
-          "name": "munitoai",
+          "name": "munitoai-free",
           "provider": "MunitoAI",
+          "rate_limit_rpm": 10,
           "type": "remote"
         },
         {
@@ -61,6 +63,15 @@
           "type": "remote"
         },
         {
+          "api_key_env": "MUNITOAI_API_KEY",
+          "endpoint": "https://api.munito.ai/inference",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash",
+          "name": "munitoai",
+          "provider": "MunitoAI",
+          "type": "remote"
+        },
+        {
           "api_key_env": "DEEPSEEK_API_KEY",
           "endpoint": "https://api.deepseek.com",
           "model": "deepseek-flash",
@@ -69,6 +80,10 @@
           "type": "remote"
         }
       ],
+      "system_prompt": {
+        "file": "proxy/prompts/author.txt",
+        "mode": "override"
+      },
       "tokenizer": "qwen3"
     },
     "code": {
@@ -83,12 +98,14 @@
           "type": "local"
         },
         {
-          "api_key_env": "MUNITOAI_API_KEY",
+          "api_key_env": "MUNITOAI_FREE_API_KEY",
+          "display_name": "MunitoAI Free",
           "endpoint": "https://api.munito.ai/inference",
           "forward_session_headers": false,
           "model": "deepseek-ai/deepseek-v4-flash",
-          "name": "munitoai",
+          "name": "munitoai-free",
           "provider": "MunitoAI",
+          "rate_limit_rpm": 10,
           "type": "remote"
         },
         {
@@ -116,6 +133,15 @@
           "model": "deepseek-v4.1-flash",
           "name": "opencode-go",
           "provider": "opencode-go",
+          "type": "remote"
+        },
+        {
+          "api_key_env": "MUNITOAI_API_KEY",
+          "endpoint": "https://api.munito.ai/inference",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash",
+          "name": "munitoai",
+          "provider": "MunitoAI",
           "type": "remote"
         },
         {
@@ -189,12 +215,14 @@
           "type": "local"
         },
         {
-          "api_key_env": "MUNITOAI_API_KEY",
+          "api_key_env": "MUNITOAI_FREE_API_KEY",
+          "display_name": "MunitoAI Free",
           "endpoint": "https://api.munito.ai/inference",
           "forward_session_headers": false,
           "model": "deepseek-ai/deepseek-v4-flash",
-          "name": "munitoai",
+          "name": "munitoai-free",
           "provider": "MunitoAI",
+          "rate_limit_rpm": 10,
           "type": "remote"
         },
         {
@@ -222,6 +250,15 @@
           "model": "deepseek-v4.1-flash",
           "name": "opencode-go",
           "provider": "opencode-go",
+          "type": "remote"
+        },
+        {
+          "api_key_env": "MUNITOAI_API_KEY",
+          "endpoint": "https://api.munito.ai/inference",
+          "forward_session_headers": false,
+          "model": "deepseek-ai/deepseek-v4-flash",
+          "name": "munitoai",
+          "provider": "MunitoAI",
           "type": "remote"
         },
         {
@@ -266,8 +303,8 @@
     "chain_hold_total_seconds": 720,
     "compaction_dry_run": false,
     "compaction_trigger_ratio": 0,
-    "contention_queue_max_depth": 3,
-    "contention_queue_max_wait_seconds": 45,
+    "contention_queue_max_depth": 8,
+    "contention_queue_max_wait_seconds": 120,
     "contention_queue_policy": "queue",
     "embeddings_model": "mxbai-embed",
     "host": "0.0.0.0",
@@ -308,7 +345,7 @@
     "llama_start_script": "start-llama.sh",
     "llama_startup_timeout": 300,
     "llama_watchdog_interval_seconds": 5,
-    "local_dispatch_lease_timeout_seconds": 30,
+    "local_dispatch_lease_timeout_seconds": 15,
     "local_large_context_cold_cache_threshold": 38000,
     "local_large_context_economic_ceiling_ratio": 0.3815,
     "local_large_context_warm_cache_threshold": 100000,
@@ -327,8 +364,15 @@
     "mode_switch_grandfathering": {
       "enabled": true
     },
+    "mode_switch_lock": {
+      "enabled": false
+    },
     "port": 8000,
+    "provider_affinity_ttl_seconds": 900,
     "provider_cooldown_seconds": 60,
+    "provider_rate_limit_reserve_ratio": 0.3,
+    "provider_rate_limit_wait_max_seconds": 15,
+    "provider_rate_limit_wait_max_waiters": 8,
     "remote_http_client": {
       "connect_timeout_seconds": 30,
       "keepalive_seconds": 60,
@@ -354,7 +398,7 @@
     "session_slot_max_consecutive_failures": 3,
     "session_slot_max_prompt_tokens": 0,
     "session_slot_max_timeout_seconds": 60,
-    "session_slot_pool_size": 1,
+    "session_slot_pool_size": 2,
     "session_slot_save_path": "/home/rgardler/projects/llm/slot-cache",
     "session_slot_skip_when_busy": true,
     "session_slot_timeout_per_token_seconds": 0.0015,

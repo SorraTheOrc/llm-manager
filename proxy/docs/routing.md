@@ -71,6 +71,45 @@ For remote models (`proxy_to_remote()`):
 - Adds custom headers from config
 - Forwards the request via `httpx` (streaming for SSE responses)
 
+### Free-tier request budgets (`rate_limit_rpm`, LP-0MVDQ1GMO00801PL)
+
+Remote entries may declare `rate_limit_rpm`, a per-entry request budget for a
+rolling 60-second window. It is enforced by
+`proxy.provider_budget.acquire_provider_budget()` *before* dispatch in both
+fallback entry points (`_proxy_with_remote_fallback_cycle` and
+`_proxy_with_fallback`), on top of the cooldown / `available_times` /
+failure-domain gates (which only react *after* a failure).
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Window has capacity below the new-session cap | Entry is dispatched normally (slot reserved up front). |
+| Unreserved part spent — **new** session (no recorded affinity) | Skip immediately, log `Provider budget exhausted: … limit=<rpm-reserve> reserve=<n> reason=rate_limited`, record attempt `status=rate_limited` with `effective_limit`/`reserve_slots`, continue to the next provider. **No waiting.** |
+| Unreserved part spent, reserved slots free — **in-progress** session (affinity recorded on a 2xx dispatch) | Dispatch on the reserved slot: the reserve exists so established sessions keep their provider and prompt cache instead of queueing behind new traffic. |
+| Window completely full — **in-progress** session | Wait up to `server.provider_rate_limit_wait_max_seconds` (default **15**) for the window to drain, then dispatch on this entry (`status=rate_limited_waited`); if it never drains, pass through like a new session (`reason=rate_limited_after_wait`). |
+| Waiters already at `server.provider_rate_limit_wait_max_waiters` (default 8) | Pass through (`reason=rate_limited_waiters`) so waiters cannot pile up. |
+| Client disconnects during the wait | Wait aborts promptly (`reason=rate_limited_disconnect`). |
+| `rate_limit_rpm` unset or `0` | Ungated: behaviour exactly as before; no affinity recorded. |
+
+**Why the reserve exists (LP-0MVDUN5CY009VD20).** Affinity is recorded on the
+first successful dispatch, so *every* later turn of that session counts as
+"in-progress". Without a reserve, established sessions queued behind new-session
+traffic and waited 15–55 s per turn, which dominated first-token latency
+(p90 6.5 s → 12.8 s, p99 21 s → 53 s while generation speed was unchanged).
+Reserving `floor(rate_limit_rpm × provider_rate_limit_reserve_ratio)` slots
+(default 3 of 10) keeps a slot available for them, so waits become rare; the
+default 15 s cap bounds whatever remains.
+
+Affinity is `session → entry`, TTL-scoped by
+`server.provider_affinity_ttl_seconds` (default 900), and is **never** shared
+across sessions or between sibling entries (e.g. free `munitoai-free` vs paid
+`munitoai`). The point of the split behaviour is prompt-cache continuity: a
+session already on the free tier keeps its provider, while a batch of new
+agent sessions passes straight through instead of queueing behind an exhausted
+allowance.
+
+`munitoai-free` ships with `rate_limit_rpm: 10` in `config.yaml` (and the fast
+overlay); tune the value from the `remaining=` field in the skip logs.
+
 ### Responses-API providers (`api: openai-responses`)
 
 Some upstreams expose **only** the OpenAI Responses API (`/v1/responses`) and
@@ -256,6 +295,28 @@ LP-0MSDFKCK4007CPMY; see `proxy/docs/error-analysis-2026-08-03.md`):
 
 Emission sites and the single-helper enrichment point are documented in
 `proxy/docs/sse-error-emission-audit.md`.
+
+## Local cold-start immunity (LP-0MV9UNIOZ009RIAN)
+
+After a proxy restart, requests that race llama-server warm-up receive
+HTTP 503 (or connection errors) and previously entered the standard
+per-failure 60s provider cooldown — the dominant source of post-restart
+local quarantines (~12 of 45 cooldown episodes in one analysed 24h window).
+
+**Exemption, strictly scoped:** while the cold-start grace window is active
+(`cold_start.is_cold()` is True — the single immunity-boundary signal), a
+**local** HTTP 503 or connection error is **deferred** with the
+`local_cold_start_retry_after_seconds` Retry-After hint instead of being
+quarantined: no `provider_cooldown_seconds` cooldown is applied, the
+exponential-backoff failure counter is not bumped, and the next fallback/
+chain cycle can try local again immediately. The deferral is recorded as a
+`cold_start_deferral` attempt entry for observability.
+
+**Genuine faults are never masked:** any other 5xx during the window (e.g.
+500/502), and any HTTP 503 or connection error after the window expires,
+still quenches normally. The window is re-armed per restart by
+`cold_start.note_model_loaded()`; router-level concurrent-dispatch gating
+(`local_cold_start_max_concurrent`) is unchanged.
 
 ## Usage-limit reset quarantine (GoUsageLimitError)
 

@@ -901,3 +901,129 @@ async def test_proxy_to_remote_no_attribution_headers_by_default():
     header_keys_lower = {k.lower() for k in captured_headers.keys()}
     assert "http-referer" not in header_keys_lower, "HTTP-Referer should not be sent by default"
     assert "x-openrouter-title" not in header_keys_lower, "X-OpenRouter-Title should not be sent by default"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tier-aware display (LP-0MVCQ36QV009QX8K): free vs paid distinct in
+# X-Resolved-Model, display-only via config ``display_name``.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_build_resolved_model_value_uses_display_name():
+    """display_name wins over the provider brand for the display component."""
+    cfg = {
+        "name": "munitoai-free",
+        "type": "remote",
+        "provider": "MunitoAI",
+        "display_name": "MunitoAI Free",
+        "endpoint": "https://api.munito.ai/inference",
+        "api_key_env": "MUNITOAI_FREE_API_KEY",
+        "model": "deepseek-ai/deepseek-v4-flash",
+    }
+    assert provider._build_resolved_model_value(cfg) == \
+        "MunitoAI Free/deepseek-ai/deepseek-v4-flash", \
+        "free-tier entry must resolve to a tier-carrying display string"
+
+
+def test_build_resolved_model_value_free_and_paid_are_distinct():
+    """Free and paid MunitoAI tiers yield distinct X-Resolved-Model strings.
+
+    AC2: free and paid are no longer byte-identical when the free entry
+    carries a display_name while the paid entry keeps the brand label.
+    """
+    free_cfg = {
+        "name": "munitoai-free",
+        "type": "remote",
+        "provider": "MunitoAI",
+        "display_name": "MunitoAI Free",
+        "model": "deepseek-ai/deepseek-v4-flash",
+    }
+    paid_cfg = {
+        "name": "munitoai",
+        "type": "remote",
+        "provider": "MunitoAI",
+        "model": "deepseek-ai/deepseek-v4-flash",
+    }
+    free_value = provider._build_resolved_model_value(free_cfg)
+    paid_value = provider._build_resolved_model_value(paid_cfg)
+    assert free_value == "MunitoAI Free/deepseek-ai/deepseek-v4-flash"
+    assert paid_value == "MunitoAI/deepseek-ai/deepseek-v4-flash"
+    assert "Free" in free_value, "free tier must be human-readable as free"
+    assert free_value != paid_value, "free and paid must no longer be identical"
+
+
+def test_resolve_display_provider_name_priority():
+    """Shared helper resolves display_name -> provider -> name (AC3)."""
+    assert provider._resolve_display_provider_name(
+        {"display_name": "D", "provider": "P", "name": "N"}) == "D"
+    assert provider._resolve_display_provider_name({"provider": "P", "name": "N"}) == "P"
+    assert provider._resolve_display_provider_name({"name": "N"}) == "N"
+    assert provider._resolve_display_provider_name({}) is None
+
+
+def test_build_resolved_model_value_local_unchanged():
+    """Local providers still resolve to local/<model> (AC6c)."""
+    cfg = {
+        "name": "local-qwen3",
+        "type": "local",
+        "llama_model": "Qwen3",
+    }
+    assert provider._build_resolved_model_value(cfg) == "local-qwen3/Qwen3"
+    # Adding a display_name to a local entry only changes the display, never
+    # the model-id component.
+    cfg_with_display = {**cfg, "display_name": "Local Qwen3"}
+    assert provider._build_resolved_model_value(cfg_with_display) == "Local Qwen3/Qwen3"
+
+
+def test_display_name_does_not_affect_failure_domain_or_cooldown_keys():
+    """The tier display field must not leak into failure-domain, cooldown, or
+    usage-limit quarantine keys (AC4): the change is display-only."""
+    cfg = {
+        "name": "munitoai-free",
+        "type": "remote",
+        "provider": "MunitoAI",
+        "display_name": "MunitoAI Free",
+        "endpoint": "https://api.munito.ai/inference",
+        "api_key_env": "MUNITOAI_FREE_API_KEY",
+        "model": "deepseek-ai/deepseek-v4-flash",
+    }
+    cfg_without_display = {k: v for k, v in cfg.items() if k != "display_name"}
+    assert provider._failure_domain_key(cfg) == provider._failure_domain_key(cfg_without_display)
+    assert provider._usage_limit_account_key(cfg) == provider._usage_limit_account_key(cfg_without_display)
+    assert provider._entry_cooldown_key(cfg) == provider._entry_cooldown_key(cfg_without_display)
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_streaming_uses_display_name(mock_request):
+    """proxy_to_remote streaming reports the tier-carrying display string."""
+    provider_cfg = {
+        "name": "munitoai-free",
+        "type": "remote",
+        "provider": "MunitoAI",
+        "display_name": "MunitoAI Free",
+        "endpoint": "https://api.munito.ai/inference",
+        "model": "deepseek-ai/deepseek-v4-flash",
+    }
+
+    sse_chunk = b'data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}\n\ndata: [DONE]\n\n'
+    mock_resp = _make_mock_remote_response(status_code=200, body=sse_chunk)
+    mock_client_cls = _make_mock_client(mock_resp)
+
+    mock_request.body = AsyncMock(return_value=b'{"model":"deepseek-ai/deepseek-v4-flash","stream":true}')
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", mock_client_cls):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        result = await proxy_to_remote(
+                            request=mock_request,
+                            path="v1/chat/completions",
+                            model_config=provider_cfg,
+                        )
+
+    assert isinstance(result, StreamingResponse), f"Expected StreamingResponse, got {type(result).__name__}"
+    headers = dict(result.headers)
+    assert "x-resolved-model" in headers, "X-Resolved-Model header missing"
+    assert headers["x-resolved-model"] == "MunitoAI Free/deepseek-ai/deepseek-v4-flash", \
+        f"Expected tier-carrying header, got {headers['x-resolved-model']}"

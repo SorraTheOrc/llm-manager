@@ -202,7 +202,7 @@
         }
         .slot-section-header:hover { background:rgba(79,140,255,0.12); }
         .slot-id { font-weight:600; color:var(--accent); }
-        .slot-session { font-size:0.8rem; color:var(--text-secondary); font-family:monospace; }
+        .slot-session { font-size:0.8rem; color:var(--text-secondary); font-family:monospace; min-width:0; overflow-wrap:anywhere; }
         .slot-expand-hint { margin-left:auto; font-size:0.72rem; color:var(--text-secondary); }
         .slot-autoscroll-label {
             display:flex; align-items:center; gap:0.25rem;
@@ -1046,10 +1046,6 @@
       return { cls: 'idle', label: 'Idle' };
     }
 
-    function shortSession(sessionId) {
-      return sessionId.length > 24 ? sessionId.substring(0, 8) + '…' : sessionId;
-    }
-
     function findSlotSection(slotId) {
       return document.querySelector('.slot-section[data-slot-id="' + slotId + '"]');
     }
@@ -1064,7 +1060,7 @@
         '<div class="slot-section-header" title="Click to expand/collapse">' +
           '<span class="slot-id">Slot ' + slot.slot_id + '</span>' +
           (sessionId
-            ? '<span class="slot-session" title="' + escapeHtml(sessionId) + '">' + escapeHtml(shortSession(sessionId)) + '</span>'
+            ? '<span class="slot-session" title="' + escapeHtml(sessionId) + '">' + escapeHtml(sessionId) + '</span>'
             : '<span class="slot-session muted">no session yet</span>') +
           '<span class="slot-status-badge ' + st.cls + '">' + st.label + '</span>' +
           '<span class="slot-expand-hint">expand</span>' +
@@ -1190,7 +1186,7 @@
       if (badge) { badge.className = 'slot-status-badge ' + st.cls; badge.textContent = st.label; }
       const sess = sec.querySelector('.slot-session');
       if (sess) {
-        sess.textContent = sessionId ? shortSession(sessionId) : 'no session yet';
+        sess.textContent = sessionId ? sessionId : 'no session yet';
         if (sessionId) sess.title = sessionId;
       }
       refreshSlotEmptyHint(sec, slot);

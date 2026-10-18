@@ -122,6 +122,26 @@ ROUTING_SKIP_LARGE_CONTEXT = (
     "provider session=aaaaaaaa-1111-2222-3333-444444444444"
 )
 
+# Chain-hold cycle variants (LP-0MU5AIAAY003KVM0 / LP-0MUIEO6IP0030CT3): the
+# proxy stamps ``chain_hold_cycle=<N>`` on ``routing_skip_local`` lines; cycle
+# 0 is the first (pre-hold) cycle and every hold-restart increments it. A held
+# request therefore re-emits its skip once per cycle (up to
+# ``chain_hold_max_cycles``) and must be distinguishable from genuine new
+# client demand downstream.
+ROUTING_SKIP_CHAIN_HOLD_CYCLE_0 = (
+    "2026-08-02 14:02:20,157 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+    "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+    "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+    "provider session=019fc27d-3a46-7e5c-871e-57ab32f875f3 chain_hold_cycle=0"
+)
+
+ROUTING_SKIP_CHAIN_HOLD_CYCLE_2 = (
+    "2026-08-02 14:02:20,157 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+    "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+    "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+    "provider session=019fc27d-3a46-7e5c-871e-57ab32f875f3 chain_hold_cycle=2"
+)
+
 # --- local_dispatch_denied --------------------------------------------------
 
 DISPATCH_DENIED = (
@@ -496,6 +516,36 @@ RESTART_COMPLETE_LINE = _restart_complete("2026-09-25 17:28:05,000")
 RESTART_SERVICES_OTHER_LINE = (
     "2026-09-25 17:27:58,100 - INFO - restart_services: restarting llama-server "
     "with 2 slots (reason=mode-switch)"
+)
+
+# --- Restart / mode-switch attribution markers (LP-0MVC0S6U5003SEDJ) --------
+#
+# LP-0MVAPNC2900145RH appended attribution markers to the restart and
+# mode-switch log paths (exact formats from proxy/proxy/mode.py and
+# proxy/proxy/server.py):
+#   - spawned: "Mode-switch restart spawned: <script> --restart source=.. actor=.. mode=.. reason=.."
+#     (markers present only when set_mode() captured attribution)
+#   - scheduler: "Mode scheduler: applied scheduled mode <mode> source=scheduler actor=mode-scheduler"
+#   - startup: "Proxy restart attribution: source=.. actor=.. reason=.."
+#     (echoed by the restarted process just before the ``Starting LLama Proxy
+#     Server`` marker; the CLI/env/default reason resolution happens in
+#     start-proxy.sh --restart)
+RESTART_SPAWNED_ATTRIBUTED = (
+    "2026-10-18 05:00:00,000 - INFO - Mode-switch restart spawned: "
+    f"{RESTART_SCRIPT} source=scheduler actor=mode-scheduler mode=cheap "
+    "reason=scheduled mode change"
+)
+MODE_SWITCH_ATTRIBUTED = (
+    "2026-10-18 05:00:00,010 - INFO - Mode scheduler: applied scheduled mode "
+    "cheap source=scheduler actor=mode-scheduler"
+)
+RESTART_COMPLETE_ATTRIBUTED = (
+    "2026-10-18 05:00:10,000 - INFO - restart_services: router-mode restart "
+    "complete (2 slots) source=api actor=herdr reason=maintenance window"
+)
+STARTUP_ATTRIBUTION_LINE = (
+    "2026-10-18 05:00:01,500 - INFO - Proxy restart attribution: source=api "
+    "actor=herdr reason=manual (no reason provided)"
 )
 
 # Real window: 2026-09-25 05:00 -> 2026-09-26 05:00 (archive

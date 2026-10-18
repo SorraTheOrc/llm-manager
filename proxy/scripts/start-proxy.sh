@@ -2,17 +2,24 @@
 set -euo pipefail
 
 # Start the proxy application
-# Usage: ./scripts/start-proxy.sh [--restart] [--verbose] [uvicorn-args...]
+# Usage: ./scripts/start-proxy.sh [--restart] [--reason "<text>"] [--verbose] [uvicorn-args...]
 #
 # Flags:
 #   --restart   Kill all running proxy/llama-server/TTS processes before starting
+#   --reason    Restart reason echoed into the new process's startup log
+#               (LP-0MVAPNC2900145RH; flag > LLAMA_PROXY_RESTART_REASON >
+#               `manual (no reason provided)`).
 #   --keep-llama-server
 #               Proxy-only restart: preserve the co-located llama-server so its
 #               warm KV / prompt cache survives (LP-0MUCEFCL6001ZXYN). With
 #               --restart and no explicit flag, llama-server is preserved
 #               automatically when its recorded signature matches the selected
-#               config (same mode + config hash); it is restarted when the
-#               model or parallel config actually changes.
+#               config (same mode + merged-config hash, base + overlay); it is
+#               restarted when the effective local-backend config actually
+#               changes. The signature hashes the MERGED config via the shared
+#               merged_config_sha256 helper (LP-0MUJRVYQH002IEHW); pre-upgrade
+#               raw-file-hash signatures mismatch once and conservatively
+#               restart llama-server.
 #   --verbose   Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO level)
 #
 # Automatically resolves required API keys from:
@@ -57,10 +64,15 @@ PORT="${PROXY_PORT:-${PORT:-8000}}"
 RESTART=0
 VERBOSE=0
 KEEP_LLAMA_SERVER=0
+RESTART_REASON=""
 UVICORN_ARGS=()
 prev=""
 for arg in "$@"; do
-  if [ "$prev" = "--port" ] || [ "$prev" = "-p" ]; then
+  if [ "$prev" = "--reason" ]; then
+    # --reason <text>: consumed here, never forwarded to uvicorn
+    RESTART_REASON="$arg"
+    prev=""
+  elif [ "$prev" = "--port" ] || [ "$prev" = "-p" ]; then
     PORT="$arg"
     UVICORN_ARGS+=("--port" "$arg")
     prev=""
@@ -78,6 +90,12 @@ for arg in "$@"; do
         ;;
       --restart)
         RESTART=1
+        ;;
+      --reason)
+        prev="--reason"
+        ;;
+      --reason=*)
+        RESTART_REASON="${arg#*=}"
         ;;
       --keep-llama-server)
         # LP-0MUCEFCL6001ZXYN: proxy-only restart — preserve the co-located
@@ -155,7 +173,14 @@ _wait_for_port_release() {
 
 # --restart: kill all running proxy-related processes before starting
 if [ "$RESTART" -eq 1 ]; then
+  # LP-0MVAPNC2900145RH: resolve the restart reason (--reason flag beats
+  # LLAMA_PROXY_RESTART_REASON env, which beats the default) and export it so
+  # the new server process can echo it into its startup log right before the
+  # `Starting LLama Proxy Server` marker.
+  RESTART_REASON="${RESTART_REASON:-${LLAMA_PROXY_RESTART_REASON:-manual (no reason provided)}}"
+  export LLAMA_PROXY_RESTART_REASON="$RESTART_REASON"
   echo "Restart requested: stopping running proxy services..."
+  echo "Restart reason: $RESTART_REASON"
 
   # LP-0MUCEFCL6001ZXYN: decide whether to preserve the co-located
   # llama-server. A proxy-only restart (unchanged local backend config) must
@@ -173,10 +198,18 @@ if [ "$RESTART" -eq 1 ]; then
     fi
     _restart_cfg="$REPO_ROOT/config-$_restart_mode.yaml"
     [ -f "$_restart_cfg" ] || _restart_cfg="$REPO_ROOT/config.yaml"
-    _restart_sha=""
-    if command -v sha256sum >/dev/null 2>&1 && [ -f "$_restart_cfg" ]; then
-      _restart_sha="$(sha256sum "$_restart_cfg" | cut -d' ' -f1)"
-    fi
+    # LP-0MUJRVYQH002IEHW: hash the MERGED config (base + overlay) via the
+    # shared canonical helper — NOT the raw overlay file — so a base-only
+    # local-backend change (e.g. local_model_ctx_size, llama_server_port)
+    # also changes the signature and forces a llama-server restart. When the
+    # overlay file is absent the base is hashed merged with itself. An empty
+    # hash (Python unavailable / helper failure) means "do not preserve".
+    _restart_sha="$("$PY_BIN" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/proxy')
+from config_merge import merged_config_sha256
+print(merged_config_sha256('$REPO_ROOT/config.yaml', '$_restart_cfg'))
+" 2>/dev/null || true)"
     _sig_file="$REPO_ROOT/.llama_server_signature.json"
     if [ -f "$_sig_file" ] && [ -n "$_restart_sha" ]; then
       _sig_mode="$("$PY_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('mode',''))" "$_sig_file" 2>/dev/null || true)"
@@ -356,43 +389,29 @@ for k in sorted(keys):
 }
 
 # Map api_key_env name to auth.json key.
-# Prefers opencode-go over opencode when resolving OPENCODE_API_KEY.
+# Prefers opencode-go over opencode when resolving OPENCODE_API_KEY, and
+# falls back to the hyphenated stem (e.g. ``munitoai-free`` for
+# ``MUNITOAI_FREE_API_KEY``) so documented auth.json names resolve on a
+# fresh start (LP-0MVBJPQE50017BGL). Logic lives in proxy/proxy/api_key_resolver.py.
 resolve_from_auth_json() {
   local env_var="$1"
 
-  $PY_BIN -c "
-import json, sys
+  "$PY_BIN" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/proxy')
+from api_key_resolver import load_auth, resolve_from_auth_json
 
-key_name = '$env_var'
+import json
 
 try:
-    with open('$AUTH_FILE') as f:
-        auth = json.load(f)
+    auth = load_auth('$AUTH_FILE')
 except (FileNotFoundError, json.JSONDecodeError):
     sys.exit(1)
 
-# Lowercase key for lookup
-key = key_name.lower()
-
-# Prefer opencode-go over opencode for OPENCODE_API_KEY
-if key == 'opencode_api_key':
-    for preferred in ('opencode-go', 'opencode'):
-        if preferred in auth and auth[preferred].get('type') == 'api_key':
-            print(auth[preferred]['key'])
-            sys.exit(0)
-
-# Exact lowercase match
-if key in auth and auth[key].get('type') == 'api_key':
-    print(auth[key]['key'])
+resolved = resolve_from_auth_json(auth, '$env_var')
+if resolved:
+    print(resolved)
     sys.exit(0)
-
-# Strip _API_KEY suffix
-if key.endswith('_api_key'):
-    stem = key[:-8]
-    if stem in auth and auth[stem].get('type') == 'api_key':
-        print(auth[stem]['key'])
-        sys.exit(0)
-
 sys.exit(1)
 "
 }

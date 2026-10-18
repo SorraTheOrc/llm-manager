@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.1.22 (2026-10-18)
+### Features
+- Make X-Resolved-Model tier-aware so free MunitoAI is distinguishable from paid in Pi (LP-0MVCQ36QV009QX8K)
+- Implement grace-period immunity: local cold-start 503s must not trigger a 60s local cooldown (LP-0MV9UNIOZ009RIAN)
+- Do not over-use MinutoAI-free (LP-0MVDQ1GMO00801PL)
+- Reserve free-tier request budget for in-progress sessions, cap the wait at 15s (LP-0MVDUN5CY009VD20)
+- Add mode-switch lock switch: reject fast<->cheap changes during performance investigations (LP-0MVCBMLP7009MN81)
+- Fix accidentally committed broken proxy/node_modules symlink (LP-0MV81ZIL8008RS9J)
+- Don't truncate session ID in the log (LP-0MV6CZGN6003Z5QI)
+- Log the requesting actor and reason for every proxy mode-switch / --restart so restarts are always attributable (LP-0MVAPNC2900145RH)
+### Bug Fixes
+- Paid MunitoAI tier is skipped for the rest of a request when the free tier hits a per-account 429 (shared failure domain) (LP-0MVCX0E2V001VB5N)
+- start-proxy.sh auth.json key lookup does not match the documented munitoai-free name (LP-0MVBJXZY5002UW10)
+- Restart signature should hash the merged config (base + overlay) (LP-0MUJRVYQH002IEHW)
+- llama-server adoption should also compare the merged-config signature (LP-0MUPIIDPW009RMLB)
+### Other
+- Examine proxy restart frequency: is ~24-34 restarts/day normal and what causes them? (LP-0MV9UNKVK007TN7E)
+- Refactor: Remove unused `config` local (F841) in proxy/tests/test_cold_start_immunity.py (LP-0MVB0THT7000KT0G)
+- Investigate fast<->cheap proxy mode-flip frequency and how to reduce it (ContextHub trigger focus) (LP-0MV9UNE75004903J)
+- Fix the proxy: large-context sessions stall and time out instead of progressing (LP-0MU1S617L002Q9PR)
+- Fix pre-existing ruff findings blocking audit gate (LP-0MVDLX85D0073EHD)
+- Quality Improvement - Refactoring (LP-0MVDLKQ1M008YIGZ)
+- Evaluate performance impact of equalising fast/cheap slot counts (3/2/1); if not viable implement a drain (LP-0MV9UNGEB009XUZ5)
+- When a request cannot be processed because there are no available models include a retry timer (LP-0MU3VDB9U008H8CI)
+- Ensure that the proxy-useage-analysis is scripted as much as possible (LP-0MTY7CCQP002DOZ5)
+- Wire proxy/prompts/author.txt into the author model system_prompt config (LP-0MV5S5IMX0091DZ5)
+- proxy-usage-analysis: exclude chain_hold_cycle>0 re-emissions from local_skip/demand counters (LP-0MUIEO6IP0030CT3)
+- Raise Qwen3 cache-ram to 40,960 MiB (LP-0MV5HSUHF002MDPG)
+- ruff I001 in /home/rgardler/projects/llm/proxy/tests/test_startup_ramp.py — candidate false positive — producer decision required (LP-0MUHVMLGB0056C0K)
+- Bound/characterise the in-flight lease hold for accepted-but-never-progressed local requests (LP-0MUXYXZQB002S391)
+- prompt_cache_analysis.py: reproducible post-deploy corpus selection (multi-pattern --glob) (LP-0MUQOQ5C80060SH6)
+
 ## v0.1.21 (2026-10-13)
 ### Features
 - Extend prompt_cache_analysis.py with throughput + client-visible first-byte latency (AC6) (LP-0MUYFBVHX004Z0UE)
