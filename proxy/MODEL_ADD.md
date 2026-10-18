@@ -135,7 +135,7 @@ capacity-aware:
         api_key_env: SOME_FREE_KEY
         forward_session_headers: false
         model: some-model
-        rate_limit_rpm: 10
+        rate_limit_rpm: 15
 ```
 
 Tuning knobs (all under `server:`): `provider_rate_limit_reserve_ratio` (share

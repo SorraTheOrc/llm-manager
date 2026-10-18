@@ -66,7 +66,7 @@ models:
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        rate_limit_rpm: 10
+        rate_limit_rpm: 15
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -130,7 +130,7 @@ models:
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        rate_limit_rpm: 10
+        rate_limit_rpm: 15
       - name: opencode-go-3
         type: remote
         provider: opencode-go
@@ -195,7 +195,7 @@ models:
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        rate_limit_rpm: 10
+        rate_limit_rpm: 15
       - name: opencode-go-3
         type: remote
         provider: opencode-go

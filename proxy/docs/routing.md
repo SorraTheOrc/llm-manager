@@ -96,7 +96,7 @@ first successful dispatch, so *every* later turn of that session counts as
 traffic and waited 15–55 s per turn, which dominated first-token latency
 (p90 6.5 s → 12.8 s, p99 21 s → 53 s while generation speed was unchanged).
 Reserving `floor(rate_limit_rpm × provider_rate_limit_reserve_ratio)` slots
-(default 3 of 10) keeps a slot available for them, so waits become rare; the
+(default 4 of 15) keeps a slot available for them, so waits become rare; the
 default 15 s cap bounds whatever remains.
 
 Affinity is `session → entry`, TTL-scoped by
@@ -107,8 +107,17 @@ session already on the free tier keeps its provider, while a batch of new
 agent sessions passes straight through instead of queueing behind an exhausted
 allowance.
 
-`munitoai-free` ships with `rate_limit_rpm: 10` in `config.yaml` (and the fast
+`munitoai-free` ships with `rate_limit_rpm: 15` in `config.yaml` (and the fast
 overlay); tune the value from the `remaining=` field in the skip logs.
+
+**Value history (LP-0MVDVJYN5001BMG4):** raised from 10 to 15 on 2026-10-18
+following the measured budget evaluation. Pre-gate proxy-log evidence showed
+the upstream 429 onset at ≈20 dispatches/rolling-60 s (429-minute rate: 4–6 %
+≤ 19/min, 20 % at 20–29, 47 % at 30–39, 100 % ≥ 40), so 15 sits below the
+knee while recovering roughly a quarter of the paid spill observed at 10
+(45 % → 27 %). Observation window: begins at the next proxy restart after the
+change; a follow-up check-in (24 h later) monitors the upstream 429 rate at
+peak and reverts to 10 if it exceeds ~10 % of minutes.
 
 ### Responses-API providers (`api: openai-responses`)
 

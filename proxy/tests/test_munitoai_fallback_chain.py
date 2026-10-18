@@ -37,7 +37,7 @@ MUNITOAI_FREE_ENTRY = {
     "model": "deepseek-ai/deepseek-v4-flash",
     # Free-tier request budget (LP-0MVDQ1GMO00801PL): a small per-60s window,
     # so the tier is only used while it has capacity.
-    "rate_limit_rpm": 10,
+    "rate_limit_rpm": 15,
 }
 
 #: The exact (paid) munitoai entry that must sit directly before deepseek-flash.
