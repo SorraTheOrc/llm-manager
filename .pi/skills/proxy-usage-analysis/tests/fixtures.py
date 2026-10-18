@@ -518,6 +518,36 @@ RESTART_SERVICES_OTHER_LINE = (
     "with 2 slots (reason=mode-switch)"
 )
 
+# --- Restart / mode-switch attribution markers (LP-0MVC0S6U5003SEDJ) --------
+#
+# LP-0MVAPNC2900145RH appended attribution markers to the restart and
+# mode-switch log paths (exact formats from proxy/proxy/mode.py and
+# proxy/proxy/server.py):
+#   - spawned: "Mode-switch restart spawned: <script> --restart source=.. actor=.. mode=.. reason=.."
+#     (markers present only when set_mode() captured attribution)
+#   - scheduler: "Mode scheduler: applied scheduled mode <mode> source=scheduler actor=mode-scheduler"
+#   - startup: "Proxy restart attribution: source=.. actor=.. reason=.."
+#     (echoed by the restarted process just before the ``Starting LLama Proxy
+#     Server`` marker; the CLI/env/default reason resolution happens in
+#     start-proxy.sh --restart)
+RESTART_SPAWNED_ATTRIBUTED = (
+    "2026-10-18 05:00:00,000 - INFO - Mode-switch restart spawned: "
+    f"{RESTART_SCRIPT} source=scheduler actor=mode-scheduler mode=cheap "
+    "reason=scheduled mode change"
+)
+MODE_SWITCH_ATTRIBUTED = (
+    "2026-10-18 05:00:00,010 - INFO - Mode scheduler: applied scheduled mode "
+    "cheap source=scheduler actor=mode-scheduler"
+)
+RESTART_COMPLETE_ATTRIBUTED = (
+    "2026-10-18 05:00:10,000 - INFO - restart_services: router-mode restart "
+    "complete (2 slots) source=api actor=herdr reason=maintenance window"
+)
+STARTUP_ATTRIBUTION_LINE = (
+    "2026-10-18 05:00:01,500 - INFO - Proxy restart attribution: source=api "
+    "actor=herdr reason=manual (no reason provided)"
+)
+
 # Real window: 2026-09-25 05:00 -> 2026-09-26 05:00 (archive
 # ~/proxy-usage-reports/2026-09-27/). ``stream_finish_error`` split =
 # opencode-go stall_after_content 24, local/Qwen3 stream_exception 6,

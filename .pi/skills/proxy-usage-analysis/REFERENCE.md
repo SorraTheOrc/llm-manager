@@ -197,9 +197,16 @@ entry is a local runtime edit, not a committed artifact.
    None, LP-0MTHCTLAF00147IT), plus the operating-mode lines (`Mode
    scheduler: applied scheduled mode fast|cheap`; manual switches, which
    log `Grandfathering: enabled; other-mode config ...
-   (current=fast|cheap)`, LP-0MT1EE315007AKXG) and the error lines (`Stream
+   (current=fast|cheap)`, LP-0MT1EE315007AKXG), and the error lines (`Stream
    error:`, `slot_save failed`, `backend_retry`, `[remote] upstream error`).
-   A `chain_hold_cycle=<N>` token on a `routing_skip_local` line is parsed
+   Restart markers (`Mode-switch restart spawned:`, `restart_services:
+   router-mode restart complete`) and the startup attribution line
+   (`Proxy restart attribution:`) are parsed into `restart` events
+   (LP-0MUQO82LJ008F1FS, LP-0MVC0S6U5003SEDJ). Attribution markers
+   (`source=`, `actor=`, `reason=`) appended by LP-0MVAPNC2900145RH to
+   restart/mode-switch/startup lines are extracted into structured
+   fields; absent markers degrade gracefully to `None`. A
+   `chain_hold_cycle=<N>` token on a `routing_skip_local` line is parsed
    into the event's `chain_hold_cycle` field (LP-0MU5AIAAY003KVM0); lines
    without the token (pre-chain-hold rotated logs) parse with
    `chain_hold_cycle=None`, which aggregates as cycle 0 (genuine demand).
@@ -422,8 +429,9 @@ entry is a local runtime edit, not a committed artifact.
 
   Every `stream_finish_error` / `stream_error` event is classified with a
   deterministic `root_cause` from log fields plus restart correlation (a
-  documented ±120s window around a `Mode-switch restart spawned:` /
-  `router-mode restart complete` marker or a mode-switch line):
+  documented ±120s window around any restart marker: `Mode-switch restart
+  spawned:`, `Proxy restart attribution:` (startup attribution, LP-0MVC0S6U5003SEDJ),
+  `restart_services: router-mode restart complete`, or a mode-switch line):
 
   1. **`upstream_stall_after_content`** — the enriched `error_type` is
      `stall_after_content`: the upstream stalled *after* content was delivered,

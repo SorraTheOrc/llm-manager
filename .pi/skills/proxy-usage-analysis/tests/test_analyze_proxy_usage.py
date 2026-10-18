@@ -575,6 +575,152 @@ class TestErrorLineParsing:
         assert from_gz[0].src_file == "proxy.log.2026-08-03_13.gz"
 
 
+class TestAttributionMarkers:
+    """Parsing of the actor/source/reason attribution markers added by
+    LP-0MVAPNC2900145RH (LP-0MVC0S6U5003SEDJ).
+
+    The markers ride on the restart/mode-switch/startup log paths; absent
+    markers (historical logs) must degrade gracefully to the pre-attribution
+    behaviour (new fields stay ``None``).
+    """
+
+    def test_spawned_restart_with_attribution(self):
+        """A mode-switch restart spawned line carrying the attribution captured
+        at set_mode() time populates source/actor/reason."""
+        ev = log_parser.parse_log_line(fixtures.RESTART_SPAWNED_ATTRIBUTED)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "spawned"
+        assert ev.source == "scheduler"
+        assert ev.actor == "mode-scheduler"
+        assert ev.reason == "scheduled mode change"
+
+    def test_spawned_restart_without_attribution_preserves_old_behaviour(self):
+        """Historical spawned lines carry no markers: new fields stay None and
+        the raw line is still retained (backward compatible)."""
+        ev = log_parser.parse_log_line(fixtures.RESTART_SPAWNED_LINE)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "spawned"
+        assert ev.source is None
+        assert ev.actor is None
+        assert ev.reason is None
+        assert ev.raw and "Mode-switch restart spawned" in ev.raw
+
+    def test_spawned_restart_missing_individual_keys(self):
+        """Only a subset of the attribution keys present: the others stay None
+        (never fatal)."""
+        line = (
+            "2026-10-18 05:00:00,000 - INFO - Mode-switch restart spawned: "
+            f"{fixtures.RESTART_SCRIPT} source=manual"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.source == "manual"
+        assert ev.actor is None
+        assert ev.reason is None
+
+    def test_router_mode_restart_complete_with_attribution(self):
+        """Tolerant: markers on the restart-complete line are extracted too
+        (the proxy does not emit them today; future-proof and never fatal)."""
+        ev = log_parser.parse_log_line(fixtures.RESTART_COMPLETE_ATTRIBUTED)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "complete"
+        assert ev.source == "api"
+        assert ev.actor == "herdr"
+        assert ev.reason == "maintenance window"
+
+    def test_router_mode_restart_complete_without_attribution(self):
+        ev = log_parser.parse_log_line(fixtures.RESTART_COMPLETE_LINE)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "complete"
+        assert ev.source is None
+        assert ev.actor is None
+        assert ev.reason is None
+
+    def test_mode_switch_line_with_attribution(self):
+        """The scheduler logstamped its applied-mode line with
+        source=scheduler actor=mode-scheduler."""
+        ev = log_parser.parse_log_line(fixtures.MODE_SWITCH_ATTRIBUTED)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.source == "scheduler"
+        assert ev.actor == "mode-scheduler"
+
+    def test_mode_switch_line_without_attribution(self):
+        """Historical applied-mode lines carry no markers: fields stay None."""
+        ev = log_parser.parse_log_line(fixtures.MODE_SWITCH_CHEAP)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.source is None
+        assert ev.actor is None
+        assert ev.reason is None
+
+    def test_grandfathering_line_without_attribution(self):
+        """Grandfathering lines do not carry markers today; fields stay None."""
+        ev = log_parser.parse_log_line(fixtures.MANUAL_MODE_SWITCH_GRANDFATHERING_CHEAP)
+        assert ev is not None
+        assert ev.kind == "mode_switch"
+        assert ev.mode == "cheap"
+        assert ev.source is None
+        assert ev.actor is None
+        assert ev.reason is None
+
+    def test_startup_attribution_line(self):
+        """start-proxy.sh --restart reasons are echoed into the new process
+        startup log before the ``Starting LLama Proxy Server`` marker; parsed
+        as a ``restart`` startup event carrying the definitive attribution."""
+        ev = log_parser.parse_log_line(fixtures.STARTUP_ATTRIBUTION_LINE)
+        assert ev is not None
+        assert ev.kind == "restart"
+        assert ev.restart_kind == "startup"
+        assert ev.source == "api"
+        assert ev.actor == "herdr"
+        assert ev.reason == "manual (no reason provided)"
+        assert ev.ts == datetime(2026, 10, 18, 5, 0, 1, 500000)
+
+    def test_startup_attribution_line_is_a_restart_signal(self):
+        """The startup line widens the restart-signal set: a local stream error
+        adjacent to it is classified as a restart kill."""
+        local = (
+            "2026-10-18 05:00:02,000 - WARNING - Stream error: "
+            "session=019fc754-d847-75af-86ea-991480e799d0 provider=local "
+            "model=Qwen3 error=RemoteProtocolError"
+        )
+        window_start = datetime(2026, 10, 18, 5, 0, 0)
+        window_end = datetime(2026, 10, 18, 5, 1, 0)
+        events = [
+            e
+            for e in (
+                log_parser.parse_log_line(fixtures.STARTUP_ATTRIBUTION_LINE),
+                log_parser.parse_log_line(local),
+            )
+            if e is not None
+        ]
+        res = aggregation.aggregate(events, window_start, window_end, _schedule())
+        (ev,) = res.error_events
+        assert ev.root_cause == "mode_switch_restart"
+
+    def test_attribution_extractors_tolerate_arbitrary_lines(self):
+        """The tolerant extractors pull source=/actor=/reason= out of arbitrary
+        log lines, stopping the reason at the next known key (or line end) so
+        space-containing reasons survive."""
+        assert log_parser._attribution_from(
+            "routing_check reason=context_too_large source=scheduler session=abc"
+        ) == ("scheduler", None, "context_too_large")
+        assert log_parser._attribution_from(
+            "some line actor=herdr reason=rebalanced after maintenance window end"
+        ) == (None, "herdr", "rebalanced after maintenance window end")
+        assert log_parser._attribution_from(
+            "unattributed historical line"
+        ) == (None, None, None)
+
+
 class TestDiscoverLogFiles:
     """Discovery of proxy log files for an analysis window.
 
