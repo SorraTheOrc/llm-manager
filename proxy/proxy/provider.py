@@ -40,7 +40,7 @@ import httpx
 from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from proxy import cold_start
+from proxy import cold_start, quota_pacing, quota_state
 from proxy.priority import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
@@ -2135,12 +2135,167 @@ def _record_provider_context_skip(
 
 
 # ---------------------------------------------------------------------------
+# Headroom-aware quota ordering (LP-0MVF7KIKE002DZVD)
+# ---------------------------------------------------------------------------
+
+
+def _quota_ordering_active(config: dict | None) -> bool:
+    """Whether headroom-aware ordering may re-order the provider chain.
+
+    The single predicate guarding the whole quota-ordering feature
+    (LP-0MVF7KIKE002DZVD): whenever it returns ``False`` every resolution path
+    behaves exactly as it did before the feature existed. Ordering is active
+    only while the quota-surge feature is enabled *and* not in dry-run.
+    Dry-run still computes and logs the ranking
+    (:func:`_quota_ranked_providers`) but never applies it.
+    """
+    return quota_pacing.surge_enabled(config) and not quota_pacing.surge_dry_run(
+        config
+    )
+
+
+def _quota_provider_score(
+    provider_cfg: dict, config: dict | None
+) -> tuple[float, float, float] | None:
+    """Return ``(score, effective_headroom, seconds_to_reset)`` or ``None``.
+
+    A pure cache read through :func:`proxy.quota_state.get_quota_snapshot`:
+    it never polls, never blocks and never raises. ``None`` means "no quota
+    opinion" — the entry keeps its configured position with score 0.
+    """
+    snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+    if snapshot is None:
+        return None
+    headroom = snapshot.effective_headroom
+    seconds_to_reset = snapshot.seconds_to_reset
+    score = quota_pacing.urgency_score(headroom, seconds_to_reset, config)
+    return score, headroom, seconds_to_reset
+
+
+def _quota_ranked_providers(
+    model_config: dict, config: dict | None = None
+) -> list[dict[str, Any]]:
+    """Return the model's provider list with quota entries headroom-ordered.
+
+    Only entries matched by :func:`proxy.quota_state.is_quota_provider`
+    (``opencode-*``, or the ``server.quota_surge_accounts`` allow-list) are
+    re-ordered: they are ranked by descending
+    :func:`proxy.quota_pacing.urgency_score` (``effective_headroom /
+    seconds_to_reset``) and spliced back into the *same positions* they
+    occupy in config order, so every other provider keeps its configured
+    position. The sort is stable, so equal scores tie-break on config order
+    and repeated calls are deterministic.
+
+    A copy is always returned — the caller's list is never mutated. An entry
+    with no snapshot scores 0 and keeps config order among its peers; when no
+    quota entry has been polled the configured order is preserved exactly.
+    """
+    providers = model_config.get("providers")
+    if not isinstance(providers, list) or len(providers) < 2:
+        return list(providers) if isinstance(providers, list) else []
+    if not quota_pacing.surge_enabled(config):
+        return list(providers)
+
+    active = _quota_ordering_active(config)
+    quota_positions: list[int] = []
+    ranked: list[dict[str, Any]] = []
+    for index, provider_cfg in enumerate(providers):
+        if not isinstance(provider_cfg, dict):
+            continue
+        if not quota_state.is_quota_provider(provider_cfg, config):
+            continue
+        quota_positions.append(index)
+        scored = _quota_provider_score(provider_cfg, config)
+        if scored is None:
+            ranked.append(
+                {
+                    "score": 0.0,
+                    "index": index,
+                    "provider": provider_cfg,
+                    "headroom": 0.0,
+                    "seconds_to_reset": 0.0,
+                    "polled": False,
+                }
+            )
+            continue
+        score, headroom, seconds_to_reset = scored
+        ranked.append(
+            {
+                "score": score,
+                "index": index,
+                "provider": provider_cfg,
+                "headroom": headroom,
+                "seconds_to_reset": seconds_to_reset,
+                "polled": True,
+            }
+        )
+
+    if not quota_positions:
+        return list(providers)
+
+    # ``reverse=True`` keeps the sort stable, so equal scores retain config order.
+    ranked.sort(key=lambda entry: entry["score"], reverse=True)
+
+    if any(entry["polled"] for entry in ranked):
+        for rank, entry in enumerate(ranked, start=1):
+            logger.debug(
+                "quota_ordering rank=%d provider=%s config_index=%d headroom=%.1f "
+                "seconds_to_reset=%.0f score=%.6g applied=%s",
+                rank,
+                entry["provider"].get("name", "unknown"),
+                entry["index"],
+                entry["headroom"],
+                entry["seconds_to_reset"],
+                entry["score"],
+                active,
+            )
+
+    if not active:
+        return list(providers)
+
+    ordered = [entry["provider"] for entry in ranked]
+    result = list(providers)
+    for position, provider_cfg in zip(quota_positions, ordered):
+        result[position] = provider_cfg
+    return result
+
+
+def _quota_unavailable_reason(
+    provider_cfg: dict, config: dict | None
+) -> str | None:
+    """Return a log-friendly reason when quota state marks the entry spent.
+
+    Ordering never drops a candidate that still has headroom (AC3c), but an
+    entry whose snapshot is
+    :attr:`~proxy.quota_state.QuotaSnapshot.exhausted` (any window blocking,
+    or no effective headroom left) is treated as unavailable — the same
+    conservative stance the snapshot itself takes. Returns ``None`` (fail
+    open) when ordering is inactive, the entry is not quota-managed, or no
+    snapshot has been polled yet.
+    """
+    if not _quota_ordering_active(config):
+        return None
+    if not quota_state.is_quota_provider(provider_cfg, config):
+        return None
+    snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+    if snapshot is None or not snapshot.exhausted:
+        return None
+    return (
+        f"quota_exhausted (account={snapshot.account}, "
+        f"effective_headroom={snapshot.effective_headroom:.1f}%, "
+        f"resets_in={int(snapshot.seconds_to_reset)}s)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def resolve_provider(
     model_config: dict,
     failed_provider: str | None = None,
+    *,
+    config: dict | None = None,
 ) -> dict | None:
     """Get the next available provider for a model config.
 
@@ -2153,18 +2308,26 @@ def resolve_provider(
       LP-0MSG45LOO007K236)
     - Does not belong to a usage-limit ACCOUNT with a pending usage-limit
       reset (LP-0MSLJPOCC0001ROJ / LP-0MSMBWB23009XYPW)
+    - Is not marked spent by proactive quota state (LP-0MVF7KIKE002DZVD)
+
+    Quota-managed (``opencode-*``) entries are considered in descending
+    headroom urgency instead of config order — see
+    :func:`_quota_ranked_providers`.
 
     Args:
         model_config: Model configuration dict. Must contain a ``providers``
                       key whose value is an ordered list of provider configs.
         failed_provider: Optional name of a provider that just failed and
                          should be skipped.
+        config: Optional proxy config, used for the quota-ordering gates
+                (``server.quota_surge_*``). ``None`` falls back to the
+                documented defaults.
 
     Returns:
         A provider config dict (with keys ``name``, ``type``, etc.), or
         ``None`` if no provider is available.
     """
-    providers: list[dict[str, Any]] | None = model_config.get("providers")
+    providers = _quota_ranked_providers(model_config, config)
     if not providers:
         return None
 
@@ -2207,6 +2370,13 @@ def resolve_provider(
                 datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
             )
+            continue
+        # Proactive quota state says this account has nothing left to spend
+        # (LP-0MVF7KIKE002DZVD): treat it as unavailable instead of burning a
+        # dispatch on a guaranteed limit error.
+        quota_reason = _quota_unavailable_reason(provider_cfg, config)
+        if quota_reason is not None:
+            logger.info("Skipping provider=%s: %s", name, quota_reason)
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
         if cooldown_key is not None:
@@ -4420,6 +4590,8 @@ def _has_next_provider(
     model_config: dict,
     attempted_provider_names: set[str],
     excluded_domains: set[str] | None = None,
+    *,
+    config: dict | None = None,
 ) -> bool:
     """True if at least one more provider remains untried (and not in cooldown).
 
@@ -4427,12 +4599,17 @@ def _has_next_provider(
     when the chain has a remaining provider to fall back to (LP-0MSETOTWY000SU0Z).
     Accepts already-failed failure domains so same-gateway siblings are not
     counted as a usable fallback (LP-0MSG45I8Q0020N1F).
+
+    Delegates to :func:`_resolve_provider_with_exclusions`, so it walks the
+    same headroom-ranked chain as resolution (LP-0MVF7KIKE002DZVD AC3b) and
+    must be given the same ``config``.
     """
     return (
         _resolve_provider_with_exclusions(
             model_config,
             attempted_provider_names,
             excluded_domains,
+            config=config,
         )
         is not None
     )
@@ -4573,6 +4750,8 @@ def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
     excluded_domains: set[str] | None = None,
+    *,
+    config: dict | None = None,
 ) -> dict | None:
     """Resolve next available provider while excluding names tried this request
     and any entry sharing an already-failed failure domain.
@@ -4583,8 +4762,12 @@ def _resolve_provider_with_exclusions(
     Usage-limit account keys (see ``_usage_limit_account_key``) are checked
     against the same set so an account exhausted by a usage-limit error is not
     retried via another entry sharing that account (LP-0MSMBWB23009XYPW).
+
+    Quota-managed entries are walked in descending headroom urgency order
+    (LP-0MVF7KIKE002DZVD); ``config`` supplies the ordering gates and defaults
+    to the documented behaviour when omitted.
     """
-    providers: list[dict[str, Any]] | None = model_config.get("providers")
+    providers = _quota_ranked_providers(model_config, config)
     if not providers:
         return None
 
@@ -4616,6 +4799,12 @@ def _resolve_provider_with_exclusions(
                 name,
                 usage_key,
             )
+            continue
+        # Proactive quota state says this account has nothing left to spend
+        # (LP-0MVF7KIKE002DZVD): treat it as unavailable.
+        quota_reason = _quota_unavailable_reason(provider_cfg, config)
+        if quota_reason is not None:
+            logger.info("Skipping provider=%s: %s", name, quota_reason)
             continue
         reset_remaining = _usage_reset_remaining(usage_key)
         if reset_remaining > 0:
@@ -6551,6 +6740,7 @@ async def _proxy_with_remote_fallback_cycle(
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
+            config=config,
         )
         if provider_cfg is None:
             break
@@ -6636,6 +6826,7 @@ async def _proxy_with_remote_fallback_cycle(
             # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
             if provider_type == "remote" and _has_next_provider(
                 model_config, attempted_provider_names, attempted_domains,
+                config=config,
             ):
                 try:
                     response = await _preflight_streaming_response(
@@ -7174,6 +7365,7 @@ async def _proxy_with_fallback_cycle(
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
+            config=config,
         )
         if provider_cfg is None and fallback_reason == "local_lease_active":
             # Local lease-active is expected contention, not provider failure.
@@ -7647,6 +7839,7 @@ async def _proxy_with_fallback_cycle(
             # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
             if provider_type == "remote" and _has_next_provider(
                 model_config, attempted_provider_names, attempted_domains,
+                config=config,
             ):
                 try:
                     response = await _preflight_streaming_response(
