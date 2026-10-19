@@ -346,18 +346,13 @@ async def status_events():
             # endpoint is unresponsive during busy generation.
             from proxy.observability import (
                 _enrich_slot_details_with_progress,
+                _resolve_slot_details_for_enrichment,
                 _update_slot_progress_from_log,
             )
-            from proxy.observability import (
-                _last_slot_details_cache as _slot_cache,
-            )
             _update_slot_progress_from_log()
-            if slot_details:
-                # In-place update is fine because we're extending the list variable
-                _slot_cache.clear()
-                _slot_cache.extend(slot_details)
-            else:
-                slot_details = list(_slot_cache)
+            # Enrich a detached copy so the shared fallback cache keeps the
+            # pristine /slots values (LP-0MVECWYWK000U3E1, AC2).
+            slot_details = _resolve_slot_details_for_enrichment(slot_details)
             _enrich_slot_details_with_progress(slot_details, srv=srv)
 
             initial_status = json.dumps({

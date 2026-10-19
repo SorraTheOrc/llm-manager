@@ -590,8 +590,23 @@ Maps ``slot_id`` to ``{"n_tokens": int, "progress": float,"timestamp": float}``.
 Used as a supplemental source of token counts when the ``/slots`` HTTP
 endpoint is unresponsive during busy token generation.
 
+``timestamp`` is the *source* time of the data — the log file's mtime at the
+read that produced the entry — not the read time.  A frozen log therefore
+ages out of the cache instead of being re-stamped fresh on every cycle
+(LP-0MVECWYWK000U3E1).
+
 Populated by ``_update_slot_progress_from_log()`` which is called by
 ``_periodic_broadcast_loop()`` on each iteration.
+"""
+
+
+SLOT_PROGRESS_MAX_AGE_SECONDS: float = 60.0
+"""Maximum age (seconds) for log-derived progress data to be trusted.
+
+Entries older than this are pruned from ``_slot_progress_cache`` and
+rejected by ``_enrich_slot_details_with_progress()`` / ``_slot_progress_is_fresh()``.
+The window is measured against the log's real mtime, so a frozen
+``llama-server.log`` self-expires (LP-0MVECWYWK000U3E1).
 """
 
 
@@ -1039,6 +1054,15 @@ def _update_slot_progress_from_log() -> None:
             tail = f.read().decode("utf-8", errors="replace")
 
         now = time.time()
+        # Stamp each parsed entry with the log's real modification time, not
+        # the read time (LP-0MVECWYWK000U3E1).  A frozen log (e.g. an adopted
+        # llama-server whose stdout pipe was never re-attached) is otherwise
+        # re-parsed every cycle and re-stamped as "now", pinning the UI at
+        # stale token counts forever.  Clamp a future mtime (clock skew) to
+        # now so it cannot keep entries alive indefinitely either.
+        source_time = stat.st_mtime
+        if source_time > now:
+            source_time = now
         for line in tail.splitlines():
             result = _extract_progress_data_from_log(line)
             if result is not None:
@@ -1046,13 +1070,13 @@ def _update_slot_progress_from_log() -> None:
                 _slot_progress_cache[slot_id] = {
                     "n_tokens": n_tokens,
                     "progress": progress,
-                    "timestamp": now,
+                    "timestamp": source_time,
                 }
 
-        # Prune entries older than 60 seconds (generations don't last that
-        # long, and stale entries would show bogus token counts).
+        # Prune entries older than the trust window (generations don't last
+        # that long, and stale entries would show bogus token counts).
         stale = [sid for sid, data in _slot_progress_cache.items()
-                 if now - data["timestamp"] > 60.0]
+                 if not _slot_progress_is_fresh(data, now)]
         for sid in stale:
             _slot_progress_cache.pop(sid, None)
     except Exception:
@@ -1091,6 +1115,24 @@ def _extract_progress_data_from_log(line: str) -> tuple | None:
         return (slot_id, int(m_tokens.group(1)), float(m_progress.group(1)))
     except Exception:
         return None
+
+
+def _slot_progress_is_fresh(prog: dict | None, now: float | None = None) -> bool:
+    """Return True when *prog* is within the log-progress trust window.
+
+    ``prog`` is an entry from ``_slot_progress_cache`` whose ``timestamp``
+    is the source log's mtime at read time (LP-0MVECWYWK000U3E1).  Missing
+    or non-numeric timestamps are treated as stale so malformed data can
+    never be served as live.
+    """
+    if not isinstance(prog, dict):
+        return False
+    ts = prog.get("timestamp")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return False
+    if now is None:
+        now = time.time()
+    return (now - ts) <= SLOT_PROGRESS_MAX_AGE_SECONDS
 
 
 def _update_processing_slot_assignments(srv, slot_details=None) -> None:
@@ -1139,9 +1181,9 @@ def _update_processing_slot_assignments(srv, slot_details=None) -> None:
         # 2. Slots that /slots reports as processing (may not have progress yet)
         candidate_slots: set[int] = set()
 
-        # Source 1: progress cache (recent, within 60s)
+        # Source 1: progress cache (recent, within the trust window)
         for sid, data in _slot_progress_cache.items():
-            if now - data.get("timestamp", 0) < 60.0:
+            if _slot_progress_is_fresh(data, now):
                 candidate_slots.add(sid)
 
         # Source 2: /slots API reports as processing
@@ -1253,6 +1295,25 @@ def _build_slot_to_lease_map(srv) -> dict[int, dict]:
     return result
 
 
+def _resolve_slot_details_for_enrichment(slot_details: list[dict] | None) -> list[dict]:
+    """Return a detached working copy of slot details, updating the cache.
+
+    On a successful fresh ``/slots`` query (*slot_details* truthy) a pristine
+    copy of the raw values is stored in the module-level
+    ``_last_slot_details_cache``; on a failed query the last-known cache is
+    used.  Either way, a *copy* is returned so that
+    ``_enrich_slot_details_with_progress()`` mutating the working list can
+    never bake log-derived fields into the fallback cache
+    (LP-0MVECWYWK000U3E1, AC2).
+
+    The cache list object is preserved (slice assignment) so any module
+    holding a reference to it keeps observing updates.
+    """
+    if slot_details:
+        _last_slot_details_cache[:] = [dict(s) for s in slot_details]
+    return [dict(s) for s in _last_slot_details_cache]
+
+
 def _enrich_slot_details_with_progress(slot_details: list[dict],
                                         srv=None) -> list[dict]:
     """Merge log-parsed progress n_tokens into slot_details.
@@ -1274,6 +1335,13 @@ def _enrich_slot_details_with_progress(slot_details: list[dict],
 
     Returns:
         The same list (modified in-place) with enriched token counts.
+
+    Note:
+        Enrichment mutates the list it is given.  Callers serving the
+        fallback cache must pass a copy from
+        ``_resolve_slot_details_for_enrichment()`` so the pristine
+        ``/slots`` values in ``_last_slot_details_cache`` are never poisoned
+        by log-derived fields (LP-0MVECWYWK000U3E1, AC2).
     """
     if not slot_details:
         return slot_details
@@ -1315,8 +1383,10 @@ def _enrich_slot_details_with_progress(slot_details: list[dict],
         prog = _slot_progress_cache.get(sid)
         if prog is None:
             continue
-        # Only use progress data if it's recent (within 60 seconds)
-        if now - prog["timestamp"] > 60.0:
+        # Only use progress data whose *source* is still fresh.  The
+        # timestamp is the log's mtime, so a frozen log is rejected here even
+        # if a caller injected it directly (LP-0MVECWYWK000U3E1, AC3).
+        if not _slot_progress_is_fresh(prog, now):
             continue
         n_tokens = prog["n_tokens"]
         pct = prog["progress"]
@@ -1380,8 +1450,8 @@ async def _periodic_broadcast_loop():
     # Cache the last successful slot query result so that transient
     # timeouts (e.g. during busy token generation) don't blank the UI.
     # Use the module-level cache so that ``status_events()`` in ``proxy.ui``
-    # can also survive timeouts on initial SSE connection.
-    global _last_slot_details_cache
+    # can also survive timeouts on initial SSE connection.  The cache is
+    # updated by ``_resolve_slot_details_for_enrichment()``.
     try:
         while True:
             try:
@@ -1449,10 +1519,10 @@ async def _periodic_broadcast_loop():
 
                 # Preserve last known slot data when query fails or llama-server
                 # is too busy to respond (ReadTimeout during token generation).
-                if slot_details:
-                    _last_slot_details_cache = slot_details
-                else:
-                    slot_details = _last_slot_details_cache
+                # Enrich a *copy* so the fallback cache keeps the pristine
+                # /slots values instead of the log-derived ones
+                # (LP-0MVECWYWK000U3E1, AC2).
+                slot_details = _resolve_slot_details_for_enrichment(slot_details)
 
                 # Merge log-parsed progress token counts and session IDs into
                 # slot details. This ensures the web UI shows real token counts
