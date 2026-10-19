@@ -96,8 +96,11 @@ first successful dispatch, so *every* later turn of that session counts as
 traffic and waited 15–55 s per turn, which dominated first-token latency
 (p90 6.5 s → 12.8 s, p99 21 s → 53 s while generation speed was unchanged).
 Reserving `floor(rate_limit_rpm × provider_rate_limit_reserve_ratio)` slots
-(default 4 of 15) keeps a slot available for them, so waits become rare; the
-default 15 s cap bounds whatever remains.
+(4 of 15 at the former budget) keeps a slot available for them, so waits become
+rare; the default 15 s cap bounds whatever remains. The reserve rounds down and
+is clamped to `rate_limit_rpm - 1`, so at the current budget of 2/min the
+reserve is **0**: there are no reserved slots and both new and in-progress
+sessions share the 2-slot window.
 
 Affinity is `session → entry`, TTL-scoped by
 `server.provider_affinity_ttl_seconds` (default 900), and is **never** shared
@@ -107,7 +110,7 @@ session already on the free tier keeps its provider, while a batch of new
 agent sessions passes straight through instead of queueing behind an exhausted
 allowance.
 
-`munitoai-free` ships with `rate_limit_rpm: 15` in `config.yaml` (the former
+`munitoai-free` ships with `rate_limit_rpm: 2` in `config.yaml` (the former
 fast/cheap overlay files were removed with priority-based routing,
 LP-0MVDT94F0003VHUA); tune the value from the `remaining=` field in the skip
 logs.
@@ -120,6 +123,15 @@ knee while recovering roughly a quarter of the paid spill observed at 10
 (45 % → 27 %). Observation window: begins at the next proxy restart after the
 change; a follow-up check-in (24 h later) monitors the upstream 429 rate at
 peak and reverts to 10 if it exceeds ~10 % of minutes.
+
+**Value history (LP-0MVF19DKR008VCHO):** lowered from 15 to **2** on 2026-10-19
+at the operator's request — the free tier is treated as a bonus tier, so bursts
+spill to the paid tiers rather than consuming the free allowance. At 2/min the
+reserve ratio (`provider_rate_limit_reserve_ratio`, default 0.3) rounds down to
+0 slots, so new and in-progress sessions both see the full 2-per-window cap;
+in-progress sessions can still wait for the window to drain (bounded by
+`provider_rate_limit_wait_max_seconds`). Takes effect at the next proxy
+restart.
 
 ### Responses-API providers (`api: openai-responses`)
 

@@ -516,8 +516,9 @@ retrying into it:
 - while the rolling 60-second window has capacity the entry is used normally;
 - a fraction of the window (`server.provider_rate_limit_reserve_ratio`,
   default `0.3`) is **reserved for in-progress sessions**: a **new** session may
-  use at most `rate_limit_rpm - reserve` dispatches (11 of 15 for
-  `munitoai-free`) and, once that is spent, skips the entry immediately — it
+  use at most `rate_limit_rpm - reserve` dispatches (2 of 2 for
+  `munitoai-free` — the reserve rounds down, so the current budget has no
+  reserved slots) and, once that is spent, skips the entry immediately — it
   never waits, so parked requests cannot compound the contention;
 - a session already served by the entry may use the reserved slots, and if the
   window is still full it may wait a short, bounded time

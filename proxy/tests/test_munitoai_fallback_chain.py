@@ -19,8 +19,8 @@ header value derived from the entry, and resolution of the ``MUNITOAI_API_KEY``
 import json
 
 import pytest
-from proxy.provider import _build_resolved_model_value
 from config_test_utils import get_merged_config, load_profile
+from proxy.provider import _build_resolved_model_value
 
 #: The exact provider entry the chains must carry right after local.
 #: ``display_name`` marks the free tier (``MunitoAI Free``) so the
@@ -36,8 +36,9 @@ MUNITOAI_FREE_ENTRY = {
     "forward_session_headers": False,
     "model": "deepseek-ai/deepseek-v4-flash",
     # Free-tier request budget (LP-0MVDQ1GMO00801PL): a small per-60s window,
-    # so the tier is only used while it has capacity.
-    "rate_limit_rpm": 15,
+    # so the tier is only used while it has capacity. Deliberately conservative
+    # at 2/min (LP-0MVF19DKR008VCHO) — bursts spill to the paid tiers.
+    "rate_limit_rpm": 2,
 }
 
 #: The exact (paid) munitoai entry that must sit directly before deepseek-flash.
