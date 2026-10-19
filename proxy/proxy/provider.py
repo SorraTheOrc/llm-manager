@@ -6531,8 +6531,15 @@ async def _proxy_with_remote_fallback_cycle(
 
     # Per-entry context ceiling (LP-0MVF9N2QL001CDA7): parse the body once so
     # the authoritative routing estimate can be computed lazily (once per
-    # cycle) for entries that declare ``max_context_tokens``.
-    _raw_body = await request.body()
+    # cycle) for entries that declare ``max_context_tokens``. Fail-open on a
+    # body read error (e.g. a synthetic request without a ``body()`` method):
+    # routing must never break because the estimate cannot be produced, so the
+    # estimate degrades to whatever the session history yields (usually 0).
+    _raw_body = None
+    try:
+        _raw_body = await request.body()
+    except Exception:
+        logger.debug("max_context_tokens body read failed; gate disabled for this request")
     try:
         body_json = json.loads(_raw_body) if _raw_body else {}
     except Exception:

@@ -339,7 +339,7 @@ class TestCooldownIntegration:
         assert cooldown == 54.0
 
     def test_skip_log_reports_header_derived_remaining(self, caplog):
-        """AC4: the 'in cooldown (Ns remaining)' line reflects the header value."""
+        """AC4: the resolver skip line reflects the header-derived remaining."""
         attempts = []
         response = Response(
             status_code=429, content=b"r", headers=_MUNITO_429_HEADERS
@@ -362,7 +362,16 @@ class TestCooldownIntegration:
                 selected = provider.resolve_provider(model_config)
         assert selected is None
         assert "munitoai-free" in caplog.text
-        assert "in cooldown (54s remaining)" in caplog.text
+        # LP-0MVFA1VRT007T9HT (83dcdd75): a quota 429 carrying an
+        # ``x-ratelimit-reset-*`` header now quarantines the failing ACCOUNT for
+        # the header-derived reset plus the 2-minute usage-limit margin, and the
+        # resolver's account quarantine is checked BEFORE the entry cooldown. So
+        # the skip line reports ``usage_limit_reset_pending`` with that window
+        # (52s header + 120s margin = 172s) instead of the 54s entry cooldown —
+        # the header-derived remaining still reaches the operator, through the
+        # longer-lived gate that now supersedes the in-memory cooldown.
+        assert "usage_limit_reset_pending" in caplog.text
+        assert "reset_in=172s" in caplog.text
 
 
 class TestPersistence:

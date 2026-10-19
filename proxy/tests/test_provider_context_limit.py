@@ -679,3 +679,43 @@ async def test_queue_context_bypass_honours_a_local_entry_limit(monkeypatch):
         _Request(), body, "ctx-limit-session",
     )
     assert ungated == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_unreadable_body_fails_open_at_the_gate(monkeypatch):
+    """AC1: an unreadable body must never drop a provider from the chain.
+
+    Some synthetic/internal callers hand the cycle a request object without a
+    usable ``body()``. The per-entry ceiling then has no prompt to measure, so
+    the estimate degrades to 0 and the entry is dispatched as today — the gate
+    must never turn an estimate failure into a context skip.
+    """
+    remote_calls: list[str] = []
+    budget_calls: list[str] = []
+
+    async def _estimate(_request, body_json, tokenizer=None):
+        return 60_000 if body_json.get("messages") else 0
+
+    model_config, _ = _patch_remote_cycle(
+        monkeypatch,
+        providers=[_remote_entry("capped", max_context_tokens=10)],
+        estimate=AsyncMock(side_effect=_estimate),
+        remote_calls=remote_calls,
+        budget_calls=budget_calls,
+    )
+
+    class _BodylessRequest:
+        headers = {"content-type": "application/json"}
+        method = "POST"
+        url = type("U", (), {"path": "/v1/chat/completions"})()
+
+        async def body(self):
+            raise RuntimeError("body unavailable")
+
+    response = await provider._proxy_with_remote_fallback_cycle(
+        _BodylessRequest(), "v1/chat/completions", model_config, {"provider_cooldown_seconds": 60}
+    )
+
+    assert response.status_code == 200
+    assert remote_calls == ["capped"]
+    assert budget_calls == ["capped"]
