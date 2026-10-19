@@ -23,8 +23,12 @@ Priority semantics (AC3)
 - ``medium`` — today's behaviour: config-driven queue policy and
   economic-bypass recovery from the merged base config (parity baseline).
 - ``low`` — prefer local and queue (bounded by the configured contention-queue
-  caps) over paid remote fallback; economic cold-cache bypass is recovered
-  locally (cheap-mode semantics in both windows).
+  caps), then the free tier, over paid remote fallback; economic cold-cache
+  bypass is recovered locally (cheap-mode semantics in both windows).
+  **Off-peak exception (LP-0MVF17VP70053JXX):** after local and the free tier
+  are exhausted, the ``low`` chain continues into the ``opencode-go`` entries
+  while they are inside their ``available_times`` (UTC) windows — see
+  :func:`priority_routing_profile` for the full rationale and caveats.
 
 Provider chains (AC2)
 ---------------------
@@ -289,6 +293,29 @@ def priority_routing_profile(
         * ``low``: True (cheap-mode semantics — recover locally).
         * ``medium``: the merged base config flag
           (``local_large_context_economic_bypass_serves_local``).
+
+    Paid-tier invariant for ``low`` (LP-0MVF17VP70053JXX): ``low`` never
+    *prefers* a paid remote tier — local is preferred, then the free tier —
+    but it is no longer forbidden from spending at all. Once the free tier is
+    exhausted the chain continues into the ``opencode-go`` entries, which are
+    only eligible inside their own ``available_times`` (UTC) windows, so paid
+    spend stays confined to off-peak hours. The cheap priority window is
+    local ``Europe/Dublin`` 01:00-10:00 (= UTC 00:00-09:00) while the opencode
+    windows are UTC 00:00-01:00, 04:00-06:00 and 10:00-00:00, so the exception
+    adds capacity in ~3 of the 9 cheap hours; the UTC 01:00-04:00 and
+    06:00-10:00 gaps are deliberate paid-spend avoidance (the windows are
+    never widened to close them).
+
+    ``low`` failover capacity vs resiliency:
+
+    - rate-limit (429) failures are quarantined per API-key account
+      (``_usage_limit_account_key`` = ``api_key_env@endpoint``), so the three
+      ``opencode-go`` entries carry independent quota and give 3x rate-limit
+      capacity;
+    - 5xx/stall failures are quarantined per failure domain
+      (``_failure_domain_key`` = ``endpoint:model``), so the three entries
+      share ONE domain and do **not** give 3x outage resilience — the chain
+      skips straight past them during an opencode outage.
 
     Unknown priorities fall back to medium (defence in depth).
     """

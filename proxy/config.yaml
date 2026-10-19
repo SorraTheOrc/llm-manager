@@ -403,14 +403,35 @@ models:
     # an ordered provider list (names resolved against ``providers``); the
     # chain used for a request is selected by its effective priority. A
     # missing priority falls back to the full ``providers`` chain (today's
-    # behaviour = ``medium`` semantics). ``low`` prefers local and the free
-    # tier, never spending on the paid remote tiers; ``medium``/``high`` use
-    # the full chain — high differs only in the routing knobs (never queues,
-    # economic bypass routes remote), not the chain (AC3).
+    # behaviour = ``medium`` semantics). ``medium``/``high`` use the full
+    # chain — high differs only in the routing knobs (never queues, economic
+    # bypass routes remote), not the chain (AC3).
+    #
+    # ``low`` prefers local, then the free tier. Off-peak exception
+    # (LP-0MVF17VP70053JXX): once the free tier is spent, the three
+    # opencode-go entries absorb local-slot overflow, gated by their
+    # timed-access (UTC) windows — unchanged from LP-0MSXPHTD9004DZ4P — so
+    # paid spend stays confined to off-peak hours
+    # (UTC 00:00-01:00, 04:00-06:00, 10:00-00:00).
+    # UTC-vs-local overlap: the cheap priority window (01:00-10:00 local
+    # Europe/Dublin = UTC 00:00-09:00), so the new tiers add capacity in ~3
+    # of the 9 cheap hours (00:00-01:00 and 04:00-06:00); the 01:00-04:00 /
+    # 06:00-10:00 gaps are deliberate paid-spend avoidance.
+    # 429 failover is per API-key account (``_usage_limit_account_key`` =
+    # ``api_key_env@endpoint``, LP-0MSMBWB23009XYPW / LP-0MVCX0E2V001VB5N),
+    # so the three entries carry independent rate-limit quota (3x capacity).
+    # Caveat: 5xx/stall failures share ONE failure domain
+    # (``_failure_domain_key``, LP-0MSG45I8Q0020N1F) — same-gateway siblings
+    # are skipped during an opencode outage, so the three entries do NOT
+    # multiply resilience. ``munitoai`` / ``deepseek-flash`` carry no window
+    # discipline and never join the low chain.
     priority_routes:
       low:
         - local-qwen3
         - munitoai-free
+        - opencode-go-3
+        - opencode-go-2
+        - opencode-go
     aliases:
     - plan*
     force_full_prompt: true
@@ -529,6 +550,9 @@ models:
       low:
         - local-qwen3
         - munitoai-free
+        - opencode-go-3
+        - opencode-go-2
+        - opencode-go
     aliases:
     - author
     force_full_prompt: true
@@ -654,6 +678,9 @@ models:
       low:
         - local-qwen3
         - munitoai-free
+        - opencode-go-3
+        - opencode-go-2
+        - opencode-go
     aliases:
     - code
     force_full_prompt: true

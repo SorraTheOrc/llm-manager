@@ -48,6 +48,7 @@ from proxy.priority import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
     PRIORITY_MEDIUM,
+    priority_routing_profile,
     provider_chain_for_priority,
     proxy_dir,
 )
@@ -209,6 +210,15 @@ class TestLiveConfigInvariants:
             entry = _live_entry(model_name, entry_name)
             assert entry["available_times"] == OPENCODE_WINDOWS
 
+    @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
+    def test_live_low_chain_is_exactly_the_target_order(self, model_name):
+        # AC1 (parent): the shipped config's ``low`` chain is exactly
+        # ``[local-qwen3, munitoai-free, opencode-go-3, opencode-go-2,
+        # opencode-go]`` — free tier ordered before any paid entry and the
+        # three keys in providers-list order.
+        names = [e["name"] for e in provider_chain_for_priority(_live_model(model_name), PRIORITY_LOW)]
+        assert names == TARGET_LOW_CHAIN
+
 
 # ---------------------------------------------------------------------------
 # AC3 — UTC window gating
@@ -311,3 +321,21 @@ class TestFailoverScope:
         with _patch_utc_now(INSIDE_WINDOW_UTC):
             picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, excluded)
         assert picked is None, "same-gateway siblings must be skipped after a 5xx on opencode-go-3 (one failure domain)"
+
+
+# ---------------------------------------------------------------------------
+# AC7 — the paid-tier invariant is documented where routing knobs are
+# ---------------------------------------------------------------------------
+
+
+class TestRoutingProfileDocs:
+    def test_low_profile_docstring_records_the_off_peak_exception(self):
+        # The routing-knob docstring must state that ``low`` may spend on
+        # paid tiers inside their off-peak ``available_times`` windows, and
+        # must carry the per-key-429 / same-domain-5xx rationale so nobody
+        # assumes 3x outage resilience.
+        doc = priority_routing_profile.__doc__ or ""
+        assert "off-peak" in doc.lower()
+        assert "available_times" in doc
+        assert "3x rate-limit" in doc
+        assert "outage resilience" in doc

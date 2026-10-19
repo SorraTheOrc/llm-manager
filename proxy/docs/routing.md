@@ -133,7 +133,37 @@ in-progress sessions can still wait for the window to drain (bounded by
 `provider_rate_limit_wait_max_seconds`). Takes effect at the next proxy
 restart.
 
-### Upstream rate-limit headers (`respect_ratelimit_headers`, LP-0MVBHDNLB007ALLJ)
+### Off-peak paid tiers in the `low` chain (LP-0MVF17VP70053JXX)
+
+`low` priority prefers local and queues over paid remote fallback, then uses the
+free tier (`munitoai-free`, `rate_limit_rpm: 2`). Because that free tier is the
+last entry of the chain, exhausted local slots plus an exhausted free budget
+used to leave the request nowhere to go but an upstream 429. `plan`, `author`
+and `code` therefore extend their `low` chain with the three `opencode-go`
+entries:
+
+```text
+low: [local-qwen3, munitoai-free, opencode-go-3, opencode-go-2, opencode-go]
+```
+
+Those entries keep the off-peak `available_times` windows added by
+LP-0MSXPHTD9004DZ4P — UTC `00:00-01:00`, `04:00-06:00`, `10:00-00:00` — so the
+extra tiers are only eligible outside peak hours; the windows are **not**
+widened by this change. The cheap priority window (`server.priority_window`,
+default local `Europe/Dublin` 01:00–10:00 = UTC 00:00–09:00) overlaps the
+opencode windows in ~3 of its 9 hours (UTC 00:00–01:00 and 04:00–06:00); the UTC
+01:00–04:00 and 06:00–10:00 gaps are deliberate paid-spend avoidance.
+
+Capacity vs resilience — the three entries are **not** interchangeable:
+
+| Failure | Quarantine key | Effect on the sibling entries |
+|---------|----------------|-------------------------------|
+| HTTP 429 / usage limit | `_usage_limit_account_key` = `api_key_env@endpoint` | Independent per API key: a 429 on `opencode-go-3` leaves `opencode-go-2` and `opencode-go` eligible → 3× rate-limit capacity (LP-0MSMBWB23009XYPW, LP-0MVCX0E2V001VB5N). |
+| 5xx / stall / terminal error | `_failure_domain_key` = `endpoint:model` | Shared domain: one failure skips all three for the rest of the request → **no** 3× outage resilience (LP-0MSG45I8Q0020N1F). |
+
+The fully paid `munitoai` and `deepseek-flash` entries never join a `low` chain:
+they carry no window discipline that would confine spend to off-peak hours.
+
 
 Some gateways answer HTTP 429 with custom `x-ratelimit-*` headers instead of
 the standard `Retry-After` (MunitoAI sends none). The proxy can honour them so
