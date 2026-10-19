@@ -14,6 +14,26 @@ The LLM proxy runs as a Python process (`python3 -m uvicorn proxy.server:app`) a
 - To stop hung agent/audit subprocesses, kill the **specific PIDs only** — never a blanket process-name kill that could match the proxy.
 - **If the proxy needs a restart, use the start-proxy skill:** `/skill:start-proxy --restart`. This performs the controlled teardown and relaunch of the proxy and its backends; do not kill processes manually and restart ad hoc.
 
+### `forcing full prompt re-processing` is expected on Qwen3.x — NOT an error
+
+`llama-server.log` periodically emits:
+
+```
+slot update_slots: id N | task M | forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see llama.cpp#13194)
+```
+
+**Never report this as a cache failure, a defect, or an error condition, and do not file a work item for it.** Qwen3.6-35B-A3B is a hybrid attention + recurrent/SWA architecture: llama.cpp cannot rewind to the context checkpoints it created earlier in the slot, so it invalidates them (`erased invalidated context checkpoint ... n_swa = 0`) and re-prefills. The prompt cache is unaffected and still recovers prefixes normally.
+
+Measured 2026-10-18 over 792 dispatches — caching is healthy:
+
+- median `cached_ratio` **0.952** (p75 0.995); 568 `cache_state=warm` vs 224 `cold`
+- per-task `n_past` shows real prefix reuse before any re-prefill
+- prompt cache well under its cap: 7 prompts / ~7.5 GiB of the 40 GiB `cache-ram`
+
+The message describes a **checkpoint rollback**, not a prompt-cache miss, and re-prefill is bounded by the last usable checkpoint. It does cost real latency when a large prompt shares only a short prefix (one observed dispatch took 113 s to first byte after re-prefilling ~19.6K tokens), but that is expected behaviour for this architecture: attribute slow first bytes to prompt divergence, not to a cache defect.
+
+Background: `models.ini` documents the hybrid-arch caveats (`swa-full` is a no-op for this arch; `ctx-checkpoints = 32` at ~62.8 MiB each is the dominant per-prompt memory term).
+
 ## Testing
 
 Run the full test suite through the test skill — `/skill:test` (equivalently
