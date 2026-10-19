@@ -516,3 +516,280 @@ def test_resolver_failure_message_names_candidate_keys():
         "opencode-go",
         "opencode",
     ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# api_key_resolver stale-key comparison / fingerprint (LP-0MVF7DO29009T8MH)
+#
+# AC-pinning tests for the fingerprint + ``compare_env_key`` helper and the
+# ``--check`` CLI contract that start-proxy.sh will call per ``api_key_env``
+# (parent LP-0MVD2RF7H008B7OT AC1–AC4). Authored test-first (RED) before the
+# helper child (LP-0MVF7DRBM004N90W) lands, so the contract is executable,
+# not prose. Fixture keys are deliberately >= 12 chars so fingerprint
+# redaction is genuinely exercised (an <= 8-char key would be returned whole).
+#
+# TDD red phase: every assertion below fails today because the helper and the
+# ``--check`` mode do not exist yet. They are marked ``xfail(strict=True)`` so
+# ``dev`` stays green while the red phase is in flight — the same convention as
+# ``test_compaction_headers_contract.py`` (LP-0MU44KR5F0015D7A). ``strict=True``
+# means an unexpected *pass* fails the suite, so the implementation child must
+# remove these markers when it makes the helpers real.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_RED_REASON = "helper added by LP-0MVF7DRBM004N90W"
+
+# Env var name uses a synthetic provider stem so the tests never read or write
+# a real provider key in the ambient environment (fixtures only, via tmp_path).
+_ENV_VAR = "TEST_PROVIDER_API_KEY"
+_ENV_KEY = "ENV_KEY_MATCHING_AAAA"
+_AUTH_KEY = "AUTH_KEY_ROTATED_AAAA"
+
+
+def _auth_json(tmp_path, **keys) -> Path:
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps(_auth_fixture(**keys)))
+    return path
+
+
+# ── key_fingerprint (AC2: short fingerprint, never the whole key) ─────────────
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_key_fingerprint_is_first_8_chars_ac2():
+    """Pin the fingerprint width and that it never returns the whole key."""
+    from proxy.api_key_resolver import FINGERPRINT_LEN, key_fingerprint
+
+    assert FINGERPRINT_LEN == 8
+    fp = key_fingerprint(_AUTH_KEY)
+    assert fp == _AUTH_KEY[:8]
+    assert len(fp) <= FINGERPRINT_LEN
+    # longer-than-8 keys must never be returned whole (diagnosis, not auth)
+    assert fp != _AUTH_KEY
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_key_fingerprint_empty_and_none_yield_empty_string_ac2():
+    from proxy.api_key_resolver import key_fingerprint
+
+    assert key_fingerprint(None) == ""
+    assert key_fingerprint("") == ""
+
+
+# ── compare_env_key: the four AC4 cases ──────────────────────────────────────
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_compare_env_key_match_when_env_equals_auth_json_ac4_case1():
+    """AC4 case 1: env set and matching auth.json -> ``match``."""
+    from proxy.api_key_resolver import EnvKeyCheck, compare_env_key, key_fingerprint
+
+    auth = _auth_fixture(test_provider=_AUTH_KEY)
+    check = compare_env_key(_ENV_VAR, _AUTH_KEY, auth)
+
+    assert isinstance(check, EnvKeyCheck)
+    assert check.env_var == _ENV_VAR
+    assert check.status == "match"
+    assert check.env_fingerprint == key_fingerprint(_AUTH_KEY)
+    assert check.env_fingerprint == check.auth_fingerprint
+    # env already supplies the key, so nothing is exported
+    assert not check.resolved_key
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_compare_env_key_mismatch_when_env_differs_from_auth_json_ac4_case2():
+    """AC4 case 2: env set and differing -> ``mismatch`` (stale key)."""
+    from proxy.api_key_resolver import compare_env_key, key_fingerprint
+
+    auth = _auth_fixture(test_provider=_AUTH_KEY)
+    check = compare_env_key(_ENV_VAR, _ENV_KEY, auth)
+
+    assert check.status == "mismatch"
+    assert check.env_fingerprint == key_fingerprint(_ENV_KEY)
+    assert check.auth_fingerprint == key_fingerprint(_AUTH_KEY)
+    assert check.env_fingerprint != check.auth_fingerprint
+    # fingerprints must be redacted, never the full key
+    assert check.env_fingerprint != _ENV_KEY
+    assert check.auth_fingerprint != _AUTH_KEY
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_compare_env_key_resolved_from_auth_json_when_env_unset_ac4_case3():
+    """AC4 case 3: env unset -> ``resolved``, returning the auth.json key
+    so start-proxy.sh can export it."""
+    from proxy.api_key_resolver import compare_env_key, key_fingerprint
+
+    auth = _auth_fixture(test_provider=_AUTH_KEY)
+    for unset in (None, ""):
+        check = compare_env_key(_ENV_VAR, unset, auth)
+        assert check.status == "resolved"
+        assert check.resolved_key == _AUTH_KEY
+        assert check.env_fingerprint == ""
+        assert check.auth_fingerprint == key_fingerprint(_AUTH_KEY)
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_compare_env_key_auth_json_missing_with_env_is_env_only_ac4_case4():
+    """AC4 case 4a: auth.json absent (``auth=None``) + env set -> ``env_only``
+    (staleness cannot be verified; keep the env key, warn, do not fail)."""
+    from proxy.api_key_resolver import compare_env_key
+
+    check = compare_env_key(_ENV_VAR, _ENV_KEY, None)
+    assert check.status == "env_only"
+    assert check.env_fingerprint == _ENV_KEY[:8]
+    assert check.auth_fingerprint == ""
+    assert not check.resolved_key
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_compare_env_key_auth_json_missing_with_env_unset_is_auth_missing_ac4_case4():
+    """AC4 case 4b: auth.json absent + env unset -> ``auth_missing``, and
+    never raises."""
+    from proxy.api_key_resolver import compare_env_key
+
+    check = compare_env_key(_ENV_VAR, None, None)
+    assert check.status == "auth_missing"
+    assert not check.resolved_key
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_compare_env_key_unresolvable_entry_with_env_is_unresolved():
+    """auth.json present but no resolvable entry cannot be compared ->
+    ``unresolved`` (never raises)."""
+    from proxy.api_key_resolver import compare_env_key
+
+    auth = _auth_fixture(munitoai="PAID_KEY_AAAA")
+    assert compare_env_key(_ENV_VAR, _ENV_KEY, auth).status == "unresolved"
+    assert compare_env_key(_ENV_VAR, None, auth).status == "unresolved"
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_compare_env_key_prefers_opencode_go():
+    """OPENCODE_API_KEY resolution follows the opencode-go preference, so the
+    comparison is against the Go key, not the base ``opencode`` key."""
+    from proxy.api_key_resolver import compare_env_key
+
+    go_key = "OPENCODE_GO_KEY_AAAA"
+    base_key = "OPENCODE_BASE_KEY_AAAA"
+    auth = _auth_fixture(**{"opencode-go": go_key, "opencode": base_key})
+
+    resolved = compare_env_key("OPENCODE_API_KEY", None, auth)
+    assert resolved.status == "resolved"
+    assert resolved.resolved_key == go_key
+
+    assert compare_env_key("OPENCODE_API_KEY", go_key, auth).status == "match"
+    assert (
+        compare_env_key("OPENCODE_API_KEY", base_key, auth).status == "mismatch"
+    )
+
+
+# ── --check CLI contract (exit codes 0/3/4, fingerprints-only stdout) ────────
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_check_cli_exit_0_with_fingerprints_only_on_match(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import key_fingerprint, main
+
+    auth_file = _auth_json(tmp_path, test_provider=_AUTH_KEY)
+    monkeypatch.setenv(_ENV_VAR, _AUTH_KEY)
+
+    rc = main(["--check", str(auth_file), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    payload = json.loads(out.strip())  # exactly one line of JSON
+    assert payload["status"] == "match"
+    assert payload["env_var"] == _ENV_VAR
+    assert payload["env_fingerprint"] == key_fingerprint(_AUTH_KEY)
+    # no plaintext key may appear when the env var is set
+    assert _AUTH_KEY not in out
+    assert _ENV_KEY not in out
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_check_cli_exit_0_and_exports_resolved_key_when_env_unset(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import main
+
+    auth_file = _auth_json(tmp_path, test_provider=_AUTH_KEY)
+    monkeypatch.delenv(_ENV_VAR, raising=False)
+
+    rc = main(["--check", str(auth_file), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    payload = json.loads(out.strip())
+    assert payload["status"] == "resolved"
+    # the env-unset path is the export path, so the full key is expected
+    assert payload["resolved_key"] == _AUTH_KEY
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_check_cli_exit_3_on_mismatch_without_plaintext(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import key_fingerprint, main
+
+    auth_file = _auth_json(tmp_path, test_provider=_AUTH_KEY)
+    monkeypatch.setenv(_ENV_VAR, _ENV_KEY)
+
+    rc = main(["--check", str(auth_file), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 3
+    payload = json.loads(out.strip())
+    assert payload["status"] == "mismatch"
+    assert payload["env_fingerprint"] == key_fingerprint(_ENV_KEY)
+    assert payload["auth_fingerprint"] == key_fingerprint(_AUTH_KEY)
+    assert _ENV_KEY not in out
+    assert _AUTH_KEY not in out
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_check_cli_exit_4_when_key_unresolvable(tmp_path, monkeypatch, capsys):
+    from proxy.api_key_resolver import main
+
+    auth_file = _auth_json(tmp_path, munitoai="PAID_KEY_AAAA")
+    monkeypatch.delenv(_ENV_VAR, raising=False)
+
+    rc = main(["--check", str(auth_file), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 4
+    assert json.loads(out.strip())["status"] == "unresolved"
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_check_cli_exit_0_env_only_when_auth_json_absent(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import main
+
+    missing = tmp_path / "auth-does-not-exist.json"
+    monkeypatch.setenv(_ENV_VAR, _ENV_KEY)
+
+    rc = main(["--check", str(missing), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 0  # env_only keeps the key, warns, does not fail
+    assert json.loads(out.strip())["status"] == "env_only"
+    assert _ENV_KEY not in out
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+def test_check_cli_non_zero_when_auth_json_absent_and_env_unset(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import main
+
+    missing = tmp_path / "auth-does-not-exist.json"
+    monkeypatch.delenv(_ENV_VAR, raising=False)
+
+    rc = main(["--check", str(missing), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    # no key at all: fail closed rather than silently exporting nothing
+    assert rc != 0
+    assert json.loads(out.strip())["status"] == "auth_missing"
