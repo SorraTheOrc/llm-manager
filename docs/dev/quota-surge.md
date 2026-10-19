@@ -374,7 +374,102 @@ suspend) is exercised as a single integration test against a fake upstream
 routing gates are asserted unaffected under surge
 (`test_pre_existing_routing_gates_unaffected_under_surge`).
 
-## 9. References
+## 9. Post-deploy measurement (F10, LP-0MVF7KTMI005B667)
+
+Closes the loop on the epic's outcome: per account, how much of the monthly
+allowance was spent **at the moment of reset**, and whether the target
+(≥ 90% consumption at reset, ≤ 10% residual) was met. The measurement is
+log-derived, deterministic and reproducible — the tool is
+`scripts/quota_allowance_report.py` (tested in `tests/test_quota_allowance_report.py`),
+which reuses the shared rotation-aware log discovery (`scripts/lib/proxy_logs.py`)
+and mirrors the rule-based (no-LLM) pipeline of the
+`.pi/skills/proxy-usage-analysis` skill.
+
+### 9.1 When to measure (per-account schedule)
+
+Resets are per account and **not calendar-aligned**. The first *full* period
+after deployment ends at each account's first reset **after** 2026-10-19:
+
+| Account | First reset after deploy | First full post-deploy period ends |
+|---|---|---|
+| `OPENCODE_API_KEY` | 2026-10-23 | **2026-11-23** |
+| `OPENCODE_2_API_KEY` | 2026-10-30 | **2026-11-30** |
+| `OPENCODE_3_API_KEY` | 2026-11-17 | **2026-12-17** |
+
+Run the report once after **each** account's reset (or once after 2026-12-17
+for the full set) — the tool reports every completed period in the window,
+so a later run covers all of them retroactively.
+
+### 9.2 Exact invocation (recorded for reproducibility, AC13d)
+
+```bash
+python3 scripts/quota_allowance_report.py \
+    --log-dir /var/log/llama-proxy \
+    --start 2026-10-19T18:00:00 \
+    --end 2026-12-18T00:00:00 \
+    --output-md docs/dev/quota-surge-post-deploy-2026-12-18.md \
+    --output-json docs/dev/quota-surge-post-deploy-2026-12-18.json
+```
+
+The window **must start at deployment** (2026-10-19 ~18:46 UTC, when quota
+polling began) so the first period's consumption is attributed to the post-epic
+deployment. The invocation (argv, window, filters) is embedded in the JSON
+artifact; re-running the same command over the same logs reproduces the same
+figures byte-for-byte.
+
+### 9.3 What the report contains
+
+Per account, per completed period: the monthly percentage at reset (the last
+poll at/before `resetsAt`), the residual (`100 − percent`), the coverage gap
+(how far that reading was from the reset), surge-active hours (total and
+inside the final 7 days), hard-stop dwell, quota-driven skips (applied vs
+dry-run), poll failures and stale suspensions. Outcomes:
+
+- `target_met` — ≥ 90% at reset.
+- `below_target` — < 90%: **follow-up work item** with a concrete tuning
+  proposal (`quota_pacing_target`, `quota_surge_days`, ramp start) and the
+  observed data (AC13c).
+- `overspend` — at/above `quota_exhaustion_percent` at reset: the guard did
+  not hold; **critical** follow-up immediately (AC13c).
+- `insufficient_data` — no usable reading near the reset.
+
+Surge hours come from the `quota_surge_bypass entered|left` transitions,
+which the proxy logs only when an entry is evaluated **outside** its
+configured `available_times` window (the off-peak gaps `01:00–04:00` and
+`06:00–10:00` UTC; inside `10:00–00:00`/`00:00–01:00`/`04:00–06:00` the
+window already allows dispatch, so no transition is emitted). Zero surge
+hours therefore means "no out-of-window dispatch was attempted", not "the
+surge feature was off" — a conservative lower bound on bypass use.
+
+Dwell at the hard stop is derived from consecutive polls at/above
+`quota_exhaustion_percent`, so it is reported only while polling covers the
+episode (bounded by the 15-minute interval).
+
+### 9.4 Baseline (2026-10-19)
+
+`docs/dev/quota-surge-post-deploy-2026-10-19-baseline.{md,json}` record the
+start-of-measurement state so a later period report can be diffed against it.
+No completed period existed at that point (nothing to classify).
+
+Leading indicators from the baseline (as of deployment evening, 2026-10-19):
+
+- `OPENCODE_API_KEY`: 93% monthly, reset 2026-10-23 — inside its final
+  week. No `reason=quota_surge` transition had been logged by the baseline
+  because the evening window (`10:00–00:00`) already permits dispatch and
+  transitions only fire for out-of-window evaluations (`01:00–04:00`,
+  `06:00–10:00` UTC).
+- `OPENCODE_2_API_KEY`: pinned at 95% monthly for the whole observed window
+  (rolling/weekly 0% → effective headroom 5, ranked below the other accounts)
+  — on track to finish ≥ 90% at its 2026-10-30 reset.
+- `OPENCODE_3_API_KEY`: 13% monthly, reset 2026-11-17, with a flat spend
+  curve — it is the at-risk account. It is ranked first by urgency score but
+  receives almost no dispatch, so whether it closes the gap depends on how
+  much traffic the chain gets at all (routing/steering, outside quota surge's
+  control). The 2026-12-17 measurement will confirm the outcome; if it
+  finishes below 90% the follow-up proposal will additionally flag the
+  `quota_surge_accounts` / dispatch-volume question.
+
+## 10. References
 
 - `proxy/quota_state.py` — poller, derivation, cache, central predicate.
 - `proxy/quota_pacing.py` — pure pacing/urgency/peak model.
