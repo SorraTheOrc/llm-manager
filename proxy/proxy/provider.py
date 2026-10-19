@@ -24,6 +24,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -2475,6 +2476,88 @@ def _compute_retry_after(
     return int(max(candidates))
 
 
+#: Attempt statuses recorded when the proactive free-tier request-budget gate
+#: (``proxy.provider_budget.acquire_provider_budget``) denied a dispatch. A
+#: budget skip applies NO cooldown and NO usage-limit quarantine, so the
+#: generic exhaustion payload carries ``unavailable={}`` and
+#: ``_compute_retry_after`` finds no candidate (returns 0) even though the
+#: provider comes back as soon as its rolling window drains
+#: (LP-0MVF0N9SA0071LWM).
+_BUDGET_SKIP_STATUSES = frozenset({"rate_limited"})
+
+
+def _budget_window_retry_after(
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> int:
+    """Derive a ``retry_after`` from a free-tier budget window rollover.
+
+    A budget skip is the one exhaustion cause that records no cooldown and no
+    reset time: the provider is healthy and simply out of allowance for the
+    rest of its sliding window. Without this derivation the exhaustion payload
+    advertises ``retry_after: 0`` — which the chain-hold reads as "instant
+    recovery" and retries immediately, replaying every cycle inside the same
+    still-full window (the measured 13/11 ``munitoai-free`` failure,
+    LP-0MVF0N9SA0071LWM).
+
+    For every diagnostics entry that IS a budget skip (``status`` in
+    :data:`_BUDGET_SKIP_STATUSES`, entry carrying a window cap), ask the rate
+    limiter how long until that entry's window frees a slot and take the
+    EARLIEST positive rollover: the next cycle can succeed as soon as ANY
+    provider regains capacity. ``0`` is returned when no budget-skipped entry
+    is waiting on its window (capacity is available now, or the blockers are
+    not budget-related) so genuine instant recovery keeps zero added latency.
+
+    The derived value can never exceed the limiter's window
+    (:data:`RATE_LIMIT_WINDOW_SECONDS`), so it is inherently within the
+    chain-hold budgets; the caller additionally caps the advertised value with
+    ``max_retry_after_seconds`` and ``_bounded_hold_seconds`` bounds the hold
+    by ``chain_hold_seconds`` / ``chain_hold_total_seconds``.
+    """
+    if not diagnostics:
+        return 0
+    try:
+        from proxy.rate_limiter import get_rate_limiter
+
+        limiter = get_rate_limiter()
+    except Exception:  # pragma: no cover - defensive: limiter always importable
+        return 0
+
+    rollovers: list[float] = []
+    for attempt in diagnostics:
+        if not isinstance(attempt, dict):
+            continue
+        if attempt.get("status") not in _BUDGET_SKIP_STATUSES:
+            continue
+        entry_name = str(attempt.get("provider") or "")
+        if not entry_name:
+            continue
+        # ``effective_limit`` is the per-window cap actually applied to this
+        # request (``limit_rpm - reserve`` for a new session, ``limit_rpm``
+        # for an affinity session); fall back to the entry's own limit.
+        cap = 0
+        for key in ("effective_limit", "limit_rpm"):
+            try:
+                cap = int(attempt.get(key) or 0)
+            except (TypeError, ValueError):
+                cap = 0
+            if cap > 0:
+                break
+        if cap <= 0:
+            continue
+        try:
+            seconds = limiter.seconds_until_capacity(
+                entry_name, cap, RATE_LIMIT_WINDOW_SECONDS
+            )
+        except Exception:  # pragma: no cover - defensive: limiter is sync/cheap
+            continue
+        if seconds > 0:
+            rollovers.append(seconds)
+
+    if not rollovers:
+        return 0
+    return int(math.ceil(min(rollovers)))
+
+
 # Client-facing exhaustion retry-timer cap (LP-0MV0MM5R60025XZE). The honest
 # ``_compute_retry_after`` value can be hours away (the next ``available_times``
 # window edge or a pending usage-limit reset). That is truthful, but parking a
@@ -3310,6 +3393,14 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
         )
 
     retry_after = _compute_retry_after(unavailable_providers, model_config=model_config)
+    if retry_after <= 0:
+        # Budget-skip-only exhaustion (LP-0MVF0N9SA0071LWM): a free-tier
+        # rolling-window skip records no cooldown and no usage-limit reset, so
+        # ``_compute_retry_after`` has no candidate and would advertise 0.
+        # Derive the wait from the window rollover instead, otherwise the
+        # chain-hold treats the exhaustion as instant recovery and replays
+        # every cycle inside the still-full window.
+        retry_after = _budget_window_retry_after(diagnostics)
     client_retry_after = min(retry_after, _max_retry_after_seconds(config))
     payload: dict[str, Any] = {
         "error": "All providers exhausted",

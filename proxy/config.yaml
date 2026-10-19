@@ -790,6 +790,14 @@ server:
   #     budget (chain_hold_seconds x chain_hold_max_cycles) the terminal 503
   #     is returned immediately with its accurate Retry-After instead of
   #     holding through cycles that cannot succeed.
+  #   - Free-tier budget-window exhaustion advertises the WINDOW ROLLOVER as
+  #     its ``retry_after`` (LP-0MVF0N9SA0071LWM): a ``rate_limit_rpm`` budget
+  #     skip records no cooldown and no usage-limit reset, so the exhaustion
+  #     used to advertise 0 and every hold cycle replayed instantly inside the
+  #     still-full window. The derived wait (<= the 60 s window) is bounded by
+  #     these chain-hold budgets, so one hold is typically enough for the
+  #     window to roll over. Exhaustions with a real cooldown/reset, and
+  #     instant-recovery (genuinely 0 s) exhaustions, are unchanged.
   #   - Each hold cycle re-runs the full chain, including local routing and
   #     compaction evaluation; every routing/compaction/hold log line carries
   #     ``chain_hold_cycle=N`` so re-emissions are not read as new demand

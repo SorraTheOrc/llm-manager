@@ -154,6 +154,35 @@ wait bounded by the cap. Warm/cold classification and lookup helpers live in
 `proxy/test_dispatch_first_byte_metric.py`-covered helpers
 (`_classify_cache_state`, `_lookup_dispatch_cache_state`).
 
+## Budget-window exhaustion advertises the window rollover (LP-0MVF0N9SA0071LWM)
+
+A free-tier entry gated by `rate_limit_rpm` (`munitoai-free`) is skipped by
+`proxy.provider_budget` **before dispatch** when its rolling 60 s window is
+full. That skip applies no provider cooldown and no usage-limit quarantine, so
+the exhaustion payload carried `unavailable={}` and `_compute_retry_after`
+found no candidate — it advertised `retry_after: 0`. The chain-hold read 0 as
+"instant recovery" and held 0 s, replaying all `chain_hold_max_cycles` inside
+the same still-full window and surfacing a spurious "All providers exhausted"
+(the measured `13/11 requests in 60s window` case).
+
+`_budget_window_retry_after` now derives the wait from the limiter's own
+rollover (`seconds_until_capacity`, evaluated with the per-request
+`effective_limit`) and takes the **earliest** freeing entry, since the next
+cycle can succeed as soon as ANY provider regains capacity. The derived value
+is used only when the cooldown/reset computation yields 0, so:
+
+- budget-skip-only exhaustion → positive `retry_after` (≤ the 60 s window),
+  bounded by `chain_hold_seconds` / `chain_hold_total_seconds`, so one hold is
+  normally enough for the window to roll over;
+- exhaustion with a real cooldown / usage-limit reset → unchanged (the
+  cooldown-derived wait wins);
+- genuine instant recovery (`retry_after == 0`, no budget skip) → still 0 s,
+  no added latency (LP-0MU56ZKQD005SX08 behaviour preserved).
+
+The 503 body's JSON `retry_after` and the matching `Retry-After` header carry
+the derived value, so clients back off correctly. Regression tests:
+`proxy/tests/test_chain_hold_budget_window.py`.
+
 ## Acceptance criteria coverage
 
 - **AC1 — bounded failover:** `upstream_retry_failover_budget_seconds`
@@ -174,3 +203,5 @@ wait bounded by the cap. Warm/cold classification and lookup helpers live in
 - LP-0MSF5IAXE005BG33 — stall-gap distribution analysis (keeps 240 s).
 - LP-0MRFEXXVC001RYKB — Tier-3 cross-request stall circuit breaker.
 - LP-0MRF77A0E0026B9T — empty-response retry origin.
+- LP-0MVF0N9SA0071LWM — budget-window exhaustion derives `retry_after` from
+  the free-tier window rollover (see above).
