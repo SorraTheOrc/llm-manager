@@ -996,6 +996,13 @@ server:
   #   - quota_surge_days: length of the final surge window in days. An entry
   #     with `0 < seconds_to_reset <= quota_surge_days * 86400` is inside the
   #     window. 0 disables the window. Default: 7.
+  #     Inside this window the entry's `available_times` restriction is also
+  #     lifted for that account (LP-0MVF7KJN2000ASE8): the residual allowance
+  #     may be spent at any UTC hour, logged once per state change with
+  #     `reason=quota_surge`. Only `available_times` is bypassed — cooldown,
+  #     `rate_limit_rpm`, the sibling-failure circuit breaker, failure-domain
+  #     grouping, usage-limit quarantine and stall gates still apply. The
+  #     bypass clears when the account is exhausted or its reset passes.
   #   - quota_pacing_target: fraction of the residual allowance the ramp aims
   #     to spend by `resetsAt` (0.95 = finish at ~95%, leaving a 5% margin for
   #     the rolling/weekly caps). Values outside (0, 1] are clamped, not

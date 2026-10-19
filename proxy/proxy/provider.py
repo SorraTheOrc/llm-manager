@@ -2148,10 +2148,12 @@ def _quota_ordering_active(config: dict | None) -> bool:
     only while the quota-surge feature is enabled *and* not in dry-run.
     Dry-run still computes and logs the ranking
     (:func:`_quota_ranked_providers`) but never applies it.
+
+    Delegates to :func:`_quota_surge_applies` so ordering and the final-week
+    ``available_times`` bypass (LP-0MVF7KJN2000ASE8) can never disagree about
+    whether surge may change routing.
     """
-    return quota_pacing.surge_enabled(config) and not quota_pacing.surge_dry_run(
-        config
-    )
+    return _quota_surge_applies(config)
 
 
 def _quota_provider_score(
@@ -2388,7 +2390,7 @@ def resolve_provider(
                 remaining,
             )
             continue
-        if not _is_within_allowed_window(provider_cfg):
+        if not _provider_in_allowed_window(provider_cfg, config):
             logger.info(
                 "Skipping provider=%s: outside its available_times window (UTC)",
                 name,
@@ -2710,17 +2712,148 @@ def _is_within_allowed_window(provider_cfg: dict, now_utc: datetime | None = Non
     return False
 
 
-def _seconds_until_next_window(provider_cfg: dict, now_utc: datetime | None = None) -> float | None:
+# ---------------------------------------------------------------------------
+# Final-week available_times surge bypass (LP-0MVF7KJN2000ASE8)
+#
+# During the final ``server.quota_surge_days`` (default 7) before an
+# ``opencode-*`` account's monthly reset its remaining allowance is
+# use-it-or-lose-it, so the ``available_times`` restriction (a pricing-only
+# off-peak gate, LP-0MS4ETBNO0022QAC) is lifted for THAT account: the residual
+# may be spent at any UTC hour. Nothing else is bypassed — cooldown,
+# ``rate_limit_rpm`` budget, the sibling-failure circuit breaker, failure-domain
+# grouping, usage-limit quarantine and stall gates all keep running unchanged
+# (child AC6 / epic R7).
+#
+# The window is computed per account from its OWN ``resetsAt`` (reset dates are
+# not calendar-aligned) and the bypass clears automatically when the account
+# becomes exhausted or its reset passes (child AC5b).
+# ---------------------------------------------------------------------------
+
+#: account key -> last observed bypass state, for once-per-transition logging.
+_SURGE_BYPASS_LOGGED: dict[str, bool] = {}
+
+
+def reset_surge_bypass_state() -> None:
+    """Forget the per-account transition log state (tests, cache resets)."""
+    _SURGE_BYPASS_LOGGED.clear()
+
+
+def _quota_surge_applies(config: dict | None = None) -> bool:
+    """True when surge may change routing: enabled and not in dry-run.
+
+    The single review point for the kill switch (``quota_surge_enabled``) and
+    dry-run (``quota_surge_dry_run``) shared by headroom ordering and the
+    final-week bypass, so the two can never disagree. Dry-run leaves routing
+    byte-identical to the pre-feature behaviour.
+    """
+    return quota_pacing.surge_enabled(config) and not quota_pacing.surge_dry_run(
+        config
+    )
+
+
+def _log_surge_bypass_transition(
+    provider_cfg: dict,
+    snapshot: quota_state.QuotaSnapshot,
+    active: bool,
+) -> None:
+    """Log one INFO line per account state change (enter / leave) only.
+
+    Per-request logging would flood the log; the transition is remembered per
+    quota account (``api_key_env``, so two entries on independent keys track
+    independently). The line carries ``reason=quota_surge`` so operators can
+    grep the bypass, plus the account and its ``resetsAt``.
+    """
+    account = quota_state.account_key(provider_cfg)
+    previous = _SURGE_BYPASS_LOGGED.get(account, False)
+    if previous is active:
+        return
+    _SURGE_BYPASS_LOGGED[account] = active
+    resets_at = snapshot.monthly.resets_at
+    resets_at_text = (
+        resets_at.isoformat().replace("+00:00", "Z") if resets_at else "unknown"
+    )
+    logger.info(
+        "quota_surge_bypass %s provider=%s account=%s resets_at=%s "
+        "seconds_to_reset=%ds reason=quota_surge",
+        "entered" if active else "left",
+        str(provider_cfg.get("name") or "unknown"),
+        account,
+        resets_at_text,
+        int(snapshot.seconds_to_reset),
+    )
+
+
+def _quota_surge_bypass_active(
+    provider_cfg: dict, config: dict | None = None
+) -> bool:
+    """True when the final-week surge removes this entry's time restriction.
+
+    Active only when **all** hold (child AC5 / epic R4):
+
+    - surge may change routing (:func:`_quota_surge_applies`);
+    - the entry is quota-managed (:func:`proxy.quota_state.is_quota_provider`);
+    - a fresh snapshot exists and is not
+      :attr:`~proxy.quota_state.QuotaSnapshot.exhausted`;
+    - ``0 < seconds_to_reset <= server.quota_surge_days * 86400``, measured
+      from the account's own monthly ``resetsAt``.
+
+    A missing snapshot fails closed (no bypass): without authoritative quota
+    state the configured ``available_times`` gate stands. The module clock is
+    injectable through :func:`proxy.quota_state.set_clock`, so the reset
+    horizon is deterministic in tests.
+    """
+    if not _quota_surge_applies(config):
+        return False
+    if not quota_state.is_quota_provider(provider_cfg, config):
+        return False
+    snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+    if snapshot is None:
+        return False
+    active = not snapshot.exhausted and quota_pacing.surge_window_active(
+        snapshot.seconds_to_reset, config
+    )
+    _log_surge_bypass_transition(provider_cfg, snapshot, active)
+    return active
+
+
+def _provider_in_allowed_window(
+    provider_cfg: dict,
+    config: dict | None = None,
+    now_utc: datetime | None = None,
+) -> bool:
+    """True when *provider_cfg* may be used now: window **or** surge bypass.
+
+    The single eligibility predicate every resolution path (and the
+    retry-after / diagnostics derivations) uses for ``available_times``, so
+    they can never disagree: :func:`_is_within_allowed_window` is unchanged and
+    the final-week bypass is layered on top of it (LP-0MVF7KJN2000ASE8).
+    Nothing else is relaxed — callers keep checking cooldown, budget, circuit
+    breaker, failure domains, quarantine and stall gates themselves.
+    """
+    if _is_within_allowed_window(provider_cfg, now_utc=now_utc):
+        return True
+    return _quota_surge_bypass_active(provider_cfg, config)
+
+
+def _seconds_until_next_window(
+    provider_cfg: dict,
+    now_utc: datetime | None = None,
+    config: dict | None = None,
+) -> float | None:
     """Return seconds until the provider's next available_times window opens.
 
     Returns ``None`` when the provider is currently inside its window or has
     no ``available_times`` restriction. Otherwise returns the positive number
     of seconds until the next window start (UTC).
+
+    A surged entry (LP-0MVF7KJN2000ASE8) is already usable, so it contributes
+    no phantom "next window" delay: the surge bypass is part of the
+    eligibility check via :func:`_provider_in_allowed_window` (child AC5b).
     """
     windows = _parse_available_times(provider_cfg)
     if windows is None:
         return None
-    if _is_within_allowed_window(provider_cfg, now_utc=now_utc):
+    if _provider_in_allowed_window(provider_cfg, config, now_utc=now_utc):
         return None
     if now_utc is None:
         now_utc = datetime.now(UTC)
@@ -2748,6 +2881,7 @@ def _compute_retry_after(
     unavailable_providers: dict | None = None,
     model_config: dict | None = None,
     now_utc: datetime | None = None,
+    config: dict | None = None,
 ) -> int:
     """Compute an honest ``retry_after`` (seconds) from real availability data.
 
@@ -2756,6 +2890,10 @@ def _compute_retry_after(
     - available_times window edges (seconds until next window for providers
       currently outside their window)
     - usage-limit reset times (``_usage_reset_at`` remaining seconds)
+
+    ``config`` enables the final-week surge bypass for the window edges: a
+    surged entry is usable now, so it contributes no delay
+    (LP-0MVF7KJN2000ASE8, child AC5b).
 
     Returns 0 when every provider is actually available (edge case).
     """
@@ -2772,7 +2910,7 @@ def _compute_retry_after(
         for p in (model_config.get("providers") or []):
             if not isinstance(p, dict):
                 continue
-            secs = _seconds_until_next_window(p, now_utc=now_utc)
+            secs = _seconds_until_next_window(p, now_utc=now_utc, config=config)
             if secs is not None and secs > 0:
                 candidates.append(secs)
 
@@ -2970,7 +3108,9 @@ def _record_quarantine_attempts(
     return quarantined
 
 
-def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
+def _providers_outside_window(
+    model_config: dict, config: dict | None = None
+) -> list[dict[str, str]]:
     """Return ``{name, type}`` pairs for providers whose ``available_times``
     window excludes the current UTC time.
 
@@ -2981,12 +3121,15 @@ def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
     is also usage-limit quarantined is excluded: quarantine is the true reason
     and is reported once as ``usage_limit_reset`` by
     ``_record_quarantine_attempts`` (LP-0MU56ZFVD001LP0H).
+
+    A surged entry (:func:`_provider_in_allowed_window`) is not restricted, so
+    it is never reported as a window skip (LP-0MVF7KJN2000ASE8).
     """
     result: list[dict[str, str]] = []
     for p in model_config.get("providers") or []:
         if not isinstance(p, dict):
             continue
-        if _is_within_allowed_window(p):
+        if _provider_in_allowed_window(p, config):
             continue
         if _usage_reset_remaining(_usage_limit_account_key(p)) > 0:
             continue  # quarantine takes precedence over the window reason
@@ -3940,7 +4083,9 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
             media_type="application/json",
         )
 
-    retry_after = _compute_retry_after(unavailable_providers, model_config=model_config)
+    retry_after = _compute_retry_after(
+        unavailable_providers, model_config=model_config, config=config
+    )
     if retry_after <= 0:
         # Budget-skip-only exhaustion (LP-0MVF0N9SA0071LWM): a free-tier
         # rolling-window skip records no cooldown and no usage-limit reset, so
@@ -4025,7 +4170,9 @@ def _build_time_window_exhausted_response(
             if isinstance(p, dict) and p.get("name") not in window_names:
                 return None
 
-    retry_after = _compute_retry_after(unavailable, model_config=model_config)
+    retry_after = _compute_retry_after(
+        unavailable, model_config=model_config, config=config
+    )
     client_retry_after = min(retry_after, _max_retry_after_seconds(config))
     payload: dict[str, Any] = {
         "error": "All providers exhausted",
@@ -4827,7 +4974,7 @@ def _resolve_provider_with_exclusions(
                 remaining,
             )
             continue
-        if not _is_within_allowed_window(provider_cfg):
+        if not _provider_in_allowed_window(provider_cfg, config):
             logger.info(
                 "Skipping provider=%s: outside its available_times window (UTC)",
                 name,
@@ -7085,7 +7232,7 @@ async def _proxy_with_remote_fallback_cycle(
     # Record time-window skips as distinct diagnostics so operators can tell
     # whether providers were excluded by their available_times windows rather
     # than by cooldown/errors (LP-0MS4ETBNO0022QAC).
-    for skipped in _providers_outside_window(model_config):
+    for skipped in _providers_outside_window(model_config, config):
         _record_attempt(
             attempts,
             provider=skipped["name"],
@@ -7382,7 +7529,7 @@ async def _proxy_with_fallback_cycle(
                     continue
                 if candidate.get("type") != "remote":
                     continue
-                if not _is_within_allowed_window(candidate):
+                if not _provider_in_allowed_window(candidate, config):
                     continue
                 provider_cfg = candidate
                 break
@@ -8559,7 +8706,7 @@ async def _proxy_with_fallback_cycle(
     # Record time-window skips as distinct diagnostics so operators can tell
     # whether providers were excluded by their available_times windows rather
     # than by cooldown/errors (LP-0MS4ETBNO0022QAC).
-    for skipped in _providers_outside_window(model_config):
+    for skipped in _providers_outside_window(model_config, config):
         _record_attempt(
             attempts,
             provider=skipped["name"],
