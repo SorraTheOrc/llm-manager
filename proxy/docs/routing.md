@@ -245,9 +245,55 @@ Behaviour when enabled, on an HTTP 429 only:
   `ratelimit_reset_seconds`, `ratelimit_over_limit`) and persisted in
   `provider-state.json`, so the `Skipping provider=… in cooldown (Ns
   remaining)` log line shows the header-derived wait.
+- On a **quota** 429 (per-account rate-limit error or
+  `x-ratelimit-over-limit: yes`) the parsed reset is *also* applied as an
+  account-scoped quarantine (reset + the 2-minute usage-limit margin), keyed
+  on `api_key_env` so same-gateway paid siblings stay eligible — see
+  [Account-scoped quarantine from reset headers](#account-scoped-quarantine-from-reset-headers-lp-0mvfa1vrt007t9ht).
 
 Default is **off**: every existing provider keeps its pre-change behaviour.
 The `munitoai-free` and `munitoai` entries opt in via `config.yaml`.
+
+#### Account-scoped quarantine from reset headers (LP-0MVFA1VRT007T9HT)
+
+A reset header on a **quota** 429 is applied to the failing ACCOUNT, not just
+the provider entry. This is the account-scoped half of the header support
+above; the entry-level cooldown described there is unchanged.
+
+- **Trigger:** an HTTP 429 whose body is a per-account rate-limit error
+  (`type: rate_limit_error` or `code: rate_limit_exceeded`, top-level or
+  nested under `error` — the observed MunitoAI body) **or** which carries
+  `x-ratelimit-over-limit: yes`, **and** which also yields a parseable
+  `x-ratelimit-reset-*` duration. No reset signal (or a zero/absent value)
+  means no account quarantine: the pre-existing short provider cooldown and
+  per-request account-key exclusion apply exactly as before.
+- **Duration:** `parsed reset + _USAGE_LIMIT_RESET_MARGIN_SECONDS` (120 s).
+  Two distinct margins apply on such a 429 and they are **not**
+  interchangeable: the **2-second** `server.ratelimit_cooldown_margin_seconds`
+  pads the provider-ENTRY cooldown, while the **2-minute** usage-limit margin
+  pads the persisted ACCOUNT quarantine.
+- **Account key:** `_usage_limit_account_key` = `api_key_env` @ the
+  entry's failure domain (`endpoint:model`). Entries without an
+  `api_key_env` fall back to the failure-domain key. Because the key is the
+  API-key account, a paid sibling on the same gateway (e.g. `munitoai` on
+  `MUNITOAI_API_KEY` after `munitoai-free` on `MUNITOAI_FREE_API_KEY` hit its
+  quota) has an independent key, stays unquarantined, and remains eligible
+  for the rest of the request (LP-0MVCX0E2V001VB5N).
+- **Consequences:** the quarantine is recorded in `_usage_reset_at` as an
+  **explicit** reset (so it is exempt from the guessed-quarantine 24 h cap and
+  the self-healing probe), is persisted to `provider-state.json` and therefore
+  survives a proxy restart, is recorded in the attempt
+  (`account_quarantine_seconds`) and in the exhaustion diagnostics
+  (`usage_limit_reset` with `reset_in`/`reset_at`), and feeds
+  `_compute_retry_after()` — so an exhausted chain-hold reports the reset as
+  its `retry_after` instead of a blind backoff. Chain-hold cycles themselves
+  (`chain_hold_seconds` 300 s, `chain_hold_max_cycles` 3, `chain_hold_total_seconds`
+  720 s) are unchanged: the account is
+  excluded, the request advances down the chain, and siblings keep their
+  normal eligibility.
+- **Flag gate:** the header is only consulted when
+  `respect_ratelimit_headers` is enabled for the entry (or globally); with it
+  off the reset is ignored and no account quarantine is created.
 
 ### Responses-API providers (`api: openai-responses`)
 

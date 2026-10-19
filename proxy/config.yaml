@@ -117,7 +117,12 @@
 #                    reported reset plus `server.ratelimit_cooldown_margin_seconds`
 #                    (default 2s), instead of only the exponential-backoff
 #                    guess. Use for gateways that send no `Retry-After`
-#                    (e.g. MunitoAI). The entry flag overrides
+#                    (e.g. MunitoAI). On a quota 429 the reset also
+#                    quarantines the failing API-key ACCOUNT (reset + the
+#                    2-minute usage-limit margin) — distinct from the 2-second
+#                    `ratelimit_cooldown_margin_seconds` entry margin — while
+#                    same-gateway paid siblings stay eligible
+#                    (LP-0MVFA1VRT007T9HT). The entry flag overrides
 #                    `server.respect_ratelimit_headers`; default false so
 #                    every existing provider is unchanged (LP-0MVBHDNLB007ALLJ).
 #
@@ -353,6 +358,12 @@ models:
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
         respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
@@ -455,6 +466,12 @@ models:
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
         respect_ratelimit_headers: true
         type: remote
         provider: MunitoAI
@@ -533,6 +550,12 @@ models:
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
         respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
@@ -628,6 +651,12 @@ models:
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
         respect_ratelimit_headers: true
         type: remote
         provider: MunitoAI
@@ -687,6 +716,12 @@ models:
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
         respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
@@ -782,6 +817,12 @@ models:
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
         respect_ratelimit_headers: true
         type: remote
         provider: MunitoAI
@@ -931,6 +972,13 @@ server:
   # guess, so the proxy stops probing an endpoint that is guaranteed to reject
   # during a rate-limit exhaustion window. Enable per provider entry with
   # `respect_ratelimit_headers: true` (the entry flag wins), or globally here.
+  # On a quota 429 (per-account rate_limit_error / rate_limit_exceeded, or
+  # `x-ratelimit-over-limit`) the parsed reset is ALSO applied as an
+  # account-scoped quarantine of reset + the 2-minute usage-limit margin
+  # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), keyed on api_key_env@endpoint:model
+  # so same-gateway paid siblings stay eligible (LP-0MVFA1VRT007T9HT). Two
+  # margins, never interchangeable: 2 s for the entry cooldown above,
+  # 2 minutes for the account quarantine.
   # Default false: every provider keeps its existing behaviour.
   respect_ratelimit_headers: false
   # Safety margin added to a header-derived cooldown so it never expires
