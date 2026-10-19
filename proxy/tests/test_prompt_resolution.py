@@ -475,8 +475,8 @@ def test_author_alias_resolves_author_txt_from_real_config():
     ``override`` mode so the proxy auto-injects the wiki authoring guidelines
     without any client supplying them.
     """
-    from proxy.prompt_resolver import REPO_ROOT, resolve_system_prompt
     from config_test_utils import load_profile
+    from proxy.prompt_resolver import REPO_ROOT, resolve_system_prompt
 
     cfg = load_profile("config.yaml")
     model_cfg = cfg["models"]["author"]

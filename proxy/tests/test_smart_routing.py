@@ -549,8 +549,8 @@ class TestEconomicBypassRecoveryFlag:
     # ``high`` never does.
     def test_priority_overrides_shipped_flag(self):
         """The shipped unified config omits the flag; priority decides."""
-        from proxy.provider import _economic_bypass_serves_local
         from config_test_utils import get_merged_config
+        from proxy.provider import _economic_bypass_serves_local
 
         unified = get_merged_config("fast")
         assert (
