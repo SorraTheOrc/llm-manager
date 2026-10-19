@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from proxy import quota_state
 from proxy.lifecycle import _extract_router_model_ids
 from proxy.observability import _query_slots_detail
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
@@ -101,6 +102,36 @@ def _current_priority_window() -> str:
         return "off"
 
 
+def _quota_cell_text(provider_cfg: dict, config) -> str:
+    """Home-page quota text for one provider entry (never raises).
+
+    Degrades to an empty string when the quota surface is unavailable or the
+    entry has no polled state, so the home page can never be broken by quota
+    observability (LP-0MVF7KQED005TG9Z AC2b).
+    """
+    try:
+        return quota_state.format_quota_status(
+            provider_cfg, config if isinstance(config, dict) else None
+        )
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
+def _quota_status_payload(config):
+    """The ``quota`` section for ``/events``, or ``None`` when unavailable.
+
+    A quota-surface failure must never break the SSE status stream, so any
+    error degrades to ``None`` (the same "absent state" shape a pre-poll
+    process already produces).
+    """
+    try:
+        return quota_state.quota_status_payload(
+            config if isinstance(config, dict) else None
+        )
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def _build_home_model_rows(srv) -> str:
     """Build the Home tab model endpoint table rows.
 
@@ -171,6 +202,15 @@ def _build_home_model_rows(srv) -> str:
             if budget_status:
                 active_times_cell += (
                     f' <span class="provider-budget">{budget_status}</span>'
+                )
+            # Derived quota state (LP-0MVF7KQED005TG9Z): remaining allowance,
+            # reset countdown and surge state next to availability / budget.
+            # Empty when the entry has never been polled, so a disabled
+            # feature or a pre-poll process renders exactly as before.
+            quota_status = _quota_cell_text(p, srv.config)
+            if quota_status:
+                active_times_cell += (
+                    f' <span class="provider-quota">{quota_status}</span>'
                 )
 
             if is_first:
@@ -366,6 +406,10 @@ async def status_events():
                 "total_recv": total_recv,
                 "per_model_queries": per_model_queries,
                 "slots": slot_details,
+                # Derived per-account quota state (LP-0MVF7KQED005TG9Z):
+                # null when the feature is disabled or nothing has been
+                # polled yet, so the payload degrades cleanly (AC2b).
+                "quota": _quota_status_payload(srv.config),
             })
             yield f"data: {initial_status}\n\n"
 

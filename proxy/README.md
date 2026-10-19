@@ -2577,6 +2577,21 @@ Token-rate observability metrics (exposed on `/metrics`):
 - `llama_token_rate_gauge{session_id="..."}` (gauge) — Best-effort instantaneous tokens/second observed for an active session. Useful for short-term spikes and live dashboards.
 - `llama_token_rate_histogram{session_id="..."}` (histogram) — Bucketed distribution of observed token rates per session. Use Prometheus `histogram_quantile()` over a reasonable window (e.g., 5m) to compute operational percentiles for calibration.
 
+Quota observability metrics (LP-0MVF7KQED005TG9Z, exposed on `/metrics`):
+
+- `quota_rolling_percent{account="...",entry="..."}` (gauge) — rolling-window quota percentage consumed.
+- `quota_weekly_percent{account="...",entry="..."}` (gauge) — weekly-window quota percentage consumed.
+- `quota_monthly_percent{account="...",entry="..."}` (gauge) — monthly-window quota percentage consumed.
+- `quota_effective_headroom{account="...",entry="..."}` (gauge) — remaining allowance percentage across the binding (minimum) window.
+- `quota_seconds_to_reset{account="...",entry="..."}` (gauge) — seconds until the account's monthly allowance resets.
+- `quota_resets_at_timestamp_seconds{account="...",entry="..."}` (gauge) — Unix timestamp of the monthly allowance reset.
+- `quota_surge_active{account="...",entry="..."}` (gauge) — 1 when quota-driven surge is active for the account.
+- `quota_exhausted{account="...",entry="..."}` (gauge) — 1 when the account quota is exhausted.
+- `quota_last_poll_timestamp_seconds{account="...",entry="..."}` (gauge) — Unix timestamp of the last successful `/v1/usage` poll.
+- `quota_poll_failures_total{account="...",reason="..."}` (counter) — failed `/v1/usage` polls by account and reason (e.g. `QuotaPollError`, `ReadTimeout`).
+
+`account` is the account key derived from the provider entry's `api_key_env` **name** (e.g. `OPENCODE_2_API_KEY`) — never the API key value; `entry` is the configured provider entry name. The same derived per-account fields (including `surge_active`/`exhausted`, `resetsAt` and `seconds_to_reset`) are also exposed in the `/events` status payload's `quota` section and on the home-page model rows, and all surfaces degrade cleanly (no quota data) until the first successful poll (LP-0MVF7KQED005TG9Z AC2/AC2b).
+
 Example queries:
 - 95th percentile token-rate across all sessions:
 ```promql

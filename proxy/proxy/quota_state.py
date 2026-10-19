@@ -71,7 +71,7 @@ from typing import Any
 
 import httpx
 
-from proxy import quota_pacing
+from proxy import metrics, quota_pacing
 
 logger = logging.getLogger("llama-proxy.quota_state")
 
@@ -246,19 +246,22 @@ class QuotaSnapshot:
             return True
         return self.effective_headroom <= 0.0
 
-    @property
-    def seconds_to_reset(self) -> float:
-        """Seconds until the account's monthly allowance resets.
+    def seconds_to_reset_at(self, now: datetime) -> float:
+        """Seconds until the account's monthly allowance resets, at *now*.
 
         The monthly window is the account's allowance period (reset dates are
         per account and not calendar-aligned). Returns ``0`` when the reset
         time is missing or unparseable in **any** window — a partial report is
         never allowed to produce a guessed reset (child AC2b).
         """
-        now = _now()
         if any(window.resets_at is None for window in self.windows.values()):
             return 0.0
         return self.monthly.seconds_to_reset_at(now)
+
+    @property
+    def seconds_to_reset(self) -> float:
+        """Seconds until the account's monthly allowance resets (module clock)."""
+        return self.seconds_to_reset_at(_now())
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +783,264 @@ def reset_quota_state() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Observability surface (LP-0MVF7KQED005TG9Z)
+# ---------------------------------------------------------------------------
+#
+# A single source of truth for the three consumer surfaces — the Prometheus
+# gauges (``proxy/metrics.py``), the ``/events`` status payload and the home
+# page model rows — so they can never disagree about "how much is left, when
+# does it reset, is surge active". Logging levels already follow epic R8 here
+# and in ``proxy/provider.py`` (polls and surge transitions at INFO,
+# per-request ordering at DEBUG, quota-driven skips at INFO).
+
+
+def _isoformat(dt: datetime | None) -> str | None:
+    """ISO-8601 UTC text for a datetime, or ``None`` (never raises)."""
+    if dt is None:
+        return None
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _account_seconds_to_reset(snapshot: QuotaSnapshot, now: datetime) -> float:
+    """Account-level reset countdown at *now* (no clock read of its own)."""
+    return snapshot.seconds_to_reset_at(now)
+
+
+def _surge_active(
+    snapshot: QuotaSnapshot,
+    config: dict | None,
+    behaviour: QuotaBehaviour,
+    now: datetime,
+) -> bool:
+    """The surge flag the surface exposes, mirroring the routing bypass.
+
+    Mirrors ``proxy.provider._quota_surge_bypass_active`` so the surface can
+    never disagree with actual routing: the central behaviour predicate must
+    report ``enabled`` (kill switch, dry-run and stale-state suspension all
+    switch it off), the account must not be exhausted, and its own monthly
+    reset must lie inside the surge window.
+    """
+    if not behaviour.applies:
+        return False
+    if snapshot.exhausted:
+        return False
+    return quota_pacing.surge_window_active(
+        _account_seconds_to_reset(snapshot, now), config
+    )
+
+
+def surge_active_for(
+    snapshot: QuotaSnapshot,
+    config: dict | None = None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Whether *snapshot*'s account is surge-active right now.
+
+    A pure derivation over the cached snapshot and the central behaviour
+    predicate — no polling, no side effects beyond the predicate's own
+    once-per-transition suspension WARN (which is a deliberate observability
+    signal, not a routing mutation).
+    """
+    current = now if now is not None else _now()
+    return _surge_active(
+        snapshot, config, quota_behaviour(config, now=current), current
+    )
+
+
+def _snapshot_observation(
+    snapshot: QuotaSnapshot,
+    entry: str,
+    config: dict | None,
+    behaviour: QuotaBehaviour,
+    now: datetime,
+) -> dict:
+    """One account's observable derived state (see snapshot_observation)."""
+    monthly_resets_at = snapshot.monthly.resets_at
+    return {
+        "account": snapshot.account,
+        "entry": entry,
+        "rolling": {
+            "percent": snapshot.rolling.percent,
+            "resetsAt": _isoformat(snapshot.rolling.resets_at),
+            "seconds_to_reset": snapshot.rolling.seconds_to_reset_at(now),
+            "status": snapshot.rolling.status,
+            "headroom": snapshot.rolling.headroom,
+        },
+        "weekly": {
+            "percent": snapshot.weekly.percent,
+            "resetsAt": _isoformat(snapshot.weekly.resets_at),
+            "seconds_to_reset": snapshot.weekly.seconds_to_reset_at(now),
+            "status": snapshot.weekly.status,
+            "headroom": snapshot.weekly.headroom,
+        },
+        "monthly": {
+            "percent": snapshot.monthly.percent,
+            "resetsAt": _isoformat(monthly_resets_at),
+            "seconds_to_reset": snapshot.monthly.seconds_to_reset_at(now),
+            "status": snapshot.monthly.status,
+            "headroom": snapshot.monthly.headroom,
+        },
+        "effective_headroom": snapshot.effective_headroom,
+        "resetsAt": _isoformat(monthly_resets_at),
+        "resets_at_timestamp_seconds": (
+            monthly_resets_at.timestamp() if monthly_resets_at else 0.0
+        ),
+        "seconds_to_reset": _account_seconds_to_reset(snapshot, now),
+        "surge_active": _surge_active(snapshot, config, behaviour, now),
+        "exhausted": snapshot.exhausted,
+        "stale": behaviour.suspended,
+        "last_poll_timestamp_seconds": snapshot.last_success_at.timestamp(),
+        "last_status": snapshot.last_status,
+    }
+
+
+def snapshot_observation(
+    snapshot: QuotaSnapshot,
+    config: dict | None = None,
+    *,
+    entry: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """The derived per-account quota state every surface exposes (AC2).
+
+    Single source of truth for the Prometheus gauges, the ``/events`` quota
+    section and the home-page quota cell. Fields:
+
+    - per-window ``rolling`` / ``weekly`` / ``monthly``: ``percent``,
+      ``resetsAt`` (ISO-8601 UTC or ``None``), ``seconds_to_reset``,
+      ``status`` and ``headroom``;
+    - account-level ``effective_headroom`` (the **minimum** of the three
+      windows — epic R2), ``resetsAt`` / ``resets_at_timestamp_seconds`` (the
+      monthly reset, the account's allowance period), ``seconds_to_reset``,
+      ``surge_active``, ``exhausted``, ``stale``,
+      ``last_poll_timestamp_seconds`` and ``last_status``.
+
+    ``entry`` defaults to the account key so a caller that only has a snapshot
+    still produces a valid label. ``now`` defaults to the module clock so
+    tests freeze it together with the poller.
+    """
+    current = now if now is not None else _now()
+    behaviour = quota_behaviour(config, now=current)
+    return _snapshot_observation(
+        snapshot, entry or snapshot.account, config, behaviour, current
+    )
+
+
+def _entry_names_by_account(config: dict | None) -> dict[str, str]:
+    """Map account key → first configured provider entry name (stable)."""
+    names: dict[str, str] = {}
+    for provider_cfg in collect_quota_providers(config):
+        if not is_quota_provider(provider_cfg, config):
+            continue
+        names.setdefault(
+            account_key(provider_cfg),
+            str(provider_cfg.get("name") or account_key(provider_cfg)),
+        )
+    return names
+
+
+def quota_status_payload(
+    config: dict | None = None,
+    *,
+    now: datetime | None = None,
+) -> dict | None:
+    """The ``quota`` section for the ``/events`` status payload / home page.
+
+    Returns ``None`` — never raises — when no quota state has been polled yet
+    (the clean-degradation contract of AC2b: a disabled feature or a pre-poll
+    process must not break the status stream). Otherwise returns::
+
+        {
+          "enabled": True,            # surge feature on (not kill-switched)
+          "mode": "enabled",          # enabled|dry_run|suspended|disabled
+          "poll_interval_seconds": 900.0,
+          "accounts": [ <snapshot_observation>, ... ],
+        }
+
+    ``accounts`` carries the entry names from *config* when present (falling
+    back to the account key), so the metrics surface and the UI label an
+    account the same way.
+    """
+    snapshots = cached_snapshots()
+    if not snapshots:
+        return None
+    current = now if now is not None else _now()
+    behaviour = quota_behaviour(config, now=current)
+    entries = _entry_names_by_account(config)
+    accounts = [
+        _snapshot_observation(
+            snapshot,
+            entries.get(account, account),
+            config,
+            behaviour,
+            current,
+        )
+        for account, snapshot in snapshots.items()
+    ]
+    accounts.sort(key=lambda item: item["account"])
+    return {
+        "enabled": behaviour.enabled,
+        "mode": behaviour.mode,
+        "poll_interval_seconds": poll_interval_seconds(config),
+        "accounts": accounts,
+    }
+
+
+def _format_reset_countdown(seconds: float) -> str:
+    """Human countdown like ``14d`` / ``3d4h`` / ``5h12m`` / ``8m``, or ``""``."""
+    if seconds <= 0 or not math.isfinite(seconds):
+        return ""
+    remaining = int(seconds)
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, _ = divmod(remaining, 60)
+    if days:
+        return f"{days}d{hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h{minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
+
+
+def format_quota_status(
+    provider_cfg: dict,
+    config: dict | None = None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Home-page text for one provider entry, or ``""`` when nothing to show.
+
+    Shows the remaining allowance (``effective_headroom``), the monthly
+    consumption, the account's reset countdown and the surge state next to the
+    existing availability / budget cells (AC2b). Returns ``""`` without
+    raising when the entry has never been polled, so disabled-feature and
+    pre-poll states degrade cleanly.
+    """
+    if not isinstance(provider_cfg, dict):
+        return ""
+    snapshot = get_quota_snapshot(provider_cfg, config)
+    if snapshot is None:
+        return ""
+    current = now if now is not None else _now()
+    behaviour = quota_behaviour(config, now=current)
+    remaining = _account_seconds_to_reset(snapshot, current)
+    parts: list[str] = []
+    if snapshot.exhausted:
+        parts.append("exhausted")
+    else:
+        parts.append(f"{snapshot.effective_headroom:.0f}% eff")
+    parts.append(f"monthly {snapshot.monthly.percent:.0f}%")
+    countdown = _format_reset_countdown(remaining)
+    if countdown:
+        parts.append(f"resets {countdown}")
+    if _surge_active(snapshot, config, behaviour, current):
+        parts.append("surge")
+    if behaviour.suspended:
+        parts.append("stale")
+    return "quota " + " · ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Polling
 # ---------------------------------------------------------------------------
 
@@ -853,7 +1114,9 @@ def _handle_poll_failure(
     return failed
 
 
-async def _poll_account(account: str, provider_cfg: dict) -> QuotaSnapshot | None:
+async def _poll_account(
+    account: str, provider_cfg: dict, config: dict | None = None
+) -> QuotaSnapshot | None:
     """Poll one account once. Never raises (except cancellation)."""
     try:
         body = await _fetch_usage(provider_cfg)
@@ -861,6 +1124,7 @@ async def _poll_account(account: str, provider_cfg: dict) -> QuotaSnapshot | Non
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        metrics.record_quota_poll_failure(account, type(exc).__name__)
         return _handle_poll_failure(account, exc)
 
     _snapshots[account] = snapshot
@@ -874,6 +1138,15 @@ async def _poll_account(account: str, provider_cfg: dict) -> QuotaSnapshot | Non
         snapshot.monthly.percent,
         int(snapshot.seconds_to_reset),
         snapshot.effective_headroom,
+    )
+    # Publish the derived state on the observability surface so the operator
+    # can answer "how much is left / when does it reset / is surge active".
+    metrics.record_quota_state(
+        snapshot_observation(
+            snapshot,
+            config,
+            entry=str(provider_cfg.get("name") or account),
+        )
     )
     return snapshot
 
@@ -903,7 +1176,7 @@ async def _refresh_account(
                 return cached
 
     _last_poll_at[account] = _now()
-    task = asyncio.ensure_future(_poll_account(account, provider_cfg))
+    task = asyncio.ensure_future(_poll_account(account, provider_cfg, config))
     _inflight[account] = task
     try:
         return await task
