@@ -213,9 +213,148 @@ async def _try_adopt_running_llama_server(
             )
         except Exception:
             pass
+        # LP-0MVECX47Z004LJAQ: the log relay must survive the adoption. New
+        # spawns redirect llama-server's stdout/stderr directly into the log
+        # file (fd owned by the backend itself), so the relay is intrinsically
+        # attached — nothing to re-attach. A backend spawned by a pre-fix
+        # proxy still routes through the dead pipe (its reader thread died with
+        # the old proxy): re-attachment is impossible, so per AC2 we detect it,
+        # log a WARNING and mark the llama log source unhealthy — we do NOT
+        # restart (AC5: preserve the warm prompt cache).
+        try:
+            _verify_adopted_log_relay(srv)
+        except Exception:
+            pass
         return True
     except Exception:
         return False
+
+
+def _resolve_llama_log_path(srv) -> Path:
+    """Resolve the llama-server log path for the given server context."""
+    log_dir = getattr(srv, "log_dir", None)
+    if log_dir:
+        return Path(log_dir) / "llama-server.log"
+    return Path(__file__).resolve().parent / "logs" / "llama-server.log"
+
+
+def _log_has_live_writer(log_path: Path, exclude_pid: int | None = None) -> bool:
+    """True when any live process holds ``log_path`` open for writing.
+
+    In the direct-redirection design (LP-0MVECX47Z004LJAQ) the backend itself
+    holds llama-server.log as its stdout/stderr fd, so a live *writable*
+    holder proves the relay is attached and log lines will keep flowing even
+    after a proxy restart. A pre-fix backend holds only the dead pipe — nobody
+    holds the log file for writing, which identifies the frozen case without
+    shell access.
+
+    Read-only holders (e.g. the log-tail SSE viewers or the progress tailer)
+    are ignored via the fdinfo access-mode flags, so they cannot mask a broken
+    relay. ``exclude_pid`` (typically the probing proxy's own PID) removes the
+    proxy's own write handle from consideration: when the proxy opened the log
+    for the backend, only the backend's own hold should count as evidence that
+    the relay is alive.
+    """
+    target = os.path.realpath(str(log_path))
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            if exclude_pid is not None and int(entry) == int(exclude_pid):
+                continue
+            proc_base = f"/proc/{entry}"
+            fd_dir = f"{proc_base}/fd"
+            try:
+                names = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for name in names:
+                try:
+                    link = os.readlink(f"{fd_dir}/{name}")
+                except OSError:
+                    continue
+                if os.path.realpath(link) != target:
+                    continue
+                # Require write access (O_WRONLY=1 / O_RDWR=2; O_RDONLY=0).
+                try:
+                    with open(f"{proc_base}/fdinfo/{name}", encoding="utf-8") as fh:
+                        for line in fh:
+                            if line.startswith("flags:"):
+                                flags = int(line.split()[1], 8)
+                                return (flags & 0o3) in (0o1, 0o2)
+                        # fdinfo present but no flags line (rare) — fail open
+                        return True
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def _verify_adopted_log_relay(srv) -> None:
+    """Verify the adopted backend's log relay is attached (LP-0MVECX47Z004LJAQ).
+
+    New spawns redirect the backend's stdout directly into llama-server.log so
+    the relay is intrinsic and survives the proxy. When a live writable
+    holder keeps the log file open, the relay is healthy and nothing needs
+    re-attaching.
+
+    If the log file exists but nobody holds it open for writing (the pre-fix
+    pipe-based backend whose reader thread died with the old proxy),
+    re-attachment is impossible: log a WARNING and mark the llama log source
+    unhealthy (visible in ``/health``) — AC2: no silent freeze. We deliberately
+    do NOT restart the backend here, which would discard the warm prompt cache
+    (AC5). When the log file is absent entirely we cannot judge and leave the
+    source unflagged (fail-safe).
+    """
+    log_path = _resolve_llama_log_path(srv)
+    if not log_path.exists():
+        return
+    # LP-0MVECX47Z004LJAQ: re-attach prefill progress logging by (re)starting
+    # the log tailer over the surviving backend's log file. This is the
+    # "re-attachment" of the log sink that survives the proxy restart; it is
+    # safe whether or not the backend was spawned by a pre-fix proxy.
+    try:
+        start_llama_log_tailer(
+            srv, model_name=getattr(srv, "current_model", None) or "unknown"
+        )
+    except Exception:
+        pass
+    if _log_has_live_writer(log_path, exclude_pid=os.getpid()):
+        try:
+            srv.logger.info(
+                "Adopted llama-server log relay attached (%s)", log_path
+            )
+        except Exception:
+            pass
+        return
+    try:
+        srv.logger.warning(
+            "Adopted llama-server log relay is NOT attached — no live writer "
+            "on %s: the backend was likely spawned with a proxy-owned stdout "
+            "pipe whose reader died with the previous proxy. Re-attachment is "
+            "impossible; llama-server.log cannot receive new lines. Marking "
+            "llama log source unhealthy; restart llama-server to restore "
+            "logging (LP-0MVECX47Z004LJAQ).",
+            log_path,
+        )
+    except Exception:
+        pass
+    try:
+        srv.llama_log_source_unhealthy = True
+    except Exception:
+        pass
+
+
+def _llama_log_age_seconds(srv) -> float | None:
+    """Age of llama-server.log in seconds, or None when the file is absent."""
+    try:
+        log_path = _resolve_llama_log_path(srv)
+        if not log_path.exists():
+            return None
+        return time.time() - log_path.stat().st_mtime
+    except Exception:
+        return None
 
 
 def _note_model_loaded_cold_start() -> None:
@@ -1107,20 +1246,34 @@ def spawn_and_capture(
 ) -> tuple:
     """Start a subprocess and capture immediate stderr/stdout if it exits quickly.
 
+    LP-0MVECX47Z004LJAQ: when a real log file is available, llama-server's
+    stdout/stderr are redirected DIRECTLY into that file (no proxy-owned pipe +)
+    reader thread). The write fd is held by the backend process itself, so a
+    proxy-only restart that ADOPTS the running backend keeps llama-server.log
+    flowing — nothing in the relay dies with the old proxy and nothing needs
+    re-attaching on adoption.
+
+    The pipe + ``_stream_output`` reader-thread path is retained only when no
+    log file exists (``DEVNULL``/``None`` — e.g. logging disabled), where there
+    is no durable sink to protect.
+
     Args:
         cmd: Command list to execute.
         env: Environment variables.
-        log_file: File-like object for streaming output.
+        log_file: Log destination for streaming output. A real file object is
+            passed straight to the child as its stdout/stderr; ``DEVNULL``/
+            ``None`` falls back to the legacy pipe relay.
         logger: Logger instance.
         model_name: Short model name for progress display (e.g. "Qwen3", "gemma4").
 
     Returns a tuple (Popen|None, captured_output_str|None).
     """
+    direct_to_file = log_file not in (None, subprocess.DEVNULL)
     try:
         proc = subprocess.Popen(
             cmd,
             env=env,
-            stdout=subprocess.PIPE,
+            stdout=log_file if direct_to_file else subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             start_new_session=True,
@@ -1134,28 +1287,125 @@ def spawn_and_capture(
         return None, f"Spawn failed: {e}\n{tb}"
 
     try:
+        if direct_to_file:
+            # No pipe to poll for output: wait out the quick-exit window and
+            # read the startup diagnostics from the log tail instead.
+            proc.wait(timeout=3)
+            return None, _read_log_tail(log_file)
         outs, _ = proc.communicate(timeout=3)
         return None, outs
     except subprocess.TimeoutExpired:
-        try:
-            if log_file and proc.stdout:
-                t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file, model_name, logger), daemon=True)
-                t.start()
-        except Exception:
-            pass
+        if not direct_to_file:
+            try:
+                if log_file and proc.stdout:
+                    t = threading.Thread(target=_stream_output, args=(proc.stdout, log_file, model_name, logger), daemon=True)
+                    t.start()
+            except Exception:
+                pass
         return proc, None
 
 
+def _read_log_tail(log_file, max_bytes: int = 16384) -> str:
+    """Read the tail of a log file a quick-exiting child wrote to.
+
+    Used for startup-failure diagnostics when stdout was redirected directly
+    into the log file (no pipe to capture from).
+    """
+    try:
+        path = getattr(log_file, "name", None)
+        if not path or not os.path.isfile(path):
+            return ""
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            return f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+class _ProgressLogger:
+    """Threshold-deduplicated logger for llama-server prefill progress lines.
+
+    Per-slot progress thresholds are tracked in-memory so each slot
+    independently triggers log entries only when crossing a new 10% boundary.
+    Shared by the pipe relay (``_stream_output``) and the log tailer
+    (``_llama_log_progress_tailer``) so both emit identical proxy.log lines
+    (LP-0MVECX47Z004LJAQ).
+    """
+
+    def __init__(self, model_name: str = "unknown") -> None:
+        # Maps slot_id -> last logged 10%-bucket index (0-10, where 0 = 0%, 10 = 100%).
+        # A slot not in the dict has never been logged.
+        self._last_logged_pct: dict[int, int] = {}
+        self.first_progress_time: float | None = None
+        self.model_name = model_name
+
+    def handle_line(self, line_str: str, logger: logging.Logger | None) -> None:
+        """Log one progress line if it crosses a new per-slot threshold."""
+        if 'prompt processing' not in line_str.lower():
+            return
+        parsed = extract_progress_data(line_str)
+        if not parsed:
+            return
+        slot_id, n_tokens, progress = parsed
+        total_tokens = int(n_tokens / progress) if progress > 0 else n_tokens
+
+        # Track elapsed time for average tokens/sec calculation
+        now = time.monotonic()
+        if self.first_progress_time is None:
+            self.first_progress_time = now
+        elapsed = now - self.first_progress_time
+        if elapsed < 0.5:
+            tokens_per_sec = None
+        else:
+            tokens_per_sec = n_tokens / elapsed
+
+        # Dynamically resolve model name for router mode
+        resolved_name = self.model_name
+        if resolved_name == "unknown":
+            try:
+                srv = _srv()
+                if getattr(srv, 'current_model', None):
+                    resolved_name = srv.current_model
+            except Exception:
+                pass
+
+        progress_str = format_progress(
+            n_tokens, total_tokens, progress,
+            model_name=resolved_name,
+            slot_id=slot_id,
+            tokens_per_sec=tokens_per_sec,
+        )
+
+        # Threshold-based logging: log at start, at each 10% milestone, and at
+        # completion (progress >= 1.0).
+        current_threshold = int(min(progress, 1.0) * 10)
+        last = self._last_logged_pct.get(slot_id)
+
+        if last is None:
+            # First progress data for this slot — always log.
+            self._last_logged_pct[slot_id] = current_threshold
+            if logger:
+                logger.info(progress_str)
+        elif current_threshold > last:
+            # Crossed a new 10% boundary.
+            self._last_logged_pct[slot_id] = current_threshold
+            if logger:
+                logger.info(progress_str)
+        elif progress >= 1.0 and last < 10:
+            # Final milestone (progress >= 100%) — ensure logged.
+            self._last_logged_pct[slot_id] = 10
+            if logger:
+                logger.info(progress_str)
+
+
 def _stream_output(src, dst, model_name: str = "unknown", logger: logging.Logger | None = None):
-    """Stream lines from src to dst, logging prompt progress as timestamped INFO entries.
+    """Stream lines from src to dst, logging prompt progress as INFO entries.
 
-    Instead of writing progress updates to stderr with carriage-return overwrites,
-    this function logs clean progress entries via the Python logging system at
-    each 10% progress milestone (10%, 20%, …, 100%) per slot.
-
-    Per-slot progress thresholds are tracked in-memory so each slot independently
-    triggers log entries only when crossing a new 10% boundary.  The state is
-    scoped to the lifetime of this thread (one per llama-server process).
+    Legacy pipe-relay path, used only when llama-server output is NOT redirected
+    directly into a log file (e.g. logging disabled). Progress lines are logged
+    via ``_ProgressLogger`` at each 10% milestone per slot.
 
     Args:
         src: Source stream (e.g. subprocess stdout).
@@ -1166,11 +1416,7 @@ def _stream_output(src, dst, model_name: str = "unknown", logger: logging.Logger
         logger: Logger instance for progress entries.  If ``None``, progress
             entries are silently skipped (no-op).
     """
-    # Per-slot progress threshold tracking.
-    # Maps slot_id -> last logged 10%-bucket index (0-10, where 0 = 0%, 10 = 100%).
-    # A slot not in the dict has never been logged.
-    _last_logged_pct: dict[int, int] = {}
-    first_progress_time = None
+    tracker = _ProgressLogger(model_name)
     try:
         for line in src:
             try:
@@ -1182,59 +1428,7 @@ def _stream_output(src, dst, model_name: str = "unknown", logger: logging.Logger
             # Parse and log prompt processing progress
             try:
                 line_str = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else str(line)
-                if 'prompt processing' in line_str.lower():
-                    parsed = extract_progress_data(line_str)
-                    if parsed:
-                        slot_id, n_tokens, progress = parsed
-                        total_tokens = int(n_tokens / progress) if progress > 0 else n_tokens
-
-                        # Track elapsed time for average tokens/sec calculation
-                        now = time.monotonic()
-                        if first_progress_time is None:
-                            first_progress_time = now
-                        elapsed = now - first_progress_time
-                        if elapsed < 0.5:
-                            tokens_per_sec = None
-                        else:
-                            tokens_per_sec = n_tokens / elapsed
-
-                        # Dynamically resolve model name for router mode
-                        resolved_name = model_name
-                        if resolved_name == "unknown":
-                            try:
-                                srv = _srv()
-                                if getattr(srv, 'current_model', None):
-                                    resolved_name = srv.current_model
-                            except Exception:
-                                pass
-
-                        progress_str = format_progress(
-                            n_tokens, total_tokens, progress,
-                            model_name=resolved_name,
-                            slot_id=slot_id,
-                            tokens_per_sec=tokens_per_sec,
-                        )
-
-                        # Threshold-based logging: log at start, at each 10%
-                        # milestone, and at completion (progress >= 1.0).
-                        current_threshold = int(min(progress, 1.0) * 10)
-                        last = _last_logged_pct.get(slot_id)
-
-                        if last is None:
-                            # First progress data for this slot — always log.
-                            _last_logged_pct[slot_id] = current_threshold
-                            if logger:
-                                logger.info(progress_str)
-                        elif current_threshold > last:
-                            # Crossed a new 10% boundary.
-                            _last_logged_pct[slot_id] = current_threshold
-                            if logger:
-                                logger.info(progress_str)
-                        elif progress >= 1.0 and last < 10:
-                            # Final milestone (progress >= 100%) — ensure logged.
-                            _last_logged_pct[slot_id] = 10
-                            if logger:
-                                logger.info(progress_str)
+                tracker.handle_line(line_str, logger)
             except Exception:
                 if logger:
                     logger.exception("Error processing progress line in _stream_output")
@@ -1247,6 +1441,124 @@ def _stream_output(src, dst, model_name: str = "unknown", logger: logging.Logger
         else:
             import traceback
             traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------
+# llama-server.log progress tailer (LP-0MVECX47Z004LJAQ)
+#
+# With direct file redirection the proxy no longer sees llama-server stdout
+# through a pipe, so the prefill progress lines are recovered by tailing the
+# log file instead. Tailing is also what makes "re-attachment" literal: when a
+# proxy adopts a running backend it simply starts a fresh tailer over the same
+# file, and progress logging resumes.
+# ---------------------------------------------------------------------------
+_log_tailer_lock = threading.Lock()
+_log_tailer_stop: threading.Event | None = None
+_log_tailer_thread: threading.Thread | None = None
+
+
+def _llama_log_progress_tailer(
+    log_path: Path,
+    model_name: str,
+    logger: logging.Logger | None,
+    stop_event: threading.Event,
+    poll_interval: float = 0.5,
+) -> None:
+    """Tail ``log_path`` from EOF, logging prefill progress lines.
+
+    Reopens the file when it is rotated (inode change). Exits when
+    ``stop_event`` is set or the path disappears persistently.
+    """
+    tracker = _ProgressLogger(model_name)
+    fh = None
+    inode = None
+    try:
+        while not stop_event.is_set():
+            try:
+                st = log_path.stat()
+            except OSError:
+                st = None
+            if st is not None and st.st_ino != inode:
+                # New file (first open or rotation) — start from the beginning
+                # of the *new* file so no lines are missed.
+                try:
+                    if fh is not None:
+                        fh.close()
+                except Exception:
+                    pass
+                try:
+                    fh = open(log_path, encoding="utf-8", errors="replace")
+                    inode = st.st_ino
+                except OSError:
+                    fh = None
+                    inode = None
+            if fh is not None:
+                try:
+                    while not stop_event.is_set():
+                        line = fh.readline()
+                        if not line:
+                            break
+                        try:
+                            tracker.handle_line(line, logger)
+                        except Exception:
+                            if logger:
+                                logger.exception(
+                                    "Error processing progress line in log tailer"
+                                )
+                except Exception:
+                    if logger:
+                        logger.exception("Error reading llama-server log tailer")
+                    fh = None
+                    inode = None
+            stop_event.wait(poll_interval)
+    finally:
+        try:
+            if fh is not None:
+                fh.close()
+        except Exception:
+            pass
+
+
+def start_llama_log_tailer(srv, model_name: str = "unknown") -> None:
+    """(Re)start the llama-server.log progress tailer for ``srv``.
+
+    Idempotent: any previously started tailer is stopped first, so a proxy that
+    adopts a running backend can call this to re-attach progress logging
+    (LP-0MVECX47Z004LJAQ). Best-effort — failures never break startup.
+    """
+    global _log_tailer_stop, _log_tailer_thread
+    try:
+        log_path = _resolve_llama_log_path(srv)
+        if not log_path.exists():
+            return
+        stop_llama_log_tailer()
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=_llama_log_progress_tailer,
+            args=(log_path, model_name, getattr(srv, "logger", None), stop_event),
+            daemon=True,
+            name="llama-log-progress-tailer",
+        )
+        with _log_tailer_lock:
+            _log_tailer_stop = stop_event
+            _log_tailer_thread = thread
+        thread.start()
+    except Exception:
+        pass
+
+
+def stop_llama_log_tailer() -> None:
+    """Stop the llama-server.log progress tailer, if running."""
+    global _log_tailer_stop, _log_tailer_thread
+    with _log_tailer_lock:
+        stop_event = _log_tailer_stop
+        _log_tailer_stop = None
+        _log_tailer_thread = None
+    if stop_event is not None:
+        try:
+            stop_event.set()
+        except Exception:
+            pass
 
 
 def start_llama_server(model: str | None, display_name: str | None = None) -> subprocess.Popen | None:
@@ -1317,6 +1629,14 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
     else:
        srv.llama_log_file = subprocess.DEVNULL
 
+    # LP-0MVECX47Z004LJAQ: a freshly spawned backend re-establishes the log
+    # relay, so any prior "unhealthy" verdict from an adopted pre-fix backend
+    # is cleared (it would otherwise stick forever).
+    try:
+       srv.llama_log_source_unhealthy = False
+    except Exception:
+       pass
+
     # Build the command for the configured start script
     if router_mode:
        llama_models_max = server_config.get("llama_models_max")
@@ -1356,6 +1676,9 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
 
         if host_proc is not None:
             srv.logger.info(f"Host-first startup succeeded with command: {' '.join(host_cmd)}")
+            # LP-0MVECX47Z004LJAQ: recover prefill progress lines by tailing the
+            # log the backend now writes to directly.
+            start_llama_log_tailer(srv, model_name=_display)
             return host_proc
 
         srv.logger.warning(
@@ -1373,6 +1696,9 @@ def start_llama_server(model: str | None, display_name: str | None = None) -> su
        tried_cmds.append((cmd, out))
        if proc is not None:
            srv.logger.info(f"Started llama-server with command: {' '.join(cmd)}")
+           # LP-0MVECX47Z004LJAQ: recover prefill progress lines by tailing the
+           # log the backend now writes to directly.
+           start_llama_log_tailer(srv, model_name=_display)
            return proc
        srv.logger.warning(f"Attempt {attempt+1} failed quickly: {out}")
        time.sleep(backoff * (2 ** attempt))
@@ -1526,6 +1852,12 @@ def stop_llama_server():
        except Exception:
            pass
        srv.llama_log_file = None
+
+    # Stop the llama-server.log progress tailer (LP-0MVECX47Z004LJAQ).
+    try:
+        stop_llama_log_tailer()
+    except Exception:
+        pass
 
     # Refresh the HTTP client to discard stale connections from the old server.
     _close_and_recreate_http_client(srv)

@@ -2726,6 +2726,32 @@ The llama-server output is captured to `llama-server.log`. Each time the server 
 - `llama-server.log` → `llama-server.1.log` → `llama-server.2.log` → ...
 - The last 15 log files are retained
 
+**The log relay survives proxy restarts (LP-0MVECX47Z004LJAQ).** llama-server's
+stdout/stderr are redirected **directly into `llama-server.log`** at spawn time,
+so the write descriptor is owned by the backend process itself — not by a
+proxy-side reader thread. A proxy-only restart therefore keeps the log flowing
+even when the new proxy *adopts* the already-running backend (preserving the
+warm prompt cache, LP-0MUCEFCL6001ZXYN). Previously the relay was a
+proxy-owned pipe reader, which died with the old proxy and left
+`llama-server.log` frozen while the pipe still had writers.
+
+When the proxy adopts a backend spawned by a *pre-fix* proxy, the relay cannot
+be re-attached (the old reader thread is gone). Instead of freezing silently
+the proxy logs a **WARNING** and marks the llama log source unhealthy; restart
+llama-server to restore logging. The adoption itself is preserved (no forced
+restart) so the warm prompt cache is not discarded.
+
+Log freshness is observable from `GET /health`:
+
+| Field | Meaning |
+|-------|---------|
+| `llama_log_age_seconds` | Seconds since `llama-server.log` was last written (`null` when the file is absent) |
+| `llama_log_source_healthy` | `false` when the relay is known broken (adopted pre-fix backend) or the log is stale with no live writer |
+
+Prefill progress entries (`[slot:N MODEL] Processing a/b tokens (P%)`) are
+recovered by a tailer over `llama-server.log`, which is restarted on adoption —
+so progress logging also continues across a proxy-only restart.
+
 View logs:
 ```bash
 # Development logs

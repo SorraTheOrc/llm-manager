@@ -13,6 +13,7 @@ to avoid circular-import problems during the transitional refactor period.
 import asyncio
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -744,7 +745,60 @@ async def health_check():
         "tts_enabled": tts_enabled,
         "tts_server_running": tts_process_alive,
         "tts_server_healthy": tts_server_healthy,
+        # LP-0MVECX47Z004LJAQ: llama-server.log freshness / relay health so
+        # log staleness is observable without shell access (AC3).
+        "llama_log_age_seconds": _llama_log_age_seconds_health(srv),
+        "llama_log_source_healthy": _llama_log_source_healthy(srv),
     }
+
+
+# ---------------------------------------------------------------------------
+# llama-server.log freshness helpers (LP-0MVECX47Z004LJAQ, AC3)
+# ---------------------------------------------------------------------------
+
+
+def _llama_log_age_seconds_health(srv) -> float | None:
+    """Age of llama-server.log in seconds, or None when absent/unreadable."""
+    try:
+        from proxy.lifecycle import _llama_log_age_seconds
+
+        return _llama_log_age_seconds(srv)
+    except Exception:
+        return None
+
+
+def _llama_log_source_healthy(srv) -> bool:
+    """True when llama-server.log is expected to keep receiving lines.
+
+    Combines the adoption-time relay verdict (``llama_log_source_unhealthy``)
+    with a live-writer check: a fresh log file with no live writer would
+    already be frozen, so it is reported unhealthy rather than silently stale.
+    """
+    try:
+        if getattr(srv, "llama_log_source_unhealthy", False):
+            return False
+        from proxy.lifecycle import (
+            _llama_log_age_seconds,
+            _log_has_live_writer,
+            _resolve_llama_log_path,
+        )
+
+        age = _llama_log_age_seconds(srv)
+        if age is None:
+            # No log yet (fresh startup before first backend write) — nothing
+            # to flag.
+            return True
+        log_path = _resolve_llama_log_path(srv)
+        if age <= 60.0:
+            # Recently written — relay clearly alive.
+            return True
+        # Stale: healthy only if a live writer (other than this proxy's own
+        # log handle) still holds the file.
+        if not log_path.exists():
+            return False
+        return _log_has_live_writer(log_path, exclude_pid=os.getpid())
+    except Exception:
+        return True
 
 
 # ---------------------------------------------------------------------------
