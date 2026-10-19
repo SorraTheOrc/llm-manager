@@ -549,6 +549,11 @@ async def test_fast_mode_economic_bypass_falls_back_remote(
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
+        # Fast-mode semantics = high priority (never recovers the economic
+        # bypass locally); pinned so the test is deterministic inside the
+        # cheap window (01:00–10:00), where an unpinned request would cap
+        # to low and serve the bypass locally instead.
+        patch("proxy.provider.request_priority", return_value="high"),
     ):
         result = await provider.proxy_with_fallback(
             request, "v1/chat/completions", mixed_model_config, cfg

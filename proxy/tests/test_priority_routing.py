@@ -66,8 +66,14 @@ class TestHeaderParsing:
         assert parse_priority("!!") == PRIORITY_MEDIUM
 
     def test_header_lookup_case_insensitive(self):
+        # Pinned to a time outside the cheap window so the header lookup is
+        # deterministic regardless of the wall clock (inside 01:00–10:00 the
+        # effective priority would be capped to low).
         headers = {"x-priority": "high"}
-        assert priority_from_headers(headers) == PRIORITY_HIGH
+        assert (
+            priority_from_headers(headers, now=datetime(2026, 1, 1, 12, 0))
+            == PRIORITY_HIGH
+        )
 
 
 class TestCheapWindow:
@@ -282,11 +288,21 @@ class TestRequestPriority:
         assert request_priority(req) == "low"
 
     def test_recompute_when_unstamped(self):
+        # Cheap window disabled so the recompute path is deterministic at any
+        # local time (inside 01:00–10:00 every request would cap to low).
         req = _DummyRequest({"X-Priority": "high"})
-        assert request_priority(req, {}) == "high"
+        assert (
+            request_priority(req, {"priority_window": {"enabled": False}})
+            == "high"
+        )
 
     def test_default_medium(self):
-        assert request_priority(_DummyRequest(), {}) == "medium"
+        assert (
+            request_priority(
+                _DummyRequest(), {"priority_window": {"enabled": False}}
+            )
+            == "medium"
+        )
 
 
 class TestAppliedHeader:
@@ -396,8 +412,12 @@ class TestDecisionPointLogging:
         # effective_chain_for_request stamps the priority on the request so
         # decision points (chain selection, queue entry) log `priority=` and
         # the response header can be attached.
+        # Cheap window disabled so the stamp reflects the declared header
+        # priority at any local time (inside 01:00–10:00 it would be low).
         chain = prov.effective_chain_for_request(
-            request, {"providers": [{"name": "p", "type": "remote"}]}, {}
+            request,
+            {"providers": [{"name": "p", "type": "remote"}]},
+            {"priority_window": {"enabled": False}},
         )
         assert chain
         assert request.state.priority == "high"

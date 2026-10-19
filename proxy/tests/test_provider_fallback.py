@@ -60,8 +60,16 @@ def pin_fast_mode(monkeypatch):
     (LP-0MU5A4QBR003YJM0) is config-driven
     (``local_large_context_economic_bypass_serves_local``), so it is not
     enabled by this fixture.
+
+    Note: the priority is pinned via ``proxy.provider.request_priority`` —
+    the binding the routing cycle reads (provider.py imports it into its own
+    namespace) — so the tests are also deterministic inside the cheap window
+    (01:00–10:00), where an unpinned request would cap to ``low`` and route
+    differently.
     """
-    monkeypatch.setattr("proxy.priority.request_priority", lambda *a, **k: "medium")
+    monkeypatch.setattr(
+        "proxy.provider.request_priority", lambda *a, **k: "medium"
+    )
 
 
 @pytest.fixture
