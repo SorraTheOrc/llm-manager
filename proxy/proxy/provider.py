@@ -2294,6 +2294,48 @@ def _quota_unavailable_reason(
     )
 
 
+def _quota_exhausted(
+    provider_cfg: dict, config: dict | None
+) -> tuple[bool, str]:
+    """Return ``(True, reason)`` when the quota hard stop skips *provider_cfg*.
+
+    The cost guard (LP-0MVF7KO8C005NB59): an entry is skipped before any
+    upstream request is attempted when its monthly consumption is at or above
+    ``server.quota_exhaustion_percent`` (default 99.5) **or** its
+    ``effective_headroom`` is at or below the equivalent headroom
+    (``100 - threshold``) — so a spent rolling or weekly window blocks the
+    entry even when the monthly percent is still low. The decision is a pure
+    cache read: it never polls, never blocks and never raises.
+
+    Unlike the ordering-gated :func:`_quota_unavailable_reason`, this guard is
+    **not** conditional on the surge feature: an exhausted account is skipped
+    whether or not surge is enabled, and the final-week surge bypass can
+    never re-enable it (the skip runs before the ``available_times``/surge
+    gate). Returns ``(False, "")`` (fail open) when the entry is not
+    quota-managed or no snapshot has been polled yet — the guard only acts on
+    authoritative quota state.
+    """
+    if not quota_state.is_quota_provider(provider_cfg, config):
+        return False, ""
+    snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+    if snapshot is None:
+        return False, ""
+    threshold = quota_state.quota_exhaustion_percent(config)
+    monthly_percent = snapshot.monthly.percent
+    effective_headroom = snapshot.effective_headroom
+    if (
+        monthly_percent < threshold
+        and effective_headroom > 100.0 - threshold
+    ):
+        return False, ""
+    return True, (
+        f"reason=quota_exhausted (account={snapshot.account}, "
+        f"monthly_percent={monthly_percent:.1f}%, "
+        f"effective_headroom={effective_headroom:.1f}%, "
+        f"threshold={threshold:g}%)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -2316,6 +2358,8 @@ def resolve_provider(
     - Does not belong to a usage-limit ACCOUNT with a pending usage-limit
       reset (LP-0MSLJPOCC0001ROJ / LP-0MSMBWB23009XYPW)
     - Is not marked spent by proactive quota state (LP-0MVF7KIKE002DZVD)
+    - Is not at or near its monthly quota cap (the cost-guard hard stop —
+      ``server.quota_exhaustion_percent``, LP-0MVF7KO8C005NB59)
 
     Quota-managed (``opencode-*``) entries are considered in descending
     headroom urgency instead of config order — see
@@ -2384,6 +2428,18 @@ def resolve_provider(
         quota_reason = _quota_unavailable_reason(provider_cfg, config)
         if quota_reason is not None:
             logger.info("Skipping provider=%s: %s", name, quota_reason)
+            continue
+        # Quota hard stop (LP-0MVF7KO8C005NB59): at-or-near the monthly cap the
+        # entry is skipped before any upstream request is attempted. Runs after
+        # the usage-limit-quarantine and cooldown checks so those reasons keep
+        # their precedence, and before the available_times/surge gate so the
+        # final-week surge can never re-enable an exhausted account. The
+        # guard is independent of the surge kill switch/dry-run.
+        quota_hard_stop, quota_stop_reason = _quota_exhausted(
+            provider_cfg, config
+        )
+        if quota_hard_stop:
+            logger.info("Skipping provider=%s: %s", name, quota_stop_reason)
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
         if cooldown_key is not None:
@@ -4968,6 +5024,18 @@ def _resolve_provider_with_exclusions(
                 datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
             )
+            continue
+        # Quota hard stop (LP-0MVF7KO8C005NB59): at-or-near the monthly cap the
+        # entry is skipped before any upstream request is attempted. Runs after
+        # the usage-limit-quarantine and cooldown checks so those reasons keep
+        # their precedence, and before the available_times/surge gate so the
+        # final-week surge can never re-enable an exhausted account. The
+        # guard is independent of the surge kill switch/dry-run.
+        quota_hard_stop, quota_stop_reason = _quota_exhausted(
+            provider_cfg, config
+        )
+        if quota_hard_stop:
+            logger.info("Skipping provider=%s: %s", name, quota_stop_reason)
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
         if cooldown_key is not None:

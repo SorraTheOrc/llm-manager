@@ -1061,6 +1061,19 @@ server:
   # so e.g. 90% left with 2 days to reset must already be ramping.
   quota_surge_days: 7
   quota_pacing_target: 0.95
+  # Quota hard stop / cost guard (LP-0MVF7KO8C005NB59). An `opencode-*` account
+  # whose monthly consumption is at or above this percentage — or whose
+  # `effective_headroom` is at or below `100 - threshold` (a spent rolling or
+  # weekly window) — is skipped before any upstream request is attempted and
+  # logged at INFO with `reason=quota_exhausted`. The skip applies whether or
+  # not surge is active (surge can never re-enable an exhausted account) and
+  # is cumulative with the reactive usage-limit quarantine: it never clears,
+  # shortens or overrides it. This is the guard that prevents spending real
+  # pay-as-you-go money on an account with the console "Use balance" option
+  # enabled. Values outside [1, 100] are clamped and non-numeric values fall
+  # back to the default, with one WARN per process.
+  # Default: 99.5.
+  quota_exhaustion_percent: 99.5
   # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote
   # provider repeatedly returns an EMPTY response / stalls (no usable content)
   # across retry cycles, the provider is quarantined for an EXTENDED cooldown

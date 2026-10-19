@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -79,6 +80,22 @@ DEFAULT_USAGE_TIMEOUT_SECONDS = 10.0
 
 #: Minimum gap between failure WARNs for the same account.
 WARN_MIN_INTERVAL_SECONDS = 300.0
+
+#: ``server.quota_exhaustion_percent`` default: the quota hard stop threshold
+#: (LP-0MVF7KO8C005NB59). An account at or above this monthly percentage — or
+#: whose ``effective_headroom`` is at or below the equivalent headroom — is
+#: skipped before any upstream request is attempted.
+DEFAULT_QUOTA_EXHAUSTION_PERCENT = 99.5
+
+#: Inclusive clamp bounds for an out-of-range ``quota_exhaustion_percent``.
+#: The value is fail-safe: a mistyped threshold can never disable the guard
+#: (the lower bound keeps the skip conservative) nor exceed the percentage
+#: scale (the upper bound).
+MIN_QUOTA_EXHAUSTION_PERCENT = 1.0
+MAX_QUOTA_EXHAUSTION_PERCENT = 100.0
+
+#: One-shot guard for the invalid-``quota_exhaustion_percent`` WARN.
+_QUOTA_EXHAUSTION_PERCENT_WARNED = False
 
 #: Only ``opencode-*`` entries are quota-managed by default.
 _OPENCODE_PROVIDER_PREFIX = "opencode"
@@ -317,6 +334,72 @@ def _config_value(config: dict | None, key: str, default: Any) -> Any:
     return default if value is None else value
 
 
+def reset_quota_exhaustion_warning() -> None:
+    """Forget the one-shot invalid-threshold WARN (tests / config reload)."""
+    global _QUOTA_EXHAUSTION_PERCENT_WARNED
+    _QUOTA_EXHAUSTION_PERCENT_WARNED = False
+
+
+def quota_exhaustion_percent(config: dict | None) -> float:
+    """``server.quota_exhaustion_percent`` (default 99.5), always fail-safe.
+
+    Returns the monthly-consumption percentage at or above which the quota
+    hard stop skips an account (LP-0MVF7KO8C005NB59). The absent key yields
+    :data:`DEFAULT_QUOTA_EXHAUSTION_PERCENT` so the guard is on by default.
+
+    Invalid values never disable the guard:
+
+    - a numeric value outside ``[1, 100]`` is clamped into that range (so
+      ``0``/``-5`` become ``1`` and ``101`` becomes ``100``);
+    - a non-numeric or non-finite value (``"abc"``, ``NaN``, ``inf``) falls
+      back to the default ``99.5``;
+    - either case logs exactly one WARN per process (``once``) so a
+      misconfigured key is visible without flooding the log on every
+      dispatch decision.
+    """
+    global _QUOTA_EXHAUSTION_PERCENT_WARNED
+    raw = _config_value(config, "quota_exhaustion_percent", None)
+    if raw is None:
+        return DEFAULT_QUOTA_EXHAUSTION_PERCENT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = None
+    if value is not None and math.isfinite(value) and (
+        value < MIN_QUOTA_EXHAUSTION_PERCENT
+        or value > MAX_QUOTA_EXHAUSTION_PERCENT
+    ):
+        clamped = min(
+            MAX_QUOTA_EXHAUSTION_PERCENT,
+            max(MIN_QUOTA_EXHAUSTION_PERCENT, value),
+        )
+        _warn_invalid_quota_exhaustion_percent(raw, clamped)
+        return clamped
+    if value is None or not math.isfinite(value):
+        _warn_invalid_quota_exhaustion_percent(
+            raw, DEFAULT_QUOTA_EXHAUSTION_PERCENT
+        )
+        return DEFAULT_QUOTA_EXHAUSTION_PERCENT
+    return value
+
+
+def _warn_invalid_quota_exhaustion_percent(raw: Any, used: float) -> None:
+    """WARN once about an invalid threshold, naming the value actually used."""
+    global _QUOTA_EXHAUSTION_PERCENT_WARNED
+    if _QUOTA_EXHAUSTION_PERCENT_WARNED:
+        return
+    _QUOTA_EXHAUSTION_PERCENT_WARNED = True
+    logger.warning(
+        "quota_exhaustion_percent value=%r is invalid or out of range; "
+        "using %.1f (valid range [%.0f, %.0f], default %.1f)",
+        raw,
+        used,
+        MIN_QUOTA_EXHAUSTION_PERCENT,
+        MAX_QUOTA_EXHAUSTION_PERCENT,
+        DEFAULT_QUOTA_EXHAUSTION_PERCENT,
+    )
+
+
 def poll_interval_seconds(config: dict | None) -> float:
     """``server.quota_poll_interval_seconds`` (default 900 s, minimum 1 s)."""
     try:
@@ -463,6 +546,7 @@ def reset_quota_state() -> None:
     _last_poll_at.clear()
     _inflight.clear()
     _last_warn_at.clear()
+    reset_quota_exhaustion_warning()
     set_quota_transport(None)
     set_clock(None)
 
