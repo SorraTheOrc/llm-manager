@@ -133,6 +133,50 @@ in-progress sessions can still wait for the window to drain (bounded by
 `provider_rate_limit_wait_max_seconds`). Takes effect at the next proxy
 restart.
 
+### Upstream rate-limit headers (`respect_ratelimit_headers`, LP-0MVBHDNLB007ALLJ)
+
+Some gateways answer HTTP 429 with custom `x-ratelimit-*` headers instead of
+the standard `Retry-After` (MunitoAI sends none). The proxy can honour them so
+a rate-limited provider is skipped for the upstream's own reset window rather
+than being re-probed every ~45 s by the exponential-backoff guess.
+
+Enable it per provider entry, or globally under `server`:
+
+```yaml
+- name: munitoai-free
+  type: remote
+  rate_limit_rpm: 2
+  respect_ratelimit_headers: true   # entry flag wins over server.*
+```
+
+```yaml
+server:
+  respect_ratelimit_headers: true   # global default (false)
+  ratelimit_cooldown_margin_seconds: 2
+```
+
+Behaviour when enabled, on an HTTP 429 only:
+
+- `x-ratelimit-reset-requests`, `-tokens`, `-input-tokens` and
+  `-output-tokens` are parsed; durations accept bare seconds or unit suffixes
+  (`52s`, `1m`, `1h30m`, `250ms`).
+- When one or more dimensions report `x-ratelimit-remaining-*` at or below
+  zero, the longest reset among those exhausted dimensions is used; otherwise
+  the longest parseable reset is used.
+- The cooldown becomes `max(exponential backoff, reset + margin)` — the
+  upstream reset is a floor, and the per-provider failure counter still
+  extends it under repeated failures. `Retry-After`, when present, still wins
+  if longer.
+- `x-ratelimit-over-limit` is parsed and recorded for diagnostics; a 429 that
+  carries the flag but no parseable reset falls back to plain backoff.
+- The resolved cooldown is recorded in the attempt (`cooldown_seconds`,
+  `ratelimit_reset_seconds`, `ratelimit_over_limit`) and persisted in
+  `provider-state.json`, so the `Skipping provider=… in cooldown (Ns
+  remaining)` log line shows the header-derived wait.
+
+Default is **off**: every existing provider keeps its pre-change behaviour.
+The `munitoai-free` and `munitoai` entries opt in via `config.yaml`.
+
 ### Responses-API providers (`api: openai-responses`)
 
 Some upstreams expose **only** the OpenAI Responses API (`/v1/responses`) and

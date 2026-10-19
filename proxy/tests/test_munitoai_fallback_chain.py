@@ -39,6 +39,10 @@ MUNITOAI_FREE_ENTRY = {
     # so the tier is only used while it has capacity. Deliberately conservative
     # at 2/min (LP-0MVF19DKR008VCHO) — bursts spill to the paid tiers.
     "rate_limit_rpm": 2,
+    # Honour the upstream's x-ratelimit-reset-* headers on 429
+    # (LP-0MVBHDNLB007ALLJ): MunitoAI sends no Retry-After, so the reset header
+    # supplies the cooldown instead of a blind backoff guess.
+    "respect_ratelimit_headers": True,
 }
 
 #: The exact (paid) munitoai entry that must sit directly before deepseek-flash.
@@ -50,6 +54,8 @@ MUNITOAI_ENTRY = {
     "api_key_env": "MUNITOAI_API_KEY",
     "forward_session_headers": False,
     "model": "deepseek-ai/deepseek-v4-flash",
+    # Honour x-ratelimit-reset-* headers on 429 (LP-0MVBHDNLB007ALLJ).
+    "respect_ratelimit_headers": True,
 }
 
 CHAINS = ("plan", "author", "code")

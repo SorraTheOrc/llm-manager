@@ -109,6 +109,18 @@
 #                        api_key_env: SOME_FREE_KEY
 #                        rate_limit_rpm: 15
 #
+# Upstream rate-limit headers (optional, remote providers only):
+#   respect_ratelimit_headers - when true, an HTTP 429 carrying
+#                    `x-ratelimit-reset-requests` / `-tokens` /
+#                    `-input-tokens` / `-output-tokens` (durations like `52s`,
+#                    `1m`, `1h30m`) sets the provider cooldown to at least the
+#                    reported reset plus `server.ratelimit_cooldown_margin_seconds`
+#                    (default 2s), instead of only the exponential-backoff
+#                    guess. Use for gateways that send no `Retry-After`
+#                    (e.g. MunitoAI). The entry flag overrides
+#                    `server.respect_ratelimit_headers`; default false so
+#                    every existing provider is unchanged (LP-0MVBHDNLB007ALLJ).
+#
 # Responses-API mode (optional, remote providers only):
 #   api - "openai-completions" (default) or "openai-responses". Some
 #        upstreams (opencode.ai zen/go for the muse model family) expose
@@ -284,6 +296,10 @@ models:
       # ``MunitoAI Free/<model>`` vs the paid ``MunitoAI/<model>`` in Pi
       # (LP-0MVCQ36QV009QX8K).
       - name: munitoai-free
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
@@ -366,6 +382,10 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        respect_ratelimit_headers: true
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
@@ -409,6 +429,10 @@ models:
       # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
       # around the clock.
       - name: munitoai-free
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
@@ -484,6 +508,10 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        respect_ratelimit_headers: true
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
@@ -526,6 +554,10 @@ models:
       # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
       # around the clock.
       - name: munitoai-free
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
@@ -601,6 +633,10 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        respect_ratelimit_headers: true
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
@@ -722,6 +758,19 @@ server:
   llama_request_timeout: 1500
   # Provider fallback cooldown: seconds to wait before retrying a failed provider
   provider_cooldown_seconds: 60
+
+  # Upstream x-ratelimit-* honouring (LP-0MVBHDNLB007ALLJ). When enabled, an
+  # HTTP 429 whose response carries `x-ratelimit-reset-*` headers sets the
+  # provider cooldown to at least the upstream-reported reset (plus
+  # ratelimit_cooldown_margin_seconds) instead of a blind exponential-backoff
+  # guess, so the proxy stops probing an endpoint that is guaranteed to reject
+  # during a rate-limit exhaustion window. Enable per provider entry with
+  # `respect_ratelimit_headers: true` (the entry flag wins), or globally here.
+  # Default false: every provider keeps its existing behaviour.
+  respect_ratelimit_headers: false
+  # Safety margin added to a header-derived cooldown so it never expires
+  # exactly on the upstream boundary (default 2 seconds).
+  ratelimit_cooldown_margin_seconds: 2
 
   # Free-tier request budget (LP-0MVDQ1GMO00801PL).
   # A provider entry that declares `rate_limit_rpm` (e.g. `munitoai-free`) is

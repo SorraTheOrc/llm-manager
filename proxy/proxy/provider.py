@@ -2767,7 +2767,199 @@ def _parse_retry_after(response: Response) -> float | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Upstream x-ratelimit-* header support (LP-0MVBHDNLB007ALLJ)
+#
+# Some gateways (notably MunitoAI) answer HTTP 429 with custom
+# ``x-ratelimit-*`` headers instead of the standard ``Retry-After``.  Those
+# headers carry the upstream's own reset timing, so honouring them yields a
+# truthful cooldown instead of a blind exponential-backoff guess that keeps
+# probing an endpoint which is guaranteed to reject for the whole window.
+#
+# Support is opt-in: either a provider entry sets
+# ``respect_ratelimit_headers: true`` or the behaviour is enabled globally
+# under ``server.respect_ratelimit_headers``.  When neither is set the new
+# code paths are never reached and every existing provider behaves exactly as
+# before (backward compatibility).
+# ---------------------------------------------------------------------------
 
+# (label, reset header, remaining header) for each rate-limit dimension an
+# upstream may report.  The label is only used in diagnostics.
+_RATELIMIT_RESET_HEADERS: tuple[tuple[str, str, str], ...] = (
+    ("requests", "x-ratelimit-reset-requests", "x-ratelimit-remaining-requests"),
+    ("tokens", "x-ratelimit-reset-tokens", "x-ratelimit-remaining-tokens"),
+    (
+        "input_tokens",
+        "x-ratelimit-reset-input-tokens",
+        "x-ratelimit-remaining-input-tokens",
+    ),
+    (
+        "output_tokens",
+        "x-ratelimit-reset-output-tokens",
+        "x-ratelimit-remaining-output-tokens",
+    ),
+)
+
+# One ``<number><unit>`` segment.  ``ms`` is matched before ``m`` so the
+# millisecond suffix is not misread as minutes.
+_RATELIMIT_DURATION_SEGMENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)")
+
+_RATELIMIT_UNIT_SECONDS: dict[str, float] = {
+    "ms": 0.001,
+    "s": 1.0,
+    "m": 60.0,
+    "h": 3600.0,
+    "d": 86400.0,
+}
+
+# Extra seconds added on top of the upstream reset so a cooldown never expires
+# exactly at the boundary the upstream reported (clock skew / queueing).
+_RATELIMIT_COOLDOWN_MARGIN_SECONDS = 2.0
+
+
+def _parse_ratelimit_duration(value: Any) -> float | None:
+    """Parse a single ``x-ratelimit-reset-*`` value into seconds.
+
+    Accepts a bare number (seconds), or one or more concatenated
+    ``<number><unit>`` segments such as ``52s``, ``1m``, ``1h30m`` or
+    ``250ms``.  Returns ``None`` for a missing, empty or unparseable value so
+    the caller falls back to the existing backoff untouched.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    # Bare number -> seconds (the Retry-After convention).
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    total = 0.0
+    position = 0
+    matched = False
+    for match in _RATELIMIT_DURATION_SEGMENT_RE.finditer(text):
+        # Reject gaps between segments (e.g. ``1x2s``) so a malformed header
+        # is not partially honoured.
+        if text[position:match.start()].strip():
+            return None
+        total += float(match.group(1)) * _RATELIMIT_UNIT_SECONDS[match.group(2)]
+        position = match.end()
+        matched = True
+    if not matched or text[position:].strip():
+        return None
+    return total
+
+
+def _ratelimit_over_limit(headers) -> bool:
+    """Return ``True`` when the upstream flags the account as over-limit.
+
+    MunitoAI sends ``x-ratelimit-over-limit: yes`` alongside the reset headers.
+    Parsing it keeps the flag available for diagnostics and lets callers
+    distinguish a rate-limited 429 from an unrelated error.
+    """
+    value = headers.get("x-ratelimit-over-limit") if headers is not None else None
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
+def _parse_ratelimit_reset_seconds(headers) -> float | None:
+    """Return the longest most-relevant ``x-ratelimit-reset-*`` duration.
+
+    Preference order:
+
+    1. When one or more dimensions report ``x-ratelimit-remaining-*`` at or
+       below zero, use the longest reset among those exhausted dimensions —
+       that is the wait the upstream actually demands before the next request
+       can succeed.
+    2. Otherwise use the longest parseable reset across all dimensions (a 429
+       with reset headers is evidence of *a* limit, so the most conservative
+       reported reset is honoured).
+
+    Returns ``None`` when no dimension carries a parseable reset, preserving
+    the caller's existing exponential-backoff behaviour.
+    """
+    if headers is None:
+        return None
+    exhausted: list[float] = []
+    all_resets: list[float] = []
+    for _label, reset_header, remaining_header in _RATELIMIT_RESET_HEADERS:
+        reset = _parse_ratelimit_duration(headers.get(reset_header))
+        if reset is None:
+            continue
+        all_resets.append(reset)
+        remaining = _parse_ratelimit_duration(headers.get(remaining_header))
+        if remaining is not None and remaining <= 0:
+            exhausted.append(reset)
+    if exhausted:
+        return max(exhausted)
+    if all_resets:
+        return max(all_resets)
+    return None
+
+
+def _coerce_optional_bool(value: Any) -> bool:
+    """Coerce a config value to a bool, tolerating YAML/env string forms."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _get_respect_ratelimit_headers(
+    config: dict | None, provider_cfg: dict | None = None
+) -> bool:
+    """Return whether ``x-ratelimit-*`` headers should drive 429 cooldowns.
+
+    The per-provider entry flag takes precedence over the global
+    ``server.respect_ratelimit_headers`` setting (a flat top-level key is also
+    accepted for unit-test convenience).  Defaults to ``False`` so existing
+    providers are unaffected (LP-0MVBHDNLB007ALLJ AC6).
+    """
+    if isinstance(provider_cfg, dict):
+        value = provider_cfg.get("respect_ratelimit_headers")
+        if value is not None:
+            return _coerce_optional_bool(value)
+    if isinstance(config, dict):
+        value = config.get("respect_ratelimit_headers")
+        if value is not None:
+            return _coerce_optional_bool(value)
+        server_cfg = config.get("server")
+        if isinstance(server_cfg, dict):
+            value = server_cfg.get("respect_ratelimit_headers")
+            if value is not None:
+                return _coerce_optional_bool(value)
+    return False
+
+
+def _get_ratelimit_cooldown_margin_seconds(config: dict | None) -> float:
+    """Read the safety margin added to a header-derived cooldown.
+
+    Supports both the nested production form
+    (``server.ratelimit_cooldown_margin_seconds``) and a flat key for unit
+    tests.  Defaults to :data:`_RATELIMIT_COOLDOWN_MARGIN_SECONDS`; a missing,
+    malformed or negative value falls back to the default.
+    """
+    default = _RATELIMIT_COOLDOWN_MARGIN_SECONDS
+    if not isinstance(config, dict):
+        return default
+    raw = config.get("ratelimit_cooldown_margin_seconds")
+    if raw is None:
+        server_cfg = config.get("server")
+        if isinstance(server_cfg, dict):
+            raw = server_cfg.get("ratelimit_cooldown_margin_seconds")
+    if raw is None or isinstance(raw, bool):
+        return default
+    try:
+        margin = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if margin < 0:
+        return default
+    return margin
 
 
 def _get_cooldown_seconds(config: dict) -> float:
@@ -5145,12 +5337,20 @@ def _handle_http_error_with_cooldown(
     attempts: list[dict[str, Any]],
     body_text: str,
     config: dict | None = None,
+    provider_cfg: dict | None = None,
 ) -> float:
     """Handle an HTTP error response: compute effective cooldown, mark the
     provider unavailable, record a diagnostic attempt entry, and return the
     effective cooldown duration.
 
     Applies exponential backoff for remote providers.
+
+    When the provider entry opts into ``respect_ratelimit_headers`` (or the
+    behaviour is enabled globally under ``server``), a 429 carrying parseable
+    ``x-ratelimit-reset-*`` headers sets the cooldown to at least the upstream
+    reset duration plus a small safety margin.  Exponential backoff still
+    applies, so a cooldown is the *longer* of the two and repeated failures
+    keep extending it sensibly (LP-0MVBHDNLB007ALLJ).
 
     Grace-period immunity (LP-0MV9UNIOZ009RIAN): while ``cold_start.is_cold()``
     is True and *provider_type* is ``"local"``, an HTTP 503 reflects llama-server
@@ -5184,6 +5384,20 @@ def _handle_http_error_with_cooldown(
     # Parse Retry-After separately so we can respect it alongside backoff
     retry_after = _parse_retry_after(response)
 
+    # Upstream x-ratelimit-* headers (LP-0MVBHDNLB007ALLJ): opt-in per entry or
+    # globally; only consulted for a 429 so unrelated HTTP errors keep the
+    # pre-existing behaviour exactly.  A missing/parseable-less reset leaves
+    # the exponential-backoff guess untouched (AC3).
+    ratelimit_reset: float | None = None
+    ratelimit_over_limit = False
+    if (
+        provider_cfg is not None
+        and int(response.status_code) == 429
+        and _get_respect_ratelimit_headers(config, provider_cfg)
+    ):
+        ratelimit_over_limit = _ratelimit_over_limit(response.headers)
+        ratelimit_reset = _parse_ratelimit_reset_seconds(response.headers)
+
     cooldown = cooldown_seconds
     if provider_type == "remote" and cooldown_seconds > 0:
         count = _provider_failure_count.get(provider_name, 0)
@@ -5198,16 +5412,25 @@ def _handle_http_error_with_cooldown(
     if retry_after is not None:
         cooldown = max(cooldown, retry_after)
 
+    # Honour the upstream's own reset timing when it is longer than the
+    # backoff guess: at least the reset duration plus a safety margin.
+    if ratelimit_reset is not None:
+        margin = _get_ratelimit_cooldown_margin_seconds(config)
+        cooldown = max(cooldown, ratelimit_reset + margin)
+
     mark_provider_unavailable(provider_name, cooldown)
-    _record_attempt(
-        attempts,
-        provider=provider_name,
-        type=provider_type,
-        status="http_error",
-        status_code=int(response.status_code),
-        body_snippet=(body_text[:512] if body_text else None),
-        cooldown_seconds=cooldown,
-    )
+    attempt_fields: dict[str, Any] = {
+        "provider": provider_name,
+        "type": provider_type,
+        "status": "http_error",
+        "status_code": int(response.status_code),
+        "body_snippet": (body_text[:512] if body_text else None),
+        "cooldown_seconds": cooldown,
+    }
+    if ratelimit_reset is not None:
+        attempt_fields["ratelimit_reset_seconds"] = ratelimit_reset
+        attempt_fields["ratelimit_over_limit"] = ratelimit_over_limit
+    _record_attempt(attempts, **attempt_fields)
     return cooldown
 
 
@@ -6314,6 +6537,7 @@ async def _proxy_with_remote_fallback_cycle(
                 _handle_http_error_with_cooldown(
                     response, provider_name, provider_type,
                     cooldown_seconds, attempts, body_text, config,
+                    provider_cfg=provider_cfg,
                 )
                 # AC3 (LP-0MSGU3JNU0092AFQ): remember this specific 400 so the
                 # exhausted path can return a synthetic error instead of the
@@ -7611,6 +7835,7 @@ async def _proxy_with_fallback_cycle(
                     _handle_http_error_with_cooldown(
                         response, provider_name, provider_type,
                         cooldown_seconds, attempts, body_text, config,
+                        provider_cfg=provider_cfg,
                     )
                     # Per-account rate limit (LP-0MVCX0E2V001VB5N): a 429 with
                     # body type=rate_limit_error / code=rate_limit_exceeded is a
