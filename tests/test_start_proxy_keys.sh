@@ -19,6 +19,10 @@
 #      path is unchanged
 #   6. --use-env-keys is consumed by start-proxy.sh (never forwarded to
 #      uvicorn) and documented in the script's usage header
+#   7. a mixed setup (one env-matched key + one key resolved from auth.json)
+#      starts normally — only a genuine mismatch blocks
+#   8. the mismatch report names the auth.json key name(s) that were tried, so
+#      the failure is self-diagnosing
 #
 # Harness pattern (mirrors tests/test_start_proxy_mode.sh): a sandboxed copy of
 # start-proxy.sh, a fake `python3` that intercepts the final `exec uvicorn`, an
@@ -122,7 +126,7 @@ cat > "$FAKE_PY" <<'PY'
 #!/usr/bin/env bash
 if [ "${1:-}" = "-m" ] && [ "${2:-}" = "uvicorn" ]; then
     key="${OPENCODE_API_KEY:-}"
-    echo "FAKE_UVICORN args=$* key_fp=${key:0:8}"
+    echo "FAKE_UVICORN args=$* key_fp=${key:0:8} gh_fp=${GITHUB_TOKEN:0:8}"
     exit 0
 fi
 exec /usr/bin/python3 "$@"
@@ -284,6 +288,15 @@ test_env_differs_refuses_startup() {
         fail "differing env key: auth.json fingerprint $AUTH_FP not logged"
     fi
 
+    # Self-diagnosing message: name the auth.json key(s) the resolver tried so
+    # the operator can fix auth.json without reading the resolver source.
+    # GITHUB-free assertion: "opencode-go" only appears in the candidate list.
+    if script_log_has "opencode-go"; then
+        pass "differing env key: the report names the auth.json key(s) tried"
+    else
+        fail "differing env key: the report does not name the auth.json key(s) tried"
+    fi
+
     if out_has "$STALE_KEY"; then
         fail "differing env key: plaintext env key leaked into stdout/stderr"
     else
@@ -421,6 +434,78 @@ test_auth_json_missing_keeps_missing_key_error() {
     fi
 }
 
+# ---- Test 7: mixed env/auth.json setup starts normally ---------------------
+
+test_mixed_env_and_auth_json_setup_starts() {
+    echo "--- Test: mixed env + auth.json keys start normally (only mismatches block) ---"
+    local second_var="GITHUB_TOKEN"
+    local second_key="MIXEDKEY_cccccccccc"
+    local second_fp="${second_key:0:8}"
+
+    cp "$AUTH_FILE" "$AUTH_FILE.single"
+    cat > "$AUTH_FILE" <<JSON
+{
+  "opencode-go": {"type": "api_key", "key": "$AUTH_KEY"},
+  "github_token": {"type": "api_key", "key": "$second_key"}
+}
+JSON
+    cp "$PROXY_DIR/config.yaml" "$PROXY_DIR/config.yaml.single"
+    cat > "$PROXY_DIR/config.yaml" <<YAML
+models:
+  test-model:
+    providers:
+      - name: test-remote
+        type: remote
+        endpoint: https://example.invalid
+        api_key_env: $ENV_VAR
+      - name: test-github
+        type: remote
+        endpoint: https://example.invalid
+        api_key_env: $second_var
+server:
+  session_slot_pool_size: 1
+YAML
+
+    OPENCODE_VALUE="$AUTH_KEY"
+    USE_ENV_KEYS=""
+    run_proxy
+
+    # Restore the single-key fixtures first so a failure here cannot poison the
+    # remaining runs.
+    mv "$PROXY_DIR/config.yaml.single" "$PROXY_DIR/config.yaml"
+    mv "$AUTH_FILE.single" "$AUTH_FILE"
+
+    if [ "$LAST_RC" -eq 0 ] && started; then
+        pass "mixed setup: proxy starts (env-matched + auth.json-resolved keys)"
+    else
+        fail "mixed setup: startup failed (exit $LAST_RC): $(cat "$RUN_LOG")"
+    fi
+
+    if script_log_has_pair "$ENV_VAR" "$AUTH_FP"; then
+        pass "mixed setup: env-matched $ENV_VAR logged with fingerprint"
+    else
+        fail "mixed setup: env-matched $ENV_VAR not logged with fingerprint"
+    fi
+
+    if script_log_has_pair "$second_var" "$second_fp"; then
+        pass "mixed setup: $second_var resolved from auth.json with fingerprint"
+    else
+        fail "mixed setup: $second_var not resolved/logged from auth.json"
+    fi
+
+    if out_matches "FAKE_UVICORN .*gh_fp=$second_fp"; then
+        pass "mixed setup: the auth.json-resolved key reached the proxy"
+    else
+        fail "mixed setup: the auth.json-resolved key was not exported"
+    fi
+
+    if out_has "$second_key"; then
+        fail "mixed setup: plaintext auth.json key leaked into stdout/stderr"
+    else
+        pass "mixed setup: plaintext auth.json key never printed"
+    fi
+}
+
 # ---- Test 6: --use-env-keys consumed (not forwarded) and documented --------
 
 test_use_env_keys_flag_consumed_and_documented() {
@@ -463,6 +548,7 @@ test_opt_out_uses_env_key
 test_env_unset_resolves_from_auth_json
 test_auth_json_missing_keeps_missing_key_error
 test_use_env_keys_flag_consumed_and_documented
+test_mixed_env_and_auth_json_setup_starts
 
 # The cleanup trap prints the results footer; force the documented non-zero
 # exit on failure (a trap's last command does not change the script status).

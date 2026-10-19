@@ -208,6 +208,11 @@ def _candidate_key_names(env_var: str) -> list[str]:
 def _check(env_var: str, auth_file: str) -> int:
     """Run the ``--check`` comparison and emit exactly one JSON line.
 
+    The payload carries the fingerprints only (plus ``resolved_key`` on the
+    env-unset export path) and the ``candidate_names`` the resolver tried, so
+    ``start-proxy.sh`` can print a self-diagnosing stale-key message from this
+    single call (LP-0MVF7DRMK001NHT8).
+
     Exit codes: 0 for ``match`` / ``resolved`` / ``env_only``, 3 for a stale
     ``mismatch``, 4 for ``unresolved`` / ``auth_missing`` (nothing usable).
     """
@@ -224,6 +229,7 @@ def _check(env_var: str, auth_file: str) -> int:
         "env_fingerprint": check.env_fingerprint,
         "auth_fingerprint": check.auth_fingerprint,
         "resolved_key": check.resolved_key,
+        "candidate_names": _candidate_key_names(env_var),
     }
     print(json.dumps(payload))
 
@@ -240,8 +246,9 @@ def main(argv: list[str] | None = None) -> int:
     Default form (``<auth_file> <env_var>``) prints the resolved plaintext key
     and exits 1 when unresolved — unchanged for backwards compatibility.
     ``--check <auth_file> <env_var>`` prints one JSON line of fingerprints
-    (plus ``resolved_key`` on the env-unset export path) and exits 0/3/4 so
-    the shell can decide whether to fail closed on a stale env key.
+    (plus ``resolved_key`` on the env-unset export path and the
+    ``candidate_names`` that were tried) and exits 0/3/4 so the shell can
+    decide whether to fail closed on a stale env key.
     """
     parser = argparse.ArgumentParser(
         description="Resolve an api_key_env var from ~/.pi/agent/auth.json."
