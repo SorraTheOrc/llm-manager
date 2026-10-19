@@ -151,6 +151,26 @@ def test_munitoai_resolved_model_header(model):
     assert free_value != paid_value
 
 
+@pytest.mark.parametrize("model", CHAINS)
+def test_shipped_context_limit_field_is_a_positive_int(model):
+    """A shipped ``max_context_tokens`` must be a positive integer.
+
+    The per-entry context ceiling (LP-0MVF9MY0W002J2N3, parent
+    LP-0MVF2DNCX003Z5CO) is optional: an entry that is deliberately ungated
+    omits the key. When present, it must be a real positive ``int`` — a bool,
+    string, zero or negative value would either silently disable the gate or
+    mis-parse it at dispatch time.
+    """
+    for entry in _providers(load_profile("config.yaml"), model):
+        if "max_context_tokens" not in entry:
+            continue
+        value = entry["max_context_tokens"]
+        assert isinstance(value, int) and not isinstance(value, bool), (
+            f"{entry['name']}: max_context_tokens must be an int, got {value!r}"
+        )
+        assert value > 0, f"{entry['name']}: use an absent key rather than {value!r}"
+
+
 def test_munitoai_api_key_resolves_from_pi_auth_json(tmp_path):
     """``MUNITOAI_API_KEY`` resolves from the ``munitoai`` auth.json entry.
 
