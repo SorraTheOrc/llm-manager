@@ -404,6 +404,52 @@ def test_start_proxy_documents_reason_flag():
     assert "--reason" in joined
 
 
+def test_start_proxy_documents_use_env_keys_in_usage_synopsis():
+    """The usage synopsis lists the fail-closed stale-key opt-out flag."""
+    synopsis = _script_path().read_text(encoding="utf-8").splitlines()[4]
+    assert "--use-env-keys" in synopsis
+
+
+def test_readme_documents_stale_env_key_refusal():
+    """LP-0MVF7DRX70070KYZ: the operator docs record the fail-closed default,
+    the covered api_key_env list, fingerprint-only logging and both opt-out
+    forms, so a rotated auth.json can never be silently ignored."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "### API key rotation and stale env keys" in readme
+    section = readme.split("### API key rotation and stale env keys", 1)[1]
+    for token in (
+        "--use-env-keys",
+        "LLAMA_PROXY_USE_ENV_KEYS=1",
+        "OPENCODE_API_KEY",
+        "OPENCODE_2_API_KEY",
+        "OPENCODE_3_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "MUNITOAI_API_KEY",
+        "MUNITOAI_FREE_API_KEY",
+        "stale API key environment variable(s) detected — refusing to start",
+        "8-character key fingerprint",
+    ):
+        assert token in section, f"README stale-key section is missing {token!r}"
+
+
+def test_start_proxy_skill_documents_stale_key_refusal():
+    """LP-0MVF7DRX70070KYZ: the start-proxy skill warns that a restart may
+    refuse on a stale env key and records the remediation."""
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / ".pi"
+        / "skills"
+        / "start-proxy"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "fails closed" in skill
+    assert "--use-env-keys" in skill
+    assert "LLAMA_PROXY_USE_ENV_KEYS=1" in skill
+    assert "unset OPENCODE_API_KEY" in skill
+
+
 def test_start_proxy_reason_resolution_precedence():
     """The restart-reason resolution is FLAG > ENV > default (LP-0MVAPNC2900145RH).
 

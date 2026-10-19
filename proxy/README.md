@@ -1391,7 +1391,58 @@ before now, wrapping circularly" rule.
 | `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` | Cap (seconds) applied to a guessed (period-name-only) usage-limit quarantine; default 24h. Overridden by `server.usage_limit_guess_cap_seconds` |
 | `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
+| `LLAMA_PROXY_USE_ENV_KEYS` | Set to `1` to keep environment provider API keys even when they disagree with `~/.pi/agent/auth.json` — the opt-out of fail-closed stale-key detection, equivalent to the `--use-env-keys` flag (LP-0MVF7DRMK001NHT8) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
+
+### API key rotation and stale env keys
+
+`start-proxy.sh` resolves every provider key declared as `api_key_env` in the
+effective config from, in order, the environment and
+`~/.pi/agent/auth.json`. The covered variables are `OPENCODE_API_KEY`,
+`OPENCODE_2_API_KEY`, `OPENCODE_3_API_KEY`, `DEEPSEEK_API_KEY`,
+`MUNITOAI_API_KEY` and `MUNITOAI_FREE_API_KEY`.
+
+A key inherited from a long-lived shell — or from an agent/herdr session that
+was started before a rotation — otherwise wins silently over a freshly rotated
+`auth.json`. Stale-key detection is therefore **fail-closed by default**: when
+an environment variable is set but disagrees with the `auth.json` entry for the
+same variable, the proxy refuses to start and names the offending variable with
+both fingerprints:
+
+```text
+ERROR: stale API key environment variable(s) detected — refusing to start.
+       The environment disagrees with /home/<user>/.pi/agent/auth.json, so a rotated
+       auth.json would be silently ignored:
+  - OPENCODE_API_KEY  (environment fp=xxxxxxxx, auth.json fp=yyyyyyyy; auth.json key(s) tried: opencode-go) — stale environment key, MISMATCH
+
+Fix one of these, then restart:
+  1. Unset the stale variable(s) so the auth.json key is used:
+       unset OPENCODE_API_KEY
+  2. Re-export the current key from /home/<user>/.pi/agent/auth.json.
+  3. Explicitly keep the environment keys (stale-key detection is
+     then disabled for this restart):
+       --use-env-keys   or   LLAMA_PROXY_USE_ENV_KEYS=1
+```
+
+Only an 8-character key fingerprint is ever logged — both on startup
+(`[env] <VAR> from environment (matches auth.json, fp=...)`,
+`[env] <VAR> resolved from ~/.pi/agent/auth.json (fp=...)`) and in the
+refusal — so a stale key is diagnosable from the logs alone without exposing
+the secret.
+
+Opt out explicitly when the environment is the intended source of truth:
+
+- `--use-env-keys` — interactive restarts.
+- `LLAMA_PROXY_USE_ENV_KEYS=1` — unattended restarts (herdr/agent-spawned)
+  that cannot pass CLI flags.
+
+With the opt-out a mismatch keeps the environment key and logs a warning that
+the rotated `auth.json` is **ignored for this restart**; unset the opt-out and
+rotate the launching shell's environment to return to fail-closed behaviour. A
+variable set in the environment while `auth.json` has no matching entry is kept
+with a warning that staleness cannot be verified, so only a genuine mismatch
+blocks startup and mixed setups (some keys from the environment, some from
+`auth.json`) start normally.
 
 ### Slot configuration
 

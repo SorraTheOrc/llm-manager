@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Start the proxy application
-# Usage: ./scripts/start-proxy.sh [--restart] [--reason "<text>"] [--verbose] [uvicorn-args...]
+# Usage: ./scripts/start-proxy.sh [--restart] [--reason "<text>"] [--verbose] [--use-env-keys] [uvicorn-args...]
 #
 # Flags:
 #   --restart   Kill all running proxy/llama-server/TTS processes before starting
