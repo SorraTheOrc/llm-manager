@@ -850,6 +850,24 @@ server:
   # quota_surge_accounts:
   #   - opencode-go
   #   - opencode-go-3
+  # Quota-surge pacing model (LP-0MVF7KHI5000J7BL, pure functions in
+  # proxy/quota_pacing.py). OpenCode Go allowances are use-it-or-lose-it, so
+  # during the final week before an account's own `resetsAt` the proxy may
+  # surge traffic to it. The window and ramp are computed per account from its
+  # own reset date (reset dates are not calendar-aligned).
+  #   - quota_surge_days: length of the final surge window in days. An entry
+  #     with `0 < seconds_to_reset <= quota_surge_days * 86400` is inside the
+  #     window. 0 disables the window. Default: 7.
+  #   - quota_pacing_target: fraction of the residual allowance the ramp aims
+  #     to spend by `resetsAt` (0.95 = finish at ~95%, leaving a 5% margin for
+  #     the rolling/weekly caps). Values outside (0, 1] are clamped, not
+  #     trusted. Default: 0.95.
+  # The ramp also starts BEFORE the final week when the residual cannot be
+  # discharged in time: the documented Go caps (rolling 5-hour window = 20% of
+  # monthly, weekly window = 50% of monthly) bound the achievable spend rate,
+  # so e.g. 90% left with 2 days to reset must already be ramping.
+  quota_surge_days: 7
+  quota_pacing_target: 0.95
   # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote
   # provider repeatedly returns an EMPTY response / stalls (no usable content)
   # across retry cycles, the provider is quarantined for an EXTENDED cooldown
