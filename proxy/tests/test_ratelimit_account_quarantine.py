@@ -29,13 +29,12 @@ Coverage map: AC1/AC4 (helper + cycle), AC2 (sibling eligibility in
 ``test_failure_domain_grouping.py``), AC3 (chain-hold exhaustion), AC5 (no
 reset signal), AC6 (Free/Go regressions), AC7 (flag gate), AC8 (both cycles).
 
-TDD red phase: the reset-aware quarantine assertions are marked
-``xfail(strict=True)`` so ``dev`` stays green while this red phase is in
-flight — the same convention as ``test_compaction_headers_contract.py``
-(LP-0MU44KR5F0015D7A) and ``test_restart_lifecycle.py`` (LP-0MVF7DO29009T8MH).
-``strict=True`` means an unexpected pass fails the suite, so the
-implementation item LP-0MVFA1VRT007T9HT must remove these markers when it
-makes the quarantine real. The pre-xfail red run is recorded on the work item.
+TDD red phase completed: the reset-aware quarantine assertions were marked
+``xfail(strict=True)`` while the red phase was in flight (the convention of
+``test_compaction_headers_contract.py`` (LP-0MU44KR5F0015D7A) and
+``test_restart_lifecycle.py`` (LP-0MVF7DO29009T8MH)). The implementation item
+LP-0MVFA1VRT007T9HT made the quarantine real and removed those markers; every
+test in this module is now a plain assertion.
 """
 
 import json
@@ -48,9 +47,6 @@ from fastapi import Response
 
 _MUNITO_ENDPOINT = "https://api.munito.ai/inference"
 _MUNITO_MODEL = "deepseek-ai/deepseek-v4-flash"
-
-# Red-phase marker (see module docstring): removed by LP-0MVFA1VRT007T9HT.
-_RED_REASON = "reset-derived account quarantine added by LP-0MVFA1VRT007T9HT"
 
 # Reset headers mirroring a live MunitoAI free-tier quota 429
 # (LP-0MVBHDNLB007ALLJ): requests exhausted, reset in 32 s.
@@ -222,7 +218,6 @@ class TestResetAwareAccountQuarantine:
             )
             assert attempts[-1]["ratelimit_over_limit"] is True
 
-    @pytest.mark.xfail(strict=True, reason=_RED_REASON)
     def test_reset_header_quarantines_failing_account_beyond_entry_cooldown(self):
         """AC1/AC4: the same 32 s reset ALSO quarantines the failing account
         for reset + the 2-minute ``_USAGE_LIMIT_RESET_MARGIN_SECONDS``, which
@@ -317,7 +312,6 @@ def _chain_mock(call_order: list[str], headers: dict | None = _RESET_HEADERS):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=_RED_REASON)
 async def test_remote_fallback_cycle_quarantines_failing_account(free_paid_chain):
     """AC1/AC8: the remote-only loop quarantines the failing account and still
     advances to the paid sibling within the same request."""
@@ -348,7 +342,6 @@ async def test_remote_fallback_cycle_quarantines_failing_account(free_paid_chain
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=_RED_REASON)
 async def test_combined_fallback_cycle_quarantines_failing_account(free_paid_chain):
     """AC8: the combined local+remote loop applies the same quarantine."""
     call_order: list[str] = []
@@ -401,7 +394,6 @@ async def test_combined_fallback_cycle_without_reset_signal_does_not_quarantine(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=_RED_REASON)
 async def test_quota_429_exhaustion_retry_after_derives_from_account_quarantine():
     """AC3: when the quota 429 exhausts the whole chain, the chain-hold cycles
     still apply and the terminal exhaustion response advertises a retry_after

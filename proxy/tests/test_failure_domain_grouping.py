@@ -1424,15 +1424,12 @@ async def test_usage_limit_different_gateway_falls_through():
 # endpoint stays eligible for the SAME request. Endpoint-level failures
 # (HTTP 5xx) still poison the shared failure domain (AC2).
 #
-# Reset-aware account quarantine (LP-0MVFA0PAV0022ZHO) below: a quota 429
-# carrying x-ratelimit-reset-* must ALSO quarantine ONLY the failing account
+# Reset-aware account quarantine (LP-0MVFA0PAV0022ZHO): a quota 429
+# carrying x-ratelimit-reset-* quarantines ONLY the failing account
 # (reset + _USAGE_LIMIT_RESET_MARGIN_SECONDS) while the paid sibling stays
-# eligible. The pinning test is marked xfail(strict=True) as a red phase —
-# the marker is removed by the implementation item LP-0MVFA1VRT007T9HT.
+# eligible. The marker was removed by the implementation item
+# LP-0MVFA1VRT007T9HT once the quarantine became real.
 # ===========================================================================
-
-# Red-phase marker (see test_ratelimit_account_quarantine.py module docstring).
-_RED_REASON = "reset-derived account quarantine added by LP-0MVFA1VRT007T9HT"
 
 
 @pytest.fixture
@@ -1669,7 +1666,6 @@ async def test_account_429_poisons_account_key_not_failure_domain(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=_RED_REASON)
 async def test_reset_aware_429_quarantines_only_the_failing_account(
     munitoai_free_paid_chain, tmp_path, monkeypatch,
 ):

@@ -2962,6 +2962,51 @@ def _get_ratelimit_cooldown_margin_seconds(config: dict | None) -> float:
     return margin
 
 
+def _apply_ratelimit_account_quarantine(
+    response: Response,
+    body_text: str,
+    provider_cfg: dict,
+    ratelimit_reset: float | None,
+) -> float | None:
+    """Quarantine the failing API-key ACCOUNT for an upstream reset window.
+
+    A quota 429 (a per-account rate-limit error or an explicit
+    ``x-ratelimit-over-limit`` flag) that also carries a parseable
+    ``x-ratelimit-reset-*`` duration is evidence the upstream will not serve
+    that ACCOUNT until the reported reset. The ENTRY-level cooldown applied by
+    :func:`_handle_http_error_with_cooldown` (reset + the 2 s
+    ``_RATELIMIT_COOLDOWN_MARGIN_SECONDS``) is only in-memory for that entry;
+    recording the reset as an explicit ACCOUNT quarantine here makes the wait
+    survive the request, feeds :func:`_compute_retry_after` and the chain-hold,
+    and is persisted to ``provider-state.json`` (LP-0MVFA1VRT007T9HT).
+
+    The quarantine is keyed on :func:`_usage_limit_account_key`
+    (``api_key_env@endpoint:model``), so a paid sibling on the same gateway
+    with an independent quota is never poisoned. ``explicit=True`` keeps it
+    exempt from the guessed-quarantine 24 h cap and the self-healing probe.
+
+    Returns the applied quarantine duration (parsed reset plus the existing
+    2-minute :data:`_USAGE_LIMIT_RESET_MARGIN_SECONDS`) when a quarantine was
+    recorded, otherwise ``None`` (the caller then keeps the pre-existing
+    behaviour untouched).
+    """
+    if ratelimit_reset is None:
+        return None
+    if int(getattr(response, "status_code", 0) or 0) != 429:
+        return None
+    if not (
+        _is_account_rate_limit_error(response, body_text)
+        or _ratelimit_over_limit(response.headers)
+    ):
+        return None
+    quarantine_seconds = ratelimit_reset + _USAGE_LIMIT_RESET_MARGIN_SECONDS
+    _set_usage_limit_quarantine(
+        _usage_limit_account_key(provider_cfg),
+        _UsageLimitReset(quarantine_seconds, True, "x-ratelimit-headers"),
+    )
+    return quarantine_seconds
+
+
 def _get_cooldown_seconds(config: dict) -> float:
     """Read ``provider_cooldown_seconds`` from config, supporting both flat and nested formats.
 
@@ -5418,6 +5463,17 @@ def _handle_http_error_with_cooldown(
         margin = _get_ratelimit_cooldown_margin_seconds(config)
         cooldown = max(cooldown, ratelimit_reset + margin)
 
+    # Account-scoped application (LP-0MVFA1VRT007T9HT): the reset also poisons
+    # the failing API-key ACCOUNT (reset + 2-minute margin) so the wait outlives
+    # the entry cooldown and is consumed by the exclusion / retry-after / chain
+    # hold machinery unchanged. Only applied to a quota 429 that parsed a reset
+    # header; a plain 429 with no reset signal keeps the pre-existing behaviour.
+    account_quarantine_seconds: float | None = None
+    if ratelimit_reset is not None and provider_cfg is not None:
+        account_quarantine_seconds = _apply_ratelimit_account_quarantine(
+            response, body_text, provider_cfg, ratelimit_reset
+        )
+
     mark_provider_unavailable(provider_name, cooldown)
     attempt_fields: dict[str, Any] = {
         "provider": provider_name,
@@ -5430,6 +5486,8 @@ def _handle_http_error_with_cooldown(
     if ratelimit_reset is not None:
         attempt_fields["ratelimit_reset_seconds"] = ratelimit_reset
         attempt_fields["ratelimit_over_limit"] = ratelimit_over_limit
+    if account_quarantine_seconds is not None:
+        attempt_fields["account_quarantine_seconds"] = account_quarantine_seconds
     _record_attempt(attempts, **attempt_fields)
     return cooldown
 
