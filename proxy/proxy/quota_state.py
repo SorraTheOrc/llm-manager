@@ -18,6 +18,10 @@ What this module provides
   the derived account state (per-window ``headroom``, ``effective_headroom``,
   ``seconds_to_reset``, ``exhausted``, ``last_success_at``, ``last_status``).
 - :func:`get_quota_snapshot` — a non-blocking cache read for routing callers.
+- :func:`quota_behaviour` / :class:`QuotaBehaviour` — the single predicate
+  answering "may quota state influence routing right now?" (enabled /
+  dry-run / suspended-on-stale-state / disabled by the kill switch),
+  consulted by every quota decision site (LP-0MVF7KPB9009U7CG).
 - :func:`refresh_quota_accounts` — an interval-gated, single-flighted
   background refresh for a set of provider entries.
 - An injectable module-level transport (:data:`_quota_usage_transport`,
@@ -67,6 +71,8 @@ from typing import Any
 
 import httpx
 
+from proxy import quota_pacing
+
 logger = logging.getLogger("llama-proxy.quota_state")
 
 #: The three quota windows returned by ``/v1/usage``, in nesting order.
@@ -96,6 +102,19 @@ MAX_QUOTA_EXHAUSTION_PERCENT = 100.0
 
 #: One-shot guard for the invalid-``quota_exhaustion_percent`` WARN.
 _QUOTA_EXHAUSTION_PERCENT_WARNED = False
+
+#: ``server.quota_state_max_age_seconds`` default: once the last successful
+#: poll for an account is older than this, the quota state is treated as
+#: **stale** and surge is suspended for that account (fail-safe: no bypass, no
+#: quota-driven re-ordering or skip — routing reverts to the configured
+#: ``available_times`` and config order).
+DEFAULT_QUOTA_STATE_MAX_AGE_SECONDS = 3600.0
+
+#: The four modes :func:`quota_behaviour` can report.
+MODE_ENABLED = "enabled"
+MODE_DRY_RUN = "dry_run"
+MODE_SUSPENDED = "suspended"
+MODE_DISABLED = "disabled"
 
 #: Only ``opencode-*`` entries are quota-managed by default.
 _OPENCODE_PROVIDER_PREFIX = "opencode"
@@ -400,6 +419,30 @@ def _warn_invalid_quota_exhaustion_percent(raw: Any, used: float) -> None:
     )
 
 
+def quota_state_max_age_seconds(config: dict | None) -> float:
+    """``server.quota_state_max_age_seconds`` (default 3600 s, never negative).
+
+    The staleness horizon for :func:`quota_behaviour`: a snapshot whose
+    ``last_success_at`` is older than this many seconds suspends surge for
+    that account (fail-safe, not fail-open).
+
+    Invalid values leak in the **fail-safe** direction only: a malformed or
+    non-finite value falls back to the default, and a negative value is
+    clamped to ``0`` ("any age is stale"), which suspends rather than
+    trusting. ``0`` therefore means "always suspend once polled".
+    """
+    raw = _config_value(config, "quota_state_max_age_seconds", None)
+    if raw is None:
+        return DEFAULT_QUOTA_STATE_MAX_AGE_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_QUOTA_STATE_MAX_AGE_SECONDS
+    if not math.isfinite(value):
+        return DEFAULT_QUOTA_STATE_MAX_AGE_SECONDS
+    return max(0.0, value)
+
+
 def poll_interval_seconds(config: dict | None) -> float:
     """``server.quota_poll_interval_seconds`` (default 900 s, minimum 1 s)."""
     try:
@@ -537,6 +580,190 @@ def cached_snapshots() -> dict[str, QuotaSnapshot]:
     return dict(_snapshots)
 
 
+# ---------------------------------------------------------------------------
+# Central behaviour predicate (kill switch / dry-run / stale suspension)
+# ---------------------------------------------------------------------------
+
+#: account key -> currently-suspended flag, for the once-per-suspension WARN.
+_stale_suspension_active: set[str] = set()
+
+
+@dataclass(frozen=True)
+class QuotaBehaviour:
+    """One immutable verdict: how may quota state influence routing right now.
+
+    The single predicate consulted by every quota decision site (ordering,
+    bypass and skip — LP-0MVF7KPB9009U7CG), so a test can prove "all quota
+    behaviour off" by construction. ``mode`` is one of the :data:`MODE_*`
+    constants:
+
+    - ``enabled`` — quota state may change routing (ordering, bypass, skip);
+    - ``dry_run`` — decisions are still *computed* (and logged with
+      ``reason=quota_surge_dry_run``) but never applied: routing is
+      byte-identical to the pre-feature behaviour;
+    - ``suspended`` — at least one account's snapshot is stale (older than
+      ``server.quota_state_max_age_seconds``): quota state is **not**
+      consulted for routing at all, reverting to configured
+      ``available_times`` and config order (fail-safe, not fail-open);
+    - ``disabled`` — ``server.quota_surge_enabled: false``: every quota-derived
+      decision is skipped and routing is byte-identical to today.
+
+    Suspension is deliberately **global** (any stale snapshot suspends surge
+    for the routing decision): a stale reading is guesswork, and the fail-safe
+    is that the surge makes *no* ordering/bypass/skip decisions from it — so a
+    stale candidate can never be ranked below fresh ones or dropped (child
+    AC9b). ``stale_accounts`` names every account that caused the suspension,
+    and ``last_poll_age_seconds`` is the oldest such age (for log
+    observability).
+    """
+
+    mode: str
+    stale_accounts: tuple[str, ...] = ()
+    last_poll_age_seconds: float = 0.0
+    max_age_seconds: float = DEFAULT_QUOTA_STATE_MAX_AGE_SECONDS
+
+    @property
+    def enabled(self) -> bool:
+        """The feature itself is on (not the kill switch)."""
+        return self.mode != MODE_DISABLED
+
+    @property
+    def dry_run(self) -> bool:
+        return self.mode == MODE_DRY_RUN
+
+    @property
+    def suspended(self) -> bool:
+        return self.mode == MODE_SUSPENDED
+
+    @property
+    def disabled(self) -> bool:
+        return self.mode == MODE_DISABLED
+
+    @property
+    def applies(self) -> bool:
+        """True when quota state may change routing (strictly enabled)."""
+        return self.mode == MODE_ENABLED
+
+    @property
+    def computes(self) -> bool:
+        """True when quota decisions are (still) worth computing for logging."""
+        return self.mode in (MODE_ENABLED, MODE_DRY_RUN)
+
+    def log_reason(self) -> str:
+        """The stable ``reason=`` code call sites append to their log lines."""
+        if self.dry_run:
+            return "quota_surge_dry_run"
+        if self.suspended:
+            return "quota_surge_suspended"
+        return "quota_surge"
+
+
+#: account key -> currently-suspended flag, for the once-per-suspension WARN.
+_stale_suspension_active: set[str] = set()
+
+
+def _warn_stale_suspension(
+    account: str,
+    snapshot: QuotaSnapshot,
+    age: float,
+    max_age: float,
+) -> None:
+    """WARN once per account per suspension transition (fail-safe notice)."""
+    if account in _stale_suspension_active:
+        return
+    _stale_suspension_active.add(account)
+    logger.warning(
+        "quota surge suspended account=%s last_poll_age=%.0fs "
+        "max_age=%.0fs reason=quota_surge_suspended fail_safe=true "
+        "effective_headroom=%.1f%% resets_in=%ds",
+        account,
+        age,
+        max_age,
+        snapshot.effective_headroom,
+        int(snapshot.seconds_to_reset),
+    )
+
+
+def _resume_suspension(account: str) -> None:
+    """Clear the suspension flag and note the recovery once per resume."""
+    if account not in _stale_suspension_active:
+        return
+    _stale_suspension_active.discard(account)
+    logger.info(
+        "quota surge resumed account=%s reason=quota_surge_resumed",
+        account,
+    )
+
+
+def reset_quota_behaviour_state() -> None:
+    """Forget per-account suspension WARN state (tests, config reload)."""
+    _stale_suspension_active.clear()
+
+
+def quota_behaviour(
+    config: dict | None = None,
+    *,
+    now: datetime | None = None,
+) -> QuotaBehaviour:
+    """Return the mode quota state may influence routing for *config*.
+
+    The **single predicate** consulted by every quota decision site — headroom
+    ordering, the final-week ``available_times`` bypass and the quota-driven
+    skip (LP-0MVF7KPB9009U7CG) — so "all quota behaviour off" is scrutably
+    true whenever it reports ``disabled`` or ``suspended``.
+
+    Mode resolution, in order:
+
+    1. ``server.quota_surge_enabled: false`` → :data:`MODE_DISABLED` (the kill
+       switch; nothing is computed or applied);
+    2. any cached snapshot older than ``server.quota_state_max_age_seconds``
+       (default 3600 s) → :data:`MODE_SUSPENDED`, with exactly one WARN per
+       account per suspension transition. Suspension is global: **any** stale
+       snapshot suspends the whole decision, so no routing decision is ever
+       made from guesswork (child AC9 / AC9b);
+    3. ``server.quota_surge_dry_run: true`` → :data:`MODE_DRY_RUN`;
+    4. otherwise :data:`MODE_ENABLED`.
+
+    A **missing** snapshot (never polled, account not matched, endpoint
+    absent) never suspends: with nothing to be stale about, the mode is
+    ``dry_run``/``enabled`` and the routing call sites fail closed on the
+    absent snapshot by themselves (child AC9b). ``now`` defaults to the
+    module clock (:func:`set_clock`), so tests freeze it together with the
+    poller.
+    """
+    if not quota_pacing.surge_enabled(config):
+        return QuotaBehaviour(MODE_DISABLED)
+
+    current = now if now is not None else _now()
+    max_age = quota_state_max_age_seconds(config)
+    stale: list[tuple[str, float, QuotaSnapshot]] = []
+    for account, snapshot in _snapshots.items():
+        age = (current - snapshot.last_success_at).total_seconds()
+        if age > max_age:
+            stale.append((account, age, snapshot))
+
+    if stale:
+        for account, age, snapshot in stale:
+            _warn_stale_suspension(account, snapshot, age, max_age)
+        recovered = set(_stale_suspension_active) - {a for a, _, _ in stale}
+        for account in recovered:
+            _resume_suspension(account)
+        oldest = max(age for _, age, _ in stale)
+        return QuotaBehaviour(
+            MODE_SUSPENDED,
+            stale_accounts=tuple(a for a, _, _ in stale),
+            last_poll_age_seconds=oldest,
+            max_age_seconds=max_age,
+        )
+
+    for account in list(_stale_suspension_active):
+        _resume_suspension(account)
+
+    if quota_pacing.surge_dry_run(config):
+        return QuotaBehaviour(MODE_DRY_RUN)
+    return QuotaBehaviour(MODE_ENABLED)
+
+
 def reset_quota_state() -> None:
     """Clear all cached state, in-flight tasks and injected hooks (tests)."""
     for task in list(_inflight.values()):
@@ -547,6 +774,7 @@ def reset_quota_state() -> None:
     _inflight.clear()
     _last_warn_at.clear()
     reset_quota_exhaustion_warning()
+    reset_quota_behaviour_state()
     set_quota_transport(None)
     set_clock(None)
 

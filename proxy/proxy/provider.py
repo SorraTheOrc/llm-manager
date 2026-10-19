@@ -2147,18 +2147,33 @@ def _record_provider_context_skip(
 def _quota_ordering_active(config: dict | None) -> bool:
     """Whether headroom-aware ordering may re-order the provider chain.
 
-    The single predicate guarding the whole quota-ordering feature
+    The config-level predicate guarding the whole quota-ordering feature
     (LP-0MVF7KIKE002DZVD): whenever it returns ``False`` every resolution path
     behaves exactly as it did before the feature existed. Ordering is active
     only while the quota-surge feature is enabled *and* not in dry-run.
     Dry-run still computes and logs the ranking
     (:func:`_quota_ranked_providers`) but never applies it.
 
-    Delegates to :func:`_quota_surge_applies` so ordering and the final-week
-    ``available_times`` bypass (LP-0MVF7KJN2000ASE8) can never disagree about
-    whether surge may change routing.
+    Delegates to :func:`_quota_surge_applies` for the config-level gate, and to
+    :func:`_quota_behaviour` for the per-account / stale-state part of the
+    decision (which also gates the final-week bypass,
+    LP-0MVF7KPB9009U7CG).
     """
     return _quota_surge_applies(config)
+
+
+def _quota_behaviour(
+    config: dict | None, now: datetime | None = None
+) -> quota_state.QuotaBehaviour:
+    """The single central predicate every quota decision site consults.
+
+    Returns :class:`proxy.quota_state.QuotaBehaviour` (enabled / dry-run /
+    suspended-on-stale-state / disabled by the kill switch). Ordering, the
+    ``available_times`` bypass and the quota-driven skip all branch on this
+    one object, so a test can prove "all quota behaviour off" by construction
+    (LP-0MVF7KPB9009U7CG). ``now`` defaults to the injectable quota clock.
+    """
+    return quota_state.quota_behaviour(config, now=now)
 
 
 def _quota_provider_score(
@@ -2196,11 +2211,23 @@ def _quota_ranked_providers(
     A copy is always returned — the caller's list is never mutated. An entry
     with no snapshot scores 0 and keeps config order among its peers; when no
     quota entry has been polled the configured order is preserved exactly.
+
+    Ordering is gated by the central :func:`_quota_behaviour` predicate: it is
+    suspended entirely when any snapshot is stale (older than
+    ``server.quota_state_max_age_seconds``), so the chain reverts to config
+    order and a stale reading can never re-rank or strand a candidate (child
+    AC9). Disabled and suspended modes therefore both return the configured
+    order unchanged.
     """
     providers = model_config.get("providers")
     if not isinstance(providers, list) or len(providers) < 2:
         return list(providers) if isinstance(providers, list) else []
     if not quota_pacing.surge_enabled(config):
+        return list(providers)
+
+    behaviour = _quota_behaviour(config)
+    if not behaviour.computes:
+        # Stale state: fail-safe — no ranking, no log, plain config order.
         return list(providers)
 
     active = _quota_ordering_active(config)
@@ -2247,7 +2274,7 @@ def _quota_ranked_providers(
         for rank, entry in enumerate(ranked, start=1):
             logger.debug(
                 "quota_ordering rank=%d provider=%s config_index=%d headroom=%.1f "
-                "seconds_to_reset=%.0f score=%.6g applied=%s",
+                "seconds_to_reset=%.0f score=%.6g applied=%s behaviour=%s reason=%s",
                 rank,
                 entry["provider"].get("name", "unknown"),
                 entry["index"],
@@ -2255,6 +2282,8 @@ def _quota_ranked_providers(
                 entry["seconds_to_reset"],
                 entry["score"],
                 active,
+                behaviour.mode,
+                behaviour.log_reason(),
             )
 
     if not active:
@@ -2276,22 +2305,34 @@ def _quota_unavailable_reason(
     entry whose snapshot is
     :attr:`~proxy.quota_state.QuotaSnapshot.exhausted` (any window blocking,
     or no effective headroom left) is treated as unavailable — the same
-    conservative stance the snapshot itself takes. Returns ``None`` (fail
-    open) when ordering is inactive, the entry is not quota-managed, or no
-    snapshot has been polled yet.
+    conservative stance the snapshot itself takes.
+
+    The decision is gated on the central behaviour predicate
+    (:func:`proxy.quota_state.quota_behaviour`): it returns ``None`` (fail
+    open) when the feature is disabled, when the state is stale (suspended —
+    a stale exhausted reading must not strand the account, child AC9b), when
+    the entry is not quota-managed, or when no snapshot has been polled yet.
+    In dry-run mode the would-be skip is logged once per account with
+    ``reason=quota_surge_dry_run`` but ``None`` is returned, so eligibility is
+    byte-identical to the pre-feature behaviour (child AC8b).
     """
-    if not _quota_ordering_active(config):
-        return None
     if not quota_state.is_quota_provider(provider_cfg, config):
+        return None
+    behaviour = _quota_behaviour(config)
+    if behaviour.disabled or behaviour.suspended:
         return None
     snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
     if snapshot is None or not snapshot.exhausted:
         return None
-    return (
+    reason = (
         f"quota_exhausted (account={snapshot.account}, "
         f"effective_headroom={snapshot.effective_headroom:.1f}%, "
         f"resets_in={int(snapshot.seconds_to_reset)}s)"
     )
+    if behaviour.dry_run:
+        _log_quota_skip_decision(provider_cfg, snapshot)
+        return None
+    return reason
 
 
 def _quota_exhausted(
@@ -2311,7 +2352,11 @@ def _quota_exhausted(
     **not** conditional on the surge feature: an exhausted account is skipped
     whether or not surge is enabled, and the final-week surge bypass can
     never re-enable it (the skip runs before the ``available_times``/surge
-    gate). Returns ``(False, "")`` (fail open) when the entry is not
+    gate). It is also deliberately **not** suspended by stale state
+    (``server.quota_state_max_age_seconds``): it is a money guard, so a stale
+    "nearly spent" reading fails in the safe direction (keep blocking) rather
+    than spending real pay-as-you-go money on an old observation. Returns
+    ``(False, "")`` (fail open) when the entry is not
     quota-managed or no snapshot has been polled yet — the guard only acts on
     authoritative quota state.
     """
@@ -2793,19 +2838,77 @@ def _is_within_allowed_window(provider_cfg: dict, now_utc: datetime | None = Non
 #: account key -> last observed bypass state, for once-per-transition logging.
 _SURGE_BYPASS_LOGGED: dict[str, bool] = {}
 
+#: ``(decision, account)`` pairs already reported in dry-run, so a dry run
+#: names each would-be decision once per account instead of on every request.
+_QUOTA_DRY_RUN_LOGGED: set[tuple[str, str]] = set()
+
 
 def reset_surge_bypass_state() -> None:
-    """Forget the per-account transition log state (tests, cache resets)."""
+    """Forget per-account transition / dry-run decision log state (tests)."""
     _SURGE_BYPASS_LOGGED.clear()
+    _QUOTA_DRY_RUN_LOGGED.clear()
+
+
+def _log_quota_skip_decision(
+    provider_cfg: dict, snapshot: quota_state.QuotaSnapshot
+) -> None:
+    """INFO once per account that a dry run *would* have skipped the entry.
+
+    Dry-run must not change eligibility (child AC8b), so the decision is
+    reported and the caller returns ``None`` (fail open) instead of skipping.
+    The ``reason=quota_surge_dry_run`` code keeps these lines greppable apart
+    from the applied ``reason=quota_exhausted`` skips.
+    """
+    key = ("skip", snapshot.account)
+    if key in _QUOTA_DRY_RUN_LOGGED:
+        return
+    _QUOTA_DRY_RUN_LOGGED.add(key)
+    logger.info(
+        "quota_skip dry_run would_skip=true provider=%s account=%s "
+        "effective_headroom=%.1f%% resets_in=%ds reason=quota_surge_dry_run",
+        str(provider_cfg.get("name") or "unknown"),
+        snapshot.account,
+        snapshot.effective_headroom,
+        int(snapshot.seconds_to_reset),
+    )
+
+
+def _log_surge_bypass_dry_run(
+    provider_cfg: dict, snapshot: quota_state.QuotaSnapshot
+) -> None:
+    """INFO once per account that a dry run *would* have lifted the window.
+
+    The would-be bypass is exactly the decision that differs from today's
+    routing (the configured ``available_times`` window still applies in
+    dry-run), so it is logged with ``reason=quota_surge_dry_run`` while the
+    eligibility decision itself stays unchanged (child AC8b).
+    """
+    key = ("bypass", snapshot.account)
+    if key in _QUOTA_DRY_RUN_LOGGED:
+        return
+    _QUOTA_DRY_RUN_LOGGED.add(key)
+    resets_at = snapshot.monthly.resets_at
+    resets_at_text = (
+        resets_at.isoformat().replace("+00:00", "Z") if resets_at else "unknown"
+    )
+    logger.info(
+        "quota_surge_bypass dry_run would_bypass=true provider=%s account=%s "
+        "resets_at=%s seconds_to_reset=%ds reason=quota_surge_dry_run",
+        str(provider_cfg.get("name") or "unknown"),
+        snapshot.account,
+        resets_at_text,
+        int(snapshot.seconds_to_reset),
+    )
 
 
 def _quota_surge_applies(config: dict | None = None) -> bool:
-    """True when surge may change routing: enabled and not in dry-run.
+    """Config-level gate: surge is enabled and not in dry-run.
 
     The single review point for the kill switch (``quota_surge_enabled``) and
-    dry-run (``quota_surge_dry_run``) shared by headroom ordering and the
-    final-week bypass, so the two can never disagree. Dry-run leaves routing
-    byte-identical to the pre-feature behaviour.
+    dry-run (``quota_surge_dry_run``). The per-account decision (including the
+    stale-state suspension) is made by
+    :func:`proxy.quota_state.quota_behaviour`; this helper only answers
+    "would surge be allowed at all for this config?".
     """
     return quota_pacing.surge_enabled(config) and not quota_pacing.surge_dry_run(
         config
@@ -2851,21 +2954,35 @@ def _quota_surge_bypass_active(
 
     Active only when **all** hold (child AC5 / epic R4):
 
-    - surge may change routing (:func:`_quota_surge_applies`);
     - the entry is quota-managed (:func:`proxy.quota_state.is_quota_provider`);
-    - a fresh snapshot exists and is not
+    - :func:`_quota_behaviour` reports ``enabled`` — the central predicate, so
+      the kill switch, dry-run and stale-state suspension all switch the
+      bypass off (children AC8 / AC8b / AC9);
+    - a snapshot exists and is not
       :attr:`~proxy.quota_state.QuotaSnapshot.exhausted`;
     - ``0 < seconds_to_reset <= server.quota_surge_days * 86400``, measured
       from the account's own monthly ``resetsAt``.
 
     A missing snapshot fails closed (no bypass): without authoritative quota
-    state the configured ``available_times`` gate stands. The module clock is
-    injectable through :func:`proxy.quota_state.set_clock`, so the reset
-    horizon is deterministic in tests.
+    state the configured ``available_times`` gate stands. A **stale** snapshot
+    suspends the bypass (fail-safe revert to the configured window), and the
+    live transition state is dropped so a later recovery logs a fresh
+    ``entered`` line. In dry-run the would-be bypass is logged once per
+    account with ``reason=quota_surge_dry_run`` and ``False`` is returned, so
+    eligibility, retry-after and next-window values stay unchanged.
+    The module clock is injectable through
+    :func:`proxy.quota_state.set_clock`, so the reset horizon is deterministic
+    in tests.
     """
-    if not _quota_surge_applies(config):
-        return False
     if not quota_state.is_quota_provider(provider_cfg, config):
+        return False
+    behaviour = _quota_behaviour(config)
+    if behaviour.disabled:
+        return False
+    if behaviour.suspended:
+        # Fail-safe: stale state must not lift a configured restriction. Drop
+        # the live transition flag so a later recovery re-logs ``entered``.
+        _SURGE_BYPASS_LOGGED[quota_state.account_key(provider_cfg)] = False
         return False
     snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
     if snapshot is None:
@@ -2873,6 +2990,10 @@ def _quota_surge_bypass_active(
     active = not snapshot.exhausted and quota_pacing.surge_window_active(
         snapshot.seconds_to_reset, config
     )
+    if behaviour.dry_run:
+        if active:
+            _log_surge_bypass_dry_run(provider_cfg, snapshot)
+        return False
     _log_surge_bypass_transition(provider_cfg, snapshot, active)
     return active
 
@@ -2890,6 +3011,10 @@ def _provider_in_allowed_window(
     the final-week bypass is layered on top of it (LP-0MVF7KJN2000ASE8).
     Nothing else is relaxed — callers keep checking cooldown, budget, circuit
     breaker, failure domains, quarantine and stall gates themselves.
+    The bypass itself is off whenever surge is in dry-run, suspended (stale
+    quota state) or disabled, so eligibility, ``retry_after`` and
+    next-window values are byte-identical to the pre-feature behaviour in
+    those modes (LP-0MVF7KPB9009U7CG).
     """
     if _is_within_allowed_window(provider_cfg, now_utc=now_utc):
         return True

@@ -1061,6 +1061,33 @@ server:
   # so e.g. 90% left with 2 days to reset must already be ramping.
   quota_surge_days: 7
   quota_pacing_target: 0.95
+  # Quota-surge kill switch, dry run and stale-state fail-safe
+  # (LP-0MVF7KPB9009U7CG). All three flags are consulted per request through
+  # the single predicate `quota_state.quota_behaviour()`, which every quota
+  # decision site (ordering, `available_times` bypass, quota-driven skip)
+  # shares:
+  #   - quota_surge_enabled: false turns every quota-derived decision off. No
+  #     ordering, no bypass, no quota-driven skip: routing is byte-identical
+  #     to the configuration without quota state. The separate cost guard
+  #     (`quota_exhaustion_percent`) is a money guard and stays active. The
+  #     poller keeps running so state and observability stay current.
+  #     Default: true.
+  #   - quota_surge_dry_run: true computes and logs the decisions it *would*
+  #     take (INFO lines with `reason=quota_surge_dry_run`, DEBUG
+  #     `quota_ordering` lines with `applied=False`) but leaves the selected
+  #     provider, eligibility, `retry_after` and next-window values unchanged.
+  #     The flag is re-read per request (no cached decision). Default: false.
+  #   - quota_state_max_age_seconds: fail-safe stale guard. When the last
+  #     successful poll for an account is older than this, surge is
+  #     SUSPENDED for that account: no bypass, no quota-driven re-ordering or
+  #     skip, so routing reverts to the configured `available_times` and config
+  #     order. One WARN per account per suspension with
+  #     `reason=quota_surge_suspended`, and one INFO on recovery. Missing /
+  #     never-polled state never suspends (nothing is stale) and never enables
+  #     surge. Default: 3600 seconds (1 hour).
+  quota_surge_enabled: true
+  quota_surge_dry_run: false
+  quota_state_max_age_seconds: 3600
   # Quota hard stop / cost guard (LP-0MVF7KO8C005NB59). An `opencode-*` account
   # whose monthly consumption is at or above this percentage — or whose
   # `effective_headroom` is at or below `100 - threshold` (a spent rolling or
