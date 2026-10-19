@@ -504,6 +504,7 @@ When a request arrives for a model with a `providers` list, the proxy tries each
 | `llama_model` | string | local | Name of the local model |
 | `available_times` | list | no | List of `"HH:MM-HH:MM"` UTC windows during which this provider may be used (timed access, see below) |
 | `rate_limit_rpm` | int | no | Maximum dispatches to this entry per rolling 60-second window (free-tier request budget — see [Free-tier request budgets](#free-tier-request-budgets-rate_limit_rpm)) |
+| `max_context_tokens` | int | no | Maximum estimated prompt context the entry may serve. A request estimated above it skips the entry and falls through to the next provider — a size mismatch, not a failure (no cooldown/affinity/queue side effects). Absent/`0` = ungated. Shipped values are sourced — see [Per-entry context limits](#per-entry-context-limits-max_context_tokens) (LP-0MVF9N2QL001CDA7, LP-0MVF9N31A0006VH5) |
 | `display_name` | string | no | Human-readable tier label for the X-Resolved-Model header (e.g. `MunitoAI Free`, `OpenCode Go 3`). Overrides the `provider` brand in the display string only — failure-domain, cooldown and usage-limit keying still use `provider`. Use it to distinguish same-brand tiers/accounts (LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62). |
 
 #### Free-tier request budgets (`rate_limit_rpm`)
@@ -580,6 +581,32 @@ models:
 ```
 
 In this example, requests first try the local `Qwen3` model. If the local server is unavailable, has no available slots, or returns errors, the request falls back to the remote provider.
+
+#### Per-Entry Context Limits (`max_context_tokens`)
+
+Each provider entry may optionally declare `max_context_tokens`, the maximum
+**estimated prompt context** it may serve. At dispatch time, a request whose
+routing estimate exceeds the ceiling **skips** the entry and falls through to
+the next eligible provider (LP-0MVF9N2QL001CDA7):
+
+- the estimate reuses the authoritative routing pipeline, so the gate is
+  consistent with the local thresholds and the hard routing cap, and it is
+  computed **once per request** (no duplicate tokenizer pass per provider);
+- a skip is recorded as an attempt (`status=provider_context_exceeded`,
+  carrying estimate + limit) and logged — it is a size mismatch, **not** a
+  failure: no cooldown, no failure-domain exclusion, no usage-limit reset, no
+  affinity record, no contention-queue entry, and the entry stays eligible for
+  later, smaller requests;
+- absent / `0` / non-positive = ungated (byte-for-byte previous behaviour);
+  on a local entry it composes as an **additional hard cap**
+  (`min(existing local thresholds, max_context_tokens)`);
+- shipped values are **sourced** (upstream model context window or the
+  provider's documented per-minute token allowance), never guessed — see the
+  value table and provenance in `proxy/config.yaml` (sourced-limits block) and
+  `proxy/MODEL_ADD.md`;
+- at least one tier (the final `deepseek-flash`) is capped at the **largest
+  upstream context window**, so an oversized prompt always has a destination
+  and the chain cannot exhaust because of caps alone.
 
 #### Timed Access (`available_times`)
 
@@ -835,6 +862,7 @@ hint.
 | Usage-limit quarantine | `usage_limit_reset` (+ `reset_in`/`reset_at`) | `<provider>: <reset seconds>` | `Skipping provider=<p>: usage_limit_reset_pending` / `usage_limit_reset=` on the exhaustion line |
 | Local slot held by another session | `local_lease_active` / `fallback_after_queue` | — | `local_dispatch_denied session=… owner=… active=…` |
 | Free-tier request budget exhausted (`rate_limit_rpm`) | `rate_limited` / `rate_limited_waited` | — | `Provider budget exhausted: skipping provider=<p> limit=<n> remaining=<n> reason=rate_limited …` |
+| Prompt context above the entry's `max_context_tokens` | `provider_context_exceeded` | — | `routing_skip_provider_context provider=<p> type=<t> status=provider_context_exceeded estimated_tokens=<n> limit=<limit> reason=provider_context_exceeded …` |
 | All local slots busy (slot exhaustion) | `slot_exhaustion` | — | `Model server busy: 0/N slots available` (429) |
 | Provider / brand cooldown | `http_exception` / `empty_response` / etc. | `<name or brand>: <seconds>` | `marking provider unavailable` / `unavailable={…}` on the exhaustion line |
 

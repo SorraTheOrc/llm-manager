@@ -164,6 +164,43 @@ Capacity vs resilience — the three entries are **not** interchangeable:
 The fully paid `munitoai` and `deepseek-flash` entries never join a `low` chain:
 they carry no window discipline that would confine spend to off-peak hours.
 
+### Per-entry context limits (`max_context_tokens`, LP-0MVF9N31A0006VH5)
+
+Remote tiers have no inherent context ceiling: without a per-entry limit every
+request, however large, is dispatched to the first eligible provider. For a
+tier whose allowance is expressed per minute, one oversized prompt can spend
+the whole window (or trigger an upstream 429), pushing legitimate traffic onto
+a paid tier. Each provider entry may therefore declare `max_context_tokens`,
+the maximum **estimated prompt context** it may serve.
+
+The gate runs in both fallback dispatch loops
+(`_proxy_with_remote_fallback_cycle`, `_proxy_with_fallback_cycle`) *before*
+`acquire_provider_budget`/dispatch, using the authoritative routing estimate
+(`_get_tokenizer_for_model` + `_estimate_effective_prompt_tokens_for_routing` +
+`token_estimate_multiplier`) computed **once per request**.
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Estimated context ≤ entry limit | Entry is dispatched normally (all other gates unchanged). |
+| Estimated context > entry limit | Skip the entry: log `routing_skip_provider_context provider=<p> type=<t> status=provider_context_exceeded estimated_tokens=<n> limit=<limit> reason=provider_context_exceeded session=<s>`, record attempt `status=provider_context_exceeded` with the estimate and the limit, continue to the next eligible provider. **No cooldown, failure-domain exclusion, usage-limit reset, affinity record or contention-queue entry** — the entry stays eligible for later, smaller requests. |
+| `max_context_tokens` absent / `0` / non-positive | Ungated: behaviour byte-for-byte as before. |
+| Limit set on a **local** entry | Composes as an additional hard cap: `min(existing local thresholds, max_context_tokens)`. Never loosens `_should_skip_local`. |
+| No tier can serve the request (all capped below it) | Only possible if every tier is capped below the estimate; the shipped config prevents it by capping the final `deepseek-flash` tier at the largest upstream window (1,048,576) so an oversized prompt always has a destination. |
+
+Shipped values (each sourced in a comment next to the entry in
+`proxy/config.yaml`, probed 2026-10-19):
+
+| Entry | Limit | Source |
+|-------|-------|--------|
+| `munitoai-free` | 150000 | free-tier `x-ratelimit-limit-input-tokens` (rolling 60 s input allowance) |
+| `munitoai` | 400000 | paid-tier `x-ratelimit-limit-input-tokens` |
+| `opencode-go`, `opencode-go-2`, `opencode-go-3` | 1000000 | model-registry context window for `opencode-go/deepseek-v4.1-flash` (Go publishes plan quota as percentages, not per-minute tokens) |
+| `deepseek-flash` | 1048576 | `api.deepseek.com` `/models` `context_window` — largest window in the chain |
+| `compact` chain | 1048576 | model-registry / `api.deepseek.com` windows |
+
+`github-primary` is deliberately left ungated: it declares no `model`, so a
+per-entry ceiling cannot be sourced.
+
 
 Some gateways answer HTTP 429 with custom `x-ratelimit-*` headers instead of
 the standard `Retry-After` (MunitoAI sends none). The proxy can honour them so
