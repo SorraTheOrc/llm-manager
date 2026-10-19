@@ -1891,6 +1891,50 @@ async def _estimate_effective_prompt_tokens_for_routing(
         return estimated_tokens
 
 
+class _RoutingEstimateCache:
+    """Lazily-computed, per-cycle routing token estimate.
+
+    The authoritative routing estimate (``_get_tokenizer_for_model`` +
+    ``_estimate_effective_prompt_tokens_for_routing`` +
+    ``token_estimate_multiplier``) is **model-scoped**, not provider-scoped, so
+    every per-entry consumer in a fallback cycle — the local
+    ``_should_skip_local`` gate and the per-entry ``max_context_tokens``
+    ceiling — must share ONE computation (LP-0MVF9N2QL001CDA7 AC4).
+
+    Lazy: a cycle that never consults the estimate (e.g. an ungated remote
+    chain) pays no tokenizer pass at all. ``recompute()`` refreshes it after
+    the request body has been rewritten in place (compaction).
+    """
+
+    def __init__(self, request, body_json: dict, model_config: dict, config: dict):
+        self._request = request
+        self._body_json = body_json
+        self._model_config = model_config
+        self._config = config
+        self._value: int | None = None
+        self.tokenizer = None
+        self.multiplier = 1.0
+
+    async def get(self) -> int:
+        """Return the cached estimate, computing it on first use."""
+        if self._value is None:
+            await self.recompute()
+        return int(self._value or 0)
+
+    async def recompute(self) -> int:
+        """Re-estimate from the current body (after in-place compaction)."""
+        self.tokenizer, self.multiplier = _get_tokenizer_for_model(
+            self._model_config, self._config
+        )
+        tokens = await _estimate_effective_prompt_tokens_for_routing(
+            self._request, self._body_json, tokenizer=self.tokenizer
+        )
+        if self.multiplier != 1.0:
+            tokens = int(tokens * self.multiplier)
+        self._value = int(tokens or 0)
+        return self._value
+
+
 def _should_skip_local(
     model_name: str,
     session_id: str | None,
@@ -1991,6 +2035,103 @@ def _should_skip_local(
         return (False, None)
 
     return (True, "large_context_bypass")
+
+
+def _provider_context_limit(provider_cfg: dict) -> int:
+    """Read ``max_context_tokens`` from a provider entry (0 = ungated).
+
+    LP-0MVF9N2QL001CDA7: the optional per-entry ceiling on the estimated prompt
+    context the entry may serve. Parsing mirrors ``rate_limit_rpm``
+    (``provider_budget._provider_rpm``): a malformed value fails open (the entry
+    is ungated) rather than raising at dispatch time, and any non-positive
+    value — ``0``, a negative number, ``None`` — disables the gate so an absent
+    field is byte-for-byte today's behaviour.
+
+    Args:
+        provider_cfg: A single provider entry from the model's ``providers``.
+
+    Returns:
+        The positive integer limit, or ``0`` when the entry is ungated.
+    """
+    if not isinstance(provider_cfg, dict):
+        return 0
+    raw = provider_cfg.get("max_context_tokens", 0)
+    # ``bool`` is an ``int`` subclass: ``True`` would silently mean a 1-token
+    # ceiling, so treat it as malformed (ungated).
+    if isinstance(raw, bool):
+        return 0
+    try:
+        value = int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def _should_skip_provider_context(
+    provider_cfg: dict,
+    estimated_tokens: int | None,
+) -> tuple[bool, int]:
+    """Decide whether an entry's ``max_context_tokens`` ceiling is exceeded.
+
+    The ceiling is **inclusive**: an estimate at or below the limit is
+    dispatched; only a strictly larger estimate is skipped. Fail-open in both
+    directions — an ungated entry never skips, and a missing/non-positive
+    estimate (nothing to compare) never skips either, mirroring the local
+    gate's behaviour when it has no usable estimate.
+
+    Args:
+        provider_cfg: A single provider entry from the model's ``providers``.
+        estimated_tokens: The authoritative per-request routing estimate.
+
+    Returns:
+        ``(skip, limit)``; ``limit`` is ``0`` when the entry is ungated.
+    """
+    limit = _provider_context_limit(provider_cfg)
+    if limit <= 0:
+        return (False, 0)
+    try:
+        estimate = int(estimated_tokens or 0)
+    except (TypeError, ValueError):
+        return (False, limit)
+    if estimate <= 0:
+        return (False, limit)
+    return (estimate > limit, limit)
+
+
+def _record_provider_context_skip(
+    attempts: list[dict[str, Any]],
+    provider_name: str,
+    provider_type: str,
+    estimated_tokens: int,
+    limit: int,
+    session_id: str | None = None,
+) -> None:
+    """Record + log a per-entry context-ceiling skip (AC3).
+
+    A context skip is a per-request size mismatch, NOT a provider failure
+    (AC5): this helper deliberately records nothing beyond the diagnostic
+    attempt — no cooldown, no usage-limit reset, no failure-domain exclusion
+    and no affinity — so the entry stays eligible for later, smaller requests.
+    """
+    _record_attempt(
+        attempts,
+        provider=provider_name,
+        type=provider_type,
+        status="provider_context_exceeded",
+        estimated_tokens=estimated_tokens,
+        limit=limit,
+        reason="provider_context_exceeded",
+    )
+    logger.info(
+        "routing_skip_provider_context provider=%s type=%s "
+        "status=provider_context_exceeded estimated_tokens=%d limit=%d "
+        "reason=provider_context_exceeded session=%s",
+        provider_name,
+        provider_type,
+        estimated_tokens,
+        limit,
+        str(session_id or "unknown"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4080,6 +4221,16 @@ async def _queue_context_bypass(
     """
     _llama_model = provider_cfg.get("llama_model", "")
     _cold_threshold, _warm_threshold = _effective_large_context_thresholds(config)
+    # A LOCAL entry's ``max_context_tokens`` (LP-0MVF9N2QL001CDA7 AC7) composes
+    # as an additional hard cap here too, so a request the local gate will skip
+    # is never queued for a local slot (AC6 queue-safety).
+    _local_context_limit = _provider_context_limit(provider_cfg)
+    if _local_context_limit > 0:
+        _warm_threshold = (
+            min(_warm_threshold, _local_context_limit)
+            if _warm_threshold > 0
+            else _local_context_limit
+        )
     _tokenizer, _multiplier = _get_tokenizer_for_model(model_config, config)
     _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
         request, body_json, tokenizer=_tokenizer,
@@ -6378,6 +6529,18 @@ async def _proxy_with_remote_fallback_cycle(
         len(_chain or model_config.get("providers") or []),
     )
 
+    # Per-entry context ceiling (LP-0MVF9N2QL001CDA7): parse the body once so
+    # the authoritative routing estimate can be computed lazily (once per
+    # cycle) for entries that declare ``max_context_tokens``.
+    _raw_body = await request.body()
+    try:
+        body_json = json.loads(_raw_body) if _raw_body else {}
+    except Exception:
+        body_json = {}
+    _routing_estimate = _RoutingEstimateCache(
+        request, body_json, model_config, config,
+    )
+
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
@@ -6391,6 +6554,28 @@ async def _proxy_with_remote_fallback_cycle(
         try:
             # Mark that we attempted this provider
             any_provider_tried = True
+
+            # Per-entry context ceiling (LP-0MVF9N2QL001CDA7 AC2/AC5/AC6): a
+            # request whose estimate exceeds the entry's ``max_context_tokens``
+            # falls through to the next provider BEFORE the budget gate and
+            # dispatch. A skip is a size mismatch, not a failure — no cooldown,
+            # usage-limit reset, failure-domain exclusion or affinity — and it
+            # never consumes a rate-limit slot.
+            _entry_limit = _provider_context_limit(provider_cfg)
+            if _entry_limit > 0:
+                _entry_estimate = await _routing_estimate.get()
+                _context_skip, _context_limit = _should_skip_provider_context(
+                    provider_cfg, _entry_estimate,
+                )
+                if _context_skip:
+                    _record_provider_context_skip(
+                        attempts, provider_name, provider_type,
+                        _entry_estimate, _context_limit, _budget_session_id,
+                    )
+                    fallback_reason = "provider_context_exceeded"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
 
             # Capacity-aware request budget for free-tier style entries
             # (LP-0MVDQ1GMO00801PL): dispatches only while the rolling window
@@ -6962,6 +7147,14 @@ async def _proxy_with_fallback_cycle(
         len(_chain or model_config.get("providers") or []),
     )
 
+    # Shared per-cycle routing estimate (LP-0MVF9N2QL001CDA7 AC4): computed
+    # once on first use — by the local smart-routing gate and/or the per-entry
+    # ``max_context_tokens`` ceiling — and reused for every provider in the
+    # chain, so the gate never adds a tokenizer pass per entry.
+    _routing_estimate = _RoutingEstimateCache(
+        request, body_json, model_config, config,
+    )
+
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: list[dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
@@ -7117,6 +7310,18 @@ async def _proxy_with_fallback_cycle(
                 _cold_threshold, _warm_threshold = _effective_large_context_thresholds(
                     config
                 )
+                # Per-entry context ceiling on a LOCAL entry
+                # (LP-0MVF9N2QL001CDA7 AC7): ``max_context_tokens`` composes as
+                # an ADDITIONAL hard cap on the existing warm threshold —
+                # effective = ``min(existing, limit)`` — so it can only tighten
+                # the local gate, never loosen it.
+                _local_context_limit = _provider_context_limit(provider_cfg)
+                if _local_context_limit > 0:
+                    _warm_threshold = (
+                        min(_warm_threshold, _local_context_limit)
+                        if _warm_threshold > 0
+                        else _local_context_limit
+                    )
                 # Resolve the native tokenizer + multiplier via the shared
                 # helper (LP-0MSEQ71IF0003FRT): a named tokenizer (e.g.
                 # ``tokenizer: qwen3`` on the model entry) replaces the
@@ -7124,17 +7329,9 @@ async def _proxy_with_fallback_cycle(
                 # LP-0MSAOQTJS000FFVM F2/F3) with exact counts and forces
                 # the multiplier to 1.0; without a tokenizer, the server-
                 # level / per-model token_estimate_multiplier still applies
-                # (LP-0MSEGPO77005CYCQ F2).
-                _tokenizer, _multiplier = _get_tokenizer_for_model(
-                    model_config, config
-                )
-                _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
-                    request,
-                    body_json,
-                    tokenizer=_tokenizer,
-                )
-                if _multiplier != 1.0:
-                    _estimated_tokens = int(_estimated_tokens * _multiplier)
+                # (LP-0MSEGPO77005CYCQ F2). The estimate itself is shared per
+                # cycle (_RoutingEstimateCache) with the per-entry ceiling.
+                _estimated_tokens = await _routing_estimate.get()
                 # Compute once for reuse in logs and reason detection
                 _routing_cached_ratio = _get_cached_ratio(_llama_model, _session_id)
                 _routing_new_tokens = int(
@@ -7242,14 +7439,9 @@ async def _proxy_with_fallback_cycle(
                     if _bypass_compaction["applied"]:
                         # Re-run local eligibility against the compacted size so
                         # a session bypassed purely for size can return to
-                        # local on this same request (AC2).
-                        _compacted_tokens = (
-                            await _estimate_effective_prompt_tokens_for_routing(
-                                request, body_json, tokenizer=_tokenizer,
-                            )
-                        )
-                        if _multiplier != 1.0:
-                            _compacted_tokens = int(_compacted_tokens * _multiplier)
+                        # local on this same request (AC2). ``recompute()`` also
+                        # refreshes the per-cycle cache for any later entry.
+                        _compacted_tokens = await _routing_estimate.recompute()
                         _skip_after, _skip_after_reason = _should_skip_local(
                             _llama_model,
                             _session_id,
@@ -7376,6 +7568,28 @@ async def _proxy_with_fallback_cycle(
                     return response
 
             else:
+                # Per-entry context ceiling (LP-0MVF9N2QL001CDA7 AC2/AC5/AC6):
+                # same gate as the remote-only cycle — an over-limit entry is
+                # skipped BEFORE the budget gate and dispatch, records no
+                # failure-side state, and the chain proceeds to the next
+                # eligible provider. The routing estimate is the shared
+                # per-cycle one, so a local probe above already paid for it.
+                _entry_limit = _provider_context_limit(provider_cfg)
+                if _entry_limit > 0:
+                    _entry_estimate = await _routing_estimate.get()
+                    _context_skip, _context_limit = _should_skip_provider_context(
+                        provider_cfg, _entry_estimate,
+                    )
+                    if _context_skip:
+                        _record_provider_context_skip(
+                            attempts, provider_name, provider_type,
+                            _entry_estimate, _context_limit, _session_id,
+                        )
+                        fallback_reason = "provider_context_exceeded"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        continue
+
                 # Capacity-aware request budget for free-tier style entries
                 # (LP-0MVDQ1GMO00801PL). See _proxy_with_remote_fallback_cycle:
                 # new sessions pass straight through, in-progress sessions wait

@@ -1,15 +1,10 @@
-"""Test-first contract for the per-entry ``max_context_tokens`` gate
-(LP-0MVF9MY0W002J2N3, parent LP-0MVF2DNCX003Z5CO).
+"""Contract tests for the per-entry ``max_context_tokens`` gate
+(LP-0MVF9MY0W002J2N3 tests, LP-0MVF9N2QL001CDA7 gate, parent
+LP-0MVF2DNCX003Z5CO).
 
-TDD red phase: the gate itself is implemented by F2
-(``LP-0MVF9N2QL001CDA7``), so the assertions below describe the upcoming
-behaviour and are marked ``xfail(strict=True)`` — the same convention as
-``test_compaction_headers_contract.py`` (LP-0MU44KR5F0015D7A) and
-``test_restart_lifecycle.py`` (LP-0MVF7DO29009T8MH). ``strict=True`` turns an
-unexpected pass into a failure, so F2 must remove the markers when it makes the
-gate real. The tests that already hold today (ungated / at-limit dispatch,
-existing local behaviour) are deliberately left green so they guard against a
-regression while the red phase is in flight.
+These tests were written test-first (F1) as ``xfail(strict=True)`` and the
+markers were removed by F2 when the gate landed, so they are now the live
+regression suite for the per-entry context ceiling.
 
 Agreed vocabulary (parent plan Appendix):
 
@@ -44,8 +39,6 @@ import proxy.provider_budget as provider_budget
 import pytest
 from fastapi import Response
 from proxy.provider_budget import BudgetDecision
-
-RED_REASON = "gate implemented by LP-0MVF9N2QL001CDA7 (F2)"
 
 _OK_BODY = json.dumps({"choices": [{"message": {"content": "ok"}}]})
 
@@ -208,14 +201,12 @@ def _local_entry(**extra) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_context_limit_positive_int_is_parsed():
     """A positive ``max_context_tokens`` is the entry's estimate ceiling."""
     assert provider._provider_context_limit({"max_context_tokens": 128_000}) == 128_000
     assert provider._provider_context_limit({"max_context_tokens": 1}) == 1
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_context_limit_absent_is_ungated():
     """An entry without the field is ungated (0), byte-for-byte as today."""
     assert provider._provider_context_limit({}) == 0
@@ -223,7 +214,6 @@ def test_context_limit_absent_is_ungated():
     assert provider._provider_context_limit({"max_context_tokens": None}) == 0
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_context_limit_zero_and_negative_are_ungated():
     """``0`` and any non-positive value disable the gate (AC1 contract)."""
     assert provider._provider_context_limit({"max_context_tokens": 0}) == 0
@@ -231,7 +221,6 @@ def test_context_limit_zero_and_negative_are_ungated():
     assert provider._provider_context_limit({"max_context_tokens": -128_000}) == 0
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_context_limit_malformed_value_is_ungated_not_fatal():
     """A malformed value must fail open (mirrors ``rate_limit_rpm`` parsing)."""
     assert provider._provider_context_limit({"max_context_tokens": "many"}) == 0
@@ -239,7 +228,6 @@ def test_context_limit_malformed_value_is_ungated_not_fatal():
     assert provider._provider_context_limit({"max_context_tokens": [1]}) == 0
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_context_limit_numeric_string_is_tolerated():
     """A numeric string parses like ``int()`` does for ``rate_limit_rpm``."""
     assert provider._provider_context_limit({"max_context_tokens": "64000"}) == 64_000
@@ -250,7 +238,6 @@ def test_context_limit_numeric_string_is_tolerated():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_gate_skips_entry_above_its_limit():
     """Above the limit -> skip, with the evaluated limit returned."""
     skip, limit = provider._should_skip_provider_context(
@@ -260,7 +247,6 @@ def test_gate_skips_entry_above_its_limit():
     assert limit == 50_000
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_gate_allows_entry_at_its_limit():
     """At the limit is allowed: the ceiling is inclusive (AC1: at or below)."""
     skip, limit = provider._should_skip_provider_context(
@@ -270,7 +256,6 @@ def test_gate_allows_entry_at_its_limit():
     assert limit == 50_000
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_gate_allows_entry_below_its_limit():
     skip, limit = provider._should_skip_provider_context(
         {"max_context_tokens": 50_000}, 49_999
@@ -279,7 +264,6 @@ def test_gate_allows_entry_below_its_limit():
     assert limit == 50_000
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 @pytest.mark.parametrize("field_value", [None, 0, -10])
 def test_gate_never_skips_an_ungated_entry(field_value):
     """Absent / 0 / non-positive -> ungated, however large the estimate."""
@@ -289,7 +273,6 @@ def test_gate_never_skips_an_ungated_entry(field_value):
     assert limit == 0
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 @pytest.mark.parametrize("estimated", [None, 0, -1])
 def test_gate_never_skips_without_a_positive_estimate(estimated):
     """No usable estimate -> no skip (fail open, like the local gate)."""
@@ -359,7 +342,6 @@ async def test_ungated_remote_entry_dispatches_at_any_size(monkeypatch, field_va
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 async def test_remote_entry_above_limit_is_skipped_before_budget_and_next_serves(monkeypatch):
     """Above the limit the entry is skipped BEFORE ``acquire_provider_budget``.
 
@@ -389,7 +371,6 @@ async def test_remote_entry_above_limit_is_skipped_before_budget_and_next_serves
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 async def test_context_skip_chain_exhausts_as_context_not_slots(monkeypatch, caplog):
     """Every entry above its limit -> a context exhaustion, not a slot 429.
 
@@ -448,7 +429,6 @@ async def test_context_skip_chain_exhausts_as_context_not_slots(monkeypatch, cap
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 async def test_estimate_is_computed_once_per_cycle(monkeypatch):
     """AC4: one routing estimate per cycle, reused for every gated entry.
 
@@ -485,7 +465,6 @@ async def test_estimate_is_computed_once_per_cycle(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 async def test_skip_leaves_no_state_so_the_entry_serves_a_later_smaller_request(monkeypatch):
     """AC5: a skip records nothing, so the entry stays eligible within the cycle.
 
@@ -533,7 +512,6 @@ async def test_skip_leaves_no_state_so_the_entry_serves_a_later_smaller_request(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 async def test_local_and_remote_cycle_skips_an_over_limit_remote_entry(monkeypatch):
     """AC2: ``_proxy_with_fallback_cycle`` skips an over-limit remote entry."""
     remote_calls: list[str] = []
@@ -585,7 +563,6 @@ def test_local_skip_decision_is_unchanged_without_the_field():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 async def test_local_entry_limit_composes_as_an_additional_hard_cap(
     monkeypatch, local_and_remote_calls
 ):
@@ -667,3 +644,38 @@ async def test_local_context_too_large_still_falls_through_without_a_limit(
     assert response.status_code == 200
     assert local_and_remote_calls["local_calls"] == []
     assert local_and_remote_calls["remote_calls"] == ["remote-tail"]
+
+
+@pytest.mark.asyncio
+async def test_queue_context_bypass_honours_a_local_entry_limit(monkeypatch):
+    """AC6/AC7: a queued local request never waits for a slot it cannot use.
+
+    ``_queue_context_bypass`` mirrors the smart-routing decision at the
+    contention-queue point. A local entry whose ``max_context_tokens`` is below
+    the request estimate must therefore be reported as a context bypass (never
+    queued), while the same entry without the field still queues as today.
+    """
+    monkeypatch.setattr(
+        provider, "_get_tokenizer_for_model", MagicMock(return_value=(None, 1.0))
+    )
+    monkeypatch.setattr(
+        provider, "_estimate_effective_prompt_tokens_for_routing", AsyncMock(return_value=60_000)
+    )
+    monkeypatch.setattr(provider, "_get_cached_ratio", lambda *_: 0.0)
+    monkeypatch.setattr(
+        provider, "_effective_large_context_thresholds", lambda *_: (1_000_000, 100_000)
+    )
+    config = {"local_large_context_warm_cache_threshold": 100_000}
+    body = {"model": "ctx-limit-test", "messages": [{"role": "user", "content": "hi"}]}
+
+    capped = await provider._queue_context_bypass(
+        config, {"name": "ctx-limit-test"}, _local_entry(max_context_tokens=50_000),
+        _Request(), body, "ctx-limit-session",
+    )
+    assert capped == (True, "context_too_large")
+
+    ungated = await provider._queue_context_bypass(
+        config, {"name": "ctx-limit-test"}, _local_entry(),
+        _Request(), body, "ctx-limit-session",
+    )
+    assert ungated == (False, None)
