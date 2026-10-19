@@ -170,8 +170,8 @@ Remote tiers have no inherent context ceiling: without a per-entry limit every
 request, however large, is dispatched to the first eligible provider. For a
 tier whose allowance is expressed per minute, one oversized prompt can spend
 the whole window (or trigger an upstream 429), pushing legitimate traffic onto
-a paid tier. Each provider entry may therefore declare `max_context_tokens`,
-the maximum **estimated prompt context** it may serve.
+a paid tier. Each provider entry may therefore declare `max_context_tokens`
+(an `int`), the maximum **estimated prompt context** it may serve.
 
 The gate runs in both fallback dispatch loops
 (`_proxy_with_remote_fallback_cycle`, `_proxy_with_fallback_cycle`) *before*
@@ -186,6 +186,11 @@ The gate runs in both fallback dispatch loops
 | `max_context_tokens` absent / `0` / non-positive | Ungated: behaviour byte-for-byte as before. |
 | Limit set on a **local** entry | Composes as an additional hard cap: `min(existing local thresholds, max_context_tokens)`. Never loosens `_should_skip_local`. |
 | No tier can serve the request (all capped below it) | Only possible if every tier is capped below the estimate; the shipped config prevents it by capping the final `deepseek-flash` tier at the largest upstream window (1,048,576) so an oversized prompt always has a destination. |
+
+Every context skip increments the cumulative
+`backend_signals.provider_context_exceeded` counter (mirroring the local
+`context_too_large` signal), so the gate is visible on `/health` and
+`/admin/metrics` as well as in the `routing_skip_provider_context` log line.
 
 Shipped values (each sourced in a comment next to the entry in
 `proxy/config.yaml`, probed 2026-10-19):

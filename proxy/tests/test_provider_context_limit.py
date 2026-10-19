@@ -63,6 +63,12 @@ def _reset_router_state(monkeypatch):
     provider._sibling_failure_count.clear()
     provider._sibling_failure_streak_start.clear()
     provider_budget._affinity.clear()
+    # The per-entry context skip now increments a process-global backend signal
+    # (LP-0MVF9N3BV00155RI). Reset it per test (monkeypatch restores it) so skip
+    # tests cannot leak a count into later tests or modules.
+    from proxy import observability
+
+    monkeypatch.setitem(observability.backend_signal_counts, "provider_context_exceeded", 0)
     # Both bindings matter: ``proxy.provider`` imports the callable into its own
     # namespace, while ``effective_chain_for_request`` resolves it from
     # ``proxy.priority``. Pinning both keeps the cycle deterministic inside the
@@ -719,3 +725,79 @@ async def test_unreadable_body_fails_open_at_the_gate(monkeypatch):
     assert response.status_code == 200
     assert remote_calls == ["capped"]
     assert budget_calls == ["capped"]
+
+
+# ---------------------------------------------------------------------------
+# (F4, LP-0MVF9N3BV00155RI) Observability: backend signal counter
+# ---------------------------------------------------------------------------
+
+
+def test_provider_context_exceeded_counter_is_registered():
+    """AC: ``provider_context_exceeded`` mirrors ``context_too_large``.
+
+    Both are cumulative backend-signal counters (``backend_signals`` on
+    ``/health`` and ``/admin/metrics``), so a context-ceiling skip is visible
+    to operators alongside the local context skip instead of only in the log.
+    """
+    from proxy.observability import backend_signal_counts
+
+    assert isinstance(backend_signal_counts.get("context_too_large"), int)
+    assert isinstance(backend_signal_counts.get("provider_context_exceeded"), int)
+    assert backend_signal_counts["provider_context_exceeded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_context_skip_increments_the_backend_signal_counter(monkeypatch):
+    """AC: every context-ceiling skip increments the counter.
+
+    Two capped entries are skipped for one oversized request, so the counter
+    must advance by two (one per skip), independent of the chain-exhaustion
+    diagnostics.
+    """
+    from proxy import observability
+
+    monkeypatch.setitem(observability.backend_signal_counts, "provider_context_exceeded", 0)
+    remote_calls: list[str] = []
+    budget_calls: list[str] = []
+    model_config, _ = _patch_remote_cycle(
+        monkeypatch,
+        providers=[
+            _remote_entry("capped-a", max_context_tokens=50_000),
+            _remote_entry("capped-b", max_context_tokens=50_000),
+        ],
+        estimate=60_000,
+        remote_calls=remote_calls,
+        budget_calls=budget_calls,
+    )
+
+    with pytest.raises(provider.ChainExhaustedError):
+        await provider._proxy_with_remote_fallback_cycle(
+            _Request(), "v1/chat/completions", model_config, {"provider_cooldown_seconds": 60}
+        )
+
+    assert observability.backend_signal_counts["provider_context_exceeded"] == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatched_request_does_not_increment_the_counter(monkeypatch):
+    """AC: only a skip is counted; a within-limit dispatch leaves it at 0."""
+    from proxy import observability
+
+    monkeypatch.setitem(observability.backend_signal_counts, "provider_context_exceeded", 0)
+    remote_calls: list[str] = []
+    budget_calls: list[str] = []
+    model_config, _ = _patch_remote_cycle(
+        monkeypatch,
+        providers=[_remote_entry("capped", max_context_tokens=50_000)],
+        estimate=50_000,
+        remote_calls=remote_calls,
+        budget_calls=budget_calls,
+    )
+
+    response = await provider._proxy_with_remote_fallback_cycle(
+        _Request(), "v1/chat/completions", model_config, {"provider_cooldown_seconds": 60}
+    )
+
+    assert response.status_code == 200
+    assert remote_calls == ["capped"]
+    assert observability.backend_signal_counts["provider_context_exceeded"] == 0

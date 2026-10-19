@@ -122,7 +122,10 @@ budget spent by a single oversized prompt. `max_context_tokens` caps the
   (carrying the estimate and the limit) and logged with provider, estimate,
   limit and reason — it is **not** a failure, so no cooldown, failure-domain
   exclusion, usage-limit reset, affinity record or contention-queue entry is
-  applied, and the entry stays eligible for later, smaller requests;
+  applied, and the entry stays eligible for later, smaller requests; each skip
+  also increments the cumulative `backend_signals.provider_context_exceeded`
+  counter (mirroring `context_too_large`; read it from `/health` or
+  `/admin/metrics`);
 - at least one tier is left effectively ungated (capped at the largest
   upstream context window), so an oversized prompt always has a destination
   and the chain cannot exhaust because of caps alone.
@@ -137,6 +140,31 @@ config comment next to the entry):
 | `opencode-go*` | 1000000 | Model-registry context window for `opencode-go/deepseek-v4.1-flash` (OpenCode Go publishes plan quota as percentages, not per-minute tokens) |
 | `deepseek-flash` | 1048576 | `api.deepseek.com` `/models` `context_window` — the largest window in the chain (effectively ungated destination) |
 | `compact` chain | 1048576 | model-registry / `api.deepseek.com` windows (documentation-consistency caps) |
+
+Copy-pasteable example — a capped local entry, a capped free tier and an
+ungated final tier, so an oversized prompt always has a destination:
+
+```yaml
+models:
+  some-model:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+        max_context_tokens: 50000      # extra hard cap on top of the local thresholds
+      - name: some-free-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FREE_KEY
+        model: some-model
+        max_context_tokens: 150000     # estimated prompt-context ceiling
+      - name: some-final-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FINAL_KEY
+        model: some-model
+        # max_context_tokens omitted -> ungated (absent/0/non-positive)
+```
 
 #### Free-tier request budgets (`rate_limit_rpm`)
 

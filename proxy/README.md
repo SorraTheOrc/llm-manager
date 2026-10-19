@@ -596,7 +596,9 @@ the next eligible provider (LP-0MVF9N2QL001CDA7):
   carrying estimate + limit) and logged — it is a size mismatch, **not** a
   failure: no cooldown, no failure-domain exclusion, no usage-limit reset, no
   affinity record, no contention-queue entry, and the entry stays eligible for
-  later, smaller requests;
+  later, smaller requests; each skip increments the cumulative
+  `backend_signals.provider_context_exceeded` counter (mirroring
+  `context_too_large`, visible on `/health` and `/admin/metrics`);
 - absent / `0` / non-positive = ungated (byte-for-byte previous behaviour);
   on a local entry it composes as an **additional hard cap**
   (`min(existing local thresholds, max_context_tokens)`);
@@ -607,6 +609,31 @@ the next eligible provider (LP-0MVF9N2QL001CDA7):
 - at least one tier (the final `deepseek-flash`) is capped at the **largest
   upstream context window**, so an oversized prompt always has a destination
   and the chain cannot exhaust because of caps alone.
+
+Copy-pasteable example — a capped local entry, a capped free tier and an
+ungated final tier:
+
+```yaml
+models:
+  some-model:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+        max_context_tokens: 50000      # extra hard cap on top of the local thresholds
+      - name: some-free-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FREE_KEY
+        model: some-model
+        max_context_tokens: 150000     # estimated prompt-context ceiling
+      - name: some-final-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FINAL_KEY
+        model: some-model
+        # max_context_tokens omitted -> ungated (absent/0/non-positive)
+```
 
 #### Timed Access (`available_times`)
 
@@ -2306,7 +2333,10 @@ Important fields:
 - `single_flight_metrics` (queue/reject/active session counters)
 - `guardrail_metrics` (cutoff + invalidation counters)
 - `backend_ready`
-- `backend_signals`
+- `backend_signals` (cumulative counters, including
+  `backend_signals.provider_context_exceeded` — per-entry `max_context_tokens`
+  skips, mirroring `context_too_large`; see
+  [Per-Entry Context Limits](#per-entry-context-limits-max_context_tokens))
 
 ### Large-Context Routing (Cache-Aware Bypass)
 

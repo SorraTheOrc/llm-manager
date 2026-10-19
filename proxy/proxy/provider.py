@@ -41,6 +41,7 @@ from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy import cold_start, quota_pacing, quota_state
+from proxy.observability import _record_backend_signal
 from proxy.priority import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
@@ -2110,8 +2111,11 @@ def _record_provider_context_skip(
 
     A context skip is a per-request size mismatch, NOT a provider failure
     (AC5): this helper deliberately records nothing beyond the diagnostic
-    attempt — no cooldown, no usage-limit reset, no failure-domain exclusion
-    and no affinity — so the entry stays eligible for later, smaller requests.
+    attempt and the cumulative ``provider_context_exceeded`` backend signal —
+    no cooldown, no usage-limit reset, no failure-domain exclusion and no
+    affinity — so the entry stays eligible for later, smaller requests. The
+    counter mirrors ``context_too_large`` (LP-0MVF9N3BV00155RI) and is exposed
+    as ``backend_signals`` on ``/health`` and ``/admin/metrics``.
     """
     _record_attempt(
         attempts,
@@ -2122,6 +2126,7 @@ def _record_provider_context_skip(
         limit=limit,
         reason="provider_context_exceeded",
     )
+    _record_backend_signal("provider_context_exceeded")
     logger.info(
         "routing_skip_provider_context provider=%s type=%s "
         "status=provider_context_exceeded estimated_tokens=%d limit=%d "

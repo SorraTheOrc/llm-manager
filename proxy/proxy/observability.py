@@ -76,6 +76,9 @@ backend_signal_counts: dict = {
     "gpu_wedge": 0,
     "grandfathered": 0,
     "context_too_large": 0,  # LP-0MTBOX45O005LD1S fast-mode cap skip
+    # Per-entry ``max_context_tokens`` ceiling skip (LP-0MVF9N3BV00155RI):
+    # mirrors ``context_too_large``; a size mismatch, never a failure signal.
+    "provider_context_exceeded": 0,
 }
 
 
