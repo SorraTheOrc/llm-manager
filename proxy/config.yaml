@@ -833,6 +833,23 @@ server:
   provider_rate_limit_wait_max_seconds: 15
   provider_rate_limit_wait_max_waiters: 8
   provider_affinity_ttl_seconds: 900
+  # Proactive OpenCode Go quota poller (LP-0MVF7KEG7007C8MF).
+  # The proxy polls GET {endpoint}/v1/usage per distinct `opencode-*`
+  # api_key_env on this interval and caches the derived per-account quota
+  # state (rolling/weekly/monthly headroom, effective headroom, seconds to
+  # reset, exhausted). Polls are interval-gated and single-flighted per
+  # account; a poll failure keeps the last known values, logs at WARN and
+  # never delays a client request. Full documentation lands with the
+  # quota-surge design doc (LP-0MVF7KRH30000KOA).
+  # Default: 900 seconds (15 minutes).
+  quota_poll_interval_seconds: 900
+  # Optional quota-surge account allow-list. Each item is either a provider
+  # entry name (e.g. `opencode-go-3`) or an `api_key_env`
+  # (e.g. `OPENCODE_3_API_KEY`). When omitted, all `opencode-*` entries are
+  # managed. A comma-separated string is also accepted.
+  # quota_surge_accounts:
+  #   - opencode-go
+  #   - opencode-go-3
   # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote
   # provider repeatedly returns an EMPTY response / stalls (no usable content)
   # across retry cycles, the provider is quarantined for an EXTENDED cooldown

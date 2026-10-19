@@ -966,6 +966,32 @@ def _shutdown_stop_recording_prune():
         _recording_prune_task = None
 
 
+def _startup_launch_quota_poller():
+    """Start the proactive OpenCode quota poller (LP-0MVF7KEG7007C8MF).
+
+    Polls ``GET /v1/usage`` per distinct ``opencode-*`` account on the
+    configured interval and caches the derived quota state in
+    :mod:`proxy.quota_state`. Best-effort and non-blocking: a failed poll
+    (or a failure to start) must never break proxy startup.
+    """
+    try:
+        from proxy.lifecycle import start_quota_poller
+
+        start_quota_poller(config)
+    except Exception as e:
+        logger.warning("Failed to start the quota poller: %s", e)
+
+
+async def _shutdown_quota_poller():
+    """Cancel the background quota poller on shutdown."""
+    try:
+        from proxy.lifecycle import stop_quota_poller
+
+        await stop_quota_poller()
+    except Exception as e:
+        logger.warning("Failed to stop the quota poller: %s", e)
+
+
 def _startup_launch_disconnect_reaper():
     """Start the CLOSE-WAIT disconnect reaper background loop.
 
@@ -1112,6 +1138,7 @@ async def lifespan(app: FastAPI):
     _startup_register_session_routes(app)
     _startup_launch_disconnect_reaper()
     _startup_launch_recording_prune()
+    _startup_launch_quota_poller()
 
     # Record the monotonic start time for the startup-ramp gate.
     global PROXY_START_TIME
@@ -1132,6 +1159,7 @@ async def lifespan(app: FastAPI):
     _shutdown_stop_session_cleanup()
     _shutdown_stop_recording_prune()
     await _shutdown_cleanup_tasks()
+    await _shutdown_quota_poller()
     _shutdown_tts_server()
     await _shutdown_http_client()
     _shutdown_llama_server()

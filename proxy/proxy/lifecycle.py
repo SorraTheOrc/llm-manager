@@ -2588,3 +2588,35 @@ async def restart_services(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Proactive quota poller (LP-0MVF7KEG7007C8MF)
+# ---------------------------------------------------------------------------
+
+
+def start_quota_poller(config: dict | None = None) -> asyncio.Task | None:
+    """Start the background OpenCode quota poller.
+
+    The poller periodically refreshes the per-account ``/v1/usage`` snapshot
+    (see :mod:`proxy.quota_state`) so routing can consult proactive quota
+    state instead of learning about exhaustion reactively from a
+    ``GoUsageLimitError``. Best-effort: a failure to start (or a failed poll)
+    never breaks startup. When *config* is omitted the active server config is
+    used.
+    """
+    from proxy import quota_state
+
+    if config is None:
+        try:
+            config = _srv().config
+        except Exception:
+            config = {}
+    return quota_state.start_quota_poller(config)
+
+
+async def stop_quota_poller() -> None:
+    """Cancel the background OpenCode quota poller on shutdown."""
+    from proxy import quota_state
+
+    await quota_state.stop_quota_poller()
+
+
