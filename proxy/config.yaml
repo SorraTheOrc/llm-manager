@@ -1482,6 +1482,27 @@ server:
   session_slot_pool_size: 2
 
   # -----------------------------------------------------------------------
+  # Prefill serialisation (LP-0MVGDUUV3001XFRJ)
+  # -----------------------------------------------------------------------
+  # Maximum concurrent local PREFILLS (dispatch → first byte). Decoding in
+  # other slots is unaffected — only prefill-vs-prefill is serialised (decode
+  # keeps running in parallel).
+  #
+  # Measured 2026-10-19 → 10-20 (460 paired local dispatches): 47.8 % of
+  # prefills shared the GPU with at least one other; per-request first-byte
+  # p50 was 85.0 s with one overlap vs 23.4 s alone, while aggregate prefill
+  # throughput stayed flat (~254 tok/s) — concurrency added latency, not
+  # capacity. 1 = serialise (default); 0 = disable the gate (the cap becomes
+  # the slot pool, i.e. the behaviour before this change). A malformed or
+  # negative value falls back to 1.
+  #
+  # A request that cannot start its prefill waits in the bounded contention
+  # queue above (when the policy allows) and falls back to remote exactly as
+  # before when the caps are hit; the prefill-ETA admission guard refuses
+  # waits that cannot succeed. Server restart required to change.
+  local_max_concurrent_prefills: 1
+
+  # -----------------------------------------------------------------------
   # Contention queue (merged from the retired config-fast/cheap overlays)
   # -----------------------------------------------------------------------
   # The per-mode queue policy was declared by the mode overlays

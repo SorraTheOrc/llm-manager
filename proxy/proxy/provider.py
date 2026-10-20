@@ -4930,12 +4930,22 @@ def _local_slot_saturation(
     except Exception:
         pass
     # Prefill-aware guard (LP-0MTJET4I5009EHNX): a prefill in flight holds a
-    # slot; never admit more concurrent prefills than the slot pool.
+    # slot; never admit more concurrent prefills than the prefill cap.
+    # Serialised prefills (LP-0MVGDUUV3001XFRJ): the cap is
+    # ``local_max_concurrent_prefills`` (default 1) rather than the slot pool,
+    # because concurrent prefills halve per-request throughput at flat
+    # aggregate tok/s.
     try:
         import proxy.server as _srv
-        from proxy.router_helpers import _get_prefill_in_flight_count
+        from proxy.router_helpers import (
+            _effective_prefill_cap,
+            _get_prefill_in_flight_count,
+        )
 
-        if _get_prefill_in_flight_count(_srv) >= max_local:
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        if _get_prefill_in_flight_count(_srv) >= _effective_prefill_cap(
+            server_cfg, max_local
+        ):
             return "prefill"
     except Exception:
         pass
@@ -5242,7 +5252,14 @@ async def _maybe_queue_for_local_slot(
 
     # LP-0MU498TWH008DBCI AC5: record which gate the request waits on so
     # generating-saturation and prefill-saturation waits are distinguishable.
+    # LP-0MVGDUUV3001XFRJ AC4: the saturation is stamped on the request so the
+    # local-dispatch path can emit ``prefill_gate_wait_ms`` (the time this
+    # request waited specifically for the prefill gate).
     _saturation = _local_slot_saturation(config, max_local, endpoint=endpoint)
+    try:
+        setattr(request, "_local_queue_saturation", _saturation)
+    except Exception:
+        pass
     logger.info(
         "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s",
         cq["max_wait_seconds"], cq["max_depth"], _saturation or "none",
@@ -8623,6 +8640,45 @@ async def _proxy_with_fallback_cycle(
                         cached_ratio=_routing_cached_ratio,
                         reason="economic_bypass_local_serve",
                     )
+
+                # Prefill-gate wait accounting (LP-0MVGDUUV3001XFRJ AC4): how
+                # long this request waited specifically for the prefill gate.
+                # ``_local_queue_saturation`` is stamped by
+                # ``_maybe_queue_for_local_slot`` before the wait and
+                # ``_contention_queue_wait_seconds`` records the measured wait,
+                # so both are read here (0.0 when the request was never
+                # prefill-gated).
+                _prefill_gate_wait_ms = 0.0
+                try:
+                    if (
+                        getattr(request, "_local_queue_saturation", None)
+                        == "prefill"
+                    ):
+                        _prefill_gate_wait_ms = max(
+                            0.0,
+                            float(
+                                getattr(
+                                    request,
+                                    "_contention_queue_wait_seconds",
+                                    0.0,
+                                )
+                                or 0.0
+                            ),
+                        ) * 1000.0
+                except Exception:
+                    _prefill_gate_wait_ms = 0.0
+                try:
+                    logger.info(
+                        "prefill_gate_wait_ms=%.1f saturation=%s session=%s "
+                        "model=%s provider=%s",
+                        _prefill_gate_wait_ms,
+                        getattr(request, "_local_queue_saturation", None) or "none",
+                        _session_id or "unknown",
+                        _llama_model or "unknown",
+                        provider_name,
+                    )
+                except Exception:
+                    pass
 
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 

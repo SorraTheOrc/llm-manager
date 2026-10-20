@@ -636,6 +636,35 @@ async def get_llama_local_status(request: Request):
     except Exception:
         prefill_eta = {}
 
+    # -- prefill gate state (LP-0MVGDUUV3001XFRJ AC4) ----------------------
+    # Prefills are serialised by default (``local_max_concurrent_prefills``),
+    # so a dispatcher needs to see how many prefills are in flight, what the
+    # cap is, and how many requests are waiting behind the gate.
+    try:
+        from proxy.router_helpers import (
+            _effective_prefill_cap,
+            _get_prefill_in_flight_count,
+        )
+
+        _server_cfg_for_prefill = (
+            srv.config.get("server", srv.config)
+            if isinstance(getattr(srv, "config", None), dict)
+            else {}
+        )
+        prefill_in_flight = _get_prefill_in_flight_count(srv)
+        prefill_cap = _effective_prefill_cap(
+            _server_cfg_for_prefill, int(total_slots or 1)
+        )
+    except Exception:
+        prefill_in_flight = 0
+        prefill_cap = 0
+    try:
+        from proxy.contention_queue import queue_depth as _queue_depth
+
+        prefill_gate_waiters = _queue_depth()
+    except Exception:
+        prefill_gate_waiters = 0
+
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): idle age of the local
@@ -714,6 +743,12 @@ async def get_llama_local_status(request: Request):
         "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
         "local_last_activity_at": _idle_snapshot.get("last_activity_at"),
         "local_last_activity_source": _idle_snapshot.get("last_activity_source"),
+        # Prefill serialisation (LP-0MVGDUUV3001XFRJ AC4): in-flight prefills,
+        # the effective cap (0 when the gate is disabled) and the requests
+        # waiting for it (the contention queue depth).
+        "local_prefills_in_flight": prefill_in_flight,
+        "local_max_concurrent_prefills": prefill_cap,
+        "prefill_gate_waiters": prefill_gate_waiters,
     }
 
 

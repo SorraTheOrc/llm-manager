@@ -1408,6 +1408,64 @@ def _get_generating_only_count(srv) -> int:
         return 0
 
 
+DEFAULT_MAX_CONCURRENT_PREFILLS = 1
+"""Default cap on concurrent local prefills (serialised prefills, LP-0MVGDUUV3001XFRJ)."""
+
+
+def _max_concurrent_prefills(server_config: dict | None) -> int:
+    """Return ``server.local_max_concurrent_prefills`` (0 = cap disabled).
+
+    Measured 2026-10-19 → 10-20: 47.8 % of local prefills shared the GPU with at
+    least one other prefill, halving per-request prefill throughput (p50 85 s
+    overlapped vs 23.4 s solitary) while aggregate throughput stayed flat at
+    ~254 tok/s — concurrency adds latency, not capacity. Prefills are therefore
+    serialised by default.
+
+    Validation (AC1): a missing value defaults to 1, ``0`` disables the cap
+    (restoring the previous slot-pool-sized behaviour), and a malformed or
+    negative value falls back to the default rather than silently disabling a
+    latency protection.
+    """
+    if not isinstance(server_config, dict):
+        return DEFAULT_MAX_CONCURRENT_PREFILLS
+    raw = server_config.get(
+        "local_max_concurrent_prefills", DEFAULT_MAX_CONCURRENT_PREFILLS
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_CONCURRENT_PREFILLS
+    if value < 0:
+        return DEFAULT_MAX_CONCURRENT_PREFILLS
+    return value
+
+
+def _effective_prefill_cap(server_config: dict | None, max_local: int) -> int:
+    """Return the effective prefill concurrency cap for a slot pool of *max_local*.
+
+    The configured cap can never exceed the slot pool (a larger value is
+    equivalent to no cap), and ``0`` means "disabled" — the pool size is then
+    the cap, which is the behaviour before LP-0MVGDUUV3001XFRJ.
+    """
+    try:
+        pool = max(1, int(max_local or 1))
+    except (TypeError, ValueError):
+        pool = 1
+    configured = _max_concurrent_prefills(server_config)
+    if configured <= 0:
+        return pool
+    return min(configured, pool)
+
+
+def _server_config_of(srv) -> dict:
+    """Return the ``server`` config block from *srv* (fail-open to ``{}``)."""
+    try:
+        cfg = srv.config
+        return cfg.get("server", cfg) if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
 def _get_prefill_in_flight_count(srv) -> int:
     """Return the number of sessions currently in prefill (dispatch→first-byte).
 
@@ -1704,7 +1762,14 @@ async def _try_acquire_local_dispatch(
                         # Prefill-aware guard (LP-0MTJET4I5009EHNX): cap
                         # concurrent prefills to ``parallel`` (max_local) so
                         # the llama-server internal queue does not saturate.
-                        if _prefill_count >= max_local:
+                        # Serialised by default since LP-0MVGDUUV3001XFRJ: at
+                        # most ``local_max_concurrent_prefills`` (default 1)
+                        # prefills share the GPU, because prefills do not scale
+                        # (47.8 % shared the GPU, halving per-request prefill
+                        # throughput at flat aggregate tok/s).
+                        if _prefill_count >= _effective_prefill_cap(
+                            _server_config_of(srv), max_local
+                        ):
                             active_owner = None
                             for ek, er in srv.local_dispatch_records.items():
                                 if ek != record_key and er.get("active"):

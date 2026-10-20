@@ -1985,11 +1985,21 @@ def _make_dispatch_srv(
     generating_sessions: set | None = None,
     dispatch_records: dict | None = None,
     prefill_in_flight: dict | None = None,
+    max_concurrent_prefills: int | None = None,
 ) -> SimpleNamespace:
     if dispatch_records is None:
         dispatch_records = {}
+    server_cfg = {
+        "local_dispatch_lease_timeout_seconds": 60,
+        "session_slot_pool_size": session_slot_pool_size,
+    }
+    if max_concurrent_prefills is not None:
+        # Prefill serialisation defaults to 1 (LP-0MVGDUUV3001XFRJ). The
+        # prefill-guard tests below pin the POOL-sized boundary semantics, so
+        # they set the cap explicitly.
+        server_cfg["local_max_concurrent_prefills"] = max_concurrent_prefills
     return SimpleNamespace(
-        config={"server": {"local_dispatch_lease_timeout_seconds": 60, "session_slot_pool_size": session_slot_pool_size}},
+        config={"server": server_cfg},
         local_active_queries=len(dispatch_records),
         local_active_queries_lock=asyncio.Lock(),
         local_generating_queries=generating_queries,
@@ -2033,6 +2043,7 @@ async def test_prefill_guard_allows_when_below_cap():
     from proxy.router_helpers import _try_acquire_local_dispatch
     srv = _make_dispatch_srv(
         session_slot_pool_size=3,
+        max_concurrent_prefills=3,
         dispatch_records={
             k: {"backend": "local", "started_at": 0.0, "active": True, "expires_at": time.monotonic() + 100, "model_name": None}
             for k in ("a", "b")
@@ -2047,7 +2058,7 @@ async def test_prefill_guard_allows_when_below_cap():
 async def test_prefill_guard_boundary_exact_parallel():
     """AC4 edge case: N in flight < parallel allows; N==parallel blocks."""
     from proxy.router_helpers import _get_prefill_in_flight_count, _try_acquire_local_dispatch
-    srv = _make_dispatch_srv(session_slot_pool_size=3)
+    srv = _make_dispatch_srv(session_slot_pool_size=3, max_concurrent_prefills=3)
     for k in ("a", "b"):
         srv.local_prefill_in_flight[k] = True
         srv.local_dispatch_records[k] = {"backend": "local", "started_at": 0.0, "active": True, "expires_at": time.monotonic() + 100, "model_name": None}

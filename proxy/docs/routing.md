@@ -433,6 +433,43 @@ separately from genuine prompt-cache hits. `slot_ratio_restored` is logged once
 per seed with `cached_tokens`, `estimated_tokens` and the credited
 `cached_ratio`.
 
+## Prefill serialisation (LP-0MVGDUUV3001XFRJ)
+
+Prefill (dispatch → first byte) does not scale with concurrency on this
+backend. Measured 2026-10-19 → 10-20 over 460 paired local dispatches:
+
+| Overlapping prefills | n | first-byte p50 | new tok/s p50 |
+| --- | ---: | ---: | ---: |
+| 0 | 190 | **23.4 s** | **253.8** |
+| 1 | 220 | 85.0 s | 156.6 |
+| 2 | 48 | 119.7 s | 128.8 |
+
+47.8 % of prefills shared the GPU with at least one other and aggregate
+throughput stayed flat (~254 tok/s) — i.e. concurrency added latency, not
+capacity, and inflated total prefill wall time 2.3×.
+
+At most `server.local_max_concurrent_prefills` prefills now run at once:
+
+```yaml
+server:
+  local_max_concurrent_prefills: 1   # 1 = serialise (default); 0 = disabled
+```
+
+- **Decode is not affected** — only prefill-vs-prefill is serialised; a slot
+  that is already generating does not block another slot's prefill.
+- **Waiting is bounded by the existing machinery** — a second prefill waits
+  in the contention queue (policy/depth/wait caps) and falls back to remote
+  exactly as before when those caps are hit; the prefill-ETA admission guard
+  refuses waits that cannot succeed rather than parking the request.
+- **No added delay for a lone request** — with nothing else prefilling the
+  gate is open (the in-flight count is 0).
+- **Observability** — each local dispatch logs
+  `prefill_gate_wait_ms=… saturation=… session=… model=… provider=…` (the time
+  the request waited specifically for the prefill gate; `0.0` when it was not
+  prefill-gated), and `/llama/local/status` publishes
+  `local_prefills_in_flight`, `local_max_concurrent_prefills` and
+  `prefill_gate_waiters` (the contention queue depth).
+
 ## Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
 
 Routing is size/economics-driven and used to ignore whether the backend was
