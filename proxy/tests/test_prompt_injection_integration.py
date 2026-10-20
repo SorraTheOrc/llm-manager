@@ -415,7 +415,7 @@ async def test_real_author_config_injects_author_txt(monkeypatch):
     """
     from pathlib import Path
 
-    from tests.config_test_utils import load_profile
+    from config_test_utils import load_profile
 
     real_author_cfg = load_profile("config.yaml")["models"]["author"]
 

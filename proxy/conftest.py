@@ -1,12 +1,26 @@
-import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-proxy_dir = os.path.join(os.getcwd())
+# Insert the ``proxy/`` directory (this conftest's own directory) on
+# ``sys.path`` so ``from tests.<module> import ...`` and ``import proxy.<x>``
+# resolve regardless of the pytest invocation cwd. Using ``os.getcwd()``
+# broke combined runs whose rootdir is the repository root (e.g. the test
+# skill's changed-scope selection mixing proxy tests and .pi skill tests in
+# one invocation).
+proxy_dir = str(Path(__file__).resolve().parent)
 if proxy_dir not in sys.path:
     sys.path.insert(0, proxy_dir)
+# ``proxy/tests`` uses a bare ``from config_test_utils import ...`` (it has no
+# ``__init__.py``, so a top-level ``tests`` name could collide with the
+# .pi skill test packages when both are collected in one invocation). Put the
+# tests directory directly on the path so the helper imports without a
+# package prefix.
+_proxy_tests_dir = str(Path(proxy_dir) / "tests")
+if _proxy_tests_dir not in sys.path:
+    sys.path.insert(0, _proxy_tests_dir)
 
 
 @pytest.fixture(autouse=True)
@@ -94,8 +108,8 @@ def _reset_server_global_state(monkeypatch):
 def _isolate_startup_ramp_config():
     """Isolate the process-global startup-ramp config between tests.
 
-    ``proxy.mode._startup_ramp_config`` is a module-level variable mutated
-    by ``set_startup_ramp_config()``.  A test that calls
+    ``proxy.startup_ramp._startup_ramp_config`` is a module-level variable
+    mutated by ``set_startup_ramp_config()``.  A test that calls
     ``set_startup_ramp_config(None)`` installs the *enabled* defaults
     (``{"enabled": True, ...}``), not a disabled state — so a teardown that
     does ``set_startup_ramp_config(None)`` leaves the global enabled and
@@ -106,11 +120,11 @@ def _isolate_startup_ramp_config():
     afterwards, preventing any test from inheriting a leaked enabled ramp
     configuration (LP-0MUD0D0DU005R2VQ).
     """
-    import proxy.mode as mode_module
+    import proxy.startup_ramp as ramp_module
 
-    saved = mode_module._startup_ramp_config
+    saved = ramp_module._startup_ramp_config
     yield
-    mode_module._startup_ramp_config = saved
+    ramp_module._startup_ramp_config = saved
 
 
 @pytest.fixture(autouse=True)
@@ -197,21 +211,11 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
 @pytest.fixture(autouse=True)
 def _isolate_mode_switch_lock(tmp_path, monkeypatch):
-    """Isolate the mode-switch lock state between tests.
+    """Legacy no-op fixture retained as a placeholder.
 
-    ``proxy.mode.mode_switch_locked()`` reads a runtime state file
-    (``proxy/.mode-switch-lock``) written by ``set_mode_switch_lock()`` /
-    ``POST /admin/mode-switch-lock`` (LP-0MVCBMLP7009MN81). An autouse
-    fixture in the API/mode test modules already redirects it for their own
-    tests, but a leftover/ambient lock file (e.g. engaged for a live sweep)
-    must not leak into unrelated tests: point the state file at a per-test
-    temp path so every test starts unlocked (normal operation).
+    The mode-switch lock and the whole fast/cheap mode axis were removed
+    (LP-0MVDT94F0003VHUA AC4); there is no lock state left to isolate. The
+    fixture is kept (empty) so any test that names it explicitly does not
+    error.
     """
-    import proxy.mode as mode_module
-
-    monkeypatch.setattr(
-        mode_module, "mode_switch_lock_file", lambda: tmp_path / ".mode-switch-lock"
-    )
-    # Default the config fallback off so a live config pin cannot leak either.
-    monkeypatch.setattr(mode_module, "_live_server_config", lambda: {})
     yield

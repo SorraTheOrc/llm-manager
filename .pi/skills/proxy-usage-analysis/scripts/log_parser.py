@@ -31,7 +31,21 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+
 # Log line prefix: "2026-08-02 13:58:32,260 - INFO - <message>"
+def _normalise_bucket(value: str | None) -> str | None:
+    """Normalise a parsed priority/mode marker to the internal bucket key.
+
+    The proxy now logs ``priority=standard|low`` (AC6); historical logs carry
+    ``mode=fast|cheap``. Both map to the internal budget buckets (``cheap``/
+    ``low`` -> "cheap", everything else -> "fast").
+    """
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    return "cheap" if v in ("cheap", "low") else "fast"
+
+
 LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3}) - (\w+) - (.*)$")
 
 # Field extractors (tolerant: may match nothing).
@@ -75,7 +89,10 @@ RE_COMPACTION_TURNS_DROPPED = re.compile(r"\bturns_dropped=(\d+)")
 RE_COMPACTION_SUMMARY_TOKENS = re.compile(r"\bsummary_tokens=(\d+)")
 RE_COMPACTION_DRY_RUN = re.compile(r"\bdry_run=(true|false)")
 RE_COMPACTION_ACTION = re.compile(r"\baction=([A-Za-z_]+)")
-RE_COMPACTION_MODE = re.compile(r"\bmode=(\w+)")
+# New proxy emits priority=<standard|low> (LP-0MVDT94F0003VHUA AC6);
+# historical logs carry mode=<fast|cheap>. Both parse into the
+# internal budget bucket key (cheap/low -> cheap, else fast).
+RE_COMPACTION_PRIORITY = re.compile(r"\b(?:priority|mode)=(\w+)")
 RE_COMPACTION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
 # Backstop-specific field names (truncate_backstop structured log).
 RE_BACKSTOP_DROPPED_TURNS = re.compile(r"\bdropped_turns=(\d+)")
@@ -659,7 +676,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             "compaction_event",
             ts,
             session=_session_from(msg),
-            mode=(_first(RE_COMPACTION_MODE, msg) or "").lower() or None,
+            mode=_normalise_bucket(_first(RE_COMPACTION_PRIORITY, msg)),
             action=_first(RE_COMPACTION_ACTION, msg),
             reason=_first(RE_COMPACTION_REASON, msg),
             pre_tokens=int(pre_m.group(1)) if pre_m else None,

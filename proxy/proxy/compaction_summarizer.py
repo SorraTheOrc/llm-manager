@@ -816,7 +816,9 @@ def build_compact_summarizer(
         last_kind = "no_provider"
         failed_provider: str | None = None
         while attempts < tier_count:
-            provider = resolve_provider(compact_cfg, failed_provider=failed_provider)
+            provider = resolve_provider(
+                compact_cfg, failed_provider=failed_provider, config=config
+            )
             if provider is None:
                 break
             name = str(provider.get("name") or "?")

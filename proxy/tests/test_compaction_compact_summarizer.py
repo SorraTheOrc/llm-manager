@@ -315,10 +315,10 @@ class TestBuildCompactSummarizer:
 class TestShippedCompactConfig:
     @pytest.mark.parametrize(
         "config_name",
-        ["config.yaml", "config-fast.yaml", "config-cheap.yaml"],
+        ["config.yaml"],
     )
     def test_compact_model_declares_remote_chain(self, config_name):
-        from tests.config_test_utils import load_profile
+        from config_test_utils import load_profile
 
         config = load_profile(config_name)
         compact = config["models"]["compact"]

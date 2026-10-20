@@ -2576,7 +2576,9 @@ def _evaluate_session_compaction(
         srv: Server object (config at ``srv.config``).
         session_id: The session being assembled.
         session_messages: The full session message list.
-        mode: "fast" or "cheap" (from ``proxy.mode.read_mode``).
+        mode: "fast" or "cheap" compaction-budget key (derived from the
+            request's effective priority by the caller — ``low`` → "cheap",
+            otherwise "fast"; LP-0MVDT94F0003VHUA AC6).
         summarizer: Production summarizer callable (see compaction module).
         estimate_tokens: Production routing estimator.
 
@@ -2658,7 +2660,8 @@ async def evaluate_and_apply_compaction(
             ``session`` is not available.
         summarizer / estimate_tokens: Optional injectable production
             callables (tests); built from config when omitted.
-        mode: Optional mode override; defaults to ``proxy.mode.read_mode()``.
+        mode: Optional "fast"/"cheap" compaction-budget override; defaults
+            to "fast" (the unified profile, LP-0MVDT94F0003VHUA AC6).
 
     Returns:
         Outcome dict: ``evaluated``, ``action``, ``applied``, ``dry_run``,
@@ -2683,7 +2686,6 @@ async def evaluate_and_apply_compaction(
 
     try:
         from proxy.compaction_summarizer import build_compact_summarizer
-        from proxy.mode import read_mode as _read_mode
         from proxy.provider import (
             _estimate_prompt_tokens_for_routing,
             _get_tokenizer_for_model,
@@ -2759,7 +2761,15 @@ async def evaluate_and_apply_compaction(
             )
 
         _session_id = result.get("session_id") or ""
-        _mode = mode if mode is not None else _read_mode()
+        # Compaction budget selection (LP-0MVDT94F0003VHUA AC6): the retired
+        # mode axis is replaced by the request's effective priority — ``low``
+        # uses the conservative (cheap) budget, everything else the fast
+        # budget. Callers may still pass an explicit value; without a
+        # request object the medium (default) priority applies → fast budget.
+        if mode is None:
+            _mode = "fast"
+        else:
+            _mode = mode
 
         # Mark evaluated BEFORE the await so a re-entrant call short-circuits.
         result["compaction_evaluated"] = True
@@ -2821,11 +2831,13 @@ async def evaluate_and_apply_compaction(
             outcome["messages"] = list(_compaction["messages"])
             _logger = getattr(srv, "logger", None)
             if _logger is not None:
+                from proxy.compaction import _budget_to_priority
+
                 _logger.info(
-                    "session_compaction applied session=%s mode=%s "
+                    "session_compaction applied session=%s priority=%s "
                     "est_before=%d est_after=%d",
                     str(_session_id)[:8],
-                    _compaction.get("mode"),
+                    _budget_to_priority(_compaction.get("mode")),
                     outcome["estimated_before"],
                     outcome["estimated_after"],
                 )

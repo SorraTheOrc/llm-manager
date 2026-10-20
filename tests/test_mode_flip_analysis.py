@@ -204,6 +204,24 @@ def test_classify_trigger_source_manual():
     assert classify_trigger({"to": "cheap", "source": "manual"}) == "to-cheap"
 
 
+def test_classify_trigger_unknown_source_falls_back_to_heuristic():
+    """An unrecognised ``source`` value is not a canonical attribution label, so
+    classification degrades to the heuristic instead of guessing a category.
+
+    Edge case pinned by LP-0MVC145DE006SAY5: only ``scheduler``, ``worker``,
+    ``api`` and ``manual`` are deterministic inputs; anything else (a future or
+    mistyped token) must behave exactly like an absent source.
+    """
+    # Unknown source without a schedule marker -> direction-based classification.
+    assert classify_trigger({"to": "fast", "source": "mystery"}) == "to-fast"
+    assert classify_trigger({"to": "cheap", "source": "mystery"}) == "to-cheap"
+    # Unknown source with a schedule marker -> the heuristic marker still wins.
+    assert (
+        classify_trigger({"to": "fast", "source": "mystery", "sched_marker": "fast"})
+        == "schedule"
+    )
+
+
 def test_classify_trigger_source_absent_falls_back_to_heuristic():
     """When source is absent, fall back to direction-based heuristic."""
     assert classify_trigger({"to": "fast", "source": None}) == "to-fast"

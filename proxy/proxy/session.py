@@ -1107,13 +1107,13 @@ def _build_slot_context(
     # as the single source for both persistence and routing so cache-restore
     # is never attempted above the routing cap (consistent AC4).
     if max_prompt_tokens <= 0:
-        # Try the hard cap first (mode-aware); fall through to the
-        # per-slot threshold when no hard cap is configured.
+        # Try the hard cap first; fall through to the
+        # per-slot threshold when no hard cap is configured. The cap ratios
+        # were mode-aware; with the mode axis removed (LP-0MVDT94F0003VHUA)
+        # a single unified profile applies.
         try:
-            from proxy.mode import read_mode as _read_mode
             from proxy.provider import compute_hard_routing_cap
-            _mode = _read_mode()
-            _hard_cap = compute_hard_routing_cap(_mode, server_config)
+            _hard_cap = compute_hard_routing_cap("fast", server_config)
             if _hard_cap > 0:
                 max_prompt_tokens = _hard_cap
         except Exception:

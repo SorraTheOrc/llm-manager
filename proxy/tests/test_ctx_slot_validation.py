@@ -283,51 +283,27 @@ class TestLiveConfigsValidate:
     """
 
     def _load(self, name: str) -> dict:
-        from tests.config_test_utils import load_profile
+        from config_test_utils import load_profile
 
         return load_profile(name)
 
-    @pytest.mark.parametrize("config_file", ["config.yaml", "config-fast.yaml", "config-cheap.yaml"])
+    @pytest.mark.parametrize("config_file", ["config.yaml"])
     def test_live_configs_pass_validation(self, config_file):
-        """Every live profile passes validate_local_routing_config."""
+        """The live (unified) config passes validate_local_routing_config."""
         cfg = self._load(config_file)
         problems = validate_local_routing_config(cfg)
         assert problems == [], f"{config_file}: {problems}"
 
-    def test_fast_mode_cold_below_warm(self):
-        """Fast mode: cold 38000 < effective warm per-slot clamp 258048
-        (1x262144 → per-slot 258048; hard-routing cap DISABLED per
-        LP-0MTLB1LK80098R43, warm = min(100000, 258048) = 100000).
-
-        NOTE: the warm threshold config caps this at 100000; the per-slot
-        clamp itself is 258048."""
-        from proxy.provider import _effective_large_context_thresholds
-
-        cold, warm = _effective_large_context_thresholds(self._load("config-fast.yaml"))
-        assert cold == 38000
-        assert warm == 100000  # min(warm_config=100000, per-slot 258048)
-        assert cold < warm
-
-    def test_default_mode_cold_below_warm(self):
-        """Default profile (config.yaml) mirrors fast: cold 38000 < 100000."""
+    def test_unified_profile_cold_below_warm(self):
+        """Unified profile (config.yaml, 2 slots): cold 38000 < effective
+        warm min(100000 economic, per-slot clamp 262144//2 - 4096 = 126976)
+        = 100000. The fast/cheap mode profiles no longer exist
+        (LP-0MVDT94F0003VHUA AC4)."""
         from proxy.provider import _effective_large_context_thresholds
 
         cold, warm = _effective_large_context_thresholds(self._load("config.yaml"))
         assert cold == 38000
         assert warm == 100000
-        assert cold < warm
-
-    def test_cheap_mode_cold_below_warm(self, monkeypatch):
-        """Cheap mode: cold 42000 < effective warm per-slot clamp 83285
-        (3×262144 → per-slot 83285; hard-routing cap DISABLED per
-        LP-0MTLB1LK80098R43, warm = min(100000, 83285) = 83285)."""
-        import proxy.mode as mode_mod
-        from proxy.provider import _effective_large_context_thresholds
-
-        monkeypatch.setattr(mode_mod, "read_mode", lambda: "cheap")
-        cold, warm = _effective_large_context_thresholds(self._load("config-cheap.yaml"))
-        assert cold == 42000
-        assert warm == 83285
         assert cold < warm
 
 
@@ -342,67 +318,36 @@ class TestLiveConfigPersistenceCap:
     """
 
     def _load(self, name: str) -> dict:
-        from tests.config_test_utils import load_profile
+        from config_test_utils import load_profile
 
         return load_profile(name)
 
-    @pytest.mark.parametrize(
-        "config_file,mode,ratio_key",
-        [
-            ("config.yaml", "fast", "local_hard_routing_cap_ratio_fast"),
-            ("config-fast.yaml", "fast", "local_hard_routing_cap_ratio_fast"),
-            ("config-cheap.yaml", "cheap", "local_hard_routing_cap_ratio_cheap"),
-        ],
-    )
-    def test_persistence_cap_derives_from_hard_cap(
-        self, config_file, mode, ratio_key, monkeypatch,
-    ):
+    def test_persistence_cap_derives_from_hard_cap(self):
         """Hard-routing cap DISABLED (LP-0MTLB1LK80098R43 revert): ratio is 0
         so ``compute_hard_routing_cap`` returns 0 and persistence falls back
         to the per-slot routing clamp (no dead-band via session.py F3)."""
-        import proxy.mode as mode_mod
         from proxy.provider import compute_hard_routing_cap
 
-        monkeypatch.setattr(mode_mod, "read_mode", lambda: mode)
-
-        cfg = self._load(config_file)
+        cfg = self._load("config.yaml")
         server_cfg = cfg["server"]
         static = server_cfg.get("session_slot_max_prompt_tokens", 0)
-        assert static == 0, f"{config_file}: expected derived (0), got {static}"
-        ratio = server_cfg.get(ratio_key, 0)
-        assert ratio == 0, f"{config_file}: {ratio_key} must be disabled (0), got {ratio}"
-        derived = compute_hard_routing_cap(mode, server_cfg)
-        assert derived == 0, (
-            f"{config_file}: derived cap must be 0 when disabled, got {derived}"
-        )
+        assert static == 0, f"expected derived (0), got {static}"
+        derived = compute_hard_routing_cap("fast", server_cfg)
+        assert derived == 0, f"derived cap must be 0 when disabled, got {derived}"
 
-    @pytest.mark.parametrize(
-        "config_file,mode",
-        [
-            ("config.yaml", "fast"),
-            ("config-fast.yaml", "fast"),
-            ("config-cheap.yaml", "cheap"),
-        ],
-    )
-    def test_derived_cap_at_or_below_routing_clamp(
-        self, config_file, mode, monkeypatch,
-    ):
+    def test_derived_cap_at_or_below_routing_clamp(self):
         """The derived persistence cap never exceeds the per-slot routing
         clamp (ratio ≤ 1 by construction) — persistence is only attempted
         for contexts the router can dispatch."""
-        import proxy.mode as mode_mod
         from proxy.provider import (
             compute_hard_routing_cap,
             effective_per_slot_threshold,
         )
 
-        monkeypatch.setattr(mode_mod, "read_mode", lambda: mode)
-        cfg = self._load(config_file)
+        cfg = self._load("config.yaml")
         server_cfg = cfg["server"]
-        derived = compute_hard_routing_cap(mode, server_cfg)
+        derived = compute_hard_routing_cap("fast", server_cfg)
         ctx_size = int(server_cfg.get("local_model_ctx_size", 0) or 0)
         slots = int(server_cfg.get("session_slot_pool_size", 0) or 0)
         clamp = effective_per_slot_threshold(ctx_size, slots)
-        assert derived <= clamp, (
-            f"{config_file}: derived cap {derived} > routing clamp {clamp}"
-        )
+        assert derived <= clamp, f"derived cap {derived} > routing clamp {clamp}"

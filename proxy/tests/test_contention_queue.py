@@ -185,7 +185,7 @@ async def test_queue_on_contention_dispatches_local_when_slot_frees(
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
@@ -246,7 +246,7 @@ async def test_fallback_after_max_wait_exceeded(mixed_model_config, caplog):
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
         # Tiny cap: 60s real wait would be far too slow for the suite.
         patch(
             "proxy.router._get_contention_queue_config",
@@ -324,7 +324,7 @@ async def test_fallback_after_max_depth_exceeded_integration(mixed_model_config)
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
         patch(
             "proxy.router._get_contention_queue_config",
             return_value={"policy": "queue", "max_wait_seconds": 0.2, "max_depth": 1},
@@ -549,6 +549,11 @@ async def test_fast_mode_economic_bypass_falls_back_remote(
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
+        # Fast-mode semantics = high priority (never recovers the economic
+        # bypass locally); pinned so the test is deterministic inside the
+        # cheap window (01:00–10:00), where an unpinned request would cap
+        # to low and serve the bypass locally instead.
+        patch("proxy.provider.request_priority", return_value="high"),
     ):
         result = await provider.proxy_with_fallback(
             request, "v1/chat/completions", mixed_model_config, cfg
@@ -598,7 +603,7 @@ async def test_fast_mode_fallback_policy_unchanged(mixed_model_config):
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="fast"),
+        patch("proxy.provider.request_priority", return_value="high"),
     ):
         result = await provider.proxy_with_fallback(
             request, "v1/chat/completions", mixed_model_config, cfg
@@ -652,7 +657,7 @@ async def test_fast_mode_fallback_dispatch_bytes_unchanged(mixed_model_config):
     with (
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="fast"),
+        patch("proxy.provider.request_priority", return_value="high"),
     ):
         result = await provider.proxy_with_fallback(
             request, "v1/chat/completions", mixed_model_config, cfg
@@ -693,7 +698,7 @@ async def test_absent_contention_keys_default_to_fallback(mixed_model_config):
     with (
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
     ):
         result = await provider.proxy_with_fallback(
             _DummyRequest(), "v1/chat/completions", mixed_model_config, cfg
@@ -810,7 +815,7 @@ async def test_queued_dispatch_marks_request_budget(mixed_model_config):
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
     ):
         request = _DummyRequest()
         task = asyncio.create_task(
@@ -854,7 +859,7 @@ async def test_queue_log_lines_emitted_for_queue_policy(mixed_model_config, capl
     with (
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
         patch(
             "proxy.router._get_contention_queue_config",
             return_value={"policy": "queue", "max_wait_seconds": 0.05, "max_depth": 4},
@@ -890,7 +895,7 @@ async def test_no_queue_log_lines_for_fallback_policy(mixed_model_config, caplog
     with (
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
-        patch("proxy.mode.read_mode", return_value="fast"),
+        patch("proxy.provider.request_priority", return_value="high"),
     ):
         await provider.proxy_with_fallback(
             _DummyRequest(), "v1/chat/completions", mixed_model_config, cfg
@@ -994,7 +999,7 @@ def test_contention_queue_config_logs_invalid_values(caplog):
 def test_cheap_config_declares_queue_policy():
     """The merged cheap profile declares queue policy + tuned caps (F2 AC1,
     caps tuned 60→120 / 4→8 per LP-0MTF6EVLW007PEHN)."""
-    from tests.config_test_utils import get_merged_config
+    from config_test_utils import get_merged_config
 
     server = get_merged_config("cheap")["server"]
     assert server["contention_queue_policy"] == "queue"
@@ -1012,7 +1017,7 @@ def test_fast_config_declares_queue_policy():
     of local-eligible requests waits for a slot instead of spilling while the
     average local stream (~31s) is still running.
     """
-    from tests.config_test_utils import get_merged_config
+    from config_test_utils import get_merged_config
 
     server = get_merged_config("fast")["server"]
     assert server["contention_queue_policy"] == "queue"
@@ -1022,7 +1027,7 @@ def test_fast_config_declares_queue_policy():
 
 def test_fast_queue_caps_match_cheap():
     """Fast and cheap share identical queue caps (LP-0MV881O5C007PSL4)."""
-    from tests.config_test_utils import get_merged_config
+    from config_test_utils import get_merged_config
 
     cheap = get_merged_config("cheap")["server"]
     fast = get_merged_config("fast")["server"]
@@ -1101,7 +1106,7 @@ async def test_lease_denied_queue_admits_and_redispatches_local(lease_state, cap
     with (
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
         patch(
             "proxy.provider._maybe_queue_for_local_slot",
             new=AsyncMock(return_value=("dispatch", None, 0.5)),
@@ -1146,7 +1151,7 @@ async def test_lease_denied_queue_budget_expires_falls_back_to_remote(lease_stat
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
         patch(
             "proxy.provider._maybe_queue_for_local_slot",
             new=AsyncMock(return_value=("fallback", None, 300.0)),
@@ -1202,7 +1207,7 @@ async def test_lease_denied_budget_expires_all_remotes_out_of_window_terminal(le
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
         patch("proxy.provider.datetime", _FixedDateTime),
         patch(
             "proxy.provider._maybe_queue_for_local_slot",

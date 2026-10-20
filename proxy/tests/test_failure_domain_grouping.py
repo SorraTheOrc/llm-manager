@@ -1423,6 +1423,12 @@ async def test_usage_limit_different_gateway_falls_through():
 # account key in the per-request exclusion set — the paid sibling on the same
 # endpoint stays eligible for the SAME request. Endpoint-level failures
 # (HTTP 5xx) still poison the shared failure domain (AC2).
+#
+# Reset-aware account quarantine (LP-0MVFA0PAV0022ZHO): a quota 429
+# carrying x-ratelimit-reset-* quarantines ONLY the failing account
+# (reset + _USAGE_LIMIT_RESET_MARGIN_SECONDS) while the paid sibling stays
+# eligible. The marker was removed by the implementation item
+# LP-0MVFA1VRT007T9HT once the quarantine became real.
 # ===========================================================================
 
 
@@ -1480,6 +1486,25 @@ def _rate_limit_exceeded_429() -> Response:
         }).encode("utf-8"),
         status_code=429,
         media_type="application/json",
+    )
+
+
+def _rate_limit_exceeded_429_with_reset(reset: str = "32s") -> Response:
+    """The same per-account quota 429 but carrying MunitoAI's reset headers
+    (LP-0MVFA0PAV0022ZHO)."""
+    return Response(
+        content=json.dumps({
+            "code": "rate_limit_exceeded",
+            "type": "rate_limit_error",
+        }).encode("utf-8"),
+        status_code=429,
+        media_type="application/json",
+        headers={
+            "x-ratelimit-limit-requests": "10",
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-reset-requests": reset,
+            "x-ratelimit-over-limit": "yes",
+        },
     )
 
 
@@ -1638,6 +1663,66 @@ async def test_account_429_poisons_account_key_not_failure_domain(
         "usage-limit quarantine should be set"
     )
     assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_reset_aware_429_quarantines_only_the_failing_account(
+    munitoai_free_paid_chain, tmp_path, monkeypatch,
+):
+    """AC2 (LP-0MVFA0PAV0022ZHO): a quota 429 carrying x-ratelimit-reset-*
+    quarantines ONLY the failing free account. The paid sibling (different
+    api_key_env, same endpoint+model) is not quarantined, is not in cooldown,
+    and a fresh routing decision still resolves it."""
+    monkeypatch.setenv(
+        provider._PROVIDER_STATE_FILE_ENV,
+        str(tmp_path / "provider-state.json"),
+    )
+    free_cfg = munitoai_free_paid_chain["providers"][0]
+    paid_cfg = munitoai_free_paid_chain["providers"][2]
+    # Production opt-in: only the free entry respects x-ratelimit-* headers.
+    free_cfg["respect_ratelimit_headers"] = True
+
+    call_order: list[str] = []
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "munitoai-free":
+            return _rate_limit_exceeded_429_with_reset()
+        if name == "opencode-go-3":
+            return _auth_error_401()
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions", munitoai_free_paid_chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    assert result.status_code == 200
+    assert call_order == ["munitoai-free", "opencode-go-3", "munitoai"]
+
+    free_account = provider._usage_limit_account_key(free_cfg)
+    paid_account = provider._usage_limit_account_key(paid_cfg)
+    assert free_account != paid_account
+    # The failing ACCOUNT is quarantined for reset (32 s) + 2-minute margin.
+    remaining = provider._usage_reset_remaining(free_account)
+    assert remaining == pytest.approx(
+        32 + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS, abs=2
+    )
+    # The paid sibling is untouched: no quarantine, no cooldown.
+    assert paid_account not in provider._usage_reset_at
+    assert not provider._is_provider_unavailable("munitoai")
+    assert not provider._is_provider_unavailable(
+        provider._failure_domain_key(free_cfg)
+    )
+
+    # A fresh routing decision after the 429 still returns the paid sibling.
+    fresh = provider._resolve_provider_with_exclusions(
+        munitoai_free_paid_chain, {"munitoai-free", "opencode-go-3"}
+    )
+    assert fresh is not None
+    assert fresh["name"] == "munitoai"
 
 
 @pytest.mark.asyncio

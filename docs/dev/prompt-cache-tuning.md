@@ -483,9 +483,125 @@ The live post-deploy validation of this cap is a separate follow-up
 | First byte ms median | 8,046.3 | 8,106.7 | Comparable |
 | Max prompts held | 16 | 6 | Fewer held |
 
-`--recommend` output: only 20,480 MiB needed — 40,960 MiB provides ample
-headroom. A full measurement window (~4.7 d / 1,404+ requests) is needed for
-definitive comparison. See LP-0MV5HSZ51005CM7A.
+`--recommend` output (50-request sample): only 20,480 MiB needed — 40,960 MiB
+provides ample headroom. The full-window verification, the log-rotation data
+loss that limited it, and the slot-partitioned analysis are in the next
+section (LP-0MV5HSZ51005CM7A).
+
+## 40960 MiB post-deploy verification (2026-10-18) — LP-0MV5HSZ51005CM7A
+
+Follow-up validation of the 40,960 MiB cap vs the committed 32,768 MiB
+window (`prompt-cache-post-deploy-2026-10-12.json`, 1,404 requests, ~4.7 d).
+
+### AC1 — deploy args (re-verified live 2026-10-18 ~17:00 UTC)
+
+The live Qwen3 child carries the tuned values (no restart was needed to
+capture this measurement):
+
+```
+llama-server --alias Qwen3 --ctx-size 262144 --cache-ram 40960 \
+  --cache-type-k q8_0 --cache-type-v q8_0 --swa-checkpoints 32 \
+  --flash-attn true ...
+```
+
+`--cache-ram 40960` ✓, `--swa-checkpoints 32` (the `--ctx-checkpoints`
+alias) ✓, no `--swa-full` ✓.
+
+### AC2 — window and data availability (blocked by llama-server log rotation)
+
+The ~4.7-day post-deploy window (deploy 2026-10-13 23:31 UTC) matured
+~2026-10-18 16:20 UTC, but the full window is **not reconstructible**:
+llama-server numbered logs rotate to 15 copies on every spawn
+(`rotate_llama_logs(keep=15)`), and the restart rate is high (mode-switch
+fast⇄cheap restarts and crash-restarts; ~4 restarts in the final hour alone
+and all 15 numbered segments on disk written on 2026-10-18). The surviving
+40,960 corpus therefore *shrank* as earlier segments were discarded:
+
+| captured | 40,960 corpus |
+|---|---|
+| 2026-10-16 07:16 (interim) | 1,065 requests |
+| 2026-10-16 21:44 (interim) | 760 requests |
+| 2026-10-18 ~17:00 (this run) | **380 requests** |
+
+Each restart resets the in-memory prompt cache, so the surviving fragment is
+dominated by short, cold-cache restart segments — it cannot stand in for the
+full-window comparison. The committed artifact
+(`docs/dev/prompt-cache-post-deploy-2026-10-18.json`) is the rotation-limited
+best available; raising llama-server log retention for multi-day measurement
+windows is tracked in follow-up LP-0MVE0JS3B005PWY2.
+
+### AC3/AC4 — aggregate comparison (rotation-limited corpus vs 32,768 MiB)
+
+| metric | 32,768 MiB (1,404 req, ~4.7 d) | 40,960 MiB (380 req, rotation-limited) | change |
+|---|---|---|---|
+| evictions | 18 (1.28%/req) | 0 (0.0%/req) | **improved** |
+| cache-saturated samples | 67 (26.27%) | 0 (0.0%) | **improved** |
+| cache peak (MiB) | 32,765.6 / 32,768 | 7,375.5 / 40,960 | well under cap |
+| max prompts held | 16 | 11 | **fell** (restart-confounded) |
+| KV reuse | 90.77% | 60.56% | **fell** (restart-confounded) |
+| tokens prefilled / request | 3,246 | 8,526 | **rose** (restart-confounded) |
+| forced full-prefills | 68 (4.84%/req) | 69 (18.16%/req) | **rate rose** (restart-confounded) |
+| large full-prefills | 58 (4.13%/req) | 73 (19.2%/req) | **rate rose** (restart-confounded) |
+| prompt-eval tok/s (median) | 77.3 | 116.8 | **improved** |
+| decode tok/s (median) | 18.4 | 24.4 | **improved** |
+| first-byte ms, proxy (median) | 8,046.3 (n=10,557) | 11,424.2 (n=6,130) | **regressed +42%** (queue/restart-dominated) |
+
+**Verdict.** The cap is not harming the workload — in the surviving fragment
+the cache never approached 40,960 MiB (peak ~18% of cap, 0 evictions, 0%
+saturation) and prompt-eval/decode throughput improved. But AC3's *"~0
+evictions under sustained load"* is **not confirmed**: the only load-representative
+corpus captured at this cap (the 2026-10-16 interim, 1,065 requests) still
+reached 99.8% of the cap (peak 40,866.6 MiB) with 10 evictions (0.94%/req vs
+1.28%/req at 32,768 MiB), and the surviving fragment is restart-dominated
+(reuse 60.6% vs 90.8%, forced-prefill rate 18.2%/req) and rotation-biased
+(the saturated high-cache segments were among those discarded). AC4's
+first-byte latency regressed +42% on the raw numbers, consistent with the
+cold-cache-restart queue effect previously documented rather than a
+cap-capacity signal; the 2026-10-16 interim at the same cap showed the same
+magnitude. No further raise is indicated: every `--recommend` output at this
+cap (39,936 MiB from the 1,065-req interim; 27,648 MiB from this fragment)
+is at or below the deployed 40,960 MiB.
+
+### Slot-partitioned evaluation (per the 2026-10-16 methodology)
+
+The corpus was partitioned by the Qwen3 child's slot count
+(`srv load_model: initializing slots, n_slots = N` in each llama-server file;
+the proxy `total_slots` field is unreliable). First-byte latency cannot be
+slot-attributed (proxy-side), so partitions are llama-only
+(`--no-proxy`). Artifacts: `prompt-cache-post-deploy-2026-10-18-slot{1,2,3}.json`.
+
+| n_slots | requests | reuse | tokens prefilled/req | evictions | cache peak (MiB) | max held | verdict |
+|---|---|---|---|---|---|---|---|
+| 1 | 4 | 1.14% | 22,225 | 0 | 1,228 / 40,960 | 2 | too small to judge |
+| **2 (current profile)** | **311** | **64.59%** | **7,607** | **0** | **7,376 / 40,960** | **11** | **cap ample; restart-confounded** |
+| 3 | 65 | 45.61% | 12,080 | 0 | 2,874 / 40,960 | 4 | too small to judge |
+
+Per-partition verdict for the producer's question *"does the larger cache
+work?"*: at the current 2-slot profile the cap is demonstrably ample — 0
+evictions, 0% saturated samples, peak ~18% of cap across 311 requests. The
+1-slot and 3-slot subsets are too small for a verdict. Slot-profile
+drift (the 3→1 change LP-0MU1S617L has since moved to `--parallel 2`) and
+the restart-dominated window prevent a load-matched comparison to the
+32,768 MiB baseline, whose per-slot composition is unreconstructible.
+
+### Reproduction
+
+```bash
+# aggregate (AC2) — aligned proxy glob
+./scripts/prompt_cache_analysis.py --json --recommend --cache-ram-filter 40960 \
+    --proxy-glob 'proxy.log,proxy.log-2026-10-1[345678]*,proxy.log.2026-10-1[345678]*' \
+    > docs/dev/prompt-cache-post-deploy-2026-10-18.json
+
+# per-slot partitions (llama-only; n_slots from the child's log line)
+./scripts/prompt_cache_analysis.py --json --recommend --cache-ram-filter 40960 \
+    --no-proxy --glob 'llama-server.log,llama-server.9.log,llama-server.11.log,llama-server.12.log,llama-server.14.log,llama-server.2.log,llama-server.5.log,llama-server.log-2026-10-17.gz,llama-server.log-2026-10-18' \
+    > docs/dev/prompt-cache-post-deploy-2026-10-18-slot2.json
+```
+
+> **Reproducibility caveat:** the surviving corpus rotates underneath a
+> re-run (live file grows, numbered files cycle at 15), so minor count drift
+> between runs is expected; the committed artifacts are the canonical
+> snapshot.
 
 ## Non-goals
 

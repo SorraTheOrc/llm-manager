@@ -1,8 +1,10 @@
-"""Deep-merge helper for the layered proxy config (base + mode overlay).
+"""Deep-merge helper for the layered proxy config.
 
-``config.yaml`` is the authoritative base config. The mode profiles
-(``config-fast.yaml`` / ``config-cheap.yaml``) are overlays that override only
-the values that genuinely differ; :func:`deep_merge` composes the two.
+``config.yaml`` is the single authoritative config since the mode overlays
+(``config-fast.yaml`` / ``config-cheap.yaml``) were removed
+(LP-0MVDT94F0003VHUA AC4). :func:`deep_merge` remains for consumers that
+supply an optional overlay (backward compatibility) and for the restart-
+signature helper.
 
 This module is intentionally dependency-light — stdlib plus ``yaml`` only — so
 the shell entry point ``proxy/scripts/start-proxy.sh`` can reuse the merge
@@ -30,7 +32,7 @@ Typical use::
     from proxy.config_merge import deep_merge
 
     base = yaml.safe_load(open("config.yaml"))
-    overlay = yaml.safe_load(open("config-cheap.yaml"))
+    overlay = yaml.safe_load(open("config.yaml"))  # no overlay: base alone
     cfg = deep_merge(base, overlay)
 """
 

@@ -1027,3 +1027,45 @@ async def test_proxy_to_remote_streaming_uses_display_name(mock_request):
     assert "x-resolved-model" in headers, "X-Resolved-Model header missing"
     assert headers["x-resolved-model"] == "MunitoAI Free/deepseek-ai/deepseek-v4-flash", \
         f"Expected tier-carrying header, got {headers['x-resolved-model']}"
+
+
+@pytest.mark.asyncio
+async def test_proxy_to_remote_streaming_uses_opencode_go_display_name(mock_request):
+    """proxy_to_remote streaming reports the OpenCode Go account tier.
+
+    AC1: the streaming site (proxy_to_remote builds its own header value from
+    the shared resolver) must not diverge from the buffered site for the
+    account-tier entries.
+    """
+    provider_cfg = {
+        "name": "opencode-go-3",
+        "type": "remote",
+        "provider": "opencode-go",
+        "display_name": "OpenCode Go 3",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_3_API_KEY",
+        "model": "deepseek-v4.1-flash",
+    }
+
+    sse_chunk = b'data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}\n\ndata: [DONE]\n\n'
+    mock_resp = _make_mock_remote_response(status_code=200, body=sse_chunk)
+    mock_client_cls = _make_mock_client(mock_resp)
+
+    mock_request.body = AsyncMock(return_value=b'{"model":"deepseek-v4.1-flash","stream":true}')
+
+    with patch("proxy.proxy_remote.httpx.AsyncClient", mock_client_cls):
+        with patch("proxy.proxy_remote._schedule_recv_token_increment", AsyncMock()):
+            with patch("proxy.proxy_remote.log_response_chunk"):
+                with patch("proxy.proxy_remote.log_response"):
+                    with patch("proxy.proxy_remote.log_request"):
+                        result = await proxy_to_remote(
+                            request=mock_request,
+                            path="v1/chat/completions",
+                            model_config=provider_cfg,
+                        )
+
+    assert isinstance(result, StreamingResponse), f"Expected StreamingResponse, got {type(result).__name__}"
+    headers = dict(result.headers)
+    assert "x-resolved-model" in headers, "X-Resolved-Model header missing"
+    assert headers["x-resolved-model"] == "OpenCode Go 3/deepseek-v4.1-flash", \
+        f"Expected tier-carrying header, got {headers['x-resolved-model']}"

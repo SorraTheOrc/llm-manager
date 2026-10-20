@@ -103,6 +103,68 @@ Models can define an ordered list of `providers` for automatic failover. The `pr
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
 | `rate_limit_rpm` | int | optional | Maximum dispatches to this entry per rolling **60-second** window (LP-0MVDQ1GMO00801PL). Intended for free tiers with a per-minute allowance (e.g. `munitoai-free`). Default: unset/`0` = ungated. |
+| `max_context_tokens` | int | optional | Maximum **estimated prompt context** the entry may serve (LP-0MVF9N2QL001CDA7). A request whose routing estimate exceeds this ceiling SKIPS the entry and falls through to the next eligible provider — a size mismatch, not a failure (no cooldown/affinity/usage-limit/queue side effects). Absent, `0` or non-positive disables the gate (byte-for-byte previous behaviour). Shipped `config.yaml` values are sourced (upstream context window / provider per-minute token allowance) and recorded in a config comment; see [Per-entry context limits](#per-entry-context-limits-max_context_tokens). Applies to local entries too: composes as an additional hard cap (`min(existing local thresholds, max_context_tokens)`). |
+| `display_name` | string | optional | Human-readable tier label for the X-Resolved-Model header (e.g. `MunitoAI Free`, `OpenCode Go 3`). Overrides the `provider` brand in the display string only — failure-domain, cooldown and usage-limit keying still use `provider`. Use it to distinguish same-brand tiers/accounts (LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62). |
+
+#### Per-entry context limits (`max_context_tokens`)
+
+A rate-limited tier whose allowance is expressed per minute (MunitoAI
+advertises `x-ratelimit-limit-*` headers) can have its whole per-minute input
+budget spent by a single oversized prompt. `max_context_tokens` caps the
+**estimated prompt context** a request may carry before the entry is skipped:
+
+- the estimate reuses the authoritative routing pipeline
+  (`_get_tokenizer_for_model` + `_estimate_effective_prompt_tokens_for_routing`
+  + `token_estimate_multiplier`), so the gate is consistent with the local
+  thresholds and the hard routing cap, and it is computed **once per request**
+  (no duplicate tokenizer pass per provider);
+- a skip is recorded as an attempt with status `provider_context_exceeded`
+  (carrying the estimate and the limit) and logged with provider, estimate,
+  limit and reason — it is **not** a failure, so no cooldown, failure-domain
+  exclusion, usage-limit reset, affinity record or contention-queue entry is
+  applied, and the entry stays eligible for later, smaller requests; each skip
+  also increments the cumulative `backend_signals.provider_context_exceeded`
+  counter (mirroring `context_too_large`; read it from `/health` or
+  `/admin/metrics`);
+- at least one tier is left effectively ungated (capped at the largest
+  upstream context window), so an oversized prompt always has a destination
+  and the chain cannot exhaust because of caps alone.
+
+Shipped values in `proxy/config.yaml` (probed 2026-10-19, each sourced in the
+config comment next to the entry):
+
+| Entry | `max_context_tokens` | Source |
+|-------|----------------------|--------|
+| `munitoai-free` | 150000 | MunitoAI free-tier `x-ratelimit-limit-input-tokens` (rolling 60 s input allowance); below the 1,048,576-token upstream window |
+| `munitoai` | 400000 | MunitoAI paid-tier `x-ratelimit-limit-input-tokens` (rolling 60 s input allowance) |
+| `opencode-go*` | 1000000 | Model-registry context window for `opencode-go/deepseek-v4.1-flash` (OpenCode Go publishes plan quota as percentages, not per-minute tokens) |
+| `deepseek-flash` | 1048576 | `api.deepseek.com` `/models` `context_window` — the largest window in the chain (effectively ungated destination) |
+| `compact` chain | 1048576 | model-registry / `api.deepseek.com` windows (documentation-consistency caps) |
+
+Copy-pasteable example — a capped local entry, a capped free tier and an
+ungated final tier, so an oversized prompt always has a destination:
+
+```yaml
+models:
+  some-model:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+        max_context_tokens: 50000      # extra hard cap on top of the local thresholds
+      - name: some-free-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FREE_KEY
+        model: some-model
+        max_context_tokens: 150000     # estimated prompt-context ceiling
+      - name: some-final-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FINAL_KEY
+        model: some-model
+        # max_context_tokens omitted -> ungated (absent/0/non-positive)
+```
 
 #### Free-tier request budgets (`rate_limit_rpm`)
 
@@ -135,7 +197,7 @@ capacity-aware:
         api_key_env: SOME_FREE_KEY
         forward_session_headers: false
         model: some-model
-        rate_limit_rpm: 10
+        rate_limit_rpm: 15
 ```
 
 Tuning knobs (all under `server:`): `provider_rate_limit_reserve_ratio` (share

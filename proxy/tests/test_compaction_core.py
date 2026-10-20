@@ -31,7 +31,7 @@ from proxy.compaction import (
 )
 
 # ===================================================================
-# Test profiles — mirror config-fast.yaml / config-cheap.yaml
+# Test profiles — historical fast/cheap-shaped inputs (mode removed)
 # ===================================================================
 # fast  : local_model_ctx_size 262144, session_slot_pool_size 3
 #         per_slot = 262144//3 - 4096 = 83285

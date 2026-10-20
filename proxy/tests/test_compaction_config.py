@@ -472,12 +472,11 @@ class TestLiveConfigsValidate:
 
     @pytest.mark.parametrize("config_file", [
         "config.yaml",
-        "config-fast.yaml",
-        "config-cheap.yaml",
+        "config.yaml",
     ])
     def test_live_configs_pass_compaction_validation(self, config_file):
         """All live config profiles validate without FATAL errors."""
-        from tests.config_test_utils import load_profile
+        from config_test_utils import load_profile
 
         cfg = load_profile(config_file)
         problems = validate_compaction_config(cfg)
@@ -486,8 +485,7 @@ class TestLiveConfigsValidate:
 
     @pytest.mark.parametrize("config_file", [
         "config.yaml",
-        "config-fast.yaml",
-        "config-cheap.yaml",
+        "config.yaml",
     ])
     def test_compaction_disabled_in_live_configs(self, config_file):
         """Proxy-side compaction is disabled in every live profile.
@@ -498,7 +496,7 @@ class TestLiveConfigsValidate:
         context-pressure advisory and the 429 gate (all driven by this single
         knob) are off.
         """
-        from tests.config_test_utils import load_profile
+        from config_test_utils import load_profile
 
         cfg = load_profile(config_file)
         assert compaction_config(cfg)["trigger_ratio"] == 0

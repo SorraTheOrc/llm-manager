@@ -5,7 +5,7 @@ Within a single test file pytest executes methods in definition order, so this
 ordering-explicit test is deterministic.
 """
 
-import proxy.mode as mode_module
+import proxy.startup_ramp as mode_module
 
 
 class TestStartupRampIsolation:

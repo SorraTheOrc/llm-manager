@@ -11,6 +11,11 @@
 #   For remote: endpoint, api_key_env, headers (optional),
 #               provider (optional, actual provider brand name used in
 #                        X-Resolved-Model header; falls back to name)
+#               display_name (optional, tier-aware label overriding
+#                        `provider` in the X-Resolved-Model header only --
+#                        e.g. `MunitoAI Free`, `OpenCode Go 3`. Keying
+#                        (failure-domain, cooldown, usage-limit) still uses
+#                        `provider`; LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62)
 #   For local:  llama_model, endpoint (optional)
 #
 # Local provider endpoints (LP-0MRPILSMW004T4H8):
@@ -102,7 +107,24 @@
 #                        type: remote
 #                        endpoint: https://api.example.com/v1
 #                        api_key_env: SOME_FREE_KEY
-#                        rate_limit_rpm: 10
+#                        rate_limit_rpm: 15
+#
+# Upstream rate-limit headers (optional, remote providers only):
+#   respect_ratelimit_headers - when true, an HTTP 429 carrying
+#                    `x-ratelimit-reset-requests` / `-tokens` /
+#                    `-input-tokens` / `-output-tokens` (durations like `52s`,
+#                    `1m`, `1h30m`) sets the provider cooldown to at least the
+#                    reported reset plus `server.ratelimit_cooldown_margin_seconds`
+#                    (default 2s), instead of only the exponential-backoff
+#                    guess. Use for gateways that send no `Retry-After`
+#                    (e.g. MunitoAI). On a quota 429 the reset also
+#                    quarantines the failing API-key ACCOUNT (reset + the
+#                    2-minute usage-limit margin) — distinct from the 2-second
+#                    `ratelimit_cooldown_margin_seconds` entry margin — while
+#                    same-gateway paid siblings stay eligible
+#                    (LP-0MVFA1VRT007T9HT). The entry flag overrides
+#                    `server.respect_ratelimit_headers`; default false so
+#                    every existing provider is unchanged (LP-0MVBHDNLB007ALLJ).
 #
 # Responses-API mode (optional, remote providers only):
 #   api - "openai-completions" (default) or "openai-responses". Some
@@ -223,6 +245,60 @@ audit_model_fallbacks:
   # was removed: OpenCode's free tier errors outside the OpenCode app).
   - "deepseek-v4.1-flash"
 
+# ---------------------------------------------------------------------------
+# Sourced per-entry context limits (LP-0MVF9N31A0006VH5)
+# ---------------------------------------------------------------------------
+# Each remote provider entry below declares ``max_context_tokens``: the
+# maximum estimated prompt context (the routing estimate) the entry may
+# serve. A request estimated above that ceiling SKIPS the entry and falls
+# through to the next eligible provider — a size mismatch, not a failure
+# (no cooldown, affinity, usage-limit reset or contention-queue entry); the
+# gate itself is LP-0MVF9N2QL001CDA7. Absent / ``0`` = ungated.
+#
+# Every shipped value is SOURCED, never guessed, and was probed on
+# 2026-10-19:
+#
+#   munitoai-free   150000   The free tier's documented rolling-60s
+#                            input-token allowance, read from the
+#                            ``x-ratelimit-limit-input-tokens`` response
+#                            header. The upstream model window
+#                            (deepseek-ai/deepseek-v4-flash, 1,048,576) is
+#                            far larger, so the ALLOWANCE is the binding
+#                            ceiling: one dispatch can consume at most one
+#                            full minute of the free tier's input budget,
+#                            and a larger prompt spills to the paid tiers
+#                            instead of spending the whole window on one
+#                            request.
+#   munitoai        400000   The paid tier's rolling-60s input-token
+#                            allowance (``x-ratelimit-limit-input-tokens``).
+#                            Same upstream model as the free tier, but a
+#                            much larger allowance, hence the deliberate
+#                            difference from munitoai-free.
+#   opencode-go     1000000  Model registry context window for
+#   opencode-go-2            opencode-go/deepseek-v4.1-flash. OpenCode Go
+#   opencode-go-3            reports plan quota as rolling/weekly/monthly
+#                            PERCENTAGES (``/v1/usage``), not a per-minute
+#                            token allowance, so the upstream context window
+#                            is the only sourceable ceiling. Identical
+#                            upstream model on all three entries → identical
+#                            limit.
+#   deepseek-flash  1048576  ``GET https://api.deepseek.com/models/
+#                            deepseek-flash`` → ``context_window``. This is
+#                            the LARGEST window in the chain, so the final
+#                            tier stays effectively ungated: an oversized
+#                            prompt always has a destination and the chain
+#                            cannot exhaust because of caps alone (AC3).
+#   compact chain   1048576  opencode-go/muse-spark-1.3-contributor (model
+#                            registry) and api.deepseek.com deepseek-flash
+#                            windows; the summariser prompt is small, so
+#                            these are documentation-consistency caps.
+#
+# Deliberately NOT gated (no single sourceable ceiling): ``github-primary``
+# declares no ``model`` — the client chooses the upstream model — so a
+# per-entry context limit cannot be sourced for it. The local entries are
+# already bounded by the local routing thresholds
+# (local_large_context_*_threshold, local_model_ctx_size, hard routing cap).
+
 models:
   # Multi-backend local providers (LP-0MRPILSMW004T4H8): a ``type: local``
   # provider may declare an optional ``endpoint`` (full ``http://host:port``
@@ -279,6 +355,16 @@ models:
       # ``MunitoAI Free/<model>`` vs the paid ``MunitoAI/<model>`` in Pi
       # (LP-0MVCQ36QV009QX8K).
       - name: munitoai-free
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
+        respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
@@ -286,6 +372,10 @@ models:
         api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): MunitoAI free-tier
+        # x-ratelimit-limit-input-tokens=150000 per rolling 60s
+        # (probed 2026-10-19; see the sourced-limits block above).
+        max_context_tokens: 150000
         # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
         # only a small number of requests per rolling 60s window, so the proxy
         # dispatches to it only while that window has capacity. Over-budget
@@ -293,8 +383,13 @@ models:
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        rate_limit_rpm: 10
+        # Deliberately conservative at 2/min (LP-0MVF19DKR008VCHO): the free
+        # tier is a bonus tier, so bursts spill to the paid tiers instead.
+        # floor(2 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 2-per-window cap.
+        rate_limit_rpm: 2
       - name: opencode-go-3
+        display_name: OpenCode Go 3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -311,6 +406,10 @@ models:
         # (LP-0MU1RXEPL005CK97)
         #
         model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -318,6 +417,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go-2
+        display_name: OpenCode Go 2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -327,6 +427,10 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -334,6 +438,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go
+        display_name: OpenCode Go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -343,6 +448,10 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -354,19 +463,72 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
+        respect_ratelimit_headers: true
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
         api_key_env: MUNITOAI_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): MunitoAI paid-tier
+        # x-ratelimit-limit-input-tokens=400000 per rolling 60s
+        # (probed 2026-10-19; see the sourced-limits block above).
+        max_context_tokens: 400000
       - name: deepseek-flash
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): api.deepseek.com
+        # GET /models/deepseek-flash context_window = 1048576 — the
+        # LARGEST window in the chain, so the final tier stays
+        # effectively ungated and oversized prompts always have a
+        # destination (AC3).
+        max_context_tokens: 1048576
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    # Per-priority provider chains (LP-0MVDT94F0003VHUA AC2). Each entry is
+    # an ordered provider list (names resolved against ``providers``); the
+    # chain used for a request is selected by its effective priority. A
+    # missing priority falls back to the full ``providers`` chain (today's
+    # behaviour = ``medium`` semantics). ``medium``/``high`` use the full
+    # chain — high differs only in the routing knobs (never queues, economic
+    # bypass routes remote), not the chain (AC3).
+    #
+    # ``low`` prefers local, then the free tier. Off-peak exception
+    # (LP-0MVF17VP70053JXX): once the free tier is spent, the three
+    # opencode-go entries absorb local-slot overflow, gated by their
+    # timed-access (UTC) windows — unchanged from LP-0MSXPHTD9004DZ4P — so
+    # paid spend stays confined to off-peak hours
+    # (UTC 00:00-01:00, 04:00-06:00, 10:00-00:00).
+    # UTC-vs-local overlap: the cheap priority window (01:00-10:00 local
+    # Europe/Dublin = UTC 00:00-09:00), so the new tiers add capacity in ~3
+    # of the 9 cheap hours (00:00-01:00 and 04:00-06:00); the 01:00-04:00 /
+    # 06:00-10:00 gaps are deliberate paid-spend avoidance.
+    # 429 failover is per API-key account (``_usage_limit_account_key`` =
+    # ``api_key_env@endpoint``, LP-0MSMBWB23009XYPW / LP-0MVCX0E2V001VB5N),
+    # so the three entries carry independent rate-limit quota (3x capacity).
+    # Caveat: 5xx/stall failures share ONE failure domain
+    # (``_failure_domain_key``, LP-0MSG45I8Q0020N1F) — same-gateway siblings
+    # are skipped during an opencode outage, so the three entries do NOT
+    # multiply resilience. ``munitoai`` / ``deepseek-flash`` carry no window
+    # discipline and never join the low chain.
+    priority_routes:
+      low:
+        - local-qwen3
+        - munitoai-free
+        - opencode-go-3
+        - opencode-go-2
+        - opencode-go
     aliases:
     - plan*
     force_full_prompt: true
@@ -385,6 +547,16 @@ models:
       # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
       # around the clock.
       - name: munitoai-free
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
+        respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
@@ -392,6 +564,10 @@ models:
         api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): MunitoAI free-tier
+        # x-ratelimit-limit-input-tokens=150000 per rolling 60s
+        # (probed 2026-10-19; see the sourced-limits block above).
+        max_context_tokens: 150000
         # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
         # only a small number of requests per rolling 60s window, so the proxy
         # dispatches to it only while that window has capacity. Over-budget
@@ -399,8 +575,13 @@ models:
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        rate_limit_rpm: 10
+        # Deliberately conservative at 2/min (LP-0MVF19DKR008VCHO): the free
+        # tier is a bonus tier, so bursts spill to the paid tiers instead.
+        # floor(2 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 2-per-window cap.
+        rate_limit_rpm: 2
       - name: opencode-go-3
+        display_name: OpenCode Go 3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -410,6 +591,10 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -417,6 +602,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go-2
+        display_name: OpenCode Go 2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -426,6 +612,10 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -433,6 +623,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go
+        display_name: OpenCode Go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -442,6 +633,10 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -453,19 +648,46 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
+        respect_ratelimit_headers: true
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
         api_key_env: MUNITOAI_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): MunitoAI paid-tier
+        # x-ratelimit-limit-input-tokens=400000 per rolling 60s
+        # (probed 2026-10-19; see the sourced-limits block above).
+        max_context_tokens: 400000
       - name: deepseek-flash
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): api.deepseek.com
+        # GET /models/deepseek-flash context_window = 1048576 — the
+        # LARGEST window in the chain, so the final tier stays
+        # effectively ungated and oversized prompts always have a
+        # destination (AC3).
+        max_context_tokens: 1048576
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    priority_routes:
+      low:
+        - local-qwen3
+        - munitoai-free
+        - opencode-go-3
+        - opencode-go-2
+        - opencode-go
     aliases:
     - author
     force_full_prompt: true
@@ -491,6 +713,16 @@ models:
       # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
       # around the clock.
       - name: munitoai-free
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
+        respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
         provider: MunitoAI
@@ -498,6 +730,10 @@ models:
         api_key_env: MUNITOAI_FREE_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): MunitoAI free-tier
+        # x-ratelimit-limit-input-tokens=150000 per rolling 60s
+        # (probed 2026-10-19; see the sourced-limits block above).
+        max_context_tokens: 150000
         # Free-tier request budget (LP-0MVDQ1GMO00801PL): the free tier allows
         # only a small number of requests per rolling 60s window, so the proxy
         # dispatches to it only while that window has capacity. Over-budget
@@ -505,8 +741,13 @@ models:
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        rate_limit_rpm: 10
+        # Deliberately conservative at 2/min (LP-0MVF19DKR008VCHO): the free
+        # tier is a bonus tier, so bursts spill to the paid tiers instead.
+        # floor(2 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 2-per-window cap.
+        rate_limit_rpm: 2
       - name: opencode-go-3
+        display_name: OpenCode Go 3
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -516,6 +757,10 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -523,6 +768,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go-2
+        display_name: OpenCode Go 2
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -532,6 +778,10 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -539,6 +789,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go
+        display_name: OpenCode Go
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
@@ -548,6 +799,10 @@ models:
         # Deepseek
         #
         model: deepseek-v4.1-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry
+        # context window for opencode-go/deepseek-v4.1-flash = 1000000
+        # (OpenCode Go publishes no per-minute token allowance).
+        max_context_tokens: 1000000
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
         #
         # Muse
@@ -559,19 +814,46 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
+        # Honour MunitoAI's x-ratelimit-reset-* headers on 429
+        # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
+        # this the proxy re-probes the endpoint during exhaustion.
+        # On a quota 429 the parsed reset also quarantines the failing
+        # API-key ACCOUNT for reset + the 2-minute usage-limit margin
+        # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), in addition to this entry's
+        # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
+        # the account key is api_key_env@endpoint:model, so same-gateway
+        # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
+        respect_ratelimit_headers: true
         type: remote
         provider: MunitoAI
         endpoint: https://api.munito.ai/inference
         api_key_env: MUNITOAI_API_KEY
         forward_session_headers: false
         model: deepseek-ai/deepseek-v4-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): MunitoAI paid-tier
+        # x-ratelimit-limit-input-tokens=400000 per rolling 60s
+        # (probed 2026-10-19; see the sourced-limits block above).
+        max_context_tokens: 400000
       - name: deepseek-flash
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): api.deepseek.com
+        # GET /models/deepseek-flash context_window = 1048576 — the
+        # LARGEST window in the chain, so the final tier stays
+        # effectively ungated and oversized prompts always have a
+        # destination (AC3).
+        max_context_tokens: 1048576
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    priority_routes:
+      low:
+        - local-qwen3
+        - munitoai-free
+        - opencode-go-3
+        - opencode-go-2
+        - opencode-go
     aliases:
     - code
     force_full_prompt: true
@@ -590,11 +872,15 @@ models:
   compact:
     providers:
       - name: opencode-go-compact
+        display_name: OpenCode Go Compact
         type: remote
         provider: opencode-go
         endpoint: https://opencode.ai/zen/go
         api_key_env: OPENCODE_API_KEY
         model: muse-spark-1.3-contributor
+        # Context ceiling (LP-0MVF9N31A0006VH5): model registry context
+        # window for opencode-go/muse-spark-1.3-contributor = 1048576.
+        max_context_tokens: 1048576
         api: openai-responses
         forward_session_headers: false
       - name: deepseek-flash-compact
@@ -603,7 +889,18 @@ models:
         endpoint: https://api.deepseek.com
         api_key_env: DEEPSEEK_API_KEY
         model: deepseek-flash
+        # Context ceiling (LP-0MVF9N31A0006VH5): api.deepseek.com
+        # GET /models/deepseek-flash context_window = 1048576.
+        max_context_tokens: 1048576
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
+    # Remote-only chain has no local tier, so every priority uses the same
+    # chain (summarisation never contends with the GPU slots;
+    # LP-0MTT0O74N009E7N2). Declared explicitly to satisfy the
+    # per-model ``priority_routes`` schema (AC2).
+    priority_routes:
+      low:
+        - opencode-go-compact
+        - deepseek-flash-compact
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
@@ -668,6 +965,26 @@ server:
   # Provider fallback cooldown: seconds to wait before retrying a failed provider
   provider_cooldown_seconds: 60
 
+  # Upstream x-ratelimit-* honouring (LP-0MVBHDNLB007ALLJ). When enabled, an
+  # HTTP 429 whose response carries `x-ratelimit-reset-*` headers sets the
+  # provider cooldown to at least the upstream-reported reset (plus
+  # ratelimit_cooldown_margin_seconds) instead of a blind exponential-backoff
+  # guess, so the proxy stops probing an endpoint that is guaranteed to reject
+  # during a rate-limit exhaustion window. Enable per provider entry with
+  # `respect_ratelimit_headers: true` (the entry flag wins), or globally here.
+  # On a quota 429 (per-account rate_limit_error / rate_limit_exceeded, or
+  # `x-ratelimit-over-limit`) the parsed reset is ALSO applied as an
+  # account-scoped quarantine of reset + the 2-minute usage-limit margin
+  # (_USAGE_LIMIT_RESET_MARGIN_SECONDS), keyed on api_key_env@endpoint:model
+  # so same-gateway paid siblings stay eligible (LP-0MVFA1VRT007T9HT). Two
+  # margins, never interchangeable: 2 s for the entry cooldown above,
+  # 2 minutes for the account quarantine.
+  # Default false: every provider keeps its existing behaviour.
+  respect_ratelimit_headers: false
+  # Safety margin added to a header-derived cooldown so it never expires
+  # exactly on the upstream boundary (default 2 seconds).
+  ratelimit_cooldown_margin_seconds: 2
+
   # Free-tier request budget (LP-0MVDQ1GMO00801PL).
   # A provider entry that declares `rate_limit_rpm` (e.g. `munitoai-free`) is
   # dispatched to at most that many times in any rolling 60s window. When the
@@ -702,6 +1019,88 @@ server:
   provider_rate_limit_wait_max_seconds: 15
   provider_rate_limit_wait_max_waiters: 8
   provider_affinity_ttl_seconds: 900
+  # Proactive OpenCode Go quota poller (LP-0MVF7KEG7007C8MF).
+  # The proxy polls GET {endpoint}/v1/usage per distinct `opencode-*`
+  # api_key_env on this interval and caches the derived per-account quota
+  # state (rolling/weekly/monthly headroom, effective headroom, seconds to
+  # reset, exhausted). Polls are interval-gated and single-flighted per
+  # account; a poll failure keeps the last known values, logs at WARN and
+  # never delays a client request. Full documentation lands with the
+  # quota-surge design doc (LP-0MVF7KRH30000KOA).
+  # Default: 900 seconds (15 minutes).
+  quota_poll_interval_seconds: 900
+  # Optional quota-surge account allow-list. Each item is either a provider
+  # entry name (e.g. `opencode-go-3`) or an `api_key_env`
+  # (e.g. `OPENCODE_3_API_KEY`). When omitted, all `opencode-*` entries are
+  # managed. A comma-separated string is also accepted.
+  # quota_surge_accounts:
+  #   - opencode-go
+  #   - opencode-go-3
+  # Quota-surge pacing model (LP-0MVF7KHI5000J7BL, pure functions in
+  # proxy/quota_pacing.py). OpenCode Go allowances are use-it-or-lose-it, so
+  # during the final week before an account's own `resetsAt` the proxy may
+  # surge traffic to it. The window and ramp are computed per account from its
+  # own reset date (reset dates are not calendar-aligned).
+  #   - quota_surge_days: length of the final surge window in days. An entry
+  #     with `0 < seconds_to_reset <= quota_surge_days * 86400` is inside the
+  #     window. 0 disables the window. Default: 7.
+  #     Inside this window the entry's `available_times` restriction is also
+  #     lifted for that account (LP-0MVF7KJN2000ASE8): the residual allowance
+  #     may be spent at any UTC hour, logged once per state change with
+  #     `reason=quota_surge`. Only `available_times` is bypassed — cooldown,
+  #     `rate_limit_rpm`, the sibling-failure circuit breaker, failure-domain
+  #     grouping, usage-limit quarantine and stall gates still apply. The
+  #     bypass clears when the account is exhausted or its reset passes.
+  #   - quota_pacing_target: fraction of the residual allowance the ramp aims
+  #     to spend by `resetsAt` (0.95 = finish at ~95%, leaving a 5% margin for
+  #     the rolling/weekly caps). Values outside (0, 1] are clamped, not
+  #     trusted. Default: 0.95.
+  # The ramp also starts BEFORE the final week when the residual cannot be
+  # discharged in time: the documented Go caps (rolling 5-hour window = 20% of
+  # monthly, weekly window = 50% of monthly) bound the achievable spend rate,
+  # so e.g. 90% left with 2 days to reset must already be ramping.
+  quota_surge_days: 7
+  quota_pacing_target: 0.95
+  # Quota-surge kill switch, dry run and stale-state fail-safe
+  # (LP-0MVF7KPB9009U7CG). All three flags are consulted per request through
+  # the single predicate `quota_state.quota_behaviour()`, which every quota
+  # decision site (ordering, `available_times` bypass, quota-driven skip)
+  # shares:
+  #   - quota_surge_enabled: false turns every quota-derived decision off. No
+  #     ordering, no bypass, no quota-driven skip: routing is byte-identical
+  #     to the configuration without quota state. The separate cost guard
+  #     (`quota_exhaustion_percent`) is a money guard and stays active. The
+  #     poller keeps running so state and observability stay current.
+  #     Default: true.
+  #   - quota_surge_dry_run: true computes and logs the decisions it *would*
+  #     take (INFO lines with `reason=quota_surge_dry_run`, DEBUG
+  #     `quota_ordering` lines with `applied=False`) but leaves the selected
+  #     provider, eligibility, `retry_after` and next-window values unchanged.
+  #     The flag is re-read per request (no cached decision). Default: false.
+  #   - quota_state_max_age_seconds: fail-safe stale guard. When the last
+  #     successful poll for an account is older than this, surge is
+  #     SUSPENDED for that account: no bypass, no quota-driven re-ordering or
+  #     skip, so routing reverts to the configured `available_times` and config
+  #     order. One WARN per account per suspension with
+  #     `reason=quota_surge_suspended`, and one INFO on recovery. Missing /
+  #     never-polled state never suspends (nothing is stale) and never enables
+  #     surge. Default: 3600 seconds (1 hour).
+  quota_surge_enabled: true
+  quota_surge_dry_run: false
+  quota_state_max_age_seconds: 3600
+  # Quota hard stop / cost guard (LP-0MVF7KO8C005NB59). An `opencode-*` account
+  # whose monthly consumption is at or above this percentage — or whose
+  # `effective_headroom` is at or below `100 - threshold` (a spent rolling or
+  # weekly window) — is skipped before any upstream request is attempted and
+  # logged at INFO with `reason=quota_exhausted`. The skip applies whether or
+  # not surge is active (surge can never re-enable an exhausted account) and
+  # is cumulative with the reactive usage-limit quarantine: it never clears,
+  # shortens or overrides it. This is the guard that prevents spending real
+  # pay-as-you-go money on an account with the console "Use balance" option
+  # enabled. Values outside [1, 100] are clamped and non-numeric values fall
+  # back to the default, with one WARN per process.
+  # Default: 99.5.
+  quota_exhaustion_percent: 99.5
   # Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG): when a remote
   # provider repeatedly returns an EMPTY response / stalls (no usable content)
   # across retry cycles, the provider is quarantined for an EXTENDED cooldown
@@ -735,6 +1134,14 @@ server:
   #     budget (chain_hold_seconds x chain_hold_max_cycles) the terminal 503
   #     is returned immediately with its accurate Retry-After instead of
   #     holding through cycles that cannot succeed.
+  #   - Free-tier budget-window exhaustion advertises the WINDOW ROLLOVER as
+  #     its ``retry_after`` (LP-0MVF0N9SA0071LWM): a ``rate_limit_rpm`` budget
+  #     skip records no cooldown and no usage-limit reset, so the exhaustion
+  #     used to advertise 0 and every hold cycle replayed instantly inside the
+  #     still-full window. The derived wait (<= the 60 s window) is bounded by
+  #     these chain-hold budgets, so one hold is typically enough for the
+  #     window to roll over. Exhaustions with a real cooldown/reset, and
+  #     instant-recovery (genuinely 0 s) exhaustions, are unchanged.
   #   - Each hold cycle re-runs the full chain, including local routing and
   #     compaction evaluation; every routing/compaction/hold log line carries
   #     ``chain_hold_cycle=N`` so re-emissions are not read as new demand
@@ -1068,91 +1475,53 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  # Base/default profile runs 2 slots (fast inherits 2; cheap converges to
-  # 2 per the slot-count verdict, LP-0MV9UNGEB009XUZ5 / LP-0MVCGYAI80084PCZ).
+  # Slot pool is FIXED at 2 (the N=2 verdict LP-0MV9UNGEB009XUZ5 /
+  # LP-0MVCGYAI80084PCZ); bursts are absorbed by the bounded contention
+  # queue below. No routing policy change ever restarts the proxy or
+  # llama-server again (LP-0MVDT94F0003VHUA AC4).
   session_slot_pool_size: 2
 
-  # Slot count is defined ONCE per mode profile via ``session_slot_pool_size``
-  # above (default/fast: 2, cheap: 3 — converging to 2, LP-0MVCGYAI80084PCZ). There is no time-based slot schedule:
-  # the slot count changes only when the operating mode changes. The
-  # mode-switch schedule (when to switch fast<->cheap) lives in the
-  # standalone ``proxy/mode_schedule.yaml`` file, not in this model profile.
-  #
   # -----------------------------------------------------------------------
-  # Session grandfathering across mode switches (LP-0MSMF5LXO006YDNM)
+  # Contention queue (merged from the retired config-fast/cheap overlays)
   # -----------------------------------------------------------------------
-  # When the proxy switches fast<->cheap, sessions that were ALREADY active
-  # (recorded session->model bindings persisted beside proxy/.mode) may keep
-  # using their model - including its full provider chain (local-first, with
-  # the opencode/opencode-go/deepseek remote fallbacks, or remote-only for
-  # github) - until the EARLIER of the next scheduled mode transition or the
-  # session idle TTL. This deliberately RELAXES the cheap-mode "no paid calls"
-  # guarantee for those grandfathered sessions only, and only within the grace
-  # deadline. New sessions (and requests without a session id) are never
-  # grandfathered. Set enabled: false to turn the whole feature off.
-  # fallback_grace_seconds: only used when the mode schedule is disabled
-  # (default = session TTL, 3h).
-  mode_switch_grandfathering:
-    enabled: true
-    # fallback_grace_seconds: 10800
+  # The per-mode queue policy was declared by the mode overlays
+  # (config-fast.yaml / config-cheap.yaml, both ``queue`` depth 8 / wait 120s);
+  # with the mode axis removed the policy is a single server-level knob.
+  # Circuit: a request that finds all local slots busy QUEUES (bounded by
+  # these caps) instead of immediately falling back to a paid remote
+  # provider. ``medium`` priority engages the queue when the policy is
+  # ``queue``; ``low`` always queues (cheap semantics); ``high`` never
+  # queues (immediate remote fallback) — see proxy/proxy/priority.py.
+  contention_queue_policy: queue
+  contention_queue_max_wait_seconds: 120
+  contention_queue_max_depth: 8
 
   # -----------------------------------------------------------------------
-  # Bounded drain before a mode-switch restart (LP-0MT631JKW008WAKE)
+  # Priority routing cheap window (LP-0MVDT94F0003VHUA AC1)
   # -----------------------------------------------------------------------
-  # A mode switch (scheduled 01:00/10:00 or manual POST /admin/set-mode)
-  # restarts the proxy process. Historically the restart killed in-flight
-  # local streams mid-generation, surfacing a synthetic `finish_reason:
-  # error` to clients; the bounded drain fixes that:
-  #   - NEW chat requests are deferred with a short 503 + Retry-After while
-  #     the drain is active (no new stream starts that would be killed),
-  #   - the process kill is delayed until in-flight local streams finish,
-  #     bounded by max_seconds,
-  #   - enabled: false (or max_seconds: 0) restores the old "just restart"
-  #     behavior.
-  # The window is SHORT and bounded, preserving the "no long rejection
-  # window" property of slot-schedule transitions (LP-0MSF9RUSQ007M346).
-  mode_switch_drain:
+  # During this local-time window EVERY request is routed as ``low`` priority
+  # regardless of its X-Priority header. The header value is never modified
+  # and no 503/Retry-After deferral is applied — a spoofed ``high`` during
+  # cheap hours simply routes as low. Defaults to the retired mode-schedule
+  # cheap window (01:00–10:00). A window with start > end wraps across
+  # midnight (e.g. 22:00–06:00). Set enabled: false to disable the cap.
+  priority_window:
     enabled: true
-    # Maximum seconds to wait for in-flight local streams before the restart
-    # kills the process. Increased from 30s to 90s so more complex
-    # grandfathering + slot-save operations can complete gracefully.
-    max_seconds: 90
-    # Extra seconds added to the "Retry-After" header past the drain deadline
-    # so clients retry after the restart has had time to complete.
-    retry_after_margin_seconds: 15
-
-  # -----------------------------------------------------------------------
-  # Mode-switch lock for performance investigations (LP-0MVCBMLP7009MN81)
-  # -----------------------------------------------------------------------
-  # A slot sweep or other performance investigation must not be corrupted
-  # by a fast<->cheap mode switch mid-run (the herdr mode-switch worker and
-  # the schedule can both flip modes, each triggering a proxy restart).
-  # When the lock is ON, every request that would CHANGE the mode is
-  # rejected (POST /admin/set-mode -> 423 Locked) and the mode scheduler
-  # stands down; the current mode is held. Normal operation is unaffected
-  # when the lock is OFF (the default).
-  #
-  # The lock is normally toggled at runtime WITHOUT a restart via
-  # POST /admin/mode-switch-lock {"enabled": true|false, "reason": "..."}
-  # (state persisted in proxy/.mode-switch-lock, so it survives the restart
-  # a pre-lock change would have armed). This config key sets the default
-  # for a fresh deployment; absent = OFF.
-  mode_switch_lock:
-    enabled: false
-    # reason: "1/2/3 slot sweep"   # optional, for diagnostics only
+    start: "01:00"
+    end: "10:00"
 
   # -----------------------------------------------------------------------
   # Post-restart startup ramp (LP-0MU9ZXFQS0023DXT)
   # -----------------------------------------------------------------------
-  # After a mode-switch restart, competing herdr/agent workers reconnect
-  # simultaneously, creating a thundering herd that overwhelms the freshly-
-  # started proxy. This gate returns 503 + random Retry-After (uniform
-  # jitter) so reconnects spread across the ramp window instead of hitting
-  # the server at once. Clients simply retry with the given delay. The 503
-  # body also includes ``ramp_ends_at`` (ISO-8601 UTC, the guaranteed ceiling)
-  # and ``ramp_remaining_seconds`` (whole seconds) so clients can sleep for a
-  # deterministic upper bound instead of inferring one from the jitter
-  # (LP-0MU9Z7O8M0053Y0K).
+  # After any proxy restart (operator restart, model switch), competing
+  # herdr/agent workers reconnect simultaneously, creating a thundering herd
+  # that overwhelms the freshly-started proxy. This gate returns 503 + random
+  # Retry-After (uniform jitter) so reconnects spread across the ramp window
+  # instead of hitting the server at once. Clients simply retry with the
+  # given delay. The 503 body also includes ``ramp_ends_at`` (ISO-8601 UTC,
+  # the guaranteed ceiling) and ``ramp_remaining_seconds`` (whole seconds) so
+  # clients can sleep for a deterministic upper bound instead of inferring
+  # one from the jitter (LP-0MU9Z7O8M0053Y0K).
   startup_ramp:
     enabled: true
     # Short safety ceiling (seconds) after process start. New chat requests
@@ -1292,7 +1661,9 @@ server:
   # Trade-off: true failures are detected more slowly (up to 30s of silence).
   # Bounded by upstream_request_timeout_seconds (120s) — the idle timeout
   # never exceeds the total request timeout. See LP-0MU1RXEPL005CK97.
-  upstream_idle_timeout_seconds: 30
+  # 240s (merged from the retired config-fast/cheap overlays, which both
+  # set 240s; the pre-overlay base default was 30s).
+  upstream_idle_timeout_seconds: 240
 
   # Remote-stream watchdog budgets (LP-0MSVP7ZML003XZTJ).
   # The per-chunk idle timeout above only fires on SILENCE — an upstream

@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.23 (2026-10-20)
+### Features
+- Respect MunitoAI x-ratelimit-* reset headers on quota 429s (LP-0MVDNP36J006430L)
+- Per model context size (LP-0MVF2DNCX003Z5CO)
+- start-proxy.sh: detect stale provider API keys in environment (auth.json rotation leaves proxy serving expired keys) (LP-0MVD2RF7H008B7OT)
+- Quota-aware OpenCode Go surge: spend the full monthly allowance before it resets (LP-0MVF4FIP1001RD8P)
+### Bug Fixes
+- Proxy: honour MunitoAI x-ratelimit-* headers when queuing 429 cooldowns (LP-0MVBHDNLB007ALLJ)
+- Chain-hold on budget-window exhaustion: hold for the free-tier 60s window rollover, not 0s (LP-0MVF0N9SA0071LWM)
+- Adopted llama-server loses its log sink, freezing llama-server.log (LP-0MVECX47Z004LJAQ)
+- Slot status serves stale log-derived progress, so the Web UI shows slots frozen (LP-0MVECWYWK000U3E1)
+- Reporting the wrong model to Pi for opencode-go-* (LP-0MVDUW7OB006UT62)
+### Other
+- Evaluate whether munitoai-free rate_limit_rpm should be increased (LP-0MVDVJYN5001BMG4)
+- Quality Improvement - Refactoring (LP-0MVF54OUT0059JAP)
+- Reduce munitoai-free rate_limit_rpm to 2 (LP-0MVF19DKR008VCHO)
+- Priority-based routing replacing fast/cheap mode (X-Priority header + per-model priority tiers) (LP-0MVDT94F0003VHUA)
+- Quality Improvement - Refactoring (LP-0MVE3SIB1001OYYR)
+- Evaluate whether the munitoai-free rate-limit budget is effective (LP-0MVDU4FDE003RQHS)
+- Document that 'forcing full prompt re-processing' is expected on Qwen3.x hybrid-arch models (LP-0MVEWGYDE000O0KG)
+- proxy-usage-analysis: consume actor/source/reason attribution from proxy restart logs (LP-0MVB8F5ZU0079DE9)
+
 ## v0.1.22 (2026-10-18)
 ### Features
 - Make X-Resolved-Model tier-aware so free MunitoAI is distinguishable from paid in Pi (LP-0MVCQ36QV009QX8K)

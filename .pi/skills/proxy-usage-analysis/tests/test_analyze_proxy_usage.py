@@ -2001,24 +2001,15 @@ class TestConfigLoader:
         p.write_text("x: 1\n")
         assert config_loader.find_config_path(explicit=str(p)) == p
 
-    def test_find_config_path_prefers_mode_selected_profile(self, tmp_path):
-        """A persisted cheap mode selects config-cheap.yaml (LP-0MSLMYEEU002IBH6)."""
+    def test_find_config_path_mode_profiles_no_longer_selected(self, tmp_path):
+        """The mode profiles and persisted `.mode` were removed
+        (LP-0MVDT94F0003VHUA AC4): find_config_path always returns the single
+        unified ``config.yaml`` even when legacy mode files exist."""
         (tmp_path / "proxy").mkdir()
         (tmp_path / "proxy" / "config.yaml").write_text("default_model: code\n")
         (tmp_path / "proxy" / "config-cheap.yaml").write_text("default_model: code\n")
-        (tmp_path / "proxy" / "config-fast.yaml").write_text("default_model: code\n")
-        (tmp_path / "proxy" / ".mode").write_text("cheap\n")
         found = config_loader.find_config_path(start=tmp_path)
-        assert found == tmp_path / "proxy" / "config-cheap.yaml"
-
-    def test_find_config_path_mode_fast_selects_fast_profile(self, tmp_path):
-        """A persisted fast mode selects config-fast.yaml."""
-        (tmp_path / "proxy").mkdir()
-        (tmp_path / "proxy" / "config.yaml").write_text("default_model: code\n")
-        (tmp_path / "proxy" / "config-fast.yaml").write_text("default_model: code\n")
-        (tmp_path / "proxy" / ".mode").write_text("fast\n")
-        found = config_loader.find_config_path(start=tmp_path)
-        assert found == tmp_path / "proxy" / "config-fast.yaml"
+        assert found == tmp_path / "proxy" / "config.yaml"
 
     def test_find_config_path_missing_mode_defaults_to_config_yaml(self, tmp_path):
         """No .mode file -> the default config.yaml is used."""
@@ -2081,27 +2072,21 @@ server:
         assert schedule["entries"] == [("23:59", 2), ("10:00", 3)]
         assert schedule.get("ctx_by_time") == {"23:59": 262144}
 
-    def test_discover_configs_loads_profiles_and_analysis_mode(self, tmp_path):
-        """discover_configs loads all three profiles plus the persisted mode
-        (LP-0MSPZUD4G007IYGH)."""
+    def test_discover_configs_loads_unified_config_and_priority_window(self, tmp_path):
+        """discover_configs loads the single unified ``config.yaml`` and the
+        priority-window label (the mode axis was removed,
+        LP-0MVDT94F0003VHUA AC4/AC6)."""
         (tmp_path / "proxy").mkdir()
-        (tmp_path / "proxy" / "config.yaml").write_text("local_model_ctx_size: 131072\n")
-        (tmp_path / "proxy" / "config-cheap.yaml").write_text("local_model_ctx_size: 262144\n")
-        (tmp_path / "proxy" / "config-fast.yaml").write_text("local_model_ctx_size: 131072\n")
-        (tmp_path / "proxy" / ".mode").write_text("cheap\n")
+        (tmp_path / "proxy" / "config.yaml").write_text(
+            "local_model_ctx_size: 131072\n"
+            "server:\n  priority_window:\n    enabled: true\n    start: \"01:00\"\n    end: \"10:00\"\n"
+        )
         configs = config_loader.discover_configs(start=tmp_path)
         assert configs["base"] == tmp_path / "proxy" / "config.yaml"
-        assert configs["profiles"]["fast"]["local_model_ctx_size"] == 131072
-        assert configs["profiles"]["cheap"]["local_model_ctx_size"] == 262144
-        assert configs["analysis_mode"] == "cheap"
-        assert configs["analysis_config"] is configs["profiles"]["cheap"]
-
-    def test_discover_configs_no_mode_uses_default(self, tmp_path):
-        (tmp_path / "proxy").mkdir()
-        (tmp_path / "proxy" / "config.yaml").write_text("local_model_ctx_size: 131072\n")
-        (tmp_path / "proxy" / "config-cheap.yaml").write_text("local_model_ctx_size: 262144\n")
-        configs = config_loader.discover_configs(start=tmp_path)
+        assert configs["profiles"]["default"]["local_model_ctx_size"] == 131072
+        # Legacy mode axis removed: no analysis_mode, priority window label present.
         assert configs["analysis_mode"] is None
+        assert configs["priority_window"] in ("low", "standard")
         assert configs["analysis_config"] is configs["profiles"]["default"]
 
     # -- base + overlay merge (LP-0MUI681CH00653DT) ----------------------
@@ -2160,9 +2145,9 @@ server:
         cfg = config_loader.load_proxy_config(d / "config.yaml")
         assert cfg["local_model_ctx_size"] == 131072
 
-    def test_discover_configs_profiles_are_merged(self, tmp_path):
-        """discover_configs resolves every profile against the base, so a
-        deduplicated overlay still carries inherited values/models."""
+    def test_discover_configs_loads_unified_base(self, tmp_path):
+        """discover_configs loads the unified base config (the fast/cheap
+        overlay files and ``.mode`` are ignored; LP-0MVDT94F0003VHUA AC4)."""
         d = tmp_path / "proxy"
         d.mkdir()
         (d / "config.yaml").write_text(
@@ -2178,17 +2163,14 @@ server:
         (d / "config-cheap.yaml").write_text(
             "server:\n  session_slot_pool_size: 3\n"
         )
-        (d / "config-fast.yaml").write_text(
-            "server:\n  upstream_idle_timeout_seconds: 240\n"
-        )
         (d / ".mode").write_text("cheap\n")
 
         configs = config_loader.discover_configs(start=tmp_path)
 
-        assert configs["profiles"]["cheap"]["local_model_ctx_size"] == 262144
-        assert configs["profiles"]["cheap"]["models"]  # inherited from base
-        assert configs["analysis_config"]["local_model_ctx_size"] == 262144
-        assert configs["profiles"]["fast"]["local_model_ctx_size"] == 262144
+        assert configs["profiles"]["default"]["local_model_ctx_size"] == 262144
+        assert configs["profiles"]["default"]["models"]  # full model surface
+        assert configs["analysis_config"] is configs["profiles"]["default"]
+        assert configs["analysis_mode"] is None
 
     def test_real_profiles_ctx_sizes_match_pre_dedup(self):
         """The merged loader yields the same per-mode ctx sizes the proxy
@@ -2871,8 +2853,8 @@ class TestEndToEnd:
         # Two sessions in the window.
         assert len(result.summary.sessions) == 2
 
-        fast_csv = out_dir / "fast_sessions.csv"
-        cheap_csv = out_dir / "cheap_sessions.csv"
+        fast_csv = out_dir / "standard_sessions.csv"
+        cheap_csv = out_dir / "low_priority_sessions.csv"
         report_md = out_dir / "report.md"
         assert fast_csv.exists()
         assert cheap_csv.exists()
@@ -3035,9 +3017,9 @@ class TestEndToEnd:
         assert result.summary.sessions["cheap-sess"].slots == 2
         assert result.summary.sessions["cheap-sess"].ctx_size == 262144
 
-        with (out_dir / "fast_sessions.csv").open() as f:
+        with (out_dir / "standard_sessions.csv").open() as f:
             fast_rows = list(csv.DictReader(f))
-        with (out_dir / "cheap_sessions.csv").open() as f:
+        with (out_dir / "low_priority_sessions.csv").open() as f:
             cheap_rows = list(csv.DictReader(f))
         assert {r["session_id"] for r in fast_rows} == {"fast-early", "fast-late"}
         assert {r["session_id"] for r in cheap_rows} == {"cheap-sess"}
@@ -3057,8 +3039,8 @@ class TestEndToEnd:
 
         # JSON summary exposes the split too.
         data = reporting.summary_to_json(result.summary, mm)
-        assert data["fast_sessions"] == 2
-        assert data["cheap_sessions"] == 1
+        assert data["standard_sessions"] == 2
+        assert data["low_priority_sessions"] == 1
 
     def test_mode_aware_context_pressure_uses_per_session_profile(self, tmp_path):
         """Context-pressure recommendations use each session's own profile
@@ -3398,8 +3380,8 @@ class TestDefaultOutputDir:
         out = home / "proxy-usage-reports"
         assert out.is_dir()
         assert (out / "report.md").exists()
-        assert (out / "fast_sessions.csv").exists()
-        assert (out / "cheap_sessions.csv").exists()
+        assert (out / "standard_sessions.csv").exists()
+        assert (out / "low_priority_sessions.csv").exists()
 
 
 class TestSummaryOutputPaths:
@@ -3432,8 +3414,8 @@ class TestSummaryOutputPaths:
         listed = [ln.strip() for ln in captured.splitlines() if ln.strip().startswith(str(out))]
         expected = [
             out.resolve() / "report.md",
-            out.resolve() / "fast_sessions.csv",
-            out.resolve() / "cheap_sessions.csv",
+            out.resolve() / "standard_sessions.csv",
+            out.resolve() / "low_priority_sessions.csv",
             out.resolve() / "errors.csv",
             out.resolve() / "errors.json",
         ]
@@ -3507,7 +3489,7 @@ class TestReportRestructure:
     def test_session_summary_has_total_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
-        assert "| Metric | Total | Fast | Cheap |" in section
+        assert "| Metric | Total | Standard | Low |" in section
         # Both fixture sessions start during day hours (14:00-15:00 window);
         # fast/cheap cells carry the share of the metric's total.
         assert "| Sessions | 2 | 2 (100.0%) | 0 (0.0%) |" in section
@@ -3521,19 +3503,19 @@ class TestReportRestructure:
     def test_fallback_reasons_have_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## Fallback reasons", 1)[1].split("## ", 1)[0]
-        assert "| Reason | Total | % of fallbacks | Fast | Cheap |" in section
+        assert "| Reason | Total | % of fallbacks | Standard | Low |" in section
         assert "| local_concurrency_limit | 1 | 100.0% | 1 (100.0%) | 0 (0.0%) |" in section
 
     def test_routing_skip_reasons_have_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## routing_skip_local reasons", 1)[1].split("## ", 1)[0]
-        assert "| Reason | Total | % of skips | Fast | Cheap |" in section
+        assert "| Reason | Total | % of skips | Standard | Low |" in section
         assert "| local_concurrency_limit | 1 | 100.0% | 1 (100.0%) | 0 (0.0%) |" in section
 
     def test_per_model_breakdown_has_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
-        assert "| Provider | Model | Sessions | Fast | Cheap | Requests | Fell back |" in section
+        assert "| Provider | Model | Sessions | Standard | Low | Requests | Fell back |" in section
         assert "| local | Qwen3 | 2 | 2 (100.0%) | 0 (0.0%) |" in section
 
 
@@ -3697,8 +3679,8 @@ class TestArchiveOutputs:
         out.mkdir()
         # Pre-existing artifacts, as if a previous run had written them.
         (out / "report.md").write_text("OLD REPORT")
-        (out / "fast_sessions.csv").write_text("old fast")
-        (out / "cheap_sessions.csv").write_text("old cheap")
+        (out / "standard_sessions.csv").write_text("old fast")
+        (out / "low_priority_sessions.csv").write_text("old cheap")
         (out / "errors.csv").write_text("old errors")
         (out / "errors.json").write_text("{\"old\": true}")
 
@@ -3709,14 +3691,14 @@ class TestArchiveOutputs:
         assert archive.is_dir()
         assert run.archived_to == archive
         assert (archive / "report.md").read_text() == "OLD REPORT"
-        assert (archive / "fast_sessions.csv").read_text() == "old fast"
-        assert (archive / "cheap_sessions.csv").read_text() == "old cheap"
+        assert (archive / "standard_sessions.csv").read_text() == "old fast"
+        assert (archive / "low_priority_sessions.csv").read_text() == "old cheap"
         assert (archive / "errors.csv").read_text() == "old errors"
         assert (archive / "errors.json").read_text() == "{\"old\": true}"
         # Fresh outputs written at the root.
         assert (out / "report.md").read_text().startswith("# Proxy Usage Analysis")
-        assert (out / "fast_sessions.csv").exists()
-        assert (out / "cheap_sessions.csv").exists()
+        assert (out / "standard_sessions.csv").exists()
+        assert (out / "low_priority_sessions.csv").exists()
         assert (out / "errors.csv").exists()
         assert (out / "errors.json").exists()
 
@@ -3761,7 +3743,7 @@ class TestArchiveOutputs:
         assert (archive1 / "report.md").read_text() == first_md
         # A fresh report still sits at the root after every run.
         assert (out / "report.md").exists()
-        assert (out / "fast_sessions.csv").exists()
+        assert (out / "standard_sessions.csv").exists()
 
     def test_same_day_archive_dir_collides_with_existing_dir(self, tmp_path):
         # A dated dir already exists (e.g. a manual archive) -> suffix, not overwrite.
@@ -4534,8 +4516,8 @@ class TestTotalTokens:
         assert "| Input (prompt) | 0 |" in sec
         assert "| Output (completion) | 0 |" in sec
         assert "| Total | **0** |" in sec
-        assert "| Fast | 0 |" in sec
-        assert "| Cheap | 0 |" in sec
+        assert "| Standard | 0 |" in sec
+        assert "| Low | 0 |" in sec
         assert "_No tokens in window._" in sec
 
     def test_report_section_fast_cheap_counts_and_shares(self):
@@ -4547,8 +4529,8 @@ class TestTotalTokens:
         assert "| Total | **4,700** |" in sec
         # Fast 1000/4000 = 25.0% input; 200/700 = 28.6% output; 1200/4700 = 25.5% total
         # Cheap 3000/4000 = 75.0% input; 500/700 = 71.4% output; 3500/4700 = 74.5% total
-        assert "| Fast | 1,000" in sec
-        assert "| Cheap | 3,000" in sec
+        assert "| Standard | 1,000" in sec
+        assert "| Low | 3,000" in sec
         # At least one share column present for each row
         assert "25.5%" in sec  # fast share of total
         assert "74.5%" in sec  # cheap share of total
@@ -4867,7 +4849,7 @@ class TestAttributionInReport:
             mm,
         )
         report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
-        assert "## Mode timeline & restarts" in report
+        assert "## Priority window timeline & restarts" in report
         assert "scheduler" in report
         assert "mode-scheduler" in report
         assert "scheduled mode change" in report
@@ -4892,7 +4874,7 @@ class TestAttributionInReport:
             mm,
         )
         report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
-        assert "## Mode timeline & restarts" in report
+        assert "## Priority window timeline & restarts" in report
         assert "unknown" in report
 
     def test_report_section_zero_unknown_for_attributed_events(self):
@@ -4915,7 +4897,7 @@ class TestAttributionInReport:
             mm,
         )
         report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
-        section_start = report.index("## Mode timeline & restarts")
+        section_start = report.index("## Priority window timeline & restarts")
         next_heading = report.find("\n## ", section_start + 1)
         section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
         # Table rows (timestamp-prefixed) — every restart row must be fully
@@ -4966,7 +4948,7 @@ class TestAttributionInReport:
             mm,
         )
         report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
-        assert "## Mode timeline & restarts" not in report
+        assert "## Priority window timeline & restarts" not in report
 
     def test_restart_rows_show_requested_mode(self):
         """A restart spawned by set_mode() carries the requested mode
@@ -4988,7 +4970,7 @@ class TestAttributionInReport:
             mm,
         )
         report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
-        section_start = report.index("## Mode timeline & restarts")
+        section_start = report.index("## Priority window timeline & restarts")
         next_heading = report.find("\n## ", section_start + 1)
         section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
         # The restart row shows kind → requested mode.
@@ -5029,12 +5011,12 @@ class TestAttributionInReport:
             mm,
         )
         report = reporting.build_report(res, fixtures.MODE_FAST_CONFIG, mode_map=mm)
-        assert "## Mode timeline & restarts" in report
+        assert "## Priority window timeline & restarts" in report
         # Should contain both 'unknown' (for the mode switch) and 'scheduler'
         # (for the restart)
         assert "scheduler" in report
         # The section text should contain 'unknown' once (for the mode switch)
-        section_start = report.index("## Mode timeline & restarts")
+        section_start = report.index("## Priority window timeline & restarts")
         next_heading = report.find("\n## ", section_start + 1)
         section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
         # 'unknown' should appear (for the mode_switch without attribution)

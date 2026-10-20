@@ -301,7 +301,7 @@ async def test_prefill_denied_request_queues_and_redispatches_local(
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", _Concurrency(0, 1)),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
         patch(
             "proxy.provider._queue_context_bypass",
             new=AsyncMock(return_value=(False, None)),
@@ -354,7 +354,7 @@ async def test_prefill_denied_request_cap_exceeded_falls_back_to_remote(
         patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
         patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
         patch("proxy.provider._get_local_concurrency_info", _Concurrency(0, 1)),
-        patch("proxy.mode.read_mode", return_value="cheap"),
+        patch("proxy.provider.request_priority", return_value="low"),
         patch(
             "proxy.provider._queue_context_bypass",
             new=AsyncMock(return_value=(False, None)),

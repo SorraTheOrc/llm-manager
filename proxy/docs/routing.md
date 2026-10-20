@@ -96,8 +96,11 @@ first successful dispatch, so *every* later turn of that session counts as
 traffic and waited 15–55 s per turn, which dominated first-token latency
 (p90 6.5 s → 12.8 s, p99 21 s → 53 s while generation speed was unchanged).
 Reserving `floor(rate_limit_rpm × provider_rate_limit_reserve_ratio)` slots
-(default 3 of 10) keeps a slot available for them, so waits become rare; the
-default 15 s cap bounds whatever remains.
+(4 of 15 at the former budget) keeps a slot available for them, so waits become
+rare; the default 15 s cap bounds whatever remains. The reserve rounds down and
+is clamped to `rate_limit_rpm - 1`, so at the current budget of 2/min the
+reserve is **0**: there are no reserved slots and both new and in-progress
+sessions share the 2-slot window.
 
 Affinity is `session → entry`, TTL-scoped by
 `server.provider_affinity_ttl_seconds` (default 900), and is **never** shared
@@ -107,8 +110,190 @@ session already on the free tier keeps its provider, while a batch of new
 agent sessions passes straight through instead of queueing behind an exhausted
 allowance.
 
-`munitoai-free` ships with `rate_limit_rpm: 10` in `config.yaml` (and the fast
-overlay); tune the value from the `remaining=` field in the skip logs.
+`munitoai-free` ships with `rate_limit_rpm: 2` in `config.yaml` (the former
+fast/cheap overlay files were removed with priority-based routing,
+LP-0MVDT94F0003VHUA); tune the value from the `remaining=` field in the skip
+logs.
+
+**Value history (LP-0MVDVJYN5001BMG4):** raised from 10 to 15 on 2026-10-18
+following the measured budget evaluation. Pre-gate proxy-log evidence showed
+the upstream 429 onset at ≈20 dispatches/rolling-60 s (429-minute rate: 4–6 %
+≤ 19/min, 20 % at 20–29, 47 % at 30–39, 100 % ≥ 40), so 15 sits below the
+knee while recovering roughly a quarter of the paid spill observed at 10
+(45 % → 27 %). Observation window: begins at the next proxy restart after the
+change; a follow-up check-in (24 h later) monitors the upstream 429 rate at
+peak and reverts to 10 if it exceeds ~10 % of minutes.
+
+**Value history (LP-0MVF19DKR008VCHO):** lowered from 15 to **2** on 2026-10-19
+at the operator's request — the free tier is treated as a bonus tier, so bursts
+spill to the paid tiers rather than consuming the free allowance. At 2/min the
+reserve ratio (`provider_rate_limit_reserve_ratio`, default 0.3) rounds down to
+0 slots, so new and in-progress sessions both see the full 2-per-window cap;
+in-progress sessions can still wait for the window to drain (bounded by
+`provider_rate_limit_wait_max_seconds`). Takes effect at the next proxy
+restart.
+
+### Off-peak paid tiers in the `low` chain (LP-0MVF17VP70053JXX)
+
+`low` priority prefers local and queues over paid remote fallback, then uses the
+free tier (`munitoai-free`, `rate_limit_rpm: 2`). Because that free tier is the
+last entry of the chain, exhausted local slots plus an exhausted free budget
+used to leave the request nowhere to go but an upstream 429. `plan`, `author`
+and `code` therefore extend their `low` chain with the three `opencode-go`
+entries:
+
+```text
+low: [local-qwen3, munitoai-free, opencode-go-3, opencode-go-2, opencode-go]
+```
+
+Those entries keep the off-peak `available_times` windows added by
+LP-0MSXPHTD9004DZ4P — UTC `00:00-01:00`, `04:00-06:00`, `10:00-00:00` — so the
+extra tiers are only eligible outside peak hours; the windows are **not**
+widened by this change. The cheap priority window (`server.priority_window`,
+default local `Europe/Dublin` 01:00–10:00 = UTC 00:00–09:00) overlaps the
+opencode windows in ~3 of its 9 hours (UTC 00:00–01:00 and 04:00–06:00); the UTC
+01:00–04:00 and 06:00–10:00 gaps are deliberate paid-spend avoidance.
+
+Capacity vs resilience — the three entries are **not** interchangeable:
+
+| Failure | Quarantine key | Effect on the sibling entries |
+|---------|----------------|-------------------------------|
+| HTTP 429 / usage limit | `_usage_limit_account_key` = `api_key_env@endpoint` | Independent per API key: a 429 on `opencode-go-3` leaves `opencode-go-2` and `opencode-go` eligible → 3× rate-limit capacity (LP-0MSMBWB23009XYPW, LP-0MVCX0E2V001VB5N). |
+| 5xx / stall / terminal error | `_failure_domain_key` = `endpoint:model` | Shared domain: one failure skips all three for the rest of the request → **no** 3× outage resilience (LP-0MSG45I8Q0020N1F). |
+
+The fully paid `munitoai` and `deepseek-flash` entries never join a `low` chain:
+they carry no window discipline that would confine spend to off-peak hours.
+
+### Per-entry context limits (`max_context_tokens`, LP-0MVF9N31A0006VH5)
+
+Remote tiers have no inherent context ceiling: without a per-entry limit every
+request, however large, is dispatched to the first eligible provider. For a
+tier whose allowance is expressed per minute, one oversized prompt can spend
+the whole window (or trigger an upstream 429), pushing legitimate traffic onto
+a paid tier. Each provider entry may therefore declare `max_context_tokens`
+(an `int`), the maximum **estimated prompt context** it may serve.
+
+The gate runs in both fallback dispatch loops
+(`_proxy_with_remote_fallback_cycle`, `_proxy_with_fallback_cycle`) *before*
+`acquire_provider_budget`/dispatch, using the authoritative routing estimate
+(`_get_tokenizer_for_model` + `_estimate_effective_prompt_tokens_for_routing` +
+`token_estimate_multiplier`) computed **once per request**.
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Estimated context ≤ entry limit | Entry is dispatched normally (all other gates unchanged). |
+| Estimated context > entry limit | Skip the entry: log `routing_skip_provider_context provider=<p> type=<t> status=provider_context_exceeded estimated_tokens=<n> limit=<limit> reason=provider_context_exceeded session=<s>`, record attempt `status=provider_context_exceeded` with the estimate and the limit, continue to the next eligible provider. **No cooldown, failure-domain exclusion, usage-limit reset, affinity record or contention-queue entry** — the entry stays eligible for later, smaller requests. |
+| `max_context_tokens` absent / `0` / non-positive | Ungated: behaviour byte-for-byte as before. |
+| Limit set on a **local** entry | Composes as an additional hard cap: `min(existing local thresholds, max_context_tokens)`. Never loosens `_should_skip_local`. |
+| No tier can serve the request (all capped below it) | Only possible if every tier is capped below the estimate; the shipped config prevents it by capping the final `deepseek-flash` tier at the largest upstream window (1,048,576) so an oversized prompt always has a destination. |
+
+Every context skip increments the cumulative
+`backend_signals.provider_context_exceeded` counter (mirroring the local
+`context_too_large` signal), so the gate is visible on `/health` and
+`/admin/metrics` as well as in the `routing_skip_provider_context` log line.
+
+Shipped values (each sourced in a comment next to the entry in
+`proxy/config.yaml`, probed 2026-10-19):
+
+| Entry | Limit | Source |
+|-------|-------|--------|
+| `munitoai-free` | 150000 | free-tier `x-ratelimit-limit-input-tokens` (rolling 60 s input allowance) |
+| `munitoai` | 400000 | paid-tier `x-ratelimit-limit-input-tokens` |
+| `opencode-go`, `opencode-go-2`, `opencode-go-3` | 1000000 | model-registry context window for `opencode-go/deepseek-v4.1-flash` (Go publishes plan quota as percentages, not per-minute tokens) |
+| `deepseek-flash` | 1048576 | `api.deepseek.com` `/models` `context_window` — largest window in the chain |
+| `compact` chain | 1048576 | model-registry / `api.deepseek.com` windows |
+
+`github-primary` is deliberately left ungated: it declares no `model`, so a
+per-entry ceiling cannot be sourced.
+
+
+Some gateways answer HTTP 429 with custom `x-ratelimit-*` headers instead of
+the standard `Retry-After` (MunitoAI sends none). The proxy can honour them so
+a rate-limited provider is skipped for the upstream's own reset window rather
+than being re-probed every ~45 s by the exponential-backoff guess.
+
+Enable it per provider entry, or globally under `server`:
+
+```yaml
+- name: munitoai-free
+  type: remote
+  rate_limit_rpm: 2
+  respect_ratelimit_headers: true   # entry flag wins over server.*
+```
+
+```yaml
+server:
+  respect_ratelimit_headers: true   # global default (false)
+  ratelimit_cooldown_margin_seconds: 2
+```
+
+Behaviour when enabled, on an HTTP 429 only:
+
+- `x-ratelimit-reset-requests`, `-tokens`, `-input-tokens` and
+  `-output-tokens` are parsed; durations accept bare seconds or unit suffixes
+  (`52s`, `1m`, `1h30m`, `250ms`).
+- When one or more dimensions report `x-ratelimit-remaining-*` at or below
+  zero, the longest reset among those exhausted dimensions is used; otherwise
+  the longest parseable reset is used.
+- The cooldown becomes `max(exponential backoff, reset + margin)` — the
+  upstream reset is a floor, and the per-provider failure counter still
+  extends it under repeated failures. `Retry-After`, when present, still wins
+  if longer.
+- `x-ratelimit-over-limit` is parsed and recorded for diagnostics; a 429 that
+  carries the flag but no parseable reset falls back to plain backoff.
+- The resolved cooldown is recorded in the attempt (`cooldown_seconds`,
+  `ratelimit_reset_seconds`, `ratelimit_over_limit`) and persisted in
+  `provider-state.json`, so the `Skipping provider=… in cooldown (Ns
+  remaining)` log line shows the header-derived wait.
+- On a **quota** 429 (per-account rate-limit error or
+  `x-ratelimit-over-limit: yes`) the parsed reset is *also* applied as an
+  account-scoped quarantine (reset + the 2-minute usage-limit margin), keyed
+  on `api_key_env` so same-gateway paid siblings stay eligible — see
+  [Account-scoped quarantine from reset headers](#account-scoped-quarantine-from-reset-headers-lp-0mvfa1vrt007t9ht).
+
+Default is **off**: every existing provider keeps its pre-change behaviour.
+The `munitoai-free` and `munitoai` entries opt in via `config.yaml`.
+
+#### Account-scoped quarantine from reset headers (LP-0MVFA1VRT007T9HT)
+
+A reset header on a **quota** 429 is applied to the failing ACCOUNT, not just
+the provider entry. This is the account-scoped half of the header support
+above; the entry-level cooldown described there is unchanged.
+
+- **Trigger:** an HTTP 429 whose body is a per-account rate-limit error
+  (`type: rate_limit_error` or `code: rate_limit_exceeded`, top-level or
+  nested under `error` — the observed MunitoAI body) **or** which carries
+  `x-ratelimit-over-limit: yes`, **and** which also yields a parseable
+  `x-ratelimit-reset-*` duration. No reset signal (or a zero/absent value)
+  means no account quarantine: the pre-existing short provider cooldown and
+  per-request account-key exclusion apply exactly as before.
+- **Duration:** `parsed reset + _USAGE_LIMIT_RESET_MARGIN_SECONDS` (120 s).
+  Two distinct margins apply on such a 429 and they are **not**
+  interchangeable: the **2-second** `server.ratelimit_cooldown_margin_seconds`
+  pads the provider-ENTRY cooldown, while the **2-minute** usage-limit margin
+  pads the persisted ACCOUNT quarantine.
+- **Account key:** `_usage_limit_account_key` = `api_key_env` @ the
+  entry's failure domain (`endpoint:model`). Entries without an
+  `api_key_env` fall back to the failure-domain key. Because the key is the
+  API-key account, a paid sibling on the same gateway (e.g. `munitoai` on
+  `MUNITOAI_API_KEY` after `munitoai-free` on `MUNITOAI_FREE_API_KEY` hit its
+  quota) has an independent key, stays unquarantined, and remains eligible
+  for the rest of the request (LP-0MVCX0E2V001VB5N).
+- **Consequences:** the quarantine is recorded in `_usage_reset_at` as an
+  **explicit** reset (so it is exempt from the guessed-quarantine 24 h cap and
+  the self-healing probe), is persisted to `provider-state.json` and therefore
+  survives a proxy restart, is recorded in the attempt
+  (`account_quarantine_seconds`) and in the exhaustion diagnostics
+  (`usage_limit_reset` with `reset_in`/`reset_at`), and feeds
+  `_compute_retry_after()` — so an exhausted chain-hold reports the reset as
+  its `retry_after` instead of a blind backoff. Chain-hold cycles themselves
+  (`chain_hold_seconds` 300 s, `chain_hold_max_cycles` 3, `chain_hold_total_seconds`
+  720 s) are unchanged: the account is
+  excluded, the request advances down the chain, and siblings keep their
+  normal eligibility.
+- **Flag gate:** the header is only consulted when
+  `respect_ratelimit_headers` is enabled for the entry (or globally); with it
+  off the reset is ignored and no account quarantine is created.
 
 ### Responses-API providers (`api: openai-responses`)
 
