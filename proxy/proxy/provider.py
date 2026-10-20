@@ -4227,6 +4227,63 @@ def _build_reasoning_content_roundtrip_error() -> Response:
 EXHAUSTION_CODE_ALL = "all_exhausted"
 EXHAUSTION_CODE_TIME_WINDOW = "outside_time_window"
 EXHAUSTION_CODE_SLOTS = "all_slots_exhausted"
+EXHAUSTION_CODE_LOCAL_ADMISSION = "local_admission_reject"
+
+
+def _build_local_admission_reject_response(
+    attempt: dict[str, Any], config: dict | None = None
+) -> Response:
+    """Retryable response for a request the prefill-ETA guard refused.
+
+    The guard refuses local admission *immediately* when the projected prefill
+    cannot finish inside the caller's wait budget, and the request normally
+    falls through to a remote provider. When the rest of the chain is
+    exhausted as well, the client gets this distinguishable 429 instead of the
+    generic exhaustion body: ``Retry-After`` carries how much longer the local
+    prefill would need than the caller was prepared to wait, and the
+    ``X-Local-Admission*`` headers expose the estimate so a dispatcher can pace
+    its next attempt (LP-0MVGDUV5E005UWBQ AC3).
+    """
+    from proxy.prefill_eta import suggested_retry_after_seconds
+
+    eta = float(attempt.get("eta_prefill_seconds") or 0.0)
+    budget = float(attempt.get("budget_seconds") or 0.0)
+    retry_after = suggested_retry_after_seconds(
+        eta, budget, maximum=_max_retry_after_seconds(config)
+    )
+    payload: dict[str, Any] = {
+        "error": "All providers exhausted",
+        "code": EXHAUSTION_CODE_LOCAL_ADMISSION,
+        "detail": (
+            "local admission refused: projected prefill exceeds the wait budget "
+            "and no remote provider is available"
+        ),
+        "eta_prefill_seconds": eta,
+        "budget_seconds": budget,
+        "retry_after": retry_after,
+        "suggested_action": (
+            "Retry after the advertised delay, reduce the prompt size (compact "
+            "the session) so the prefill fits the local wait budget, or route "
+            "the request to a remote provider."
+        ),
+    }
+    try:
+        payload["diagnostics"] = [attempt]
+    except Exception:
+        pass
+    headers = {
+        "Retry-After": str(retry_after),
+        "Cache-Control": "no-store",
+        "X-Local-Admission": "reject",
+        "X-Local-Admission-Eta": f"{eta:.1f}",
+        "X-Local-Admission-Budget": f"{budget:.1f}",
+    }
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=429,
+        media_type="application/json",
+        headers=headers,
+    )
 
 
 def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None, config: dict | None = None) -> Response:
@@ -4250,6 +4307,11 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     on the ``error`` prose, whose meaning is preserved for older clients
     (LP-0MU56ZM0K005F69G).
 
+    A request refused by the prefill-ETA admission guard
+    (LP-0MVGDUV5E005UWBQ) that then finds no remote provider yields a
+    retryable 429 carrying ``Retry-After`` plus the ETA guidance headers
+    instead of the generic exhaustion body, so the refusal is actionable.
+
     Verified end-to-end by ``proxy/tests/test_overnight_exhaustion_e2e.py``
     (LP-0MV728XBH00546FB): ``Retry-After`` / ``retry_after`` are identical,
     the stable ``code`` discriminator is present, the advertisement cap is
@@ -4268,6 +4330,10 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
             status_code=429,
             media_type="application/json",
         )
+
+    admission_reject = _local_admission_reject_payload(diagnostics)
+    if admission_reject is not None:
+        return _build_local_admission_reject_response(admission_reject, config)
 
     retry_after = _compute_retry_after(
         unavailable_providers, model_config=model_config, config=config
@@ -4703,6 +4769,38 @@ def _contention_queue_enabled(config: dict, priority: str | None = None) -> bool
         return False
 
 
+async def _effective_routing_tokens(
+    config: dict,
+    model_config: dict,
+    request,
+    body_json: dict,
+) -> int:
+    """Authoritative prompt-token estimate shared by the local routing gates.
+
+    Uses the same pipeline as the smart-routing block below — native tokenizer
+    (``_get_tokenizer_for_model``) + session history + ``token_estimate_multiplier``
+    — so the contention-queue context bypass and the prefill-ETA admission
+    guard cost the prompt identically (LP-0MSEQ71IF0003FRT).
+
+    Fail-open: an estimate failure yields 0 ("no prompt to measure"), which
+    keeps every gate open — an estimate error must never drop local from the
+    chain.
+    """
+    try:
+        _tokenizer, _multiplier = _get_tokenizer_for_model(model_config, config)
+        _tokens = await _estimate_effective_prompt_tokens_for_routing(
+            request, body_json, tokenizer=_tokenizer,
+        )
+        if _multiplier != 1.0:
+            _tokens = int(_tokens * _multiplier)
+        return max(0, int(_tokens or 0))
+    except Exception:
+        logger.debug(
+            "routing token estimate failed; gates fail open", exc_info=True
+        )
+        return 0
+
+
 async def _queue_context_bypass(
     config: dict,
     model_config: dict,
@@ -4711,6 +4809,7 @@ async def _queue_context_bypass(
     body_json: dict,
     session_id: str | None,
     priority: str | None = None,
+    estimated_tokens: int | None = None,
 ) -> tuple[bool, str | None]:
     """Mirror of the smart-routing large-context skip decision.
 
@@ -4721,6 +4820,10 @@ async def _queue_context_bypass(
     (LP-0MU5A4QBR003YJM0).  Keeps the same
     thresholds/tokenizer/estimate/``_should_skip_local`` pipeline as the main
     smart-routing block below; returns ``(skip_local, skip_reason)``.
+
+    *estimated_tokens* is the caller's already-computed estimate
+    (``_effective_routing_tokens``) so the same queue decision point does not
+    pay for the tokenizer twice; ``None`` recomputes it here.
     """
     _llama_model = provider_cfg.get("llama_model", "")
     _cold_threshold, _warm_threshold = _effective_large_context_thresholds(config)
@@ -4734,12 +4837,12 @@ async def _queue_context_bypass(
             if _warm_threshold > 0
             else _local_context_limit
         )
-    _tokenizer, _multiplier = _get_tokenizer_for_model(model_config, config)
-    _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
-        request, body_json, tokenizer=_tokenizer,
-    )
-    if _multiplier != 1.0:
-        _estimated_tokens = int(_estimated_tokens * _multiplier)
+    if estimated_tokens is None:
+        _estimated_tokens = await _effective_routing_tokens(
+            config, model_config, request, body_json
+        )
+    else:
+        _estimated_tokens = max(0, int(estimated_tokens))
     # Pass the priority-driven recovery flag (AC3): low priority recovers
     # economic bypasses locally even when the base config flag is off.
     _recover_economic = _economic_bypass_serves_local(config, priority)
@@ -4750,6 +4853,81 @@ async def _queue_context_bypass(
         economic_bypass_serves_local=_recover_economic,
     )
     return _skip_local, _skip_reason
+
+
+async def _prefill_admission_guard(
+    config: dict,
+    provider_cfg: dict,
+    estimated_tokens: int,
+    session_id: str | None,
+    priority: str | None = None,
+):
+    """Evaluate (and log) the prefill-ETA admission guard.
+
+    Returns the :class:`proxy.prefill_eta.AdmissionDecision` when the guard
+    actually decided (a calibrated ETA against a real wait budget), else
+    ``None`` — an inert guard leaves today's queueing behaviour untouched
+    (LP-0MVGDUV5E005UWBQ AC1/AC3). Never raises: the guard must not be able to
+    break local routing.
+    """
+    try:
+        from proxy import prefill_eta
+
+        if estimated_tokens <= 0:
+            return None
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        guard_cfg = prefill_eta.resolve_config(server_cfg)
+        if guard_cfg.policy == prefill_eta.POLICY_OFF:
+            return None
+        if prefill_eta.wait_budget_seconds(config, priority) <= 0:
+            # ``high`` priority never queues, so there is no budget to guard.
+            return None
+        model_name = (
+            provider_cfg.get("llama_model", "")
+            if isinstance(provider_cfg, dict)
+            else ""
+        )
+        decision = prefill_eta.evaluate_admission(
+            config,
+            model_name,
+            estimated_tokens,
+            _get_cached_ratio(model_name, session_id),
+            priority,
+        )
+        if not decision.active:
+            return None
+        prefill_eta.record_guard_decision(
+            decision,
+            provider=(provider_cfg.get("name") if isinstance(provider_cfg, dict) else None),
+            session_id=session_id,
+            model=model_name,
+            priority=priority,
+        )
+        return decision
+    except Exception:
+        logger.debug(
+            "prefill-ETA admission guard failed; admitting as today", exc_info=True
+        )
+        return None
+
+
+def _local_admission_reject_payload(attempts: list | None) -> dict | None:
+    """Return the ETA-guard rejection diagnostic from *attempts*, if any.
+
+    A request refused by the prefill-ETA admission guard falls through to the
+    remote chain; when that chain is exhausted too, the client must see a
+    retryable status (with ``Retry-After`` and the ETA guidance headers)
+    rather than a generic exhaustion error, so the refusal is recoverable
+    (LP-0MVGDUV5E005UWBQ AC3).
+    """
+    if not attempts:
+        return None
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        if attempt.get("status") == "local_admission_reject":
+            return attempt
+    return None
 
 
 def _set_queue_wait_on_request(request, elapsed: float) -> None:
@@ -4790,17 +4968,42 @@ async def _maybe_queue_for_local_slot(
       - ``"fallback_policy"`` — policy is fallback / high priority never
         queues; the caller keeps today's ``local_concurrency_limit``
         behavior.
+      - ``"admission_reject"`` — the prefill-ETA admission guard refused
+        local admission because the projected prefill cannot finish inside
+        the wait budget; the caller falls through to the next provider
+        immediately (no queueing) and records the ETA diagnostic
+        (LP-0MVGDUV5E005UWBQ).
     """
     if not _contention_queue_enabled(config, priority):
         return ("fallback_policy", None, None)
+    # One authoritative prompt estimate, shared by the context-bypass check,
+    # the smart-routing mirror and the prefill-ETA guard below.
+    _estimated_tokens = await _effective_routing_tokens(
+        config, model_config, request, body_json
+    )
     # Context bypasses never queue (AC4): a request that cannot fit the KV
     # slot must fall back exactly as today.
     skip_local, skip_reason = await _queue_context_bypass(
         config, model_config, provider_cfg, request, body_json, session_id,
-        priority=priority,
+        priority=priority, estimated_tokens=_estimated_tokens,
     )
     if skip_local:
         return ("context_bypass", skip_reason, None)
+
+    # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ): a wait that cannot
+    # finish the prefill inside the budget is a guaranteed loss (measured 85 %
+    # of queued waits were abandoned after up to 120 s and went remote). Refuse
+    # immediately and let the caller fall through instead. Inert (``None``)
+    # when uncalibrated, so today's queueing behaviour is unchanged.
+    _admission = await _prefill_admission_guard(
+        config, provider_cfg, _estimated_tokens, session_id, priority=priority,
+    )
+    if _admission is not None and not _admission.admit:
+        try:
+            setattr(request, "_local_admission_decision", _admission)
+        except Exception:
+            pass
+        return ("admission_reject", _admission.reason, None)
 
     from proxy.router import _get_contention_queue_config
 
@@ -7825,6 +8028,32 @@ async def _proxy_with_fallback_cycle(
                         prev_provider = provider_name
                         all_slot_exhaustion = False
                         continue
+                    elif _cq_action == "admission_reject":
+                        # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ):
+                        # the projected prefill cannot finish inside the wait
+                        # budget, so refuse local admission NOW and fall
+                        # through to the next provider instead of parking in
+                        # the contention queue for the full budget.
+                        _admission = getattr(
+                            request, "_local_admission_decision", None
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_admission_reject",
+                            reason=_cq_reason,
+                            eta_prefill_seconds=round(
+                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
+                            ),
+                            budget_seconds=round(
+                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
+                            ),
+                        )
+                        fallback_reason = "local_admission_guard"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        continue
                     else:  # fallback_policy — fast mode unchanged
                         _record_attempt(
                             attempts,
@@ -8386,6 +8615,28 @@ async def _proxy_with_fallback_cycle(
                             reason=_lease_reason,
                         )
                         fallback_reason = _lease_reason
+                        all_slot_exhaustion = False
+                        continue
+                    elif _lease_action == "admission_reject":
+                        # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ) on
+                        # the lease-denial path: refuse the wait immediately.
+                        _admission = getattr(
+                            request, "_local_admission_decision", None
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_admission_reject",
+                            reason=_lease_reason,
+                            eta_prefill_seconds=round(
+                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
+                            ),
+                            budget_seconds=round(
+                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
+                            ),
+                        )
+                        fallback_reason = "local_admission_guard"
                         all_slot_exhaustion = False
                         continue
                     else:

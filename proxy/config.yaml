@@ -1497,6 +1497,38 @@ server:
   contention_queue_max_depth: 8
 
   # -----------------------------------------------------------------------
+  # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ)
+  # -----------------------------------------------------------------------
+  # Before entering the contention queue the proxy costs the projected local
+  # prefill from OBSERVED dispatches (dispatch_first_byte_ms, per model and
+  # context bucket, rolling window) and compares it with the caller's wait
+  # budget (``contention_queue_max_wait_seconds`` above; ``high`` priority
+  # never queues, so it has no budget). When the prefill cannot finish inside
+  # the budget the wait is a guaranteed loss — the request would park for up
+  # to the full budget and then fall back remote anyway (measured 2026-10-19
+  # → 10-20: 4,947 of 5,805 queued waits = 85 % abandoned) — so local
+  # admission is refused immediately and the request falls through to the
+  # next provider. A request refused this way that finds no remote provider
+  # receives a retryable 429 with ``Retry-After`` and ``X-Local-Admission*``
+  # headers.
+  #
+  #   reject  — refuse admission when the ETA exceeds the budget (default)
+  #   observe — log the decision (``local_admission_guard decision=…``) but
+  #             never refuse; use to validate calibration on live traffic
+  #   off     — do not evaluate the guard at all
+  #
+  # The guard is INERT (today's queueing behaviour, byte-for-byte) until a
+  # (model, context bucket) window holds ``local_admission_guard_min_samples``
+  # observations, so it can never refuse on a guess. Decisions and their
+  # ETAs are counted by the proxy-usage-analysis report.
+  local_admission_guard_policy: reject
+  local_admission_guard_min_samples: 5
+  local_admission_guard_window_samples: 200
+  # Prompt size used for the published estimate on /llama/local/status when
+  # no dispatch has been observed yet for the current model.
+  local_admission_guard_reference_tokens: 32000
+
+  # -----------------------------------------------------------------------
   # Priority routing cheap window (LP-0MVDT94F0003VHUA AC1)
   # -----------------------------------------------------------------------
   # During this local-time window EVERY request is routed as ``low`` priority

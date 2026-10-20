@@ -179,6 +179,12 @@ class AnalysisResult:
     # to a remote provider after the wait/depth caps were exceeded.
     contention_dispatch_events: list[LogEvent] = field(default_factory=list)
     contention_fallback_events: list[LogEvent] = field(default_factory=list)
+    # Prefill-ETA admission-guard decisions (LP-0MVGDUV5E005UWBQ): one event per
+    # decision taken at the contention-queue point, with ``decision`` = the
+    # guard verdict (``admit`` / ``reject``), ``enforced`` = whether it was
+    # applied (``false`` in ``observe`` mode), and the projected prefill ETA /
+    # wait budget in seconds.
+    local_admission_events: list[LogEvent] = field(default_factory=list)
     # Parsed error events (stream errors, slot_save failures, backend_retry
     # timeouts, upstream HTTP errors) inside the window.
     error_events: list[LogEvent] = field(default_factory=list)
@@ -887,6 +893,7 @@ def aggregate(
     error_events: list[LogEvent] = []
     contention_dispatch_events: list[LogEvent] = []
     contention_fallback_events: list[LogEvent] = []
+    local_admission_events: list[LogEvent] = []
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
@@ -1004,6 +1011,9 @@ def aggregate(
         if ev.kind == "contention_fallback_after_queue":
             contention_fallback_events.append(ev)
             continue
+        if ev.kind == "local_admission_guard":
+            local_admission_events.append(ev)
+            continue
         if ev.kind in ("compaction_event", "compaction_backstop", "compaction_churn"):
             compaction_events.append(ev)
             continue
@@ -1052,6 +1062,7 @@ def aggregate(
         error_events=error_events,
         contention_dispatch_events=contention_dispatch_events,
         contention_fallback_events=contention_fallback_events,
+        local_admission_events=local_admission_events,
         compaction_events=compaction_events,
         busy=busy,
         hourly_activity=hourly_activity,

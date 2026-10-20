@@ -133,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             f"({data['fallback_rate'] * 100:.1f}%), "
             f"{data.get('contention_dispatch', 0)} queued-dispatched-local, "
             f"{data.get('contention_fallback_after_queue', 0)} fallback-after-queue, "
+            f"{data.get('local_admission_reject', 0)} local-admission-refused "
+            f"(prefill ETA), "
             f"{errors} error event(s){decode_summary}{busy_summary}."
         )
         output_lines = _summary_output_paths(out_dir)

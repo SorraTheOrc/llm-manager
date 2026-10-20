@@ -112,6 +112,17 @@ RE_CONTENTION_DURATION = re.compile(r"queued_duration=([\d.]+)s")
 RE_CONTENTION_DEPTH = re.compile(r"\bdepth=(\d+)")
 RE_CONTENTION_POLICY = re.compile(r"\bpolicy=(\S+)")
 
+# Prefill-ETA admission-guard decision (LP-0MVGDUV5E005UWBQ): the proxy emits
+# ``local_admission_guard decision=admit|reject reason=<verdict> enforced=<bool>
+# eta_prefill_s=<f> budget_s=<f> ...`` at the contention-queue decision point.
+# ``decision`` is the guard's verdict; ``enforced=false`` marks an ``observe``
+# rollout (logged but not applied).
+RE_LOCAL_ADMISSION_DECISION = re.compile(r"\bdecision=(admit|reject)\b")
+RE_LOCAL_ADMISSION_ENFORCED = re.compile(r"\benforced=(true|false)\b")
+RE_LOCAL_ADMISSION_ETA = re.compile(r"\beta_prefill_s=([\d.]+)")
+RE_LOCAL_ADMISSION_BUDGET = re.compile(r"\bbudget_s=([\d.]+)")
+RE_LOCAL_ADMISSION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
+
 # Enriched error payload on ``Stream finished: reason=error`` (LP-0MT6322OT00900OX).
 # The proxy now logs ``error_type=<type> error_message=<msg> suggested_action=<act>``
 # before the trailing session/provider/model/entry fields. Messages/actions may
@@ -148,6 +159,7 @@ ROUTING_SKIP = "routing_skip_local"
 DISPATCH_DENIED = "local_dispatch_denied"
 CONTENTION_DISPATCH = "contention_queue_dispatch"
 CONTENTION_FALLBACK_AFTER_QUEUE = "contention_queue_fallback_after_queue"
+LOCAL_ADMISSION_GUARD = "local_admission_guard"
 COMPACTION_EVENT = "compaction_event"
 COMPACTION_BACKSTOP = "compaction_backstop"
 COMPACTION_CHURN = "compaction_churn"
@@ -391,6 +403,14 @@ class LogEvent:
     # ``routing_skip`` events; aggregation treats ``> 0`` as hold-cycle
     # re-emissions rather than genuine demand.
     chain_hold_cycle: int | None = None
+    # Prefill-ETA admission-guard fields (LP-0MVGDUV5E005UWBQ,
+    # ``local_admission_guard`` kind): the guard's verdict (``admit`` /
+    # ``reject``), whether it was applied (``false`` in ``observe`` mode), and
+    # the projected prefill ETA / wait budget in seconds.
+    decision: str | None = None
+    enforced: str | None = None
+    eta_prefill_s: str | None = None
+    budget_s: str | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -529,6 +549,24 @@ def parse_log_line(line: str) -> LogEvent | None:
             provider=_first(RE_PROVIDER, msg),
             session=_session_from(msg),
             queued_duration=_first(RE_CONTENTION_DURATION, msg),
+        )
+    if msg.startswith(LOCAL_ADMISSION_GUARD):
+        # "local_admission_guard decision=reject reason=eta_exceeds_budget
+        #  enforced=true eta_prefill_s=468.0 budget_s=120.0 priority=low ..."
+        m2 = RE_LOCAL_ADMISSION_DECISION.search(msg)
+        if m2 is None:
+            return None
+        return LogEvent(
+            "local_admission_guard",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            model=_first(RE_MODEL, msg),
+            session=_session_from(msg),
+            reason=_normalize_reason(_first(RE_LOCAL_ADMISSION_REASON, msg)),
+            decision=m2.group(1),
+            enforced=_first(RE_LOCAL_ADMISSION_ENFORCED, msg),
+            eta_prefill_s=_first(RE_LOCAL_ADMISSION_ETA, msg),
+            budget_s=_first(RE_LOCAL_ADMISSION_BUDGET, msg),
         )
     if msg.startswith(MODE_SWITCH_PREFIX):
         # "Mode scheduler: applied scheduled mode cheap" — the mode that the

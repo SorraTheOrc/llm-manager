@@ -450,6 +450,78 @@ The queue engages only when ``contention_queue_policy`` is ``queue`` AND the
 proxy is in the corresponding operating mode. Absent keys default to
 ``fallback`` for backward compatibility.
 
+## Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ)
+
+Queuing only helps when the local prefill can actually finish inside the wait
+budget. Evidence for 2026-10-19 07:23 → 2026-10-20 07:23: of 5,805 queued waits
+only 855 were dispatched local — **4,947 (85 %) were abandoned after up to
+120 s and then went remote anyway**, while local prefill times during the same
+window were p50 61.8 s / p90 269.8 s / max 817 s. Waiting 120 s to maybe avoid
+a remote call whose median TTFT is 27 ms is a losing trade unless the prompt
+is genuinely cache-warm.
+
+Before a request enters the contention queue (and before a dispatch that
+would start another concurrent prefill), the proxy therefore costs the
+projected prefill and compares it with the caller's wait budget:
+
+```
+eta_prefill = coded_tokens * coded_ms_per_token + new_tokens * prefill_ms_per_token
+  coded_tokens = est_tokens * cached_ratio          # served from the prompt cache
+  new_tokens   = est_tokens * (1 - cached_ratio)    # must actually be prefilled
+
+admit  if eta_prefill <= wait_budget
+else   refuse local admission immediately -> next provider in the chain
+```
+
+- **Data-driven coefficients** (`proxy/proxy/prefill_eta.py`): every local
+  dispatch records `(coded_tokens, new_tokens, dispatch_to_first_byte_ms)` —
+  the service time from the existing `dispatch_first_byte_ms` line, queue wait
+  excluded — in a rolling window (default 200 samples) keyed by
+  `(model, context bucket)` (buckets: <16k, 16k–64k, 64k–128k, ≥128k). A
+  two-coefficient least-squares fit produces the per-bucket coefficients,
+  which pass through a conservatism factor (1.2 — over-estimating prefers the
+  fast remote call) and are clamped to plausible bounds. Defaults (0.5 ms per
+  cached token, 3.9 ms per fresh token ≈ 254 tok/s solitary) apply until a
+  bucket is calibrated.
+- **Inert until calibrated**: with fewer than
+  `local_admission_guard_min_samples` (5) observations a bucket, the guard is
+  inert — today's queueing behaviour is byte-for-byte unchanged. It can never
+  refuse on a guess.
+- **Cache-warm stays local**: a 90 %-cached 100k prompt costs
+  `0.9*100k*0.5 ms + 0.1*100k*3.9 ms ≈ 84 s` and is admitted, while the same
+  prompt cache-cold costs ≈ 390 s and is refused. Locality is kept where it
+  actually pays.
+- **Priority semantics are unchanged**: `high` never queues, so it has no
+  wait budget and the guard never applies to it; `low`/`medium` use
+  `contention_queue_max_wait_seconds`.
+- **Refusal is immediate and visible**: the request falls through to the next
+  provider without waiting. If the whole chain is exhausted, the client
+  receives a retryable `429` with `Retry-After` (how much longer the prefill
+  would need than the budget) and `X-Local-Admission: reject` /
+  `X-Local-Admission-Eta` / `X-Local-Admission-Budget` headers, plus the
+  machine-readable `code: local_admission_reject`.
+- **Observability**: each decision logs
+  `local_admission_guard decision=admit|reject reason=… enforced=true|false
+  eta_prefill_s=… budget_s=…`. The 24h report counts them as
+  `local_admission_reject` / `local_admission_reject_enforced` /
+  `local_admission_admit`. `/llama/local/status` publishes
+  `prefill_eta_seconds` (cost of the reference prompt, cache-cold) and
+  `queue_eta_seconds` (that cost repeated for every occupied slot, plus the
+  newcomer's own) so a dispatcher can pace *before* launching a session.
+
+Rollout control (`server.local_admission_guard_policy`):
+
+| Value | Behaviour |
+|-------|-----------|
+| `reject` (default) | Refuse admission when the ETA exceeds the budget |
+| `observe` | Log the verdict (`enforced=false`) but keep queuing — use to validate calibration on live traffic |
+| `off` | Do not evaluate the guard at all |
+
+Verification target (48h after rollout): `contention_queue_fallback_after_queue`
+drops well below the 4,947 baseline, client-visible latency for refused
+requests approaches the remote TTFT baseline instead of ~120 s, local serve
+share stays above 2.6 %, and mid-stream error counts do not increase.
+
 ## Stream Error Handling (recovery-first + informative-error fallback)
 
 When a routed stream fails, the proxy follows a **recovery-first** strategy

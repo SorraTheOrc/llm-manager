@@ -372,7 +372,19 @@ async def get_llama_local_status(request: Request):
          "total_slots": int,
          "slots": [{"slot_id": int, "is_processing": bool, "n_decoded": int | None}],
          "local_owner_session_id": str | None,
-         "local_owner_lease_remaining_seconds": float | None}
+         "local_owner_lease_remaining_seconds": float | None,
+         "prefill_eta_seconds": float | None,
+         "queue_eta_seconds": float | None}
+
+    ``prefill_eta_seconds`` and ``queue_eta_seconds`` publish the calibrated
+    prefill-ETA estimate (LP-0MVGDUV5E005UWBQ): the projected prefill cost of
+    the reference prompt (the most recent dispatch for the current model, else
+    ``server.local_admission_guard_reference_tokens``, assumed cache-cold) and
+    the wait a *newcomer* would face (the prefills of the currently occupied
+    slots plus its own). Dispatchers can pace themselves from these instead of
+    discovering a contended 120 s wait. ``prefill_eta_calibrated`` reports
+    whether the rolling calibration has enough samples; with too few samples
+    the guard is inert and the wait behaviour is unchanged.
 
     ``available_slots`` and ``total_slots`` reflect the model-serving slot
     state reported by llama-server's ``/slots`` endpoint. When the server is
@@ -596,6 +608,26 @@ async def get_llama_local_status(request: Request):
     except Exception:
         pass
 
+    # -- prefill / queue ETA estimate (LP-0MVGDUV5E005UWBQ) -----------------
+    # Published so a dispatcher can pace BEFORE launching a session instead of
+    # discovering a 120 s contended wait. Both fields come from the calibrated
+    # prefill cost of the reference prompt (most recent dispatch for the
+    # current model, else ``local_admission_guard_reference_tokens``); they are
+    # ``None`` only if the estimate itself failed (fail-open payload).
+    prefill_eta: dict = {}
+    try:
+        from proxy.prefill_eta import status_estimate
+
+        prefill_eta = status_estimate(
+            srv.config if isinstance(srv.config, dict) else {},
+            cm,
+            total_slots=total_slots,
+            available_slots=available_slots,
+            active_queries=int(getattr(srv, "local_active_queries", 0) or 0),
+        )
+    except Exception:
+        prefill_eta = {}
+
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
     client_ip, client_ip_source = _resolve_client_ip(request)
@@ -612,6 +644,8 @@ async def get_llama_local_status(request: Request):
         "available_slots": available_slots,
         "total_slots": total_slots,
         "slots_stale": slots_stale,
+        "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
+        "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
     }
@@ -641,6 +675,19 @@ async def get_llama_local_status(request: Request):
         # when not running / no model / no cached data, so herdr can track
         # same-slot idleness.
         "slots": slots,
+        # Prefill / queue ETA (LP-0MVGDUV5E005UWBQ): the projected prefill cost
+        # of the reference prompt and the wait a newcomer would face (the
+        # prefills of the occupied slots plus its own). Additive fields;
+        # ``None`` when the estimate is unavailable.
+        "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
+        "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
+        "prefill_eta_reference_tokens": prefill_eta.get(
+            "prefill_eta_reference_tokens"
+        ),
+        "prefill_eta_samples": prefill_eta.get("prefill_eta_samples", 0),
+        "prefill_eta_calibrated": bool(
+            prefill_eta.get("prefill_eta_calibrated", False)
+        ),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
     }

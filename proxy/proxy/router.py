@@ -1798,6 +1798,24 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     session_id or "unknown",
                                                     model_name or "unknown",
                                                 )
+                                                # Feed the prefill-ETA calibration window
+                                                # (LP-0MVGDUV5E005UWBQ): the observed service
+                                                # time for this prompt/cache state becomes a
+                                                # sample of the per-(model, context-bucket)
+                                                # prefill cost. Never breaks the stream.
+                                                try:
+                                                    from proxy.prefill_eta import (
+                                                        record_dispatch_sample,
+                                                    )
+
+                                                    record_dispatch_sample(
+                                                        model_name,
+                                                        _estimated_tokens,
+                                                        _cached_ratio,
+                                                        _first_byte_service_ms,
+                                                    )
+                                                except Exception:
+                                                    pass
                                             _first_byte_emitted = True
                                         except Exception:
                                             try:

@@ -719,3 +719,113 @@ class TestPerSlotDetails:
             assert isinstance(slot["slot_id"], int)
             assert isinstance(slot["is_processing"], bool)
             assert slot["n_decoded"] is None or isinstance(slot["n_decoded"], int)
+
+
+# ======================================================================
+# Prefill / queue ETA fields (LP-0MVGDUV5E005UWBQ)
+# ======================================================================
+
+
+class _EtaStatusHarness:
+    """Status call with a controllable calibration window + server config."""
+
+    class _FakeLock:
+        def locked(self):
+            return False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+    async def get(self, server_config, local_active_queries=0):
+        from proxy.server import app
+
+        from proxy import server
+
+        async def fake_query():
+            return {"llama_server_running": True}
+
+        transport = httpx.ASGITransport(app=app)
+        with patch("proxy.server.query_llama_status", side_effect=fake_query):
+            with patch.object(server, "active_queries", local_active_queries):
+                with patch.object(server, "active_queries_lock", asyncio.Lock()):
+                    with patch.object(server, "local_active_queries", local_active_queries):
+                        with patch.object(server, "local_active_queries_lock", asyncio.Lock()):
+                            with patch.object(server, "local_dispatch_records", {}):
+                                with patch.object(server, "local_dispatch_records_lock", self._FakeLock()):
+                                    with patch.object(server, "model_switch_refcount", 0):
+                                        with patch.object(server, "model_switch_lock", self._FakeLock()):
+                                            with patch.object(server, "background_loads", {}):
+                                                with patch.object(server, "current_model", "test-model"):
+                                                    with patch.object(server, "config", server_config):
+                                                        async with httpx.AsyncClient(
+                                                            transport=transport, base_url="http://test"
+                                                        ) as ac:
+                                                            resp = await ac.get("/llama/local/status")
+        assert resp.status_code == 200
+        return resp.json()
+
+
+@pytest.fixture
+def _eta_calibration():
+    from proxy import prefill_eta
+
+    prefill_eta.reset()
+    for _ in range(6):
+        prefill_eta.record_dispatch_sample("test-model", 100_000, 0.0, 390_000.0)
+    yield
+    prefill_eta.reset()
+
+
+@pytest.mark.asyncio
+async def test_status_publishes_prefill_and_queue_eta(_eta_calibration):
+    """The calibrated estimate is published so dispatchers can pace before
+    launching a session (LP-0MVGDUV5E005UWBQ)."""
+    server_config = {
+        "server": {
+            "llama_server_port": 8080,
+            "contention_queue_max_wait_seconds": 120,
+        }
+    }
+    j = await _EtaStatusHarness().get(server_config, local_active_queries=1)
+
+    assert j["prefill_eta_seconds"] > 0
+    assert j["queue_eta_seconds"] >= j["prefill_eta_seconds"]
+    assert j["prefill_eta_calibrated"] is True
+    assert j["prefill_eta_samples"] == 6
+    assert j["prefill_eta_reference_tokens"] == 100_000
+
+
+@pytest.mark.asyncio
+async def test_status_eta_fields_are_well_formed_without_calibration():
+    from proxy import prefill_eta
+
+    prefill_eta.reset()
+    server_config = {
+        "server": {
+            "llama_server_port": 8080,
+            "local_admission_guard_reference_tokens": 8_000,
+        }
+    }
+    j = await _EtaStatusHarness().get(server_config)
+
+    assert j["prefill_eta_seconds"] > 0
+    assert j["queue_eta_seconds"] > 0
+    assert j["prefill_eta_calibrated"] is False
+    assert j["prefill_eta_reference_tokens"] == 8_000
+
+
+@pytest.mark.asyncio
+async def test_status_eta_failure_is_fail_open():
+    """An estimate failure must not break the status payload."""
+    server_config = {"server": {"llama_server_port": 8080}}
+    with patch(
+        "proxy.prefill_eta.status_estimate", side_effect=RuntimeError("boom")
+    ):
+        j = await _EtaStatusHarness().get(server_config)
+
+    assert j["prefill_eta_seconds"] is None
+    assert j["queue_eta_seconds"] is None
+    assert j["prefill_eta_calibrated"] is False
