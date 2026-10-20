@@ -648,12 +648,19 @@ class TestPerSlotDetails:
 
     @pytest.mark.asyncio
     async def test_slots_present_when_running_and_model_loaded(self):
-        """AC1: slots array reflects per-slot state when llama-server is up."""
+        """AC1: slots array reflects per-slot state when llama-server is up.
+
+        The base per-slot fields are preserved (additive contract); the new
+        capacity fields are added alongside (LP-0MVGDUVGE0024YAI).
+        """
         j, detail_mock = await self._get(
             query_result={"llama_server_running": True},
             slots_detail=self._FAKE_SLOTS,
         )
-        assert j["slots"] == self._FAKE_SLOTS
+        assert len(j["slots"]) == len(self._FAKE_SLOTS)
+        for served, base in zip(j["slots"], self._FAKE_SLOTS):
+            for key in ("slot_id", "is_processing", "n_decoded"):
+                assert served[key] == base[key]
         assert j["total_slots"] == 0  # counts path unchanged (stubbed)
         detail_mock.assert_awaited_once()
         _, kwargs = detail_mock.await_args
@@ -702,11 +709,10 @@ class TestPerSlotDetails:
         detail_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_slot_dicts_are_compact_and_typed(self):
-        """AC4: each slot dict carries only the compact per-slot fields.
-
-        The endpoint passes through the helper's compact projection — no
-        streaming state or session identifiers leak into the payload.
+    async def test_slot_dicts_carry_capacity_fields(self):
+        """AC1/AC2/AC5: each slot dict is compact but carries the additive
+        capacity fields (owner_session_id, lease_state, phase, context_tokens,
+        prefill_eta_seconds) on top of the legacy base fields.
         """
         j, _ = await self._get(
             query_result={"llama_server_running": True},
@@ -715,10 +721,25 @@ class TestPerSlotDetails:
         assert isinstance(j["slots"], list)
         assert len(j["slots"]) == 3
         for slot in j["slots"]:
-            assert set(slot.keys()) == {"slot_id", "is_processing", "n_decoded"}
+            assert set(slot.keys()) == {
+                "slot_id",
+                "is_processing",
+                "n_decoded",
+                "context_tokens",
+                "owner_session_id",
+                "lease_state",
+                "phase",
+                "prefill_eta_seconds",
+            }
             assert isinstance(slot["slot_id"], int)
             assert isinstance(slot["is_processing"], bool)
             assert slot["n_decoded"] is None or isinstance(slot["n_decoded"], int)
+            assert isinstance(slot["lease_state"], str)
+            assert slot["phase"] in ("prefill", "decode", None)
+            assert slot["prefill_eta_seconds"] is None or isinstance(
+                slot["prefill_eta_seconds"], (int, float)
+            )
+        assert j["status_schema_version"] == 2  # AC1: additive + versioned
 
 
 # ======================================================================
@@ -829,3 +850,381 @@ async def test_status_eta_failure_is_fail_open():
     assert j["prefill_eta_seconds"] is None
     assert j["queue_eta_seconds"] is None
     assert j["prefill_eta_calibrated"] is False
+
+
+# ======================================================================
+# Truthful local capacity: slot phase + prefill ETA (LP-0MVGDUVGE0024YAI)
+#
+# The endpoint must distinguish a slot that is *generating* from one that is
+# merely *leased but idle* (the reserved-but-idle false-busy case) and publish
+# a calibrated prefill ETA so dispatchers pace before launching a session.
+# ======================================================================
+
+
+class _CapacityStatusHarness:
+    """Status call with controllable slots, lease registries and calibration."""
+
+    class _FakeLock:
+        def locked(self):
+            return False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+    async def get(
+        self,
+        slots_detail=None,
+        *,
+        stale_cache=None,
+        current_model="test-model",
+        config=None,
+        slot_owners=None,
+        dispatch_records=None,
+    ):
+        """Issue /llama/local/status and return the parsed JSON body.
+
+        ``stale_cache`` exercises the degraded path: the fresh detail query
+        returns nothing and the last-known per-slot cache is served with
+        ``slots_stale=true``.
+        """
+        from unittest.mock import AsyncMock
+
+        from proxy.server import app
+
+        from proxy import server
+
+        async def fake_query():
+            return {"llama_server_running": True}
+
+        detail_mock = AsyncMock(return_value=slots_detail or [])
+        counts_mock = AsyncMock(return_value=(0, 0))
+        transport = httpx.ASGITransport(app=app)
+        resolved_config = config if config is not None else {
+            "server": {
+                "llama_server_port": 8080,
+                "contention_queue_max_wait_seconds": 120,
+            }
+        }
+        with patch("proxy.server.query_llama_status", side_effect=fake_query):
+            with patch.object(server, "active_queries", 0):
+                with patch.object(server, "active_queries_lock", asyncio.Lock()):
+                    with patch.object(server, "local_active_queries", 0):
+                        with patch.object(
+                            server, "local_active_queries_lock", asyncio.Lock()
+                        ):
+                            with patch.object(server, "current_model", current_model):
+                                with patch.object(server, "model_switch_refcount", 0):
+                                    with patch.object(
+                                        server, "model_switch_lock", self._FakeLock()
+                                    ):
+                                        with patch.object(server, "background_loads", {}):
+                                            with patch.object(
+                                                server,
+                                                "local_dispatch_records",
+                                                dispatch_records or {},
+                                            ):
+                                                with patch.object(
+                                                    server,
+                                                    "local_dispatch_records_lock",
+                                                    self._FakeLock(),
+                                                ):
+                                                    with patch.object(
+                                                        server, "config", resolved_config
+                                                    ):
+                                                        with patch(
+                                                            "proxy.observability._query_slots_detail",
+                                                            detail_mock,
+                                                        ):
+                                                            with patch(
+                                                                "proxy.observability._query_slots",
+                                                                counts_mock,
+                                                            ):
+                                                                with patch(
+                                                                    "proxy.observability._last_slot_details_cache",
+                                                                    stale_cache,
+                                                                ):
+                                                                    with patch.dict(
+                                                                        "proxy.session._slot_owners",
+                                                                        slot_owners or {},
+                                                                        clear=True,
+                                                                    ):
+                                                                        async with httpx.AsyncClient(
+                                                                            transport=transport,
+                                                                            base_url="http://test",
+                                                                        ) as ac:
+                                                                            resp = await ac.get(
+                                                                                "/llama/local/status"
+                                                                            )
+        assert resp.status_code == 200
+        return resp.json()
+
+
+def _slot(slot_id, is_processing=False, n_decoded=None, context_tokens=None):
+    return {
+        "slot_id": slot_id,
+        "is_processing": is_processing,
+        "n_decoded": n_decoded,
+        "context_tokens": context_tokens,
+    }
+
+
+# -- AC1: additive, versioned, old-shaped consumers unaffected ---------------
+
+
+@pytest.mark.asyncio
+async def test_new_capacity_fields_are_additive_and_versioned():
+    """AC1: new fields are additive and versioned; an old-shaped consumer
+    (reads only the pre-change fields) behaves exactly as today."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(0, is_processing=False), _slot(1, is_processing=True, n_decoded=9)],
+    )
+
+    assert j["status_schema_version"] == 2
+    # New fields exist...
+    assert j["capacity_hint"] in ("idle", "prefill_bound", "saturated")
+    assert "prefill_budget_seconds" in j
+    for slot in j["slots"]:
+        assert {"lease_state", "phase", "owner_session_id", "prefill_eta_seconds"} <= set(slot)
+    # ...and the legacy view is unchanged in value and type.
+    assert j["available_slots"] == 0 and j["total_slots"] == 0
+    assert isinstance(j["llama_server_running"], bool)
+    legacy = [
+        {k: s[k] for k in ("slot_id", "is_processing", "n_decoded")}
+        for s in j["slots"]
+    ]
+    assert legacy == [
+        {"slot_id": 0, "is_processing": False, "n_decoded": None},
+        {"slot_id": 1, "is_processing": True, "n_decoded": 9},
+    ]
+
+
+# -- AC2: lease_state ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lease_state_generating_while_processing():
+    """AC2: a processing slot is ``generating`` — never ``free`` while a
+    prefill or decode is in flight, even with no lease owner."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(0, is_processing=True, n_decoded=0)],
+    )
+    assert j["slots"][0]["lease_state"] == "generating"
+
+
+@pytest.mark.asyncio
+async def test_lease_state_idle_leased_after_stream_finished():
+    """AC2: a session holding an inactive (post-stream) lease marks the slot
+    ``idle_leased`` — the reserved-but-idle case, not a working slot."""
+    import time
+
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(0, is_processing=False)],
+        slot_owners={("", 0): "idle-holder"},
+        dispatch_records={
+            "idle-holder": {
+                "active": False,
+                "expires_at": time.monotonic() + 60.0,
+            }
+        },
+    )
+    slot = j["slots"][0]
+    assert slot["lease_state"] == "idle_leased"
+    assert slot["owner_session_id"] == "idle-holder"
+
+
+@pytest.mark.asyncio
+async def test_lease_state_free_when_no_lease_and_not_processing():
+    """AC2: not processing and no lease holder → ``free``."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(0, is_processing=False)],
+    )
+    slot = j["slots"][0]
+    assert slot["lease_state"] == "free"
+    assert slot["owner_session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_lease_state_ignores_expired_lease():
+    """AC2: an expired inactive lease does not keep the slot ``idle_leased``."""
+    import time
+
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(0, is_processing=False)],
+        slot_owners={("", 0): "stale-holder"},
+        dispatch_records={
+            "stale-holder": {"active": False, "expires_at": time.monotonic() - 1.0}
+        },
+    )
+    assert j["slots"][0]["lease_state"] == "free"
+
+
+# -- AC5: phase inference ------------------------------------------------------
+
+
+def test_infer_slot_phase_null_when_not_processing():
+    from proxy.observability import infer_slot_phase
+
+    assert infer_slot_phase(False, 42) is None
+    assert infer_slot_phase(False, None) is None
+
+
+def test_infer_slot_phase_prefill_without_decoded_tokens():
+    from proxy.observability import infer_slot_phase
+
+    # ``is_processing`` with n_decoded ≈ 0 (or absent) is prefill; prompt
+    # progress corroborates but does not change the verdict.
+    assert infer_slot_phase(True, 0) == "prefill"
+    assert infer_slot_phase(True, None) == "prefill"
+    assert infer_slot_phase(True, 0, context_tokens=4_096) == "prefill"
+
+
+def test_infer_slot_phase_decode_with_decoded_tokens():
+    from proxy.observability import infer_slot_phase
+
+    assert infer_slot_phase(True, 42) == "decode"
+    assert infer_slot_phase(True, 1, context_tokens=100_000) == "decode"
+
+
+# -- AC3: shared calibration, nulls when not computable -----------------------
+
+
+@pytest.mark.asyncio
+async def test_per_slot_prefill_eta_sourced_from_shared_calibration(_eta_calibration):
+    """AC3: per-slot ETA and the budget come from ``prefill_eta.py`` — the same
+    calibration the admission guard uses, never a second estimator."""
+    from proxy import prefill_eta
+
+    config = {
+        "server": {
+            "llama_server_port": 8080,
+            "contention_queue_max_wait_seconds": 120,
+        }
+    }
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(0, is_processing=True, n_decoded=0, context_tokens=50_000)],
+        config=config,
+    )
+    slot = j["slots"][0]
+    expected, _coeffs = prefill_eta.estimate_prefill_seconds(
+        "test-model", 50_000, 0.0, config
+    )
+    assert slot["phase"] == "prefill"
+    assert slot["prefill_eta_seconds"] == round(expected, 1)
+    assert slot["prefill_eta_seconds"] > 0
+    # The budget is the admission guard's own wait budget, not a second source.
+    assert j["prefill_budget_seconds"] == 120.0
+
+
+@pytest.mark.asyncio
+async def test_per_slot_prefill_eta_null_when_context_unknown(_eta_calibration):
+    """AC3: unknown prompt progress → ``null`` ETA, never a misleading ``0``."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(0, is_processing=True, n_decoded=0, context_tokens=None)],
+    )
+    slot = j["slots"][0]
+    assert slot["phase"] == "prefill"
+    assert slot["prefill_eta_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_per_slot_prefill_eta_null_for_decoding_slot(_eta_calibration):
+    """AC3: a slot past prefill has no prefill ETA (null, not zero)."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(0, is_processing=True, n_decoded=42, context_tokens=1_000)],
+    )
+    slot = j["slots"][0]
+    assert slot["phase"] == "decode"
+    assert slot["prefill_eta_seconds"] is None
+
+
+# -- AC4: capacity_hint decision table ---------------------------------------
+
+
+def _capacity_state(lease_state, phase=None):
+    return {"lease_state": lease_state, "phase": phase}
+
+
+def test_capacity_hint_idle_when_a_slot_is_free():
+    from proxy.observability import compute_capacity_hint
+
+    slots = [
+        _capacity_state("generating", "decode"),
+        _capacity_state("free"),
+    ]
+    assert compute_capacity_hint(slots) == "idle"
+
+
+def test_capacity_hint_idle_when_every_occupied_slot_is_idle_leased():
+    from proxy.observability import compute_capacity_hint
+
+    slots = [
+        _capacity_state("idle_leased"),
+        _capacity_state("idle_leased"),
+    ]
+    assert compute_capacity_hint(slots) == "idle"
+
+
+def test_capacity_hint_prefill_bound_when_no_free_and_any_prefill():
+    from proxy.observability import compute_capacity_hint
+
+    slots = [
+        _capacity_state("generating", "prefill"),
+        _capacity_state("generating", "decode"),
+    ]
+    assert compute_capacity_hint(slots) == "prefill_bound"
+
+
+def test_capacity_hint_saturated_when_no_free_and_all_decode():
+    from proxy.observability import compute_capacity_hint
+
+    slots = [
+        _capacity_state("generating", "decode"),
+        _capacity_state("generating", "decode"),
+    ]
+    assert compute_capacity_hint(slots) == "saturated"
+
+
+def test_capacity_hint_idle_for_empty_slots():
+    from proxy.observability import compute_capacity_hint
+
+    assert compute_capacity_hint([]) == "idle"
+
+
+@pytest.mark.asyncio
+async def test_endpoint_publishes_capacity_hint():
+    """AC4: the endpoint's capacity_hint follows the same decision table."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[
+            _slot(0, is_processing=True, n_decoded=0),  # prefill
+            _slot(1, is_processing=True, n_decoded=12),  # decode
+        ],
+    )
+    assert j["capacity_hint"] == "prefill_bound"
+
+
+# -- AC7: staleness honesty ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_slots_null_eta_fields(_eta_calibration):
+    """AC7: when the served slot data is stale, per-slot AND top-level ETA
+    fields are null (never stale numbers); slots_stale stays true."""
+    cached = [
+        {
+            "slot_id": 0,
+            "is_processing": True,
+            "n_decoded": 0,
+            "context_tokens": 50_000,
+        }
+    ]
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[], stale_cache=cached
+    )
+
+    assert j["slots_stale"] is True
+    assert j["slots"][0]["prefill_eta_seconds"] is None
+    assert j["prefill_eta_seconds"] is None
+    assert j["queue_eta_seconds"] is None

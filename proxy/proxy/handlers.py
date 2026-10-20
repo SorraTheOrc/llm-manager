@@ -370,14 +370,20 @@ async def get_llama_local_status(request: Request):
          "llama_server_running": bool,
          "available_slots": int,
          "total_slots": int,
-         "slots": [{"slot_id": int, "is_processing": bool, "n_decoded": int | None}],
+         "slots": [{"slot_id": int, "is_processing": bool, "n_decoded": int | None,
+                    "context_tokens": int | None, "owner_session_id": str | None,
+                    "lease_state": str, "phase": str | None,
+                    "prefill_eta_seconds": float | None}],
          "local_owner_session_id": str | None,
          "local_owner_lease_remaining_seconds": float | None,
          "local_idle_seconds": float | None,
          "local_last_activity_at": str | None,
          "local_last_activity_source": str | None,
          "prefill_eta_seconds": float | None,
-         "queue_eta_seconds": float | None}
+         "queue_eta_seconds": float | None,
+         "prefill_budget_seconds": float | None,
+         "capacity_hint": str,
+         "status_schema_version": int}
 
     ``local_idle_seconds`` reports how long the local backend has been idle
     (LP-0MVGD9Z8Z0055Y5J) — the same monotonic signal the idle-aware routing
@@ -422,6 +428,28 @@ async def get_llama_local_status(request: Request):
     a malformed payload. The fetch reuses ``_query_slots_detail()``'s own
     httpx timeout bounded by the ``STATUS_QUERY_TIMEOUT`` window so a slow
     /slots response cannot blow the endpoint's response budget.
+
+    Per-slot capacity (LP-0MVGDUVGE0024YAI, ``status_schema_version: 2``):
+    each slot also carries ``owner_session_id`` and ``lease_state``
+    (``generating`` | ``idle_leased`` | ``free``) so a dispatcher can tell a
+    slot that is actually working from one that is merely reserved-but-idle
+    (the case behind 2,633 of 2,641 local dispatch denials while local decoded
+    29.3 % of wall clock). ``phase`` (``prefill`` | ``decode`` | ``null``) is
+    inferred proxy-side from ``is_processing``/``n_decoded`` (AC5);
+    ``context_tokens`` is the slot's prompt progress when the build reports it
+    and ``prefill_eta_seconds`` is the shared calibrated prefill cost for it
+    (null when not computable). ``lease_state`` is never ``free`` while a
+    prefill or decode is in flight.
+
+    The top level publishes the same calibration's ``prefill_budget_seconds``
+    (the admission guard's wait budget) and a ``capacity_hint`` summarising
+    the pool, evaluated in order: ``idle`` when a slot is free or every
+    occupied slot is ``idle_leased``; ``prefill_bound`` when nothing is free
+    and at least one slot is prefilling; ``saturated`` when nothing is free
+    and every occupied slot is decoding. All new fields are additive — a
+    client that ignores them behaves exactly as before (AC1), and the ETA
+    fields are ``null`` (never stale numbers) when ``slots_stale`` is true
+    (AC7).
 
     ``local_active_query`` mirrors ``active_query`` but is derived from the
     local-only counter (``local_active_queries``), so remote provider
@@ -590,6 +618,29 @@ async def get_llama_local_status(request: Request):
                 total_slots = 3
             available_slots = total_slots
 
+    # -- per-slot capacity annotation (LP-0MVGDUVGE0024YAI) -----------------
+    # Add owner_session_id / lease_state / phase / context_tokens /
+    # prefill_eta_seconds to each slot so a dispatcher can distinguish a slot
+    # that is *generating* from one that is merely *leased but idle* (the
+    # reserved-but-idle false-busy case) and can read the shared calibrated
+    # prefill ETA. ``slots_stale`` nulls the per-slot ETA: a cached /slots
+    # snapshot must never be presented with a fresh-looking number (AC7).
+    try:
+        from proxy.observability import (
+            annotate_slots_for_status,
+        )
+
+        slots = annotate_slots_for_status(
+            slots,
+            srv,
+            cm,
+            srv.config if isinstance(getattr(srv, "config", None), dict) else {},
+            stale=slots_stale,
+        )
+    except Exception:
+        # Annotation is best-effort; the base slot fields remain valid.
+        pass
+
     # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
     # The owner id is normalised to its bare session-id string: per-endpoint
     # leases are keyed by ``(endpoint, session_id)`` tuples and the raw key
@@ -635,6 +686,26 @@ async def get_llama_local_status(request: Request):
         )
     except Exception:
         prefill_eta = {}
+
+    # AC7 (LP-0MVGDUVGE0024YAI): when the served slot data came from the
+    # last-known cache, a poll-derived ETA is not a fresh number. Null it
+    # rather than let a dispatcher act on a stale estimate. The budget is a
+    # configuration constant (not poll-derived) and stays truthful.
+    if slots_stale:
+        prefill_eta = dict(prefill_eta)
+        prefill_eta["prefill_eta_seconds"] = None
+        prefill_eta["queue_eta_seconds"] = None
+
+    # AC4 (LP-0MVGDUVGE0024YAI): summarise whether the pool is genuinely
+    # working — ``idle`` (a free slot, or only idle leases), ``prefill_bound``
+    # (no free slot, at least one prefill) or ``saturated`` (no free slot, all
+    # decode). Computed from the annotated slots by the pure decision table.
+    try:
+        from proxy.observability import compute_capacity_hint as _capacity_hint
+
+        capacity_hint = _capacity_hint(slots)
+    except Exception:
+        capacity_hint = "idle"
 
     # -- prefill gate state (LP-0MVGDUUV3001XFRJ AC4) ----------------------
     # Prefills are serialised by default (``local_max_concurrent_prefills``),
@@ -694,6 +765,8 @@ async def get_llama_local_status(request: Request):
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
+        "capacity_hint": capacity_hint,
+        "status_schema_version": 2,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -734,6 +807,17 @@ async def get_llama_local_status(request: Request):
         "prefill_eta_calibrated": bool(
             prefill_eta.get("prefill_eta_calibrated", False)
         ),
+        # Admission-guard budget (LP-0MVGDUVGE0024YAI AC3), sourced from the
+        # shared prefill_eta calibration: the wait a prefill must fit inside
+        # (``None`` when unresolvable — never a fabricated 0).
+        "prefill_budget_seconds": prefill_eta.get("prefill_budget_seconds"),
+        # Whether the local pool is genuinely working (LP-0MVGDUVGE0024YAI
+        # AC4): ``idle`` | ``prefill_bound`` | ``saturated``.
+        "capacity_hint": capacity_hint,
+        # Additive payload version (AC1): bumped when per-slot/top-level
+        # capacity fields change meaning. Consumers that ignore it behave
+        # exactly as before.
+        "status_schema_version": 2,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local

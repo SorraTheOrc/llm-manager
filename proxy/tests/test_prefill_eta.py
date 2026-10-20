@@ -310,6 +310,37 @@ def test_status_estimate_falls_back_to_active_queries_without_slot_data():
     )
 
 
+def test_per_slot_prefill_eta_is_null_when_context_unknown():
+    """LP-0MVGDUVGE0024YAI AC3: an unobservable prompt size yields ``None``
+    (never a misleading ``0``); a known size costs from the same estimator."""
+    assert prefill_eta.per_slot_prefill_eta_seconds("Qwen3", None, _cfg()) is None
+    assert prefill_eta.per_slot_prefill_eta_seconds("Qwen3", 0, _cfg()) is None
+
+    expected, _coeffs = prefill_eta.estimate_prefill_seconds("Qwen3", 8_000, 0.0, _cfg())
+    assert prefill_eta.per_slot_prefill_eta_seconds(
+        "Qwen3", 8_000, _cfg()
+    ) == pytest.approx(round(expected, 1))
+
+
+def test_status_estimate_publishes_admission_budget():
+    """LP-0MVGDUVGE0024YAI AC3: the published budget is the guard's own wait
+    budget (one source of truth), and ``None`` when none is resolvable."""
+    fields = prefill_eta.status_estimate(_cfg(), "Qwen3", total_slots=1, available_slots=1)
+    assert fields["prefill_budget_seconds"] == 120.0
+    # The published budget is exactly wait_budget_seconds (null when the
+    # guard resolves no budget), never an independent number.
+    resolved = prefill_eta.wait_budget_seconds(
+        {"server": {"contention_queue_policy": "off"}}
+    )
+    expected = round(float(resolved), 1) if float(resolved) > 0 else None
+    assert (
+        prefill_eta.status_estimate(
+            {"server": {"contention_queue_policy": "off"}}, "Qwen3"
+        )["prefill_budget_seconds"]
+        == expected
+    )
+
+
 # ---------------------------------------------------------------------------
 # Retry hint + log line (AC2)
 # ---------------------------------------------------------------------------

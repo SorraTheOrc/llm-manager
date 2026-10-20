@@ -123,8 +123,18 @@ class TestDirectModelInstancePolling:
             _query_slots_detail(8080, model="Qwen3", _client=mock_client)
         )
         assert len(detail) == 2
-        assert detail[0] == {"slot_id": 0, "is_processing": False, "n_decoded": 0}
-        assert detail[1] == {"slot_id": 1, "is_processing": True, "n_decoded": 42}
+        assert detail[0] == {
+            "slot_id": 0,
+            "is_processing": False,
+            "n_decoded": 0,
+            "context_tokens": None,
+        }
+        assert detail[1] == {
+            "slot_id": 1,
+            "is_processing": True,
+            "n_decoded": 42,
+            "context_tokens": None,
+        }
 
     def test_direct_polling_parses_progress(self):
         """_query_slots_progress extracts progress from n_past / n_prompt_tokens_processed."""

@@ -524,6 +524,34 @@ def reference_tokens(model: str | None, config: dict | None = None) -> int:
     return observed if observed > 0 else guard_cfg.reference_tokens
 
 
+def per_slot_prefill_eta_seconds(
+    model: str | None,
+    context_tokens: int | None,
+    config: dict | None = None,
+) -> float | None:
+    """Calibrated prefill cost of one slot's loaded context (AC3).
+
+    Published per-slot on ``/llama/local/status`` (LP-0MVGDUVGE0024YAI AC3):
+    the single source of truth is the shared calibration this module owns, so
+    the status endpoint never grows a second estimator. Returns ``None``
+    rather than a misleading ``0`` when the slot's prompt progress is unknown
+    (modern llama.cpp builds dropped ``n_past``/``n_prompt_tokens_processed``)
+    or not positive — a prefill whose size cannot be observed must not be
+    presented as free.
+    """
+    try:
+        tokens = int(context_tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    if tokens <= 0:
+        return None
+    try:
+        seconds, _coeffs = estimate_prefill_seconds(model, tokens, 0.0, config)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return round(seconds, 1)
+
+
 def status_estimate(
     config: dict | None,
     model: str | None,
@@ -553,12 +581,22 @@ def status_estimate(
             busy = max(0, total - available)
         else:
             busy = max(0, active)
+        # The admission guard's own budget (the contention-queue max wait, 0
+        # for high-priority that never queues): the same number a dispatcher
+        # must pace a session against (LP-0MVGDUVGE0024YAI AC3). ``None``
+        # when no budget is resolvable, never a fabricated ``0``.
+        try:
+            budget = wait_budget_seconds(config)
+        except Exception:  # pragma: no cover - defensive
+            budget = 0.0
+        budget_published = round(float(budget), 1) if float(budget) > 0 else None
         return {
             "prefill_eta_seconds": round(eta, 1),
             "queue_eta_seconds": round(eta * (busy + 1), 1),
             "prefill_eta_reference_tokens": tokens,
             "prefill_eta_samples": coeffs.samples,
             "prefill_eta_calibrated": coeffs.calibrated,
+            "prefill_budget_seconds": budget_published,
         }
     except Exception:  # pragma: no cover - defensive
         logger.debug("status_estimate failed", exc_info=True)
@@ -568,6 +606,7 @@ def status_estimate(
             "prefill_eta_reference_tokens": None,
             "prefill_eta_samples": 0,
             "prefill_eta_calibrated": False,
+            "prefill_budget_seconds": None,
         }
 
 
