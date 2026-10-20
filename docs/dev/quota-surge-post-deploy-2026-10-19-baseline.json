@@ -1,0 +1,96 @@
+{
+  "accounts": {
+    "OPENCODE_2_API_KEY": [
+      {
+        "account": "OPENCODE_2_API_KEY",
+        "completed": false,
+        "coverage_gap_hours": 241.28,
+        "effective_headroom_at_reset": null,
+        "hard_stop_hours": 0.0,
+        "monthly_percent_at_reset": null,
+        "monthly_percent_latest": 95.0,
+        "outcome": "in_progress",
+        "period_start": "2026-10-19T18:46:07Z",
+        "poll_count": 21,
+        "poll_failures": 0,
+        "quota_skip_count": 0,
+        "quota_skip_dry_run_count": 0,
+        "reading_approximate": true,
+        "resets_at": "2026-10-30T01:03:42Z",
+        "residual_percent": null,
+        "stale_suspensions": 0,
+        "surge_active_hours": 0.0,
+        "surge_final_window_hours": 0.0
+      }
+    ],
+    "OPENCODE_3_API_KEY": [
+      {
+        "account": "OPENCODE_3_API_KEY",
+        "completed": false,
+        "coverage_gap_hours": 683.31,
+        "effective_headroom_at_reset": null,
+        "hard_stop_hours": 0.0,
+        "monthly_percent_at_reset": null,
+        "monthly_percent_latest": 13.0,
+        "outcome": "in_progress",
+        "period_start": "2026-10-19T18:46:06Z",
+        "poll_count": 21,
+        "poll_failures": 0,
+        "quota_skip_count": 0,
+        "quota_skip_dry_run_count": 0,
+        "reading_approximate": true,
+        "resets_at": "2026-11-17T11:05:08Z",
+        "residual_percent": null,
+        "stale_suspensions": 0,
+        "surge_active_hours": 0.0,
+        "surge_final_window_hours": 0.0
+      }
+    ],
+    "OPENCODE_API_KEY": [
+      {
+        "account": "OPENCODE_API_KEY",
+        "completed": false,
+        "coverage_gap_hours": 81.95,
+        "effective_headroom_at_reset": null,
+        "hard_stop_hours": 0.0,
+        "monthly_percent_at_reset": null,
+        "monthly_percent_latest": 93.0,
+        "outcome": "in_progress",
+        "period_start": "2026-10-19T18:46:08Z",
+        "poll_count": 21,
+        "poll_failures": 0,
+        "quota_skip_count": 0,
+        "quota_skip_dry_run_count": 0,
+        "reading_approximate": true,
+        "resets_at": "2026-10-23T09:43:54Z",
+        "residual_percent": null,
+        "stale_suspensions": 0,
+        "surge_active_hours": 0.0,
+        "surge_final_window_hours": 0.0
+      }
+    ]
+  },
+  "generated_at": "2026-10-19T22:57:35.155546Z",
+  "invocation": {
+    "argv": "scripts/quota_allowance_report.py --log-dir /var/log/llama-proxy --start 2026-10-19T18:00:00 --end 2026-10-20T00:00:00 --output-md docs/dev/quota-surge-post-deploy-2026-10-19-baseline.md --output-json docs/dev/quota-surge-post-deploy-2026-10-19-baseline.json --quiet",
+    "log_dir": "/var/log/llama-proxy",
+    "max_poll_gap_hours": 6.0,
+    "surge_days": 7,
+    "threshold_percent": 99.5,
+    "window": {
+      "end": "2026-10-20T00:00:00Z",
+      "start": "2026-10-19T18:00:00Z"
+    }
+  },
+  "summary": {
+    "accounts_measured": 3,
+    "below_target": 0,
+    "completed_periods": 0,
+    "insufficient_data": 0,
+    "overspend": 0,
+    "target_met": 0
+  },
+  "target_percent": 90.0,
+  "tool": "scripts/quota_allowance_report.py",
+  "work_item": "LP-0MVF7KTMI005B667"
+}

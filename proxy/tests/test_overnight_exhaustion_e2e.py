@@ -98,7 +98,7 @@ def _reset_state():
 
 @pytest.fixture(autouse=True)
 def _pin_fast_mode(monkeypatch):
-    monkeypatch.setattr("proxy.mode.read_mode", lambda: "fast")
+    monkeypatch.setattr("proxy.priority.request_priority", lambda *a, **k: "medium")
 
 
 def _remote_providers_for_overnight() -> dict:

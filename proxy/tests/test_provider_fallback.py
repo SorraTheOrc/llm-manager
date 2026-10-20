@@ -60,8 +60,16 @@ def pin_fast_mode(monkeypatch):
     (LP-0MU5A4QBR003YJM0) is config-driven
     (``local_large_context_economic_bypass_serves_local``), so it is not
     enabled by this fixture.
+
+    Note: the priority is pinned via ``proxy.provider.request_priority`` —
+    the binding the routing cycle reads (provider.py imports it into its own
+    namespace) — so the tests are also deterministic inside the cheap window
+    (01:00–10:00), where an unpinned request would cap to ``low`` and route
+    differently.
     """
-    monkeypatch.setattr("proxy.mode.read_mode", lambda: "fast")
+    monkeypatch.setattr(
+        "proxy.provider.request_priority", lambda *a, **k: "medium"
+    )
 
 
 @pytest.fixture
@@ -5357,3 +5365,59 @@ class TestLocalSiblingFallbackExemption:
             ) is True
             assert provider._is_provider_unavailable("opencode-go-2")
             assert provider._is_provider_unavailable("opencode-go")
+
+
+# ---------------------------------------------------------------------------
+# Per-entry ``max_context_tokens`` is dispatch-time, not resolution state
+# (LP-0MVF9MY0W002J2N3, parent LP-0MVF2DNCX003Z5CO)
+# ---------------------------------------------------------------------------
+
+
+def _context_limited_model_config() -> dict:
+    """Two remote entries; the first declares a tiny context limit."""
+    return {
+        "providers": [
+            {
+                "name": "capped",
+                "type": "remote",
+                "endpoint": "https://capped.example.com/v1",
+                "api_key_env": "CAPPED_KEY",
+                "max_context_tokens": 1,
+            },
+            {
+                "name": "open",
+                "type": "remote",
+                "endpoint": "https://open.example.com/v1",
+                "api_key_env": "OPEN_KEY",
+            },
+        ],
+        "aliases": ["ctxlimit*"],
+    }
+
+
+def test_context_limit_does_not_exclude_the_entry_at_resolution_time():
+    """A tiny ``max_context_tokens`` must not affect provider resolution.
+
+    The per-entry context gate is stateless per request (parent A1/A3): it is
+    evaluated in the dispatch loops, never as a resolution-time exclusion. So
+    ``resolve_provider`` / ``_resolve_provider_with_exclusions`` keep returning
+    the capped entry, which stays eligible for later, smaller requests in the
+    same chain cycle.
+    """
+    model_config = _context_limited_model_config()
+
+    assert provider.resolve_provider(model_config)["name"] == "capped"
+    assert provider._resolve_provider_with_exclusions(model_config, set())["name"] == "capped"
+    # Second resolution in the same state still yields the entry: the field
+    # records no cooldown / failure-domain exclusion.
+    assert provider._resolve_provider_with_exclusions(model_config, set())["name"] == "capped"
+    assert provider._provider_unavailable_until == {}
+
+
+def test_context_limit_field_absent_keeps_resolution_order():
+    """Without the field the chain order resolves exactly as today."""
+    model_config = _context_limited_model_config()
+    del model_config["providers"][0]["max_context_tokens"]
+
+    assert provider.resolve_provider(model_config)["name"] == "capped"
+    assert provider._resolve_provider_with_exclusions(model_config, {"capped"})["name"] == "open"

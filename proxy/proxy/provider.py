@@ -24,6 +24,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -39,7 +40,15 @@ import httpx
 from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from proxy import cold_start
+from proxy import cold_start, quota_pacing, quota_state
+from proxy.observability import _record_backend_signal
+from proxy.priority import (
+    PRIORITY_HIGH,
+    PRIORITY_LOW,
+    effective_chain_for_request,
+    priority_routing_profile,
+    request_priority,
+)
 from proxy.provider_budget import (
     RATE_LIMIT_WINDOW_SECONDS,
     acquire_provider_budget,
@@ -833,24 +842,35 @@ def _get_warm_cache_threshold(config: dict) -> int:
         return 0
 
 
-def _economic_bypass_serves_local(config: dict) -> bool:
+def _economic_bypass_serves_local(config: dict, priority: str | None = None) -> bool:
     """Whether the economic cold-cache bypass should be recovered locally.
 
-    Mode-gated via the active mode-profile config (LP-0MU5A4QBR003YJM0):
-    ``config-cheap.yaml`` sets
-    ``local_large_context_economic_bypass_serves_local: true`` so economic
-    bypasses (``new_tokens > cold_threshold`` while the prompt still fits the
-    per-slot KV capacity) are served locally — entering the contention queue
-    when all slots are busy — instead of falling back to a paid remote.
+    Priority-gated (AC3, LP-0MVDT94F0003VHUA): the flag replaces the retired
+    mode-profile gate (``config-cheap.yaml`` set
+    ``local_large_context_economic_bypass_serves_local: true``):
 
-    Fast/default profiles omit the key (or set it false), preserving the
-    remote-fallback behaviour for tail latency.  This is an explicit
-    mode-aware flag, not a hardcoded mode string branch: the active config
-    file selected by the mode decides the behaviour.
+    - ``low``: always True — economic bypasses are served locally (entering
+      the contention queue when all slots are busy) instead of falling back
+      to a paid remote (cheap-mode semantics in both windows).
+    - ``high``: always False — economic bypass routes remote (fast-mode
+      semantics).
+    - ``medium``: the merged base config flag
+      (``server.local_large_context_economic_bypass_serves_local``; the
+      merged base omits it, preserving today's remote-fallback behaviour).
 
     Supports both nested (``server:``) and flat config keys for test
     compatibility.  Default: false.
     """
+    profile = (
+        priority_routing_profile(
+            priority,
+            config.get("server", config) if isinstance(config, dict) else None,
+        )
+        if priority is not None
+        else None
+    )
+    if profile is not None:
+        return bool(profile.get("economic_bypass_serves_local"))
     val = config.get("local_large_context_economic_bypass_serves_local")
     if val is None:
         val = config.get("server", {}).get(
@@ -1480,17 +1500,18 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     if warm > 0:
         warm = min(warm, cap)
         # LP-0MTBOX45O005LD1S AC4: also clamp warm to the hard-routing cap
-        # (mode-aware; the cap is expressed as a per-mode ratio) so
+        # (the ratio keys were mode-aware; with the mode axis removed
+        # LP-0MVDT94F0003VHUA the cap is a single unified ratio) so
         # ``context_too_large`` fires exactly at the hard cap — the SAME
         # single source as ``session_slot_max_prompt_tokens`` persistence.
         # No circularity: ``compute_hard_routing_cap`` derives its denominator
         # from the RAW warm config + per-slot threshold, not this clamped warm.
+        # The per-mode ratios are retired (0 → disabled) and the slot pool is
+        # fixed at 2, so the unified profile is used unconditionally.
         try:
-            from proxy.mode import read_mode as _read_mode
-            _mode = _read_mode()
+            _hard_cap = compute_hard_routing_cap("fast", config)
         except Exception:
-            _mode = "fast"  # default mode, matching read_mode()
-        _hard_cap = compute_hard_routing_cap(_mode, config)
+            _hard_cap = 0
         if _hard_cap > 0:
             warm = min(warm, _hard_cap)
     return cold, warm
@@ -1663,13 +1684,14 @@ def check_hard_routing_cap(
 
 
 def _build_compaction_gate_response(
-    estimated_tokens: int, cap: int, mode: str, session_id: str | None,
+    estimated_tokens: int, cap: int, priority: str, session_id: str | None,
     model_name: str | None,
 ) -> Response:
     """Build a 429 response that gates the request for client-side compaction.
 
-    Used only in cheap mode when the hard-routing cap is exceeded.  The
-    response includes:
+    Used when the hard-routing cap is exceeded by a low-priority request
+    (cheap semantics, AC3 — the client compacts instead of spending on a
+    paid remote).  The response includes:
     - HTTP 429 status code
     - ``X-Compaction-Gate: true`` header
     - ``X-Compaction-Estimated-Tokens`` header
@@ -1682,7 +1704,7 @@ def _build_compaction_gate_response(
     Args:
         estimated_tokens: The estimated token count that triggered the gate.
         cap: The hard-routing cap that was exceeded.
-        mode: Operating mode ("cheap").
+        priority: Effective priority ("low") that triggered the gate.
         session_id: Session ID for the request (may be None).
         model_name: Model name for the request.
 
@@ -1694,7 +1716,7 @@ def _build_compaction_gate_response(
         "X-Compaction-Gate": "true",
         "X-Compaction-Estimated-Tokens": str(estimated_tokens),
         "X-Compaction-Cap": str(cap),
-        "X-Compaction-Mode": mode,
+        "X-Compaction-Priority": priority,
     }
     if session_id:
         headers["X-Session-Id"] = session_id
@@ -1704,8 +1726,8 @@ def _build_compaction_gate_response(
             "type": "compaction_gate",
             "code": "context_too_large_for_local",
             "message": (
-                f"Context ({estimated_tokens} tokens) exceeds the "
-                f"{mode}-mode local routing cap ({cap} tokens). "
+                f"Context ({estimated_tokens} tokens) exceeds the local "
+                f"routing cap ({cap} tokens) at priority {priority!r}. "
                 "Compact the session before retrying (see the "
                 "context_pressure guidance signal)."
             ),
@@ -1713,13 +1735,13 @@ def _build_compaction_gate_response(
         "status": 429,
         "estimated_tokens": estimated_tokens,
         "cap": cap,
-        "mode": mode,
+        "priority": priority,
     }
     return JSONResponse(status_code=429, content=payload, headers=headers)
 
 
 def _is_compaction_gate_response(response) -> bool:
-    """Whether *response* is the cheap-mode compaction gate (429).
+    """Whether *response* is the low-priority compaction gate (429).
 
     The gate is a TERMINAL response (LP-0MTBOX45O005LD1S AC2): it must
     reach the client as-is and must never trigger the fallback cycle's
@@ -1870,6 +1892,50 @@ async def _estimate_effective_prompt_tokens_for_routing(
         return estimated_tokens
 
 
+class _RoutingEstimateCache:
+    """Lazily-computed, per-cycle routing token estimate.
+
+    The authoritative routing estimate (``_get_tokenizer_for_model`` +
+    ``_estimate_effective_prompt_tokens_for_routing`` +
+    ``token_estimate_multiplier``) is **model-scoped**, not provider-scoped, so
+    every per-entry consumer in a fallback cycle — the local
+    ``_should_skip_local`` gate and the per-entry ``max_context_tokens``
+    ceiling — must share ONE computation (LP-0MVF9N2QL001CDA7 AC4).
+
+    Lazy: a cycle that never consults the estimate (e.g. an ungated remote
+    chain) pays no tokenizer pass at all. ``recompute()`` refreshes it after
+    the request body has been rewritten in place (compaction).
+    """
+
+    def __init__(self, request, body_json: dict, model_config: dict, config: dict):
+        self._request = request
+        self._body_json = body_json
+        self._model_config = model_config
+        self._config = config
+        self._value: int | None = None
+        self.tokenizer = None
+        self.multiplier = 1.0
+
+    async def get(self) -> int:
+        """Return the cached estimate, computing it on first use."""
+        if self._value is None:
+            await self.recompute()
+        return int(self._value or 0)
+
+    async def recompute(self) -> int:
+        """Re-estimate from the current body (after in-place compaction)."""
+        self.tokenizer, self.multiplier = _get_tokenizer_for_model(
+            self._model_config, self._config
+        )
+        tokens = await _estimate_effective_prompt_tokens_for_routing(
+            self._request, self._body_json, tokenizer=self.tokenizer
+        )
+        if self.multiplier != 1.0:
+            tokens = int(tokens * self.multiplier)
+        self._value = int(tokens or 0)
+        return self._value
+
+
 def _should_skip_local(
     model_name: str,
     session_id: str | None,
@@ -1972,6 +2038,349 @@ def _should_skip_local(
     return (True, "large_context_bypass")
 
 
+def _provider_context_limit(provider_cfg: dict) -> int:
+    """Read ``max_context_tokens`` from a provider entry (0 = ungated).
+
+    LP-0MVF9N2QL001CDA7: the optional per-entry ceiling on the estimated prompt
+    context the entry may serve. Parsing mirrors ``rate_limit_rpm``
+    (``provider_budget._provider_rpm``): a malformed value fails open (the entry
+    is ungated) rather than raising at dispatch time, and any non-positive
+    value — ``0``, a negative number, ``None`` — disables the gate so an absent
+    field is byte-for-byte today's behaviour.
+
+    Args:
+        provider_cfg: A single provider entry from the model's ``providers``.
+
+    Returns:
+        The positive integer limit, or ``0`` when the entry is ungated.
+    """
+    if not isinstance(provider_cfg, dict):
+        return 0
+    raw = provider_cfg.get("max_context_tokens", 0)
+    # ``bool`` is an ``int`` subclass: ``True`` would silently mean a 1-token
+    # ceiling, so treat it as malformed (ungated).
+    if isinstance(raw, bool):
+        return 0
+    try:
+        value = int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def _should_skip_provider_context(
+    provider_cfg: dict,
+    estimated_tokens: int | None,
+) -> tuple[bool, int]:
+    """Decide whether an entry's ``max_context_tokens`` ceiling is exceeded.
+
+    The ceiling is **inclusive**: an estimate at or below the limit is
+    dispatched; only a strictly larger estimate is skipped. Fail-open in both
+    directions — an ungated entry never skips, and a missing/non-positive
+    estimate (nothing to compare) never skips either, mirroring the local
+    gate's behaviour when it has no usable estimate.
+
+    Args:
+        provider_cfg: A single provider entry from the model's ``providers``.
+        estimated_tokens: The authoritative per-request routing estimate.
+
+    Returns:
+        ``(skip, limit)``; ``limit`` is ``0`` when the entry is ungated.
+    """
+    limit = _provider_context_limit(provider_cfg)
+    if limit <= 0:
+        return (False, 0)
+    try:
+        estimate = int(estimated_tokens or 0)
+    except (TypeError, ValueError):
+        return (False, limit)
+    if estimate <= 0:
+        return (False, limit)
+    return (estimate > limit, limit)
+
+
+def _record_provider_context_skip(
+    attempts: list[dict[str, Any]],
+    provider_name: str,
+    provider_type: str,
+    estimated_tokens: int,
+    limit: int,
+    session_id: str | None = None,
+) -> None:
+    """Record + log a per-entry context-ceiling skip (AC3).
+
+    A context skip is a per-request size mismatch, NOT a provider failure
+    (AC5): this helper deliberately records nothing beyond the diagnostic
+    attempt and the cumulative ``provider_context_exceeded`` backend signal —
+    no cooldown, no usage-limit reset, no failure-domain exclusion and no
+    affinity — so the entry stays eligible for later, smaller requests. The
+    counter mirrors ``context_too_large`` (LP-0MVF9N3BV00155RI) and is exposed
+    as ``backend_signals`` on ``/health`` and ``/admin/metrics``.
+    """
+    _record_attempt(
+        attempts,
+        provider=provider_name,
+        type=provider_type,
+        status="provider_context_exceeded",
+        estimated_tokens=estimated_tokens,
+        limit=limit,
+        reason="provider_context_exceeded",
+    )
+    _record_backend_signal("provider_context_exceeded")
+    logger.info(
+        "routing_skip_provider_context provider=%s type=%s "
+        "status=provider_context_exceeded estimated_tokens=%d limit=%d "
+        "reason=provider_context_exceeded session=%s",
+        provider_name,
+        provider_type,
+        estimated_tokens,
+        limit,
+        str(session_id or "unknown"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Headroom-aware quota ordering (LP-0MVF7KIKE002DZVD)
+# ---------------------------------------------------------------------------
+
+
+def _quota_ordering_active(config: dict | None) -> bool:
+    """Whether headroom-aware ordering may re-order the provider chain.
+
+    The config-level predicate guarding the whole quota-ordering feature
+    (LP-0MVF7KIKE002DZVD): whenever it returns ``False`` every resolution path
+    behaves exactly as it did before the feature existed. Ordering is active
+    only while the quota-surge feature is enabled *and* not in dry-run.
+    Dry-run still computes and logs the ranking
+    (:func:`_quota_ranked_providers`) but never applies it.
+
+    Delegates to :func:`_quota_surge_applies` for the config-level gate, and to
+    :func:`_quota_behaviour` for the per-account / stale-state part of the
+    decision (which also gates the final-week bypass,
+    LP-0MVF7KPB9009U7CG).
+    """
+    return _quota_surge_applies(config)
+
+
+def _quota_behaviour(
+    config: dict | None, now: datetime | None = None
+) -> quota_state.QuotaBehaviour:
+    """The single central predicate every quota decision site consults.
+
+    Returns :class:`proxy.quota_state.QuotaBehaviour` (enabled / dry-run /
+    suspended-on-stale-state / disabled by the kill switch). Ordering, the
+    ``available_times`` bypass and the quota-driven skip all branch on this
+    one object, so a test can prove "all quota behaviour off" by construction
+    (LP-0MVF7KPB9009U7CG). ``now`` defaults to the injectable quota clock.
+    """
+    return quota_state.quota_behaviour(config, now=now)
+
+
+def _quota_provider_score(
+    provider_cfg: dict, config: dict | None
+) -> tuple[float, float, float] | None:
+    """Return ``(score, effective_headroom, seconds_to_reset)`` or ``None``.
+
+    A pure cache read through :func:`proxy.quota_state.get_quota_snapshot`:
+    it never polls, never blocks and never raises. ``None`` means "no quota
+    opinion" — the entry keeps its configured position with score 0.
+    """
+    snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+    if snapshot is None:
+        return None
+    headroom = snapshot.effective_headroom
+    seconds_to_reset = snapshot.seconds_to_reset
+    score = quota_pacing.urgency_score(headroom, seconds_to_reset, config)
+    return score, headroom, seconds_to_reset
+
+
+def _quota_ranked_providers(
+    model_config: dict, config: dict | None = None
+) -> list[dict[str, Any]]:
+    """Return the model's provider list with quota entries headroom-ordered.
+
+    Only entries matched by :func:`proxy.quota_state.is_quota_provider`
+    (``opencode-*``, or the ``server.quota_surge_accounts`` allow-list) are
+    re-ordered: they are ranked by descending
+    :func:`proxy.quota_pacing.urgency_score` (``effective_headroom /
+    seconds_to_reset``) and spliced back into the *same positions* they
+    occupy in config order, so every other provider keeps its configured
+    position. The sort is stable, so equal scores tie-break on config order
+    and repeated calls are deterministic.
+
+    A copy is always returned — the caller's list is never mutated. An entry
+    with no snapshot scores 0 and keeps config order among its peers; when no
+    quota entry has been polled the configured order is preserved exactly.
+
+    Ordering is gated by the central :func:`_quota_behaviour` predicate: it is
+    suspended entirely when any snapshot is stale (older than
+    ``server.quota_state_max_age_seconds``), so the chain reverts to config
+    order and a stale reading can never re-rank or strand a candidate (child
+    AC9). Disabled and suspended modes therefore both return the configured
+    order unchanged.
+    """
+    providers = model_config.get("providers")
+    if not isinstance(providers, list) or len(providers) < 2:
+        return list(providers) if isinstance(providers, list) else []
+    if not quota_pacing.surge_enabled(config):
+        return list(providers)
+
+    behaviour = _quota_behaviour(config)
+    if not behaviour.computes:
+        # Stale state: fail-safe — no ranking, no log, plain config order.
+        return list(providers)
+
+    active = _quota_ordering_active(config)
+    quota_positions: list[int] = []
+    ranked: list[dict[str, Any]] = []
+    for index, provider_cfg in enumerate(providers):
+        if not isinstance(provider_cfg, dict):
+            continue
+        if not quota_state.is_quota_provider(provider_cfg, config):
+            continue
+        quota_positions.append(index)
+        scored = _quota_provider_score(provider_cfg, config)
+        if scored is None:
+            ranked.append(
+                {
+                    "score": 0.0,
+                    "index": index,
+                    "provider": provider_cfg,
+                    "headroom": 0.0,
+                    "seconds_to_reset": 0.0,
+                    "polled": False,
+                }
+            )
+            continue
+        score, headroom, seconds_to_reset = scored
+        ranked.append(
+            {
+                "score": score,
+                "index": index,
+                "provider": provider_cfg,
+                "headroom": headroom,
+                "seconds_to_reset": seconds_to_reset,
+                "polled": True,
+            }
+        )
+
+    if not quota_positions:
+        return list(providers)
+
+    # ``reverse=True`` keeps the sort stable, so equal scores retain config order.
+    ranked.sort(key=lambda entry: entry["score"], reverse=True)
+
+    if any(entry["polled"] for entry in ranked):
+        for rank, entry in enumerate(ranked, start=1):
+            logger.debug(
+                "quota_ordering rank=%d provider=%s config_index=%d headroom=%.1f "
+                "seconds_to_reset=%.0f score=%.6g applied=%s behaviour=%s reason=%s",
+                rank,
+                entry["provider"].get("name", "unknown"),
+                entry["index"],
+                entry["headroom"],
+                entry["seconds_to_reset"],
+                entry["score"],
+                active,
+                behaviour.mode,
+                behaviour.log_reason(),
+            )
+
+    if not active:
+        return list(providers)
+
+    ordered = [entry["provider"] for entry in ranked]
+    result = list(providers)
+    for position, provider_cfg in zip(quota_positions, ordered):
+        result[position] = provider_cfg
+    return result
+
+
+def _quota_unavailable_reason(
+    provider_cfg: dict, config: dict | None
+) -> str | None:
+    """Return a log-friendly reason when quota state marks the entry spent.
+
+    Ordering never drops a candidate that still has headroom (AC3c), but an
+    entry whose snapshot is
+    :attr:`~proxy.quota_state.QuotaSnapshot.exhausted` (any window blocking,
+    or no effective headroom left) is treated as unavailable — the same
+    conservative stance the snapshot itself takes.
+
+    The decision is gated on the central behaviour predicate
+    (:func:`proxy.quota_state.quota_behaviour`): it returns ``None`` (fail
+    open) when the feature is disabled, when the state is stale (suspended —
+    a stale exhausted reading must not strand the account, child AC9b), when
+    the entry is not quota-managed, or when no snapshot has been polled yet.
+    In dry-run mode the would-be skip is logged once per account with
+    ``reason=quota_surge_dry_run`` but ``None`` is returned, so eligibility is
+    byte-identical to the pre-feature behaviour (child AC8b).
+    """
+    if not quota_state.is_quota_provider(provider_cfg, config):
+        return None
+    behaviour = _quota_behaviour(config)
+    if behaviour.disabled or behaviour.suspended:
+        return None
+    snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+    if snapshot is None or not snapshot.exhausted:
+        return None
+    reason = (
+        f"quota_exhausted (account={snapshot.account}, "
+        f"effective_headroom={snapshot.effective_headroom:.1f}%, "
+        f"resets_in={int(snapshot.seconds_to_reset)}s)"
+    )
+    if behaviour.dry_run:
+        _log_quota_skip_decision(provider_cfg, snapshot)
+        return None
+    return reason
+
+
+def _quota_exhausted(
+    provider_cfg: dict, config: dict | None
+) -> tuple[bool, str]:
+    """Return ``(True, reason)`` when the quota hard stop skips *provider_cfg*.
+
+    The cost guard (LP-0MVF7KO8C005NB59): an entry is skipped before any
+    upstream request is attempted when its monthly consumption is at or above
+    ``server.quota_exhaustion_percent`` (default 99.5) **or** its
+    ``effective_headroom`` is at or below the equivalent headroom
+    (``100 - threshold``) — so a spent rolling or weekly window blocks the
+    entry even when the monthly percent is still low. The decision is a pure
+    cache read: it never polls, never blocks and never raises.
+
+    Unlike the ordering-gated :func:`_quota_unavailable_reason`, this guard is
+    **not** conditional on the surge feature: an exhausted account is skipped
+    whether or not surge is enabled, and the final-week surge bypass can
+    never re-enable it (the skip runs before the ``available_times``/surge
+    gate). It is also deliberately **not** suspended by stale state
+    (``server.quota_state_max_age_seconds``): it is a money guard, so a stale
+    "nearly spent" reading fails in the safe direction (keep blocking) rather
+    than spending real pay-as-you-go money on an old observation. Returns
+    ``(False, "")`` (fail open) when the entry is not
+    quota-managed or no snapshot has been polled yet — the guard only acts on
+    authoritative quota state.
+    """
+    if not quota_state.is_quota_provider(provider_cfg, config):
+        return False, ""
+    snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+    if snapshot is None:
+        return False, ""
+    threshold = quota_state.quota_exhaustion_percent(config)
+    monthly_percent = snapshot.monthly.percent
+    effective_headroom = snapshot.effective_headroom
+    if (
+        monthly_percent < threshold
+        and effective_headroom > 100.0 - threshold
+    ):
+        return False, ""
+    return True, (
+        f"reason=quota_exhausted (account={snapshot.account}, "
+        f"monthly_percent={monthly_percent:.1f}%, "
+        f"effective_headroom={effective_headroom:.1f}%, "
+        f"threshold={threshold:g}%)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1979,6 +2388,8 @@ def _should_skip_local(
 def resolve_provider(
     model_config: dict,
     failed_provider: str | None = None,
+    *,
+    config: dict | None = None,
 ) -> dict | None:
     """Get the next available provider for a model config.
 
@@ -1991,18 +2402,28 @@ def resolve_provider(
       LP-0MSG45LOO007K236)
     - Does not belong to a usage-limit ACCOUNT with a pending usage-limit
       reset (LP-0MSLJPOCC0001ROJ / LP-0MSMBWB23009XYPW)
+    - Is not marked spent by proactive quota state (LP-0MVF7KIKE002DZVD)
+    - Is not at or near its monthly quota cap (the cost-guard hard stop —
+      ``server.quota_exhaustion_percent``, LP-0MVF7KO8C005NB59)
+
+    Quota-managed (``opencode-*``) entries are considered in descending
+    headroom urgency instead of config order — see
+    :func:`_quota_ranked_providers`.
 
     Args:
         model_config: Model configuration dict. Must contain a ``providers``
                       key whose value is an ordered list of provider configs.
         failed_provider: Optional name of a provider that just failed and
                          should be skipped.
+        config: Optional proxy config, used for the quota-ordering gates
+                (``server.quota_surge_*``). ``None`` falls back to the
+                documented defaults.
 
     Returns:
         A provider config dict (with keys ``name``, ``type``, etc.), or
         ``None`` if no provider is available.
     """
-    providers: list[dict[str, Any]] | None = model_config.get("providers")
+    providers = _quota_ranked_providers(model_config, config)
     if not providers:
         return None
 
@@ -2046,6 +2467,25 @@ def resolve_provider(
                 int(reset_remaining),
             )
             continue
+        # Proactive quota state says this account has nothing left to spend
+        # (LP-0MVF7KIKE002DZVD): treat it as unavailable instead of burning a
+        # dispatch on a guaranteed limit error.
+        quota_reason = _quota_unavailable_reason(provider_cfg, config)
+        if quota_reason is not None:
+            logger.info("Skipping provider=%s: %s", name, quota_reason)
+            continue
+        # Quota hard stop (LP-0MVF7KO8C005NB59): at-or-near the monthly cap the
+        # entry is skipped before any upstream request is attempted. Runs after
+        # the usage-limit-quarantine and cooldown checks so those reasons keep
+        # their precedence, and before the available_times/surge gate so the
+        # final-week surge can never re-enable an exhausted account. The
+        # guard is independent of the surge kill switch/dry-run.
+        quota_hard_stop, quota_stop_reason = _quota_exhausted(
+            provider_cfg, config
+        )
+        if quota_hard_stop:
+            logger.info("Skipping provider=%s: %s", name, quota_stop_reason)
+            continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
         if cooldown_key is not None:
             remaining = _provider_cooldown_remaining(cooldown_key)
@@ -2056,7 +2496,7 @@ def resolve_provider(
                 remaining,
             )
             continue
-        if not _is_within_allowed_window(provider_cfg):
+        if not _provider_in_allowed_window(provider_cfg, config):
             logger.info(
                 "Skipping provider=%s: outside its available_times window (UTC)",
                 name,
@@ -2378,17 +2818,228 @@ def _is_within_allowed_window(provider_cfg: dict, now_utc: datetime | None = Non
     return False
 
 
-def _seconds_until_next_window(provider_cfg: dict, now_utc: datetime | None = None) -> float | None:
+# ---------------------------------------------------------------------------
+# Final-week available_times surge bypass (LP-0MVF7KJN2000ASE8)
+#
+# During the final ``server.quota_surge_days`` (default 7) before an
+# ``opencode-*`` account's monthly reset its remaining allowance is
+# use-it-or-lose-it, so the ``available_times`` restriction (a pricing-only
+# off-peak gate, LP-0MS4ETBNO0022QAC) is lifted for THAT account: the residual
+# may be spent at any UTC hour. Nothing else is bypassed — cooldown,
+# ``rate_limit_rpm`` budget, the sibling-failure circuit breaker, failure-domain
+# grouping, usage-limit quarantine and stall gates all keep running unchanged
+# (child AC6 / epic R7).
+#
+# The window is computed per account from its OWN ``resetsAt`` (reset dates are
+# not calendar-aligned) and the bypass clears automatically when the account
+# becomes exhausted or its reset passes (child AC5b).
+# ---------------------------------------------------------------------------
+
+#: account key -> last observed bypass state, for once-per-transition logging.
+_SURGE_BYPASS_LOGGED: dict[str, bool] = {}
+
+#: ``(decision, account)`` pairs already reported in dry-run, so a dry run
+#: names each would-be decision once per account instead of on every request.
+_QUOTA_DRY_RUN_LOGGED: set[tuple[str, str]] = set()
+
+
+def reset_surge_bypass_state() -> None:
+    """Forget per-account transition / dry-run decision log state (tests)."""
+    _SURGE_BYPASS_LOGGED.clear()
+    _QUOTA_DRY_RUN_LOGGED.clear()
+
+
+def _log_quota_skip_decision(
+    provider_cfg: dict, snapshot: quota_state.QuotaSnapshot
+) -> None:
+    """INFO once per account that a dry run *would* have skipped the entry.
+
+    Dry-run must not change eligibility (child AC8b), so the decision is
+    reported and the caller returns ``None`` (fail open) instead of skipping.
+    The ``reason=quota_surge_dry_run`` code keeps these lines greppable apart
+    from the applied ``reason=quota_exhausted`` skips.
+    """
+    key = ("skip", snapshot.account)
+    if key in _QUOTA_DRY_RUN_LOGGED:
+        return
+    _QUOTA_DRY_RUN_LOGGED.add(key)
+    logger.info(
+        "quota_skip dry_run would_skip=true provider=%s account=%s "
+        "effective_headroom=%.1f%% resets_in=%ds reason=quota_surge_dry_run",
+        str(provider_cfg.get("name") or "unknown"),
+        snapshot.account,
+        snapshot.effective_headroom,
+        int(snapshot.seconds_to_reset),
+    )
+
+
+def _log_surge_bypass_dry_run(
+    provider_cfg: dict, snapshot: quota_state.QuotaSnapshot
+) -> None:
+    """INFO once per account that a dry run *would* have lifted the window.
+
+    The would-be bypass is exactly the decision that differs from today's
+    routing (the configured ``available_times`` window still applies in
+    dry-run), so it is logged with ``reason=quota_surge_dry_run`` while the
+    eligibility decision itself stays unchanged (child AC8b).
+    """
+    key = ("bypass", snapshot.account)
+    if key in _QUOTA_DRY_RUN_LOGGED:
+        return
+    _QUOTA_DRY_RUN_LOGGED.add(key)
+    resets_at = snapshot.monthly.resets_at
+    resets_at_text = (
+        resets_at.isoformat().replace("+00:00", "Z") if resets_at else "unknown"
+    )
+    logger.info(
+        "quota_surge_bypass dry_run would_bypass=true provider=%s account=%s "
+        "resets_at=%s seconds_to_reset=%ds reason=quota_surge_dry_run",
+        str(provider_cfg.get("name") or "unknown"),
+        snapshot.account,
+        resets_at_text,
+        int(snapshot.seconds_to_reset),
+    )
+
+
+def _quota_surge_applies(config: dict | None = None) -> bool:
+    """Config-level gate: surge is enabled and not in dry-run.
+
+    The single review point for the kill switch (``quota_surge_enabled``) and
+    dry-run (``quota_surge_dry_run``). The per-account decision (including the
+    stale-state suspension) is made by
+    :func:`proxy.quota_state.quota_behaviour`; this helper only answers
+    "would surge be allowed at all for this config?".
+    """
+    return quota_pacing.surge_enabled(config) and not quota_pacing.surge_dry_run(
+        config
+    )
+
+
+def _log_surge_bypass_transition(
+    provider_cfg: dict,
+    snapshot: quota_state.QuotaSnapshot,
+    active: bool,
+) -> None:
+    """Log one INFO line per account state change (enter / leave) only.
+
+    Per-request logging would flood the log; the transition is remembered per
+    quota account (``api_key_env``, so two entries on independent keys track
+    independently). The line carries ``reason=quota_surge`` so operators can
+    grep the bypass, plus the account and its ``resetsAt``.
+    """
+    account = quota_state.account_key(provider_cfg)
+    previous = _SURGE_BYPASS_LOGGED.get(account, False)
+    if previous is active:
+        return
+    _SURGE_BYPASS_LOGGED[account] = active
+    resets_at = snapshot.monthly.resets_at
+    resets_at_text = (
+        resets_at.isoformat().replace("+00:00", "Z") if resets_at else "unknown"
+    )
+    logger.info(
+        "quota_surge_bypass %s provider=%s account=%s resets_at=%s "
+        "seconds_to_reset=%ds reason=quota_surge",
+        "entered" if active else "left",
+        str(provider_cfg.get("name") or "unknown"),
+        account,
+        resets_at_text,
+        int(snapshot.seconds_to_reset),
+    )
+
+
+def _quota_surge_bypass_active(
+    provider_cfg: dict, config: dict | None = None
+) -> bool:
+    """True when the final-week surge removes this entry's time restriction.
+
+    Active only when **all** hold (child AC5 / epic R4):
+
+    - the entry is quota-managed (:func:`proxy.quota_state.is_quota_provider`);
+    - :func:`_quota_behaviour` reports ``enabled`` — the central predicate, so
+      the kill switch, dry-run and stale-state suspension all switch the
+      bypass off (children AC8 / AC8b / AC9);
+    - a snapshot exists and is not
+      :attr:`~proxy.quota_state.QuotaSnapshot.exhausted`;
+    - ``0 < seconds_to_reset <= server.quota_surge_days * 86400``, measured
+      from the account's own monthly ``resetsAt``.
+
+    A missing snapshot fails closed (no bypass): without authoritative quota
+    state the configured ``available_times`` gate stands. A **stale** snapshot
+    suspends the bypass (fail-safe revert to the configured window), and the
+    live transition state is dropped so a later recovery logs a fresh
+    ``entered`` line. In dry-run the would-be bypass is logged once per
+    account with ``reason=quota_surge_dry_run`` and ``False`` is returned, so
+    eligibility, retry-after and next-window values stay unchanged.
+    The module clock is injectable through
+    :func:`proxy.quota_state.set_clock`, so the reset horizon is deterministic
+    in tests.
+    """
+    if not quota_state.is_quota_provider(provider_cfg, config):
+        return False
+    behaviour = _quota_behaviour(config)
+    if behaviour.disabled:
+        return False
+    if behaviour.suspended:
+        # Fail-safe: stale state must not lift a configured restriction. Drop
+        # the live transition flag so a later recovery re-logs ``entered``.
+        _SURGE_BYPASS_LOGGED[quota_state.account_key(provider_cfg)] = False
+        return False
+    snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+    if snapshot is None:
+        return False
+    active = not snapshot.exhausted and quota_pacing.surge_window_active(
+        snapshot.seconds_to_reset, config
+    )
+    if behaviour.dry_run:
+        if active:
+            _log_surge_bypass_dry_run(provider_cfg, snapshot)
+        return False
+    _log_surge_bypass_transition(provider_cfg, snapshot, active)
+    return active
+
+
+def _provider_in_allowed_window(
+    provider_cfg: dict,
+    config: dict | None = None,
+    now_utc: datetime | None = None,
+) -> bool:
+    """True when *provider_cfg* may be used now: window **or** surge bypass.
+
+    The single eligibility predicate every resolution path (and the
+    retry-after / diagnostics derivations) uses for ``available_times``, so
+    they can never disagree: :func:`_is_within_allowed_window` is unchanged and
+    the final-week bypass is layered on top of it (LP-0MVF7KJN2000ASE8).
+    Nothing else is relaxed — callers keep checking cooldown, budget, circuit
+    breaker, failure domains, quarantine and stall gates themselves.
+    The bypass itself is off whenever surge is in dry-run, suspended (stale
+    quota state) or disabled, so eligibility, ``retry_after`` and
+    next-window values are byte-identical to the pre-feature behaviour in
+    those modes (LP-0MVF7KPB9009U7CG).
+    """
+    if _is_within_allowed_window(provider_cfg, now_utc=now_utc):
+        return True
+    return _quota_surge_bypass_active(provider_cfg, config)
+
+
+def _seconds_until_next_window(
+    provider_cfg: dict,
+    now_utc: datetime | None = None,
+    config: dict | None = None,
+) -> float | None:
     """Return seconds until the provider's next available_times window opens.
 
     Returns ``None`` when the provider is currently inside its window or has
     no ``available_times`` restriction. Otherwise returns the positive number
     of seconds until the next window start (UTC).
+
+    A surged entry (LP-0MVF7KJN2000ASE8) is already usable, so it contributes
+    no phantom "next window" delay: the surge bypass is part of the
+    eligibility check via :func:`_provider_in_allowed_window` (child AC5b).
     """
     windows = _parse_available_times(provider_cfg)
     if windows is None:
         return None
-    if _is_within_allowed_window(provider_cfg, now_utc=now_utc):
+    if _provider_in_allowed_window(provider_cfg, config, now_utc=now_utc):
         return None
     if now_utc is None:
         now_utc = datetime.now(UTC)
@@ -2416,6 +3067,7 @@ def _compute_retry_after(
     unavailable_providers: dict | None = None,
     model_config: dict | None = None,
     now_utc: datetime | None = None,
+    config: dict | None = None,
 ) -> int:
     """Compute an honest ``retry_after`` (seconds) from real availability data.
 
@@ -2424,6 +3076,10 @@ def _compute_retry_after(
     - available_times window edges (seconds until next window for providers
       currently outside their window)
     - usage-limit reset times (``_usage_reset_at`` remaining seconds)
+
+    ``config`` enables the final-week surge bypass for the window edges: a
+    surged entry is usable now, so it contributes no delay
+    (LP-0MVF7KJN2000ASE8, child AC5b).
 
     Returns 0 when every provider is actually available (edge case).
     """
@@ -2440,7 +3096,7 @@ def _compute_retry_after(
         for p in (model_config.get("providers") or []):
             if not isinstance(p, dict):
                 continue
-            secs = _seconds_until_next_window(p, now_utc=now_utc)
+            secs = _seconds_until_next_window(p, now_utc=now_utc, config=config)
             if secs is not None and secs > 0:
                 candidates.append(secs)
 
@@ -2453,6 +3109,88 @@ def _compute_retry_after(
     if not candidates:
         return 0
     return int(max(candidates))
+
+
+#: Attempt statuses recorded when the proactive free-tier request-budget gate
+#: (``proxy.provider_budget.acquire_provider_budget``) denied a dispatch. A
+#: budget skip applies NO cooldown and NO usage-limit quarantine, so the
+#: generic exhaustion payload carries ``unavailable={}`` and
+#: ``_compute_retry_after`` finds no candidate (returns 0) even though the
+#: provider comes back as soon as its rolling window drains
+#: (LP-0MVF0N9SA0071LWM).
+_BUDGET_SKIP_STATUSES = frozenset({"rate_limited"})
+
+
+def _budget_window_retry_after(
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> int:
+    """Derive a ``retry_after`` from a free-tier budget window rollover.
+
+    A budget skip is the one exhaustion cause that records no cooldown and no
+    reset time: the provider is healthy and simply out of allowance for the
+    rest of its sliding window. Without this derivation the exhaustion payload
+    advertises ``retry_after: 0`` — which the chain-hold reads as "instant
+    recovery" and retries immediately, replaying every cycle inside the same
+    still-full window (the measured 13/11 ``munitoai-free`` failure,
+    LP-0MVF0N9SA0071LWM).
+
+    For every diagnostics entry that IS a budget skip (``status`` in
+    :data:`_BUDGET_SKIP_STATUSES`, entry carrying a window cap), ask the rate
+    limiter how long until that entry's window frees a slot and take the
+    EARLIEST positive rollover: the next cycle can succeed as soon as ANY
+    provider regains capacity. ``0`` is returned when no budget-skipped entry
+    is waiting on its window (capacity is available now, or the blockers are
+    not budget-related) so genuine instant recovery keeps zero added latency.
+
+    The derived value can never exceed the limiter's window
+    (:data:`RATE_LIMIT_WINDOW_SECONDS`), so it is inherently within the
+    chain-hold budgets; the caller additionally caps the advertised value with
+    ``max_retry_after_seconds`` and ``_bounded_hold_seconds`` bounds the hold
+    by ``chain_hold_seconds`` / ``chain_hold_total_seconds``.
+    """
+    if not diagnostics:
+        return 0
+    try:
+        from proxy.rate_limiter import get_rate_limiter
+
+        limiter = get_rate_limiter()
+    except Exception:  # pragma: no cover - defensive: limiter always importable
+        return 0
+
+    rollovers: list[float] = []
+    for attempt in diagnostics:
+        if not isinstance(attempt, dict):
+            continue
+        if attempt.get("status") not in _BUDGET_SKIP_STATUSES:
+            continue
+        entry_name = str(attempt.get("provider") or "")
+        if not entry_name:
+            continue
+        # ``effective_limit`` is the per-window cap actually applied to this
+        # request (``limit_rpm - reserve`` for a new session, ``limit_rpm``
+        # for an affinity session); fall back to the entry's own limit.
+        cap = 0
+        for key in ("effective_limit", "limit_rpm"):
+            try:
+                cap = int(attempt.get(key) or 0)
+            except (TypeError, ValueError):
+                cap = 0
+            if cap > 0:
+                break
+        if cap <= 0:
+            continue
+        try:
+            seconds = limiter.seconds_until_capacity(
+                entry_name, cap, RATE_LIMIT_WINDOW_SECONDS
+            )
+        except Exception:  # pragma: no cover - defensive: limiter is sync/cheap
+            continue
+        if seconds > 0:
+            rollovers.append(seconds)
+
+    if not rollovers:
+        return 0
+    return int(math.ceil(min(rollovers)))
 
 
 # Client-facing exhaustion retry-timer cap (LP-0MV0MM5R60025XZE). The honest
@@ -2556,7 +3294,9 @@ def _record_quarantine_attempts(
     return quarantined
 
 
-def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
+def _providers_outside_window(
+    model_config: dict, config: dict | None = None
+) -> list[dict[str, str]]:
     """Return ``{name, type}`` pairs for providers whose ``available_times``
     window excludes the current UTC time.
 
@@ -2567,12 +3307,15 @@ def _providers_outside_window(model_config: dict) -> list[dict[str, str]]:
     is also usage-limit quarantined is excluded: quarantine is the true reason
     and is reported once as ``usage_limit_reset`` by
     ``_record_quarantine_attempts`` (LP-0MU56ZFVD001LP0H).
+
+    A surged entry (:func:`_provider_in_allowed_window`) is not restricted, so
+    it is never reported as a window skip (LP-0MVF7KJN2000ASE8).
     """
     result: list[dict[str, str]] = []
     for p in model_config.get("providers") or []:
         if not isinstance(p, dict):
             continue
-        if _is_within_allowed_window(p):
+        if _provider_in_allowed_window(p, config):
             continue
         if _usage_reset_remaining(_usage_limit_account_key(p)) > 0:
             continue  # quarantine takes precedence over the window reason
@@ -2664,7 +3407,244 @@ def _parse_retry_after(response: Response) -> float | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Upstream x-ratelimit-* header support (LP-0MVBHDNLB007ALLJ)
+#
+# Some gateways (notably MunitoAI) answer HTTP 429 with custom
+# ``x-ratelimit-*`` headers instead of the standard ``Retry-After``.  Those
+# headers carry the upstream's own reset timing, so honouring them yields a
+# truthful cooldown instead of a blind exponential-backoff guess that keeps
+# probing an endpoint which is guaranteed to reject for the whole window.
+#
+# Support is opt-in: either a provider entry sets
+# ``respect_ratelimit_headers: true`` or the behaviour is enabled globally
+# under ``server.respect_ratelimit_headers``.  When neither is set the new
+# code paths are never reached and every existing provider behaves exactly as
+# before (backward compatibility).
+# ---------------------------------------------------------------------------
 
+# (label, reset header, remaining header) for each rate-limit dimension an
+# upstream may report.  The label is only used in diagnostics.
+_RATELIMIT_RESET_HEADERS: tuple[tuple[str, str, str], ...] = (
+    ("requests", "x-ratelimit-reset-requests", "x-ratelimit-remaining-requests"),
+    ("tokens", "x-ratelimit-reset-tokens", "x-ratelimit-remaining-tokens"),
+    (
+        "input_tokens",
+        "x-ratelimit-reset-input-tokens",
+        "x-ratelimit-remaining-input-tokens",
+    ),
+    (
+        "output_tokens",
+        "x-ratelimit-reset-output-tokens",
+        "x-ratelimit-remaining-output-tokens",
+    ),
+)
+
+# One ``<number><unit>`` segment.  ``ms`` is matched before ``m`` so the
+# millisecond suffix is not misread as minutes.
+_RATELIMIT_DURATION_SEGMENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)")
+
+_RATELIMIT_UNIT_SECONDS: dict[str, float] = {
+    "ms": 0.001,
+    "s": 1.0,
+    "m": 60.0,
+    "h": 3600.0,
+    "d": 86400.0,
+}
+
+# Extra seconds added on top of the upstream reset so a cooldown never expires
+# exactly at the boundary the upstream reported (clock skew / queueing).
+_RATELIMIT_COOLDOWN_MARGIN_SECONDS = 2.0
+
+
+def _parse_ratelimit_duration(value: Any) -> float | None:
+    """Parse a single ``x-ratelimit-reset-*`` value into seconds.
+
+    Accepts a bare number (seconds), or one or more concatenated
+    ``<number><unit>`` segments such as ``52s``, ``1m``, ``1h30m`` or
+    ``250ms``.  Returns ``None`` for a missing, empty or unparseable value so
+    the caller falls back to the existing backoff untouched.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    # Bare number -> seconds (the Retry-After convention).
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    total = 0.0
+    position = 0
+    matched = False
+    for match in _RATELIMIT_DURATION_SEGMENT_RE.finditer(text):
+        # Reject gaps between segments (e.g. ``1x2s``) so a malformed header
+        # is not partially honoured.
+        if text[position:match.start()].strip():
+            return None
+        total += float(match.group(1)) * _RATELIMIT_UNIT_SECONDS[match.group(2)]
+        position = match.end()
+        matched = True
+    if not matched or text[position:].strip():
+        return None
+    return total
+
+
+def _ratelimit_over_limit(headers) -> bool:
+    """Return ``True`` when the upstream flags the account as over-limit.
+
+    MunitoAI sends ``x-ratelimit-over-limit: yes`` alongside the reset headers.
+    Parsing it keeps the flag available for diagnostics and lets callers
+    distinguish a rate-limited 429 from an unrelated error.
+    """
+    value = headers.get("x-ratelimit-over-limit") if headers is not None else None
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
+def _parse_ratelimit_reset_seconds(headers) -> float | None:
+    """Return the longest most-relevant ``x-ratelimit-reset-*`` duration.
+
+    Preference order:
+
+    1. When one or more dimensions report ``x-ratelimit-remaining-*`` at or
+       below zero, use the longest reset among those exhausted dimensions —
+       that is the wait the upstream actually demands before the next request
+       can succeed.
+    2. Otherwise use the longest parseable reset across all dimensions (a 429
+       with reset headers is evidence of *a* limit, so the most conservative
+       reported reset is honoured).
+
+    Returns ``None`` when no dimension carries a parseable reset, preserving
+    the caller's existing exponential-backoff behaviour.
+    """
+    if headers is None:
+        return None
+    exhausted: list[float] = []
+    all_resets: list[float] = []
+    for _label, reset_header, remaining_header in _RATELIMIT_RESET_HEADERS:
+        reset = _parse_ratelimit_duration(headers.get(reset_header))
+        if reset is None:
+            continue
+        all_resets.append(reset)
+        remaining = _parse_ratelimit_duration(headers.get(remaining_header))
+        if remaining is not None and remaining <= 0:
+            exhausted.append(reset)
+    if exhausted:
+        return max(exhausted)
+    if all_resets:
+        return max(all_resets)
+    return None
+
+
+def _coerce_optional_bool(value: Any) -> bool:
+    """Coerce a config value to a bool, tolerating YAML/env string forms."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _get_respect_ratelimit_headers(
+    config: dict | None, provider_cfg: dict | None = None
+) -> bool:
+    """Return whether ``x-ratelimit-*`` headers should drive 429 cooldowns.
+
+    The per-provider entry flag takes precedence over the global
+    ``server.respect_ratelimit_headers`` setting (a flat top-level key is also
+    accepted for unit-test convenience).  Defaults to ``False`` so existing
+    providers are unaffected (LP-0MVBHDNLB007ALLJ AC6).
+    """
+    if isinstance(provider_cfg, dict):
+        value = provider_cfg.get("respect_ratelimit_headers")
+        if value is not None:
+            return _coerce_optional_bool(value)
+    if isinstance(config, dict):
+        value = config.get("respect_ratelimit_headers")
+        if value is not None:
+            return _coerce_optional_bool(value)
+        server_cfg = config.get("server")
+        if isinstance(server_cfg, dict):
+            value = server_cfg.get("respect_ratelimit_headers")
+            if value is not None:
+                return _coerce_optional_bool(value)
+    return False
+
+
+def _get_ratelimit_cooldown_margin_seconds(config: dict | None) -> float:
+    """Read the safety margin added to a header-derived cooldown.
+
+    Supports both the nested production form
+    (``server.ratelimit_cooldown_margin_seconds``) and a flat key for unit
+    tests.  Defaults to :data:`_RATELIMIT_COOLDOWN_MARGIN_SECONDS`; a missing,
+    malformed or negative value falls back to the default.
+    """
+    default = _RATELIMIT_COOLDOWN_MARGIN_SECONDS
+    if not isinstance(config, dict):
+        return default
+    raw = config.get("ratelimit_cooldown_margin_seconds")
+    if raw is None:
+        server_cfg = config.get("server")
+        if isinstance(server_cfg, dict):
+            raw = server_cfg.get("ratelimit_cooldown_margin_seconds")
+    if raw is None or isinstance(raw, bool):
+        return default
+    try:
+        margin = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if margin < 0:
+        return default
+    return margin
+
+
+def _apply_ratelimit_account_quarantine(
+    response: Response,
+    body_text: str,
+    provider_cfg: dict,
+    ratelimit_reset: float | None,
+) -> float | None:
+    """Quarantine the failing API-key ACCOUNT for an upstream reset window.
+
+    A quota 429 (a per-account rate-limit error or an explicit
+    ``x-ratelimit-over-limit`` flag) that also carries a parseable
+    ``x-ratelimit-reset-*`` duration is evidence the upstream will not serve
+    that ACCOUNT until the reported reset. The ENTRY-level cooldown applied by
+    :func:`_handle_http_error_with_cooldown` (reset + the 2 s
+    ``_RATELIMIT_COOLDOWN_MARGIN_SECONDS``) is only in-memory for that entry;
+    recording the reset as an explicit ACCOUNT quarantine here makes the wait
+    survive the request, feeds :func:`_compute_retry_after` and the chain-hold,
+    and is persisted to ``provider-state.json`` (LP-0MVFA1VRT007T9HT).
+
+    The quarantine is keyed on :func:`_usage_limit_account_key`
+    (``api_key_env@endpoint:model``), so a paid sibling on the same gateway
+    with an independent quota is never poisoned. ``explicit=True`` keeps it
+    exempt from the guessed-quarantine 24 h cap and the self-healing probe.
+
+    Returns the applied quarantine duration (parsed reset plus the existing
+    2-minute :data:`_USAGE_LIMIT_RESET_MARGIN_SECONDS`) when a quarantine was
+    recorded, otherwise ``None`` (the caller then keeps the pre-existing
+    behaviour untouched).
+    """
+    if ratelimit_reset is None:
+        return None
+    if int(getattr(response, "status_code", 0) or 0) != 429:
+        return None
+    if not (
+        _is_account_rate_limit_error(response, body_text)
+        or _ratelimit_over_limit(response.headers)
+    ):
+        return None
+    quarantine_seconds = ratelimit_reset + _USAGE_LIMIT_RESET_MARGIN_SECONDS
+    _set_usage_limit_quarantine(
+        _usage_limit_account_key(provider_cfg),
+        _UsageLimitReset(quarantine_seconds, True, "x-ratelimit-headers"),
+    )
+    return quarantine_seconds
 
 
 def _get_cooldown_seconds(config: dict) -> float:
@@ -3122,12 +4102,13 @@ def _resolve_display_provider_name(provider_cfg: dict) -> str | None:
     """Resolve the human-readable provider component used in X-Resolved-Model.
 
     Priority: ``display_name`` (opt-in tier-aware label, e.g. ``MunitoAI
-    Free``) -> ``provider`` (actual provider brand name) -> ``name``
-    (provider entry name). The ``display_name`` field lets operators
-    distinguish provider tiers (free vs paid) that share a brand + model,
-    without touching failure-domain, cooldown, or usage-limit keys (which key
-    on endpoint, model, api_key_env, brand and entry name upstream of this
-    display string) (LP-0MVCQ36QV009QX8K).
+    Free`` / ``OpenCode Go 3``) -> ``provider`` (actual provider brand name)
+    -> ``name`` (provider entry name). The ``display_name`` field lets
+    operators distinguish provider tiers (free vs paid; same-brand accounts
+    such as the OpenCode Go tiers -- LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62)
+    that share a brand + model, without touching failure-domain, cooldown,
+    or usage-limit keys (which key on endpoint, model, api_key_env, brand
+    and entry name upstream of this display string).
     """
     return (
         provider_cfg.get("display_name")
@@ -3288,7 +4269,17 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
             media_type="application/json",
         )
 
-    retry_after = _compute_retry_after(unavailable_providers, model_config=model_config)
+    retry_after = _compute_retry_after(
+        unavailable_providers, model_config=model_config, config=config
+    )
+    if retry_after <= 0:
+        # Budget-skip-only exhaustion (LP-0MVF0N9SA0071LWM): a free-tier
+        # rolling-window skip records no cooldown and no usage-limit reset, so
+        # ``_compute_retry_after`` has no candidate and would advertise 0.
+        # Derive the wait from the window rollover instead, otherwise the
+        # chain-hold treats the exhaustion as instant recovery and replays
+        # every cycle inside the still-full window.
+        retry_after = _budget_window_retry_after(diagnostics)
     client_retry_after = min(retry_after, _max_retry_after_seconds(config))
     payload: dict[str, Any] = {
         "error": "All providers exhausted",
@@ -3365,7 +4356,9 @@ def _build_time_window_exhausted_response(
             if isinstance(p, dict) and p.get("name") not in window_names:
                 return None
 
-    retry_after = _compute_retry_after(unavailable, model_config=model_config)
+    retry_after = _compute_retry_after(
+        unavailable, model_config=model_config, config=config
+    )
     client_retry_after = min(retry_after, _max_retry_after_seconds(config))
     payload: dict[str, Any] = {
         "error": "All providers exhausted",
@@ -3675,19 +4668,32 @@ def _local_slot_free(
 # Bounded cross-session contention queue (LP-0MSORQVK50012Q4D)
 # ---------------------------------------------------------------------------
 
-def _contention_queue_enabled(config: dict) -> bool:
-    """True when the contention queue should engage: queue policy.
+def _contention_queue_enabled(config: dict, priority: str | None = None) -> bool:
+    """True when the contention queue should engage for *priority* (AC3).
 
-    The per-mode policy comes from the active mode config
-    (``contention_queue_policy``; config-cheap.yaml declares ``queue`` with
-    depth 8 / wait 120s, config-fast.yaml declares ``queue`` with depth 3 /
-    wait 45s — LP-0MTQYIK4Z008XF2V). The active mode's config determines
-    the depth and wait caps; the policy gate ensures ``fallback`` config
-    files never engage the queue. Fail-open: any error → queue disabled.
+    The queue policy was a per-mode knob known to the active mode config
+    (``contention_queue_policy``; the retired config-fast.yaml /
+    config-cheap.yaml both declared ``queue`` depth 8 / wait 120s). With the
+    mode axis removed the policy is a server-level knob and priority gates
+    entry:
+
+    - ``high``  — never queues (immediate remote fallback when local slots
+      are busy).
+    - ``low``   — always queues (bounded by the configured caps): prefer a
+      local slot over a paid remote call.
+    - ``medium`` — today's behaviour: engages when the merged base config's
+      ``contention_queue_policy`` is ``queue``.
+
+    The configured depth/wait caps always bound the queue. Fail-open: any
+    error → queue disabled (a broken policy never parks a request).
     """
     try:
         from proxy.router import _get_contention_queue_config
 
+        if priority is not None:
+            profile = priority_routing_profile(priority, config.get("server", config))
+            if priority in (PRIORITY_HIGH, PRIORITY_LOW):
+                return bool(profile.get("queue"))
         server_cfg = config.get("server", config) if isinstance(config, dict) else {}
         cq = _get_contention_queue_config(server_cfg)
         if cq["policy"] != "queue":
@@ -3704,27 +4710,39 @@ async def _queue_context_bypass(
     request,
     body_json: dict,
     session_id: str | None,
+    priority: str | None = None,
 ) -> tuple[bool, str | None]:
     """Mirror of the smart-routing large-context skip decision.
 
-    Used ONLY at the contention-queue decision point.  In cheap mode,
-    ``large_context_bypass`` is recovered (the request proceeds to local
-    and may queue); only ``context_too_large`` is a hard bypass
+    Used ONLY at the contention-queue decision point.  Priority-gated (AC3):
+    for ``low`` (cheap semantics) ``large_context_bypass`` is recovered (the
+    request proceeds to local and may queue); ``high`` and ``medium`` keep
+    today's behaviour where only ``context_too_large`` is a hard bypass
     (LP-0MU5A4QBR003YJM0).  Keeps the same
     thresholds/tokenizer/estimate/``_should_skip_local`` pipeline as the main
     smart-routing block below; returns ``(skip_local, skip_reason)``.
     """
     _llama_model = provider_cfg.get("llama_model", "")
     _cold_threshold, _warm_threshold = _effective_large_context_thresholds(config)
+    # A LOCAL entry's ``max_context_tokens`` (LP-0MVF9N2QL001CDA7 AC7) composes
+    # as an additional hard cap here too, so a request the local gate will skip
+    # is never queued for a local slot (AC6 queue-safety).
+    _local_context_limit = _provider_context_limit(provider_cfg)
+    if _local_context_limit > 0:
+        _warm_threshold = (
+            min(_warm_threshold, _local_context_limit)
+            if _warm_threshold > 0
+            else _local_context_limit
+        )
     _tokenizer, _multiplier = _get_tokenizer_for_model(model_config, config)
     _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
         request, body_json, tokenizer=_tokenizer,
     )
     if _multiplier != 1.0:
         _estimated_tokens = int(_estimated_tokens * _multiplier)
-    # Pass the config-driven recovery flag so the cheap profile can recover
-    # economic bypasses (LP-0MU5A4QBR003YJM0)
-    _recover_economic = _economic_bypass_serves_local(config)
+    # Pass the priority-driven recovery flag (AC3): low priority recovers
+    # economic bypasses locally even when the base config flag is off.
+    _recover_economic = _economic_bypass_serves_local(config, priority)
     _skip_local, _skip_reason = _should_skip_local(
         _llama_model, session_id, body_json, _cold_threshold,
         estimated_tokens=_estimated_tokens,
@@ -3754,9 +4772,10 @@ async def _maybe_queue_for_local_slot(
     provider_cfg: dict,
     session_id: str | None,
     endpoint: str | None = None,
+    priority: str | None = None,
 ) -> tuple[str, str | None, float | None]:
-    """Queue-wait for a local slot (cheap mode, queue policy) instead of
-    immediately falling back to the next remote provider.
+    """Queue-wait for a local slot (low/medium priority, queue policy)
+    instead of immediately falling back to the next remote provider.
 
     Returns ``(action, reason, elapsed_seconds)`` where action is one of:
 
@@ -3768,15 +4787,17 @@ async def _maybe_queue_for_local_slot(
       - ``"context_bypass"`` — the request cannot fit a KV slot; it was
         never queued; the caller records ``cached_tokens_skip`` with the
         returned *reason*.
-      - ``"fallback_policy"`` — policy is fallback / not cheap mode; the
-        caller keeps today's ``local_concurrency_limit`` behavior.
+      - ``"fallback_policy"`` — policy is fallback / high priority never
+        queues; the caller keeps today's ``local_concurrency_limit``
+        behavior.
     """
-    if not _contention_queue_enabled(config):
+    if not _contention_queue_enabled(config, priority):
         return ("fallback_policy", None, None)
     # Context bypasses never queue (AC4): a request that cannot fit the KV
     # slot must fall back exactly as today.
     skip_local, skip_reason = await _queue_context_bypass(
         config, model_config, provider_cfg, request, body_json, session_id,
+        priority=priority,
     )
     if skip_local:
         return ("context_bypass", skip_reason, None)
@@ -3902,6 +4923,8 @@ def _has_next_provider(
     model_config: dict,
     attempted_provider_names: set[str],
     excluded_domains: set[str] | None = None,
+    *,
+    config: dict | None = None,
 ) -> bool:
     """True if at least one more provider remains untried (and not in cooldown).
 
@@ -3909,12 +4932,17 @@ def _has_next_provider(
     when the chain has a remaining provider to fall back to (LP-0MSETOTWY000SU0Z).
     Accepts already-failed failure domains so same-gateway siblings are not
     counted as a usable fallback (LP-0MSG45I8Q0020N1F).
+
+    Delegates to :func:`_resolve_provider_with_exclusions`, so it walks the
+    same headroom-ranked chain as resolution (LP-0MVF7KIKE002DZVD AC3b) and
+    must be given the same ``config``.
     """
     return (
         _resolve_provider_with_exclusions(
             model_config,
             attempted_provider_names,
             excluded_domains,
+            config=config,
         )
         is not None
     )
@@ -4055,6 +5083,8 @@ def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
     excluded_domains: set[str] | None = None,
+    *,
+    config: dict | None = None,
 ) -> dict | None:
     """Resolve next available provider while excluding names tried this request
     and any entry sharing an already-failed failure domain.
@@ -4065,8 +5095,12 @@ def _resolve_provider_with_exclusions(
     Usage-limit account keys (see ``_usage_limit_account_key``) are checked
     against the same set so an account exhausted by a usage-limit error is not
     retried via another entry sharing that account (LP-0MSMBWB23009XYPW).
+
+    Quota-managed entries are walked in descending headroom urgency order
+    (LP-0MVF7KIKE002DZVD); ``config`` supplies the ordering gates and defaults
+    to the documented behaviour when omitted.
     """
-    providers: list[dict[str, Any]] | None = model_config.get("providers")
+    providers = _quota_ranked_providers(model_config, config)
     if not providers:
         return None
 
@@ -4099,6 +5133,12 @@ def _resolve_provider_with_exclusions(
                 usage_key,
             )
             continue
+        # Proactive quota state says this account has nothing left to spend
+        # (LP-0MVF7KIKE002DZVD): treat it as unavailable.
+        quota_reason = _quota_unavailable_reason(provider_cfg, config)
+        if quota_reason is not None:
+            logger.info("Skipping provider=%s: %s", name, quota_reason)
+            continue
         reset_remaining = _usage_reset_remaining(usage_key)
         if reset_remaining > 0:
             logger.info(
@@ -4110,6 +5150,18 @@ def _resolve_provider_with_exclusions(
                 int(reset_remaining),
             )
             continue
+        # Quota hard stop (LP-0MVF7KO8C005NB59): at-or-near the monthly cap the
+        # entry is skipped before any upstream request is attempted. Runs after
+        # the usage-limit-quarantine and cooldown checks so those reasons keep
+        # their precedence, and before the available_times/surge gate so the
+        # final-week surge can never re-enable an exhausted account. The
+        # guard is independent of the surge kill switch/dry-run.
+        quota_hard_stop, quota_stop_reason = _quota_exhausted(
+            provider_cfg, config
+        )
+        if quota_hard_stop:
+            logger.info("Skipping provider=%s: %s", name, quota_stop_reason)
+            continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
         if cooldown_key is not None:
             remaining = _provider_cooldown_remaining(cooldown_key)
@@ -4120,7 +5172,7 @@ def _resolve_provider_with_exclusions(
                 remaining,
             )
             continue
-        if not _is_within_allowed_window(provider_cfg):
+        if not _provider_in_allowed_window(provider_cfg, config):
             logger.info(
                 "Skipping provider=%s: outside its available_times window (UTC)",
                 name,
@@ -5015,12 +6067,20 @@ def _handle_http_error_with_cooldown(
     attempts: list[dict[str, Any]],
     body_text: str,
     config: dict | None = None,
+    provider_cfg: dict | None = None,
 ) -> float:
     """Handle an HTTP error response: compute effective cooldown, mark the
     provider unavailable, record a diagnostic attempt entry, and return the
     effective cooldown duration.
 
     Applies exponential backoff for remote providers.
+
+    When the provider entry opts into ``respect_ratelimit_headers`` (or the
+    behaviour is enabled globally under ``server``), a 429 carrying parseable
+    ``x-ratelimit-reset-*`` headers sets the cooldown to at least the upstream
+    reset duration plus a small safety margin.  Exponential backoff still
+    applies, so a cooldown is the *longer* of the two and repeated failures
+    keep extending it sensibly (LP-0MVBHDNLB007ALLJ).
 
     Grace-period immunity (LP-0MV9UNIOZ009RIAN): while ``cold_start.is_cold()``
     is True and *provider_type* is ``"local"``, an HTTP 503 reflects llama-server
@@ -5054,6 +6114,20 @@ def _handle_http_error_with_cooldown(
     # Parse Retry-After separately so we can respect it alongside backoff
     retry_after = _parse_retry_after(response)
 
+    # Upstream x-ratelimit-* headers (LP-0MVBHDNLB007ALLJ): opt-in per entry or
+    # globally; only consulted for a 429 so unrelated HTTP errors keep the
+    # pre-existing behaviour exactly.  A missing/parseable-less reset leaves
+    # the exponential-backoff guess untouched (AC3).
+    ratelimit_reset: float | None = None
+    ratelimit_over_limit = False
+    if (
+        provider_cfg is not None
+        and int(response.status_code) == 429
+        and _get_respect_ratelimit_headers(config, provider_cfg)
+    ):
+        ratelimit_over_limit = _ratelimit_over_limit(response.headers)
+        ratelimit_reset = _parse_ratelimit_reset_seconds(response.headers)
+
     cooldown = cooldown_seconds
     if provider_type == "remote" and cooldown_seconds > 0:
         count = _provider_failure_count.get(provider_name, 0)
@@ -5068,16 +6142,38 @@ def _handle_http_error_with_cooldown(
     if retry_after is not None:
         cooldown = max(cooldown, retry_after)
 
+    # Honour the upstream's own reset timing when it is longer than the
+    # backoff guess: at least the reset duration plus a safety margin.
+    if ratelimit_reset is not None:
+        margin = _get_ratelimit_cooldown_margin_seconds(config)
+        cooldown = max(cooldown, ratelimit_reset + margin)
+
+    # Account-scoped application (LP-0MVFA1VRT007T9HT): the reset also poisons
+    # the failing API-key ACCOUNT (reset + 2-minute margin) so the wait outlives
+    # the entry cooldown and is consumed by the exclusion / retry-after / chain
+    # hold machinery unchanged. Only applied to a quota 429 that parsed a reset
+    # header; a plain 429 with no reset signal keeps the pre-existing behaviour.
+    account_quarantine_seconds: float | None = None
+    if ratelimit_reset is not None and provider_cfg is not None:
+        account_quarantine_seconds = _apply_ratelimit_account_quarantine(
+            response, body_text, provider_cfg, ratelimit_reset
+        )
+
     mark_provider_unavailable(provider_name, cooldown)
-    _record_attempt(
-        attempts,
-        provider=provider_name,
-        type=provider_type,
-        status="http_error",
-        status_code=int(response.status_code),
-        body_snippet=(body_text[:512] if body_text else None),
-        cooldown_seconds=cooldown,
-    )
+    attempt_fields: dict[str, Any] = {
+        "provider": provider_name,
+        "type": provider_type,
+        "status": "http_error",
+        "status_code": int(response.status_code),
+        "body_snippet": (body_text[:512] if body_text else None),
+        "cooldown_seconds": cooldown,
+    }
+    if ratelimit_reset is not None:
+        attempt_fields["ratelimit_reset_seconds"] = ratelimit_reset
+        attempt_fields["ratelimit_over_limit"] = ratelimit_over_limit
+    if account_quarantine_seconds is not None:
+        attempt_fields["account_quarantine_seconds"] = account_quarantine_seconds
+    _record_attempt(attempts, **attempt_fields)
     return cooldown
 
 
@@ -5948,9 +7044,48 @@ async def _proxy_with_remote_fallback_cycle(
     except Exception:
         pass
 
+    # Effective priority (AC1/AC2): cheap-window capped header value, stamped
+    # on the request; the remote-only chain is selected by it (priority_routes)
+    # just like the local+remote cycle, so a ``low`` request on a remote-only
+    # model uses its low chain (e.g. free-tier-first).
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+    _priority = request_priority(request, server_cfg)
+    from proxy.priority import set_request_priority
+
+    set_request_priority(request, _priority)
+    _chain = effective_chain_for_request(request, model_config, server_cfg)
+    if _chain:
+        model_config = {**model_config, "providers": _chain}
+    logger.info(
+        "priority_routing model=%s priority=%s providers=%d",
+        model_config.get("name") or "unknown",
+        _priority,
+        len(_chain or model_config.get("providers") or []),
+    )
+
+    # Per-entry context ceiling (LP-0MVF9N2QL001CDA7): parse the body once so
+    # the authoritative routing estimate can be computed lazily (once per
+    # cycle) for entries that declare ``max_context_tokens``. Fail-open on a
+    # body read error (e.g. a synthetic request without a ``body()`` method):
+    # routing must never break because the estimate cannot be produced, so the
+    # estimate degrades to whatever the session history yields (usually 0).
+    _raw_body = None
+    try:
+        _raw_body = await request.body()
+    except Exception:
+        logger.debug("max_context_tokens body read failed; gate disabled for this request")
+    try:
+        body_json = json.loads(_raw_body) if _raw_body else {}
+    except Exception:
+        body_json = {}
+    _routing_estimate = _RoutingEstimateCache(
+        request, body_json, model_config, config,
+    )
+
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
+            config=config,
         )
         if provider_cfg is None:
             break
@@ -5961,6 +7096,28 @@ async def _proxy_with_remote_fallback_cycle(
         try:
             # Mark that we attempted this provider
             any_provider_tried = True
+
+            # Per-entry context ceiling (LP-0MVF9N2QL001CDA7 AC2/AC5/AC6): a
+            # request whose estimate exceeds the entry's ``max_context_tokens``
+            # falls through to the next provider BEFORE the budget gate and
+            # dispatch. A skip is a size mismatch, not a failure — no cooldown,
+            # usage-limit reset, failure-domain exclusion or affinity — and it
+            # never consumes a rate-limit slot.
+            _entry_limit = _provider_context_limit(provider_cfg)
+            if _entry_limit > 0:
+                _entry_estimate = await _routing_estimate.get()
+                _context_skip, _context_limit = _should_skip_provider_context(
+                    provider_cfg, _entry_estimate,
+                )
+                if _context_skip:
+                    _record_provider_context_skip(
+                        attempts, provider_name, provider_type,
+                        _entry_estimate, _context_limit, _budget_session_id,
+                    )
+                    fallback_reason = "provider_context_exceeded"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    continue
 
             # Capacity-aware request budget for free-tier style entries
             # (LP-0MVDQ1GMO00801PL): dispatches only while the rolling window
@@ -6014,6 +7171,7 @@ async def _proxy_with_remote_fallback_cycle(
             # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
             if provider_type == "remote" and _has_next_provider(
                 model_config, attempted_provider_names, attempted_domains,
+                config=config,
             ):
                 try:
                     response = await _preflight_streaming_response(
@@ -6165,6 +7323,7 @@ async def _proxy_with_remote_fallback_cycle(
                 _handle_http_error_with_cooldown(
                     response, provider_name, provider_type,
                     cooldown_seconds, attempts, body_text, config,
+                    provider_cfg=provider_cfg,
                 )
                 # AC3 (LP-0MSGU3JNU0092AFQ): remember this specific 400 so the
                 # exhausted path can return a synthetic error instead of the
@@ -6271,7 +7430,7 @@ async def _proxy_with_remote_fallback_cycle(
     # Record time-window skips as distinct diagnostics so operators can tell
     # whether providers were excluded by their available_times windows rather
     # than by cooldown/errors (LP-0MS4ETBNO0022QAC).
-    for skipped in _providers_outside_window(model_config):
+    for skipped in _providers_outside_window(model_config, config):
         _record_attempt(
             attempts,
             provider=skipped["name"],
@@ -6512,6 +7671,33 @@ async def _proxy_with_fallback_cycle(
     except Exception:
         pass
 
+    # Effective priority (AC1/AC2): cheap-window capped header value, stamped
+    # on the request; the provider chain is selected by it (priority_routes).
+    # Rebound local ``model_config`` so the whole cycle (including the
+    # lease-active fallback below) iterates the priority-selected chain.
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+    _priority = request_priority(request, server_cfg)
+    from proxy.priority import set_request_priority
+
+    set_request_priority(request, _priority)
+    _chain = effective_chain_for_request(request, model_config, server_cfg)
+    if _chain:
+        model_config = {**model_config, "providers": _chain}
+    logger.info(
+        "priority_routing model=%s priority=%s providers=%d",
+        model_config.get("name") or "unknown",
+        _priority,
+        len(_chain or model_config.get("providers") or []),
+    )
+
+    # Shared per-cycle routing estimate (LP-0MVF9N2QL001CDA7 AC4): computed
+    # once on first use — by the local smart-routing gate and/or the per-entry
+    # ``max_context_tokens`` ceiling — and reused for every provider in the
+    # chain, so the gate never adds a tokenizer pass per entry.
+    _routing_estimate = _RoutingEstimateCache(
+        request, body_json, model_config, config,
+    )
+
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: list[dict[str, Any]] = []
     attempted_provider_names: set[str] = set()
@@ -6524,6 +7710,7 @@ async def _proxy_with_fallback_cycle(
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
+            config=config,
         )
         if provider_cfg is None and fallback_reason == "local_lease_active":
             # Local lease-active is expected contention, not provider failure.
@@ -6540,7 +7727,7 @@ async def _proxy_with_fallback_cycle(
                     continue
                 if candidate.get("type") != "remote":
                     continue
-                if not _is_within_allowed_window(candidate):
+                if not _provider_in_allowed_window(candidate, config):
                     continue
                 provider_cfg = candidate
                 break
@@ -6582,6 +7769,7 @@ async def _proxy_with_fallback_cycle(
                             config, cur_local, max_local, request, body_json,
                             model_config, provider_cfg, _session_id,
                             endpoint=local_endpoint,
+                            priority=_priority,
                         )
                     )
                     if _cq_action == "dispatch":
@@ -6666,6 +7854,18 @@ async def _proxy_with_fallback_cycle(
                 _cold_threshold, _warm_threshold = _effective_large_context_thresholds(
                     config
                 )
+                # Per-entry context ceiling on a LOCAL entry
+                # (LP-0MVF9N2QL001CDA7 AC7): ``max_context_tokens`` composes as
+                # an ADDITIONAL hard cap on the existing warm threshold —
+                # effective = ``min(existing, limit)`` — so it can only tighten
+                # the local gate, never loosen it.
+                _local_context_limit = _provider_context_limit(provider_cfg)
+                if _local_context_limit > 0:
+                    _warm_threshold = (
+                        min(_warm_threshold, _local_context_limit)
+                        if _warm_threshold > 0
+                        else _local_context_limit
+                    )
                 # Resolve the native tokenizer + multiplier via the shared
                 # helper (LP-0MSEQ71IF0003FRT): a named tokenizer (e.g.
                 # ``tokenizer: qwen3`` on the model entry) replaces the
@@ -6673,17 +7873,9 @@ async def _proxy_with_fallback_cycle(
                 # LP-0MSAOQTJS000FFVM F2/F3) with exact counts and forces
                 # the multiplier to 1.0; without a tokenizer, the server-
                 # level / per-model token_estimate_multiplier still applies
-                # (LP-0MSEGPO77005CYCQ F2).
-                _tokenizer, _multiplier = _get_tokenizer_for_model(
-                    model_config, config
-                )
-                _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
-                    request,
-                    body_json,
-                    tokenizer=_tokenizer,
-                )
-                if _multiplier != 1.0:
-                    _estimated_tokens = int(_estimated_tokens * _multiplier)
+                # (LP-0MSEGPO77005CYCQ F2). The estimate itself is shared per
+                # cycle (_RoutingEstimateCache) with the per-entry ceiling.
+                _estimated_tokens = await _routing_estimate.get()
                 # Compute once for reuse in logs and reason detection
                 _routing_cached_ratio = _get_cached_ratio(_llama_model, _session_id)
                 _routing_new_tokens = int(
@@ -6731,10 +7923,11 @@ async def _proxy_with_fallback_cycle(
                         ),
                         _get_context_pressure_warn_ratio(config),
                     )
-                # Resolve the config-driven economic-bypass recovery flag
-                # (LP-0MU5A4QBR003YJM0): set by config-cheap.yaml, absent/
-                # false in fast/default profiles.
-                _recover_economic = _economic_bypass_serves_local(config)
+                # Resolve the priority-driven economic-bypass recovery flag
+                # (AC3, LP-0MVDT94F0003VHUA): low priority recovers economic
+                # bypasses locally (cheap semantics); high routes remote;
+                # medium uses the merged base config flag (absent — false).
+                _recover_economic = _economic_bypass_serves_local(config, _priority)
                 _skip_local, _skip_reason = _should_skip_local(
                     _llama_model,
                     _session_id,
@@ -6790,14 +7983,9 @@ async def _proxy_with_fallback_cycle(
                     if _bypass_compaction["applied"]:
                         # Re-run local eligibility against the compacted size so
                         # a session bypassed purely for size can return to
-                        # local on this same request (AC2).
-                        _compacted_tokens = (
-                            await _estimate_effective_prompt_tokens_for_routing(
-                                request, body_json, tokenizer=_tokenizer,
-                            )
-                        )
-                        if _multiplier != 1.0:
-                            _compacted_tokens = int(_compacted_tokens * _multiplier)
+                        # local on this same request (AC2). ``recompute()`` also
+                        # refreshes the per-cycle cache for any later entry.
+                        _compacted_tokens = await _routing_estimate.recompute()
                         _skip_after, _skip_after_reason = _should_skip_local(
                             _llama_model,
                             _session_id,
@@ -6924,6 +8112,28 @@ async def _proxy_with_fallback_cycle(
                     return response
 
             else:
+                # Per-entry context ceiling (LP-0MVF9N2QL001CDA7 AC2/AC5/AC6):
+                # same gate as the remote-only cycle — an over-limit entry is
+                # skipped BEFORE the budget gate and dispatch, records no
+                # failure-side state, and the chain proceeds to the next
+                # eligible provider. The routing estimate is the shared
+                # per-cycle one, so a local probe above already paid for it.
+                _entry_limit = _provider_context_limit(provider_cfg)
+                if _entry_limit > 0:
+                    _entry_estimate = await _routing_estimate.get()
+                    _context_skip, _context_limit = _should_skip_provider_context(
+                        provider_cfg, _entry_estimate,
+                    )
+                    if _context_skip:
+                        _record_provider_context_skip(
+                            attempts, provider_name, provider_type,
+                            _entry_estimate, _context_limit, _session_id,
+                        )
+                        fallback_reason = "provider_context_exceeded"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        continue
+
                 # Capacity-aware request budget for free-tier style entries
                 # (LP-0MVDQ1GMO00801PL). See _proxy_with_remote_fallback_cycle:
                 # new sessions pass straight through, in-progress sessions wait
@@ -6974,6 +8184,7 @@ async def _proxy_with_fallback_cycle(
             # bare error to the client (LP-0MSETOTWY000SU0Z, Recommendation 1).
             if provider_type == "remote" and _has_next_provider(
                 model_config, attempted_provider_names, attempted_domains,
+                config=config,
             ):
                 try:
                     response = await _preflight_streaming_response(
@@ -7441,6 +8652,7 @@ async def _proxy_with_fallback_cycle(
                     _handle_http_error_with_cooldown(
                         response, provider_name, provider_type,
                         cooldown_seconds, attempts, body_text, config,
+                        provider_cfg=provider_cfg,
                     )
                     # Per-account rate limit (LP-0MVCX0E2V001VB5N): a 429 with
                     # body type=rate_limit_error / code=rate_limit_exceeded is a
@@ -7692,7 +8904,7 @@ async def _proxy_with_fallback_cycle(
     # Record time-window skips as distinct diagnostics so operators can tell
     # whether providers were excluded by their available_times windows rather
     # than by cooldown/errors (LP-0MS4ETBNO0022QAC).
-    for skipped in _providers_outside_window(model_config):
+    for skipped in _providers_outside_window(model_config, config):
         _record_attempt(
             attempts,
             provider=skipped["name"],

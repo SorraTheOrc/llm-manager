@@ -21,7 +21,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 import proxy.metrics as metrics  # noqa: F401 — srv.metrics used by handlers.py, observability.py
 from proxy import cold_start
-from proxy import mode as mode_module
 from proxy.disconnect_reaper import DisconnectReaperMiddleware
 from proxy.session_manager import DEFAULT_SESSION_TTL_SECONDS, SessionManager
 
@@ -148,18 +147,10 @@ provider_fallback_count: dict = {}
 # Background lease cleanup task (started in lifespan)
 _dispatch_cleanup_task: asyncio.Task | None = None
 
-# Session→model grandfathering registry (LP-0MSMF5LXO006YDNM). Loaded at
-# startup from the persisted state file; records which model each explicit
-# session uses so sessions active before a fast↔cheap mode switch keep their
-# model (and full provider chain) after the restart. None when disabled via
-# config (``server.mode_switch_grandfathering.enabled: false``).
-grandfathering_registry: Any | None = None
-# The OTHER mode's config (fast↔cheap), loaded once at startup. Used to
-# resolve restricted models for grandfathered sessions with their full
-# provider chain. None when the registry is disabled.
-other_mode_config: dict | None = None
-# Periodic prune task for the grandfathering registry.
-_grandfathering_prune_task: asyncio.Task | None = None
+# Session→model grandfathering registry, the other-mode config and the
+# mode-switch machinery were removed with the fast/cheap mode axis
+# (LP-0MVDT94F0003VHUA AC4). No routing policy change ever restarts the
+# proxy, so sessions never need cross-restart grandfathering.
 
 # Periodic prune task for session recordings (retention, LP-0MT2TC3PB005H1RD).
 # The recorder prunes on startup (immediately) and then on an interval.
@@ -508,21 +499,16 @@ def _startup_config_logging():
     _startup_validate_local_routing_config(config)
     _startup_validate_compaction_config(config)
 
-    # Log resolved hard-routing caps for both modes (LP-0MTBOX45O005LD1S).
-    # The caps are derived from per-mode ratios against the active per-slot
-    # threshold, so they rescale automatically when the mode profile's slot
-    # count changes.
+    # Log resolved hard-routing caps (LP-0MTBOX45O005LD1S). With the mode
+    # axis removed (LP-0MVDT94F0003VHUA AC4) there is a single unified cap
+    # derived from the base profile's ratio against the active per-slot
+    # threshold.
     try:
-        from proxy.mode import read_mode as _read_mode
         from proxy.provider import compute_hard_routing_cap
-        _mode = _read_mode()
-        _fast_cap = compute_hard_routing_cap("fast", config)
-        _cheap_cap = compute_hard_routing_cap("cheap", config)
+        _cap = compute_hard_routing_cap("fast", config)
         logger.info(
-            "Hard-routing caps: fast=%s cheap=%s (mode=%s)",
-            _fast_cap if _fast_cap > 0 else "disabled",
-            _cheap_cap if _cheap_cap > 0 else "disabled",
-            _mode,
+            "Hard-routing cap: %s",
+            _cap if _cap > 0 else "disabled",
         )
     except Exception:
         pass  # Logging is best-effort; don't block startup
@@ -885,109 +871,6 @@ def _startup_start_dispatch_cleanup():
             logger.warning(f"Failed to start dispatch lease cleanup task: {e}")
 
 
-def _startup_initialize_grandfathering():
-    """Load the grandfathering registry and the other-mode config at startup.
-
-    Builds the registry from ``server.mode_switch_grandfathering`` (enabled,
-    fallback_grace_seconds) and loads the OTHER mode's config file (fast↔cheap)
-    so grandfathered sessions can keep their full provider chain after a
-    mode-switch restart. Starts a periodic prune task. When disabled (or on
-    error) the registry is None and routing is unchanged.
-    """
-    global grandfathering_registry, other_mode_config, _grandfathering_prune_task
-    try:
-        from proxy.grandfathering import registry_from_config
-
-        server_config = config.get("server", {}) if isinstance(config, dict) else None
-        grandfathering_registry = registry_from_config(server_config)
-        if not grandfathering_registry.enabled:
-            grandfathering_registry = None
-            other_mode_config = None
-            logger.info(
-                "Grandfathering: disabled via config "
-                "(server.mode_switch_grandfathering.enabled: false)"
-            )
-            return
-
-        # The OTHER mode relative to the currently active one.
-        current_mode = mode_module.read_mode()
-        other_mode = (
-            mode_module.MODE_FAST
-            if current_mode == mode_module.MODE_CHEAP
-            else mode_module.MODE_CHEAP
-        )
-        other_path = mode_module.mode_config_file(other_mode)
-        # Explicit merged load: the mode overlays are deduplicated, so the
-        # other-mode config must inherit the base `models` section for
-        # grandfathering's remote-provider comparison to be correct.
-        # `load_config(explicit_path=...)` stays raw for backward compat
-        # (AC1), hence the dedicated merged entry point.
-        other_mode_config = load_merged_config(str(other_path))
-        logger.info(
-            "Grandfathering: enabled; other-mode config %s (current=%s)",
-            other_path.name,
-            current_mode,
-        )
-
-        try:
-            loop = asyncio.get_running_loop()
-            _grandfathering_prune_task = loop.create_task(
-                _grandfathering_prune_loop()
-            )
-        except RuntimeError:
-            # No running loop (sync call path) — prune is opportunistic.
-            _grandfathering_prune_task = None
-    except Exception as e:
-        logger.warning(
-            "Failed to initialize grandfathering; feature disabled: %s", e
-        )
-        grandfathering_registry = None
-        other_mode_config = None
-
-
-async def _grandfathering_prune_loop(
-    interval_seconds: float = 300.0,
-) -> None:
-    """Periodically prune expired grandfathering bindings and persist.
-
-    Saves every cycle (debounced write) so refreshed ``last_seen``
-    timestamps survive a crash; a full save also happens on shutdown.
-    """
-    while True:
-        try:
-            await asyncio.sleep(interval_seconds)
-            import proxy.server as _srv
-
-            if _srv.grandfathering_registry is not None:
-                removed = _srv.grandfathering_registry.prune()
-                _srv.grandfathering_registry.save()
-                if removed:
-                    logger.info(
-                        "Grandfathering: pruned %d expired binding(s)", removed
-                    )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Grandfathering prune loop error")
-
-
-def _shutdown_grandfathering():
-    """Persist the grandfathering registry on graceful shutdown."""
-    global grandfathering_registry, _grandfathering_prune_task
-    try:
-        if _grandfathering_prune_task is not None:
-            _grandfathering_prune_task.cancel()
-            _grandfathering_prune_task = None
-    except Exception:
-        pass
-    try:
-        if grandfathering_registry is not None:
-            grandfathering_registry.save()
-            logger.info("Grandfathering: registry saved on shutdown")
-    except Exception:
-        logger.exception("Failed to save grandfathering registry on shutdown")
-
-
 def _startup_launch_recording_prune():
     """Start the session-recording retention prune task (non-blocking).
 
@@ -1083,31 +966,30 @@ def _shutdown_stop_recording_prune():
         _recording_prune_task = None
 
 
-def _startup_launch_mode_scheduler():
-    """Start the automatic fast/cheap mode-scheduler background thread.
+def _startup_launch_quota_poller():
+    """Start the proactive OpenCode quota poller (LP-0MVF7KEG7007C8MF).
 
-    Enforces the standalone ``proxy/mode_schedule.yaml`` schedule (default
-    cheap 01:00-10:00, fast 10:00-01:00). A manual API override (persisted
-    override-until expiry) is respected until the next scheduled
-    transition, so a restart mid-override does NOT revert it
-    (LP-0MSMF25V9002AY1J). The first check runs immediately so schedule
-    transitions apply right away instead of waiting a full interval.
+    Polls ``GET /v1/usage`` per distinct ``opencode-*`` account on the
+    configured interval and caches the derived quota state in
+    :mod:`proxy.quota_state`. Best-effort and non-blocking: a failed poll
+    (or a failure to start) must never break proxy startup.
     """
     try:
-        schedule = mode_module.ModeScheduleConfig.from_file()
-        if schedule.enabled:
-            mode_module.start_mode_scheduler(schedule)
-            logger.info(
-                "Mode scheduler: enabled with %d entries: %s",
-                len(schedule.entries),
-                [(e.time.strftime("%H:%M"), e.mode) for e in schedule.entries],
-            )
-        else:
-            logger.debug("Mode scheduler: disabled via %s (enabled: false)",
-                mode_module.mode_schedule_file(),
-            )
+        from proxy.lifecycle import start_quota_poller
+
+        start_quota_poller(config)
     except Exception as e:
-        logger.warning("Failed to start mode scheduler: %s", e)
+        logger.warning("Failed to start the quota poller: %s", e)
+
+
+async def _shutdown_quota_poller():
+    """Cancel the background quota poller on shutdown."""
+    try:
+        from proxy.lifecycle import stop_quota_poller
+
+        await stop_quota_poller()
+    except Exception as e:
+        logger.warning("Failed to stop the quota poller: %s", e)
 
 
 def _startup_launch_disconnect_reaper():
@@ -1254,18 +1136,19 @@ async def lifespan(app: FastAPI):
     _startup_start_session_cleanup()
     _startup_start_dispatch_cleanup()
     _startup_register_session_routes(app)
-    _startup_launch_mode_scheduler()
-    _startup_initialize_grandfathering()
     _startup_launch_disconnect_reaper()
     _startup_launch_recording_prune()
+    _startup_launch_quota_poller()
 
     # Record the monotonic start time for the startup-ramp gate.
     global PROXY_START_TIME
     PROXY_START_TIME = time.monotonic()
-    # Resolve and propagate the startup_ramp config to mode.py.
-    from proxy import mode as _mode_mod
+    # Resolve and propagate the startup_ramp config (extracted from the
+    # retired mode module, LP-0MVDT94F0003VHUA AC4).
+    from proxy import startup_ramp as _ramp_mod
+
     _server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
-    _mode_mod.set_startup_ramp_config(_mode_mod._startup_ramp_config_section(_server_cfg))
+    _ramp_mod.set_startup_ramp_config(_ramp_mod._startup_ramp_config_section(_server_cfg))
 
     yield
 
@@ -1275,8 +1158,8 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down LLama Proxy Server")
     _shutdown_stop_session_cleanup()
     _shutdown_stop_recording_prune()
-    _shutdown_grandfathering()
     await _shutdown_cleanup_tasks()
+    await _shutdown_quota_poller()
     _shutdown_tts_server()
     await _shutdown_http_client()
     _shutdown_llama_server()

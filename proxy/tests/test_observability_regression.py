@@ -188,6 +188,28 @@ class TestHealthEndpoint:
         assert signals["timeout_failures"] == 0
         assert signals["other_failures"] == 2
 
+    @pytest.mark.asyncio
+    async def test_health_surfaces_the_registered_signal_registry(self, monkeypatch):
+        """Every registered counter is surfaced on /health (F4).
+
+        ``backend_signal_counts`` is the single registry (the handler returns
+        it verbatim). The per-entry context-ceiling skip is a cumulative
+        counter mirroring ``context_too_large`` (LP-0MVF9N3BV00155RI), so both
+        must appear in the payload with the registry's current value — a
+        cumulative counter is process-global, so the assertion is on the value
+        the registry holds, not on zero.
+        """
+        from proxy.observability import backend_signal_counts
+
+        monkeypatch.setattr(server, "backend_signal_counts", dict(backend_signal_counts))
+
+        j = await self._get_health()
+        signals = j.get("backend_signals", {})
+        for counter in ("context_too_large", "provider_context_exceeded"):
+            assert counter in backend_signal_counts, f"{counter} is not registered"
+            assert isinstance(signals.get(counter), int), f"{counter} missing from /health"
+            assert signals[counter] == backend_signal_counts[counter]
+
 
 # ── /metrics endpoint contracts ──────────────────────────────────────────────
 

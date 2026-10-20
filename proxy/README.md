@@ -15,7 +15,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
-- **Base + overlay config model**: `config.yaml` is the authoritative base; `config-fast.yaml` / `config-cheap.yaml` are overlays deep-merged on top of it by `load_config()`. The resolved profile defines its local llama-server slot count via `session_slot_pool_size` (fast inherits 1 from the base, cheap overrides 3) — no time-based slot schedule. See [Config model: base + mode overlays](#config-model-base--mode-overlays) and [Slot configuration](#slot-configuration) below.
+- **Priority-based routing**: every request carries an effective priority (`X-Priority: low|medium|high`, default `medium`; capped to `low` during the configured cheap window, `server.priority_window`, default 01:00–10:00 local). The effective priority selects the model's `priority_routes` provider chain and gates the routing knobs (contention-queue entry, economic-bypass recovery, local-vs-remote preference) — LP-0MVDT94F0003VHUA AC1–AC3. The slot pool is fixed at 2 (`session_slot_pool_size`); no routing-policy change ever restarts the proxy. The fast/cheap mode machinery (overlays, `proxy/.mode`, `mode_schedule.yaml`, `/admin/set-mode`) was removed (AC4).
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view. Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in). Each slot header badge shows the **full session ID** (untruncated, with the full ID also on hover) — slot session IDs are no longer shortened to 8 characters (LP-0MV6CZGN6003Z5QI).
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
@@ -55,9 +55,9 @@ The body preview automatically filters out messages with `role: "system"` to pre
 ### Usage analysis (proxy-usage-analysis skill)
 
 The `proxy-usage-analysis` skill turns the last 24h of proxy logs into
-per-session fast/cheap CSVs and a Markdown report with data-backed
+per-session standard/low CSVs and a Markdown report with data-backed
 configuration recommendations (fallback reasons, slot contention, context
-pressure, fast/cheap comparison). It parses the structured INFO lines the
+pressure, priority-window comparison). It parses the structured INFO lines the
 proxy emits — `Stream started`/`Stream finished` (with authoritative
 `tokens=prompt/completion/total`), `Fallback triggered`, `routing_skip_local`,
 and `local_dispatch_denied` — streaming large logs line by line.
@@ -75,9 +75,9 @@ python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
 
 Outputs (in `--output-dir`, default `~/proxy-usage-reports`):
 `report.md` (the aggregate report plus recommendations),
-`fast_sessions.csv`, `cheap_sessions.csv`
-(one row per session; fast/cheap split derived from the mode timeline
-of the active config profile), and `errors.csv`/`errors.json`. Existing
+`standard_sessions.csv`, `low_priority_sessions.csv`
+(one row per session; standard/low split derived from the priority
+window, LP-0MVDT94F0003VHUA AC6), and `errors.csv`/`errors.json`. Existing
 outputs are archived into a dated subdirectory before each run overwrites
 them (`~/proxy-usage-reports/YYYY-MM-DD/`), so history is kept. The cron
 job at 05:00 runs the report daily and logs to
@@ -504,6 +504,8 @@ When a request arrives for a model with a `providers` list, the proxy tries each
 | `llama_model` | string | local | Name of the local model |
 | `available_times` | list | no | List of `"HH:MM-HH:MM"` UTC windows during which this provider may be used (timed access, see below) |
 | `rate_limit_rpm` | int | no | Maximum dispatches to this entry per rolling 60-second window (free-tier request budget — see [Free-tier request budgets](#free-tier-request-budgets-rate_limit_rpm)) |
+| `max_context_tokens` | int | no | Maximum estimated prompt context the entry may serve. A request estimated above it skips the entry and falls through to the next provider — a size mismatch, not a failure (no cooldown/affinity/queue side effects). Absent/`0` = ungated. Shipped values are sourced — see [Per-entry context limits](#per-entry-context-limits-max_context_tokens) (LP-0MVF9N2QL001CDA7, LP-0MVF9N31A0006VH5) |
+| `display_name` | string | no | Human-readable tier label for the X-Resolved-Model header (e.g. `MunitoAI Free`, `OpenCode Go 3`). Overrides the `provider` brand in the display string only — failure-domain, cooldown and usage-limit keying still use `provider`. Use it to distinguish same-brand tiers/accounts (LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62). |
 
 #### Free-tier request budgets (`rate_limit_rpm`)
 
@@ -515,8 +517,9 @@ retrying into it:
 - while the rolling 60-second window has capacity the entry is used normally;
 - a fraction of the window (`server.provider_rate_limit_reserve_ratio`,
   default `0.3`) is **reserved for in-progress sessions**: a **new** session may
-  use at most `rate_limit_rpm - reserve` dispatches (7 of 10 for
-  `munitoai-free`) and, once that is spent, skips the entry immediately — it
+  use at most `rate_limit_rpm - reserve` dispatches (2 of 2 for
+  `munitoai-free` — the reserve rounds down, so the current budget has no
+  reserved slots) and, once that is spent, skips the entry immediately — it
   never waits, so parked requests cannot compound the contention;
 - a session already served by the entry may use the reserved slots, and if the
   window is still full it may wait a short, bounded time
@@ -537,7 +540,7 @@ remaining=<n> reason=rate_limited …` and appear in the exhaustion
         type: remote
         endpoint: https://api.example.com/v1
         api_key_env: SOME_FREE_KEY
-        rate_limit_rpm: 10
+        rate_limit_rpm: 15
 ```
 
 #### Example: Remote Fallback
@@ -578,6 +581,59 @@ models:
 ```
 
 In this example, requests first try the local `Qwen3` model. If the local server is unavailable, has no available slots, or returns errors, the request falls back to the remote provider.
+
+#### Per-Entry Context Limits (`max_context_tokens`)
+
+Each provider entry may optionally declare `max_context_tokens`, the maximum
+**estimated prompt context** it may serve. At dispatch time, a request whose
+routing estimate exceeds the ceiling **skips** the entry and falls through to
+the next eligible provider (LP-0MVF9N2QL001CDA7):
+
+- the estimate reuses the authoritative routing pipeline, so the gate is
+  consistent with the local thresholds and the hard routing cap, and it is
+  computed **once per request** (no duplicate tokenizer pass per provider);
+- a skip is recorded as an attempt (`status=provider_context_exceeded`,
+  carrying estimate + limit) and logged — it is a size mismatch, **not** a
+  failure: no cooldown, no failure-domain exclusion, no usage-limit reset, no
+  affinity record, no contention-queue entry, and the entry stays eligible for
+  later, smaller requests; each skip increments the cumulative
+  `backend_signals.provider_context_exceeded` counter (mirroring
+  `context_too_large`, visible on `/health` and `/admin/metrics`);
+- absent / `0` / non-positive = ungated (byte-for-byte previous behaviour);
+  on a local entry it composes as an **additional hard cap**
+  (`min(existing local thresholds, max_context_tokens)`);
+- shipped values are **sourced** (upstream model context window or the
+  provider's documented per-minute token allowance), never guessed — see the
+  value table and provenance in `proxy/config.yaml` (sourced-limits block) and
+  `proxy/MODEL_ADD.md`;
+- at least one tier (the final `deepseek-flash`) is capped at the **largest
+  upstream context window**, so an oversized prompt always has a destination
+  and the chain cannot exhaust because of caps alone.
+
+Copy-pasteable example — a capped local entry, a capped free tier and an
+ungated final tier:
+
+```yaml
+models:
+  some-model:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+        max_context_tokens: 50000      # extra hard cap on top of the local thresholds
+      - name: some-free-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FREE_KEY
+        model: some-model
+        max_context_tokens: 150000     # estimated prompt-context ceiling
+      - name: some-final-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FINAL_KEY
+        model: some-model
+        # max_context_tokens omitted -> ungated (absent/0/non-positive)
+```
 
 #### Timed Access (`available_times`)
 
@@ -648,6 +704,7 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
   normally so genuine local faults are never masked.
 - **FreeUsageLimitError (HTTP 429, LP-0MRGU0I91006ODFD)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s). No per-provider overrides are active (the last override, `opencode-big-pickle`'s 24h entry, was removed with the provider in LP-0MT652JRM004ZLSI). 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
 - **Usage-limit quarantine (LP-0MSLJPOCC0001ROJ, bounded by LP-0MUQTCMW2001VXH8)**: A 429 usage-limit error (`GoUsageLimitError`, or a `FreeUsageLimitError` carrying a reset time) quarantines only the failing **API-key account**, not the whole gateway. An **explicit** `Resets in …` duration is honoured in full (plus a 2-minute margin). A **guessed** duration — derived from `metadata.limitName` alone when the gateway omits the reset time, which is the common opencode case — is capped at **24 hours** (`server.usage_limit_guess_cap_seconds`, or the `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` env override) and is **never persisted**, so a duration-less 429 can no longer lock a healthy account out for the full 7/30-day period. Guessed quarantines are also re-validated by a cheap self-healing probe (at most one probe per 5 minutes per account); the first successful probe clears the quarantine and the account is routed to within the same request cycle. An operator can clear any quarantine immediately with `POST /admin/clear-usage-limit`.
+- **Reset-aware account quarantine (LP-0MVFA1VRT007T9HT)**: With `respect_ratelimit_headers` enabled, a **quota** 429 (body `rate_limit_error`/`rate_limit_exceeded`, or `x-ratelimit-over-limit: yes`) that also carries a parseable `x-ratelimit-reset-*` duration quarantines the failing **API-key account** for the parsed reset **plus the 2-minute usage-limit margin** — distinct from the 2-second `ratelimit_cooldown_margin_seconds` applied to the provider-ENTRY cooldown. The quarantine is keyed on `api_key_env@endpoint:model`, so a paid sibling on the same gateway stays eligible; it is persisted to `provider-state.json`, survives restarts, and feeds the exhaustion `retry_after`. A 429 with no reset signal keeps the plain short cooldown and per-request account-key exclusion. See the account-scoped quarantine subsection in `docs/routing.md`.
 - **State**: Cooldown state is persisted across restarts (see Provider Availability Persistence below) — a cooldown set before a restart is still honoured after it.
 - **Scope**: Cooldown state is global across all sessions within a single proxy process.
   When a provider fails in one session, all other sessions immediately see it as
@@ -833,6 +890,7 @@ hint.
 | Usage-limit quarantine | `usage_limit_reset` (+ `reset_in`/`reset_at`) | `<provider>: <reset seconds>` | `Skipping provider=<p>: usage_limit_reset_pending` / `usage_limit_reset=` on the exhaustion line |
 | Local slot held by another session | `local_lease_active` / `fallback_after_queue` | — | `local_dispatch_denied session=… owner=… active=…` |
 | Free-tier request budget exhausted (`rate_limit_rpm`) | `rate_limited` / `rate_limited_waited` | — | `Provider budget exhausted: skipping provider=<p> limit=<n> remaining=<n> reason=rate_limited …` |
+| Prompt context above the entry's `max_context_tokens` | `provider_context_exceeded` | — | `routing_skip_provider_context provider=<p> type=<t> status=provider_context_exceeded estimated_tokens=<n> limit=<limit> reason=provider_context_exceeded …` |
 | All local slots busy (slot exhaustion) | `slot_exhaustion` | — | `Model server busy: 0/N slots available` (429) |
 | Provider / brand cooldown | `http_exception` / `empty_response` / etc. | `<name or brand>: <seconds>` | `marking provider unavailable` / `unavailable={…}` on the exhaustion line |
 
@@ -1070,7 +1128,38 @@ The proxy runs in one of two operator-selected operating modes:
   LP-0MSMIPPJI007GU9N). The only intended difference from fast mode is the
   local slot pool (1 vs 3).
 
-#### Config model: base + mode overlays
+#### Config model: single authoritative config + priority routing
+
+`proxy/config.yaml` is the **single authoritative config**: the fast/cheap
+mode overlays (`proxy/config-fast.yaml`, `proxy/config-cheap.yaml`), the
+persisted mode file (`proxy/.mode`), the mode schedule
+(`proxy/mode_schedule.yaml`) and the `LLAMA_PROXY_CONFIG` overlay selection
+were removed with the mode axis (LP-0MVDT94F0003VHUA AC4). The overlay values
+were merged into the base: the slot pool is fixed at 2, the contention queue
+policy/caps are single server keys, and the cheap-window routing policy is
+declared as `server.priority_window`.
+
+Routing policy now lives **per request**, not per machine state:
+
+- `X-Priority: low|medium|high` (absent/invalid → `medium`) is parsed per
+  request; during the configured cheap window (`server.priority_window`,
+  default local 01:00–10:00) every request routes as `low` — the header is
+  never modified and no 503/Retry-After deferral is applied (AC1).
+- Each model may declare `priority_routes` (AC2) — a map from priority to an
+  ordered provider list (names resolve against the model's `providers`).
+  A config without `priority_routes` behaves exactly as today (`medium`
+  semantics), so the existing base config is 100% backward compatible.
+- The routing knobs (contention-queue entry, economic-bypass recovery,
+  local-vs-remote preference) are keyed to the effective priority (AC3) —
+  see the README "Per-priority contention-queue tuning" section.
+
+Because `config.yaml` is the only config, the restart signature simply hashes
+the base config (still via the shared canonical helper
+`proxy/proxy/config_merge.py::merged_config_sha256`, so a base-only
+local-backend change forces the co-located llama-server to restart; the
+signature no longer carries a mode label).
+
+### Config model: base + mode overlays
 
 `proxy/config.yaml` is the **authoritative base** config. The mode profiles
 `proxy/config-fast.yaml` and `proxy/config-cheap.yaml` are **overlays**: a
@@ -1302,7 +1391,58 @@ before now, wrapping circularly" rule.
 | `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` | Cap (seconds) applied to a guessed (period-name-only) usage-limit quarantine; default 24h. Overridden by `server.usage_limit_guess_cap_seconds` |
 | `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
+| `LLAMA_PROXY_USE_ENV_KEYS` | Set to `1` to keep environment provider API keys even when they disagree with `~/.pi/agent/auth.json` — the opt-out of fail-closed stale-key detection, equivalent to the `--use-env-keys` flag (LP-0MVF7DRMK001NHT8) |
 | `XDG_STATE_HOME` | Base dir for state (defaults to `~/.local/state`) |
+
+### API key rotation and stale env keys
+
+`start-proxy.sh` resolves every provider key declared as `api_key_env` in the
+effective config from, in order, the environment and
+`~/.pi/agent/auth.json`. The covered variables are `OPENCODE_API_KEY`,
+`OPENCODE_2_API_KEY`, `OPENCODE_3_API_KEY`, `DEEPSEEK_API_KEY`,
+`MUNITOAI_API_KEY` and `MUNITOAI_FREE_API_KEY`.
+
+A key inherited from a long-lived shell — or from an agent/herdr session that
+was started before a rotation — otherwise wins silently over a freshly rotated
+`auth.json`. Stale-key detection is therefore **fail-closed by default**: when
+an environment variable is set but disagrees with the `auth.json` entry for the
+same variable, the proxy refuses to start and names the offending variable with
+both fingerprints:
+
+```text
+ERROR: stale API key environment variable(s) detected — refusing to start.
+       The environment disagrees with /home/<user>/.pi/agent/auth.json, so a rotated
+       auth.json would be silently ignored:
+  - OPENCODE_API_KEY  (environment fp=xxxxxxxx, auth.json fp=yyyyyyyy; auth.json key(s) tried: opencode-go) — stale environment key, MISMATCH
+
+Fix one of these, then restart:
+  1. Unset the stale variable(s) so the auth.json key is used:
+       unset OPENCODE_API_KEY
+  2. Re-export the current key from /home/<user>/.pi/agent/auth.json.
+  3. Explicitly keep the environment keys (stale-key detection is
+     then disabled for this restart):
+       --use-env-keys   or   LLAMA_PROXY_USE_ENV_KEYS=1
+```
+
+Only an 8-character key fingerprint is ever logged — both on startup
+(`[env] <VAR> from environment (matches auth.json, fp=...)`,
+`[env] <VAR> resolved from ~/.pi/agent/auth.json (fp=...)`) and in the
+refusal — so a stale key is diagnosable from the logs alone without exposing
+the secret.
+
+Opt out explicitly when the environment is the intended source of truth:
+
+- `--use-env-keys` — interactive restarts.
+- `LLAMA_PROXY_USE_ENV_KEYS=1` — unattended restarts (herdr/agent-spawned)
+  that cannot pass CLI flags.
+
+With the opt-out a mismatch keeps the environment key and logs a warning that
+the rotated `auth.json` is **ignored for this restart**; unset the opt-out and
+rotate the launching shell's environment to return to fail-closed behaviour. A
+variable set in the environment while `auth.json` has no matching entry is kept
+with a warning that staleness cannot be verified, so only a genuine mismatch
+blocks startup and mixed setups (some keys from the environment, some from
+`auth.json`) start normally.
 
 ### Slot configuration
 
@@ -2245,7 +2385,10 @@ Important fields:
 - `single_flight_metrics` (queue/reject/active session counters)
 - `guardrail_metrics` (cutoff + invalidation counters)
 - `backend_ready`
-- `backend_signals`
+- `backend_signals` (cumulative counters, including
+  `backend_signals.provider_context_exceeded` — per-entry `max_context_tokens`
+  skips, mirroring `context_too_large`; see
+  [Per-Entry Context Limits](#per-entry-context-limits-max_context_tokens))
 
 ### Large-Context Routing (Cache-Aware Bypass)
 
@@ -2433,6 +2576,21 @@ Token-rate observability metrics (exposed on `/metrics`):
 
 - `llama_token_rate_gauge{session_id="..."}` (gauge) — Best-effort instantaneous tokens/second observed for an active session. Useful for short-term spikes and live dashboards.
 - `llama_token_rate_histogram{session_id="..."}` (histogram) — Bucketed distribution of observed token rates per session. Use Prometheus `histogram_quantile()` over a reasonable window (e.g., 5m) to compute operational percentiles for calibration.
+
+Quota observability metrics (LP-0MVF7KQED005TG9Z, exposed on `/metrics`):
+
+- `quota_rolling_percent{account="...",entry="..."}` (gauge) — rolling-window quota percentage consumed.
+- `quota_weekly_percent{account="...",entry="..."}` (gauge) — weekly-window quota percentage consumed.
+- `quota_monthly_percent{account="...",entry="..."}` (gauge) — monthly-window quota percentage consumed.
+- `quota_effective_headroom{account="...",entry="..."}` (gauge) — remaining allowance percentage across the binding (minimum) window.
+- `quota_seconds_to_reset{account="...",entry="..."}` (gauge) — seconds until the account's monthly allowance resets.
+- `quota_resets_at_timestamp_seconds{account="...",entry="..."}` (gauge) — Unix timestamp of the monthly allowance reset.
+- `quota_surge_active{account="...",entry="..."}` (gauge) — 1 when quota-driven surge is active for the account.
+- `quota_exhausted{account="...",entry="..."}` (gauge) — 1 when the account quota is exhausted.
+- `quota_last_poll_timestamp_seconds{account="...",entry="..."}` (gauge) — Unix timestamp of the last successful `/v1/usage` poll.
+- `quota_poll_failures_total{account="...",reason="..."}` (counter) — failed `/v1/usage` polls by account and reason (e.g. `QuotaPollError`, `ReadTimeout`).
+
+`account` is the account key derived from the provider entry's `api_key_env` **name** (e.g. `OPENCODE_2_API_KEY`) — never the API key value; `entry` is the configured provider entry name. The same derived per-account fields (including `surge_active`/`exhausted`, `resetsAt` and `seconds_to_reset`) are also exposed in the `/events` status payload's `quota` section and on the home-page model rows, and all surfaces degrade cleanly (no quota data) until the first successful poll (LP-0MVF7KQED005TG9Z AC2/AC2b).
 
 Example queries:
 - 95th percentile token-rate across all sessions:
@@ -2692,6 +2850,32 @@ Log entries include:
 The llama-server output is captured to `llama-server.log`. Each time the server restarts (e.g., model switch), the current log is rotated:
 - `llama-server.log` → `llama-server.1.log` → `llama-server.2.log` → ...
 - The last 15 log files are retained
+
+**The log relay survives proxy restarts (LP-0MVECX47Z004LJAQ).** llama-server's
+stdout/stderr are redirected **directly into `llama-server.log`** at spawn time,
+so the write descriptor is owned by the backend process itself — not by a
+proxy-side reader thread. A proxy-only restart therefore keeps the log flowing
+even when the new proxy *adopts* the already-running backend (preserving the
+warm prompt cache, LP-0MUCEFCL6001ZXYN). Previously the relay was a
+proxy-owned pipe reader, which died with the old proxy and left
+`llama-server.log` frozen while the pipe still had writers.
+
+When the proxy adopts a backend spawned by a *pre-fix* proxy, the relay cannot
+be re-attached (the old reader thread is gone). Instead of freezing silently
+the proxy logs a **WARNING** and marks the llama log source unhealthy; restart
+llama-server to restore logging. The adoption itself is preserved (no forced
+restart) so the warm prompt cache is not discarded.
+
+Log freshness is observable from `GET /health`:
+
+| Field | Meaning |
+|-------|---------|
+| `llama_log_age_seconds` | Seconds since `llama-server.log` was last written (`null` when the file is absent) |
+| `llama_log_source_healthy` | `false` when the relay is known broken (adopted pre-fix backend) or the log is stale with no live writer |
+
+Prefill progress entries (`[slot:N MODEL] Processing a/b tokens (P%)`) are
+recovered by a tailer over `llama-server.log`, which is restarted on adoption —
+so progress logging also continues across a proxy-only restart.
 
 View logs:
 ```bash

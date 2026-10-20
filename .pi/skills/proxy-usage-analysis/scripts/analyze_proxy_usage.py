@@ -66,8 +66,8 @@ def _summary_output_paths(out_dir: Path) -> list[str]:
     """Return the output artifact paths in the preferred summary order (report first)."""
     return [
         str(out_dir / "report.md"),
-        str(out_dir / "fast_sessions.csv"),
-        str(out_dir / "cheap_sessions.csv"),
+        str(out_dir / "standard_sessions.csv"),
+        str(out_dir / "low_priority_sessions.csv"),
         str(out_dir / "errors.csv"),
         str(out_dir / "errors.json"),
     ]

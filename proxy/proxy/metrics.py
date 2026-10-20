@@ -10,10 +10,26 @@ This module exposes a small set of metrics required by LP-0MNA7G5JB004P5O6:
 Extended by LP-0MQ1HDY1N00502S7:
 - proxy_http_errors_total{endpoint="...",status="...",reason="..."} (counter)
 
+Extended by LP-0MVF7KQED005TG9Z (quota observability surface):
+- quota_rolling_percent{account,entry} (gauge)
+- quota_weekly_percent{account,entry} (gauge)
+- quota_monthly_percent{account,entry} (gauge)
+- quota_effective_headroom{account,entry} (gauge)
+- quota_seconds_to_reset{account,entry} (gauge)
+- quota_resets_at_timestamp_seconds{account,entry} (gauge)
+- quota_surge_active{account,entry} (gauge, 1 = active)
+- quota_exhausted{account,entry} (gauge, 1 = exhausted)
+- quota_last_poll_timestamp_seconds{account,entry} (gauge)
+- quota_poll_failures_total{account,reason} (counter)
+
 The implementation is best-effort: when router-mode exposes multiple models in a
 single process we estimate per-model RSS by dividing the process RSS equally
 across loaded models (documented). If prometheus_client is not installed the
 functions are no-ops and generate_metrics() returns an explanatory payload.
+
+Quota labels never carry an API key **value**: ``account`` is the account key
+derived from the provider entry's ``api_key_env`` name (e.g.
+``OPENCODE_2_API_KEY``) and ``entry`` is the configured provider entry name.
 """
 
 from collections.abc import Iterable
@@ -59,6 +75,26 @@ llama_slots_query_failures_total = None
 # as an alert instead of silently holding proxy state (local_active_query,
 # slots) indefinitely.
 llama_remote_stream_terminated_total = None
+# Quota observability surface (LP-0MVF7KQED005TG9Z): per-account derived quota
+# state from the proactive poller, so "how much is left, when does it reset, is
+# surge active" is answerable from /metrics instead of from the logs. Labels are
+# the account key (the ``api_key_env`` NAME, never the key value) plus the
+# configured provider entry name.
+quota_rolling_percent = None
+quota_weekly_percent = None
+quota_monthly_percent = None
+quota_effective_headroom = None
+quota_seconds_to_reset = None
+quota_resets_at_timestamp_seconds = None
+quota_surge_active = None
+quota_exhausted = None
+quota_last_poll_timestamp_seconds = None
+#: Counts failed quota polls by reason, so a dead /v1/usage endpoint surfaces as
+#: an alert instead of only a rate-limited WARN.
+quota_poll_failures_total = None
+
+#: Label names shared by every quota gauge.
+_QUOTA_GAUGE_LABELS = ['account', 'entry']
 
 if _enabled:
     try:
@@ -102,6 +138,59 @@ if _enabled:
             'llama_remote_stream_terminated_total',
             'Remote streams terminated by the duration/activity watchdog by reason',
             ['reason'],
+        )
+        # Quota observability surface (LP-0MVF7KQED005TG9Z). One series per
+        # (account, entry): the account is the api_key_env NAME (never the key
+        # value) and the entry is the configured provider entry name.
+        quota_rolling_percent = Gauge(
+            'quota_rolling_percent',
+            'Rolling-window quota percentage consumed, per account and entry',
+            _QUOTA_GAUGE_LABELS,
+        )
+        quota_weekly_percent = Gauge(
+            'quota_weekly_percent',
+            'Weekly-window quota percentage consumed, per account and entry',
+            _QUOTA_GAUGE_LABELS,
+        )
+        quota_monthly_percent = Gauge(
+            'quota_monthly_percent',
+            'Monthly-window quota percentage consumed, per account and entry',
+            _QUOTA_GAUGE_LABELS,
+        )
+        quota_effective_headroom = Gauge(
+            'quota_effective_headroom',
+            'Remaining quota percentage across the binding (minimum) window',
+            _QUOTA_GAUGE_LABELS,
+        )
+        quota_seconds_to_reset = Gauge(
+            'quota_seconds_to_reset',
+            'Seconds until the account monthly allowance resets',
+            _QUOTA_GAUGE_LABELS,
+        )
+        quota_resets_at_timestamp_seconds = Gauge(
+            'quota_resets_at_timestamp_seconds',
+            'Unix timestamp of the account monthly allowance reset',
+            _QUOTA_GAUGE_LABELS,
+        )
+        quota_surge_active = Gauge(
+            'quota_surge_active',
+            'Whether quota-driven surge is active for the account (1 = active)',
+            _QUOTA_GAUGE_LABELS,
+        )
+        quota_exhausted = Gauge(
+            'quota_exhausted',
+            'Whether the account quota is exhausted (1 = exhausted)',
+            _QUOTA_GAUGE_LABELS,
+        )
+        quota_last_poll_timestamp_seconds = Gauge(
+            'quota_last_poll_timestamp_seconds',
+            'Unix timestamp of the last successful /v1/usage poll for the account',
+            _QUOTA_GAUGE_LABELS,
+        )
+        quota_poll_failures_total = Counter(
+            'quota_poll_failures_total',
+            'Total /v1/usage poll failures by account and reason',
+            ['account', 'reason'],
         )
     except Exception:  # pragma: no cover - defensive
         _enabled = False
@@ -234,6 +323,108 @@ def record_remote_stream_terminated(reason: str):
         llama_remote_stream_terminated_total.labels(reason=reason).inc()
     except Exception:
         pass
+
+
+def record_quota_poll_failure(account: str, reason: str):
+    """Increment ``quota_poll_failures_total`` for a failed ``/v1/usage`` poll.
+
+    Args:
+        account: The account key (the provider entry's ``api_key_env`` NAME —
+            never the API key value).
+        reason: A short, stable failure identifier, e.g. ``QuotaPollError``,
+            ``HTTPStatusError``, ``ReadTimeout``.
+
+    The previous gauges are deliberately left untouched: a failed poll is a
+    fail-open event that keeps the last known-good quota values
+    (LP-0MVF7KEG7007C8MF) and only increments the failure counter.
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or quota_poll_failures_total is None:
+        return
+    try:
+        quota_poll_failures_total.labels(account=account, reason=reason).inc()
+    except Exception:
+        pass
+
+
+def _quota_gauge_value(observation: dict, *path, default: float = 0.0) -> float:
+    """Read a numeric field from a nested observation dict, never raising."""
+    node = observation
+    for key in path:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(key)
+    try:
+        return float(node)
+    except (TypeError, ValueError):
+        return default
+
+
+def record_quota_state(observation: dict):
+    """Publish one account's derived quota state on the Prometheus gauges.
+
+    Args:
+        observation: A single-account observation as returned by
+            :func:`proxy.quota_state.snapshot_observation` (the same fields the
+            ``/events`` payload and the home page render): ``account``,
+            ``entry``, the three window dicts (``percent``), ``resetsAt`` /
+            ``resets_at_timestamp_seconds``, ``seconds_to_reset``,
+            ``effective_headroom``, ``surge_active``, ``exhausted`` and
+            ``last_poll_timestamp_seconds``.
+
+    Best-effort: a missing field defaults to ``0`` and any metric error is
+    swallowed, so a metrics failure can never break the poller or routing.
+    """
+    if not _enabled or not isinstance(observation, dict):
+        return
+    gauges = (
+        quota_rolling_percent,
+        quota_weekly_percent,
+        quota_monthly_percent,
+        quota_effective_headroom,
+        quota_seconds_to_reset,
+        quota_resets_at_timestamp_seconds,
+        quota_surge_active,
+        quota_exhausted,
+        quota_last_poll_timestamp_seconds,
+    )
+    if any(gauge is None for gauge in gauges):
+        return
+    account = str(observation.get('account') or 'unknown')
+    entry = str(observation.get('entry') or account)
+    labels = {'account': account, 'entry': entry}
+    try:
+        quota_rolling_percent.labels(**labels).set(
+            _quota_gauge_value(observation, 'rolling', 'percent')
+        )
+        quota_weekly_percent.labels(**labels).set(
+            _quota_gauge_value(observation, 'weekly', 'percent')
+        )
+        quota_monthly_percent.labels(**labels).set(
+            _quota_gauge_value(observation, 'monthly', 'percent')
+        )
+        quota_effective_headroom.labels(**labels).set(
+            _quota_gauge_value(observation, 'effective_headroom')
+        )
+        quota_seconds_to_reset.labels(**labels).set(
+            _quota_gauge_value(observation, 'seconds_to_reset')
+        )
+        quota_resets_at_timestamp_seconds.labels(**labels).set(
+            _quota_gauge_value(observation, 'resets_at_timestamp_seconds')
+        )
+        quota_surge_active.labels(**labels).set(
+            1.0 if observation.get('surge_active') else 0.0
+        )
+        quota_exhausted.labels(**labels).set(
+            1.0 if observation.get('exhausted') else 0.0
+        )
+        quota_last_poll_timestamp_seconds.labels(**labels).set(
+            _quota_gauge_value(observation, 'last_poll_timestamp_seconds')
+        )
+    except Exception:
+        # Best-effort: never propagate metric errors into the poller.
+        return
 
 
 def generate_metrics_payload() -> tuple[bytes, str]:

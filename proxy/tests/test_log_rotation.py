@@ -332,13 +332,13 @@ def test_setup_logging_pruning_logs_on_startup(tmp_path, monkeypatch, caplog, _c
 
 
 def test_config_files_have_7_day_retention():
-    """Every config profile resolves retention_days: 7 (LP-0MSNKMXIK004P7TL AC5).
+    """The unified config resolves retention_days: 7 (LP-0MSNKMXIK004P7TL AC5).
 
-    The mode files are overlays, so retention is inherited from config.yaml.
+    The mode overlays were removed (LP-0MVDT94F0003VHUA AC4).
     """
-    from tests.config_test_utils import load_profile
+    from config_test_utils import load_profile
 
-    for config_name in ("config.yaml", "config-cheap.yaml", "config-fast.yaml"):
+    for config_name in ("config.yaml",):
         cfg = load_profile(config_name)
         retention = cfg.get("logging", {}).get("retention_days")
         assert retention == 7, (

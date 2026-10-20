@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from proxy import mode as mode_module
+from proxy import startup_ramp as mode_module
 
 
 def _apply_ramp_config(monkeypatch, cfg=None):
@@ -125,7 +125,7 @@ class TestStartupRampApiGate:
         import proxy.server as srv_mod
         from proxy.server import app
 
-        from proxy import mode as _mode_mod
+        from proxy import startup_ramp as _mode_mod
 
         # Verify config is active
         assert _mode_mod._startup_ramp_config is not None
@@ -218,7 +218,7 @@ class TestStartupRampApiGate:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://test"
             ) as client:
-                resp = await client.get("/admin/mode")
+                resp = await client.get("/health")
             assert resp.status_code == 200
         finally:
             pass
@@ -844,7 +844,7 @@ class TestStartupRampNonChatUnaffected:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
-            resp = await client.get("/admin/mode")
+            resp = await client.get("/health")
 
         assert resp.status_code == 200
 

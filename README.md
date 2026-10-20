@@ -23,7 +23,7 @@ Key features
 ### Session & Slot Management
 - **Job-level slot scheduler** — configurable slot pool with queueing, per-job timeouts, and load-aware skip to avoid ReadTimeouts under concurrency.
 - **Dispatch leases** — per-session reservation of the local backend with adaptive timeouts and prefill-progress polling.
-- **Automatic Config Switching** — switch local model modes to keep more traffic local (slower) or push remote (faster) based on time.
+- **Priority-based routing** — per-request `X-Priority: low|medium|high` selects the provider chain and gates the routing knobs (queueing, economic-bypass, local-vs-remote); during the configured cheap window every request routes as `low`. The slot pool is fixed at 2 and no routing-policy change ever restarts the proxy.
 - **Session tracking** — active session list with preview text, model, and provider; sessions can be deleted via the admin API.
 - **Session recording retention** — automatic pruning of old recordings with configurable retention days and background intervals.
 - **Grandfathering** — legacy session migration for in-flight requests across proxy restarts.
@@ -48,7 +48,7 @@ Key features
 
 ### Administration
 - **Health check** — `/health` reports readiness, self-healing state, GPU wedge detection, and TTS server status.
-- **Mode switching** — toggle between Fast (cloud-backed) and Cheap (local pool) runtime modes.
+- **Priority window** — during the cheap window (01:00–10:00 local by default) every request routes as low; the header is never modified and no deferral is applied.
 - **Hot config reload** — `/admin/reload-config` re-reads configuration without a restart.
 - **Server control** — stop/restart the llama-server from the UI (with confirmation), plus TTS server lifecycle management.
 - **Self-healing & recovery** — automatic backend recovery, GPU wedge detection, and disconnect-reaper middleware for stalled clients.
@@ -105,7 +105,7 @@ The following test modules exercise the persistence-cap pin fix (LP-0MTIFR5W3006
 
 | Module | Purpose |
 |--------|---------|
-| `proxy/tests/test_cap_persistence_pin.py` | Fast (83285) and cheap (126976) clamp derivation and persistence gating |
+| `proxy/tests/test_cap_persistence_pin.py` | Unified clamp derivation and persistence gating |
 | `proxy/tests/test_clamp_derived_persistence.py` | Clamp derived from `effective_per_slot_threshold` (dynamic schedule-aware path) |
 | `proxy/tests/test_slot_persistence_guards.py` | GPU-wedge safeguards: adaptive timeout, circuit breaker, skip-when-busy |
 | `proxy/tests/test_persistence_cap_modes.py` | **New** — save→restore cycles for oversized (>50K) contexts in fast/cheap modes; restore-rate baselines (>80% for >50K); wedge parameter pinning |
@@ -215,25 +215,33 @@ Dispatch-lease settings (per-session reservation of the local backend):
 | `local_dispatch_lease_prefill_poll_seconds` | `10` | Cadence (s) at which the proxy polls llama-server for observed prefill progress and extends the lease while progress advances (explicit sessions; `0` disables). |
 | `local_dispatch_lease_prefill_buffer_seconds` | `30` | Safety buffer added to the lease expiry after each observed prefill-progress advance. |
 
-Per-mode contention-queue tuning (cost vs latency)
----------------------------------------------------
+Per-priority contention-queue tuning (cost vs latency)
+----------------------------------------------------
 
 When all local slots are busy the proxy can **queue** a request waiting for
 a slot to free, or **fall back** immediately to the next remote provider.
-Per-mode config lets you trade local utilisation for tail latency:
+Queue entry is gated by the request's effective priority (LP-0MVDT94F0003VHUA
+AC3): ``low`` always queues (prefer a local slot over a paid remote call),
+``high`` never queues (immediate remote fallback), ``medium`` follows the
+configured policy. The caps bound the queue for every priority:
 
 | Config key | Meaning | Clamped to |
 |---|---|---|
-| `contention_queue_policy` | ``queue`` or ``fallback`` | — |
-| `contention_queue_max_depth` | Max queued requests per mode | `[1, 16]` |
+| `contention_queue_policy` | ``queue`` or ``fallback`` (applies to ``medium``) | — |
+| `contention_queue_max_depth` | Max queued requests | `[1, 16]` |
 | `contention_queue_max_wait_seconds` | Max seconds to wait for a local slot | `[1, session_guardrail_max_runtime_seconds]` |
 
-**Shipped defaults (fast vs cheap):**
+**Shipped defaults (unified config, slot pool fixed at 2):**
 
-| Mode | Policy | Depth | Max wait | Rationale |
+| Priority | Policy | Depth | Max wait | Rationale |
 |---|---|---|---|---|
-| **fast** (10:00–01:00) | ``queue`` | `3` | `45s` | Short queue — spills to remotes quickly to minimise latency |
-| **cheap** (01:00–10:00) | ``queue`` | `8` | `120s` | Deeper queue — batches requests to local to maximise cost savings |
+| **low** | ``queue`` (always) | `8` | `120s` | Deeper queue — batches requests to local to maximise cost savings |
+| **medium** | ``queue`` (config-driven) | `8` | `120s` | Today's behaviour; parity baseline |
+| **high** | never queues | — | — | Immediate remote fallback under local contention |
+
+For cold-cache economics (AC3): ``low`` recovers ``large_context_bypass``
+locally (queue for a slot) in both windows, ``high`` routes it remote, and
+``medium`` follows the config flag.
 
 **Tuning guidance:**
 
@@ -241,10 +249,8 @@ Per-mode config lets you trade local utilisation for tail latency:
   worse tail latency under burst.
 - **Lower depth/wait** → faster fallback to remotes, lower local utilisation,
   better tail latency.
-- Fast mode defaults (3/45s) are deliberately smaller than cheap (8/120s)
-  so burst traffic spills to remotes sooner during peak hours.
-- Set ``contention_queue_policy: fallback`` to disable queuing entirely
-  (legacy fast-mode behaviour).
+- Set ``contention_queue_policy: fallback`` to make ``medium`` (default)
+  fall back instead of queueing (legacy fast-mode behaviour).
 
 See `proxy/docs/routing.md` for the full contention-queue semantics and
 metrics.

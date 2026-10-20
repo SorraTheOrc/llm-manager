@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from proxy import quota_state
 from proxy.lifecycle import _extract_router_model_ids
 from proxy.observability import _query_slots_detail
 from proxy.prompt_resolver import compose_messages, resolve_system_prompt
@@ -82,14 +83,53 @@ def _model_can_route_remote(model_cfg) -> bool:
     )
 
 
-def _current_mode() -> str:
-    """Return the currently persisted operating mode (fast/cheap)."""
-    try:
-        from proxy.mode import read_mode
+def _current_priority_window() -> str:
+    """Human-readable cheap-window state for the UI indicator.
 
-        return read_mode()
+    "active" when the request would route as low (during the configured
+    cheap window); "off" otherwise. Replaces the retired operating-mode
+    indicator (LP-0MVDT94F0003VHUA AC4 — the mode indicator was removed).
+    """
+    try:
+        from proxy import server as _srv
+
+        cfg = getattr(_srv, "config", None)
+        server_cfg = cfg.get("server", {}) if isinstance(cfg, dict) else {}
+        from proxy.priority import in_cheap_window
+
+        return "active" if in_cheap_window(server_cfg) else "off"
     except Exception:
-        return "fast"
+        return "off"
+
+
+def _quota_cell_text(provider_cfg: dict, config) -> str:
+    """Home-page quota text for one provider entry (never raises).
+
+    Degrades to an empty string when the quota surface is unavailable or the
+    entry has no polled state, so the home page can never be broken by quota
+    observability (LP-0MVF7KQED005TG9Z AC2b).
+    """
+    try:
+        return quota_state.format_quota_status(
+            provider_cfg, config if isinstance(config, dict) else None
+        )
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
+def _quota_status_payload(config):
+    """The ``quota`` section for ``/events``, or ``None`` when unavailable.
+
+    A quota-surface failure must never break the SSE status stream, so any
+    error degrades to ``None`` (the same "absent state" shape a pre-poll
+    process already produces).
+    """
+    try:
+        return quota_state.quota_status_payload(
+            config if isinstance(config, dict) else None
+        )
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 def _build_home_model_rows(srv) -> str:
@@ -162,6 +202,15 @@ def _build_home_model_rows(srv) -> str:
             if budget_status:
                 active_times_cell += (
                     f' <span class="provider-budget">{budget_status}</span>'
+                )
+            # Derived quota state (LP-0MVF7KQED005TG9Z): remaining allowance,
+            # reset countdown and surge state next to availability / budget.
+            # Empty when the entry has never been polled, so a disabled
+            # feature or a pre-poll process renders exactly as before.
+            quota_status = _quota_cell_text(p, srv.config)
+            if quota_status:
+                active_times_cell += (
+                    f' <span class="provider-quota">{quota_status}</span>'
                 )
 
             if is_first:
@@ -264,7 +313,7 @@ async def index(request: Request):
     # Substitute placeholders
     html_content = html_content.replace('__PROVIDER_HOST_HTML__', provider_host_html)
     html_content = html_content.replace('__CURRENT_MODEL_DISPLAY__', srv.current_model or 'None')
-    html_content = html_content.replace('__CURRENT_MODE__', _current_mode())
+    html_content = html_content.replace('__CURRENT_MODE__', _current_priority_window())
     html_content = html_content.replace('__ROUTER_MODE_STR__', 'true' if router_mode else 'false')
     html_content = html_content.replace('__ROUTER_MODE_DISPLAY__', 'flex' if router_mode else 'none')
     html_content = html_content.replace('__ROUTER_MODE_LABEL__', 'Enabled' if router_mode else 'Disabled')
@@ -337,18 +386,13 @@ async def status_events():
             # endpoint is unresponsive during busy generation.
             from proxy.observability import (
                 _enrich_slot_details_with_progress,
+                _resolve_slot_details_for_enrichment,
                 _update_slot_progress_from_log,
             )
-            from proxy.observability import (
-                _last_slot_details_cache as _slot_cache,
-            )
             _update_slot_progress_from_log()
-            if slot_details:
-                # In-place update is fine because we're extending the list variable
-                _slot_cache.clear()
-                _slot_cache.extend(slot_details)
-            else:
-                slot_details = list(_slot_cache)
+            # Enrich a detached copy so the shared fallback cache keeps the
+            # pristine /slots values (LP-0MVECWYWK000U3E1, AC2).
+            slot_details = _resolve_slot_details_for_enrichment(slot_details)
             _enrich_slot_details_with_progress(slot_details, srv=srv)
 
             initial_status = json.dumps({
@@ -362,6 +406,10 @@ async def status_events():
                 "total_recv": total_recv,
                 "per_model_queries": per_model_queries,
                 "slots": slot_details,
+                # Derived per-account quota state (LP-0MVF7KQED005TG9Z):
+                # null when the feature is disabled or nothing has been
+                # polled yet, so the payload degrades cleanly (AC2b).
+                "quota": _quota_status_payload(srv.config),
             })
             yield f"data: {initial_status}\n\n"
 
@@ -934,108 +982,6 @@ async def create_embeddings(request: Request):
 
 
 
-async def proxy_openai_api(request: Request, path: str):
-    """
-    Main proxy endpoint for OpenAI API requests.
-    Routes to local llama-server or remote API based on model.
-
-    Duplicate in-flight requests are coalesced via ``RequestCoalescer``
-    to prevent retry cascades when the Pi client retries a request that
-    is still being processed.
-    """
-    from proxy.request_coalescer import get_coalescer
-
-    # Read the body early so the coalescer has the hash key.
-    srv = _srv()
-    body = await request.body()
-
-    # Wrap the rest of the processing in an inner coroutine so we can
-    # pass it to the coalescer for deduplication.
-    async def _process_request():
-        return await _do_proxy_openai_api(request, path, body, srv)
-
-    return await get_coalescer().coalesce_or_execute(path, body, _process_request)
-
-
-def _apply_grandfathering(srv, request, model_name, model_cfg):
-    """Record the session→model binding and apply grandfathered routing.
-
-    When an explicit session (``X-Session-Id``) requests a model that the
-    current mode restricts (absent from the current config, or present with
-    fewer remote providers than the other mode's config — e.g. github, or the
-    opencode/opencode-go/deepseek tiers of plan/author/code), a binding
-    recorded in a DIFFERENT mode (i.e. the session had activity before the
-    switch) is grandfathered: the model config is resolved from the other
-    mode's config so the request keeps its full provider chain.
-
-    Returns the (possibly overridden) ``model_cfg``. Anonymous requests are
-    never recorded; missing registry/other-config degrade gracefully to
-    current-mode handling.
-    """
-    registry = getattr(srv, "grandfathering_registry", None)
-    if registry is None or not model_name:
-        return model_cfg
-    try:
-        from proxy.session import _resolve_session_id_header
-
-        session_id, _ = _resolve_session_id_header(request.headers)
-        if not session_id:
-            return model_cfg
-        from proxy.mode import read_mode
-
-        current_mode = read_mode()
-        registry.record(session_id, model_name, current_mode)
-
-        other_config = getattr(srv, "other_mode_config", None)
-        if other_config is None:
-            return model_cfg
-        current_models = (
-            srv.config.get("models", {}) if isinstance(srv.config, dict) else {}
-        )
-        other_models = (
-            other_config.get("models", {}) if isinstance(other_config, dict) else {}
-        )
-        if not registry.is_grandfathered(
-            session_id, current_mode, current_models, other_models
-        ):
-            return model_cfg
-
-        from proxy.lifecycle import lookup_model_config
-
-        other_cfg = lookup_model_config(other_models, model_name)
-        if other_cfg is None:
-            # Config drift: the bound model no longer exists in the other
-            # mode's config → degrade to current-mode handling (no crash).
-            srv.logger.warning(
-                "Grandfathering: session %s bound to %r but model missing from "
-                "the other-mode config; degrading to current-mode handling",
-                session_id[:8] if session_id else session_id,
-                model_name,
-            )
-            return model_cfg
-
-        # Observability (AC 5): mark grandfathered routes so usage analysis
-        # can distinguish them from normal current-mode traffic.
-        try:
-            srv._record_backend_signal("grandfathered")
-        except Exception:
-            pass
-        srv.logger.info(
-            "Grandfathering: session %s keeps using model %s via %s-mode "
-            "config (grandfathered=true)",
-            session_id[:8] if session_id else session_id,
-            model_name,
-            current_mode,
-        )
-        return other_cfg
-    except Exception:
-        srv.logger.debug(
-            "Grandfathering hook failed; continuing with current-mode handling",
-            exc_info=True,
-        )
-        return model_cfg
-
-
 async def _do_proxy_openai_api(
     request: Request,
     path: str,
@@ -1047,16 +993,9 @@ async def _do_proxy_openai_api(
     Extracted so that request coalescing can wrap just the outer call
     without interfering with the processing logic.
     """
-    # Bounded mode-switch drain (LP-0MT631JKW008WAKE / AC2): while a
-    # mode-switch restart is draining in-flight local streams, defer NEW
-    # chat requests with a short 503 + Retry-After so no new stream starts
-    # that the imminent restart would kill (the old behavior surfaced a
-    # synthetic ``finish_reason: error`` to the client).
     if path == "chat/completions":
         try:
             import random as _random_mod
-
-            from proxy import mode as _mode_mod
 
             # --- Early body parse for ramp gate routing check (LP-0MUAY9AMS002O2ZO) ---
             # Parse the body before the ramp gate so we can determine whether
@@ -1081,7 +1020,7 @@ async def _do_proxy_openai_api(
 
             # --- Startup ramp (LP-0MU9ZXFQS0023DXT, LP-0MUAY98ZR002JBAA,
             # refined LP-0MUAY9AMS002O2ZO) ---
-            # After a mode-switch restart, competing herdr/agent workers
+            # After any proxy restart, competing herdr/agent workers
             # reconnect simultaneously, creating a thundering-herd.
             # Gate new requests with 503 + random Retry-After until either
             # (a) local backends are ready (``backend_ready`` becomes True)
@@ -1104,7 +1043,8 @@ async def _do_proxy_openai_api(
             # naturally escalate to a remote provider when local
             # dispatch fails during ramp, so blocking it adds pure
             # latency with no protective benefit.
-            ramp_cfg = _mode_mod._startup_ramp_config
+            from proxy import startup_ramp as _ramp_mod
+            ramp_cfg = _ramp_mod._startup_ramp_config
             if ramp_cfg and ramp_cfg.get("enabled") and ramp_cfg.get("max_seconds", 0) > 0:
                 elapsed = srv.PROXY_START_TIME and (
                     time.monotonic() - srv.PROXY_START_TIME
@@ -1196,40 +1136,39 @@ async def _do_proxy_openai_api(
                                 },
                             )
 
-            # --- Drain gate ---
-            # Defer only while a mode-switch restart is pending AND the
-            # bounded drain is active (restart_pending stays True from the
-            # moment set_mode arms it, so the drain window alone bounds the
-            # deferral). This keeps the gate inert outside a real mode switch.
-            if _mode_mod.restart_pending() and _mode_mod.draining():
-                retry_after = _mode_mod.drain_retry_after()
+            # --- Priority plumbing (AC1/AC6): compute the effective
+            # priority now (cheap-window capped), stamp it on the request so
+            # every decision point below (chain selection, queue entry,
+            # economic bypass, compaction) uses the same value, and log it
+            # for observability. The response header is attached by
+            # proxy_openai_api after the response is built.
+            try:
+                from proxy.priority import (
+                    priority_from_headers,
+                    set_request_priority,
+                )
+
+                server_cfg = (
+                    srv.config.get("server", {})
+                    if isinstance(srv.config, dict) else {}
+                )
+                _priority = priority_from_headers(request.headers, server_cfg)
+                set_request_priority(request, _priority)
                 srv.logger.info(
-                    "Deferring chat request during mode-switch drain "
-                    "(retry_after=%ss)",
-                    retry_after,
+                    "priority_decision priority=%s header=%s",
+                    _priority,
+                    request.headers.get("X-Priority") or "(none)",
                 )
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": {
-                            "type": "mode_switch_drain",
-                            "code": "mode_switch_drain",
-                            "message": (
-                                "Mode switch in progress; retry shortly."
-                            ),
-                        },
-                        "status": 503,
-                        "retry_after": retry_after,
-                    },
-                    headers={
-                        "Retry-After": str(retry_after),
-                        "Cache-Control": "no-store",
-                    },
+            except Exception:
+                srv.logger.debug(
+                    "priority computation failed; routing as medium",
+                    exc_info=True,
                 )
+
         except Exception:
-            # Never let the ramp/drain gate break request handling.
+            # Never let the ramp gate break request handling.
             srv.logger.debug(
-                "Startup ramp / mode-switch drain gate failed; serving request normally",
+                "Startup ramp gate failed; serving request normally",
                 exc_info=True,
             )
 
@@ -1251,11 +1190,9 @@ async def _do_proxy_openai_api(
     # Get model configuration
     model_cfg = srv.get_model_config(model_name) if model_name else None
 
-    # Grandfathering (LP-0MSMF5LXO006YDNM): record session→model usage and,
-    # for sessions that were active before a mode switch, resolve restricted
-    # models from the other mode's config so they keep their full provider
-    # chain (local-first + remote fallbacks) instead of being cut off.
-    model_cfg = _apply_grandfathering(srv, request, model_name, model_cfg)
+    # Grandfathering was removed with the mode axis (LP-0MVDT94F0003VHUA
+    # AC4): sessions never need cross-restart grandfathering because no
+    # routing policy change ever restarts the proxy.
 
     # Apply system prompt if configured
     if model_cfg is not None and "messages" in body_json and isinstance(body_json.get("messages"), list):
@@ -1305,10 +1242,6 @@ async def _do_proxy_openai_api(
     )
 
 
-
-
-
-
 async def switch_model(model_name: str):
     """Manually switch to a different model."""
     srv = _srv()
@@ -1348,6 +1281,71 @@ async def switch_model(model_name: str):
 # ═══════════════════════════════════════════════════════════════════════════
 # Admin endpoint for session recordings
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+async def proxy_openai_api(request: Request, path: str):
+    """
+    Main proxy endpoint for OpenAI API requests.
+    Routes to local llama-server or remote API based on model.
+
+    Duplicate in-flight requests are coalesced via ``RequestCoalescer``
+    to prevent retry cascades when the Pi client retries a request that
+    is still being processed.
+    """
+    from proxy.request_coalescer import get_coalescer
+
+    # Read the body early so the coalescer has the hash key.
+    srv = _srv()
+    body = await request.body()
+
+    # Wrap the rest of the processing in an inner coroutine so we can
+    # pass it to the coalescer for deduplication.
+    async def _process_request():
+        return await _do_proxy_openai_api(request, path, body, srv)
+
+    response = await get_coalescer().coalesce_or_execute(path, body, _process_request)
+
+    # Observability (AC6): record the effective priority on the response so
+    # clients and operators can verify which tier actually routed the request
+    # (the cheap-window low-capping is visible here: the header shows the
+    # effective priority, not the client's claim). Best-effort on any
+    # response object exposing mutable headers.
+    _attach_priority_applied_header(response, request, srv)
+
+    return response
+
+
+def _attach_priority_applied_header(response, request, srv) -> None:
+    """Attach the ``X-Priority-Applied`` response header (AC6).
+
+    Reads the request's stamped effective priority (recomputing from the
+    headers when absent) and writes it onto *response*'s headers. For a
+    ``StreamingResponse`` the headers dict is still mutable until the
+    response starts streaming, so the header is attached here at the
+    top-level endpoint for all response kinds. Best-effort: any failure is
+    logged and never breaks the response.
+    """
+    try:
+        from proxy.priority import (
+            PRIORITY_APPLIED_HEADER,
+            request_priority,
+        )
+
+        server_cfg = (
+            srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
+        )
+        applied = request_priority(request, server_cfg)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            headers[PRIORITY_APPLIED_HEADER] = applied
+    except Exception:
+        try:
+            srv.logger.debug(
+                "Failed to attach X-Priority-Applied header", exc_info=True
+            )
+        except Exception:
+            pass
+
 
 def _get_recorder():
     """Resolve the global SessionRecorder instance from the server module."""

@@ -7,9 +7,10 @@ The MTP (Multi-Token Prediction) evaluation adds a COEXISTING model entry:
    GGUF (unsloth/Qwen3.6-35B-A3B-MTP-GGUF) with `--spec-type draft-mtp` and
    `--spec-draft-n-max 2` in llama-server flags, plus single-slot mode.
 2. models.ini: a [Qwen3-MTP] router preset for the same MTP GGUF.
-3. proxy configs (config.yaml, config-fast.yaml, config-cheap.yaml): a
-   `local-qwen3-mtp` model entry whose first provider is the local MTP model,
-   wired into the same remote fallback chain as the production entries.
+3. proxy config.yaml: a `local-qwen3-mtp` model entry whose first provider
+   is the local MTP model, wired into the same remote fallback chain as the
+   production entries (the mode overlays were removed with the fast/cheap
+   axis, LP-0MVDT94F0003VHUA AC4).
 
 The production plan/author/code chains must remain UNCHANGED (first local
 provider still llama_model: Qwen3) so the MTP evaluation never affects live
@@ -24,8 +25,6 @@ MODELS_INI_PATH = os.path.join(REPO_ROOT, "models.ini")
 START_LLAMA_PATH = os.path.join(REPO_ROOT, "start-llama.sh")
 CONFIG_PATHS = [
     os.path.join(REPO_ROOT, "proxy", "config.yaml"),
-    os.path.join(REPO_ROOT, "proxy", "config-fast.yaml"),
-    os.path.join(REPO_ROOT, "proxy", "config-cheap.yaml"),
 ]
 
 MTP_HF_REPO = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
@@ -33,7 +32,7 @@ MTP_HF_REPO = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 
 def _load_config(path):
     """Load a profile as seen at runtime (raw base, merged mode overlays)."""
-    from tests.config_test_utils import load_profile
+    from config_test_utils import load_profile
 
     return load_profile(os.path.basename(path))
 

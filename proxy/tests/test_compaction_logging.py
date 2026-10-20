@@ -72,7 +72,7 @@ def make_session(num_turns: int) -> list[dict]:
 
 _REQUIRED_FIELDS = {
     "session",
-    "mode",
+    "priority",
     "action",
     "reason",
     "pre_tokens",
@@ -110,7 +110,7 @@ class TestFieldCompleteness:
         assert fields is not None
         assert set(fields.keys()) == _REQUIRED_FIELDS
         assert fields["session"] == "sess-123"
-        assert fields["mode"] == "fast"
+        assert fields["priority"] == "standard"
         assert fields["action"] == "compact"
         assert fields["reason"] == "compacted_within_target"
         assert fields["pre_tokens"] == result["estimated_before"]

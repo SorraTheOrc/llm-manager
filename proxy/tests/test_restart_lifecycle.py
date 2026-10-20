@@ -54,84 +54,17 @@ def _make_srv(**overrides) -> SimpleNamespace:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def test_count_in_flight_counts_active_records_when_counter_zero(monkeypatch):
-    """The drain sees real streams even when ``local_active_queries`` is 0."""
-    import proxy.server as srv
+def test_mode_switch_drain_removed():
+    """The bounded mode-switch drain was removed with the fast/cheap mode
+    axis (LP-0MVDT94F0003VHUA AC4): the proxy never restarts for a routing
+    policy change, so no drain exists. The drain helpers lived in
+    ``proxy.mode``, which is gone.
+    """
+    import importlib
 
-    monkeypatch.setattr(srv, "local_active_queries", 0)
-    monkeypatch.setattr(
-        srv,
-        "local_dispatch_records",
-        {
-            "sess-a": {"active": True},
-            "sess-b": {"active": False},
-            "sess-c": {"active": True},
-        },
-    )
-    from proxy import mode
+    with pytest.raises(ImportError):
+        importlib.import_module("proxy.mode")
 
-    assert mode._count_in_flight_local_streams() == 2
-
-
-def test_count_in_flight_uses_counter_when_higher(monkeypatch):
-    """The counter wins when it exceeds the active-record count."""
-    import proxy.server as srv
-
-    monkeypatch.setattr(srv, "local_active_queries", 5)
-    monkeypatch.setattr(srv, "local_dispatch_records", {"sess-a": {"active": True}})
-    from proxy import mode
-
-    assert mode._count_in_flight_local_streams() == 5
-
-
-def test_count_in_flight_fail_open(monkeypatch):
-    """A missing/invalid records dict falls back to the counter."""
-    import proxy.server as srv
-
-    monkeypatch.setattr(srv, "local_active_queries", 3)
-    monkeypatch.setattr(srv, "local_dispatch_records", None)
-    from proxy import mode
-
-    assert mode._count_in_flight_local_streams() == 3
-
-
-def test_wait_for_in_flight_waits_for_active_records(monkeypatch):
-    """A drain deadline holds while an active dispatch record is present."""
-    import proxy.server as srv
-
-    from proxy import mode
-
-    # Counter is 0 but a real stream is active; then it clears.
-    state = {"calls": 0}
-
-    def _count():
-        state["calls"] += 1
-        return 1 if state["calls"] < 3 else 0
-
-    monkeypatch.setattr(mode, "_count_in_flight_local_streams", _count)
-    monkeypatch.setattr(mode.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(mode, "_end_drain", lambda: None)
-
-    deadline = time.monotonic() + 5
-    mode._wait_for_in_flight_local_streams(deadline=deadline)
-    assert state["calls"] >= 3, "Drain must poll until the real stream clears"
-
-
-def test_wait_for_in_flight_bounded_by_deadline(monkeypatch):
-    """A stuck stream cannot hold the restart past the deadline."""
-    from proxy import mode
-
-    monkeypatch.setattr(mode, "_count_in_flight_local_streams", lambda: 99)
-    monkeypatch.setattr(mode.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(mode, "_end_drain", lambda: None)
-
-    # Already-expired deadline returns immediately.
-    mode._wait_for_in_flight_local_streams(deadline=time.monotonic() - 1)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Signature
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @pytest.fixture
@@ -142,13 +75,13 @@ def sig_path(tmp_path, monkeypatch):
 
 
 def test_write_and_read_signature(sig_path, monkeypatch):
-    monkeypatch.setattr(lifecycle, "_read_mode_label", lambda: "fast")
+    monkeypatch.setattr(lifecycle, "_read_mode_label", lambda: "unified")
     monkeypatch.setattr(lifecycle, "_config_file_sha256", lambda: "abc123")
     lifecycle._write_llama_server_signature("Qwen3", 1, router_mode=True)
 
     sig = lifecycle._read_llama_server_signature()
     assert sig is not None
-    assert sig["mode"] == "fast"
+    assert sig["mode"] == "unified"
     assert sig["model"] == "router"
     assert sig["parallel"] == 1
     assert sig["router_mode"] is True
@@ -369,7 +302,7 @@ def test_config_file_sha256_matches_shared_merged_helper(monkeypatch, tmp_path):
     overlay) is byte-identical to the shared ``merged_config_sha256`` helper
     on the same inputs."""
     from proxy.config_merge import merged_config_sha256
-    from proxy.mode import proxy_dir
+    from proxy.priority import proxy_dir
 
     overlay = tmp_path / "custom-overlay.yaml"
     overlay.write_text("server:\n  session_slot_pool_size: 2\n", encoding="utf-8")
@@ -385,7 +318,7 @@ def test_config_file_sha256_hashes_merged_not_raw_overlay(monkeypatch, tmp_path)
     raw overlay bytes) must change the write-side hash — proxied through the
     shared helper which reads the merged surface."""
     from proxy.config_merge import merged_config_sha256
-    from proxy.mode import proxy_dir
+    from proxy.priority import proxy_dir
 
     overlay = tmp_path / "custom-overlay.yaml"
     overlay.write_text("server:\n  session_slot_pool_size: 2\n", encoding="utf-8")
@@ -414,7 +347,7 @@ def test_config_file_sha256_falls_back_to_base_without_env(monkeypatch):
     """With ``$LLAMA_PROXY_CONFIG`` unset the write side hashes the base
     merged with itself (base still exists), not the empty string."""
     from proxy.config_merge import merged_config_sha256
-    from proxy.mode import proxy_dir
+    from proxy.priority import proxy_dir
 
     monkeypatch.delenv("LLAMA_PROXY_CONFIG", raising=False)
     base_path = proxy_dir() / "config.yaml"
@@ -427,7 +360,7 @@ def test_config_file_sha256_tolerates_missing_overlay(monkeypatch, tmp_path):
     """A ``$LLAMA_PROXY_CONFIG`` pointing at a missing file falls back to
     the base rather than returning an error/empty string."""
     from proxy.config_merge import merged_config_sha256
-    from proxy.mode import proxy_dir
+    from proxy.priority import proxy_dir
 
     missing = tmp_path / "missing-overlay.yaml"
     monkeypatch.setenv("LLAMA_PROXY_CONFIG", str(missing))
@@ -469,6 +402,52 @@ def test_start_proxy_documents_reason_flag():
     header = _script_path().read_text(encoding="utf-8").splitlines()[:8]
     joined = "\n".join(header)
     assert "--reason" in joined
+
+
+def test_start_proxy_documents_use_env_keys_in_usage_synopsis():
+    """The usage synopsis lists the fail-closed stale-key opt-out flag."""
+    synopsis = _script_path().read_text(encoding="utf-8").splitlines()[4]
+    assert "--use-env-keys" in synopsis
+
+
+def test_readme_documents_stale_env_key_refusal():
+    """LP-0MVF7DRX70070KYZ: the operator docs record the fail-closed default,
+    the covered api_key_env list, fingerprint-only logging and both opt-out
+    forms, so a rotated auth.json can never be silently ignored."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "### API key rotation and stale env keys" in readme
+    section = readme.split("### API key rotation and stale env keys", 1)[1]
+    for token in (
+        "--use-env-keys",
+        "LLAMA_PROXY_USE_ENV_KEYS=1",
+        "OPENCODE_API_KEY",
+        "OPENCODE_2_API_KEY",
+        "OPENCODE_3_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "MUNITOAI_API_KEY",
+        "MUNITOAI_FREE_API_KEY",
+        "stale API key environment variable(s) detected — refusing to start",
+        "8-character key fingerprint",
+    ):
+        assert token in section, f"README stale-key section is missing {token!r}"
+
+
+def test_start_proxy_skill_documents_stale_key_refusal():
+    """LP-0MVF7DRX70070KYZ: the start-proxy skill warns that a restart may
+    refuse on a stale env key and records the remediation."""
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / ".pi"
+        / "skills"
+        / "start-proxy"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "fails closed" in skill
+    assert "--use-env-keys" in skill
+    assert "LLAMA_PROXY_USE_ENV_KEYS=1" in skill
+    assert "unset OPENCODE_API_KEY" in skill
 
 
 def test_start_proxy_reason_resolution_precedence():
@@ -583,3 +562,269 @@ def test_resolver_failure_message_names_candidate_keys():
         "opencode-go",
         "opencode",
     ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# api_key_resolver stale-key comparison / fingerprint (LP-0MVF7DO29009T8MH)
+#
+# AC-pinning tests for the fingerprint + ``compare_env_key`` helper and the
+# ``--check`` CLI contract that start-proxy.sh will call per ``api_key_env``
+# (parent LP-0MVD2RF7H008B7OT AC1–AC4). Authored test-first (RED) before the
+# helper child (LP-0MVF7DRBM004N90W) lands, so the contract is executable,
+# not prose. Fixture keys are deliberately >= 12 chars so fingerprint
+# redaction is genuinely exercised (an <= 8-char key would be returned whole).
+#
+# TDD red phase completed: the helper and ``--check`` mode landed in
+# LP-0MVF7DRBM004N90W, which removed the ``xfail(strict=True)`` markers that
+# kept ``dev`` green while the contract was unimplemented. The assertions below
+# are now enforced directly (same convention as
+# ``test_compaction_headers_contract.py``, LP-0MU44KR5F0015D7A).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Test names carry the parent AC they pin (audit AC6 traceability):
+#   ac1 — env key compared against auth.json (match / mismatch / cannot verify)
+#   ac2 — short fingerprint only, never the full key
+#   ac3 — fail-closed decision surface (--check exit 0/3/4)
+#   ac4_caseN — the four required AC4 cases (match, mismatch, resolved, auth.json
+#               missing) plus the derived env_only/auth_missing/unresolved cases
+
+# Env var name uses a synthetic provider stem so the tests never read or write
+# a real provider key in the ambient environment (fixtures only, via tmp_path).
+_ENV_VAR = "TEST_PROVIDER_API_KEY"
+_ENV_KEY = "ENV_KEY_MATCHING_AAAA"
+_AUTH_KEY = "AUTH_KEY_ROTATED_AAAA"
+
+
+def _auth_json(tmp_path, **keys) -> Path:
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps(_auth_fixture(**keys)))
+    return path
+
+
+# ── key_fingerprint (AC2: short fingerprint, never the whole key) ─────────────
+
+
+def test_key_fingerprint_is_first_8_chars_ac2():
+    """Pin the fingerprint width and that it never returns the whole key."""
+    from proxy.api_key_resolver import FINGERPRINT_LEN, key_fingerprint
+
+    assert FINGERPRINT_LEN == 8
+    fp = key_fingerprint(_AUTH_KEY)
+    assert fp == _AUTH_KEY[:8]
+    assert len(fp) <= FINGERPRINT_LEN
+    # longer-than-8 keys must never be returned whole (diagnosis, not auth)
+    assert fp != _AUTH_KEY
+
+
+def test_key_fingerprint_empty_and_none_yield_empty_string_ac2():
+    from proxy.api_key_resolver import key_fingerprint
+
+    assert key_fingerprint(None) == ""
+    assert key_fingerprint("") == ""
+
+
+# ── compare_env_key: the four AC4 cases ──────────────────────────────────────
+
+
+def test_compare_env_key_match_when_env_equals_auth_json_ac1_ac4_case1():
+    """AC4 case 1: env set and matching auth.json -> ``match``."""
+    from proxy.api_key_resolver import EnvKeyCheck, compare_env_key, key_fingerprint
+
+    auth = _auth_fixture(test_provider=_AUTH_KEY)
+    check = compare_env_key(_ENV_VAR, _AUTH_KEY, auth)
+
+    assert isinstance(check, EnvKeyCheck)
+    assert check.env_var == _ENV_VAR
+    assert check.status == "match"
+    assert check.env_fingerprint == key_fingerprint(_AUTH_KEY)
+    assert check.env_fingerprint == check.auth_fingerprint
+    # env already supplies the key, so nothing is exported
+    assert not check.resolved_key
+
+
+def test_compare_env_key_mismatch_when_env_differs_from_auth_json_ac1_ac3_ac4_case2():
+    """AC4 case 2: env set and differing -> ``mismatch`` (stale key)."""
+    from proxy.api_key_resolver import compare_env_key, key_fingerprint
+
+    auth = _auth_fixture(test_provider=_AUTH_KEY)
+    check = compare_env_key(_ENV_VAR, _ENV_KEY, auth)
+
+    assert check.status == "mismatch"
+    assert check.env_fingerprint == key_fingerprint(_ENV_KEY)
+    assert check.auth_fingerprint == key_fingerprint(_AUTH_KEY)
+    assert check.env_fingerprint != check.auth_fingerprint
+    # fingerprints must be redacted, never the full key
+    assert check.env_fingerprint != _ENV_KEY
+    assert check.auth_fingerprint != _AUTH_KEY
+
+
+def test_compare_env_key_resolved_from_auth_json_when_env_unset_ac4_case3():
+    """AC4 case 3: env unset -> ``resolved``, returning the auth.json key
+    so start-proxy.sh can export it."""
+    from proxy.api_key_resolver import compare_env_key, key_fingerprint
+
+    auth = _auth_fixture(test_provider=_AUTH_KEY)
+    for unset in (None, ""):
+        check = compare_env_key(_ENV_VAR, unset, auth)
+        assert check.status == "resolved"
+        assert check.resolved_key == _AUTH_KEY
+        assert check.env_fingerprint == ""
+        assert check.auth_fingerprint == key_fingerprint(_AUTH_KEY)
+
+
+def test_compare_env_key_auth_json_missing_with_env_is_env_only_ac1_ac4_case4():
+    """AC4 case 4a: auth.json absent (``auth=None``) + env set -> ``env_only``
+    (staleness cannot be verified; keep the env key, warn, do not fail)."""
+    from proxy.api_key_resolver import compare_env_key
+
+    check = compare_env_key(_ENV_VAR, _ENV_KEY, None)
+    assert check.status == "env_only"
+    assert check.env_fingerprint == _ENV_KEY[:8]
+    assert check.auth_fingerprint == ""
+    assert not check.resolved_key
+
+
+def test_compare_env_key_auth_json_missing_with_env_unset_is_auth_missing_ac3_ac4_case4():
+    """AC4 case 4b: auth.json absent + env unset -> ``auth_missing``, and
+    never raises."""
+    from proxy.api_key_resolver import compare_env_key
+
+    check = compare_env_key(_ENV_VAR, None, None)
+    assert check.status == "auth_missing"
+    assert not check.resolved_key
+
+
+def test_compare_env_key_unresolvable_entry_is_unresolved_ac4_case4():
+    """auth.json present but no resolvable entry cannot be compared ->
+    ``unresolved`` (never raises)."""
+    from proxy.api_key_resolver import compare_env_key
+
+    auth = _auth_fixture(munitoai="PAID_KEY_AAAA")
+    assert compare_env_key(_ENV_VAR, _ENV_KEY, auth).status == "unresolved"
+    assert compare_env_key(_ENV_VAR, None, auth).status == "unresolved"
+
+
+def test_compare_env_key_prefers_opencode_go_ac1_ac4():
+    """OPENCODE_API_KEY resolution follows the opencode-go preference, so the
+    comparison is against the Go key, not the base ``opencode`` key."""
+    from proxy.api_key_resolver import compare_env_key
+
+    go_key = "OPENCODE_GO_KEY_AAAA"
+    base_key = "OPENCODE_BASE_KEY_AAAA"
+    auth = _auth_fixture(**{"opencode-go": go_key, "opencode": base_key})
+
+    resolved = compare_env_key("OPENCODE_API_KEY", None, auth)
+    assert resolved.status == "resolved"
+    assert resolved.resolved_key == go_key
+
+    assert compare_env_key("OPENCODE_API_KEY", go_key, auth).status == "match"
+    assert (
+        compare_env_key("OPENCODE_API_KEY", base_key, auth).status == "mismatch"
+    )
+
+
+# ── --check CLI contract (exit codes 0/3/4, fingerprints-only stdout) ────────
+
+
+def test_check_cli_exit_0_with_fingerprints_only_on_match_ac2_ac3_ac4_case1(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import key_fingerprint, main
+
+    auth_file = _auth_json(tmp_path, test_provider=_AUTH_KEY)
+    monkeypatch.setenv(_ENV_VAR, _AUTH_KEY)
+
+    rc = main(["--check", str(auth_file), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    payload = json.loads(out.strip())  # exactly one line of JSON
+    assert payload["status"] == "match"
+    assert payload["env_var"] == _ENV_VAR
+    assert payload["env_fingerprint"] == key_fingerprint(_AUTH_KEY)
+    # no plaintext key may appear when the env var is set
+    assert _AUTH_KEY not in out
+    assert _ENV_KEY not in out
+
+
+def test_check_cli_exit_0_and_exports_resolved_key_when_env_unset_ac3_ac4_case3(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import main
+
+    auth_file = _auth_json(tmp_path, test_provider=_AUTH_KEY)
+    monkeypatch.delenv(_ENV_VAR, raising=False)
+
+    rc = main(["--check", str(auth_file), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    payload = json.loads(out.strip())
+    assert payload["status"] == "resolved"
+    # the env-unset path is the export path, so the full key is expected
+    assert payload["resolved_key"] == _AUTH_KEY
+
+
+def test_check_cli_exit_3_on_mismatch_without_plaintext_ac1_ac3_ac4_case2(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import key_fingerprint, main
+
+    auth_file = _auth_json(tmp_path, test_provider=_AUTH_KEY)
+    monkeypatch.setenv(_ENV_VAR, _ENV_KEY)
+
+    rc = main(["--check", str(auth_file), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 3
+    payload = json.loads(out.strip())
+    assert payload["status"] == "mismatch"
+    assert payload["env_fingerprint"] == key_fingerprint(_ENV_KEY)
+    assert payload["auth_fingerprint"] == key_fingerprint(_AUTH_KEY)
+    assert _ENV_KEY not in out
+    assert _AUTH_KEY not in out
+
+
+def test_check_cli_exit_4_when_key_unresolvable_ac3_ac4_case4(tmp_path, monkeypatch, capsys):
+    from proxy.api_key_resolver import main
+
+    auth_file = _auth_json(tmp_path, munitoai="PAID_KEY_AAAA")
+    monkeypatch.delenv(_ENV_VAR, raising=False)
+
+    rc = main(["--check", str(auth_file), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 4
+    assert json.loads(out.strip())["status"] == "unresolved"
+
+
+def test_check_cli_exit_0_env_only_when_auth_json_absent_ac1_ac4_case4(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import main
+
+    missing = tmp_path / "auth-does-not-exist.json"
+    monkeypatch.setenv(_ENV_VAR, _ENV_KEY)
+
+    rc = main(["--check", str(missing), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    assert rc == 0  # env_only keeps the key, warns, does not fail
+    assert json.loads(out.strip())["status"] == "env_only"
+    assert _ENV_KEY not in out
+
+
+def test_check_cli_non_zero_when_auth_json_absent_and_env_unset_ac3_ac4_case4(
+    tmp_path, monkeypatch, capsys
+):
+    from proxy.api_key_resolver import main
+
+    missing = tmp_path / "auth-does-not-exist.json"
+    monkeypatch.delenv(_ENV_VAR, raising=False)
+
+    rc = main(["--check", str(missing), _ENV_VAR])
+    out = capsys.readouterr().out
+
+    # no key at all: fail closed rather than silently exporting nothing
+    assert rc != 0
+    assert json.loads(out.strip())["status"] == "auth_missing"

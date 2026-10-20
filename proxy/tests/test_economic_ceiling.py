@@ -163,7 +163,7 @@ class TestShippedConfigDerivesExpectedValues:
 
     @staticmethod
     def _load(name):
-        from tests.config_test_utils import load_profile
+        from config_test_utils import load_profile
 
         return load_profile(name)
 
@@ -173,17 +173,22 @@ class TestShippedConfigDerivesExpectedValues:
 
     def test_fast_profile_effective_warm(self):
         cold, warm = _effective_large_context_thresholds(
-            self._load("config-fast.yaml")
+            self._load("config.yaml")
         )
         assert cold == 38000
         assert warm == 100000
 
-    def test_cheap_profile_effective_warm(self):
-        cold, warm = _effective_large_context_thresholds(
-            self._load("config-cheap.yaml")
-        )
-        assert cold == 42000
-        assert warm == 83285
+    def test_mode_overlays_removed(self):
+        # AC4 (LP-0MVDT94F0003VHUA): the fast/cheap overlays were merged into
+        # the base config and deleted, so there is a single unified profile.
+        from proxy.priority import proxy_dir
+
+        assert not (proxy_dir() / "config-fast.yaml").exists()
+        assert not (proxy_dir() / "config-cheap.yaml").exists()
+        # The unified profile resolves through the base alone.
+        cold, warm = _effective_large_context_thresholds(self._load("config.yaml"))
+        assert cold == 38000
+        assert warm == 100000
 
 
 class TestStartupThresholdLogging:

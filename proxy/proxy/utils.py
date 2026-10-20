@@ -558,7 +558,7 @@ def _normalize_outgoing_headers(in_headers: dict, buffered: bool = False) -> dic
 
 def _config_base_path() -> Path:
     """Return the authoritative base config path (``proxy/config.yaml``)."""
-    from proxy.mode import proxy_dir
+    from proxy.priority import proxy_dir
 
     return proxy_dir() / "config.yaml"
 
@@ -612,21 +612,16 @@ def _load_merged_config(overlay_path) -> dict:
 def load_config(config_path: str | None = None) -> dict:
     """Load configuration from YAML file.
 
-    When *config_path* is ``None`` the active config is resolved by
-    ``proxy.mode.resolve_config_path()``: ``LLAMA_PROXY_CONFIG`` env var if
-    set (start-proxy.sh exports it from the persisted mode), else the
-    mode-selected profile (``config-fast.yaml`` / ``config-cheap.yaml``),
-    else ``proxy/config.yaml`` (default/fallback). The resolved file is then
-    deep-merged **on top of** the authoritative base config
-    (``proxy/config.yaml``), so every base-only key is inherited.
+    ``proxy/config.yaml`` is the single authoritative config
+    (LP-0MVDT94F0003VHUA AC4: the mode overlays and the
+    ``LLAMA_PROXY_CONFIG`` selection were removed; load_config no longer
+    consults a persisted mode).
 
     When *config_path* is given explicitly, only that file is loaded
     (unchanged backward-compatible behaviour — no merge with the base).
     """
     if config_path is None:
-        from proxy.mode import resolve_config_path
-
-        cfg = _load_merged_config(resolve_config_path())
+        cfg = _load_merged_config(_config_base_path())
     else:
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
@@ -644,12 +639,8 @@ def load_merged_config(config_path) -> dict:
     Unlike :func:`load_config`, this never returns a raw overlay: the base
     ``proxy/config.yaml`` is always merged underneath *config_path* (unless
     *config_path* is the base itself, in which case it is loaded once). This
-    is the entry point for consumers that must see a **complete** config for
-    a mode other than the active one — currently the mode-switch
-    grandfathering other-mode load (``server._startup_initialize_
-    grandfathering``), which compares remote-provider counts between modes.
-
-    The merged config is validated exactly like :func:`load_config`.
+    entry point remains for consumers that must see a **complete** config
+    (the merged config is validated exactly like :func:`load_config`).
     """
     cfg = _load_merged_config(config_path)
     _validate_config(cfg)

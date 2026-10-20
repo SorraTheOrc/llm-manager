@@ -100,7 +100,10 @@ class TestHandleSessionCompactionWiring:
         assert captured["messages"] is not None
 
     @pytest.mark.asyncio
-    async def test_compaction_mode_is_read_from_proxy_mode(self):
+    async def test_compaction_mode_is_unified_profile(self):
+        """The compaction budget key defaults to "fast" — the single unified
+        profile (the retired mode axis was replaced by priority routing,
+        LP-0MVDT94F0003VHUA AC6)."""
         from proxy.router_helpers import _handle_session
 
         srv = _make_server()
@@ -115,7 +118,7 @@ class TestHandleSessionCompactionWiring:
         with patch("proxy.router_helpers._evaluate_session_compaction", side_effect=capture):
             await _handle_session(srv, body_json, server_config, {})
 
-        assert captured["mode"] in ("fast", "cheap")
+        assert captured["mode"] == "fast"
 
     @pytest.mark.asyncio
     async def test_summarizer_uses_server_config_from_srv(self):

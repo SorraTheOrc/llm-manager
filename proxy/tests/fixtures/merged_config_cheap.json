@@ -32,7 +32,7 @@
           "model": "deepseek-ai/deepseek-v4-flash",
           "name": "munitoai-free",
           "provider": "MunitoAI",
-          "rate_limit_rpm": 10,
+          "rate_limit_rpm": 15,
           "type": "remote"
         },
         {
@@ -42,6 +42,7 @@
             "04:00-06:00",
             "10:00-00:00"
           ],
+          "display_name": "OpenCode Go 3",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -56,6 +57,7 @@
             "04:00-06:00",
             "10:00-00:00"
           ],
+          "display_name": "OpenCode Go 2",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -70,6 +72,7 @@
             "04:00-06:00",
             "10:00-00:00"
           ],
+          "display_name": "OpenCode Go",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -125,7 +128,7 @@
           "model": "deepseek-ai/deepseek-v4-flash",
           "name": "munitoai-free",
           "provider": "MunitoAI",
-          "rate_limit_rpm": 10,
+          "rate_limit_rpm": 15,
           "type": "remote"
         },
         {
@@ -135,6 +138,7 @@
             "04:00-06:00",
             "10:00-00:00"
           ],
+          "display_name": "OpenCode Go 3",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -149,6 +153,7 @@
             "04:00-06:00",
             "10:00-00:00"
           ],
+          "display_name": "OpenCode Go 2",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -163,6 +168,7 @@
             "04:00-06:00",
             "10:00-00:00"
           ],
+          "display_name": "OpenCode Go",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -200,6 +206,7 @@
         {
           "api": "openai-responses",
           "api_key_env": "OPENCODE_API_KEY",
+          "display_name": "OpenCode Go Compact",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "muse-spark-1.3-contributor",
@@ -267,7 +274,7 @@
           "model": "deepseek-ai/deepseek-v4-flash",
           "name": "munitoai-free",
           "provider": "MunitoAI",
-          "rate_limit_rpm": 10,
+          "rate_limit_rpm": 15,
           "type": "remote"
         },
         {
@@ -277,6 +284,7 @@
             "04:00-06:00",
             "10:00-00:00"
           ],
+          "display_name": "OpenCode Go 3",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -291,6 +299,7 @@
             "04:00-06:00",
             "10:00-00:00"
           ],
+          "display_name": "OpenCode Go 2",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",
@@ -305,6 +314,7 @@
             "04:00-06:00",
             "10:00-00:00"
           ],
+          "display_name": "OpenCode Go",
           "endpoint": "https://opencode.ai/zen/go",
           "forward_session_headers": false,
           "model": "deepseek-v4.1-flash",

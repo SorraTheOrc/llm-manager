@@ -63,6 +63,44 @@ Now:
   (Prometheus counter), alerting via `monitoring/slots_query_alerts.yaml`
   when the failure rate is sustained.
 
+## Stale log-derived progress (LP-0MVECWYWK000U3E1)
+
+The `n_decoded` value served for a slot can be supplemented from
+`llama-server.log` progress lines (`slot update_slots: ... n_tokens = N
+progress = P`) when the `/slots` endpoint is unresponsive during busy
+generation. That supplemental path used to pin the UI at stale token counts
+forever when the log stopped being written (e.g. an adopted llama-server
+whose stdout pipe was never re-attached):
+
+1. `_update_slot_progress_from_log()` re-parsed the same frozen tail every
+   cycle and stamped each entry with `time.time()` (the *read* time), so the
+   values never aged past the 60 s prune window.
+2. The periodic loop aliased `_last_slot_details_cache` to the list it then
+   enriched in place, permanently baking the stale counts into the fallback
+   cache.
+3. Enrichment replaced `n_decoded` whenever the log value was larger — always
+   true for stale data.
+
+Now:
+
+- Log-derived entries are stamped with the log file's **mtime** (clamped to
+  `now` if the mtime is in the future), not the read time. A frozen log
+  self-expires after `SLOT_PROGRESS_MAX_AGE_SECONDS` (60 s) and leaves no
+  progress data behind.
+- `_slot_progress_is_fresh()` is the single freshness gate used by the prune,
+  enrichment, and processing-slot assignment. A stale entry is rejected even
+  if injected directly (AC3).
+- `_resolve_slot_details_for_enrichment()` stores a pristine copy of the raw
+  `/slots` values in `_last_slot_details_cache` and returns a **detached
+  copy** for enrichment, so log-derived fields can never poison the fallback
+  cache. Both the periodic broadcast loop and the SSE `status_events()` path
+  use it.
+- A status response served from the cache (`slots_stale: true`) therefore
+  reports only genuine `/slots` values — never a log-derived `n_decoded`
+  greater than the live value (AC5).
+- With a fresh log the override still works exactly as before (AC4), so the
+  original unresponsive-`/slots` use case is preserved.
+
 ## Why
 
 herdr's downtime worker (ContextHub `packages/herdr/src/downtime-worker.ts`)

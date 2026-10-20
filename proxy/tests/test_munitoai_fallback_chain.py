@@ -5,8 +5,8 @@ The MunitoAI tiers are the remote fallbacks of the ``plan`` / ``author`` /
 ``code`` chains: ``munitoai-free`` sits directly after the local Qwen3
 provider (first remote tier), and ``munitoai`` sits directly before the
 ``deepseek-flash`` final tier, in both the authoritative base config
-(``config.yaml``) and the fast overlay (``config-fast.yaml``); cheap inherits
-the base chains. These tests assert the *resolved* runtime config through the
+(``config.yaml``, the single authoritative config after the mode axis was
+removed, LP-0MVDT94F0003VHUA AC4). These tests assert the *resolved* runtime config through the
 production merge path, so the tier cannot silently drop out of a profile or
 drift in the chain order.
 
@@ -19,8 +19,8 @@ header value derived from the entry, and resolution of the ``MUNITOAI_API_KEY``
 import json
 
 import pytest
-from proxy.provider import _build_resolved_model_value
-from tests.config_test_utils import get_merged_config, load_profile
+from config_test_utils import get_merged_config, load_profile
+from proxy.provider import _build_resolved_model_value, _provider_context_limit
 
 #: The exact provider entry the chains must carry right after local.
 #: ``display_name`` marks the free tier (``MunitoAI Free``) so the
@@ -35,9 +35,18 @@ MUNITOAI_FREE_ENTRY = {
     "api_key_env": "MUNITOAI_FREE_API_KEY",
     "forward_session_headers": False,
     "model": "deepseek-ai/deepseek-v4-flash",
+    # Per-entry context ceiling (LP-0MVF9N31A0006VH5): the free tier's
+    # rolling-60s input-token allowance (x-ratelimit-limit-input-tokens),
+    # probed from the live endpoint 2026-10-19. Sourced, not guessed.
+    "max_context_tokens": 150000,
     # Free-tier request budget (LP-0MVDQ1GMO00801PL): a small per-60s window,
-    # so the tier is only used while it has capacity.
-    "rate_limit_rpm": 10,
+    # so the tier is only used while it has capacity. Deliberately conservative
+    # at 2/min (LP-0MVF19DKR008VCHO) — bursts spill to the paid tiers.
+    "rate_limit_rpm": 2,
+    # Honour the upstream's x-ratelimit-reset-* headers on 429
+    # (LP-0MVBHDNLB007ALLJ): MunitoAI sends no Retry-After, so the reset header
+    # supplies the cooldown instead of a blind backoff guess.
+    "respect_ratelimit_headers": True,
 }
 
 #: The exact (paid) munitoai entry that must sit directly before deepseek-flash.
@@ -49,6 +58,13 @@ MUNITOAI_ENTRY = {
     "api_key_env": "MUNITOAI_API_KEY",
     "forward_session_headers": False,
     "model": "deepseek-ai/deepseek-v4-flash",
+    # Per-entry context ceiling (LP-0MVF9N31A0006VH5): the paid tier's
+    # rolling-60s input-token allowance (x-ratelimit-limit-input-tokens),
+    # probed from the live endpoint 2026-10-19. Same upstream model as the
+    # free tier but a larger allowance, hence the deliberate higher limit.
+    "max_context_tokens": 400000,
+    # Honour x-ratelimit-reset-* headers on 429 (LP-0MVBHDNLB007ALLJ).
+    "respect_ratelimit_headers": True,
 }
 
 CHAINS = ("plan", "author", "code")
@@ -142,6 +158,176 @@ def test_munitoai_resolved_model_header(model):
     assert free_value == "MunitoAI Free/deepseek-ai/deepseek-v4-flash"
     assert paid_value == "MunitoAI/deepseek-ai/deepseek-v4-flash"
     assert free_value != paid_value
+
+
+@pytest.mark.parametrize("model", CHAINS)
+def test_shipped_context_limit_field_is_a_positive_int(model):
+    """A shipped ``max_context_tokens`` must be a positive integer.
+
+    The per-entry context ceiling (LP-0MVF9MY0W002J2N3, parent
+    LP-0MVF2DNCX003Z5CO) is optional: an entry that is deliberately ungated
+    omits the key. When present, it must be a real positive ``int`` — a bool,
+    string, zero or negative value would either silently disable the gate or
+    mis-parse it at dispatch time.
+    """
+    for entry in _providers(load_profile("config.yaml"), model):
+        if "max_context_tokens" not in entry:
+            continue
+        value = entry["max_context_tokens"]
+        assert isinstance(value, int) and not isinstance(value, bool), (
+            f"{entry['name']}: max_context_tokens must be an int, got {value!r}"
+        )
+        assert value > 0, f"{entry['name']}: use an absent key rather than {value!r}"
+
+
+#: Sourced per-entry context ceilings shipped in ``proxy/config.yaml``
+#: (LP-0MVF9N31A0006VH5). Provenance, recorded next to each value in the
+#: config:
+#:
+#: * ``munitoai-free`` (150,000) and ``munitoai`` (400,000) are the tiers'
+#:   documented rolling-60s **input-token allowances**, read from the live
+#:   ``x-ratelimit-limit-input-tokens`` response header (probed 2026-10-19).
+#:   The upstream model window (1,048,576) is far larger, so the allowance is
+#:   the binding ceiling for a single dispatch.
+#: * ``opencode-go*`` (1,000,000) is the model-registry context window for
+#:   ``opencode-go/deepseek-v4.1-flash``; OpenCode Go publishes plan quota as
+#:   percentages, not a per-minute token allowance, so the window is the only
+#:   sourceable ceiling.
+#: * ``deepseek-flash`` (1,048,576) is ``api.deepseek.com``'s own
+#:   ``context_window`` for the model — the largest window in the chain, so
+#:   the final tier stays effectively ungated (AC3).
+SHIPPED_CONTEXT_LIMITS = {
+    "munitoai-free": 150_000,
+    "opencode-go-3": 1_000_000,
+    "opencode-go-2": 1_000_000,
+    "opencode-go": 1_000_000,
+    "munitoai": 400_000,
+    "deepseek-flash": 1_048_576,
+}
+
+#: Upstream context window of ``deepseek-ai/deepseek-v4-flash`` (per
+#: api.deepseek.com ``/models``) — the model BOTH MunitoAI tiers serve, so a
+#: MunitoAI ceiling below this value is an allowance-driven cap, not a model
+#: limit.
+DEEPSEEK_V4_FLASH_WINDOW = 1_048_576
+
+#: Upstream context window of ``opencode-go/deepseek-v4.1-flash`` (model
+#: registry) — the model all three ``opencode-go*`` accounts serve.
+OPENCODE_V41_FLASH_WINDOW = 1_000_000
+
+#: Upstream context window of the model the direct ``deepseek-flash`` entry
+#: serves (``DeepSeek-V4.1-Flash``, per api.deepseek.com ``/models``).
+DEEPSEEK_FLASH_WINDOW = 1_048_576
+
+#: Upstream context window of ``muse-spark-1.3-contributor`` (model registry),
+#: used by the ``compact`` chain's opencode-go tier.
+MUSE_SPARK_WINDOW = 1_048_576
+
+
+def _entry(providers: list[dict], name: str) -> dict:
+    return next(provider for provider in providers if provider["name"] == name)
+
+
+@pytest.mark.parametrize("model", CHAINS)
+def test_shipped_context_limits_are_pinned(model):
+    """Every gated remote tier ships its sourced ceiling exactly.
+
+    The gate reads the value through ``provider._provider_context_limit``, so
+    asserting the parsed limit (not just the raw YAML key) pins what dispatch
+    will actually enforce. Drift in either the config or the reader fails here
+    (LP-0MVF9N31A0006VH5 AC4).
+    """
+    providers = _providers(load_profile("config.yaml"), model)
+    shipped = {
+        entry["name"]: _provider_context_limit(entry)
+        for entry in providers
+        if entry["name"] in SHIPPED_CONTEXT_LIMITS
+    }
+    assert shipped == SHIPPED_CONTEXT_LIMITS
+
+
+@pytest.mark.parametrize("model", CHAINS)
+def test_every_remote_tier_in_the_chain_is_gated(model):
+    """AC1: each remote tier in the chains declares a ceiling; local does not.
+
+    The local tier keeps the existing local routing thresholds, so an absent
+    limit there is correct — but every remote tier ships a sourced value.
+    """
+    for entry in _providers(load_profile("config.yaml"), model):
+        limit = _provider_context_limit(entry)
+        if entry["type"] == "remote":
+            assert limit > 0, f"{entry['name']}: remote tier must be gated"
+        else:
+            assert limit == 0, f"{entry['name']}: local tier keeps local thresholds"
+
+
+@pytest.mark.parametrize("model", CHAINS)
+def test_munitoai_free_is_capped_by_its_per_minute_input_allowance(model):
+    """The free tier's ceiling is its allowance, not the model's window.
+
+    A single dispatch must not be able to consume more than one full minute of
+    the free tier's input budget, so the shipped ceiling is far below the
+    upstream window (the deliberate difference from the paid tier).
+    """
+    free_limit = _provider_context_limit(
+        _entry(_providers(load_profile("config.yaml"), model), "munitoai-free")
+    )
+    assert free_limit < DEEPSEEK_V4_FLASH_WINDOW
+
+
+@pytest.mark.parametrize("model", CHAINS)
+def test_munitoai_paid_tier_allows_more_context_than_the_free_tier(model):
+    """Same upstream model, larger allowance → larger deliberate ceiling."""
+    providers = _providers(load_profile("config.yaml"), model)
+    free_limit = _provider_context_limit(_entry(providers, "munitoai-free"))
+    paid_limit = _provider_context_limit(_entry(providers, "munitoai"))
+    assert paid_limit > free_limit
+    assert paid_limit < DEEPSEEK_V4_FLASH_WINDOW
+
+
+@pytest.mark.parametrize("model", CHAINS)
+def test_opencode_tiers_share_the_same_context_limit(model):
+    """The three opencode-go tiers serve the same model → the same ceiling.
+
+    All three are capped at that model's upstream window (OpenCode Go exposes
+    no per-minute token allowance to cap lower against), so an inconsistency
+    between sibling accounts is a config error.
+    """
+    providers = _providers(load_profile("config.yaml"), model)
+    limits = {
+        _provider_context_limit(_entry(providers, name))
+        for name in ("opencode-go-3", "opencode-go-2", "opencode-go")
+    }
+    assert limits == {OPENCODE_V41_FLASH_WINDOW}
+
+
+@pytest.mark.parametrize("model", CHAINS)
+def test_deepseek_flash_is_the_largest_window_destination(model):
+    """AC3: the final tier holds the largest window so the chain never starves.
+
+    An oversized prompt must still have a destination: the last tier's ceiling
+    equals its upstream context window and is the largest ceiling in the
+    chain, so no request can be capped out of every tier. It must also exceed
+    the local warm-context threshold, otherwise a context the local model
+    refuses would be refused remotely too.
+    """
+    cfg = load_profile("config.yaml")
+    providers = _providers(cfg, model)
+    limits = {p["name"]: _provider_context_limit(p) for p in providers}
+    final_limit = limits["deepseek-flash"]
+    assert final_limit == DEEPSEEK_FLASH_WINDOW
+    assert final_limit == max(limits.values())
+    assert final_limit > cfg["server"]["local_large_context_warm_cache_threshold"]
+
+
+def test_compact_chain_context_limits_are_pinned():
+    """The remote-only compact chain carries the same sourced ceilings."""
+    providers = _providers(load_profile("config.yaml"), "compact")
+    limits = {p["name"]: _provider_context_limit(p) for p in providers}
+    assert limits == {
+        "opencode-go-compact": MUSE_SPARK_WINDOW,
+        "deepseek-flash-compact": DEEPSEEK_FLASH_WINDOW,
+    }
 
 
 def test_munitoai_api_key_resolves_from_pi_auth_json(tmp_path):

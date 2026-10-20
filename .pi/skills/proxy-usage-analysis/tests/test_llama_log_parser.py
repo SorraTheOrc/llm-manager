@@ -410,7 +410,7 @@ class TestEndToEnd:
         assert "| Qwen3 | Total | 2 | 243.8 | 359.2 | 128.4 |" in pe_section
 
         # CSV gains the decode tok/s column.
-        with (out_dir / "fast_sessions.csv").open() as f:
+        with (out_dir / "standard_sessions.csv").open() as f:
             rows = list(csv.DictReader(f))
         assert "decode_tok_s" in rows[0].keys()
 

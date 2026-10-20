@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Start the proxy application
-# Usage: ./scripts/start-proxy.sh [--restart] [--reason "<text>"] [--verbose] [uvicorn-args...]
+# Usage: ./scripts/start-proxy.sh [--restart] [--reason "<text>"] [--verbose] [--use-env-keys] [uvicorn-args...]
 #
 # Flags:
 #   --restart   Kill all running proxy/llama-server/TTS processes before starting
@@ -13,18 +13,32 @@ set -euo pipefail
 #               Proxy-only restart: preserve the co-located llama-server so its
 #               warm KV / prompt cache survives (LP-0MUCEFCL6001ZXYN). With
 #               --restart and no explicit flag, llama-server is preserved
-#               automatically when its recorded signature matches the selected
-#               config (same mode + merged-config hash, base + overlay); it is
-#               restarted when the effective local-backend config actually
-#               changes. The signature hashes the MERGED config via the shared
-#               merged_config_sha256 helper (LP-0MUJRVYQH002IEHW); pre-upgrade
-#               raw-file-hash signatures mismatch once and conservatively
-#               restart llama-server.
+#               automatically when its recorded signature matches the effective
+#               config; it is restarted when the local-backend config actually
+#               changes. The signature hashes the merged config (the base alone
+#               since the mode overlays were removed, LP-0MVDT94F0003VHUA AC4)
+#               via the shared merged_config_sha256 helper
+#               (LP-0MUJRVYQH002IEHW); pre-upgrade raw-file-hash signatures
+#               mismatch once and conservatively restart llama-server.
 #   --verbose   Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO level)
+#   --use-env-keys
+#               Keep the environment's provider API keys even when they
+#               DISAGREE with ~/.pi/agent/auth.json. Stale-key detection is
+#               fail-closed by default: a mismatch refuses to start, so a
+#               rotated auth.json can never be silently ignored. Unattended
+#               restart paths (herdr/agent-spawned) cannot pass flags, so they
+#               may instead set LLAMA_PROXY_USE_ENV_KEYS=1. This flag is
+#               consumed here and never forwarded to uvicorn
+#               (LP-0MVF7DRMK001NHT8).
 #
 # Automatically resolves required API keys from:
-#   1. Environment variables (already set)
+#   1. Environment variables (already set) — verified against auth.json; a
+#      stale value refuses startup unless --use-env-keys /
+#      LLAMA_PROXY_USE_ENV_KEYS=1 is given
 #   2. ~/.pi/agent/auth.json as fallback
+#
+# Every resolved provider key is logged as an 8-character fingerprint only;
+# a full key is never printed (LP-0MVF7DRMK001NHT8).
 
 VENV_DIR=".venv"
 VENV_PY="$VENV_DIR/bin/python3"
@@ -65,6 +79,13 @@ RESTART=0
 VERBOSE=0
 KEEP_LLAMA_SERVER=0
 RESTART_REASON=""
+# LP-0MVF7DRMK001NHT8: stale-key detection is fail-closed by default. The
+# opt-out is either the --use-env-keys flag or LLAMA_PROXY_USE_ENV_KEYS=1
+# (unattended restarts cannot pass flags).
+USE_ENV_KEYS=0
+if [ "${LLAMA_PROXY_USE_ENV_KEYS:-}" = "1" ]; then
+  USE_ENV_KEYS=1
+fi
 UVICORN_ARGS=()
 prev=""
 for arg in "$@"; do
@@ -101,6 +122,11 @@ for arg in "$@"; do
         # LP-0MUCEFCL6001ZXYN: proxy-only restart — preserve the co-located
         # llama-server so its warm KV / prompt cache survives.
         KEEP_LLAMA_SERVER=1
+        ;;
+      --use-env-keys)
+        # LP-0MVF7DRMK001NHT8 AC3: explicit opt-out of fail-closed stale-key
+        # detection. Consumed here — uvicorn rejects unknown CLI flags.
+        USE_ENV_KEYS=1
         ;;
       --verbose)
         # Enable verbose per-chunk SSE logging (STREAM CHUNK lines at INFO
@@ -185,25 +211,20 @@ if [ "$RESTART" -eq 1 ]; then
   # LP-0MUCEFCL6001ZXYN: decide whether to preserve the co-located
   # llama-server. A proxy-only restart (unchanged local backend config) must
   # keep it running so the warm KV / prompt cache survives; a genuine
-  # model/parallel change (e.g. a mode switch) must restart it.
+  # model/parallel change must restart it.
   KEEP_LLAMA=0
   if [ "$KEEP_LLAMA_SERVER" -eq 1 ]; then
     KEEP_LLAMA=1
   else
-    _sig_mode=""
     _sig_sha=""
-    _restart_mode="fast"
-    if [ -f "$REPO_ROOT/.mode" ]; then
-      _restart_mode="$(tr -d '[:space:]' < "$REPO_ROOT/.mode")"
-    fi
-    _restart_cfg="$REPO_ROOT/config-$_restart_mode.yaml"
-    [ -f "$_restart_cfg" ] || _restart_cfg="$REPO_ROOT/config.yaml"
+    _restart_cfg="$REPO_ROOT/config.yaml"
     # LP-0MUJRVYQH002IEHW: hash the MERGED config (base + overlay) via the
-    # shared canonical helper — NOT the raw overlay file — so a base-only
+    # shared canonical helper — NOT the raw file — so a base-only
     # local-backend change (e.g. local_model_ctx_size, llama_server_port)
-    # also changes the signature and forces a llama-server restart. When the
-    # overlay file is absent the base is hashed merged with itself. An empty
-    # hash (Python unavailable / helper failure) means "do not preserve".
+    # also changes the signature and forces a llama-server restart. With the
+    # mode axis removed (LP-0MVDT94F0003VHUA AC4) the effective config is
+    # the base alone. An empty hash (Python unavailable / helper failure)
+    # means "do not preserve".
     _restart_sha="$("$PY_BIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT/proxy')
@@ -212,10 +233,9 @@ print(merged_config_sha256('$REPO_ROOT/config.yaml', '$_restart_cfg'))
 " 2>/dev/null || true)"
     _sig_file="$REPO_ROOT/.llama_server_signature.json"
     if [ -f "$_sig_file" ] && [ -n "$_restart_sha" ]; then
-      _sig_mode="$("$PY_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('mode',''))" "$_sig_file" 2>/dev/null || true)"
       _sig_sha="$("$PY_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('config_sha256',''))" "$_sig_file" 2>/dev/null || true)"
     fi
-    if [ -n "$_sig_mode" ] && [ "$_sig_mode" = "$_restart_mode" ] && [ "$_sig_sha" = "$_restart_sha" ]; then
+    if [ -n "$_sig_sha" ] && [ "$_sig_sha" = "$_restart_sha" ]; then
       KEEP_LLAMA=1
     fi
   fi
@@ -284,79 +304,20 @@ if [ "$PORT_IN_USE" -eq 1 ]; then
   exit 1
 fi
 
-# ---- Resolve operating mode and config file -----------------------------
-# The persisted mode (proxy/.mode, written by POST /admin/set-mode) selects
-# the config profile: fast -> config-fast.yaml, cheap -> config-cheap.yaml.
-# Absent/invalid state defaults to fast (current behavior). LLAMA_PROXY_CONFIG
-# is exported so the server's load_config() uses the same profile, and API
-# keys are resolved from the MERGED config (base config.yaml + the selected
-# mode overlay), so keys declared only in the base are still resolved; a key
-# that is genuinely absent everywhere still fails startup loudly. The mode
-# overlays no longer repeat inherited values, so reading the raw mode file
-# alone would miss every base-declared api_key_env.
-
-MODE_FILE="$REPO_ROOT/.mode"
-MODE="fast"
-if [ -f "$MODE_FILE" ]; then
-  MODE_CONTENT="$(tr -d '[:space:]' < "$MODE_FILE")"
-  case "$MODE_CONTENT" in
-    fast|cheap) MODE="$MODE_CONTENT" ;;
-    *) echo "Warning: unknown mode '$MODE_CONTENT' in $MODE_FILE, defaulting to fast" >&2 ;;
-  esac
-fi
-
-CONFIG_FILE="$REPO_ROOT/config-$MODE.yaml"
-if [ ! -f "$CONFIG_FILE" ]; then
-  echo "Warning: $CONFIG_FILE not found, falling back to config.yaml" >&2
-  CONFIG_FILE="$REPO_ROOT/config.yaml"
-fi
-export LLAMA_PROXY_CONFIG="$CONFIG_FILE"
-echo "Operating mode: $MODE (config: $CONFIG_FILE)" >&2
+CONFIG_FILE="$REPO_ROOT/config.yaml"
+echo "Using config: $CONFIG_FILE" >&2
 
 AUTH_FILE="$HOME/.pi/agent/auth.json"
 
-resolve_api_keys() {
-  local missing=()
+# ---------------------------------------------------------------------------
+# API-key resolution + stale-key detection (LP-0MVF7DRMK001NHT8)
+# ---------------------------------------------------------------------------
 
-  # Extract all unique api_key_env values from the MERGED config
-  # (base config.yaml + the selected mode overlay).
-  while IFS='' read -r env_var; do
-    [[ -z "$env_var" ]] && continue
-
-    # Already set in environment — nothing to do
-    if [[ -n "${!env_var:-}" ]]; then
-      echo "[env] $env_var already set from environment"
-      continue
-    fi
-
-    # Try to resolve from pi's auth.json. Keep the call inside the `if`
-    # condition: `resolve_from_auth_json` exits non-zero when the key is
-    # absent, and a bare `resolved="$(...)"` assignment would trip `set -e`
-    # and abort before the missing-key report below is printed.
-    if [[ -f "$AUTH_FILE" ]] \
-      && resolved="$(resolve_from_auth_json "$env_var")" \
-      && [[ -n "$resolved" ]]; then
-      export "$env_var=$resolved"
-      echo "[env] $env_var resolved from ~/.pi/agent/auth.json"
-      continue
-    fi
-
-    # Not found anywhere — annotate with which model(s) need it
-    local models_using
-    models_using="$($PY_BIN -c "
-import sys
-sys.path.insert(0, '$REPO_ROOT/proxy')
-from config_merge import load_merged
-cfg = load_merged('$REPO_ROOT/config.yaml', '$CONFIG_FILE')
-models = []
-for name, model in cfg.get('models', {}).items():
-    for p in model.get('providers', []):
-        if p.get('api_key_env') == '$env_var':
-            models.append(name)
-print(', '.join(models))
-" 2>/dev/null || echo 'unknown')"
-    missing+=("$env_var  (required by: $models_using)")
-  done < <($PY_BIN -c "
+# enumerate_api_key_envs
+#
+# Print every unique api_key_env declared by the effective config, sorted.
+enumerate_api_key_envs() {
+  "$PY_BIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT/proxy')
 from config_merge import load_merged
@@ -369,7 +330,152 @@ for name, model in cfg.get('models', {}).items():
             keys.add(env_key)
 for k in sorted(keys):
     print(k)
-")
+"
+}
+
+# models_requiring <env_var>
+#
+# Print the comma-separated model names that declare <env_var>.
+models_requiring() {
+  "$PY_BIN" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/proxy')
+from config_merge import load_merged
+cfg = load_merged('$REPO_ROOT/config.yaml', '$CONFIG_FILE')
+models = []
+for name, model in cfg.get('models', {}).items():
+    for p in model.get('providers', []):
+        if p.get('api_key_env') == '$1':
+            models.append(name)
+print(', '.join(models))
+" 2>/dev/null || echo 'unknown'
+}
+
+# check_api_key <env_var>
+#
+# Run the resolver's ``--check`` mode and print ONE report line whose five
+# fields are separated by the ASCII unit separator (0x1f). Tab is deliberately
+# avoided: it is IFS whitespace, so ``read`` would collapse the empty fields an
+# env-unset (``resolved``) or auth.json-less (``auth_missing``) check produces.
+#
+#   status <US> env fingerprint <US> auth.json fingerprint <US>
+#   resolved key <US> auth.json key name(s) tried
+#
+# The resolver exit code is passed through (0 match/resolved/env_only,
+# 3 stale mismatch, 4 unresolved/auth_missing). Callers MUST invoke this
+# inside an ``if`` guard so ``set -e`` never aborts before the report is
+# printed, and must never echo ``resolved_key``: only the 8-char fingerprints
+# are ever logged (AC2).
+check_api_key() {
+  local env_var="$1"
+  "$PY_BIN" -c "
+import contextlib
+import io
+import json
+import sys
+
+sys.path.insert(0, '$REPO_ROOT/proxy')
+from api_key_resolver import main as resolver_main
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = resolver_main(['--check', '$AUTH_FILE', '$env_var'])
+payload = json.loads(buf.getvalue().strip().splitlines()[-1])
+print('\x1f'.join([
+    payload.get('status', ''),
+    payload.get('env_fingerprint', ''),
+    payload.get('auth_fingerprint', ''),
+    payload.get('resolved_key', ''),
+    ', '.join(payload.get('candidate_names') or []),
+]))
+sys.exit(rc)
+"
+}
+
+resolve_api_keys() {
+  local missing=()
+  local mismatched_vars=()
+  local mismatch_lines=()
+  local env_var="" status="" env_fp="" auth_fp="" resolved_key="" candidates=""
+  local report="" check_rc=0 models_using=""
+
+  while IFS='' read -r env_var; do
+    [[ -z "$env_var" ]] && continue
+
+    # Keep the resolver call inside the ``if`` condition: ``--check`` exits 3
+    # (stale mismatch) and 4 (nothing usable), and a bare assignment would trip
+    # ``set -e`` before the failure report below is printed.
+    report=""
+    check_rc=0
+    if report="$(check_api_key "$env_var")"; then
+      check_rc=0
+    else
+      check_rc=$?
+    fi
+
+    status="" env_fp="" auth_fp="" resolved_key="" candidates=""
+    IFS=$'\x1f' read -r status env_fp auth_fp resolved_key candidates <<< "$report"
+
+    case "$status" in
+      match)
+        # Environment key agrees with auth.json: keep it (no export needed) and
+        # log the fingerprint so a stale key is diagnosable from the log alone.
+        echo "[env] $env_var from environment (matches auth.json, fp=$env_fp)"
+        ;;
+      resolved)
+        # Environment unset: export the auth.json key, log its fingerprint.
+        export "$env_var=$resolved_key"
+        echo "[env] $env_var resolved from ~/.pi/agent/auth.json (fp=$auth_fp)"
+        ;;
+      mismatch)
+        if [ "$USE_ENV_KEYS" -eq 1 ]; then
+          echo "WARNING: $env_var in the environment differs from ~/.pi/agent/auth.json (env fp=$env_fp, auth.json fp=$auth_fp) — keeping the environment key because the stale-key opt-out is set; a rotated auth.json is IGNORED for this restart." >&2
+        else
+          mismatched_vars+=("$env_var")
+          mismatch_lines+=("$env_var  (environment fp=${env_fp:-<empty>}, auth.json fp=$auth_fp; auth.json key(s) tried: ${candidates:-unknown}) — stale environment key, MISMATCH")
+        fi
+        ;;
+      env_only|unresolved|auth_missing)
+        if [[ -n "$env_fp" ]]; then
+          # auth.json unavailable / no matching entry: keep the env key but say
+          # that staleness could not be verified.
+          echo "WARNING: $env_var from environment only (fp=$env_fp) — ~/.pi/agent/auth.json has no matching entry, so key staleness cannot be verified." >&2
+        else
+          # Nothing usable anywhere: fall through to the aggregated error.
+          models_using="$(models_requiring "$env_var")"
+          missing+=("$env_var  (required by: $models_using)")
+        fi
+        ;;
+      *)
+        # Fail closed on an unparseable report rather than starting blind.
+        echo "ERROR: key check failed for $env_var (resolver exit $check_rc, no report); cannot verify the API key source." >&2
+        models_using="$(models_requiring "$env_var")"
+        missing+=("$env_var  (key check failed; required by: $models_using)")
+        ;;
+    esac
+  done < <(enumerate_api_key_envs)
+
+  if [[ ${#mismatched_vars[@]} -gt 0 ]]; then
+    echo "" >&2
+    echo "ERROR: stale API key environment variable(s) detected — refusing to start." >&2
+    echo "       The environment disagrees with $AUTH_FILE, so a rotated" >&2
+    echo "       auth.json would be silently ignored:" >&2
+    for line in "${mismatch_lines[@]}"; do
+      echo "  - $line" >&2
+    done
+    echo "" >&2
+    echo "Fix one of these, then restart:" >&2
+    echo "  1. Unset the stale variable(s) so the auth.json key is used:" >&2
+    for var in "${mismatched_vars[@]}"; do
+      echo "       unset $var" >&2
+    done
+    echo "  2. Re-export the current key from $AUTH_FILE." >&2
+    echo "  3. Explicitly keep the environment keys (stale-key detection is" >&2
+    echo "     then disabled for this restart):" >&2
+    echo "       --use-env-keys   or   LLAMA_PROXY_USE_ENV_KEYS=1" >&2
+    echo "" >&2
+    return 1
+  fi
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo ""
@@ -386,34 +492,6 @@ for k in sorted(keys):
     echo "Or add the key to \$AUTH_FILE under the matching provider name"
     return 1
   fi
-}
-
-# Map api_key_env name to auth.json key.
-# Prefers opencode-go over opencode when resolving OPENCODE_API_KEY, and
-# falls back to the hyphenated stem (e.g. ``munitoai-free`` for
-# ``MUNITOAI_FREE_API_KEY``) so documented auth.json names resolve on a
-# fresh start (LP-0MVBJPQE50017BGL). Logic lives in proxy/proxy/api_key_resolver.py.
-resolve_from_auth_json() {
-  local env_var="$1"
-
-  "$PY_BIN" -c "
-import sys
-sys.path.insert(0, '$REPO_ROOT/proxy')
-from api_key_resolver import load_auth, resolve_from_auth_json
-
-import json
-
-try:
-    auth = load_auth('$AUTH_FILE')
-except (FileNotFoundError, json.JSONDecodeError):
-    sys.exit(1)
-
-resolved = resolve_from_auth_json(auth, '$env_var')
-if resolved:
-    print(resolved)
-    sys.exit(0)
-sys.exit(1)
-"
 }
 
 echo "=== LLM Proxy API Key Check ==="

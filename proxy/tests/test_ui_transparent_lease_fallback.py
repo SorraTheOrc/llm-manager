@@ -18,6 +18,24 @@ import pytest
 from starlette.responses import JSONResponse
 
 
+@pytest.fixture(autouse=True)
+def pin_fast_priority(monkeypatch):
+    """Pin routing to fast/high semantics for this module.
+
+    These tests verify the lease-active fallback chain: when the local
+    dispatch lease is held by another session, the request must fall through
+    to the remote provider immediately (or 503 when none exists) — never
+    enter the contention queue.  That is the ``high`` priority behaviour
+    (AC3, LP-0MVDT94F0003VHUA).  The pin makes the tests deterministic at
+    any local time: inside the cheap window (01:00–10:00) an unpinned
+    request would cap to ``low`` and queue for up to 60 s before falling
+    back.
+    """
+    monkeypatch.setattr(
+        "proxy.provider.request_priority", lambda *a, **k: "high"
+    )
+
+
 def _setup_server_state(monkeypatch):
     """Set up minimal server module state for proxy routing.
 

@@ -90,7 +90,7 @@ def reset_provider_state():
 
 @pytest.fixture(autouse=True)
 def pin_fast_mode(monkeypatch):
-    monkeypatch.setattr("proxy.mode.read_mode", lambda: "fast")
+    monkeypatch.setattr("proxy.provider.request_priority", lambda *a, **k: "medium")
 
 
 def _model_config(with_local: bool = True) -> dict:
