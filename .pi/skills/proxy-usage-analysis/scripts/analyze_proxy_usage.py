@@ -135,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{data.get('contention_fallback_after_queue', 0)} fallback-after-queue, "
             f"{data.get('local_admission_reject', 0)} local-admission-refused "
             f"(prefill ETA), "
+            f"{data.get('local_idle_admit', 0)} idle-admitted-local, "
             f"{errors} error event(s){decode_summary}{busy_summary}."
         )
         output_lines = _summary_output_paths(out_dir)

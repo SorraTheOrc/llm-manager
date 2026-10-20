@@ -128,6 +128,30 @@ def _isolate_startup_ramp_config():
 
 
 @pytest.fixture(autouse=True)
+def _reset_stall_circuit_breaker():
+    """Reset the process-global stall circuit breaker between tests.
+
+    ``StallCircuitBreaker._stall_timestamps`` is a module-level sliding window
+    (default 300 s window / threshold 3). Stalls recorded by one test can
+    therefore mark a provider unavailable for a later, unrelated test in the
+    same pytest process — observed as
+    ``test_remote_failover_budget.py::test_failover_budget_param_overrides_config``
+    losing its second upstream attempt because an earlier test had already
+    recorded three ``opencode-go`` stalls (LP-0MVGHHSUS003GPQ1). Ordering is
+    timing dependent, so without this reset the suite is flaky by wall clock.
+
+    Only the in-memory window is cleared (production behaviour is unchanged);
+    the cooldown map is already reset by
+    ``_isolate_provider_availability_state``.
+    """
+    import proxy.stall_circuit_breaker as breaker_module
+
+    breaker_module.stall_circuit_breaker._stall_timestamps.clear()
+    yield
+    breaker_module.stall_circuit_breaker._stall_timestamps.clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_provider_availability_state(tmp_path, monkeypatch):
     """Isolate persisted provider availability state between tests.
 

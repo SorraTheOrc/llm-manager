@@ -385,6 +385,13 @@ def build_report(
        f"- | {local_admission_rejects} |")
     ap(f"| Local admission admitted (prefill ETA) | {local_admission_admits} | "
        f"- | {local_admission_admits} |")
+    # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): economic cold-cache
+    # bypasses overridden because the GPU had been idle for at least the
+    # configured threshold. Local-only by construction (it *is* a local serve),
+    # so it sits in the local column.
+    idle_admits = len(getattr(summary, "idle_admit_events", []) or [])
+    ap(f"| Local admitted while GPU idle (cold-cache override) | {idle_admits} | "
+       f"- | {idle_admits} |")
     ap(f"| Dispatch denied | {summary.dispatch_denied_count} | "
        f"{d['dispatch_denied']} ({_pct(d['dispatch_denied'], summary.dispatch_denied_count):.1f}%) | "
        f"{n['dispatch_denied']} ({_pct(n['dispatch_denied'], summary.dispatch_denied_count):.1f}%) |")
@@ -1664,6 +1671,9 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
             for e in getattr(summary, "local_admission_events", []) or []
             if getattr(e, "decision", None) == "admit"
         ),
+        # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J AC3): economic
+        # bypasses served locally because the GPU was idle.
+        "local_idle_admit": len(getattr(summary, "idle_admit_events", []) or []),
         "contention_queued_duration_seconds": round(
             sum(float(e.queued_duration or 0.0) for e in summary.contention_dispatch_events)
             + sum(float(e.queued_duration or 0.0) for e in summary.contention_fallback_events),

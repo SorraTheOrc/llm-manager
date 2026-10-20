@@ -626,6 +626,15 @@ async def _cleanup_after_request(
     caller's client identity (``client_ip`` / ``client_port``) for poller
     attribution (LP-0MSKV3IEQ004ZV88).
     """
+    # Idle-aware routing signal (LP-0MVGD9Z8Z0055Y5J): the request ending is
+    # the last local-activity event, so an idle backend is measurable from the
+    # moment its final stream closed.
+    try:
+        from proxy.local_activity import record_local_activity
+
+        record_local_activity("finish")
+    except Exception:
+        pass
     await _decrement_active_queries(srv)
     await _decrement_per_model_query(srv, model_name)
     if decrement_local:
@@ -1241,6 +1250,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         _dispatch_start = time.monotonic()
     except Exception:
         pass
+    # Idle-aware routing signal (LP-0MVGD9Z8Z0055Y5J): a dispatch is local
+    # activity, so the idle clock restarts here.
+    try:
+        from proxy.local_activity import record_local_activity
+
+        record_local_activity("dispatch")
+    except Exception:
+        pass
 
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
@@ -1771,6 +1788,19 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     txt.strip()
                                     and not txt.strip().startswith(":")
                                 )
+                                # Idle-aware routing signal
+                                # (LP-0MVGD9Z8Z0055Y5J): a forwarded chunk is
+                                # local activity, so a long stream never looks
+                                # idle.
+                                if _has_actual_data:
+                                    try:
+                                        from proxy.local_activity import (
+                                            record_local_activity,
+                                        )
+
+                                        record_local_activity("chunk")
+                                    except Exception:
+                                        pass
 
                                 # SSE finish indicators
                                 try:

@@ -373,8 +373,16 @@ async def get_llama_local_status(request: Request):
          "slots": [{"slot_id": int, "is_processing": bool, "n_decoded": int | None}],
          "local_owner_session_id": str | None,
          "local_owner_lease_remaining_seconds": float | None,
+         "local_idle_seconds": float | None,
+         "local_last_activity_at": str | None,
+         "local_last_activity_source": str | None,
          "prefill_eta_seconds": float | None,
          "queue_eta_seconds": float | None}
+
+    ``local_idle_seconds`` reports how long the local backend has been idle
+    (LP-0MVGD9Z8Z0055Y5J) — the same monotonic signal the idle-aware routing
+    override reads — with ``local_last_activity_at`` (wall clock) and
+    ``local_last_activity_source`` (dispatch/chunk/finish/...).
 
     ``prefill_eta_seconds`` and ``queue_eta_seconds`` publish the calibrated
     prefill-ETA estimate (LP-0MVGDUV5E005UWBQ): the projected prefill cost of
@@ -630,6 +638,14 @@ async def get_llama_local_status(request: Request):
 
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
+    # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): idle age of the local
+    # backend, the signal the routing override reads.
+    try:
+        from proxy.local_activity import activity_snapshot as _activity_snapshot
+
+        _idle_snapshot = _activity_snapshot()
+    except Exception:
+        _idle_snapshot = {}
     client_ip, client_ip_source = _resolve_client_ip(request)
     status_extra = {
         "client_ip": client_ip,
@@ -648,6 +664,7 @@ async def get_llama_local_status(request: Request):
         "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
+        "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -690,6 +707,13 @@ async def get_llama_local_status(request: Request):
         ),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
+        # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local
+        # backend has been idle (monotonic-derived) and when it last worked.
+        # ``idle_seconds`` is the signal the routing override reads; the
+        # timestamps are for operators.
+        "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
+        "local_last_activity_at": _idle_snapshot.get("last_activity_at"),
+        "local_last_activity_source": _idle_snapshot.get("last_activity_source"),
     }
 
 

@@ -123,6 +123,14 @@ RE_LOCAL_ADMISSION_ETA = re.compile(r"\beta_prefill_s=([\d.]+)")
 RE_LOCAL_ADMISSION_BUDGET = re.compile(r"\bbudget_s=([\d.]+)")
 RE_LOCAL_ADMISSION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
 
+# Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): the proxy emits
+# ``routing_idle_admit provider=... model=... reason=economic_bypass_idle
+# idle_seconds=<f> threshold_seconds=<f> estimated_tokens=<n> ...`` when an
+# economic cold-cache bypass is overridden because the GPU was demonstrably
+# idle. ``idle_seconds`` is the measured idle age at admission.
+RE_ROUTING_IDLE_SECONDS = re.compile(r"\bidle_seconds=([\d.]+)")
+RE_IDLE_ADMIT_THRESHOLD = re.compile(r"\bthreshold_seconds=([\d.]+)")
+
 # Enriched error payload on ``Stream finished: reason=error`` (LP-0MT6322OT00900OX).
 # The proxy now logs ``error_type=<type> error_message=<msg> suggested_action=<act>``
 # before the trailing session/provider/model/entry fields. Messages/actions may
@@ -160,6 +168,7 @@ DISPATCH_DENIED = "local_dispatch_denied"
 CONTENTION_DISPATCH = "contention_queue_dispatch"
 CONTENTION_FALLBACK_AFTER_QUEUE = "contention_queue_fallback_after_queue"
 LOCAL_ADMISSION_GUARD = "local_admission_guard"
+ROUTING_IDLE_ADMIT = "routing_idle_admit"
 COMPACTION_EVENT = "compaction_event"
 COMPACTION_BACKSTOP = "compaction_backstop"
 COMPACTION_CHURN = "compaction_churn"
@@ -311,7 +320,8 @@ class LogEvent:
 
     ``kind`` is one of ``stream_started``, ``stream_finished``, ``fallback``,
     ``routing_skip``, ``dispatch_denied``, ``contention_dispatch``,
-    ``contention_fallback_after_queue``, ``mode_switch``, ``restart``,
+    ``contention_fallback_after_queue``, ``idle_admit``, ``mode_switch``,
+    ``restart``,
     ``compaction_event``, ``compaction_backstop``, ``compaction_churn``, or an
     error kind (``stream_error``, ``stream_finish_error``, ``slot_save_error``,
     ``backend_retry``, ``upstream_http_error``). Only the fields relevant to
@@ -411,6 +421,11 @@ class LogEvent:
     enforced: str | None = None
     eta_prefill_s: str | None = None
     budget_s: str | None = None
+    # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J, ``idle_admit`` kind):
+    # the idle age at admission and the configured threshold. Populated on
+    # ``idle_admit`` events only.
+    idle_seconds: str | None = None
+    threshold_seconds: str | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -549,6 +564,21 @@ def parse_log_line(line: str) -> LogEvent | None:
             provider=_first(RE_PROVIDER, msg),
             session=_session_from(msg),
             queued_duration=_first(RE_CONTENTION_DURATION, msg),
+        )
+    if msg.startswith(ROUTING_IDLE_ADMIT):
+        # "routing_idle_admit provider=local model=Qwen3
+        #  reason=economic_bypass_idle idle_seconds=412.3 threshold_seconds=60.0
+        #  estimated_tokens=64000 new_tokens=61000 cached_ratio=0.05
+        #  cache_state=cold session=<id>"
+        return LogEvent(
+            "idle_admit",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            model=_first(RE_MODEL, msg),
+            session=_session_from(msg),
+            reason=_normalize_reason(_first(RE_LOCAL_ADMISSION_REASON, msg)),
+            idle_seconds=_first(RE_ROUTING_IDLE_SECONDS, msg),
+            threshold_seconds=_first(RE_IDLE_ADMIT_THRESHOLD, msg),
         )
     if msg.startswith(LOCAL_ADMISSION_GUARD):
         # "local_admission_guard decision=reject reason=eta_exceeds_budget

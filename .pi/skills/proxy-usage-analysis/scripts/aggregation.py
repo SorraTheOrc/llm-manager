@@ -185,6 +185,10 @@ class AnalysisResult:
     # applied (``false`` in ``observe`` mode), and the projected prefill ETA /
     # wait budget in seconds.
     local_admission_events: list[LogEvent] = field(default_factory=list)
+    # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): one event per economic
+    # cold-cache bypass that was overridden because the GPU had been idle for
+    # at least ``threshold_seconds`` (``idle_seconds`` = measured idle age).
+    idle_admit_events: list[LogEvent] = field(default_factory=list)
     # Parsed error events (stream errors, slot_save failures, backend_retry
     # timeouts, upstream HTTP errors) inside the window.
     error_events: list[LogEvent] = field(default_factory=list)
@@ -894,6 +898,7 @@ def aggregate(
     contention_dispatch_events: list[LogEvent] = []
     contention_fallback_events: list[LogEvent] = []
     local_admission_events: list[LogEvent] = []
+    idle_admit_events: list[LogEvent] = []
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
@@ -1014,6 +1019,9 @@ def aggregate(
         if ev.kind == "local_admission_guard":
             local_admission_events.append(ev)
             continue
+        if ev.kind == "idle_admit":
+            idle_admit_events.append(ev)
+            continue
         if ev.kind in ("compaction_event", "compaction_backstop", "compaction_churn"):
             compaction_events.append(ev)
             continue
@@ -1063,6 +1071,7 @@ def aggregate(
         contention_dispatch_events=contention_dispatch_events,
         contention_fallback_events=contention_fallback_events,
         local_admission_events=local_admission_events,
+        idle_admit_events=idle_admit_events,
         compaction_events=compaction_events,
         busy=busy,
         hourly_activity=hourly_activity,

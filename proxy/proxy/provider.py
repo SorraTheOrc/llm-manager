@@ -2105,6 +2105,165 @@ def _should_skip_local(
     return (True, "large_context_bypass")
 
 
+# ---------------------------------------------------------------------------
+# Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
+#
+# Routing is size/economics-driven and ignores whether the backend is doing
+# anything, so a large or cache-cold prompt is bypassed while both slots sit
+# unused (measured: 187 ``local_dispatch_denied`` in an hour where local busy
+# was 2.5 %). When the local model has demonstrably been idle, the economic
+# cold-cache bypass is overridden and the request is served locally.
+# ---------------------------------------------------------------------------
+
+IDLE_ADMIT_REASON = "economic_bypass_idle"
+"""Skip-admission reason recorded when the idle override admits a request."""
+
+DEFAULT_IDLE_ADMIT_SECONDS = 60.0
+
+def _idle_admit_config(server_config: dict | None) -> tuple[bool, float]:
+    """Return ``(enabled, idle_seconds_threshold)`` for the idle override.
+
+    Disabled by default (``local_idle_admit_enabled: false``). A missing,
+    malformed, or non-positive ``local_idle_admit_seconds`` (default 60)
+    disables the override rather than admitting on a guess — the guard must
+    never widen admission because of a config typo.
+    """
+    if not isinstance(server_config, dict):
+        return False, DEFAULT_IDLE_ADMIT_SECONDS
+    raw_seconds = server_config.get(
+        "local_idle_admit_seconds", DEFAULT_IDLE_ADMIT_SECONDS
+    )
+    try:
+        seconds = float(raw_seconds)
+    except (TypeError, ValueError):
+        return False, DEFAULT_IDLE_ADMIT_SECONDS
+    if seconds <= 0:
+        return False, seconds
+    return bool(server_config.get("local_idle_admit_enabled", False)), seconds
+
+
+def _local_idle_blocker(endpoint: str | None) -> str | None:
+    """Return why idle admission must not fire, or ``None`` when it may.
+
+    Fail-safe checks (AC2/AC3): nothing may be admitted while the backend is
+    unhealthy, self-healing, switching/loading a model, holding a lease, or
+    prefilling — or while any request is queued for a slot.
+    """
+    try:
+        import proxy.server as srv
+    except Exception:
+        return "server_unavailable"
+
+    try:
+        if srv.backend_recovery_state.get("in_progress"):
+            return "self_healing"
+    except Exception:
+        pass
+
+    # Model switch / background load in progress.
+    try:
+        if int(getattr(srv, "model_switch_refcount", 0) or 0) > 0:
+            return "model_switch"
+    except Exception:
+        pass
+    try:
+        lock = getattr(srv, "model_switch_lock", None)
+        if lock is not None and lock.locked():
+            return "model_switch"
+    except Exception:
+        pass
+    try:
+        if bool(getattr(srv, "background_loads", None)):
+            return "model_loading"
+    except Exception:
+        pass
+
+    # Local backend health. An explicit provider ``endpoint`` points at an
+    # externally managed llama-server, so the single-process ready gate does
+    # not apply to it (LP-0MRPILSMW004T4H8).
+    if not endpoint:
+        if not bool(getattr(srv, "backend_ready", False)):
+            return "backend_not_ready"
+        if getattr(srv, "llama_process", None) is None:
+            return "backend_not_running"
+
+    # Lease / prefill / generation in flight: the GPU is not idle.
+    try:
+        if int(getattr(srv, "local_active_queries", 0) or 0) > 0:
+            return "local_active"
+    except Exception:
+        pass
+    try:
+        if int(getattr(srv, "local_generating_queries", 0) or 0) > 0:
+            return "generating"
+    except Exception:
+        pass
+    try:
+        if getattr(srv, "local_prefill_in_flight", None):
+            return "prefill_in_flight"
+    except Exception:
+        pass
+
+    # A queued request means the next slot must go to interactive traffic.
+    try:
+        from proxy import contention_queue
+
+        if contention_queue.queue_depth() > 0:
+            return "queue_not_empty"
+    except Exception:
+        pass
+
+    return None
+
+
+def _evaluate_idle_admission_override(
+    config: dict,
+    provider_cfg: dict,
+    estimated_tokens: int,
+) -> dict | None:
+    """Decide whether idle local capacity should serve a bypassed request.
+
+    Only the **economic** band (``large_context_bypass``) is eligible: the
+    physical ``context_too_large`` cap is a capacity limit and is never
+    overridden. When the local backend has been idle for at least
+    ``local_idle_admit_seconds`` and :func:`_local_idle_blocker` reports no
+    blocker, a decision dict is returned; otherwise ``None`` (today's
+    behaviour, byte-for-byte).
+
+    Returns:
+        ``{"reason", "idle_seconds", "threshold_seconds"}`` when the request
+        should be admitted locally, else ``None``.
+    """
+    try:
+        server_config = config.get("server", config) if isinstance(config, dict) else {}
+        enabled, threshold = _idle_admit_config(server_config)
+        if not enabled:
+            return None
+        endpoint = _get_local_provider_endpoint(provider_cfg, config)
+        blocker = _local_idle_blocker(endpoint)
+        if blocker is not None:
+            logger.debug(
+                "idle_admit_blocked reason=%s endpoint=%s estimated_tokens=%d",
+                blocker,
+                endpoint or "default",
+                max(0, int(estimated_tokens or 0)),
+            )
+            return None
+        from proxy.local_activity import local_idle_seconds
+
+        idle_seconds = local_idle_seconds()
+        if idle_seconds < threshold:
+            return None
+        return {
+            "reason": IDLE_ADMIT_REASON,
+            "idle_seconds": idle_seconds,
+            "threshold_seconds": threshold,
+        }
+    except Exception:
+        logger.debug("idle admission evaluation failed", exc_info=True)
+        return None
+
+
 def _provider_context_limit(provider_cfg: dict) -> int:
     """Read ``max_context_tokens`` from a provider entry (0 = ungated).
 
@@ -8266,6 +8425,44 @@ async def _proxy_with_fallback_cycle(
                     warm_cache_threshold=_warm_threshold,
                     economic_bypass_serves_local=_recover_economic,
                 )
+                # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): spend
+                # obviously idle GPU capacity instead of paying for a remote
+                # call. Only the ECONOMIC bypass is overridable — the physical
+                # ``context_too_large`` cap still applies (the request cannot
+                # fit the KV slot).
+                if _skip_local and _skip_reason == "large_context_bypass":
+                    _idle_admit = _evaluate_idle_admission_override(
+                        config, provider_cfg, _estimated_tokens
+                    )
+                    if _idle_admit is not None:
+                        logger.info(
+                            "routing_idle_admit provider=%s model=%s "
+                            "reason=%s idle_seconds=%.1f threshold_seconds=%.1f "
+                            "estimated_tokens=%d new_tokens=%d cached_ratio=%.2f "
+                            "cache_state=%s session=%s",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _idle_admit["reason"],
+                            _idle_admit["idle_seconds"],
+                            _idle_admit["threshold_seconds"],
+                            _estimated_tokens,
+                            _routing_new_tokens,
+                            _routing_cached_ratio,
+                            _routing_cache_state,
+                            _session_id or "unknown",
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="idle_admit",
+                            reason=_idle_admit["reason"],
+                            estimated_tokens=_estimated_tokens,
+                            idle_seconds=round(_idle_admit["idle_seconds"], 1),
+                            threshold_seconds=_idle_admit["threshold_seconds"],
+                        )
+                        _skip_local = False
+                        _skip_reason = None
                 if _skip_local:
                     logger.info(
                         "routing_skip_local provider=%s model=%s "

@@ -433,6 +433,57 @@ separately from genuine prompt-cache hits. `slot_ratio_restored` is logged once
 per seed with `cached_tokens`, `estimated_tokens` and the credited
 `cached_ratio`.
 
+## Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
+
+Routing is size/economics-driven and used to ignore whether the backend was
+doing anything, so a large or cache-cold prompt was bypassed to a paid remote
+provider while both slots sat unused (measured: **187**
+`local_dispatch_denied` in an hour where local busy was **2.5 %**, and
+`large_context_bypass` 1,284/24 h). The economic cold-cache bypass is now
+overridable when the GPU has demonstrably been idle:
+
+```yaml
+server:
+  local_idle_admit_enabled: false   # default off
+  local_idle_admit_seconds: 60      # idle age required before overriding
+```
+
+**Scope:** only the economic band (`large_context_bypass`) is overridable. The
+physical `context_too_large` cap is a capacity limit — a prompt that cannot fit
+the KV slot never goes local because of idleness.
+
+**Idle signal** (`proxy/proxy/local_activity.py`, exposed on
+`/llama/local/status` as `local_idle_seconds`, `local_last_activity_at`,
+`local_last_activity_source`): a monotonic timestamp updated when a local
+dispatch starts, on every forwarded SSE chunk, and when the request finishes.
+The baseline is process start, so a freshly restarted idle proxy reports its
+true idle age rather than "unknown".
+
+**Fail-safe blockers** — any of these keeps today's bypass (fail-closed):
+
+| Condition | Blocker |
+| --- | --- |
+| Idle age below `local_idle_admit_seconds` (or the knob is missing/malformed/non-positive) | no override |
+| Any waiter in the contention queue | `queue_not_empty` |
+| A local lease, generation, or prefill is in flight | `local_active` / `generating` / `prefill_in_flight` |
+| Backend self-healing | `self_healing` |
+| Model switch or background load in progress | `model_switch` / `model_loading` |
+| Default local backend not ready / no process (explicit `endpoint` entries are externally managed and skip this gate) | `backend_not_ready` / `backend_not_running` |
+
+**Observability:** each override logs
+`routing_idle_admit provider=… model=… reason=economic_bypass_idle
+idle_seconds=… threshold_seconds=… estimated_tokens=… new_tokens=…
+cached_ratio=… cache_state=… session=…` and records a `local_admit`-class
+dispatch attempt (`status=idle_admit`). `proxy-usage-analysis` parses the line
+into an `idle_admit` event and reports it as the
+`Local admitted while GPU idle (cold-cache override)` row and the
+`local_idle_admit` JSON counter.
+
+Idle-admitted requests are expected to be **slow** (prefill p90 269.8 s, max
+817 s in the baseline window) — that is the deliberate trade of idle GPU time
+for remote spend, and it is why the override never fires while anything is
+queued or in flight.
+
 ## Slot Contention: Per-Mode Queue vs Fallback (LP-0MSORQVK50012Q4D)
 
 When every local slot is busy (``local_active_queries >= session_slot_pool_size``),

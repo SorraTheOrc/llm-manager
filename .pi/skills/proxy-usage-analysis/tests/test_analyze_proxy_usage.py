@@ -5106,3 +5106,54 @@ class TestLocalAdmissionGuard:
         assert data["local_admission_reject_enforced"] == 1
         assert data["local_admission_admit"] == 1
         json.dumps(data)
+
+# =========================================================================
+# Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J AC3)
+# =========================================================================
+
+
+class TestIdleAdmitCounter:
+    """AC3: idle-admitted requests are greppable and counted by the report."""
+
+    def test_parses_idle_admit_event(self):
+        ev = log_parser.parse_log_line(fixtures.ROUTING_IDLE_ADMIT)
+        assert ev.kind == "idle_admit"
+        assert ev.reason == "economic_bypass_idle"
+        assert ev.idle_seconds == "412.3"
+        assert ev.threshold_seconds == "60.0"
+        assert ev.provider == "local-qwen3"
+        assert ev.model == "Qwen3"
+        assert ev.session == "019fc245-ffff-7e5c-871e-57ab32f875f3"
+
+    def test_adjacent_events_still_parse(self):
+        """The idle-admit branch must not shadow the admission-guard branch."""
+        ev = log_parser.parse_log_line(fixtures.LOCAL_ADMISSION_GUARD_REJECT)
+        assert ev.kind == "local_admission_guard"
+
+    def test_report_row_and_json_counter(self, tmp_path):
+        log_dir = tmp_path / "logs_idle"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            "\n".join(
+                [fixtures.ROUTING_IDLE_ADMIT, fixtures.ROUTING_IDLE_ADMIT]
+            )
+            + "\n"
+        )
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out_idle",
+            config=None,
+        )
+
+        md = (tmp_path / "out_idle" / "report.md").read_text()
+        section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
+        assert (
+            "| Local admitted while GPU idle (cold-cache override) | 2 | - | 2 |"
+            in section
+        )
+
+        data = reporting.summary_to_json(result.summary)
+        assert data["local_idle_admit"] == 2
+        json.dumps(data)
