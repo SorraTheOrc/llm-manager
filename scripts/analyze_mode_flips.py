@@ -248,7 +248,9 @@ def classify_trigger(flip: dict) -> str:
     - ``source=manual`` → ``to-fast`` when flipping to fast, ``to-cheap`` otherwise
 
     Falls back to the existing heuristic (sched_marker / direction-based) when
-    no attribution is available.
+    no attribution is available — including when ``source`` is absent or holds
+    an unrecognised (non-canonical) value, so an unexpected token never
+    fabricates a category (LP-0MVC145DE006SAY5 pins this in the tests).
     """
     source = flip.get("source")
     if source == "scheduler":
