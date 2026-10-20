@@ -384,6 +384,55 @@ the proxy logs a `routing_economic_bypass_local` line with the token counts
 and cached ratio. The `routing_skip_local` line (with `reason=large_context_bypass`)
 remains parseable by reporting tools and only appears for fast mode.
 
+## Restored-prefix warmness: seeding `cached_ratio` from the slot snapshot (LP-0MVGD9YXH008O304)
+
+The economic check above is only as good as `cached_ratio`. Historically that
+ratio came *only* from `provider._last_cached_ratio`, an in-memory dict written
+by a previous local response — so a session whose KV prefix was already saved to
+disk was still scored cold (82.8 % of routing decisions reported
+`cached_ratio=0.00`), every session above 38k tokens was permanently bypassed
+(`large_context_bypass`), and each proxy restart reset the whole fleet to cold.
+
+`proxy/proxy/slot_cache_ratio.py` closes that gap with a sidecar written next to
+each snapshot (`slot_<session>.bin` → `slot_<session>.bin.ratio.json`):
+
+- **Writer** — after a *successful* `slot_save`, the proxy records the measured
+  `prompt_tokens` from the upstream `usage` block (the whole served prompt is
+  now resident in the saved KV cache) plus a SHA-256 fingerprint of every
+  message in the request. No usage block → no sidecar (today's behaviour).
+- **Reader** — before the cold-cache gate reads the ratio, the snapshot's
+  sidecar is validated and used to seed it:
+
+  ```
+  cached_ratio = min(1.0, cached_tokens / estimated_tokens) * safety_margin
+  ```
+
+  with `session_slot_ratio_safety_margin` (default `0.9`) and
+  `session_slot_ratio_ttl_seconds` (default `86400`) configurable on the
+  `server` block. The measured fraction is a hard ceiling, so restoration can
+  never over-credit (AC3), and the margin absorbs llama.cpp dropping its own
+  checkpoints (`forcing full prompt re-processing`).
+- **Correctness guard (AC2)** — the recorded message fingerprints must be a
+  prefix of the incoming message list. A changed system prompt or a history
+  truncated from the front fails the check and earns `cached_ratio = 0`; a
+  weak partial credit is still subject to the normal cold-cache gate, so it
+  cannot mask an expensive prefill.
+- **Fail-open** — missing/corrupt/expired sidecar, other model, absent
+  `session_slot_save_path`, or any error degrades to the previous behaviour
+  (`cached_ratio = 0`, conservative). Session invalidation deletes both the
+  snapshot and its sidecar and clears the in-memory ratio.
+- **Restart-safe (AC6)** — the sidecar lives on disk, so the first request of a
+  session after a proxy restart is scored warm when the snapshot is present
+  and valid.
+
+**Observability (AC4):** `routing_check`, `routing_skip_local`,
+`routing_economic_bypass_local` and `dispatch_first_byte_ms` now carry
+`cache_state=cold|warm|restored`. `restored` means the ratio was seeded from a
+snapshot *and* cleared the warm threshold, so restored-prefix wins are counted
+separately from genuine prompt-cache hits. `slot_ratio_restored` is logged once
+per seed with `cached_tokens`, `estimated_tokens` and the credited
+`cached_ratio`.
+
 ## Slot Contention: Per-Mode Queue vs Fallback (LP-0MSORQVK50012Q4D)
 
 When every local slot is busy (``local_active_queries >= session_slot_pool_size``),

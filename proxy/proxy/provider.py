@@ -520,12 +520,61 @@ _last_cached_ratio: dict[tuple[str, str], float] = {}
 # Maximum number of entries in _last_cached_ratio to prevent unbounded growth.
 _MAX_CACHED_RATIO_ENTRIES = 1000
 
+# Where each ratio came from — recorded alongside the ratio so the proxy can
+# label restored-prefix wins separately from genuine prompt-cache hits
+# (LP-0MVGD9YXH008O304 AC4).  Values: ``"usage"`` (measured on a previous local
+# response), ``"save"`` (slot snapshot saved, no usage data), ``"restored"``
+# (seeded from a persisted slot snapshot — see ``proxy/slot_cache_ratio.py``).
+_CACHED_RATIO_SOURCE_USAGE = "usage"
+_CACHED_RATIO_SOURCE_SAVE = "save"
+_cached_ratio_source: dict[tuple[str, str], str] = {}
+
+
+def set_cached_ratio(
+    model_name: str,
+    session_id: str | None,
+    ratio: float,
+    source: str = _CACHED_RATIO_SOURCE_USAGE,
+) -> None:
+    """Record a pre-computed cached-tokens ratio for a (model, session) pair.
+
+    The ratio is clamped to ``[0.0, 1.0]``; the *source* label is stored so
+    observability can distinguish a restored slot-prefix credit
+    (``"restored"``) from a measured prompt-cache hit (``"usage"``).
+
+    To prevent unbounded memory growth, both dicts are capped at
+    ``_MAX_CACHED_RATIO_ENTRIES``. When the cap is reached, the oldest entry
+    (first inserted) is evicted.
+    """
+    if not model_name or not session_id:
+        return
+    try:
+        value = float(ratio)
+    except (TypeError, ValueError):
+        return
+    if math.isnan(value):
+        return
+    value = min(1.0, max(0.0, value))
+    key = (model_name, session_id)
+    # Enforce cap: if adding a new entry would exceed the limit, evict oldest
+    if key not in _last_cached_ratio and len(_last_cached_ratio) >= _MAX_CACHED_RATIO_ENTRIES:
+        try:
+            # Evict oldest entry (dict maintains insertion order in Python 3.7+)
+            oldest = next(iter(_last_cached_ratio))
+            _last_cached_ratio.pop(oldest)
+            _cached_ratio_source.pop(oldest, None)
+        except (StopIteration, KeyError):
+            pass
+    _last_cached_ratio[key] = value
+    _cached_ratio_source[key] = source or _CACHED_RATIO_SOURCE_USAGE
+
 
 def update_cached_ratio(
     model_name: str,
     session_id: str | None,
     cached_tokens: int,
     prompt_tokens: int,
+    source: str = _CACHED_RATIO_SOURCE_USAGE,
 ) -> None:
     """Update the cached-tokens ratio for a (model, session) pair.
 
@@ -542,15 +591,7 @@ def update_cached_ratio(
         ratio = 0.0
     else:
         ratio = min(1.0, cached_tokens / prompt_tokens)
-    key = (model_name, session_id)
-    # Enforce cap: if adding a new entry would exceed the limit, evict oldest
-    if key not in _last_cached_ratio and len(_last_cached_ratio) >= _MAX_CACHED_RATIO_ENTRIES:
-        try:
-            # Evict oldest entry (dict maintains insertion order in Python 3.7+)
-            _last_cached_ratio.pop(next(iter(_last_cached_ratio)))
-        except (StopIteration, KeyError):
-            pass
-    _last_cached_ratio[key] = ratio
+    set_cached_ratio(model_name, session_id, ratio, source=source)
 
 
 def _get_cached_ratio(model_name: str, session_id: str | None) -> float:
@@ -561,6 +602,32 @@ def _get_cached_ratio(model_name: str, session_id: str | None) -> float:
     if not model_name or not session_id:
         return 0.0
     return _last_cached_ratio.get((model_name, session_id), 0.0)
+
+
+def _get_cached_ratio_source(model_name: str, session_id: str | None) -> str | None:
+    """Return the provenance label for a (model, session) ratio.
+
+    ``None`` when no ratio has been recorded yet (unknown → treated as cold).
+    """
+    if not model_name or not session_id:
+        return None
+    return _cached_ratio_source.get((model_name, session_id))
+
+
+def clear_cached_ratio_for_session(session_id: str | None) -> None:
+    """Forget every ratio (and its source) recorded for *session_id*.
+
+    Used by session invalidation: the slot snapshot and its sidecar are being
+    discarded, so any restored credit for that session is no longer valid.
+    """
+    if not session_id:
+        return
+    keys = [k for k in _last_cached_ratio if k[1] == session_id]
+    for key in keys:
+        _last_cached_ratio.pop(key, None)
+        _cached_ratio_source.pop(key, None)
+    for key in [k for k in _cached_ratio_source if k[1] == session_id]:
+        _cached_ratio_source.pop(key, None)
 
 
 def _extract_cached_tokens_from_usage(usage: dict | None) -> int:
@@ -8105,15 +8172,47 @@ async def _proxy_with_fallback_cycle(
                 # (LP-0MSEGPO77005CYCQ F2). The estimate itself is shared per
                 # cycle (_RoutingEstimateCache) with the per-entry ceiling.
                 _estimated_tokens = await _routing_estimate.get()
+                # Seed the routing ratio from the persisted local slot snapshot
+                # (LP-0MVGD9YXH008O304): a session whose KV prefix is already on
+                # disk is warm even though this process has no in-memory record
+                # of it (fresh session, or any request after a proxy restart).
+                # Fail-open: any problem keeps today's cached_ratio (cold).
+                try:
+                    from proxy.slot_cache_ratio import seed_cached_ratio
+
+                    seed_cached_ratio(
+                        config.get("server", config)
+                        if isinstance(config, dict)
+                        else {},
+                        body_json,
+                        _llama_model,
+                        _session_id,
+                        _estimated_tokens,
+                        endpoint=_get_local_provider_endpoint(provider_cfg, config),
+                    )
+                except Exception:
+                    logger.debug(
+                        "slot snapshot ratio seeding failed", exc_info=True
+                    )
                 # Compute once for reuse in logs and reason detection
                 _routing_cached_ratio = _get_cached_ratio(_llama_model, _session_id)
+                try:
+                    from proxy.router_helpers import _classify_cache_state
+
+                    _routing_cache_state = _classify_cache_state(
+                        _routing_cached_ratio,
+                        _get_cached_ratio_source(_llama_model, _session_id),
+                    )
+                except Exception:
+                    _routing_cache_state = "cold"
                 _routing_new_tokens = int(
                     _estimated_tokens * (1 - _routing_cached_ratio)
                 )
                 logger.info(
                     "routing_check provider=%s model=%s "
                     "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                    "new_tokens=%d cached_ratio=%.2f messages=%d session=%s "
+                    "new_tokens=%d cached_ratio=%.2f cache_state=%s "
+                    "messages=%d session=%s "
                     "chain_hold_cycle=%d",
                     provider_name,
                     _llama_model or "unknown",
@@ -8122,6 +8221,7 @@ async def _proxy_with_fallback_cycle(
                     _warm_threshold,
                     _routing_new_tokens,
                     _routing_cached_ratio,
+                    _routing_cache_state,
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
                     _session_id or "unknown",
                     _get_chain_hold_cycle(request),
@@ -8170,7 +8270,7 @@ async def _proxy_with_fallback_cycle(
                     logger.info(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                        "new_tokens=%d cached_ratio=%.2f "
+                        "new_tokens=%d cached_ratio=%.2f cache_state=%s "
                         "reason=%s → skipping local, routing to next remote provider "
                         "session=%s chain_hold_cycle=%d",
                         provider_name,
@@ -8180,6 +8280,7 @@ async def _proxy_with_fallback_cycle(
                         _warm_threshold,
                         _routing_new_tokens,
                         _routing_cached_ratio,
+                        _routing_cache_state,
                         _skip_reason,
                         _session_id or "unknown",
                         _get_chain_hold_cycle(request),
@@ -8194,6 +8295,7 @@ async def _proxy_with_fallback_cycle(
                         warm_threshold=_warm_threshold,
                         new_tokens=_routing_new_tokens,
                         cached_ratio=_routing_cached_ratio,
+                        cache_state=_routing_cache_state,
                         reason=_skip_reason,
                     )
                     fallback_reason = _skip_reason
@@ -8301,7 +8403,7 @@ async def _proxy_with_fallback_cycle(
                     logger.info(
                         "routing_economic_bypass_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                        "new_tokens=%d cached_ratio=%.2f session=%s",
+                        "new_tokens=%d cached_ratio=%.2f cache_state=%s session=%s",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
@@ -8309,6 +8411,7 @@ async def _proxy_with_fallback_cycle(
                         _warm_threshold,
                         _routing_new_tokens,
                         _routing_cached_ratio,
+                        _routing_cache_state,
                         _session_id or "unknown",
                     )
                     _record_attempt(

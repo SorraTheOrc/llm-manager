@@ -472,6 +472,7 @@ async def _update_session_and_slot(
     # true cache-hit fraction when available. The save-success 1.0 below
     # remains the fallback when no usage data is present.
     _real_usage_applied = False
+    _measured_prompt_tokens = 0
     if session_id and srv.current_model:
         try:
             from proxy.provider import (
@@ -513,6 +514,7 @@ async def _update_session_and_slot(
                         prompt_tokens=_prompt,
                     )
                     _real_usage_applied = True
+                    _measured_prompt_tokens = _prompt
         except Exception:
             srv.logger.debug(
                 "update_cached_ratio from usage failed", exc_info=True
@@ -539,16 +541,49 @@ async def _update_session_and_slot(
                 # as a FALLBACK when no real usage data was reported.
                 if session_id and srv.current_model and not _real_usage_applied:
                     try:
-                        from proxy.provider import update_cached_ratio
+                        from proxy.provider import (
+                            _CACHED_RATIO_SOURCE_SAVE,
+                            update_cached_ratio,
+                        )
                         update_cached_ratio(
                             srv.current_model,
                             session_id,
                             cached_tokens=1,
                             prompt_tokens=1,
+                            source=_CACHED_RATIO_SOURCE_SAVE,
                         )
                     except Exception:
                         srv.logger.debug(
                             "update_cached_ratio failed", exc_info=True
+                        )
+                # Persist the routing cache state next to the snapshot so it
+                # survives a proxy restart (LP-0MVGD9YXH008O304 AC1/AC6): the
+                # served prompt's tokens are now resident in the saved KV
+                # cache, so a later request whose message list extends this
+                # one can be credited for them at routing time. Only MEASURED
+                # usage is recorded — without a usage block the sidecar is
+                # left untouched (conservative; today's behaviour).
+                if session_id and srv.current_model and _measured_prompt_tokens > 0:
+                    try:
+                        from proxy.slot_cache_ratio import (
+                            write_slot_ratio_sidecar,
+                        )
+
+                        write_slot_ratio_sidecar(
+                            slot_filename,
+                            session_id=session_id,
+                            model=srv.current_model,
+                            cached_tokens=_measured_prompt_tokens,
+                            prompt_tokens=_measured_prompt_tokens,
+                            messages=(
+                                body_json.get("messages")
+                                if isinstance(body_json, dict)
+                                else None
+                            ),
+                        )
+                    except Exception:
+                        srv.logger.debug(
+                            "slot ratio sidecar write failed", exc_info=True
                         )
 
         except Exception:
