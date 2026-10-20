@@ -383,11 +383,11 @@ models:
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        # Deliberately conservative at 2/min (LP-0MVF19DKR008VCHO): the free
+        # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
         # tier is a bonus tier, so bursts spill to the paid tiers instead.
-        # floor(2 x 0.3) = 0 reserve slots, so new and in-progress sessions
-        # both see the full 2-per-window cap.
-        rate_limit_rpm: 2
+        # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 3-per-window cap.
+        rate_limit_rpm: 3
       - name: opencode-go-3
         display_name: OpenCode Go 3
         type: remote
@@ -575,11 +575,11 @@ models:
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        # Deliberately conservative at 2/min (LP-0MVF19DKR008VCHO): the free
+        # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
         # tier is a bonus tier, so bursts spill to the paid tiers instead.
-        # floor(2 x 0.3) = 0 reserve slots, so new and in-progress sessions
-        # both see the full 2-per-window cap.
-        rate_limit_rpm: 2
+        # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 3-per-window cap.
+        rate_limit_rpm: 3
       - name: opencode-go-3
         display_name: OpenCode Go 3
         type: remote
@@ -741,11 +741,11 @@ models:
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
         # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        # Deliberately conservative at 2/min (LP-0MVF19DKR008VCHO): the free
+        # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
         # tier is a bonus tier, so bursts spill to the paid tiers instead.
-        # floor(2 x 0.3) = 0 reserve slots, so new and in-progress sessions
-        # both see the full 2-per-window cap.
-        rate_limit_rpm: 2
+        # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 3-per-window cap.
+        rate_limit_rpm: 3
       - name: opencode-go-3
         display_name: OpenCode Go 3
         type: remote

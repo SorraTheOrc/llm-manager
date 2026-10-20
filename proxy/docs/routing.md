@@ -98,9 +98,9 @@ traffic and waited 15–55 s per turn, which dominated first-token latency
 Reserving `floor(rate_limit_rpm × provider_rate_limit_reserve_ratio)` slots
 (4 of 15 at the former budget) keeps a slot available for them, so waits become
 rare; the default 15 s cap bounds whatever remains. The reserve rounds down and
-is clamped to `rate_limit_rpm - 1`, so at the current budget of 2/min the
+is clamped to `rate_limit_rpm - 1`, so at the current budget of 3/min the
 reserve is **0**: there are no reserved slots and both new and in-progress
-sessions share the 2-slot window.
+sessions share the 3-slot window.
 
 Affinity is `session → entry`, TTL-scoped by
 `server.provider_affinity_ttl_seconds` (default 900), and is **never** shared
@@ -110,7 +110,7 @@ session already on the free tier keeps its provider, while a batch of new
 agent sessions passes straight through instead of queueing behind an exhausted
 allowance.
 
-`munitoai-free` ships with `rate_limit_rpm: 2` in `config.yaml` (the former
+`munitoai-free` ships with `rate_limit_rpm: 3` in `config.yaml` (the former
 fast/cheap overlay files were removed with priority-based routing,
 LP-0MVDT94F0003VHUA); tune the value from the `remaining=` field in the skip
 logs.
@@ -126,17 +126,27 @@ peak and reverts to 10 if it exceeds ~10 % of minutes.
 
 **Value history (LP-0MVF19DKR008VCHO):** lowered from 15 to **2** on 2026-10-19
 at the operator's request — the free tier is treated as a bonus tier, so bursts
-spill to the paid tiers rather than consuming the free allowance. At 2/min the
-reserve ratio (`provider_rate_limit_reserve_ratio`, default 0.3) rounds down to
-0 slots, so new and in-progress sessions both see the full 2-per-window cap;
-in-progress sessions can still wait for the window to drain (bounded by
-`provider_rate_limit_wait_max_seconds`). Takes effect at the next proxy
-restart.
+spill to the paid tiers rather than consuming the free allowance. At the 2/min
+budget the reserve ratio (`provider_rate_limit_reserve_ratio`, default 0.3)
+rounded down to 0 slots, so new and in-progress sessions both saw the full
+2-per-window cap; in-progress sessions could still wait for the window to drain
+(bounded by `provider_rate_limit_wait_max_seconds`). Took effect at the next
+proxy restart.
+
+**Value history (LP-0MVGGI4Y0003K4AZ):** raised from 2 to **3** on 2026-10-20
+at the operator's request — a modest bump that stays far below the measured
+upstream 429 onset (≈20 dispatches/rolling-60 s), so the free tier's real
+allowance is used a little closer to capacity and requests spill to the paid
+tiers less often. The reserve ratio still rounds down
+(`floor(3 × 0.3) = 0`), so new and in-progress sessions both see the full
+3-per-window cap; in-progress sessions can still wait for the window to drain
+(bounded by `provider_rate_limit_wait_max_seconds`). Takes effect at the next
+proxy restart.
 
 ### Off-peak paid tiers in the `low` chain (LP-0MVF17VP70053JXX)
 
 `low` priority prefers local and queues over paid remote fallback, then uses the
-free tier (`munitoai-free`, `rate_limit_rpm: 2`). Because that free tier is the
+free tier (`munitoai-free`, `rate_limit_rpm: 3`). Because that free tier is the
 last entry of the chain, exhausted local slots plus an exhausted free budget
 used to leave the request nowhere to go but an upstream 429. `plan`, `author`
 and `code` therefore extend their `low` chain with the three `opencode-go`
@@ -217,7 +227,7 @@ Enable it per provider entry, or globally under `server`:
 ```yaml
 - name: munitoai-free
   type: remote
-  rate_limit_rpm: 2
+  rate_limit_rpm: 3
   respect_ratelimit_headers: true   # entry flag wins over server.*
 ```
 
