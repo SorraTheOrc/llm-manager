@@ -635,6 +635,17 @@ async def _cleanup_after_request(
         record_local_activity("finish")
     except Exception:
         pass
+    # Capacity accounting (LP-0MVGDUVS6003T2IX): record this dispatch's
+    # slot-busy interval so idle slot-time is measured, not assumed.
+    try:
+        from proxy.capacity_admission import record_slot_busy
+
+        record_slot_busy(
+            getattr(request, "_local_dispatch_started_at", None),
+            time.monotonic(),
+        )
+    except Exception:
+        pass
     await _decrement_active_queries(srv)
     await _decrement_per_model_query(srv, model_name)
     if decrement_local:
@@ -1256,6 +1267,12 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         from proxy.local_activity import record_local_activity
 
         record_local_activity("dispatch")
+    except Exception:
+        pass
+    # Capacity accounting (LP-0MVGDUVS6003T2IX): stamp the dispatch start so
+    # the completion path can record the slot-busy interval.
+    try:
+        request._local_dispatch_started_at = _dispatch_start
     except Exception:
         pass
 

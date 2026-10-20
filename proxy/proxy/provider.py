@@ -8480,6 +8480,65 @@ async def _proxy_with_fallback_cycle(
                         )
                         _skip_local = False
                         _skip_reason = None
+                # Capacity-based admission (LP-0MVGDUVS6003T2IX): admit the
+                # economic band locally while the projected slot-seconds of
+                # admissions stay inside a share of MEASURED idle slot time.
+                # The physical ``context_too_large`` cap is never overridden.
+                # Default-off: the rollback switch is
+                # ``local_capacity_admission_enabled``.
+                if _skip_local and _skip_reason == "large_context_bypass":
+                    try:
+                        from proxy.capacity_admission import (
+                            evaluate_capacity_admission,
+                        )
+
+                        _capacity_admit = evaluate_capacity_admission(
+                            config,
+                            _llama_model,
+                            _estimated_tokens,
+                            _routing_cached_ratio,
+                        )
+                    except Exception:
+                        _capacity_admit = None
+                    if _capacity_admit is not None:
+                        logger.info(
+                            "routing_capacity_admit provider=%s model=%s "
+                            "reason=%s projected_s=%.1f admitted_s=%.1f "
+                            "budget_s=%.1f idle_s=%.1f budget_ratio=%.2f "
+                            "horizon_s=%.0f estimated_tokens=%d "
+                            "cached_ratio=%.2f cache_state=%s warm_threshold=%d "
+                            "session=%s",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _capacity_admit["reason"],
+                            _capacity_admit["projected_seconds"],
+                            _capacity_admit["admitted_seconds"],
+                            _capacity_admit["budget_seconds"],
+                            _capacity_admit["idle_seconds"],
+                            _capacity_admit["budget_ratio"],
+                            _capacity_admit["horizon_seconds"],
+                            _estimated_tokens,
+                            _routing_cached_ratio,
+                            _routing_cache_state,
+                            _warm_threshold,
+                            _session_id or "unknown",
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="capacity_admit",
+                            reason=_capacity_admit["reason"],
+                            estimated_tokens=_estimated_tokens,
+                            projected_seconds=round(
+                                _capacity_admit["projected_seconds"], 1
+                            ),
+                            budget_seconds=round(
+                                _capacity_admit["budget_seconds"], 1
+                            ),
+                        )
+                        _skip_local = False
+                        _skip_reason = None
                 if _skip_local:
                     logger.info(
                         "routing_skip_local provider=%s model=%s "

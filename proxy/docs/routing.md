@@ -433,6 +433,57 @@ separately from genuine prompt-cache hits. `slot_ratio_restored` is logged once
 per seed with `cached_tokens`, `estimated_tokens` and the credited
 `cached_ratio`.
 
+## Capacity-based local admission (LP-0MVGDUVS6003T2IX)
+
+The economic gate (`local_large_context_cold_cache_threshold`, 38 000 new
+tokens) and the physical cap (per-slot clamp, ~126 976 at N=2 / ctx 262 144)
+are **unchanged**. Raising them was rejected twice (LP-0MVGCOZMZ003I6PF,
+LP-0MVGD9YLM0055SFF): the 38k–124k band needs ~100 slot-hours per 24 h when
+cache-cold against ~26 h of measured idle headroom, so it only fits with warm
+caches plus admission control.
+
+Instead, the economic band may be admitted locally while the **projected
+slot-seconds** of admissions fit inside a share of **measured** idle slot time:
+
+```
+projected_s = prefill ETA (calibrated from dispatch_first_byte_ms) + decode allowance
+busy_s      = union of local dispatch intervals inside the horizon
+idle_s      = slots * horizon - busy_s
+budget_s    = local_capacity_admission_budget_ratio * idle_s
+
+admit iff admitted_s + projected_s <= budget_s
+```
+
+```yaml
+server:
+  local_capacity_admission_enabled: false   # rollback switch, default off
+  local_capacity_admission_budget_ratio: 0.8
+  local_capacity_admission_horizon_seconds: 3600
+  local_capacity_admission_decode_seconds: 30
+```
+
+- **Not a threshold widening.** Both existing thresholds keep their values;
+  only the *effective* treatment of the economic band changes, and only while
+  measured idle capacity supports it.
+- **Rolling, data-driven inputs.** `busy_s` is recorded from real dispatch
+  intervals (`router.py::_cleanup_after_request`), and the prefill ETA comes
+  from `proxy/prefill_eta.py`'s calibration over observed
+  `dispatch_first_byte_ms` samples — no fixed capacity constants.
+- **Burst-safe.** Admissions are recorded in a rolling ledger inside the
+  horizon, so a burst of band requests cannot collectively over-commit the
+  budget; once the budget is exhausted the bypass stands (today's behaviour).
+- **Never overrides the physical cap.** `context_too_large` still routes
+  remote; a prompt that cannot fit a KV slot is never admitted by capacity.
+- **Observability.** Each admit logs `routing_capacity_admit provider=… model=…
+  reason=capacity_admission projected_s=… admitted_s=… budget_s=… idle_s=…
+  budget_ratio=… horizon_s=… estimated_tokens=… cached_ratio=… cache_state=…
+  warm_threshold=… session=…` and records a `status=capacity_admit` attempt.
+- **Rollout / rollback.** Ships **off**. Enable only once cache warmth
+  (LP-0MVGD9YXH008O304), the prefill-ETA guard (LP-0MVGDUV5E005UWBQ) and
+  prefill serialisation (LP-0MVGDUUV3001XFRJ) are live in the running proxy and
+  the 24 h measurement (LP-0MVGHXD59008UOUD) is green; revert by setting
+  `local_capacity_admission_enabled: false` (read per request, no restart).
+
 ## Prefill serialisation (LP-0MVGDUUV3001XFRJ)
 
 Prefill (dispatch → first byte) does not scale with concurrency on this

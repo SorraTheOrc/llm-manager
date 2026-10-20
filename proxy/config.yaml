@@ -1503,6 +1503,42 @@ server:
   local_max_concurrent_prefills: 1
 
   # -----------------------------------------------------------------------
+  # Capacity-based local admission (LP-0MVGDUVS6003T2IX)
+  # -----------------------------------------------------------------------
+  # The economic gate is a fixed NEW-TOKEN threshold
+  # (local_large_context_cold_cache_threshold: 38000) and the physical cap is
+  # the per-slot clamp. Those thresholds are UNCHANGED by this feature: raising
+  # them was rejected twice (LP-0MVGCOZMZ003I6PF, LP-0MVGD9YLM0055SFF) because
+  # the 38k-124k band needs ~100 slot-hours per 24h when cache-cold against
+  # ~26 h of measured idle headroom - it only fits with warm caches.
+  #
+  # Instead the economic band may be admitted locally while its projected
+  # slot-seconds fit inside a share of MEASURED idle slot time:
+  #   projected_s = prefill ETA (calibrated from dispatch_first_byte_ms)
+  #                 + local_capacity_admission_decode_seconds
+  #   budget_s    = local_capacity_admission_budget_ratio *
+  #                 (slots * horizon - union(busy slot intervals in horizon))
+  # The prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ) and prefill
+  # serialisation (LP-0MVGDUUV3001XFRJ) supply the admission control this
+  # depends on.
+  #
+  # DEFAULT OFF. Enable only after cache warmth (LP-0MVGD9YXH008O304), the
+  # prefill-ETA guard and prefill serialisation are live in the RUNNING proxy
+  # and the 24h measurement (LP-0MVGHXD59008UOUD) is green.
+  # Rollback: local_capacity_admission_enabled: false (read per request; no
+  # llama-server restart needed).
+  #
+  # Achieved warm threshold: unchanged - the hard routing cap (~126,976 at
+  # N=2, ctx 262144, minus output headroom). Reason: the measured cold share of
+  # local dispatches in the 24h window ending 2026-10-20 11:00 is 39.4%
+  # (206/523), better than the 45.7% baseline but not low enough to justify
+  # widening a fixed threshold; capacity-based admission is used instead.
+  local_capacity_admission_enabled: false
+  local_capacity_admission_budget_ratio: 0.8
+  local_capacity_admission_horizon_seconds: 3600
+  local_capacity_admission_decode_seconds: 30
+
+  # -----------------------------------------------------------------------
   # Contention queue (merged from the retired config-fast/cheap overlays)
   # -----------------------------------------------------------------------
   # The per-mode queue policy was declared by the mode overlays
