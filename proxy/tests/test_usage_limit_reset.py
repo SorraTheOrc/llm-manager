@@ -34,9 +34,11 @@ Covers parent AC1-AC6:
 
 import json
 import time
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import proxy.provider as provider
+import proxy.quota_state as quota_state
 import pytest
 from fastapi import Response
 
@@ -61,7 +63,9 @@ def reset_cooldown_state():
     provider._usage_reset_at.clear()
     provider._usage_reset_guessed.clear()
     provider._usage_limit_last_probe.clear()
+    quota_state.reset_quota_state()
     yield
+    quota_state.reset_quota_state()
 
 
 @pytest.fixture
@@ -132,6 +136,169 @@ def _gousage_429(message: str, limit_name: str = "weekly") -> Response:
         "metadata": {"limitName": limit_name},
     })
     return Response(status_code=429, content=body.encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Authoritative quota-snapshot reset (LP-0MVF7MPZN009GOJB)
+# ---------------------------------------------------------------------------
+
+#: Frozen wall clock the quota module reads through ``quota_state.set_clock``.
+_NOW = datetime(2026, 10, 19, 12, 0, 0, tzinfo=UTC)
+
+#: The monthly reset offset used by seeded snapshots (seconds from ``_NOW``).
+_SNAPSHOT_RESET_SECONDS = 5000
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _usage_body(monthly_reset_seconds: float) -> dict:
+    """A complete ``/v1/usage`` body with a known monthly reset offset."""
+    return {
+        "usage": {
+            "rolling": {
+                "status": "ok",
+                "percent": 0.0,
+                "resetsAt": _iso(_NOW + timedelta(hours=5)),
+            },
+            "weekly": {
+                "status": "ok",
+                "percent": 0.0,
+                "resetsAt": _iso(_NOW + timedelta(days=2)),
+            },
+            "monthly": {
+                "status": "ok",
+                "percent": 50.0,
+                "resetsAt": _iso(_NOW + timedelta(seconds=monthly_reset_seconds)),
+            },
+        }
+    }
+
+
+class _UsageTransport:
+    """Injectable ``/v1/usage`` transport keyed by account (test seam)."""
+
+    def __init__(self, bodies: dict[str, dict]):
+        self._bodies = dict(bodies)
+
+    async def __call__(self, provider_cfg: dict) -> dict:
+        return self._bodies[quota_state.account_key(provider_cfg)]
+
+
+async def _seed_snapshot(
+    provider_cfg: dict, config: dict | None, body: dict
+) -> None:
+    """Populate the quota cache for one account through the public poller."""
+    account = quota_state.account_key(provider_cfg)
+    quota_state.set_quota_transport(_UsageTransport({account: body}))
+    await quota_state.refresh_quota_accounts(
+        {"providers": [provider_cfg]}, config, force=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_quota_snapshot_reset_seconds_uses_fresh_snapshot():
+    """Unit: a fresh ``opencode-*`` snapshot returns its monthly reset."""
+    entry = {
+        "name": "opencode-go-2-deepseek",
+        "provider": "opencode-go",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_2_API_KEY",
+    }
+    config: dict = {}
+    quota_state.set_clock(lambda: _NOW)
+    await _seed_snapshot(entry, config, _usage_body(_SNAPSHOT_RESET_SECONDS))
+
+    assert provider._quota_snapshot_reset_seconds(entry, config) == pytest.approx(
+        _SNAPSHOT_RESET_SECONDS, abs=1
+    )
+
+
+@pytest.mark.asyncio
+async def test_quota_snapshot_reset_seconds_none_when_stale():
+    """Unit: a stale snapshot is not authoritative (falls back to the guess)."""
+    entry = {
+        "name": "opencode-go-2-deepseek",
+        "provider": "opencode-go",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_2_API_KEY",
+    }
+    config: dict = {}
+    quota_state.set_clock(lambda: _NOW)
+    # Monthly reset far in the future, but the reading itself ages out.
+    await _seed_snapshot(entry, config, _usage_body(15 * 86400))
+    quota_state.set_clock(lambda: _NOW + timedelta(hours=2))
+
+    assert provider._quota_snapshot_reset_seconds(entry, config) is None
+
+
+@pytest.mark.asyncio
+async def test_quota_snapshot_reset_seconds_none_when_absent():
+    """Unit: no snapshot at all yields ``None`` (guess path unchanged)."""
+    entry = {
+        "name": "opencode-go-2-deepseek",
+        "provider": "opencode-go",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_2_API_KEY",
+    }
+    quota_state.set_clock(lambda: _NOW)
+    assert provider._quota_snapshot_reset_seconds(entry, {}) is None
+
+
+@pytest.mark.asyncio
+async def test_quota_snapshot_reset_seconds_ignores_non_opencode():
+    """Unit: a non-``opencode-*`` entry never uses quota state, even when a
+    snapshot exists under its shared account key."""
+    opencode_entry = {
+        "name": "opencode-go-2-deepseek",
+        "provider": "opencode-go",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "SHARED_KEY",
+    }
+    deepseek_entry = {
+        "name": "deepseek-v4-flash",
+        "provider": "deepseek",
+        "endpoint": "https://api.deepseek.com",
+        "api_key_env": "SHARED_KEY",
+    }
+    config: dict = {}
+    quota_state.set_clock(lambda: _NOW)
+    await _seed_snapshot(
+        opencode_entry, config, _usage_body(_SNAPSHOT_RESET_SECONDS)
+    )
+    # The snapshot is keyed on the shared api_key_env, so it *is* visible to
+    # the deepseek entry — the provider-type gate is what keeps it out.
+    assert quota_state.get_quota_snapshot(deepseek_entry, config) is not None
+    assert provider._quota_snapshot_reset_seconds(deepseek_entry, config) is None
+
+
+@pytest.mark.asyncio
+async def test_quota_snapshot_reset_seconds_respects_kill_switch_and_dry_run():
+    """Unit: the kill switch and dry-run both keep pre-feature behaviour."""
+    entry = {
+        "name": "opencode-go-2-deepseek",
+        "provider": "opencode-go",
+        "endpoint": "https://opencode.ai/zen/go",
+        "api_key_env": "OPENCODE_2_API_KEY",
+    }
+    quota_state.set_clock(lambda: _NOW)
+    await _seed_snapshot(entry, {}, _usage_body(_SNAPSHOT_RESET_SECONDS))
+
+    assert (
+        provider._quota_snapshot_reset_seconds(
+            entry, {"server": {"quota_surge_enabled": False}}
+        )
+        is None
+    )
+    assert (
+        provider._quota_snapshot_reset_seconds(
+            entry, {"server": {"quota_surge_dry_run": True}}
+        )
+        is None
+    )
+    # Sanity: default (enabled) config does use it.
+    assert provider._quota_snapshot_reset_seconds(entry, {}) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -560,3 +727,211 @@ async def test_usage_limit_reset_in_proxy_with_fallback(opencode_usage_chain, ca
     assert fresh is not None
     assert fresh.get("name") == "opencode-go-deepseek"
     assert any("usage_limit_reset_pending" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC2: authoritative snapshot reset vs. fallback (LP-0MVF7MPZN009GOJB)
+# ---------------------------------------------------------------------------
+
+
+def _ok_response() -> Response:
+    return Response(
+        content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+        status_code=200,
+        media_type="application/json",
+    )
+
+
+@pytest.mark.asyncio
+async def test_gousagelimit_fresh_snapshot_reset_wins_for_opencode(
+    opencode_usage_chain, caplog
+):
+    """AC1: a ``GoUsageLimitError`` on an ``opencode-*`` account with a fresh
+    snapshot quarantines for exactly the snapshot's ``seconds_to_reset`` (+ the
+    configured 2-minute margin), even when the message advertises a different
+    explicit ``Resets in ...`` duration."""
+    cfg = {"provider_cooldown_seconds": 60}
+    entry = opencode_usage_chain["providers"][0]
+    quota_state.set_clock(lambda: _NOW)
+    await _seed_snapshot(entry, cfg, _usage_body(_SNAPSHOT_RESET_SECONDS))
+
+    request = _DummyRequest()
+    call_count = 0
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        nonlocal call_count
+        call_count += 1
+        if provider_cfg.get("name") == "opencode-go-2-deepseek":
+            # The message claims ~22h43m; the snapshot must still win.
+            return _gousage_429(
+                "Weekly usage limit reached. Resets in 22hr 43min.", "weekly"
+            )
+        return _ok_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        with caplog.at_level("INFO", logger="llama-proxy.provider"):
+            result = await provider.proxy_with_remote_fallback(
+                request, "v1/chat/completions", opencode_usage_chain, cfg
+            )
+
+    assert result.status_code == 200
+    go2_key = provider._usage_limit_account_key(entry)
+    remaining = provider._usage_reset_at[go2_key] - time.time()
+    # Exactly the snapshot's monthly reset + 2-minute margin — not 22h43m.
+    assert remaining == pytest.approx(_SNAPSHOT_RESET_SECONDS + 120, abs=5)
+    assert go2_key not in provider._usage_reset_guessed
+    # The behaviour change is observable in the log.
+    assert any(
+        "source=snapshot" in rec.message and "opencode-go-2-deepseek" in rec.message
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_gousagelimit_stale_snapshot_falls_back_to_message(
+    opencode_usage_chain, caplog
+):
+    """AC2: a stale snapshot falls back to the existing message-parsing path
+    unchanged (explicit ``Resets in ...`` duration)."""
+    cfg = {"provider_cooldown_seconds": 60}
+    entry = opencode_usage_chain["providers"][0]
+    quota_state.set_clock(lambda: _NOW)
+    # Monthly reset far in the future, but the reading ages past the default
+    # 3600 s staleness horizon.
+    await _seed_snapshot(entry, cfg, _usage_body(15 * 86400))
+    quota_state.set_clock(lambda: _NOW + timedelta(hours=2))
+
+    request = _DummyRequest()
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        if provider_cfg.get("name") == "opencode-go-2-deepseek":
+            return _gousage_429(
+                "Weekly usage limit reached. Resets in 22hr 43min.", "weekly"
+            )
+        return _ok_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        with caplog.at_level("INFO", logger="llama-proxy.provider"):
+            result = await provider.proxy_with_remote_fallback(
+                request, "v1/chat/completions", opencode_usage_chain, cfg
+            )
+
+    assert result.status_code == 200
+    go2_key = provider._usage_limit_account_key(entry)
+    remaining = provider._usage_reset_at[go2_key] - time.time()
+    assert remaining == pytest.approx(22 * 3600 + 43 * 60 + 120, abs=5)
+    assert any("source=message" in rec.message for rec in caplog.records)
+    assert not any("source=snapshot" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_gousagelimit_stale_snapshot_falls_back_to_guess(
+    opencode_usage_chain, caplog
+):
+    """AC2: a stale snapshot with a duration-less message uses the capped
+    ``metadata.limitName`` guess unchanged."""
+    cfg = {"provider_cooldown_seconds": 60}
+    entry = opencode_usage_chain["providers"][0]
+    quota_state.set_clock(lambda: _NOW)
+    await _seed_snapshot(entry, cfg, _usage_body(15 * 86400))
+    quota_state.set_clock(lambda: _NOW + timedelta(hours=2))
+
+    request = _DummyRequest()
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        if provider_cfg.get("name") == "opencode-go-2-deepseek":
+            return _gousage_429("Weekly usage limit reached.", "weekly")
+        return _ok_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        with caplog.at_level("INFO", logger="llama-proxy.provider"):
+            result = await provider.proxy_with_remote_fallback(
+                request, "v1/chat/completions", opencode_usage_chain, cfg
+            )
+
+    assert result.status_code == 200
+    go2_key = provider._usage_limit_account_key(entry)
+    remaining = provider._usage_reset_at[go2_key] - time.time()
+    cap = provider._USAGE_LIMIT_GUESS_MAX_SECONDS
+    assert remaining == pytest.approx(cap + 120, abs=5)
+    assert go2_key in provider._usage_reset_guessed
+    assert any("source=guess" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_gousagelimit_absent_snapshot_falls_back_to_guess(
+    opencode_usage_chain,
+):
+    """AC2: with no snapshot at all the existing guess path is used unchanged."""
+    cfg = {"provider_cooldown_seconds": 60}
+    request = _DummyRequest()
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        if provider_cfg.get("name") == "opencode-go-2-deepseek":
+            return _gousage_429("Weekly usage limit reached.", "weekly")
+        return _ok_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", opencode_usage_chain, cfg
+        )
+
+    assert result.status_code == 200
+    go2_key = provider._usage_limit_account_key(opencode_usage_chain["providers"][0])
+    remaining = provider._usage_reset_at[go2_key] - time.time()
+    cap = provider._USAGE_LIMIT_GUESS_MAX_SECONDS
+    assert remaining == pytest.approx(cap + 120, abs=5)
+
+
+@pytest.mark.asyncio
+async def test_gousagelimit_non_opencode_ignores_snapshot():
+    """A non-``opencode-*`` entry keeps the existing message/guess path even
+    when a quota snapshot exists under its shared account key."""
+    cfg = {"provider_cooldown_seconds": 60}
+    chain = {
+        "providers": [
+            {
+                "name": "deepseek-v4-flash",
+                "type": "remote",
+                "provider": "deepseek",
+                "endpoint": "https://api.deepseek.com",
+                "api_key_env": "SHARED_KEY",
+                "model": "deepseek-v4-flash",
+            },
+            {
+                "name": "opencode-go-2-deepseek",
+                "type": "remote",
+                "provider": "opencode-go",
+                "endpoint": "https://opencode.ai/zen/go",
+                "api_key_env": "SHARED_KEY",
+                "model": "deepseek-v4-flash",
+            },
+        ],
+    }
+    quota_state.set_clock(lambda: _NOW)
+    await _seed_snapshot(
+        chain["providers"][1], cfg, _usage_body(_SNAPSHOT_RESET_SECONDS)
+    )
+    assert (
+        quota_state.get_quota_snapshot(chain["providers"][0], cfg) is not None
+    )
+
+    request = _DummyRequest()
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        if provider_cfg.get("name") == "deepseek-v4-flash":
+            return _gousage_429(
+                "Weekly usage limit reached. Resets in 22hr 43min.", "weekly"
+            )
+        return _ok_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            request, "v1/chat/completions", chain, cfg
+        )
+
+    assert result.status_code == 200
+    deepseek_key = provider._usage_limit_account_key(chain["providers"][0])
+    remaining = provider._usage_reset_at[deepseek_key] - time.time()
+    # The non-opencode entry used the message duration, not the snapshot.
+    assert remaining == pytest.approx(22 * 3600 + 43 * 60 + 120, abs=5)

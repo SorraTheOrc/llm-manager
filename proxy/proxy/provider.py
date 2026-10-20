@@ -151,7 +151,10 @@ _usage_reset_guessed: set[str] = set()
 _USAGE_LIMIT_RESET_MARGIN_SECONDS = 120
 
 # Fallback durations per metadata.limitName when the upstream message carries
-# no explicit "Resets in ..." duration (daily/weekly/monthly periods).
+# no explicit "Resets in ..." duration (daily/weekly/monthly periods). These
+# are the FALLBACK-ONLY guess for an ``opencode-*`` account whose fresh quota
+# snapshot is unavailable (stale/absent/disabled): with a fresh snapshot the
+# authoritative ``/v1/usage`` ``seconds_to_reset`` wins (LP-0MVF7MPZN009GOJB).
 _PERIOD_DEFAULT_SECONDS = {
     "daily": 24 * 3600,
     "weekly": 7 * 24 * 3600,
@@ -5796,6 +5799,12 @@ class _UsageLimitReset(NamedTuple):
 def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
     """Return the cap applied to a guessed (period-name-only) quarantine.
 
+    FALLBACK-ONLY (LP-0MVF7MPZN009GOJB): this cap is applied only when an
+    ``opencode-*`` account has no fresh quota snapshot (stale/absent/disabled
+    quota state) or the entry is not quota-managed at all; with a fresh
+    snapshot the authoritative ``/v1/usage`` reset is used instead. See
+    :func:`_usage_limit_reset_info` for the resolution order.
+
     Resolution order: ``server.usage_limit_guess_cap_seconds`` (accepting a
     flat or nested ``server:`` config), then the
     ``LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS`` env override, then the
@@ -5819,20 +5828,77 @@ def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
     return float(_USAGE_LIMIT_GUESS_MAX_SECONDS)
 
 
+def _quota_snapshot_reset_seconds(
+    provider_cfg: dict | None, config: dict | None = None
+) -> float | None:
+    """Return the authoritative reset for *provider_cfg* from quota state.
+
+    Only ``opencode-*`` entries are quota-managed, and the value is honoured
+    only while the quota source is strictly **enabled** for routing
+    (:func:`proxy.quota_state.quota_behaviour`): a disabled (kill switch),
+    stale (suspended) or dry-run quota mode returns ``None`` so the reactive
+    usage-limit handling keeps its pre-feature guessed/message behaviour for
+    every other case (LP-0MVF7MPZN009GOJB).
+
+    The returned value is the account-level
+    :attr:`~proxy.quota_state.QuotaSnapshot.seconds_to_reset` (the monthly
+    allowance window, resolved per account from ``monthly.resetsAt`` — the
+    same value surge and ``available_times`` treat as authoritative) rather
+    than the guessed cap from :func:`_usage_limit_guess_cap_seconds`. A
+    missing/unparseable reset, an absent snapshot, a stale snapshot or a
+    non-positive value all return ``None`` (fail open to the existing
+    message/guess cascade). Never blocks, never polls and never raises: a
+    pure cache read on the request path with a fail-safe exception guard.
+    """
+    if not isinstance(provider_cfg, dict):
+        return None
+    try:
+        if not quota_state.is_quota_provider(provider_cfg, config):
+            return None
+        if not quota_state.quota_behaviour(config).applies:
+            return None
+        snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+        if snapshot is None:
+            return None
+        seconds = snapshot.seconds_to_reset
+    except Exception:
+        logger.info(
+            "usage-limit snapshot reset unavailable; falling back to the "
+            "message/guess path",
+            exc_info=True,
+        )
+        return None
+    if seconds <= 0:
+        return None
+    return float(seconds)
+
+
 def _usage_limit_reset_info(
-    response: Response, body_text: str, config: dict | None = None
+    response: Response,
+    body_text: str,
+    config: dict | None = None,
+    provider_cfg: dict | None = None,
 ) -> _UsageLimitReset | None:
     """Return the resolved usage-limit reset for a 429 error response.
 
     Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ) and any usage-limit
     error variant that carries a reset duration in its message (including
-    ``FreeUsageLimitError`` responses that include one). An explicit
-    ``Resets in 22hr 43min`` duration is honoured in full. When the message
+    ``FreeUsageLimitError`` responses that include one).
+
+    Resolution order (LP-0MVF7MPZN009GOJB): for an ``opencode-*`` entry with a
+    **fresh** quota snapshot the snapshot's authoritative ``seconds_to_reset``
+    is used (monthly window, + the 2-minute margin) and returned as a hard
+    ``explicit=True`` quarantine -- the guessed cap path is unreachable for
+    that case. Otherwise (non-``opencode-*`` entry, or stale/absent/disabled
+    quota state) the previous cascade is unchanged: an explicit
+    ``Resets in 22hr 43min`` duration is honoured in full; when the message
     has no explicit duration, ``metadata.limitName`` (daily/weekly/monthly)
-    supplies a GUESSED period that is capped at
+    supplies a GUESSED period capped at
     :func:`_usage_limit_guess_cap_seconds` (24h by default) — the full 30-day
     period is never used without explicit evidence (LP-0MUQTCMW2001VXH8). The
-    2-minute safety margin is added to the returned duration.
+    2-minute safety margin is added to the returned duration. The guess path
+    is therefore retained purely as the stale/absent fallback, never for a
+    fresh-snapshot ``opencode-*`` account.
 
     Returns ``None`` when the response is not a 429 usage-limit error or no
     reset duration can be computed — callers then fall back to the existing
@@ -5868,8 +5934,39 @@ def _usage_limit_reset_info(
     if err_type not in ("gousagelimiterror", "freeusagelimiterror"):
         return None
 
+    if provider_cfg is not None:
+        snapshot_seconds = _quota_snapshot_reset_seconds(provider_cfg, config)
+        if snapshot_seconds is not None:
+            logger.info(
+                "usage-limit reset source=snapshot provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                _usage_limit_account_key(provider_cfg),
+                snapshot_seconds,
+                limit_name or "",
+            )
+            return _UsageLimitReset(
+                snapshot_seconds + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                True,
+                limit_name,
+            )
+
+    account = (
+        _usage_limit_account_key(provider_cfg)
+        if isinstance(provider_cfg, dict)
+        else None
+    )
     seconds = _parse_resets_in(message) if message else None
     if seconds is not None:
+        if account is not None:
+            logger.info(
+                "usage-limit reset source=message provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                account,
+                float(seconds),
+                limit_name or "",
+            )
         return _UsageLimitReset(
             float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS, True, limit_name
         )
@@ -5878,6 +5975,15 @@ def _usage_limit_reset_info(
             float(_PERIOD_DEFAULT_SECONDS[limit_name]),
             _usage_limit_guess_cap_seconds(config),
         )
+        if account is not None:
+            logger.info(
+                "usage-limit reset source=guess provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                account,
+                guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                limit_name,
+            )
         return _UsageLimitReset(
             guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, limit_name
         )
@@ -5885,13 +5991,17 @@ def _usage_limit_reset_info(
 
 
 def _usage_limit_reset_seconds(
-    response: Response, body_text: str, config: dict | None = None
+    response: Response,
+    body_text: str,
+    config: dict | None = None,
+    provider_cfg: dict | None = None,
 ) -> float | None:
     """Backwards-compatible wrapper returning only the reset duration.
 
-    See :func:`_usage_limit_reset_info` for the explicit-vs-guessed detail.
+    See :func:`_usage_limit_reset_info` for the snapshot-vs-message-vs-guessed
+    detail and the optional ``provider_cfg`` snapshot preference.
     """
-    info = _usage_limit_reset_info(response, body_text, config)
+    info = _usage_limit_reset_info(response, body_text, config, provider_cfg)
     return info.seconds if info is not None else None
 
 
@@ -7725,7 +7835,9 @@ async def _proxy_with_remote_fallback_cycle(
                 # API-key ACCOUNT until the computed reset time + 2m margin.
                 # Not the whole endpoint: distinct api_key_env entries on the
                 # same gateway have independent limits (LP-0MSMBWB23009XYPW).
-                _reset_info = _usage_limit_reset_info(response, body_text, config)
+                _reset_info = _usage_limit_reset_info(
+                    response, body_text, config, provider_cfg=provider_cfg
+                )
                 if _reset_info is not None:
                     _reset_account = _usage_limit_account_key(provider_cfg)
                     _set_usage_limit_quarantine(_reset_account, _reset_info)
@@ -9274,7 +9386,9 @@ async def _proxy_with_fallback_cycle(
                     # API-key ACCOUNT until the computed reset time + 2m margin.
                     # Not the whole endpoint: distinct api_key_env entries on the
                     # same gateway have independent limits (LP-0MSMBWB23009XYPW).
-                    _reset_info = _usage_limit_reset_info(response, body_text, config)
+                    _reset_info = _usage_limit_reset_info(
+                        response, body_text, config, provider_cfg=provider_cfg
+                    )
                     if _reset_info is not None:
                         _reset_account = _usage_limit_account_key(provider_cfg)
                         _set_usage_limit_quarantine(_reset_account, _reset_info)

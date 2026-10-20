@@ -777,19 +777,40 @@ still quenches normally. The window is re-armed per restart by
 
 HTTP 429 responses whose error type is `GoUsageLimitError` (a usage-limit
 variant distinct from `FreeUsageLimitError`) are treated as usage-limit
-**reset** events rather than generic rate-limit events. The proxy parses the
-reset duration from the provider message (`Resets in 22hr 43min`) — falling
-back to `metadata.limitName` (daily/weekly/monthly) when the message carries
-no explicit duration — adds a 2-minute safety margin, and quarantines the
-**whole failure domain** (all entries sharing the endpoint, e.g. both
-`opencode-go` and `opencode-go-2` on `https://opencode.ai/zen/go`) until the
-computed reset time passes. Routing decisions during the block log
-`usage_limit_reset_pending` with the reset time and do not contact the
-upstream; once the reset time arrives the domain becomes eligible again
-without operator intervention. `FreeUsageLimitError` responses without a
-reset time get the default 3-hour cooldown (10800s; per-provider overrides
-were retired with `opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in
-**LP-0MSLJPOCC0001ROJ**.
+**reset** events rather than generic rate-limit events. The quarantine is
+**account-scoped** (`_usage_limit_account_key` = `api_key_env@endpoint`):
+distinct API keys on the same gateway keep independent limits
+(LP-0MSMBWB23009XYPW), and the 2-minute `_USAGE_LIMIT_RESET_MARGIN_SECONDS`
+safety margin is always added.
+
+The reset duration is resolved in this order (LP-0MVF7MPZN009GOJB):
+
+1. **Authoritative quota snapshot** — for an `opencode-*` account with a
+   **fresh** quota snapshot and quota behaviour strictly enabled, the
+   snapshot's account-level `seconds_to_reset` (the monthly window derived
+   from `monthly.resetsAt` by the `/v1/usage` poller, LP-0MVF4FIP1001RD8P) is
+   used and logged as `source=snapshot`. This is a hard (`explicit`)
+   quarantine: it is exempt from the guessed-quarantine 24 h cap and is
+   persisted. The snapshot wins over any `Resets in ...` text in the message.
+2. **Message duration** — for a non-`opencode-*` entry (no quota source), or
+   when the snapshot is stale/absent or the quota source is disabled
+   (`quota_surge_enabled: false`) / dry-run, an explicit `Resets in 22hr
+   43min` duration in the message is honoured in full (`source=message`).
+3. **Guessed period** — when there is no explicit duration, `metadata.limitName`
+   (daily/weekly/monthly) supplies a guessed period capped at
+   `_usage_limit_guess_cap_seconds` (24 h by default), logged as
+   `source=guess`. This guessed branch is **fallback-only**: it is unreachable
+   for a fresh-snapshot `opencode-*` account, and the full 30-day period is
+   never used without explicit evidence (LP-0MUQTCMW2001VXH8).
+
+Routing decisions during the block log `usage_limit_reset_pending` with the
+reset time and do not contact the upstream; once the reset time arrives the
+account becomes eligible again without operator intervention.
+`FreeUsageLimitError` responses without a reset time get the default 3-hour
+cooldown (10800s; per-provider overrides were retired with
+`opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in
+**LP-0MSLJPOCC0001ROJ**; the snapshot-based retirement of the guess is
+**LP-0MVF7MPZN009GOJB**.
 
 ## Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG)
 
