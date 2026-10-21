@@ -312,6 +312,10 @@
             <div id="tokens"></div>
             <pre id="rawTokens" style="display:none; margin-top:8px; font-size:0.75rem; color:var(--text-secondary);"></pre>
           </div>
+          <div class="summary-card" style="grid-column:1 / -1;">
+            <h4>Tokens by model</h4>
+            <div id="modelTokens"></div>
+          </div>
         </div>
       </div>
 
@@ -375,6 +379,136 @@
 
     let latestCounts = {};
     let latestTokens = {};
+    // Signature of the token keys last reported as lacking a model suffix, so
+    // the "unknown" console note is emitted once per distinct key set.
+    let unknownModelKeySignature = null;
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, function (ch) {
+        return {
+          '&': '&amp;', '<': '&lt;', '>': '&gt;',
+          '"': '&quot;', "'": '&#39;'
+        }[ch];
+      });
+    }
+
+    /**
+     * Extract the model name from a token-count key.
+     *
+     * Keys appear in three shapes (all produced elsewhere, never here):
+     *   sent:user:POST /v1/chat/completions -> model:qwen3.6   (endpoint suffix)
+     *   sent:model:qwen3.6                                     (bare model key)
+     *   sent:user:POST /v1/embeddings -> local                 (legacy, no model)
+     *
+     * Returns null when the key carries no model name.
+     */
+    function modelFromTokenKey(key) {
+      const suffixed = key.match(/->\s*model:(\S+)\s*$/);
+      if (suffixed) return suffixed[1];
+      const bare = key.match(/(?:^|:)model:(\S+)\s*$/);
+      return bare ? bare[1] : null;
+    }
+
+    /**
+     * Aggregate raw token-count keys per model.
+     *
+     * Pure client-side grouping over the existing snapshot: no counting is
+     * performed here beyond summing what the server already recorded. Global
+     * totals (`total_sent`/`total_recv`) belong to no model and are excluded.
+     */
+    function aggregateTokensByModel(tokens) {
+      const models = {};
+      const unknownKeys = [];
+      const bucketFor = function(name) {
+        if (!models[name]) {
+          models[name] = {
+            sent: 0, recv: 0,
+            user: 0, assistant: 0, tool: 0, system: 0, response: 0
+          };
+        }
+        return models[name];
+      };
+
+      for (const [key, value] of Object.entries(tokens || {})) {
+        if (!key || key === 'total_sent' || key === 'total_recv') continue;
+        const n = Number(value || 0);
+        if (!Number.isFinite(n)) continue;
+
+        const model = modelFromTokenKey(key);
+        if (!model) unknownKeys.push(key);
+        const bucket = bucketFor(model || 'unknown');
+
+        const catSent = key.match(/^sent:(user|assistant|tool|system):/);
+        const catRecv = key.match(/^recv:(response):/);
+        if (catSent) {
+          bucket.sent += n;
+          bucket[catSent[1]] += n;
+        } else if (catRecv) {
+          bucket.recv += n;
+          bucket[catRecv[1]] += n;
+        } else if (key.startsWith('sent:')) {
+          bucket.sent += n;
+        } else if (key.startsWith('recv:')) {
+          bucket.recv += n;
+        }
+      }
+
+      if (unknownKeys.length) {
+        const signature = unknownKeys.slice().sort().join('|');
+        if (signature !== unknownModelKeySignature) {
+          unknownModelKeySignature = signature;
+          console.debug(
+            '[view_logs] token keys without a model suffix grouped under ' +
+            '"unknown":', unknownKeys
+          );
+        }
+      }
+
+      return models;
+    }
+
+    function renderModelTokens(tokensEl, tokens) {
+      if (!tokensEl) return;
+      const models = aggregateTokensByModel(tokens);
+      const names = Object.keys(models).sort(function(a, b) {
+        const ta = models[a].sent + models[a].recv;
+        const tb = models[b].sent + models[b].recv;
+        if (tb !== ta) return tb - ta;
+        return a.localeCompare(b);
+      });
+
+      if (names.length === 0) {
+        tokensEl.innerHTML = '<div class="muted">No per-model token stats yet.</div>';
+        return;
+      }
+
+      tokensEl.innerHTML = names.map(function(name) {
+        const m = models[name];
+        const parts = [];
+        if (m.user > 0) parts.push('User ' + m.user);
+        if (m.assistant > 0) parts.push('Asst. ' + m.assistant);
+        if (m.tool > 0) parts.push('Tool ' + m.tool);
+        if (m.system > 0) parts.push('Sys. ' + m.system);
+        if (m.response > 0) parts.push('resp. ' + m.response);
+        const breakdown = parts.length
+          ? '<span style="font-size:0.75rem;color:var(--text-secondary);margin-left:4px;">(' +
+            parts.join(' | ') + ')</span>'
+          : '';
+        return '<div class="line model-token-row"' +
+          ' data-model="' + escapeHtml(name) + '"' +
+          ' data-sent="' + m.sent + '"' +
+          ' data-recv="' + m.recv + '"' +
+          ' data-user="' + m.user + '"' +
+          ' data-assistant="' + m.assistant + '"' +
+          ' data-tool="' + m.tool + '"' +
+          ' data-system="' + m.system + '"' +
+          ' data-response="' + m.response + '">' +
+          '<strong>' + escapeHtml(name) + '</strong>:' +
+          ' <span>sent <strong>' + m.sent + '</strong></span>' + breakdown +
+          ' <span style="margin-left:8px;">recv <strong>' + m.recv + '</strong></span>' +
+          '</div>';
+      }).join('');
+    }
     let esProxy = null;
     let esLlama = null;
     let pollTimer = null;
@@ -418,6 +552,7 @@
       try {
         const countsEl = document.getElementById('counts');
         const tokensEl = document.getElementById('tokens');
+        const modelTokensEl = document.getElementById('modelTokens');
         const counts = latestCounts || {};
         const tokens = latestTokens || {};
         const countsParts = [];
@@ -499,6 +634,7 @@
 
         if (countsEl) countsEl.innerHTML = countsParts.join('') || '<div class="muted">No requests recorded yet.</div>';
         if (tokensEl) tokensEl.innerHTML = tokensParts.join('') || '<div class="muted">No token stats yet.</div>';
+        renderModelTokens(modelTokensEl, tokens);
 
         const rawCountsEl = document.getElementById('rawCounts');
         const rawTokensEl = document.getElementById('rawTokens');
