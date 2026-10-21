@@ -1689,6 +1689,34 @@ server:
   # ETAs are counted by the proxy-usage-analysis report; each logged decision
   # carries ``eta_prefill_s``, ``eta_occupancy_s``, ``projected_wait_s``,
   # ``budget_s``, ``busy_slots`` and ``in_flight_prefills``.
+  #
+  # Local admission reservations + fallback intent
+  # ----------------------------------------------
+  # (LP-0MVIKPCSG002B0NL) A dispatcher can claim local capacity ATOMICALLY
+  # before sending: ``POST /llama/local/reserve {estimated_tokens, ...}`` runs
+  # the same estimator and occupancy probe as this guard (never a second ETA
+  # implementation) and returns either a short-TTL single-use ticket
+  # (``X-Local-Reservation: <id>`` on the follow-up dispatches without
+  # re-checking or queueing) or an immediate 429 with ``reason`` /
+  # ``queue_eta_s`` / ``budget_s`` / ``retry_after_s``. Tickets are default-
+  # 10 s, capped at 60 s, cancellable via
+  # ``DELETE /llama/local/reserve/<id>`` and pruned on expiry.
+  #
+  # ``X-Local-Preference: prefer-local|local-only|remote-ok`` expresses intent
+  # per request: ``local-only`` returns the 429 admission response instead of
+  # falling back remote (even when remotes exist); ``remote-ok`` removes the
+  # local provider from the chain; unknown values and an absent header behave
+  # exactly as ``prefer-local`` (today). ``high`` priority keeps its
+  # never-queue semantics under every preference.
+  #
+  # Interaction with the queue: ``contention_queue_max_wait_seconds`` is the
+  # wait budget both this guard and ``/reserve`` compare against, and
+  # ``contention_queue_max_depth`` still bounds the requests that DO queue —
+  # a reserved dispatch does not consume queue depth. Every response carries
+  # ``X-Local-Route: local|remote|refused`` (plus ``X-Local-Fallback-Reason``
+  # on remote/refused), and ``/llama/local/status`` publishes the reservation
+  # counters (``reserved_issued``/``used``/``cancelled``/``expired``) so
+  # reserved-but-unused tickets are observable.
   local_admission_guard_policy: reject
   local_admission_guard_min_samples: 5
   local_admission_guard_window_samples: 200

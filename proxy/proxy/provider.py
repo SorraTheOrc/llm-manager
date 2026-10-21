@@ -4768,6 +4768,12 @@ def _build_local_admission_reject_response(
         "X-Local-Admission": "reject",
         "X-Local-Admission-Eta": f"{eta:.1f}",
         "X-Local-Admission-Budget": f"{budget:.1f}",
+        # LP-0MVIKPCSG002B0NL AC6: the refusal is a routing outcome, not a
+        # remote serve — say so on the response itself.
+        "X-Local-Route": "refused",
+        "X-Local-Fallback-Reason": str(
+            attempt.get("reason") or "eta_exceeds_budget"
+        ),
     }
     return Response(
         content=json.dumps(payload).encode("utf-8"),
@@ -5400,6 +5406,131 @@ the occupied gate ahead of it* against the budget, so it needs the number of
     return busy, in_flight
 
 
+def _note_local_fallback_reason(request, reason: str | None) -> None:
+    """Record why local was not used, for ``X-Local-Fallback-Reason``.
+
+    LP-0MVIKPCSG002B0NL AC6: a client must be able to observe its loss at the
+    moment it happens. The reason is stamped on the request as the routing
+    cycle falls back and surfaced by ``_stamp_local_route_headers`` at the
+    top-level return, so every fallback path is covered by one choke point.
+    Never raises: header bookkeeping must not break routing.
+    """
+    try:
+        setattr(request, "_local_fallback_reason", reason)
+    except Exception:
+        pass
+
+
+_PREF_LOCAL_ONLY = "local-only"
+_PREF_REMOTE_OK = "remote-ok"
+
+
+def _request_local_preference(request) -> str:
+    """Return the request's ``X-Local-Preference`` (default ``prefer-local``).
+
+    Unknown values fall back to today's behaviour (AC8). The parsed value is
+    cached on the request so both routing cycles and the refusal path agree.
+    """
+    cached = getattr(request, "_local_preference", None)
+    if cached:
+        return cached
+    try:
+        from proxy import admission_reserve
+
+        preference = admission_reserve.parse_preference(
+            getattr(request, "headers", {}) or {}
+        )
+    except Exception:
+        preference = "prefer-local"
+    try:
+        setattr(request, "_local_preference", preference)
+    except Exception:
+        pass
+    return preference
+
+
+def _build_local_only_refusal_response(
+    attempt: dict[str, Any] | None, config: dict | None = None
+) -> Response:
+    """429 for a ``local-only`` request the admission guard refused (AC4).
+
+    Unlike the exhaustion path, this response is produced **while remote
+    providers are still available**: the client said local-only, so moving it
+    remote would silently violate its intent. It carries the same retryable
+    contract as the exhaustion refusal (``Retry-After``, ``X-Local-Admission*``)
+    plus ``X-Local-Route: refused``.
+    """
+    from proxy.prefill_eta import suggested_retry_after_seconds
+
+    attempt = attempt or {}
+    eta = float(attempt.get("eta_prefill_seconds") or 0.0)
+    budget = float(attempt.get("budget_seconds") or 0.0)
+    projected = float(attempt.get("projected_wait_seconds") or eta)
+    reason = str(attempt.get("reason") or "eta_exceeds_budget")
+    retry_after = attempt.get("retry_after_s")
+    if retry_after is None:
+        retry_after = suggested_retry_after_seconds(
+            eta, budget, maximum=_max_retry_after_seconds(config)
+        )
+    payload: dict[str, Any] = {
+        "error": "Local admission refused",
+        "code": EXHAUSTION_CODE_LOCAL_ADMISSION,
+        "detail": (
+            "local admission refused: the projected wait exceeds the wait "
+            "budget and X-Local-Preference: local-only forbids remote fallback"
+        ),
+        "reason": reason,
+        "eta_prefill_seconds": eta,
+        "projected_wait_seconds": projected,
+        "budget_seconds": budget,
+        "retry_after": retry_after,
+        "suggested_action": (
+            "Retry after the advertised delay, reduce the prompt size so the "
+            "prefill fits the local wait budget, or send "
+            "X-Local-Preference: prefer-local to allow a remote fallback."
+        ),
+    }
+    headers = {
+        "Retry-After": str(retry_after),
+        "Cache-Control": "no-store",
+        "X-Local-Admission": "reject",
+        "X-Local-Admission-Eta": f"{eta:.1f}",
+        "X-Local-Admission-Budget": f"{budget:.1f}",
+        "X-Local-Route": "refused",
+        "X-Local-Fallback-Reason": reason,
+    }
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=429,
+        media_type="application/json",
+        headers=headers,
+    )
+
+
+def _stamp_local_route_headers(
+    response: Response, request, model_config: dict
+) -> Response:
+    """Add ``X-Local-Route`` / ``X-Local-Fallback-Reason`` to *response*.
+
+    Single choke point on the top-level return path so local success, remote
+    success, refusal and exhaustion are all covered (LP-0MVIKPCSG002B0NL AC6).
+    A response that already carries the route header (a local-only refusal) is
+    left untouched; every other response is classified by the ``X-Provider``
+    that served it.
+    """
+    try:
+        from proxy import admission_reserve
+
+        return admission_reserve.stamp_route_headers(
+            response,
+            model_config,
+            fallback_reason=getattr(request, "_local_fallback_reason", None),
+        )
+    except Exception:  # pragma: no cover - header stamping is best-effort
+        logger.debug("route header stamping failed", exc_info=True)
+        return response
+
+
 async def _prefill_admission_guard(
     config: dict,
     provider_cfg: dict,
@@ -5545,7 +5676,56 @@ async def _maybe_queue_for_local_slot(
         the wait budget; the caller falls through to the next provider
         immediately (no queueing) and records the ETA diagnostic
         (LP-0MVGDUV5E005UWBQ).
+      - ``"refused_local_only"`` — the guard refused and the caller set
+        ``X-Local-Preference: local-only``: the caller must return the
+        retryable 429 admission response instead of falling back to a remote
+        provider (LP-0MVIKPCSG002B0NL AC4).
+
+    A valid ``X-Local-Reservation`` ticket is consumed first: a reservation is
+    a pre-granted admission, so the follow-up request dispatches without
+    re-checking or queueing (LP-0MVIKPCSG002B0NL AC1).
     """
+    # Atomic local-admission reservation (LP-0MVIKPCSG002B0NL): a ticket
+    # claimed via POST /llama/local/reserve is a pre-granted admission. It is
+    # single-use and TTL-bound, so consuming it here is what makes the
+    # follow-up dispatch skip both the admission re-check and the queue. A
+    # stale / missing / already-consumed ticket simply falls through to the
+    # ordinary path — never a hard failure (AC3).
+    try:
+        from proxy import admission_reserve as _reservations
+
+        _ticket_id = _reservations.reservation_id_from_headers(
+            getattr(request, "headers", {}) or {}
+        )
+        _ticket = _reservations.peek(_ticket_id)
+        if _ticket is not None:
+            # Reservations are scoped per provider/model: a ticket for another
+            # local model must not fast-path (nor consume) this endpoint's
+            # gate (the work item's "per-gate, scoped per provider endpoint"
+            # constraint).
+            _ticket_local_model = (
+                provider_cfg.get("llama_model", "")
+                if isinstance(provider_cfg, dict)
+                else ""
+            )
+            if _ticket_local_model and _ticket.provider and (
+                _ticket.provider != _ticket_local_model
+            ):
+                _ticket = None
+            else:
+                _ticket = _reservations.claim(_ticket_id)
+    except Exception:
+        _ticket = None
+    if _ticket is not None:
+        _note_local_fallback_reason(request, None)
+        logger.info(
+            "local_admission_reserve_claimed ticket=%s session=%s tokens=%d",
+            _ticket.ticket_id,
+            _ticket.session_id or "unknown",
+            _ticket.estimated_tokens,
+        )
+        return ("dispatch", "reserved", 0.0)
+
     if not _contention_queue_enabled(config, priority):
         return ("fallback_policy", None, None)
     # One authoritative prompt estimate, shared by the context-bypass check,
@@ -5582,6 +5762,13 @@ async def _maybe_queue_for_local_slot(
             setattr(request, "_local_admission_decision", _admission)
         except Exception:
             pass
+        # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): with
+        # ``X-Local-Preference: local-only`` the client must never be moved
+        # remote. The caller turns this into the retryable 429 admission
+        # response instead of falling through to the next provider.
+        _preference = _request_local_preference(request)
+        if _preference == _PREF_LOCAL_ONLY:
+            return ("refused_local_only", _admission.reason, None)
         return ("admission_reject", _admission.reason, None)
 
     from proxy.router import _get_contention_queue_config
@@ -7969,14 +8156,21 @@ async def _proxy_with_remote_fallback_cycle(
     from proxy.priority import set_request_priority
 
     set_request_priority(request, _priority)
+    _preference = _request_local_preference(request)
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
+    elif _preference == _PREF_REMOTE_OK:
+        # ``remote-ok`` with no remote-capable provider in the chain: the
+        # client asked for no local route, so the chain is genuinely empty
+        # (AC5).
+        model_config = {**model_config, "providers": []}
     logger.info(
-        "priority_routing model=%s priority=%s providers=%d",
+        "priority_routing model=%s priority=%s providers=%d preference=%s",
         model_config.get("name") or "unknown",
         _priority,
         len(_chain or model_config.get("providers") or []),
+        _preference,
     )
 
     # Per-entry context ceiling (LP-0MVF9N2QL001CDA7): parse the body once so
@@ -8428,9 +8622,10 @@ async def proxy_with_remote_fallback(
         A ``Response`` from a successful provider, or the 503/429 exhaustion
         response once the hold-retry bound is reached.
     """
-    return await _run_chain_cycles(
+    response = await _run_chain_cycles(
         request, path, model_config, config, _proxy_with_remote_fallback_cycle,
     )
+    return _stamp_local_route_headers(response, request, model_config)
 
 
 async def _evaluate_compaction_for_bypass(
@@ -8602,14 +8797,21 @@ async def _proxy_with_fallback_cycle(
     from proxy.priority import set_request_priority
 
     set_request_priority(request, _priority)
+    _preference = _request_local_preference(request)
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
+    elif _preference == _PREF_REMOTE_OK:
+        # ``remote-ok`` with no remote-capable provider in the chain: the
+        # client asked for no local route, so the chain is genuinely empty
+        # (AC5).
+        model_config = {**model_config, "providers": []}
     logger.info(
-        "priority_routing model=%s priority=%s providers=%d",
+        "priority_routing model=%s priority=%s providers=%d preference=%s",
         model_config.get("name") or "unknown",
         _priority,
         len(_chain or model_config.get("providers") or []),
+        _preference,
     )
 
     # Shared per-cycle routing estimate (LP-0MVF9N2QL001CDA7 AC4): computed
@@ -8726,6 +8928,7 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = "fallback_after_queue"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
                             "session=%s queued_duration=%.2fs",
@@ -8746,6 +8949,7 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = _cq_reason
                         prev_provider = provider_name
                         all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, _cq_reason)
                         continue
                     elif _cq_action == "admission_reject":
                         # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ):
@@ -8772,7 +8976,34 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = "local_admission_guard"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
                         continue
+                    elif _cq_action == "refused_local_only":
+                        # AC4 (LP-0MVIKPCSG002B0NL): the client set
+                        # X-Local-Preference: local-only and the admission
+                        # guard refused. Unlike admission_reject, the request
+                        # must NOT fall through to a remote provider — return
+                        # the retryable 429 with X-Local-Route: refused now.
+                        _admission = getattr(
+                            request, "_local_admission_decision", None
+                        )
+                        _note_local_fallback_reason(request, _cq_reason)
+                        _refusal_attempt = {
+                            "status": "local_admission_reject",
+                            "reason": _cq_reason or "eta_exceeds_budget",
+                            "eta_prefill_seconds": round(
+                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
+                            ),
+                            "budget_seconds": round(
+                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
+                            ),
+                            "projected_wait_seconds": round(
+                                float(getattr(_admission, "projected_wait_seconds", 0.0) or 0.0), 1
+                            ),
+                        }
+                        return _build_local_only_refusal_response(
+                            _refusal_attempt, config
+                        )
                     else:  # fallback_policy — fast mode unchanged
                         _record_attempt(
                             attempts,
@@ -8785,6 +9016,7 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = "local_concurrency_limit"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
                         continue
 
                 # Smart routing: skip local when cache is cold and request is large
@@ -9061,6 +9293,7 @@ async def _proxy_with_fallback_cycle(
                     fallback_reason = _skip_reason
                     prev_provider = provider_name
                     all_slot_exhaustion = False
+                    _note_local_fallback_reason(request, _skip_reason)
 
                     # Server-side compaction rescue (LP-0MU5ARWSP001BYYB).
                     # The bypass used to ``continue`` here, before any session
@@ -9544,7 +9777,32 @@ async def _proxy_with_fallback_cycle(
                         )
                         fallback_reason = "local_admission_guard"
                         all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
                         continue
+                    elif _lease_action == "refused_local_only":
+                        # AC4 (LP-0MVIKPCSG002B0NL): local-only + guard refusal
+                        # on the lease path — return the 429 instead of
+                        # falling through to a remote provider.
+                        _admission = getattr(
+                            request, "_local_admission_decision", None
+                        )
+                        _note_local_fallback_reason(request, _lease_reason)
+                        _refusal_attempt = {
+                            "status": "local_admission_reject",
+                            "reason": _lease_reason or "eta_exceeds_budget",
+                            "eta_prefill_seconds": round(
+                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
+                            ),
+                            "budget_seconds": round(
+                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
+                            ),
+                            "projected_wait_seconds": round(
+                                float(getattr(_admission, "projected_wait_seconds", 0.0) or 0.0), 1
+                            ),
+                        }
+                        return _build_local_only_refusal_response(
+                            _refusal_attempt, config
+                        )
                     else:
                         # Queue disabled / fallback policy: preserve the
                         # pre-existing immediate remote fallback.
@@ -10165,6 +10423,7 @@ async def proxy_with_fallback(
         A ``Response`` from a successful provider, or the 503/429 exhaustion
         response once the hold-retry bound is reached.
     """
-    return await _run_chain_cycles(
+    response = await _run_chain_cycles(
         request, path, model_config, config, _proxy_with_fallback_cycle,
     )
+    return _stamp_local_route_headers(response, request, model_config)

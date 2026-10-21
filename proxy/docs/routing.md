@@ -797,6 +797,84 @@ drops well below the 4,947 baseline, client-visible latency for refused
 requests approaches the remote TTFT baseline instead of ~120 s, local serve
 share stays above 2.6 %, and mid-stream error counts do not increase.
 
+## Local Admission Reservations and Fallback Intent (LP-0MVIKPCSG002B0NL)
+
+Polling `/llama/local/status` and then sending is racy: two clients can observe
+the same idle window, and the admission decision is taken *after* the work has
+been sent (queue depth reached 7 while `available_slots` still reported 2 with
+the prefill gate saturated). The reservation handshake lets a dispatcher
+**claim** local capacity atomically, before sending, and express what it wants
+to happen if local capacity is not available.
+
+### `POST /llama/local/reserve`
+
+```
+POST /llama/local/reserve
+{"estimated_tokens": 48000, "session_id": "herdr-...",
+ "priority": "medium", "cached_ratio": 0.35,
+ "ttl_seconds": 10, "dry_run": false}
+
+200 {"admit": true, "reservation_id": "<opaque>",
+     "projected_wait_s": 63.1, "ttl_s": 10}
+429 {"admit": false, "reason": "eta_exceeds_budget",
+     "queue_eta_s": 187.2, "budget_s": 120.0, "retry_after_s": 68}
+```
+
+- The verdict is the **same** occupancy-aware decision the admission guard
+  enforces (`prefill_eta.evaluate_admission`), with the same occupancy probe,
+  so the two can never disagree for identical inputs.
+- `200` claims a ticket: a follow-up request carrying
+  `X-Local-Reservation: <id>` dispatches **without re-checking and without
+  queueing**. Tickets are single-use, TTL-bound (default 10 s, capped at
+  60 s) and scoped to the local model they were issued for.
+- `429` refuses immediately: the client defers instead of queueing behind a
+  doomed wait. `queue_eta_s` is the projected wait (`prefill_eta_seconds ×
+  (busy_slots + 1)`), `budget_s` is `contention_queue_max_wait_seconds`, and
+  `retry_after_s` is the overshoot.
+- `DELETE /llama/local/reserve/<id>` cancels an outstanding ticket and
+  releases its gate claim, so the next ticket can be issued.
+- `dry_run: true` returns the verdict without claiming (the "local-only
+  preamble").
+- A stale, expired, cancelled or mismatched ticket is ignored: the request
+  takes today's ordinary path (never a hard failure).
+- Fail-open: an uncalibrated estimator admits (the endpoint never rejects on a
+  guess), and a missing `estimated_tokens` is a `400`.
+
+Interaction with the queue: the reservation replaces the *admission* decision,
+not the capacity model. `contention_queue_max_wait_seconds` remains the wait
+budget both the guard and `/reserve` compare against, and
+`contention_queue_max_depth` still bounds the requests that do queue; a
+reserved dispatch does not consume queue depth.
+
+### `X-Local-Preference` request header
+
+| Value | Behaviour |
+|-------|-----------|
+| `prefer-local` (default) | Today's behaviour: use local when it can serve within the budget, else fall through to the next provider |
+| `local-only` | Never fall back remote. If the request cannot be admitted within the budget the proxy returns the retryable `429` admission response **even when remote providers are available** |
+| `remote-ok` | Skip the local route entirely (background / low-priority work). The local provider is removed from the chain |
+
+Unknown values (and an absent header) behave as `prefer-local`, so the header
+is purely additive. `high` priority keeps its "never queue" semantics under
+every preference.
+
+### Response headers
+
+Every response carries `X-Local-Route`:
+
+- `local` — served by a local provider.
+- `remote` — served by a remote provider; `X-Local-Fallback-Reason` names why
+  local was not used (`eta_exceeds_budget`, `local_concurrency_limit`,
+  `cached_tokens_skip`/`large_context_bypass`, `remote_ok`, …).
+- `refused` — local-only refusal or exhausted chain; `X-Local-Fallback-Reason`
+  carries the refusal reason. Refusals also carry `Retry-After` and the
+  `X-Local-Admission*` estimate headers.
+
+`/llama/local/status` publishes the reservation counters
+(`reserved_outstanding`, `reserved_issued`, `reserved_used`,
+`reserved_cancelled`, `reserved_expired`) — `issued − used − cancelled −
+expired` is the reserved-but-unused signal for ticket hoarding.
+
 ## Stream Error Handling (recovery-first + informative-error fallback)
 
 When a routed stream fails, the proxy follows a **recovery-first** strategy

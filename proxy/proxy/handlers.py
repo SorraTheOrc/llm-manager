@@ -833,7 +833,108 @@ async def get_llama_local_status(request: Request):
         "local_prefills_in_flight": prefill_in_flight,
         "local_max_concurrent_prefills": prefill_cap,
         "prefill_gate_waiters": prefill_gate_waiters,
+        # Local-admission reservations (LP-0MVIKPCSG002B0NL): outstanding /
+        # issued / used / cancelled / expired tickets. ``reserved_issued -
+        # reserved_used - reserved_cancelled - reserved_expired`` is the
+        # reserved-but-unused signal the work item asks to monitor.
+        **(admission_reserve_stats()),
     }
+
+
+# ---------------------------------------------------------------------------
+# /llama/local/reserve — atomic local-admission reservations
+# (LP-0MVIKPCSG002B0NL)
+# ---------------------------------------------------------------------------
+
+def admission_reserve_stats() -> dict:
+    """Reservation counters for the status payload (fail-open)."""
+    try:
+        from proxy.admission_reserve import stats
+
+        return stats()
+    except Exception:
+        return {}
+
+
+@router.post("/llama/local/reserve")
+async def reserve_local_slot(request: Request):
+    """Claim a local-admission ticket for a specific request, atomically.
+
+    The client sends the prompt size it is about to send and receives either a
+    ticket (``200 {"admit": true, "reservation_id", ...}``) that a follow-up
+    request honours via ``X-Local-Reservation: <id>``, or an immediate refusal
+    (``429 {"admit": false, "reason", "queue_eta_s", "budget_s",
+    "retry_after_s"}``) telling it to defer. The verdict shares the occupancy-
+    aware estimator the admission guard uses, so the two are identical for
+    identical inputs (AC7).
+
+    ``dry_run=true`` returns the verdict without claiming a ticket (this is
+    also the ``local-only`` preamble). Tickets are TTL-bound, single-use and
+    cancellable via ``DELETE /llama/local/reserve/<id>``.
+    """
+    from proxy import admission_reserve
+    from proxy import provider as provider_mod
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    srv = _srv()
+    config = getattr(srv, "config", {})
+    if not isinstance(config, dict):
+        config = {}
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+
+    # The current local model (the same one the admission guard would cost)
+    # and the occupancy probe the guard uses. Sharing the probe is what keeps
+    # ``/reserve`` and the in-flight guard identical (AC7).
+    cm = getattr(srv, "current_model", None) or server_cfg.get("llama_model")
+    current_concurrency = (0, 1)
+    busy_slots = 0
+    in_flight_prefills = 0
+    try:
+        current_concurrency = provider_mod._local_concurrency_info(
+            config, endpoint=None
+        )
+        busy_slots, in_flight_prefills = provider_mod._local_gate_occupancy(
+            config, current_concurrency[1] or 1, endpoint=None
+        )
+    except Exception:
+        busy_slots, in_flight_prefills = 0, 0
+
+    status, payload = admission_reserve.reserve(
+        body,
+        config,
+        model=cm,
+        busy_slots=busy_slots,
+        in_flight_prefills=in_flight_prefills,
+    )
+    headers: dict[str, str] = {
+        "Cache-Control": "no-store",
+    }
+    if status == 429:
+        headers.update(
+            admission_reserve.headers_for_route(
+                "refused", payload.get("reason")
+            )
+        )
+        headers["Retry-After"] = str(payload.get("retry_after_s", 1))
+        headers["X-Local-Admission"] = "reject"
+        headers["X-Local-Admission-Eta"] = str(payload.get("queue_eta_s", 0))
+        headers["X-Local-Admission-Budget"] = str(payload.get("budget_s", 0))
+    return JSONResponse(status_code=status, content=payload, headers=headers)
+
+
+@router.delete("/llama/local/reserve/{reservation_id}")
+async def cancel_reservation(reservation_id: str):
+    """Cancel an outstanding reservation, releasing its gate claim."""
+    from proxy import admission_reserve
+
+    status, payload = admission_reserve.cancel(reservation_id)
+    return JSONResponse(status_code=status, content=payload)
 
 
 # ---------------------------------------------------------------------------
