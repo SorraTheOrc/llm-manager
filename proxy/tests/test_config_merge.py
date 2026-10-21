@@ -6,6 +6,14 @@ the single authoritative config and ``load_config()`` no longer consults a
 persisted mode or the ``LLAMA_PROXY_CONFIG`` overlay selection. This suite
 pins the deep-merge primitive (still used for custom overlays) and the
 simplified load path.
+
+The golden merged-config fixtures (``merged_config_fast.json``,
+``merged_config_cheap.json``, ``prededup_raw_*.json``) were deleted with the
+golden suite: they copied the whole shipped config, so retuning a single value
+(``sibling_fallback_cooldown_seconds`` 600 -> 300, commit 4e926e7c) desynced
+them and failed 12 golden tests (LP-0MUYQ6CYZ0083X38). Shipped tuning is now
+pinned as an invariant (``TestShippedSiblingFallbackTuning``), not as a frozen
+copy of ``config.yaml``, so future retuning cannot resurface that drift.
 """
 
 import json
@@ -211,3 +219,43 @@ class TestMergedConfigSha256:
 
         base = str(proxy_dir() / "config.yaml")
         assert merged_config_sha256(base, base) == merged_config_sha256(base, base)
+
+
+# ---------------------------------------------------------------------------
+# Shipped sibling-fallback tuning invariants (LP-0MUYQ6CYZ0083X38)
+# ---------------------------------------------------------------------------
+
+
+class TestShippedSiblingFallbackTuning:
+    """Pin the shipped ``sibling_fallback_*`` tuning as invariants.
+
+    The deleted golden fixtures froze a full copy of ``config.yaml``, so a
+    retune of ``sibling_fallback_cooldown_seconds`` (600 -> 300, commit
+    4e926e7c) failed 12 golden tests even though the shipped behaviour was
+    correct. These asserts instead verify the documented contract from
+    ``config.yaml``: the extended quarantine outlives the Tier-2
+    ``provider_cooldown_seconds``, and the runtime helper honours the shipped
+    value through the nested ``server`` key.
+    """
+
+    def test_cooldown_exceeds_provider_cooldown(self):
+        from proxy.utils import load_config
+
+        server = load_config()["server"]
+        cooldown = server["sibling_fallback_cooldown_seconds"]
+        provider_cooldown = server.get("provider_cooldown_seconds", 60)
+
+        assert cooldown > provider_cooldown, (
+            "sibling_fallback_cooldown_seconds must outlive the Tier-2 "
+            "provider_cooldown_seconds so a quarantined gateway stays "
+            "skipped across cross-request retry cycles (config.yaml docs)"
+        )
+
+    def test_shipped_value_is_respected_by_runtime_helper(self):
+        from proxy.provider import _get_sibling_fallback_cooldown_seconds
+        from proxy.utils import load_config
+
+        cfg = load_config()
+        shipped = cfg["server"]["sibling_fallback_cooldown_seconds"]
+
+        assert _get_sibling_fallback_cooldown_seconds(cfg) == float(shipped)
