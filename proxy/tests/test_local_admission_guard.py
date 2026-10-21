@@ -247,9 +247,14 @@ async def test_eta_within_budget_still_queues_and_dispatches_local(
 
 @pytest.mark.asyncio
 async def test_warm_cache_prompt_is_admitted_and_queued(mixed_model_config, caplog):
-    """AC5 through the full path: 90 %-cached 100k prompt queues as today."""
+    """AC5 (LP-0MVGDUV5E005UWBQ) under occupancy: a cache-warm prompt stays
+    queueable even when the prefill gate is fully occupied (own ETA ~34 s,
+    projected wait ~68 s — inside the 120 s budget). The original fixture
+    (100k tokens, fully occupied gate) crosses the 120 s budget once the
+    occupancy term is counted (LP-0MVICD2YW004DJPV) — that refusal is the
+    point of the change."""
     caplog.set_level(logging.INFO, logger="llama-proxy")
-    _seed_calibration(tokens=100_000, ms_per_token=3.9)
+    _seed_calibration(tokens=40_000, ms_per_token=3.9)
     concurrency = _MutableConcurrency(1, 1)
     calls: list[str] = []
 
@@ -268,7 +273,7 @@ async def test_warm_cache_prompt_is_admitted_and_queued(mixed_model_config, capl
         patch("proxy.server.proxy_to_remote", _remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
         patch("proxy.provider.request_priority", return_value="low"),
-        _guard_patches(tokens=100_000, cached_ratio=0.9),
+        _guard_patches(tokens=40_000, cached_ratio=0.9),
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
@@ -281,7 +286,7 @@ async def test_warm_cache_prompt_is_admitted_and_queued(mixed_model_config, capl
                 break
             await asyncio.sleep(0.005)
         assert contention_queue.queue_depth() == 1, (
-            "a 90%-cached prompt must stay admissible"
+            "a cache-warm prompt must stay admissible under occupancy"
         )
 
         concurrency.active = 0

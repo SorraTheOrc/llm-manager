@@ -1659,7 +1659,26 @@ server:
   # receives a retryable 429 with ``Retry-After`` and ``X-Local-Admission*``
   # headers.
   #
-  #   reject  — refuse admission when the ETA exceeds the budget (default)
+  # The comparison is OCCUPANCY-AWARE (LP-0MVICD2YW004DJPV): the quantity
+  # tested against the budget is
+  # ``projected_wait = eta_prefill * (busy_slots + 1)`` — the own prefill
+  # repeated for the occupied gate ahead of it (``busy_slots`` = the larger of
+  # the generating concurrency and ``prefills in flight``, capped at the slot
+  # pool). With prefills serialised (``local_max_concurrent_prefills: 1``)
+  # the in-flight prefill is always ahead of a newcomer, and ignoring it
+  # admitted waits that ``/llama/local/status``'s own ``queue_eta_seconds``
+  # had already flagged as unservable (2026-10-21 window: 261 of 302 queued
+  # waits fell back after queueing, 215 at the full budget). The same function
+  # computes ``queue_eta_seconds`` on /llama/local/status, so the published
+  # estimate and the enforced verdict cannot drift. An in-flight prefill with
+  # unobservable progress is charged the calibrated estimate (never "free
+  # soon").
+  #
+  # Fail-open: the change can only refuse further DOOMED admissions, never
+  # admit more than before, and an uncalibrated bucket still admits.
+  #
+  #   reject  — refuse admission when the projected wait exceeds the budget
+  #             (default)
   #   observe — log the decision (``local_admission_guard decision=…``) but
   #             never refuse; use to validate calibration on live traffic
   #   off     — do not evaluate the guard at all
@@ -1667,7 +1686,9 @@ server:
   # The guard is INERT (today's queueing behaviour, byte-for-byte) until a
   # (model, context bucket) window holds ``local_admission_guard_min_samples``
   # observations, so it can never refuse on a guess. Decisions and their
-  # ETAs are counted by the proxy-usage-analysis report.
+  # ETAs are counted by the proxy-usage-analysis report; each logged decision
+  # carries ``eta_prefill_s``, ``eta_occupancy_s``, ``projected_wait_s``,
+  # ``budget_s``, ``busy_slots`` and ``in_flight_prefills``.
   local_admission_guard_policy: reject
   local_admission_guard_min_samples: 5
   local_admission_guard_window_samples: 200

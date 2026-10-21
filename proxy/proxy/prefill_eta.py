@@ -28,6 +28,32 @@ stays admissible — its expensive ``new_tokens`` term is small — while a larg
 cache-cold prompt is refused *immediately* instead of parking for the full
 queue budget.
 
+Occupancy (LP-0MVICD2YW004DJPV)
+-------------------------------
+
+The own-prefill term alone is not the wait a newcomer faces. With prefills
+serialised (``local_max_concurrent_prefills: 1``) an in-flight prefill
+occupies the gate first, so the true wait is its own prefill **plus** the
+remaining service of the gate ahead of it::
+
+    projected_wait = eta_prefill * (busy_slots + 1)
+
+``projected_wait_seconds`` is the single source of truth for that number: the
+admission guard compares it against the budget, and ``status_estimate``
+publishes it as ``queue_eta_seconds``, so the verdict a dispatcher paces
+against can never drift from the verdict the guard enforces. Measuring the
+own term alone admitted waits that the proxy's own published
+``queue_eta_seconds`` already flagged as unservable (2026-10-21 window:
+302 queued waits -> 261 fell back after queueing, 215 at the full 120 s
+budget, 25,804 s of aggregate wasted wait).
+
+The occupancy term is also the floor used when per-slot prefill progress is
+unobservable (``prefill_progress_unobservable``, ``alive=False``): an
+in-flight prefill is treated as occupying the gate for at least the
+calibrated estimate, never as "free soon". The change is fail-open by
+construction — it can only refuse admits that were already guaranteed to
+lose, never admit more than before.
+
 Calibration is data-driven: every local dispatch records a sample
 ``(coded_tokens, new_tokens, dispatch_to_first_byte_ms)`` from the existing
 ``dispatch_first_byte_ms`` log line (service time, i.e. excluding the queue
@@ -408,6 +434,64 @@ def estimate_prefill_seconds(
 
 
 # ---------------------------------------------------------------------------
+# Occupancy-aware projected wait (LP-0MVICD2YW004DJPV)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ProjectedWait:
+    """The settlement of one newcomer's wait against the occupied gate.
+
+    ``own_prefill_seconds`` is the newcomer's own calibrated prefill;
+    ``occupancy_seconds`` is the service the already-occupied prefill gate
+    owes before the newcomer can start; ``projected_seconds`` is their sum —
+    the quantity ``/llama/local/status`` publishes as ``queue_eta_seconds``
+    (``eta * (busy_slots + 1)``) and the *only* number the admission guard may
+    compare against a wait budget (LP-0MVICD2YW004DJPV).
+    """
+
+    own_prefill_seconds: float
+    occupancy_seconds: float
+    projected_seconds: float
+    busy_slots: int
+    coefficients: Coefficients
+
+
+def projected_wait_seconds(
+    model: str | None,
+    prompt_tokens: int,
+    cached_ratio: float = 0.0,
+    busy_slots: int = 0,
+    config: dict | None = None,
+) -> ProjectedWait:
+    """Projected pre-gate wait for a newcomer behind *busy_slots* occupants.
+
+    Single source of truth for the occupancy-aware wait: the admission guard
+    (this module) and the published ``queue_eta_seconds`` (``status_estimate``)
+    both call it, so the verdict a client is paced against can never drift
+    from the verdict the guard enforces (LP-0MVICD2YW004DJPV AC2).
+
+    The occupancy term is the calibrated prefill repeated once per occupied
+    gate slot. That is also the *floor* used when per-slot prefill progress is
+    unobservable (``prefill_progress_unobservable``, ``alive=False``): an
+    in-flight prefill must be treated as occupying the gate for at least the
+    calibrated estimate, never as "free soon" (AC4).
+    """
+    eta, coeffs = estimate_prefill_seconds(model, prompt_tokens, cached_ratio, config)
+    try:
+        busy = max(0, int(busy_slots or 0))
+    except (TypeError, ValueError):
+        busy = 0
+    occupancy = eta * busy
+    return ProjectedWait(
+        own_prefill_seconds=eta,
+        occupancy_seconds=occupancy,
+        projected_seconds=eta + occupancy,
+        busy_slots=busy,
+        coefficients=coeffs,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Admission decision
 # ---------------------------------------------------------------------------
 
@@ -422,6 +506,12 @@ class AdmissionDecision:
     policy: str
     calibrated: bool
     samples: int
+    #: Occupancy-aware projection (LP-0MVICD2YW004DJPV). ``None`` on an inert
+    #: decision that never costed the prompt (``policy_off`` / ``no_budget``).
+    projected_wait_seconds: float | None = None
+    eta_occupancy_seconds: float | None = None
+    busy_slots: int = 0
+    in_flight_prefills: int = 0
 
     @property
     def active(self) -> bool:
@@ -460,19 +550,44 @@ def evaluate_admission(
     prompt_tokens: int,
     cached_ratio: float,
     priority: str | None = None,
+    *,
+    busy_slots: int = 0,
+    in_flight_prefills: int = 0,
 ) -> AdmissionDecision:
     """Decide whether a local dispatch can finish inside the wait budget.
 
+    The comparison is occupancy-aware (LP-0MVICD2YW004DJPV): the *projected
+    wait* (own prefill plus the remaining service of the occupied prefill
+    gate, :func:`projected_wait_seconds`) is compared against the budget, not
+    the own-prefill term alone. Comparing the own term alone admitted waits
+    that the proxy's own published ``queue_eta_seconds`` already flagged as
+    unservable (measured 86 % of queued waits fell back after up to 120 s).
+
+    *busy_slots* is the number of occupied gate slots ahead of this request
+    (``max(generating concurrency, prefills in flight)``); *in_flight_prefills*
+    is carried for the decision log so an unobservable-progress gate is
+    diagnosable (AC4/AC6).
+
     Fail-open by construction: the guard is inert (``admit=True``) when the
     policy is ``off``, the priority never queues, the bucket is not yet
-    calibrated, or no budget can be resolved. Only a calibrated ETA that
-    exceeds the budget refuses admission, and only when the policy is
+    calibrated, or no budget can be resolved. Only a calibrated projected wait
+    that exceeds the budget refuses admission, and only when the policy is
     ``reject`` (``observe`` logs the same verdict without refusing).
     """
     guard_cfg = resolve_config(config)
 
+    try:
+        occupancy = max(0, int(busy_slots or 0))
+    except (TypeError, ValueError):
+        occupancy = 0
+    try:
+        in_flight = max(0, int(in_flight_prefills or 0))
+    except (TypeError, ValueError):
+        in_flight = 0
+
     def _inert(reason: str, eta: float | None = None, budget: float | None = None,
-               coeffs: Coefficients | None = None) -> AdmissionDecision:
+               coeffs: Coefficients | None = None,
+               projected: ProjectedWait | None = None) -> AdmissionDecision:
         return AdmissionDecision(
             admit=True,
             reason=reason,
@@ -481,6 +596,14 @@ def evaluate_admission(
             policy=guard_cfg.policy,
             calibrated=bool(coeffs.calibrated) if coeffs else False,
             samples=coeffs.samples if coeffs else 0,
+            projected_wait_seconds=(
+                projected.projected_seconds if projected else None
+            ),
+            eta_occupancy_seconds=(
+                projected.occupancy_seconds if projected else None
+            ),
+            busy_slots=projected.busy_slots if projected else occupancy,
+            in_flight_prefills=in_flight,
         )
 
     if guard_cfg.policy == POLICY_OFF:
@@ -488,10 +611,14 @@ def evaluate_admission(
     budget = wait_budget_seconds(config, priority)
     if budget <= 0:
         return _inert("no_budget")
-    eta, coeffs = estimate_prefill_seconds(model, prompt_tokens, cached_ratio, config)
+    projected = projected_wait_seconds(
+        model, prompt_tokens, cached_ratio, occupancy, config
+    )
+    coeffs = projected.coefficients
+    eta = projected.own_prefill_seconds
     if not coeffs.calibrated:
-        return _inert("insufficient_samples", eta, budget, coeffs)
-    within = eta <= budget
+        return _inert("insufficient_samples", eta, budget, coeffs, projected)
+    within = projected.projected_seconds <= budget
     reason = "within_budget" if within else "eta_exceeds_budget"
     admit = within or guard_cfg.policy == POLICY_OBSERVE
     return AdmissionDecision(
@@ -502,6 +629,10 @@ def evaluate_admission(
         policy=guard_cfg.policy,
         calibrated=True,
         samples=coeffs.samples,
+        projected_wait_seconds=projected.projected_seconds,
+        eta_occupancy_seconds=projected.occupancy_seconds,
+        busy_slots=projected.busy_slots,
+        in_flight_prefills=in_flight,
     )
 
 
@@ -564,13 +695,15 @@ def status_estimate(
     ``prefill_eta_seconds`` is the cost of prefilling the reference prompt
     (assumed cache-cold — the conservative case). ``queue_eta_seconds`` is
     what a *newcomer* would wait before its first byte: the reference prefill
-    repeated for every currently occupied slot, plus its own prefill.
+    repeated for every currently occupied slot, plus its own prefill. It is
+    computed by the same :func:`projected_wait_seconds` the admission guard
+    uses, so the published number and the enforced verdict cannot drift apart
+    (LP-0MVICD2YW004DJPV AC2).
 
     Fail-open: any error yields ``None`` fields rather than a broken payload.
     """
     try:
         tokens = reference_tokens(model, config)
-        eta, coeffs = estimate_prefill_seconds(model, tokens, 0.0, config)
         try:
             total = int(total_slots or 0)
             available = int(available_slots or 0)
@@ -581,6 +714,9 @@ def status_estimate(
             busy = max(0, total - available)
         else:
             busy = max(0, active)
+        queue_eta = projected_wait_seconds(model, tokens, 0.0, busy, config)
+        eta = queue_eta.own_prefill_seconds
+        coeffs = queue_eta.coefficients
         # The admission guard's own budget (the contention-queue max wait, 0
         # for high-priority that never queues): the same number a dispatcher
         # must pace a session against (LP-0MVGDUVGE0024YAI AC3). ``None``
@@ -592,7 +728,9 @@ def status_estimate(
         budget_published = round(float(budget), 1) if float(budget) > 0 else None
         return {
             "prefill_eta_seconds": round(eta, 1),
-            "queue_eta_seconds": round(eta * (busy + 1), 1),
+            "queue_eta_seconds": round(queue_eta.projected_seconds, 1),
+            "queue_eta_occupancy_seconds": round(queue_eta.occupancy_seconds, 1),
+            "queue_eta_busy_slots": queue_eta.busy_slots,
             "prefill_eta_reference_tokens": tokens,
             "prefill_eta_samples": coeffs.samples,
             "prefill_eta_calibrated": coeffs.calibrated,
@@ -603,6 +741,8 @@ def status_estimate(
         return {
             "prefill_eta_seconds": None,
             "queue_eta_seconds": None,
+            "queue_eta_occupancy_seconds": None,
+            "queue_eta_busy_slots": None,
             "prefill_eta_reference_tokens": None,
             "prefill_eta_samples": 0,
             "prefill_eta_calibrated": False,
@@ -648,6 +788,12 @@ def record_guard_decision(
     logging every inert request would flood the log). The line is parsed by
     the proxy-usage-analysis skill, which counts admits and refusals
     (AC2).
+
+    The occupancy evidence is part of the line (LP-0MVICD2YW004DJPV AC6): own
+    ETA, occupancy term, projected wait, budget, busy slots and in-flight
+    prefills, then the verdict — so a refusal (or a surprising admit) is
+    diagnosable from the log alone. ``eta_prefill_s`` keeps its historical
+    meaning (the own-prefill term) so existing parsers keep working.
     """
     if not decision.active or decision.eta_prefill_seconds is None:
         return
@@ -656,15 +802,25 @@ def record_guard_decision(
     # rollout, so the usage report can count would-be refusals during a
     # validation window.
     verdict = "reject" if decision.reason == "eta_exceeds_budget" else "admit"
+    projected = (
+        decision.projected_wait_seconds
+        if decision.projected_wait_seconds is not None
+        else decision.eta_prefill_seconds
+    )
     logger.info(
         "local_admission_guard decision=%s reason=%s enforced=%s "
-        "eta_prefill_s=%.1f budget_s=%.1f priority=%s policy=%s model=%s "
-        "samples=%d provider=%s session=%s",
+        "eta_prefill_s=%.1f eta_occupancy_s=%.1f projected_wait_s=%.1f "
+        "budget_s=%.1f busy_slots=%d in_flight_prefills=%d "
+        "priority=%s policy=%s model=%s samples=%d provider=%s session=%s",
         verdict,
         decision.reason,
         "false" if decision.admit else "true",
         float(decision.eta_prefill_seconds),
+        float(decision.eta_occupancy_seconds or 0.0),
+        float(projected),
         float(decision.budget_seconds or 0.0),
+        int(decision.busy_slots or 0),
+        int(decision.in_flight_prefills or 0),
         priority or "unknown",
         decision.policy,
         model or "unknown",

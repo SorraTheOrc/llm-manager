@@ -706,16 +706,39 @@ is genuinely cache-warm.
 
 Before a request enters the contention queue (and before a dispatch that
 would start another concurrent prefill), the proxy therefore costs the
-projected prefill and compares it with the caller's wait budget:
+projected prefill and compares the **occupancy-aware projected wait** with the
+caller's wait budget:
 
 ```
 eta_prefill = coded_tokens * coded_ms_per_token + new_tokens * prefill_ms_per_token
   coded_tokens = est_tokens * cached_ratio          # served from the prompt cache
   new_tokens   = est_tokens * (1 - cached_ratio)    # must actually be prefilled
 
-admit  if eta_prefill <= wait_budget
+projected_wait = eta_prefill * (busy_slots + 1)
+  busy_slots = min(slot_pool, max(generating_concurrency, prefills_in_flight))
+
+admit  if projected_wait <= wait_budget
 else   refuse local admission immediately -> next provider in the chain
 ```
+
+The occupancy term matters because prefills are serialised
+(`local_max_concurrent_prefills: 1`): the in-flight prefill holds the gate
+first, so a newcomer's real wait is its own prefill **plus** the service the
+gate already owes. Comparing the own-prefill term alone admitted waits the
+proxy's own `/llama/local/status` payload had already flagged as unservable —
+the 2026-10-21 14:56→16:49 window produced 302 queued waits, 261 of which fell
+back after queueing, 215 of them at the full 120 s budget (25,804 s of
+aggregate wasted wait), with 247 of the 325 full-budget losses entering the
+queue `saturation=prefill`. The occupancy floor is also what the guard uses
+when per-slot prefill progress is unobservable
+(`prefill_progress_unobservable`, `alive=False`, `in_flight=True`): an
+in-flight prefill is treated as occupying the gate for at least the calibrated
+estimate, never as "free soon".
+
+`projected_wait` is computed by a single function
+(`prefill_eta.projected_wait_seconds`) that also produces the published
+`queue_eta_seconds`, so the number a dispatcher paces against and the verdict
+the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
 
 - **Data-driven coefficients** (`proxy/proxy/prefill_eta.py`): every local
   dispatch records `(coded_tokens, new_tokens, dispatch_to_first_byte_ms)` —
@@ -732,9 +755,11 @@ else   refuse local admission immediately -> next provider in the chain
   inert — today's queueing behaviour is byte-for-byte unchanged. It can never
   refuse on a guess.
 - **Cache-warm stays local**: a 90 %-cached 100k prompt costs
-  `0.9*100k*0.5 ms + 0.1*100k*3.9 ms ≈ 84 s` and is admitted, while the same
-  prompt cache-cold costs ≈ 390 s and is refused. Locality is kept where it
-  actually pays.
+  `0.9*100k*0.5 ms + 0.1*100k*3.9 ms ≈ 84 s` of its own prefill and is
+  admitted behind a *free* gate, while the same prompt cache-cold costs
+  ≈ 390 s and is refused. Behind an occupied gate the occupancy term applies
+  to both, so a wait only stays admissible when the whole projected wait fits
+  the budget. Locality is kept where it actually pays.
 - **Priority semantics are unchanged**: `high` never queues, so it has no
   wait budget and the guard never applies to it; `low`/`medium` use
   `contention_queue_max_wait_seconds`.
@@ -746,18 +771,24 @@ else   refuse local admission immediately -> next provider in the chain
   machine-readable `code: local_admission_reject`.
 - **Observability**: each decision logs
   `local_admission_guard decision=admit|reject reason=… enforced=true|false
-  eta_prefill_s=… budget_s=…`. The 24h report counts them as
+  eta_prefill_s=… eta_occupancy_s=… projected_wait_s=… budget_s=…
+  busy_slots=… in_flight_prefills=…`, i.e. the own prefill, the occupancy
+  contribution, the projected wait actually compared against the budget and
+  the occupancy evidence behind it — a refusal (or a surprising admit) is
+  diagnosable from the log line alone. The 24h report counts them as
   `local_admission_reject` / `local_admission_reject_enforced` /
   `local_admission_admit`. `/llama/local/status` publishes
   `prefill_eta_seconds` (cost of the reference prompt, cache-cold) and
-  `queue_eta_seconds` (that cost repeated for every occupied slot, plus the
-  newcomer's own) so a dispatcher can pace *before* launching a session.
+  `queue_eta_seconds` (that same cost repeated for every occupied slot, plus
+  the newcomer's own — the guard's `projected_wait`), with
+  `queue_eta_occupancy_seconds` / `queue_eta_busy_slots` breaking out the
+  occupancy term, so a dispatcher can pace *before* launching a session.
 
 Rollout control (`server.local_admission_guard_policy`):
 
 | Value | Behaviour |
 |-------|-----------|
-| `reject` (default) | Refuse admission when the ETA exceeds the budget |
+| `reject` (default) | Refuse admission when the projected wait exceeds the budget |
 | `observe` | Log the verdict (`enforced=false`) but keep queuing — use to validate calibration on live traffic |
 | `off` | Do not evaluate the guard at all |
 

@@ -5356,6 +5356,50 @@ async def _queue_context_bypass(
     return _skip_local, _skip_reason
 
 
+def _local_gate_occupancy(
+    config: dict, max_local: int, endpoint: str | None = None
+) -> tuple[int, int]:
+    """Return ``(busy_slots, in_flight_prefills)`` for this request's gate.
+
+    LP-0MVICD2YW004DJPV: the admission guard must compare the wait *including
+the occupied gate ahead of it* against the budget, so it needs the number of
+    occupants — not just the newcomer's own prefill. Two occupancy sources are
+    combined, taking the larger (a conservative over-estimate is the safe
+    direction, and both can be true at once):
+
+    - the generating concurrency from ``_local_concurrency_info`` (slots that
+      will hold the gate while they decode), and
+    - the prefill-in-flight count (``_get_prefill_in_flight_count``), which is
+      the signal that remains when per-slot prefill progress is unobservable
+      (``prefill_progress_unobservable``, ``alive=False``). An in-flight
+      prefill must never be read as "free soon".
+
+    Never raises: a routing decision must not break on an observability gap.
+    """
+    in_flight = 0
+    try:
+        import proxy.server as _srv
+        from proxy.router_helpers import _get_prefill_in_flight_count
+
+        in_flight = max(0, int(_get_prefill_in_flight_count(_srv) or 0))
+    except Exception:
+        in_flight = 0
+    cur_local = 0
+    try:
+        cur_local, _ = _local_concurrency_info(config, endpoint=endpoint)
+        cur_local = max(0, int(cur_local or 0))
+    except Exception:
+        cur_local = 0
+    try:
+        pool = max(1, int(max_local or 1))
+    except (TypeError, ValueError):
+        pool = 1
+    # Never claim more occupants than the gate can physically hold: a stale
+    # counter must not multiply the occupancy term without bound.
+    busy = min(pool, max(cur_local, in_flight))
+    return busy, in_flight
+
+
 async def _prefill_admission_guard(
     config: dict,
     provider_cfg: dict,
@@ -5363,6 +5407,8 @@ async def _prefill_admission_guard(
     session_id: str | None,
     priority: str | None = None,
     messages: list | None = None,
+    max_local: int = 1,
+    endpoint: str | None = None,
 ):
     """Evaluate (and log) the prefill-ETA admission guard.
 
@@ -5373,6 +5419,11 @@ async def _prefill_admission_guard(
     break local routing.  *messages* (the request message list) lets the guard
     cost the *expected* reusable prefix (LP-0MVI2XOTY008Q4UV) rather than the
     raw measured ratio.
+
+    The verdict is occupancy-aware (LP-0MVICD2YW004DJPV): *max_local* and
+    *endpoint* let it read the occupied gate ahead of this request, so the
+    projected wait it compares against the budget includes the in-flight
+    prefill rather than the own-prefill term alone.
     """
     try:
         from proxy import prefill_eta
@@ -5399,12 +5450,21 @@ async def _prefill_admission_guard(
             messages,
             server_config=server_cfg,
         )
+        # Occupancy-aware verdict (LP-0MVICD2YW004DJPV): the wait a newcomer
+        # actually faces is its own prefill *plus* the occupied gate ahead of
+        # it, so the guard needs the occupants before it can compare against
+        # the budget.
+        occupancy, in_flight_prefills = _local_gate_occupancy(
+            config, max_local, endpoint=endpoint
+        )
         decision = prefill_eta.evaluate_admission(
             config,
             model_name,
             estimated_tokens,
             ratio,
             priority,
+            busy_slots=occupancy,
+            in_flight_prefills=in_flight_prefills,
         )
         if not decision.active:
             return None
@@ -5514,6 +5574,8 @@ async def _maybe_queue_for_local_slot(
         session_id,
         priority=priority,
         messages=body_json.get("messages") if isinstance(body_json, dict) else None,
+        max_local=max_local,
+        endpoint=endpoint,
     )
     if _admission is not None and not _admission.admit:
         try:
