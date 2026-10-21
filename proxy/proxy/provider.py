@@ -617,6 +617,126 @@ def _get_cached_ratio_source(model_name: str, session_id: str | None) -> str | N
     return _cached_ratio_source.get((model_name, session_id))
 
 
+# ---------------------------------------------------------------------------
+# Expected-reuse credit from the previous prompt (LP-0MVI2XOTY008Q4UV)
+# ---------------------------------------------------------------------------
+#
+# The measured ratio above describes the *previous* prompt's hit fraction:
+# a session's first local turn is genuinely cold (nothing cached), so it
+# records ``cached_ratio=0.0`` and every later request inherits that zero
+# until a later response happens to report a hit.  Turn 2 of a growing
+# session was therefore always costed as fully cache-cold even though turn
+# 1's tokens are resident in the KV slot.
+#
+# The prefix record closes that gap: after each successful local dispatch
+# (measured prompt_tokens from usage), we store the prompt size together
+# with a fingerprint of the message list.  At routing time, if the recorded
+# message list is a strict prefix of the incoming one (proven by
+# ``slot_cache_ratio.prefix_matches`` — the same check the persisted
+# snapshot sidecar uses), the expected reusable prefix is the recorded
+# prompt size, safety-margined so we never over-credit a restored prefix
+# that llama.cpp may have had to erase (hybrid-arch checkpoint invalidation).
+# The measured ratio remains a floor: a warm measured ratio always wins.
+
+#: Per-(model, session) recorded prompt prefix: (prompt_tokens, fingerprints).
+#: Only written when a local response reported real usage prompt_tokens, so
+#: today's behaviour is unchanged when no usage data is present.
+_last_prompt_prefix: dict[tuple[str, str], tuple[int, list[str]]] = {}
+
+#: Fraction of the recorded prompt credited at routing time (matches the
+#: sidecar's safety margin; llama.cpp may invalidate its own checkpoints).
+_DEFAULT_PREFIX_CREDIT_MARGIN = 0.9
+
+
+def record_prompt_prefix(
+    model_name: str,
+    session_id: str | None,
+    prompt_tokens: int,
+    messages: list | None,
+) -> None:
+    """Record the prompt size and message fingerprints of one local dispatch.
+
+    Called from the local streaming loop alongside ``update_cached_ratio``
+    (usage path).  *prompt_tokens* is the measured prompt size of the request
+    the KV slot now holds, so a later request whose message list extends this
+    one can be credited for them.  Never raises: a metric path must not break
+    a stream.  Also re-caps the dict like ``set_cached_ratio``.
+    """
+    if not model_name or not session_id:
+        return
+    try:
+        tokens = int(prompt_tokens or 0)
+        if tokens <= 0:
+            return
+        from proxy.slot_cache_ratio import message_fingerprints
+
+        fingerprints = message_fingerprints(messages)
+        if not fingerprints:
+            return
+    except Exception:
+        logger.debug("record_prompt_prefix failed", exc_info=True)
+        return
+    key = (model_name, session_id)
+    if key not in _last_prompt_prefix and len(_last_prompt_prefix) >= _MAX_CACHED_RATIO_ENTRIES:
+        try:
+            oldest = next(iter(_last_prompt_prefix))
+            _last_prompt_prefix.pop(oldest, None)
+        except (StopIteration, KeyError):
+            pass
+    _last_prompt_prefix[key] = (tokens, fingerprints)
+
+
+def expected_cached_ratio(
+    model_name: str | None,
+    session_id: str | None,
+    estimated_tokens: int,
+    messages: list | None,
+    server_config: dict | None = None,
+) -> float:
+    """Routing ratio for *estimated_tokens* of the current prompt.
+
+    Returns the measured ratio plus any prefix credit from the previous
+    local dispatch:
+
+    - no recorded prefix, no prefix match, or no estimate → measured ratio
+      (today's behaviour — cold 0.0 for a fresh session);
+    - a matching recorded prefix → ``max(measured, min(1.0, margin *
+      prev_prompt / estimate))`` so the credit is proportionate to the
+      incoming prompt and never over-credits.
+    """
+    measured = _get_cached_ratio(model_name, session_id)
+    if not model_name or not session_id:
+        return measured
+    try:
+        estimate = max(0, int(estimated_tokens or 0))
+        if estimate <= 0:
+            return measured
+    except (TypeError, ValueError):
+        return measured
+    record = _last_prompt_prefix.get((model_name, session_id))
+    if record is None:
+        return measured
+    prev_tokens, fingerprints = record
+    try:
+        margin = float(
+            (server_config or {}).get("cached_prefix_credit_margin", _DEFAULT_PREFIX_CREDIT_MARGIN)
+        )
+        if not 0.0 <= margin <= 1.0:
+            margin = _DEFAULT_PREFIX_CREDIT_MARGIN
+    except (TypeError, ValueError):
+        margin = _DEFAULT_PREFIX_CREDIT_MARGIN
+    try:
+        from proxy.slot_cache_ratio import message_fingerprints, prefix_matches
+
+        if not prefix_matches(fingerprints, message_fingerprints(messages)):
+            return measured
+    except Exception:
+        logger.debug("prefix credit check failed", exc_info=True)
+        return measured
+    credit = min(1.0, margin * min(prev_tokens, estimate) / estimate)
+    return max(measured, credit)
+
+
 def clear_cached_ratio_for_session(session_id: str | None) -> None:
     """Forget every ratio (and its source) recorded for *session_id*.
 
@@ -631,6 +751,10 @@ def clear_cached_ratio_for_session(session_id: str | None) -> None:
         _cached_ratio_source.pop(key, None)
     for key in [k for k in _cached_ratio_source if k[1] == session_id]:
         _cached_ratio_source.pop(key, None)
+    # The recorded prompt prefix is equally invalid: the slot snapshot and
+    # sidecar are being discarded, so no credit may survive (LP-0MVI2XOTY008Q4UV).
+    for key in [k for k in _last_prompt_prefix if k[1] == session_id]:
+        _last_prompt_prefix.pop(key, None)
 
 
 def _extract_cached_tokens_from_usage(usage: dict | None) -> int:
@@ -2140,7 +2264,12 @@ def _should_skip_local(
         return (False, None)
 
     # Check 2: Dynamic new-token calculation
-    ratio = _get_cached_ratio(model_name, session_id)
+    ratio = expected_cached_ratio(
+        model_name,
+        session_id,
+        estimated_tokens,
+        (body_json or {}).get("messages") if isinstance(body_json, dict) else None,
+    )
     new_tokens = int(estimated_tokens * (1 - ratio))
     if new_tokens <= cold_cache_threshold:
         return (False, None)
@@ -5147,6 +5276,7 @@ async def _prefill_admission_guard(
     estimated_tokens: int,
     session_id: str | None,
     priority: str | None = None,
+    messages: list | None = None,
 ):
     """Evaluate (and log) the prefill-ETA admission guard.
 
@@ -5154,7 +5284,9 @@ async def _prefill_admission_guard(
     actually decided (a calibrated ETA against a real wait budget), else
     ``None`` — an inert guard leaves today's queueing behaviour untouched
     (LP-0MVGDUV5E005UWBQ AC1/AC3). Never raises: the guard must not be able to
-    break local routing.
+    break local routing.  *messages* (the request message list) lets the guard
+    cost the *expected* reusable prefix (LP-0MVI2XOTY008Q4UV) rather than the
+    raw measured ratio.
     """
     try:
         from proxy import prefill_eta
@@ -5173,11 +5305,19 @@ async def _prefill_admission_guard(
             if isinstance(provider_cfg, dict)
             else ""
         )
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        ratio = expected_cached_ratio(
+            model_name,
+            session_id,
+            estimated_tokens,
+            messages,
+            server_config=server_cfg,
+        )
         decision = prefill_eta.evaluate_admission(
             config,
             model_name,
             estimated_tokens,
-            _get_cached_ratio(model_name, session_id),
+            ratio,
             priority,
         )
         if not decision.active:
@@ -5282,7 +5422,12 @@ async def _maybe_queue_for_local_slot(
     # immediately and let the caller fall through instead. Inert (``None``)
     # when uncalibrated, so today's queueing behaviour is unchanged.
     _admission = await _prefill_admission_guard(
-        config, provider_cfg, _estimated_tokens, session_id, priority=priority,
+        config,
+        provider_cfg,
+        _estimated_tokens,
+        session_id,
+        priority=priority,
+        messages=body_json.get("messages") if isinstance(body_json, dict) else None,
     )
     if _admission is not None and not _admission.admit:
         try:
@@ -8529,8 +8674,19 @@ async def _proxy_with_fallback_cycle(
                     logger.debug(
                         "slot snapshot ratio seeding failed", exc_info=True
                     )
-                # Compute once for reuse in logs and reason detection
-                _routing_cached_ratio = _get_cached_ratio(_llama_model, _session_id)
+                # Compute once for reuse in logs and reason detection. The
+                # expected-reuse credit (LP-0MVI2XOTY008Q4UV) makes the first
+                # turn after a cold start non-zero when the prompt extends the
+                # previous local prompt.
+                _routing_cached_ratio = expected_cached_ratio(
+                    _llama_model,
+                    _session_id,
+                    _estimated_tokens,
+                    body_json.get("messages") if isinstance(body_json, dict) else None,
+                    server_config=(
+                        config.get("server", config) if isinstance(config, dict) else None
+                    ),
+                )
                 try:
                     from proxy.router_helpers import _classify_cache_state
 

@@ -513,6 +513,22 @@ async def _update_session_and_slot(
                         cached_tokens=_cached,
                         prompt_tokens=_prompt,
                     )
+                    # Record the prompt size + message fingerprints so the
+                    # *next* turn can earn expected-reuse credit even when
+                    # this turn measured 0 cached tokens (LP-0MVI2XOTY008Q4UV).
+                    try:
+                        from proxy.provider import record_prompt_prefix
+
+                        record_prompt_prefix(
+                            srv.current_model,
+                            session_id,
+                            _prompt,
+                            list(body_json.get("messages", []))
+                            if isinstance(body_json, dict)
+                            else None,
+                        )
+                    except Exception:
+                        pass
                     _real_usage_applied = True
                     _measured_prompt_tokens = _prompt
         except Exception:

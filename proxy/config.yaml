@@ -1604,6 +1604,26 @@ server:
   local_admission_guard_reference_tokens: 32000
 
   # -----------------------------------------------------------------------
+  # Expected-reuse prefix credit (LP-0MVI2XOTY008Q4UV)
+  # -----------------------------------------------------------------------
+  # The routing ``cached_ratio`` is measured on the PREVIOUS local response,
+  # so a session's genuinely cold first turn records 0.0 and the second turn
+  # used to inherit it — every turn of a growing session was costed as fully
+  # cache-cold. The proxy now also records each local prompt's measured size
+  # plus a fingerprint of its message list; when the incoming message list
+  # extends that recorded prefix (the same prefix-match rule the slot-snapshot
+  # sidecar uses), the expected reusable prefix is credited as
+  # ``cached_prefix_credit_margin × min(prev_prompt_tokens, estimate)``.
+  #
+  # The measured ratio remains a floor (a warm measured ratio always wins),
+  # a changed head or truncated history earns no credit, and a brand-new
+  # session still routes cold. The margin matches the snapshot sidecar's
+  # safety margin: llama.cpp may invalidate its own checkpoints on this hybrid
+  # architecture, so credit less than the full recorded prompt. Set to 0.0 to
+  # disable the credit and restore the previous behaviour exactly.
+  cached_prefix_credit_margin: 0.9
+
+  # -----------------------------------------------------------------------
   # Priority routing cheap window (LP-0MVDT94F0003VHUA AC1)
   # -----------------------------------------------------------------------
   # During this local-time window EVERY request is routed as ``low`` priority
