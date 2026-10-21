@@ -225,9 +225,13 @@ def _get_contention_queue_config(server_config: dict) -> dict:
             "contention_queue_max_depth=%r clamped to %s (bounds [1, 16])",
             raw_depth, max_depth,
         )
-    # Lease-owner retention grace (LP-0MVI2VRT2000V1AP): [0, max_wait_seconds].
-    # 0 disables retention priority (the rollback path). Bounded by the wait
-    # cap so a session cannot keep priority longer than a full queue budget.
+    # Lease-owner retention grace (LP-0MVI2VRT2000V1AP): [0, max_runtime].
+    # 0 disables retention priority (the rollback path). The ceiling is the
+    # session guardrail ceiling (the same one the wait cap uses), NOT the wait
+    # cap itself: the grace must be able to exceed one queue budget so a
+    # returning session always re-queues as retained, and clamping to the wait
+    # cap made the shipped 300 s default unrepresentable — it logged a WARNING
+    # on every request (LP-0MVI63OM1009K51W).
     raw_grace = server_config.get("contention_queue_lease_grace_seconds", 300)
     try:
         grace = float(raw_grace) if raw_grace is not None else 300.0
@@ -237,12 +241,12 @@ def _get_contention_queue_config(server_config: dict) -> dict:
             raw_grace,
         )
         grace = 300.0
-    lease_grace_seconds = max(0.0, min(grace, max_wait_seconds))
+    lease_grace_seconds = max(0.0, min(grace, float(max(1, max_runtime))))
     if lease_grace_seconds != grace:
         logger.warning(
             "contention_queue_lease_grace_seconds=%r clamped to %s "
-            "(bounds [0, contention_queue_max_wait_seconds=%s])",
-            raw_grace, lease_grace_seconds, max_wait_seconds,
+            "(bounds [0, session_guardrail_max_runtime_seconds=%s])",
+            raw_grace, lease_grace_seconds, max_runtime,
         )
     return {
         "policy": policy,

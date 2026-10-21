@@ -80,13 +80,17 @@ directly from the log — the seven-transition case above would show six
 
 ```yaml
 server:
-  contention_queue_lease_grace_seconds: 300   # bounds [0, contiguous wait cap]
+  contention_queue_lease_grace_seconds: 300   # bounds [0, session_guardrail_max_runtime_seconds]
 ```
 
 - `300` (default) — a released lease keeps retention for five minutes, longer
   than any single queue budget, so a returning session always re-queues as
-  retained.
-- `0` — **rollback**: retention disabled, queue order returns to plain FIFO.
+  retained. The ceiling is `session_guardrail_max_runtime_seconds` (default
+  1800), **not** `contention_queue_max_wait_seconds`: clamping to the wait cap
+  made the default unrepresentable and logged a WARNING on every per-request
+  resolution (LP-0MVI63OM1009K51W).
+- `0` — **rollback**: retention disabled, queue order returns to plain FIFO
+  (a valid value, no warning).
 
 ## Tests
 

@@ -1581,9 +1581,11 @@ server:
   # The cache-history requirement keeps the priority honest: a session whose
   # prefix was evicted is no cheaper than a newcomer and earns no priority.
   # Each reorder logs ``contention_queue_retention session=... ahead_of=...
-  # reason=lease_owner_retention``. Bounds [0, contention_queue_max_wait_
-  # seconds]; ``0`` disables retention (the rollback path: queue order returns
-  # to plain FIFO).
+  # reason=lease_owner_retention``. Bounds [0, session_guardrail_max_runtime_
+  # seconds] (1800); the grace deliberately MAY exceed
+  # ``contention_queue_max_wait_seconds`` so a returning session always
+  # re-queues as retained. ``0`` disables retention (the rollback path: queue
+  # order returns to plain FIFO) with no warning.
   contention_queue_lease_grace_seconds: 300
 
   # -----------------------------------------------------------------------
