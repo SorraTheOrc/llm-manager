@@ -806,3 +806,423 @@ async def test_remote_fallback_keeps_slots_free_for_in_progress_sessions():
                 assert call_order == [PAID_ENTRY], (
                     f"session {i} must skip to the paid tier, got {call_order}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVDVK5TM004TQQV — model / entry level ``budget`` blocks
+# ---------------------------------------------------------------------------
+#
+# Precedence under test: provider entry > ``models.<name>.budget`` >
+# ``server.*`` > built-in default. Every knob is optional at every layer, so a
+# config without any ``budget`` block must behave exactly as before.
+
+#: knob -> (server config key, server value, model value, entry value, default)
+_BUDGET_KNOBS = {
+    "reserve_ratio": ("provider_rate_limit_reserve_ratio", 0.5, 0.2, 0.1, 0.3),
+    "wait_max_seconds": ("provider_rate_limit_wait_max_seconds", 12.0, 7.0, 2.0, 15.0),
+    "max_waiters": ("provider_rate_limit_wait_max_waiters", 6, 3, 1, 8),
+    "affinity_ttl_seconds": ("provider_affinity_ttl_seconds", 600.0, 300.0, 60.0, 900.0),
+}
+
+
+def _model_with_budget(
+    budget: dict | None = None,
+    *,
+    rpm: int = 10,
+    entry_budget: dict | None = None,
+    name: str | None = None,
+) -> dict:
+    """A ``models.<name>`` block carrying a ``budget`` block and one entry."""
+    entry = _free_provider_cfg(rpm=rpm)
+    if entry_budget is not None:
+        entry["budget"] = entry_budget
+    model: dict = {"providers": [entry]}
+    if budget is not None:
+        model["budget"] = budget
+    if name is not None:
+        model["name"] = name
+    return model
+
+
+@pytest.mark.parametrize("knob", sorted(_BUDGET_KNOBS))
+def test_budget_precedence_entry_then_model_then_server_then_default(knob):
+    """AC2: every layer of the entry > model > server > default chain."""
+    server_key, server_value, model_value, entry_value, default = _BUDGET_KNOBS[knob]
+    entry_only = _free_provider_cfg(rpm=10)
+
+    # 1. nothing configured anywhere -> built-in default
+    settings = provider_budget.resolve_budget_settings(entry_only, {}, None)
+    assert getattr(settings, knob) == default
+    assert settings.sources[knob] == "default"
+
+    # 2. server only
+    config = {"server": {server_key: server_value}}
+    settings = provider_budget.resolve_budget_settings(entry_only, config, None)
+    assert getattr(settings, knob) == server_value
+    assert settings.sources[knob] == "server"
+
+    # 3. server + model -> model wins
+    model = _model_with_budget({knob: model_value}, rpm=10)
+    settings = provider_budget.resolve_budget_settings(model["providers"][0], config, model)
+    assert getattr(settings, knob) == model_value
+    assert settings.sources[knob] == "model"
+
+    # 4. entry + model + server -> entry wins
+    overridden = _model_with_budget({knob: model_value}, rpm=10, entry_budget={knob: entry_value})
+    settings = provider_budget.resolve_budget_settings(overridden["providers"][0], config, overridden)
+    assert getattr(settings, knob) == entry_value
+    assert settings.sources[knob] == "entry"
+
+    # 5. entry only
+    settings = provider_budget.resolve_budget_settings(overridden["providers"][0], {}, overridden)
+    assert getattr(settings, knob) == entry_value
+    assert settings.sources[knob] == "entry"
+
+    # 6. model only (no server value configured)
+    settings = provider_budget.resolve_budget_settings(model["providers"][0], {}, model)
+    assert getattr(settings, knob) == model_value
+    assert settings.sources[knob] == "model"
+
+
+@pytest.mark.asyncio
+async def test_model_budget_reserve_ratio_is_honoured():
+    """AC1: a model ``budget.reserve_ratio`` beats the server-level ratio."""
+    model = _model_with_budget({"reserve_ratio": 0.5}, rpm=10)
+    entry = model["providers"][0]
+    config = _reserve_config(provider_rate_limit_reserve_ratio=0.3)
+
+    for i in range(5):
+        decision = await acquire_provider_budget(
+            entry, config, session_id=f"n-{i}", model_config=model
+        )
+        assert decision.allowed, f"new session {i} should fit the 5 unreserved slots"
+
+    denied = await acquire_provider_budget(entry, config, session_id="n-over", model_config=model)
+    assert not denied.allowed
+    assert denied.reserve_slots == 5, "model ratio 0.5 of 10, not the server's 0.3"
+    assert denied.effective_limit == 5
+
+
+@pytest.mark.asyncio
+async def test_model_budget_wait_max_seconds_is_honoured(clock, sleeps):
+    """AC1: a model ``budget.wait_max_seconds`` caps the in-progress wait."""
+    model = _model_with_budget({"wait_max_seconds": 4}, rpm=1)
+    entry = model["providers"][0]
+    config = _reserve_config(provider_rate_limit_wait_max_seconds=15)
+
+    assert (
+        await acquire_provider_budget(entry, config, session_id="busy", model_config=model)
+    ).allowed
+    provider._maybe_record_provider_affinity(
+        entry, "busy", _ok_json_response(), config, model_config=model
+    )
+
+    decision = await acquire_provider_budget(entry, config, session_id="busy", model_config=model)
+
+    assert not decision.allowed
+    assert decision.reason == "rate_limited_after_wait"
+    assert decision.waited_seconds == pytest.approx(4.0)
+    assert sum(sleeps) == pytest.approx(4.0, abs=0.1)
+
+
+@pytest.mark.asyncio
+async def test_model_budget_max_waiters_is_honoured():
+    """AC1: a model ``budget.max_waiters`` of 0 denies every wait."""
+    model = _model_with_budget({"max_waiters": 0}, rpm=1)
+    entry = model["providers"][0]
+    config = _reserve_config(provider_rate_limit_wait_max_waiters=8)
+
+    assert (
+        await acquire_provider_budget(entry, config, session_id="busy", model_config=model)
+    ).allowed
+    provider._maybe_record_provider_affinity(
+        entry, "busy", _ok_json_response(), config, model_config=model
+    )
+
+    decision = await acquire_provider_budget(entry, config, session_id="busy", model_config=model)
+
+    assert not decision.allowed
+    assert decision.reason == "rate_limited_waiters"
+
+
+@pytest.mark.asyncio
+async def test_model_budget_affinity_ttl_is_honoured(clock, sleeps):
+    """AC1: affinity recorded under a model TTL expires on that TTL, not the server's."""
+    plan = _model_with_budget({"affinity_ttl_seconds": 60}, rpm=1, name="plan")
+    code = _model_with_budget({"affinity_ttl_seconds": 900}, rpm=1, name="code")
+    entry = plan["providers"][0]
+    config = _reserve_config(provider_affinity_ttl_seconds=900)
+
+    assert (await acquire_provider_budget(entry, config, session_id="plan-1", model_config=plan)).allowed
+    provider._maybe_record_provider_affinity(
+        entry, "plan-1", _ok_json_response(), config, model_config=plan
+    )
+    provider._maybe_record_provider_affinity(
+        entry, "code-1", _ok_json_response(), config, model_config=code
+    )
+
+    # Past the 60 s plan TTL but well inside the 900 s code TTL.
+    clock["now"] += 61.0
+    assert (
+        await acquire_provider_budget(entry, config, session_id="filler", model_config=None)
+    ).allowed, "window rolled over, make the entry full again"
+
+    # plan-1 is a new session again -> passes through immediately, no wait.
+    sleeps.clear()
+    plan_decision = await acquire_provider_budget(
+        entry, config, session_id="plan-1", model_config=plan
+    )
+    assert not plan_decision.allowed
+    assert plan_decision.reason == "rate_limited"
+    assert sleeps == [], "the 60 s model TTL must have expired plan-1's affinity"
+
+    # code-1 is still in progress -> waits for capacity.
+    code_decision = await acquire_provider_budget(
+        entry, config, session_id="code-1", model_config=code
+    )
+    assert not code_decision.allowed
+    assert code_decision.reason == "rate_limited_after_wait"
+    assert code_decision.waited_seconds > 0.0
+
+
+@pytest.mark.asyncio
+async def test_entry_budget_overrides_model_budget_in_the_gate():
+    """AC1: an entry ``budget`` block wins over the model block."""
+    model = _model_with_budget(
+        {"reserve_ratio": 0.5}, rpm=10, entry_budget={"reserve_ratio": 0.0}
+    )
+    entry = model["providers"][0]
+    config = _reserve_config(provider_rate_limit_reserve_ratio=0.3)
+
+    for i in range(10):
+        assert (
+            await acquire_provider_budget(entry, config, session_id=f"s-{i}", model_config=model)
+        ).allowed, f"the entry override disables the reserve, so dispatch {i} must fit"
+
+    denied = await acquire_provider_budget(entry, config, session_id="s-over", model_config=model)
+    assert not denied.allowed
+    assert denied.reserve_slots == 0
+    assert denied.effective_limit == 10
+
+
+@pytest.mark.asyncio
+async def test_no_budget_blocks_keep_todays_decisions_and_log_lines(caplog):
+    """AC3: without any ``budget`` block, decisions and logs are byte-identical."""
+    cfg = _free_provider_cfg(rpm=10)
+    config = _reserve_config()  # 0.3 / 15 / 8 / 900 — the shipped server block
+
+    for i in range(7):
+        decision = await acquire_provider_budget(cfg, config, session_id=f"new-{i}")
+        assert decision.allowed
+        assert (decision.reserve_slots, decision.effective_limit, decision.reason) == (
+            3,
+            7,
+            "allowed",
+        )
+        assert decision.source_label == "", "no model/entry block => no source annotation"
+
+    with caplog.at_level("WARNING", logger="llama-proxy.provider_budget"):
+        denied = await acquire_provider_budget(
+            cfg, config, session_id="abcdefgh-trailing"
+        )
+
+    assert (denied.reserve_slots, denied.effective_limit, denied.reason) == (
+        3,
+        7,
+        "rate_limited",
+    )
+    skip_lines = [
+        r.getMessage() for r in caplog.records if "Provider budget exhausted" in r.getMessage()
+    ]
+    assert skip_lines[-1] == (
+        "Provider budget exhausted: skipping provider=test-free-tier limit=7 reserve=3 "
+        "remaining=3 reason=rate_limited session_affinity=false session=abcdefgh"
+    ), "the shipped-config log line must not change"
+
+
+@pytest.mark.parametrize("knob", sorted(_BUDGET_KNOBS))
+def test_malformed_budget_value_falls_back_to_the_next_layer_with_warning(knob, caplog):
+    """AC4: a malformed model value warns and defers to the server value."""
+    server_key, server_value, _model_value, _entry_value, _default = _BUDGET_KNOBS[knob]
+    model = _model_with_budget({knob: "not-a-number"}, rpm=10)
+    config = {"server": {server_key: server_value}}
+
+    with caplog.at_level("WARNING", logger="llama-proxy.provider_budget"):
+        settings = provider_budget.resolve_budget_settings(model["providers"][0], config, model)
+
+    assert getattr(settings, knob) == server_value
+    assert settings.sources[knob] == "server"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert f"key={knob}" in text
+    assert "layer=model" in text
+
+
+@pytest.mark.parametrize(
+    "knob,raw,expected",
+    [
+        ("reserve_ratio", 7.5, 1.0),
+        ("wait_max_seconds", -3, 0.0),
+        ("max_waiters", -2, 0),
+        ("affinity_ttl_seconds", -5, 0.0),
+    ],
+)
+def test_out_of_range_budget_value_is_clamped_with_warning(knob, raw, expected, caplog):
+    """AC4: out-of-range values clamp into range (as server knobs always have)."""
+    model = _model_with_budget({knob: raw}, rpm=10)
+
+    with caplog.at_level("WARNING", logger="llama-proxy.provider_budget"):
+        settings = provider_budget.resolve_budget_settings(model["providers"][0], {}, model)
+
+    assert getattr(settings, knob) == expected
+    assert settings.sources[knob] == "model"
+    assert "clamped" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_malformed_budget_block_never_blocks_a_request(caplog):
+    """AC4: garbage in the block is ignored, the request still dispatches."""
+    model = _model_with_budget(
+        {
+            "reserve_ratio": "high",
+            "wait_max_seconds": [],
+            "max_waiters": {},
+            "affinity_ttl_seconds": None,
+        },
+        rpm=10,
+    )
+    entry = model["providers"][0]
+
+    with caplog.at_level("WARNING", logger="llama-proxy.provider_budget"):
+        decision = await acquire_provider_budget(entry, {}, session_id="s-1", model_config=model)
+
+    assert decision.allowed
+    assert decision.reason == "allowed"
+
+
+def test_non_mapping_budget_block_is_ignored_with_warning(caplog):
+    """AC4: ``budget: fast`` (not a mapping) is ignored, not fatal."""
+    model = {"providers": [_free_provider_cfg(rpm=10)], "budget": "fast"}
+
+    with caplog.at_level("WARNING", logger="llama-proxy.provider_budget"):
+        settings = provider_budget.resolve_budget_settings(model["providers"][0], {}, model)
+
+    assert settings.reserve_ratio == 0.3
+    assert settings.sources["reserve_ratio"] == "default"
+    assert "layer=model" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_budget_window_stays_shared_across_models():
+    """AC5: the bucket is per provider entry — two models share one window."""
+    plan = _model_with_budget({"reserve_ratio": 0.0}, rpm=10, name="plan")
+    code = _model_with_budget({"reserve_ratio": 0.0}, rpm=10, name="code")
+    config = _reserve_config()
+
+    for i in range(5):
+        assert (
+            await acquire_provider_budget(
+                plan["providers"][0], config, session_id=f"plan-{i}", model_config=plan
+            )
+        ).allowed
+    for i in range(5):
+        assert (
+            await acquire_provider_budget(
+                code["providers"][0], config, session_id=f"code-{i}", model_config=code
+            )
+        ).allowed
+
+    denied = await acquire_provider_budget(
+        code["providers"][0], config, session_id="code-over", model_config=code
+    )
+    assert not denied.allowed, "a second model must not get a second 10/min window"
+    assert get_rate_limiter().remaining(FREE_ENTRY, max_rpm=10) == 0
+
+
+@pytest.mark.asyncio
+async def test_source_layer_is_visible_in_the_skip_log(caplog):
+    """AC6: the skip log names the layer that supplied the effective knob."""
+    model = _model_with_budget({"reserve_ratio": 0.5}, rpm=10)
+    entry = model["providers"][0]
+    config = _reserve_config()
+
+    with caplog.at_level("WARNING", logger="llama-proxy.provider_budget"):
+        for i in range(5):
+            await acquire_provider_budget(entry, config, session_id=f"n-{i}", model_config=model)
+        denied = await acquire_provider_budget(entry, config, session_id="n-over", model_config=model)
+
+    assert denied.source_label == "reserve_ratio@model"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "budget_source=reserve_ratio@model" in text
+
+
+def test_budget_diagnostics_are_empty_without_a_model_block():
+    """AC6: unchanged behaviour when no model/entry layer contributed a value."""
+    decision = provider_budget.BudgetDecision(
+        allowed=False, reason="rate_limited", reserve_slots=3, effective_limit=7
+    )
+    assert provider._budget_diagnostics(decision) == {}
+
+
+@pytest.mark.asyncio
+async def test_attempt_diagnostics_carry_the_budget_source_layer():
+    """AC6: the exhaustion payload's attempt entry names the source layer."""
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        return _ok_json_response()
+
+    model = _model_with_budget({"reserve_ratio": 0.0}, rpm=1)
+    config = {"provider_cooldown_seconds": 0}
+
+    with patch("proxy.provider._get_proxy_to_remote", return_value=_mock_proxy_to_remote):
+        first = await provider.proxy_with_remote_fallback(
+            _DummyRequest(session_id="first"), "v1/chat/completions", model, config
+        )
+        blocked = await provider.proxy_with_remote_fallback(
+            _DummyRequest(session_id="second"), "v1/chat/completions", model, config
+        )
+
+    assert first.status_code == 200
+    payload = json.loads(blocked.body)
+    rate_limited = [
+        attempt for attempt in payload["diagnostics"] if attempt.get("status") == "rate_limited"
+    ]
+    assert rate_limited, f"expected a rate_limited attempt, got {payload['diagnostics']}"
+    assert rate_limited[0]["budget_source"] == "reserve_ratio@model"
+
+
+@pytest.mark.asyncio
+async def test_both_fallback_entry_points_pass_the_model_config_to_the_gate(monkeypatch):
+    """AC7: both real entry points hand the request's model config to the gate."""
+    seen: list[dict | None] = []
+    real_acquire = provider.acquire_provider_budget
+
+    async def _spy(provider_cfg, config, session_id, request=None, model_config=None):
+        seen.append(model_config)
+        return await real_acquire(
+            provider_cfg, config, session_id, request, model_config=model_config
+        )
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        return _ok_json_response()
+
+    monkeypatch.setattr(provider, "acquire_provider_budget", _spy)
+
+    model = _model_with_budget({"wait_max_seconds": 3}, rpm=5)
+    with patch("proxy.provider._get_proxy_to_remote", return_value=_mock_proxy_to_remote):
+        await provider.proxy_with_remote_fallback(
+            _DummyRequest(session_id="remote-1"),
+            "v1/chat/completions",
+            model,
+            {"provider_cooldown_seconds": 0},
+        )
+    assert seen == [model], "the remote cycle must pass the model config"
+
+    seen.clear()
+    with patch("proxy.provider._get_proxy_to_remote", return_value=_mock_proxy_to_remote):
+        await provider.proxy_with_fallback(
+            _DummyRequest(session_id="combined-1"),
+            "v1/chat/completions",
+            model,
+            {"provider_cooldown_seconds": 0},
+        )
+    assert seen == [model], "the combined cycle must pass the model config"

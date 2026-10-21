@@ -90,6 +90,52 @@ failure-domain gates (which only react *after* a failure).
 | Client disconnects during the wait | Wait aborts promptly (`reason=rate_limited_disconnect`). |
 | `rate_limit_rpm` unset or `0` | Ungated: behaviour exactly as before; no affinity recorded. |
 
+**Per-model / per-entry knobs (`budget`, LP-0MVDVK5TM004TQQV).** Every
+behaviour knob in the table (`reserve_ratio`, `wait_max_seconds`,
+`max_waiters`, `affinity_ttl_seconds`) resolves through
+**provider entry `budget` block > `models.<name>.budget` block > `server.*` >
+built-in default**, per knob — so `plan`, `author` and `code` can trade
+latency against free-tier utilisation independently (e.g. an interactive chain
+may wait longer, a background chain may pass through immediately) without
+changing any other chain. All layers are optional; absent keys fall through, so
+a config without `budget` blocks behaves byte-for-byte as before (identical
+`BudgetDecision` values and log lines). Example:
+
+```yaml
+models:
+  plan:
+    budget:
+      reserve_ratio: 0.4        # overrides the default 0.3 for this chain
+      wait_max_seconds: 10
+      max_waiters: 4
+      affinity_ttl_seconds: 600
+    providers:
+      - name: munitoai-free
+        rate_limit_rpm: 15
+        budget:                 # overrides the model block for this entry only
+          reserve_ratio: 0.2
+```
+
+- **Validation** matches the server knobs exactly: the ratio is clamped to
+  `[0, 1]` and wait/TTL/waiter counts to `>= 0`; a malformed value is logged
+  and falls back to the next layer. Never raises, never blocks a request
+  (fail open). A non-mapping `budget:` value is ignored with a warning.
+- **Provenance.** The effective knob's source layer is logged as
+  `budget_source=<knob>@<layer>` (e.g. `budget_source=reserve_ratio@model`)
+  on the skip/wait lines and recorded in the diagnostics attempt entry
+  `budget_source` — present only when a model/entry block supplied the value,
+  so server-defaulted runs keep today's exact log lines.
+- **Boundary: the bucket is per provider entry, not per model.** Two models
+  tuning the same entry share **one** `rate_limit_rpm` window (one account
+  quota); their `budget` blocks change behaviour against that window, never
+  its size. Per-model *quota* is out of scope by design.
+- **`models.compact` caveat.** `models.compact` is consumed only by the
+  compaction summarizer (`proxy/proxy/compaction_summarizer.py`), which calls
+  its providers directly over httpx and never reaches
+  `acquire_provider_budget()` — a `models.compact.budget` block is accepted and
+  resolvable but has **no runtime effect** until that dispatch is gated
+  (tracked as LP-0MVFYYYXS0011T58).
+
 **Why the reserve exists (LP-0MVDUN5CY009VD20).** Affinity is recorded on the
 first successful dispatch, so *every* later turn of that session counts as
 "in-progress". Without a reserve, established sessions queued behind new-session

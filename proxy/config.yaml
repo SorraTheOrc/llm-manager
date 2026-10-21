@@ -109,6 +109,34 @@
 #                        api_key_env: SOME_FREE_KEY
 #                        rate_limit_rpm: 15
 #
+# Per-model budget knobs (optional, LP-0MVDVK5TM004TQQV):
+#   The four *behaviour* knobs (reserve_ratio, wait_max_seconds, max_waiters,
+#   affinity_ttl_seconds) may be tuned per fallback chain via a
+#   `models.<name>.budget` block, and per provider entry via that entry's own
+#   `budget` block. Precedence is ENTRY > MODEL > SERVER > built-in default, per
+#   knob, so a layer sets only what it cares about and absent keys fall through.
+#   Values are clamped exactly as the server knobs are (ratio to [0, 1], wait /
+#   TTL / waiters to >= 0); malformed values are logged and fall back to the
+#   next layer (fail open). The budget BUCKET stays keyed by provider entry — a
+#   `models.plan` and `models.code` block tuning the same entry still share one
+#   `rate_limit_rpm` window (one account quota); the blocks only change how each
+#   chain treats that window. Example:
+#     models:
+#       plan:
+#         budget:
+#           reserve_ratio: 0.4
+#           wait_max_seconds: 10
+#           max_waiters: 4
+#           affinity_ttl_seconds: 600
+#         providers:
+#           - name: some-free-tier
+#             type: remote
+#             endpoint: https://api.example.com/v1
+#             api_key_env: SOME_FREE_KEY
+#             rate_limit_rpm: 15
+#             budget:            # optional per-entry behaviour override
+#               reserve_ratio: 0.2
+#
 # Upstream rate-limit headers (optional, remote providers only):
 #   respect_ratelimit_headers - when true, an HTTP 429 carrying
 #                    `x-ratelimit-reset-requests` / `-tokens` /
@@ -339,6 +367,19 @@ models:
   # OpenCode Go #2, then DeepSeek direct.
   # Slot exhaustion on the local model falls through to remote tiers.
   # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
+  #
+  # Per-model budget tuning (LP-0MVDVK5TM004TQQV) — all keys optional, absent
+  # keys fall through to server.* then the built-in default:
+  #   budget:
+  #     reserve_ratio: 0.4        # share of rate_limit_rpm kept for sessions
+  #                               # already using the entry (server: 0.3)
+  #     wait_max_seconds: 10      # per-request wait cap for those sessions
+  #                               # (server: 15; 0 never waits)
+  #     max_waiters: 4            # concurrent waiter cap (server: 8)
+  #     affinity_ttl_seconds: 600 # how long a session counts as in progress
+  #                               # (server: 900)
+  # The bucket stays per provider entry, so plan/author/code tuning the same
+  # entry share one rate_limit_rpm window — only the behaviour differs.
   plan:
     providers:
       - name: local-qwen3
@@ -382,7 +423,10 @@ models:
         # requests from NEW sessions pass straight through to the next tier
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
-        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        # Tune per chain with `models.<name>.budget` or per entry with this
+        # entry's own `budget` block (LP-0MVDVK5TM004TQQV); otherwise the
+        # server.provider_rate_limit_wait_* / provider_affinity_ttl_* defaults
+        # apply.
         # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
         # tier is a bonus tier, so bursts spill to the paid tiers instead.
         # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
@@ -574,7 +618,10 @@ models:
         # requests from NEW sessions pass straight through to the next tier
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
-        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        # Tune per chain with `models.<name>.budget` or per entry with this
+        # entry's own `budget` block (LP-0MVDVK5TM004TQQV); otherwise the
+        # server.provider_rate_limit_wait_* / provider_affinity_ttl_* defaults
+        # apply.
         # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
         # tier is a bonus tier, so bursts spill to the paid tiers instead.
         # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
@@ -740,7 +787,10 @@ models:
         # requests from NEW sessions pass straight through to the next tier
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
-        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
+        # Tune per chain with `models.<name>.budget` or per entry with this
+        # entry's own `budget` block (LP-0MVDVK5TM004TQQV); otherwise the
+        # server.provider_rate_limit_wait_* / provider_affinity_ttl_* defaults
+        # apply.
         # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
         # tier is a bonus tier, so bursts spill to the paid tiers instead.
         # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
@@ -1015,6 +1065,11 @@ server:
   #   - provider_affinity_ttl_seconds: how long a session counts as "in
   #     progress" on a gated entry (default 900 = 15 min; 0 disables affinity,
   #     so every request is treated as new).
+  # These four are the GLOBAL defaults — a `models.<name>.budget` block, or a
+  # provider entry's own `budget` block, overrides any of them per chain/entry
+  # (precedence: entry > model > server > default, LP-0MVDVK5TM004TQQV;
+  # see the header comment for the full example). The budget bucket itself
+  # stays per provider entry, shared by every model that routes through it.
   provider_rate_limit_reserve_ratio: 0.3
   provider_rate_limit_wait_max_seconds: 15
   provider_rate_limit_wait_max_waiters: 8

@@ -52,6 +52,7 @@ from proxy.priority import (
 from proxy.provider_budget import (
     RATE_LIMIT_WINDOW_SECONDS,
     acquire_provider_budget,
+    affinity_ttl_seconds,
     record_provider_affinity,
 )
 from proxy.utils import _is_empty_response
@@ -64,6 +65,7 @@ def _maybe_record_provider_affinity(
     session_id: str | None,
     response,
     config: dict | None = None,
+    model_config: dict | None = None,
 ) -> None:
     """Record session -> gated-entry affinity after a successful dispatch.
 
@@ -72,6 +74,11 @@ def _maybe_record_provider_affinity(
     must reflect a real success: a 4xx/5xx response (e.g. the upstream 429 that
     proves the allowance is spent) must never create affinity. Entries without
     ``rate_limit_rpm`` are not gated and record nothing.
+
+    The TTL resolves through the same precedence as the gate itself
+    (entry ``budget`` > ``models.<name>.budget`` > ``server.*`` > default,
+    LP-0MVDVK5TM004TQQV), so the recorded affinity lifetime always matches the
+    model whose request created it.
     """
     try:
         if int(getattr(response, "status_code", 0) or 0) >= 400:
@@ -79,10 +86,28 @@ def _maybe_record_provider_affinity(
         if int(provider_cfg.get("rate_limit_rpm", 0) or 0) <= 0:
             return
         record_provider_affinity(
-            session_id, str(provider_cfg.get("name") or ""), config
+            session_id,
+            str(provider_cfg.get("name") or ""),
+            config,
+            ttl_seconds=affinity_ttl_seconds(
+                config, model_config=model_config, provider_cfg=provider_cfg
+            ),
         )
     except Exception:  # pragma: no cover - affinity is best-effort telemetry
         pass
+
+
+def _budget_diagnostics(decision) -> dict[str, str]:
+    """Budget knob provenance for an attempt diagnostic entry.
+
+    Returns ``{"budget_source": "reserve_ratio@model"}`` when a
+    ``models.<name>.budget`` or entry ``budget`` block supplied any effective
+    knob, and ``{}`` when the server config / built-in defaults decided — so a
+    config without ``budget`` blocks records exactly the same diagnostics as
+    before (LP-0MVDVK5TM004TQQV AC3/AC6).
+    """
+    label = getattr(decision, "source_label", "")
+    return {"budget_source": label} if label else {}
 
 # ---------------------------------------------------------------------------
 # Cooldown / circuit-breaker state
@@ -7956,6 +7981,7 @@ async def _proxy_with_remote_fallback_cycle(
             # its prompt cache/prefix continuity.
             _budget = await acquire_provider_budget(
                 provider_cfg, config, _budget_session_id, request,
+                model_config=model_config,
             )
             if not _budget.allowed:
                 _record_attempt(
@@ -7970,6 +7996,7 @@ async def _proxy_with_remote_fallback_cycle(
                     reserve_slots=_budget.reserve_slots,
                     remaining=_budget.remaining,
                     elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                    **_budget_diagnostics(_budget),
                 )
                 fallback_reason = "rate_limited"
                 prev_provider = provider_name
@@ -7987,11 +8014,13 @@ async def _proxy_with_remote_fallback_cycle(
                     reserve_slots=_budget.reserve_slots,
                     remaining=_budget.remaining,
                     elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                    **_budget_diagnostics(_budget),
                 )
 
             response = await ptr(request, path, provider_cfg)
             _maybe_record_provider_affinity(
                 provider_cfg, _budget_session_id, response, config,
+                model_config=model_config,
             )
 
             # Pre-flight remote streaming responses: detect a pre-content
@@ -9180,6 +9209,7 @@ async def _proxy_with_fallback_cycle(
                 # a bounded time for the window to reset.
                 _budget = await acquire_provider_budget(
                     provider_cfg, config, _session_id, request,
+                    model_config=model_config,
                 )
                 if not _budget.allowed:
                     _record_attempt(
@@ -9194,6 +9224,7 @@ async def _proxy_with_fallback_cycle(
                         reserve_slots=_budget.reserve_slots,
                         remaining=_budget.remaining,
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                        **_budget_diagnostics(_budget),
                     )
                     fallback_reason = "rate_limited"
                     prev_provider = provider_name
@@ -9211,11 +9242,13 @@ async def _proxy_with_fallback_cycle(
                         reserve_slots=_budget.reserve_slots,
                         remaining=_budget.remaining,
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                        **_budget_diagnostics(_budget),
                     )
 
                 response = await ptr_remote(request, path, provider_cfg)
                 _maybe_record_provider_affinity(
                     provider_cfg, _session_id, response, config,
+                    model_config=model_config,
                 )
 
             # Pre-flight remote streaming responses: detect a pre-content

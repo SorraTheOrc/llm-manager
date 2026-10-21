@@ -31,9 +31,20 @@ This module turns the existing proactive sliding-window limiter
 - **Affinity** — ``session -> entry`` records expire after
   ``server.provider_affinity_ttl_seconds`` (AC4), so a session that comes back
   much later is a *new* session again.
+- **Per-model / per-entry tuning (LP-0MVDVK5TM004TQQV)** — every behaviour knob
+  above (``reserve_ratio``, ``wait_max_seconds``, ``max_waiters``,
+  ``affinity_ttl_seconds``) resolves through the precedence chain
+  **provider entry ``budget`` block > ``models.<name>.budget`` block >
+  ``server.*`` > built-in default**. All layers are optional, so a config with
+  no ``budget`` blocks behaves exactly as it did before. The *bucket* itself
+  stays keyed by provider entry: two models with different ``budget`` blocks
+  still share one ``rate_limit_rpm`` window (one account quota), they only
+  differ in how they treat it.
 
 Fail-open: an entry without ``rate_limit_rpm`` (or with a malformed value) is
-never gated, and no affinity is recorded for it.
+never gated, and no affinity is recorded for it. A malformed or out-of-range
+value in any ``budget`` block is logged and either clamped into range or
+resolved from the next layer — it never raises and never blocks a request.
 """
 
 from __future__ import annotations
@@ -42,7 +53,8 @@ import asyncio
 import logging
 import math
 import time
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 
 logger = logging.getLogger("llama-proxy.provider_budget")
 
@@ -55,6 +67,30 @@ _DEFAULT_WAIT_MAX_WAITERS = 8
 _DEFAULT_AFFINITY_TTL_SECONDS = 900.0
 #: Fraction of a gated entry's window reserved for sessions that already use it.
 _DEFAULT_RESERVE_RATIO = 0.3
+
+#: The four tunable budget knobs, each mapped to the ``server.*`` key that has
+#: always carried its global value (LP-0MVDVK5TM004TQQV). Iteration order is
+#: also the order used in the ``knob@layer`` provenance label.
+BUDGET_SERVER_KEYS: dict[str, str] = {
+    "reserve_ratio": "provider_rate_limit_reserve_ratio",
+    "wait_max_seconds": "provider_rate_limit_wait_max_seconds",
+    "max_waiters": "provider_rate_limit_wait_max_waiters",
+    "affinity_ttl_seconds": "provider_affinity_ttl_seconds",
+}
+
+#: Built-in defaults, used when no layer supplies a value.
+_DEFAULT_BUDGET_VALUES: dict[str, float | int] = {
+    "reserve_ratio": _DEFAULT_RESERVE_RATIO,
+    "wait_max_seconds": _DEFAULT_WAIT_MAX_SECONDS,
+    "max_waiters": _DEFAULT_WAIT_MAX_WAITERS,
+    "affinity_ttl_seconds": _DEFAULT_AFFINITY_TTL_SECONDS,
+}
+
+#: Config layers, highest precedence first (plus the fallback default).
+LAYER_ENTRY = "entry"
+LAYER_MODEL = "model"
+LAYER_SERVER = "server"
+LAYER_DEFAULT = "default"
 
 #: Minimum sleep slice while waiting, so a zero-length recomputation cannot
 #: spin the event loop.
@@ -97,11 +133,55 @@ class BudgetDecision:
     #: Per-window cap actually applied to this request (``limit_rpm`` for an
     #: affinity session, ``limit_rpm - reserve_slots`` for a new one).
     effective_limit: int = 0
+    #: Which config layer supplied each knob (``entry`` / ``model`` /
+    #: ``server`` / ``default``) — see :func:`resolve_budget_settings`.
+    sources: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def waited(self) -> bool:
         """True when this decision involved any waiting."""
         return self.waited_seconds > 0.0
+
+    @property
+    def source_label(self) -> str:
+        """``knob@layer`` provenance for knobs set by a model/entry block.
+
+        Empty when every knob came from ``server.*`` or the built-in default,
+        so a config without ``budget`` blocks logs exactly as it did before
+        the per-model knobs existed (LP-0MVDVK5TM004TQQV AC3/AC6).
+        """
+        return _source_label(self.sources)
+
+
+@dataclass(frozen=True)
+class BudgetSettings:
+    """Effective budget knobs for one (model, provider entry) pair.
+
+    Built by :func:`resolve_budget_settings`; ``sources`` records which config
+    layer supplied each knob so diagnostics can name the winning layer.
+    """
+
+    reserve_ratio: float = _DEFAULT_RESERVE_RATIO
+    wait_max_seconds: float = _DEFAULT_WAIT_MAX_SECONDS
+    max_waiters: int = _DEFAULT_WAIT_MAX_WAITERS
+    affinity_ttl_seconds: float = _DEFAULT_AFFINITY_TTL_SECONDS
+    sources: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def source_label(self) -> str:
+        """``knob@layer`` provenance for knobs set by a model/entry block."""
+        return _source_label(self.sources)
+
+
+def _source_label(sources: Mapping[str, str] | None) -> str:
+    """Render ``knob@layer`` for the knobs a model/entry block overrode."""
+    if not sources:
+        return ""
+    return ",".join(
+        f"{key}@{layer}"
+        for key in BUDGET_SERVER_KEYS
+        if (layer := sources.get(key)) in (LAYER_ENTRY, LAYER_MODEL)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -120,52 +200,190 @@ def _config_value(config: dict | None, key: str, default):
     return default if value is None else value
 
 
-def wait_max_seconds(config: dict | None) -> float:
+def wait_max_seconds(
+    config: dict | None = None,
+    model_config: dict | None = None,
+    provider_cfg: dict | None = None,
+) -> float:
     """Maximum time an in-progress session may wait for free-tier capacity."""
-    try:
-        return max(
-            0.0, float(_config_value(config, "provider_rate_limit_wait_max_seconds", _DEFAULT_WAIT_MAX_SECONDS))
-        )
-    except (TypeError, ValueError):
-        return _DEFAULT_WAIT_MAX_SECONDS
+    return float(
+        resolve_budget_settings(provider_cfg, config, model_config).wait_max_seconds
+    )
 
 
-def wait_max_waiters(config: dict | None) -> int:
+def wait_max_waiters(
+    config: dict | None = None,
+    model_config: dict | None = None,
+    provider_cfg: dict | None = None,
+) -> int:
     """Maximum number of requests allowed to wait for capacity concurrently."""
-    try:
-        return max(
-            0,
-            int(_config_value(config, "provider_rate_limit_wait_max_waiters", _DEFAULT_WAIT_MAX_WAITERS)),
-        )
-    except (TypeError, ValueError):
-        return _DEFAULT_WAIT_MAX_WAITERS
+    return int(resolve_budget_settings(provider_cfg, config, model_config).max_waiters)
 
 
-def affinity_ttl_seconds(config: dict | None) -> float:
+def affinity_ttl_seconds(
+    config: dict | None = None,
+    model_config: dict | None = None,
+    provider_cfg: dict | None = None,
+) -> float:
     """How long a session is considered 'in progress' on a gated entry."""
-    try:
-        return max(
-            0.0, float(_config_value(config, "provider_affinity_ttl_seconds", _DEFAULT_AFFINITY_TTL_SECONDS))
-        )
-    except (TypeError, ValueError):
-        return _DEFAULT_AFFINITY_TTL_SECONDS
+    return float(
+        resolve_budget_settings(provider_cfg, config, model_config).affinity_ttl_seconds
+    )
 
 
-def reserve_ratio(config: dict | None) -> float:
-    """Fraction of a gated entry's window reserved for in-progress sessions.
+def reserve_ratio(
+    config: dict | None = None,
+    model_config: dict | None = None,
+    provider_cfg: dict | None = None,
+) -> float:
+    """Fraction of a gated entry's window reserved for in-progress sessions."""
+    return float(
+        resolve_budget_settings(provider_cfg, config, model_config).reserve_ratio
+    )
 
-    Clamped to ``[0.0, 1.0]``; malformed values fall back to the default.
+
+# ---------------------------------------------------------------------------
+# Layered resolution: entry > model > server > built-in default
+# ---------------------------------------------------------------------------
+
+
+def _budget_block(owner: dict | None, layer: str) -> dict | None:
+    """Return ``owner['budget']`` when it is a mapping, else ``None``.
+
+    A non-mapping block (e.g. ``budget: fast``) is a config error: warn once and
+    treat it as absent so the request keeps flowing (fail open).
     """
-    try:
-        ratio = float(
-            _config_value(config, "provider_rate_limit_reserve_ratio", _DEFAULT_RESERVE_RATIO)
+    if not isinstance(owner, dict):
+        return None
+    block = owner.get("budget")
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        logger.warning(
+            "Provider budget config ignored: layer=%s key=budget value=%r "
+            "reason=not-a-mapping; falling back to the next layer",
+            layer,
+            block,
         )
+        return None
+    return block
+
+
+def _coerce_budget_value(key: str, raw) -> tuple[float | int, bool]:
+    """Coerce *raw* into *key*'s type and clamp it into range.
+
+    Returns ``(value, clamped)``. Raises ``TypeError``/``ValueError`` when the
+    value is not a number at all, so the caller can fall through to the next
+    layer. Ranges match the server-level knobs exactly: the ratio is clamped to
+    ``[0, 1]`` and the wait/TTL/waiter knobs to ``>= 0``.
+    """
+    if isinstance(raw, bool):
+        raise TypeError("boolean is not a valid budget value")
+    if key == "max_waiters":
+        value: float | int = int(raw)
+        clamped: float | int = max(0, value)
+    else:
+        value = float(raw)
+        if key == "reserve_ratio":
+            clamped = min(1.0, max(0.0, value))
+        else:
+            clamped = max(0.0, value)
+    return clamped, clamped != value
+
+
+def _warn_budget_value(layer: str, key: str, raw, *, clamped_to=None) -> None:
+    """Log a malformed (falls through) or out-of-range (clamped) value."""
+    if clamped_to is None:
+        logger.warning(
+            "Provider budget config ignored: layer=%s key=%s value=%r "
+            "reason=invalid; falling back to the next layer",
+            layer,
+            key,
+            raw,
+        )
+        return
+    logger.warning(
+        "Provider budget config clamped: layer=%s key=%s value=%r clamped=%r",
+        layer,
+        key,
+        raw,
+        clamped_to,
+    )
+
+
+def _resolve_knob(
+    key: str,
+    server_key: str,
+    layers: tuple[tuple[str, dict | None], ...],
+    config: dict | None,
+) -> tuple[float | int, str]:
+    """Resolve one knob through entry > model > server > default."""
+    for layer, block in layers:
+        if block is None:
+            continue
+        raw = block.get(key)
+        if raw is None:
+            continue
+        try:
+            value, clamped = _coerce_budget_value(key, raw)
+        except (TypeError, ValueError):
+            _warn_budget_value(layer, key, raw)
+            continue
+        if clamped:
+            _warn_budget_value(layer, key, raw, clamped_to=value)
+        return value, layer
+
+    raw = _config_value(config, server_key, None)
+    if raw is None:
+        return _DEFAULT_BUDGET_VALUES[key], LAYER_DEFAULT
+    try:
+        value, clamped = _coerce_budget_value(key, raw)
     except (TypeError, ValueError):
-        ratio = _DEFAULT_RESERVE_RATIO
-    return min(1.0, max(0.0, ratio))
+        _warn_budget_value(LAYER_SERVER, key, raw)
+        return _DEFAULT_BUDGET_VALUES[key], LAYER_DEFAULT
+    if clamped:
+        _warn_budget_value(LAYER_SERVER, key, raw, clamped_to=value)
+    return value, LAYER_SERVER
 
 
-def reserved_slots(rpm: int, config: dict | None) -> int:
+def resolve_budget_settings(
+    provider_cfg: dict | None = None,
+    config: dict | None = None,
+    model_config: dict | None = None,
+) -> BudgetSettings:
+    """Resolve the effective budget knobs for this model/provider pair.
+
+    Precedence is **provider entry ``budget`` block > ``models.<name>.budget``
+    block > ``server.*`` > built-in default**, per knob, so a layer may set just
+    the knobs it cares about (LP-0MVDVK5TM004TQQV AC2). The bucket itself stays
+    keyed by provider entry: ``models.plan`` and ``models.code`` tuning the same
+    entry only change *how* they behave against one shared quota window.
+
+    Args:
+        provider_cfg: Provider entry (may carry an optional ``budget`` block).
+        config: Server config (flat or ``server.*``) supplying the defaults.
+        model_config: The request's ``models.<name>`` block (may carry an
+            optional ``budget`` block).
+    """
+    layers: tuple[tuple[str, dict | None], ...] = (
+        (LAYER_ENTRY, _budget_block(provider_cfg, LAYER_ENTRY)),
+        (LAYER_MODEL, _budget_block(model_config, LAYER_MODEL)),
+    )
+    resolved: dict[str, float | int] = {}
+    sources: dict[str, str] = {}
+    for key, server_key in BUDGET_SERVER_KEYS.items():
+        value, layer = _resolve_knob(key, server_key, layers, config)
+        resolved[key] = value
+        sources[key] = layer
+    return BudgetSettings(sources=sources, **resolved)
+
+
+def reserved_slots(
+    rpm: int,
+    config: dict | None = None,
+    model_config: dict | None = None,
+    provider_cfg: dict | None = None,
+) -> int:
     """Slots in a ``rpm``-sized window held back for in-progress sessions.
 
     ``0`` when the reserve is disabled, when the budget is too small to split
@@ -174,15 +392,26 @@ def reserved_slots(rpm: int, config: dict | None) -> int:
     """
     if rpm <= 1:
         return 0
-    ratio = reserve_ratio(config)
+    ratio = reserve_ratio(config, model_config=model_config, provider_cfg=provider_cfg)
     if ratio <= 0.0:
         return 0
     return max(0, min(int(math.floor(rpm * ratio)), rpm - 1))
 
 
-def new_session_limit(rpm: int, config: dict | None) -> int:
+def new_session_limit(
+    rpm: int,
+    config: dict | None = None,
+    model_config: dict | None = None,
+    provider_cfg: dict | None = None,
+) -> int:
     """Per-window cap for a session with no affinity for the entry."""
-    return max(1, rpm - reserved_slots(rpm, config))
+    return max(
+        1,
+        rpm
+        - reserved_slots(
+            rpm, config, model_config=model_config, provider_cfg=provider_cfg
+        ),
+    )
 
 
 def _provider_rpm(provider_cfg: dict) -> int:
@@ -202,14 +431,21 @@ def record_provider_affinity(
     session_id: str | None,
     entry_name: str,
     config: dict | None = None,
+    ttl_seconds: float | None = None,
 ) -> None:
     """Record that *session_id* was successfully served by *entry_name* (AC4).
 
     No-op for anonymous requests (no session identity) and for a zero TTL.
+
+    *ttl_seconds* overrides the config-resolved TTL so the caller can honour a
+    model-scoped ``budget.affinity_ttl_seconds``
+    (:func:`resolve_budget_settings`); when omitted the TTL is resolved from
+    *config* alone (server layer + built-in default), exactly as before
+    LP-0MVDVK5TM004TQQV.
     """
     if not session_id or not entry_name:
         return
-    ttl = affinity_ttl_seconds(config)
+    ttl = affinity_ttl_seconds(config) if ttl_seconds is None else ttl_seconds
     if ttl <= 0:
         return
     _affinity[(session_id, entry_name)] = time.monotonic() + ttl
@@ -287,50 +523,62 @@ async def _wait_for_capacity(
     rpm: int,
     config: dict | None,
     request,
+    settings: BudgetSettings | None = None,
 ) -> BudgetDecision:
     """Wait (bounded, depth-capped) for a slot on *entry_name*.
 
     Returns an ``allowed_after_wait`` decision when a slot freed, or a denial
-    naming the reason (wait cap, waiter depth, disconnect).
+    naming the reason (wait cap, waiter depth, disconnect). *settings* carries
+    the resolved per-model/per-entry knobs and their provenance; the log lines
+    name the winning layer only when a ``budget`` block contributed.
     """
     global _waiters
 
     from proxy.rate_limiter import get_rate_limiter
 
+    if settings is None:
+        settings = resolve_budget_settings(None, config, None)
     limiter = get_rate_limiter()
-    max_wait = wait_max_seconds(config)
-    max_waiters = wait_max_waiters(config)
+    max_wait = settings.wait_max_seconds
+    max_waiters = settings.max_waiters
+    sources = settings.sources
+    label = settings.source_label
+    source_note = f" budget_source={label}" if label else ""
 
     if max_wait <= 0:
         # Waiting disabled by config (provider_rate_limit_wait_max_seconds: 0):
         # in-progress sessions pass through exactly like new sessions.
         logger.info(
             "Provider budget exhausted: skipping provider=%s limit=%d "
-            "remaining=%d reason=rate_limited session_affinity=true wait_disabled=true",
+            "remaining=%d reason=rate_limited session_affinity=true wait_disabled=true%s",
             entry_name,
             rpm,
             limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
+            source_note,
         )
         return BudgetDecision(
             allowed=False,
             reason="rate_limited",
             limit_rpm=rpm,
             remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
+            sources=sources,
         )
     if _waiters >= max_waiters:
         logger.info(
             "Provider budget wait declined: provider=%s limit=%d "
-            "reason=rate_limited_waiters waiters=%d max_waiters=%d",
+            "reason=rate_limited_waiters waiters=%d max_waiters=%d%s",
             entry_name,
             rpm,
             _waiters,
             max_waiters,
+            source_note,
         )
         return BudgetDecision(
             allowed=False,
             reason="rate_limited_waiters",
             limit_rpm=rpm,
             remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
+            sources=sources,
         )
 
     deadline = time.monotonic() + max_wait
@@ -339,11 +587,12 @@ async def _wait_for_capacity(
     try:
         logger.info(
             "Provider budget wait start: provider=%s limit=%d "
-            "remaining=%d max_wait=%.0fs session_affinity=true",
+            "remaining=%d max_wait=%.0fs session_affinity=true%s",
             entry_name,
             rpm,
             limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
             max_wait,
+            source_note,
         )
         while True:
             remaining_budget = deadline - time.monotonic()
@@ -358,9 +607,10 @@ async def _wait_for_capacity(
             if disconnected:
                 logger.info(
                     "Provider budget wait aborted: provider=%s reason=client_disconnect "
-                    "waited=%.2fs",
+                    "waited=%.2fs%s",
                     entry_name,
                     waited,
+                    source_note,
                 )
                 return BudgetDecision(
                     allowed=False,
@@ -368,16 +618,18 @@ async def _wait_for_capacity(
                     limit_rpm=rpm,
                     remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
                     waited_seconds=waited,
+                    sources=sources,
                 )
             waited += slice_seconds
             if await limiter.check_and_increment(
                 entry_name, rpm, window_seconds=RATE_LIMIT_WINDOW_SECONDS
             ):
                 logger.info(
-                    "Provider budget wait satisfied: provider=%s limit=%d waited=%.2fs",
+                    "Provider budget wait satisfied: provider=%s limit=%d waited=%.2fs%s",
                     entry_name,
                     rpm,
                     waited,
+                    source_note,
                 )
                 return BudgetDecision(
                     allowed=True,
@@ -385,16 +637,18 @@ async def _wait_for_capacity(
                     limit_rpm=rpm,
                     remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
                     waited_seconds=waited,
+                    sources=sources,
                 )
     finally:
         _waiters -= 1
 
     logger.warning(
         "Provider budget wait exhausted: provider=%s limit=%d waited=%.2fs "
-        "reason=rate_limited_after_wait",
+        "reason=rate_limited_after_wait%s",
         entry_name,
         rpm,
         waited,
+        source_note,
     )
     return BudgetDecision(
         allowed=False,
@@ -402,6 +656,7 @@ async def _wait_for_capacity(
         limit_rpm=rpm,
         remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
         waited_seconds=waited,
+        sources=sources,
     )
 
 
@@ -415,6 +670,7 @@ async def acquire_provider_budget(
     config: dict | None,
     session_id: str | None,
     request=None,
+    model_config: dict | None = None,
 ) -> BudgetDecision:
     """Decide whether *provider_cfg* may be dispatched for *session_id*.
 
@@ -429,12 +685,21 @@ async def acquire_provider_budget(
     - any other request (new session, anonymous request, wait cap reached) is
       denied immediately so the fallback chain can move on without waiting.
 
+    Every behaviour knob resolves through the precedence chain **provider
+    entry ``budget`` block > ``models.<name>.budget`` block > ``server.*`` >
+    built-in default** (LP-0MVDVK5TM004TQQV), so ``plan``/``author``/``code``
+    can tune latency against free-tier utilisation independently while still
+    sharing the entry's single quota window.
+
     Args:
         provider_cfg: Provider entry (must carry ``name``; ``rate_limit_rpm``
-            opts the entry into gating).
+            opts the entry into gating; an optional ``budget`` block overrides
+            the model/server knobs).
         config: Server config (flat or ``server.*``) for the wait/TTL knobs.
         session_id: Header-resolved session identity, if any.
         request: Incoming request, used to abort a wait on client disconnect.
+        model_config: The request's ``models.<name>`` block, whose optional
+            ``budget`` block sits between the entry and the server default.
     """
     rpm = _provider_rpm(provider_cfg)
     if rpm <= 0:
@@ -447,11 +712,20 @@ async def acquire_provider_budget(
     from proxy.rate_limiter import get_rate_limiter
 
     limiter = get_rate_limiter()
-    reserve = reserved_slots(rpm, config)
+    settings = resolve_budget_settings(provider_cfg, config, model_config)
+    reserve = reserved_slots(
+        rpm, config, model_config=model_config, provider_cfg=provider_cfg
+    )
     in_progress = provider_affinity_active(session_id, entry_name, config)
     # In-progress sessions may use the whole window; new sessions stop at the
     # unreserved part so slots are always waiting for established sessions.
-    effective_limit = rpm if in_progress else new_session_limit(rpm, config)
+    effective_limit = (
+        rpm
+        if in_progress
+        else new_session_limit(
+            rpm, config, model_config=model_config, provider_cfg=provider_cfg
+        )
+    )
 
     if await limiter.check_and_increment(
         entry_name, effective_limit, window_seconds=RATE_LIMIT_WINDOW_SECONDS
@@ -463,22 +737,28 @@ async def acquire_provider_budget(
             remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
             reserve_slots=reserve,
             effective_limit=effective_limit,
+            sources=settings.sources,
         )
 
     if in_progress:
-        decision = await _wait_for_capacity(entry_name, rpm, config, request)
-        return replace(decision, reserve_slots=reserve, effective_limit=effective_limit)
+        decision = await _wait_for_capacity(
+            entry_name, rpm, config, request, settings=settings
+        )
+        return replace(
+            decision, reserve_slots=reserve, effective_limit=effective_limit
+        )
 
     remaining = limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS)
-
+    label = settings.source_label
     logger.warning(
         "Provider budget exhausted: skipping provider=%s limit=%d reserve=%d "
-        "remaining=%d reason=rate_limited session_affinity=false session=%s",
+        "remaining=%d reason=rate_limited session_affinity=false session=%s%s",
         entry_name,
         effective_limit,
         reserve,
         remaining,
         str(session_id or "")[:8] or "anonymous",
+        f" budget_source={label}" if label else "",
     )
     return BudgetDecision(
         allowed=False,
@@ -487,4 +767,5 @@ async def acquire_provider_budget(
         remaining=remaining,
         reserve_slots=reserve,
         effective_limit=effective_limit,
+        sources=settings.sources,
     )
