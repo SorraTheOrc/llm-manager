@@ -225,10 +225,30 @@ def _get_contention_queue_config(server_config: dict) -> dict:
             "contention_queue_max_depth=%r clamped to %s (bounds [1, 16])",
             raw_depth, max_depth,
         )
+    # Lease-owner retention grace (LP-0MVI2VRT2000V1AP): [0, max_wait_seconds].
+    # 0 disables retention priority (the rollback path). Bounded by the wait
+    # cap so a session cannot keep priority longer than a full queue budget.
+    raw_grace = server_config.get("contention_queue_lease_grace_seconds", 300)
+    try:
+        grace = float(raw_grace) if raw_grace is not None else 300.0
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid contention_queue_lease_grace_seconds=%r — using default 300",
+            raw_grace,
+        )
+        grace = 300.0
+    lease_grace_seconds = max(0.0, min(grace, max_wait_seconds))
+    if lease_grace_seconds != grace:
+        logger.warning(
+            "contention_queue_lease_grace_seconds=%r clamped to %s "
+            "(bounds [0, contention_queue_max_wait_seconds=%s])",
+            raw_grace, lease_grace_seconds, max_wait_seconds,
+        )
     return {
         "policy": policy,
         "max_wait_seconds": max_wait_seconds,
         "max_depth": max_depth,
+        "lease_grace_seconds": lease_grace_seconds,
     }
 
 
@@ -1618,6 +1638,17 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 model_name,
                                 session_id or "unknown",
                                 _request_preview or "",
+                            )
+                        except Exception:
+                            pass
+
+                        # Count local↔remote provider transitions per session
+                        # (LP-0MVI2VRT2000V1AP AC5).
+                        try:
+                            from proxy.provider import note_routing_hop
+
+                            note_routing_hop(
+                                session_id, "local", model_name=model_name
                             )
                         except Exception:
                             pass

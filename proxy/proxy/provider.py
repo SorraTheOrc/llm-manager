@@ -512,6 +512,64 @@ _WINDOW_PARSE_CACHE: dict[tuple[str, ...], tuple[tuple[int, int], ...] | None] =
 # (LP-0MRP44W7I0085I6N)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Routing-hop counter (LP-0MVI2VRT2000V1AP AC5)
+# ---------------------------------------------------------------------------
+# Per-session count of provider *transitions* (local↔remote, remote↔remote).
+# One routing-thrash case (LP-0MVI2VRT2000V1AP) alternated local↔remote seven
+# times in twelve minutes; without a counter that is only visible by reading
+# raw log lines by hand. ``note_routing_hop`` returns the session's new hop
+# count (0 = same provider as last time) and emits a ``routing_hop`` log line
+# only when the provider actually changes, so the count is a direct aggregate.
+#
+# ``_last_routing_hop``: (model, session) -> (last_provider, hops).
+_last_routing_hop: dict[tuple[str, str], tuple[str, int]] = {}
+_MAX_ROUTING_HOP_ENTRIES = 1000
+
+
+def note_routing_hop(
+    session_id: str | None,
+    provider_name: str | None,
+    *,
+    model_name: str | None = None,
+    **context,
+) -> int:
+    """Record the provider a request was served by; return its hop count.
+
+    Returns the number of provider transitions observed for the session so
+    far (0 for the first sighting). A ``routing_hop`` log line is emitted only
+    when the provider changes, carrying ``from``/``to``/``hops`` plus any
+    keyword *context* (e.g. ``reason=``), so the usage analysis can count
+    thrash per session without re-deriving it from stream lines.
+    """
+    if not session_id or not provider_name:
+        return 0
+    key = (str(model_name or ""), session_id)
+    previous, hops = _last_routing_hop.get(key, ("", 0))
+    if previous == provider_name:
+        return hops
+    hops = hops + 1 if previous else 0
+    if key not in _last_routing_hop and len(_last_routing_hop) >= _MAX_ROUTING_HOP_ENTRIES:
+        try:
+            _last_routing_hop.pop(next(iter(_last_routing_hop)), None)
+        except StopIteration:
+            pass
+    _last_routing_hop[key] = (provider_name, hops)
+    try:
+        extra = " ".join(f"{k}={v}" for k, v in context.items() if v is not None)
+        logger.info(
+            "routing_hop session=%s from=%s to=%s hops=%d%s",
+            session_id,
+            previous or "none",
+            provider_name,
+            hops,
+            f" {extra}" if extra else "",
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return hops
+
+
 # Per-(model, session) cached-tokens ratio: (model_name, session_id) -> ratio.
 # The ratio is cached_tokens / prompt_tokens from the last local response.
 # A ratio of 1.0 means ALL tokens were cached (fully warm).
@@ -755,6 +813,9 @@ def clear_cached_ratio_for_session(session_id: str | None) -> None:
     # sidecar are being discarded, so no credit may survive (LP-0MVI2XOTY008Q4UV).
     for key in [k for k in _last_prompt_prefix if k[1] == session_id]:
         _last_prompt_prefix.pop(key, None)
+    # A discarded session starts a fresh hop count (LP-0MVI2VRT2000V1AP).
+    for key in [k for k in _last_routing_hop if k[1] == session_id]:
+        _last_routing_hop.pop(key, None)
 
 
 def _extract_cached_tokens_from_usage(usage: dict | None) -> int:
@@ -5461,12 +5522,32 @@ async def _maybe_queue_for_local_slot(
     )
 
     _wait_started = _time.monotonic()
+    # Lease-owner retention priority (LP-0MVI2VRT2000V1AP): a session that
+    # holds, or has just released, a local lease and still has cache history
+    # queues ahead of newcomers, so it reclaims the slot it just left instead
+    # of burning the full budget and detouring to a paid provider.
+    _retained = False
+    try:
+        _grace = float(cq.get("lease_grace_seconds", 300) or 0)
+        _retained = contention_queue.is_retained_local_owner(
+            session_id,
+            (
+                provider_cfg.get("llama_model", "")
+                if isinstance(provider_cfg, dict)
+                else None
+            ),
+            grace_seconds=_grace,
+        )
+    except Exception:
+        logger.debug("retention check failed; queueing as a newcomer", exc_info=True)
     elapsed = await contention_queue.wait_for_local_slot(
         max_wait_seconds=cq["max_wait_seconds"],
         max_depth=cq["max_depth"],
         slot_free_check=lambda: _local_slot_free(
             config, max_local, endpoint=endpoint
         ),
+        session_id=session_id,
+        retained=_retained,
     )
     if elapsed is None:
         # Caps exceeded — the caller falls back. Surface the measured wait so

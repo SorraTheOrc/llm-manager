@@ -1818,6 +1818,16 @@ async def _try_acquire_local_dispatch(
                         _p[session_key] = True
                 except Exception:
                     pass
+                # Lease-owner retention priority (LP-0MVI2VRT2000V1AP): note
+                # the grant so this session keeps contention-queue priority
+                # for ``contention_queue_lease_grace_seconds`` after it
+                # releases, instead of re-queueing behind a newcomer.
+                try:
+                    from proxy import contention_queue
+
+                    contention_queue.note_local_grant(session_key)
+                except Exception:
+                    pass
 
             return (True, None, getattr(srv, "local_active_queries", 0), max(1.0, lease_timeout))
     except Exception:

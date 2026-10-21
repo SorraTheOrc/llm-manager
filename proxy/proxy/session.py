@@ -1254,6 +1254,15 @@ async def _invalidate_session_and_slot(
             clear_cached_ratio_for_session(session_id)
         except Exception:
             pass
+        # The session no longer owns a slot: drop its retention priority so a
+        # parked waiter cannot jump the queue on stale credit
+        # (LP-0MVI2VRT2000V1AP).
+        try:
+            from proxy import contention_queue
+
+            contention_queue.forget_local_grant(session_id)
+        except Exception:
+            pass
 
     if reason:
         _record_session_invalidation(reason)

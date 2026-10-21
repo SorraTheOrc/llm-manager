@@ -1570,6 +1570,21 @@ server:
   contention_queue_policy: queue
   contention_queue_max_wait_seconds: 120
   contention_queue_max_depth: 8
+  # Lease-owner retention priority (LP-0MVI2VRT2000V1AP). A session that
+  # already holds a local lease, or was granted one within this grace window
+  # AND still has local cache history, is placed ahead of non-retained
+  # waiters in the contention queue (FIFO within each class). Rationale: a
+  # returning session otherwise re-queues behind newcomers, waits the full
+  # 120 s budget and detours to a paid provider, then comes back and
+  # re-prefills — measured on 2026-10-21 as 7 local<->remote transitions in
+  # 12 minutes for one session, with no ETA or context-size cause.
+  # The cache-history requirement keeps the priority honest: a session whose
+  # prefix was evicted is no cheaper than a newcomer and earns no priority.
+  # Each reorder logs ``contention_queue_retention session=... ahead_of=...
+  # reason=lease_owner_retention``. Bounds [0, contention_queue_max_wait_
+  # seconds]; ``0`` disables retention (the rollback path: queue order returns
+  # to plain FIFO).
+  contention_queue_lease_grace_seconds: 300
 
   # -----------------------------------------------------------------------
   # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ)
