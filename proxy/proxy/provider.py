@@ -1516,6 +1516,32 @@ def effective_large_context_economic_ceiling(config: dict) -> int:
     return ceiling
 
 
+def warm_cap_ceiling_shortfall(config: dict) -> int:
+    """Tokens of a configured warm cap that the economic ceiling shadows.
+
+    ``local_large_context_warm_cache_threshold`` only supplies an UPPER
+    bound on the economic ceiling (``round(ratio x local_model_ctx_size)``),
+    so raising the absolute value above that ceiling does not move the
+    effective warm cap at all — the economic term still binds. That silent
+    no-op is what makes the two knobs a co-change (LP-0MVHSET0A008VU95).
+
+    Returns:
+        ``configured_absolute - economic_ceiling`` when the economic term is
+        the smaller of the two, else 0. Also 0 when either knob is disabled
+        (a ratio of 0 uses the absolute verbatim) or when there is no model
+        ctx size to scale with — in both cases nothing is shadowed.
+    """
+    ratio = _get_economic_ceiling_ratio(config)
+    warm_override = _get_warm_cache_threshold(config)
+    if ratio <= 0 or warm_override <= 0:
+        return 0
+    ctx_size = _get_local_model_ctx_size(config)
+    if ctx_size <= 0:
+        return 0
+    ceiling = round(ratio * ctx_size)
+    return max(0, warm_override - ceiling)
+
+
 def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     """Return (cold, warm) thresholds under the 3-term warm model.
 
@@ -1873,6 +1899,27 @@ def validate_local_routing_config(config: dict) -> list[str]:
             "(controls llama-server --parallel and the local dispatch lease "
             f"pool); found {raw_pool!r}. Add session_slot_pool_size to the "
             "server section (LP-0MTCZ35X7009IZKE)."
+        )
+
+    # --- warm cap shadowed by the economic ceiling (LP-0MVHSET0A008VU95) ---
+    # effective_warm = min(physical clamp, economic ceiling, absolute), where
+    # the economic ceiling is round(ratio x local_model_ctx_size). An absolute
+    # value ABOVE that ceiling never binds, so raising it alone is a silent
+    # no-op. Reported independently of min_local_routing_threshold so the two
+    # knobs stay a co-change.
+    shortfall = warm_cap_ceiling_shortfall(config)
+    if shortfall > 0:
+        warm_abs = _get_warm_cache_threshold(config)
+        ratio = _get_economic_ceiling_ratio(config)
+        ctx = _get_local_model_ctx_size(config)
+        problems.append(
+            f"local_large_context_warm_cache_threshold={warm_abs} is shadowed "
+            f"by the economic ceiling round({ratio} x {ctx}) = {warm_abs - shortfall}"
+            f": the effective warm cap will be {warm_abs - shortfall}, not "
+            f"{warm_abs} ({shortfall} tokens lost). Raise "
+            "local_large_context_economic_ceiling_ratio to at least "
+            f"{warm_abs}/{ctx} (the two knobs must move together, "
+            "LP-0MVHSET0A008VU95)."
         )
 
     if min_threshold <= 0:

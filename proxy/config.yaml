@@ -1237,17 +1237,35 @@ server:
   # term is the latency/utilisation limit. Only WARM is clamped/capped; COLD
   # is the economic new-token threshold and is left unchanged so the
   # (cold, warm] band stays non-empty (LP-0MSI2M5BT004BCDP).
-  local_large_context_warm_cache_threshold: 100000
+  #
+  # CO-CHANGE (LP-0MVHSET0A008VU95): this value is only an UPPER BOUND on the
+  # economic ceiling (`round(ratio x local_model_ctx_size)`), so setting it
+  # above that ceiling leaves it unused and the effective warm cap unmoved.
+  # Raising it therefore REQUIRES raising
+  # local_large_context_economic_ceiling_ratio alongside it; startup now
+  # reports a config-consistency WARNING when the ceiling shadows this value
+  # (validate_local_routing_config).
+  #
+  # 120000 (was 100000, LP-0MVHSET0A008VU95): the 2026-10-20/21 proxy-usage
+  # report showed local busy only 21.4% of the window while 44.4% of routing
+  # decisions (~2,462) were skipped as context_too_large, i.e. a context cap
+  # problem, not a capacity one. Resolves to 120000 at 1-2 slots (physical
+  # clamp 258048 / 126976) and is still bounded by the 83285 physical clamp
+  # at 3 slots.
+  local_large_context_warm_cache_threshold: 120000
 
   # Latency-derived economic-ceiling ratio for the WARM threshold
   # (LP-0MU466L1X003RTHN). The ceiling scales linearly with the model context
   # size (not the slot count) so a profile change (smaller model, different
-  # slot count) needs no manual threshold recalculation. Shipped 0.3815 =
-  # 100000 / 262144, calibrated to the ~37 tok/s @100K prefill floor: warm
-  # contexts are capped at ~30-38% of the model context. 0 falls back to the
-  # absolute local_large_context_warm_cache_threshold; both 0 disables the
-  # warm cap.
-  local_large_context_economic_ceiling_ratio: 0.3815
+  # slot count) needs no manual threshold recalculation. Shipped 0.4578 =
+  # 120000 / 262144 (was 0.3815 = 100000/262144, LP-0MVHSET0A008VU95), which
+  # keeps the ~37 tok/s @100K prefill floor as the reference point while
+  # letting the ceiling reach the configured 120K warm cap: warm contexts are
+  # capped at ~30-46% of the model context. 0 falls back to the absolute
+  # local_large_context_warm_cache_threshold; both 0 disables the warm cap.
+  # This ratio and the absolute warm value are a CO-CHANGE — raising the
+  # absolute alone is a silent no-op (LP-0MVHSET0A008VU95).
+  local_large_context_economic_ceiling_ratio: 0.4578
 
   # `local_hard_routing_cap_ratio_fast` RETIRED (LP-0MTVXP7DG00613ZB AC3):
   # the single `compaction_trigger_ratio` below is the only session detection

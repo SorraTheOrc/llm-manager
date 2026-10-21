@@ -2409,7 +2409,8 @@ contaminate another session's routing decisions:
 - **Warm** — The session has confirmed cache persistence. Large-context requests
   bypass local at the **effective warm threshold** — the minimum of the
   physical per-slot clamp and a latency-derived economic ceiling
-  (LP-0MU466L1X003RTHN; default effective value: 100K tokens in fast mode).
+  (LP-0MU466L1X003RTHN; default effective value: 120K tokens in fast mode,
+  raised from 100K by LP-0MVHSET0A008VU95).
 - **No session ID** — Falls back to model-level cache state (conservative).
   Sessions without a session_id header default to the same cold behavior.
 
@@ -2430,9 +2431,15 @@ disabled, non-streaming proxy-only mode) does **not** warm the cache.
 
 ```yaml
 local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 = disable cold bypass
-local_large_context_warm_cache_threshold: 100000  # absolute warm upper bound; 0 = disable
-local_large_context_economic_ceiling_ratio: 0.3815  # warm economic ceiling = ratio x model ctx
+local_large_context_warm_cache_threshold: 120000  # absolute warm upper bound; 0 = disable
+local_large_context_economic_ceiling_ratio: 0.4578  # warm economic ceiling = ratio x model ctx
 ```
+
+> **These two warm knobs are a co-change** (LP-0MVHSET0A008VU95). The absolute
+> value is only an **upper bound** on the economic ceiling, so setting it above
+> `round(ratio x local_model_ctx_size)` leaves it unused — raising the absolute
+> alone is a silent no-op. `validate_local_routing_config` reports a startup
+> config-consistency warning when the ceiling shadows the configured absolute.
 
 The effective warm threshold is resolved through a **3-term model**
 (LP-0MU466L1X003RTHN):
@@ -2458,8 +2465,8 @@ which does not override it) uses `38000`; `config-cheap.yaml` overrides it to
 raise breached the cheap queue guardrails and was reverted —
 LP-0MSRM54YO007YG0K AC7).
 Each value stays below its mode's effective warm threshold (fast resolves to
-`min(258048, min(round(0.3815 x 262144), 100000)) = 100000`; cheap resolves to
-`min(83285, 100000) = 83285`) so the (cold, warm] band never collapses
+`min(258048, min(round(0.4578 x 262144), 120000)) = 120000`; cheap resolves to
+`min(83285, 120000) = 83285`) so the (cold, warm] band never collapses
 (LP-0MSI2M5BT004BCDP). Prompts above the effective warm threshold are never
 routed local (`context_too_large` — physical capacity).
 

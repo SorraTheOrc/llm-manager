@@ -296,14 +296,14 @@ class TestLiveConfigsValidate:
 
     def test_unified_profile_cold_below_warm(self):
         """Unified profile (config.yaml, 2 slots): cold 38000 < effective
-        warm min(100000 economic, per-slot clamp 262144//2 - 4096 = 126976)
-        = 100000. The fast/cheap mode profiles no longer exist
-        (LP-0MVDT94F0003VHUA AC4)."""
+        warm min(120000 economic, per-slot clamp 262144//2 - 4096 = 126976)
+        = 120000 (LP-0MVHSET0A008VU95 raised the cap from 100000). The
+        fast/cheap mode profiles no longer exist (LP-0MVDT94F0003VHUA AC4)."""
         from proxy.provider import _effective_large_context_thresholds
 
         cold, warm = _effective_large_context_thresholds(self._load("config.yaml"))
         assert cold == 38000
-        assert warm == 100000
+        assert warm == 120000
         assert cold < warm
 
 
@@ -351,3 +351,61 @@ class TestLiveConfigPersistenceCap:
         slots = int(server_cfg.get("session_slot_pool_size", 0) or 0)
         clamp = effective_per_slot_threshold(ctx_size, slots)
         assert derived <= clamp, f"derived cap {derived} > routing clamp {clamp}"
+
+
+class TestWarmCapCeilingConsistency:
+    """LP-0MVHSET0A008VU95: the configured absolute warm cap must not be
+    shadowed by the economic ceiling.
+
+    ``effective_warm = min(physical, round(ratio x ctx), absolute)`` — so an
+    absolute value ABOVE ``round(ratio x ctx)`` never binds and raising it is
+    a silent no-op. The validator reports the mismatch at startup instead of
+    letting an operator believe the cap moved.
+    """
+
+    @staticmethod
+    def _cfg(ratio=0.4578, warm=120000, ctx=262144, slots=2):
+        return {
+            "server": {
+                "session_slot_pool_size": slots,
+                "local_model_ctx_size": ctx,
+                "local_large_context_cold_cache_threshold": 38000,
+                "local_large_context_warm_cache_threshold": warm,
+                "local_large_context_economic_ceiling_ratio": ratio,
+            }
+        }
+
+    def test_consistent_pairing_reports_no_problem(self):
+        assert validate_local_routing_config(self._cfg()) == []
+
+    def test_shadowed_absolute_reports_a_problem(self):
+        """The pre-change ratio with the raised absolute is caught."""
+        problems = validate_local_routing_config(self._cfg(ratio=0.3815))
+        assert len(problems) == 1
+        msg = problems[0]
+        assert "economic ceiling" in msg
+        assert "120000" in msg
+        assert "local_large_context_economic_ceiling_ratio" in msg
+        assert "local_large_context_warm_cache_threshold" in msg
+        assert not msg.startswith("FATAL: ")
+
+    def test_shadowing_check_runs_when_min_threshold_disabled(self):
+        """The check is independent of min_local_routing_threshold."""
+        cfg = self._cfg(ratio=0.3815)
+        cfg["server"]["min_local_routing_threshold"] = 0
+        problems = validate_local_routing_config(cfg)
+        assert any("economic ceiling" in p for p in problems)
+
+    def test_disabled_ratio_reports_no_problem(self):
+        """ratio 0 falls back to the absolute verbatim — nothing shadowed."""
+        assert validate_local_routing_config(self._cfg(ratio=0)) == []
+
+    def test_disabled_absolute_reports_no_problem(self):
+        assert validate_local_routing_config(self._cfg(warm=0)) == []
+
+    def test_shipped_config_is_consistent(self):
+        """The live config must resolve the economic ceiling up to the
+        configured absolute, otherwise the 120K raise would not take effect."""
+        from config_test_utils import load_profile
+
+        assert validate_local_routing_config(load_profile("config.yaml")) == []
