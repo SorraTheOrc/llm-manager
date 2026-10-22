@@ -1965,9 +1965,18 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     _qwait_ms = max(0.0, (_slot_acquired_ts - _dispatch_start) * 1000.0)
                                                 _first_byte_total_ms = _delta * 1000.0
                                                 _first_byte_service_ms = max(0.0, _first_byte_total_ms - _qwait_ms)
+                                                # ``priority=`` and ``estimated_tokens=`` are emitted for the
+                                                # idle-admission impact measurement (LP-0MVGHXD59008UOUD): AC2
+                                                # compares idle-admitted dispatches with non-idle ones in the
+                                                # SAME context bucket and AC4 compares high-priority latency, so
+                                                # both need to be carried by the dispatch event itself rather than
+                                                # joined heuristically from ``routing_check`` lines. Both values are
+                                                # already computed above in this function; appending them keeps
+                                                # every existing log consumer (and regex) byte-compatible.
                                                 srv.logger.info(
                                                     "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f "
-                                                    "cache_state=%s cached_ratio=%.3f queue_wait_ms=%.1f session=%s model=%s",
+                                                    "cache_state=%s cached_ratio=%.3f queue_wait_ms=%.1f session=%s model=%s "
+                                                    "priority=%s estimated_tokens=%d",
                                                     _first_byte_total_ms,
                                                     _first_byte_service_ms,
                                                     _cache_state,
@@ -1975,6 +1984,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     _qwait_ms,
                                                     session_id or "unknown",
                                                     model_name or "unknown",
+                                                    _priority or "unknown",
+                                                    int(_estimated_tokens or 0),
                                                 )
                                                 # Feed the prefill-ETA calibration window
                                                 # (LP-0MVGDUV5E005UWBQ): the observed service

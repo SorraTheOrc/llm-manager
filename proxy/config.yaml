@@ -1776,6 +1776,31 @@ server:
   local_admission_guard_reference_tokens: 32000
 
   # -----------------------------------------------------------------------
+  # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
+  # -----------------------------------------------------------------------
+  # When the local backend has been idle for ``local_idle_admit_seconds`` and
+  # nothing is queued, in flight or loading, an ECONOMIC cold/large bypass
+  # (``reason=large_context_bypass``) is served locally instead of falling
+  # back to a paid remote provider. The physical capacity cap
+  # (``context_too_large``) is never overridden. Each admission logs
+  # ``routing_idle_admit ... reason=economic_bypass_idle idle_seconds=...
+  # threshold_seconds=... estimated_tokens=... session=...`` and is counted as
+  # ``local_idle_admit`` by the usage report.
+  #
+  # DISABLED BY DEFAULT: an idle-admitted 120 K prompt can hold a slot for
+  # minutes, so the trade (paid fallback avoided vs interactive first-byte
+  # latency) must be measured before this is enabled by default. Enable it
+  # only to run the measurement window, and keep it on only if that window
+  # supports `enable_by_default` — measure with
+  # ``scripts/idle_admit_impact.py``; the runbook, the metric definitions and
+  # the AC5 decision rules are in ``docs/dev/idle-window-measurements.md``.
+  # Rollback is this flag back to ``false`` (no other state). A malformed or
+  # non-positive threshold also disables the override rather than admitting on
+  # a guess.
+  local_idle_admit_enabled: false
+  local_idle_admit_seconds: 60
+
+  # -----------------------------------------------------------------------
   # Expected-reuse prefix credit (LP-0MVI2XOTY008Q4UV)
   # -----------------------------------------------------------------------
   # The routing ``cached_ratio`` is measured on the PREVIOUS local response,
