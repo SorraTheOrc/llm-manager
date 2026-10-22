@@ -69,6 +69,43 @@ DEFAULT_TTL_SECONDS = 86400.0
 SOURCE_RESTORED = "restored"
 """Ratio-source label recorded when seeding from a slot snapshot."""
 
+OUTCOME_FOUND = "found"
+"""A valid sidecar seeded a credit (paired with the ``slot_ratio_restored`` line)."""
+
+OUTCOME_MISSING_SNAPSHOT = "missing_snapshot"
+"""A sidecar exists but its ``slot_<session>.bin`` snapshot does not."""
+
+OUTCOME_MISSING_SIDECAR = "missing_sidecar"
+"""A snapshot exists but no ``.ratio.json`` sidecar was written for it."""
+
+OUTCOME_EXPIRED = "expired"
+"""The sidecar is older than ``session_slot_ratio_ttl_seconds``."""
+
+OUTCOME_MODEL_MISMATCH = "model_mismatch"
+"""The sidecar was written for a different ``llama_model``."""
+
+OUTCOME_PREFIX_MISMATCH = "prefix_mismatch"
+"""The stored message fingerprints are not a prefix of the incoming messages."""
+
+OUTCOME_EMPTY_RATIO = "empty_ratio"
+"""The sidecar produced a zero credit (no cached or no estimated tokens)."""
+
+SEED_OUTCOMES = (
+    OUTCOME_FOUND,
+    OUTCOME_MISSING_SNAPSHOT,
+    OUTCOME_MISSING_SIDECAR,
+    OUTCOME_EXPIRED,
+    OUTCOME_MODEL_MISMATCH,
+    OUTCOME_PREFIX_MISMATCH,
+    OUTCOME_EMPTY_RATIO,
+)
+"""The documented ``slot_ratio_seed outcome=…`` vocabulary (LP-0MVJYZWWW005XGW7).
+
+Every seed attempt for a session that *could* have a snapshot reports exactly
+one of these at INFO, so the real failure mode of the restored-prefix feature
+is measurable from logs. Sessions with no snapshot at all stay silent.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -292,22 +329,121 @@ def ratio_from_sidecar(
     return min(1.0, measured * clamped_margin)
 
 
+def _parse_saved_at(saved_at: Any) -> datetime | None:
+    """Parse an ISO-8601 ``saved_at`` value, returning ``None`` when unusable."""
+    if not isinstance(saved_at, str) or not saved_at:
+        return None
+    try:
+        saved = datetime.fromisoformat(saved_at)
+    except (TypeError, ValueError):
+        return None
+    if saved.tzinfo is None:
+        saved = saved.replace(tzinfo=UTC)
+    return saved
+
+
+def _reference_now(now: datetime | None) -> datetime:
+    """Return *now* as an aware UTC timestamp (defaulting to the current time)."""
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    return reference
+
+
+def _age_seconds(saved_at: Any, now: datetime | None = None) -> int:
+    """Return the sidecar age in whole seconds (``0`` when unparseable)."""
+    saved = _parse_saved_at(saved_at)
+    if saved is None:
+        return 0
+    return max(0, int((_reference_now(now) - saved).total_seconds()))
+
+
 def _is_expired(saved_at: Any, ttl: float, now: datetime | None = None) -> bool:
     """True when *saved_at* (ISO-8601) is older than *ttl* seconds."""
     if ttl <= 0:
         return False
-    if not isinstance(saved_at, str) or not saved_at:
+    saved = _parse_saved_at(saved_at)
+    if saved is None:
         return True
-    try:
-        saved = datetime.fromisoformat(saved_at)
-    except (TypeError, ValueError):
-        return True
-    if saved.tzinfo is None:
-        saved = saved.replace(tzinfo=UTC)
-    reference = now or datetime.now(UTC)
-    if reference.tzinfo is None:
-        reference = reference.replace(tzinfo=UTC)
-    return (reference - saved).total_seconds() > ttl
+    return (_reference_now(now) - saved).total_seconds() > ttl
+
+
+# ---------------------------------------------------------------------------
+# Seed-outcome instrumentation (LP-0MVJYZWWW005XGW7)
+# ---------------------------------------------------------------------------
+
+
+def _short_session(session_id: str | None) -> str:
+    """Return the 8-character session prefix used by the proxy's log lines."""
+    return session_id[:8] if session_id else "unknown"
+
+
+def log_seed_outcome(
+    outcome: str,
+    *,
+    session_id: str | None,
+    model_name: str | None,
+    stored_messages: int = 0,
+    incoming_messages: int = 0,
+    age_s: int = 0,
+    cached_ratio: float = 0.0,
+) -> None:
+    """Emit one INFO ``slot_ratio_seed outcome=…`` line for a seed decision.
+
+    Behaviour-neutral: this only observes the seed path. The vocabulary is
+    documented in ``proxy/docs/routing.md`` so reporting tools can sum outcomes
+    with a single ``grep -c`` per outcome.
+    """
+    logger.info(
+        "slot_ratio_seed outcome=%s session=%s model=%s stored_messages=%d "
+        "incoming_messages=%d age_s=%d cached_ratio=%.2f",
+        outcome,
+        _short_session(session_id),
+        model_name,
+        int(stored_messages),
+        int(incoming_messages),
+        int(age_s),
+        float(cached_ratio),
+    )
+
+
+def _message_count(messages: Any) -> int:
+    """Return the number of messages in *messages* (``0`` when not a list)."""
+    if isinstance(messages, (list, tuple)):
+        return len(messages)
+    return 0
+
+
+def _log_orphan_sidecar(
+    candidates: list[str],
+    *,
+    session_id: str | None,
+    model_name: str | None,
+    incoming_messages: int,
+    now: datetime | None,
+) -> None:
+    """Log ``missing_snapshot`` when a sidecar exists without its snapshot.
+
+    Sessions with neither a snapshot nor a sidecar stay silent: they are the
+    common case and logging them would flood the routing log.
+    """
+    for candidate in candidates:
+        try:
+            if not sidecar_path(candidate).exists():
+                continue
+        except Exception:
+            continue
+        meta = read_slot_ratio_sidecar(candidate)
+        log_seed_outcome(
+            OUTCOME_MISSING_SNAPSHOT,
+            session_id=session_id,
+            model_name=model_name,
+            stored_messages=_message_count(meta.get("messages")) if meta else 0,
+            incoming_messages=incoming_messages,
+            age_s=_age_seconds(meta.get("saved_at"), now) if meta else 0,
+            cached_ratio=0.0,
+        )
+        return
 
 
 def _candidate_slot_filenames(
@@ -370,14 +506,25 @@ def seed_cached_ratio(
     4. the sidecar is not older than ``session_slot_ratio_ttl_seconds``;
     5. the sidecar's message fingerprints prefix-match the incoming messages
        (AC2 — changed system prompt / truncated history earns nothing).
+
+    Every decision for a session that *could* have a snapshot is recorded at
+    INFO as ``slot_ratio_seed outcome=…`` (LP-0MVJYZWWW005XGW7): the seed path
+    made zero contact for 54.4 h and the failure mode was unobservable while
+    the only diagnostic was DEBUG. The logging is behaviour-neutral — no
+    branch, threshold or credited value changed.
     """
     if not session_id or not model_name or not isinstance(server_config, dict):
         return None
     slot_path = server_config.get("session_slot_save_path")
     if not slot_path:
         return None
+
+    messages = body_json.get("messages") if isinstance(body_json, dict) else None
+    incoming_messages = _message_count(messages)
+
+    candidates = _candidate_slot_filenames(slot_path, session_id, endpoint)
     slot_filename = None
-    for candidate in _candidate_slot_filenames(slot_path, session_id, endpoint):
+    for candidate in candidates:
         try:
             if Path(candidate).exists():
                 slot_filename = candidate
@@ -385,28 +532,70 @@ def seed_cached_ratio(
         except Exception:
             continue
     if not slot_filename:
+        _log_orphan_sidecar(
+            candidates,
+            session_id=session_id,
+            model_name=model_name,
+            incoming_messages=incoming_messages,
+            now=now,
+        )
         return None
 
     meta = read_slot_ratio_sidecar(slot_filename)
     if meta is None:
-        return None
-    stored_model = meta.get("model")
-    if stored_model and str(stored_model) != str(model_name):
-        return None
-    if _is_expired(meta.get("saved_at"), ttl_seconds(server_config), now):
+        log_seed_outcome(
+            OUTCOME_MISSING_SIDECAR,
+            session_id=session_id,
+            model_name=model_name,
+            incoming_messages=incoming_messages,
+        )
         return None
 
-    messages = body_json.get("messages") if isinstance(body_json, dict) else None
+    stored_messages = _message_count(meta.get("messages"))
+    age_s = _age_seconds(meta.get("saved_at"), now)
+    stored_model = meta.get("model")
+    if stored_model and str(stored_model) != str(model_name):
+        log_seed_outcome(
+            OUTCOME_MODEL_MISMATCH,
+            session_id=session_id,
+            model_name=model_name,
+            stored_messages=stored_messages,
+            incoming_messages=incoming_messages,
+            age_s=age_s,
+        )
+        return None
+    if _is_expired(meta.get("saved_at"), ttl_seconds(server_config), now):
+        log_seed_outcome(
+            OUTCOME_EXPIRED,
+            session_id=session_id,
+            model_name=model_name,
+            stored_messages=stored_messages,
+            incoming_messages=incoming_messages,
+            age_s=age_s,
+        )
+        return None
+
     if not prefix_matches(meta.get("messages"), message_fingerprints(messages)):
-        logger.debug(
-            "slot_ratio_sidecar skipped reason=prefix_mismatch session=%s model=%s",
-            session_id[:8] if session_id else "unknown",
-            model_name,
+        log_seed_outcome(
+            OUTCOME_PREFIX_MISMATCH,
+            session_id=session_id,
+            model_name=model_name,
+            stored_messages=stored_messages,
+            incoming_messages=incoming_messages,
+            age_s=age_s,
         )
         return None
 
     ratio = ratio_from_sidecar(meta, estimated_tokens, safety_margin(server_config))
     if ratio <= 0.0:
+        log_seed_outcome(
+            OUTCOME_EMPTY_RATIO,
+            session_id=session_id,
+            model_name=model_name,
+            stored_messages=stored_messages,
+            incoming_messages=incoming_messages,
+            age_s=age_s,
+        )
         return None
 
     try:
@@ -421,6 +610,15 @@ def seed_cached_ratio(
     except Exception:
         logger.debug("slot ratio seeding failed", exc_info=True)
         return None
+    log_seed_outcome(
+        OUTCOME_FOUND,
+        session_id=session_id,
+        model_name=model_name,
+        stored_messages=stored_messages,
+        incoming_messages=incoming_messages,
+        age_s=age_s,
+        cached_ratio=ratio,
+    )
     logger.info(
         "slot_ratio_restored session=%s model=%s cached_tokens=%d "
         "estimated_tokens=%s cached_ratio=%.3f",

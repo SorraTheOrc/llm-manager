@@ -524,6 +524,52 @@ separately from genuine prompt-cache hits. `slot_ratio_restored` is logged once
 per seed with `cached_tokens`, `estimated_tokens` and the credited
 `cached_ratio`.
 
+### Seed-outcome instrumentation (`slot_ratio_seed`, LP-0MVJYZWWW005XGW7)
+
+A ≥24 h measurement (LP-0MVGGPSVM003W35K) found the seeding path made **zero
+contact** in 54.4 h while 33 sidecar-bearing sessions hit the local routing gate
+2,918 times — yet the only diagnostic was a DEBUG line, invisible at the INFO
+level the proxy runs at. Every seed decision for a session that *could* have a
+snapshot therefore emits one INFO line (behaviour-neutral — no credit decision
+changed):
+
+```
+slot_ratio_seed outcome=<outcome> session=<8> model=<model> stored_messages=<n> incoming_messages=<n> age_s=<n> cached_ratio=<x.xx>
+```
+
+| `outcome` | Meaning |
+|-----------|---------|
+| `found` | Sidecar validated and a credit was applied (also emits `slot_ratio_restored`). |
+| `missing_sidecar` | `slot_<session>.bin` exists but no readable `.ratio.json` sidecar was written for it (absent, corrupt, or unknown schema version; `stored_messages=0`, `age_s=0`). |
+| `missing_snapshot` | A sidecar exists but its snapshot is gone — an orphaned sidecar (counts/`age_s` read from the sidecar). |
+| `expired` | `age_s` exceeds `session_slot_ratio_ttl_seconds` (default 86 400). |
+| `model_mismatch` | The sidecar was written for a different `llama_model`. |
+| `prefix_mismatch` | The stored message fingerprints are not a prefix of the incoming messages (rewritten system prompt or client-compacted history). |
+| `empty_ratio` | The sidecar produced no credit (`cached_tokens` or `estimated_tokens` is 0). |
+
+Sessions with **no snapshot and no sidecar at all** stay silent — that is the
+common case, so log volume is bounded by snapshot-bearing sessions only. The
+line supersedes the old DEBUG `slot_ratio_sidecar skipped reason=prefix_mismatch`
+record: there is no duplicated DEBUG/INFO pair for the same event.
+
+**Aggregating the outcomes** (per reporting window, e.g. 24 h of
+`llama-proxy.log`):
+
+```bash
+for o in found missing_sidecar missing_snapshot expired model_mismatch prefix_mismatch empty_ratio; do
+  printf '%-18s %s\n' "$o" "$(grep -c "slot_ratio_seed outcome=$o" llama-proxy.log)"
+done
+# Age distribution of expired sidecars (is the 24 h TTL binding?):
+grep -o 'slot_ratio_seed outcome=expired .*age_s=[0-9]*' llama-proxy.log | grep -o 'age_s=[0-9]*'
+# Message-growth pattern for prefix mismatches (stored vs incoming):
+grep 'slot_ratio_seed outcome=prefix_mismatch' llama-proxy.log | grep -o 'stored_messages=[0-9]* incoming_messages=[0-9]*' | sort | uniq -c | sort -rn | head
+```
+
+A high `prefix_mismatch` share points at the guard (rewritten fronts); a high
+`expired` share points at the TTL; `missing_sidecar`/`missing_snapshot` point at
+the writer or at slot-file churn; a high `found` with no `slot_ratio_restored`
+lines would indicate an error inside `set_cached_ratio`.
+
 ## Capacity-based local admission (LP-0MVGDUVS6003T2IX)
 
 The economic gate (`local_large_context_cold_cache_threshold`, 38 000 new
