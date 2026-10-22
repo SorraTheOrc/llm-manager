@@ -129,18 +129,34 @@ Exit code is `0` only when every check passes **and** the recommendation is
 ## Runbook: measuring the override
 
 1. **Enable and start the window.** Set `server.local_idle_admit_enabled: true`
-   (keep `server.local_idle_admit_seconds: 60` for the first window) and
-   restart the proxy (`/skill:start-proxy --restart`) so the change takes
-   effect. Record the restart time — that is `--deployed-at` and the earliest
-   valid post-deploy window start.
-2. **Wait ≥ 24 h.** The window cannot be shortened; the tool refuses to call a
+   (keep `server.local_idle_admit_seconds: 60` for the first window), commit and
+   push it to `dev`, then make the running proxy pick it up:
+
+   ```bash
+   curl -s -X POST http://localhost:8000/admin/reload-config
+   ```
+
+   `POST /admin/reload-config` re-reads `proxy/config.yaml` into `srv.config`
+   without restarting anything, so in-flight streams (and any agent talking to
+   the proxy) are not interrupted. Record the reload time — that is
+   `--deployed-at` and the earliest valid post-deploy window start. A full
+   restart (`/skill:start-proxy --restart`) also works but is heavier: it drops
+   in-flight requests and resets the process-local idle clock.
+2. **Verify it is live.** The next request that would have been an economic
+   bypass while the GPU is idle logs
+   `routing_idle_admit ... reason=economic_bypass_idle`; on-demand check:
+   `grep -c routing_idle_admit /var/log/llama-proxy/proxy.log`.
+3. **Wait ≥ 24 h.** The window cannot be shortened; the tool refuses to call a
    shorter window a post-deploy window under `--window-closed`.
-3. **Run the measurement** with explicit windows, `--deployed-at` and
+4. **Run the measurement** with explicit windows, `--deployed-at` and
    `--window-closed`, and attach the JSON artifact to the work item.
-4. **Act on the recommendation.** `enable_by_default` → keep the flag on and
+5. **Act on the recommendation.** `enable_by_default` → keep the flag on and
    record the numbers next to the knob in `proxy/config.yaml`. `tune` → open
    the follow-up the tool proposes (priority gating / prompt-size cap /
    threshold) and keep the flag on or off according to that decision.
+
+Rollback is the flag back to `false` plus the same `POST /admin/reload-config`
+— there is no other state to unwind.
 
 Notes when reading a window:
 
