@@ -1974,6 +1974,181 @@ async def test_query_slot_processing_false_when_slot_idle(monkeypatch):
     )
     assert await _query_slot_processing(srv, "sess-x", None) is False
 
+
+# ---------------------------------------------------------------------------
+# Fail-closed orphan cleanup (LP-0MVIQ0FJC000YLX0)
+# ---------------------------------------------------------------------------
+
+
+def _expired_active_record_recent_progress(model_name: str = "Qwen3") -> dict:
+    """An active expired record whose progress clock is still fresh — the
+    shape that must be EXTENDED (fail-closed) when the /slots probe is
+    inconclusive (LP-0MVIQ0FJC000YLX0).
+
+    ``started_at`` is also recent so the no-progress watchdog's max-prefill
+    ceiling does not release the record in phase 1; the test is exercising
+    the phase-3 fail-closed verdict specifically."""
+    now = time.monotonic()
+    return {
+        "backend": "local",
+        "started_at": now - 10,  # inside max_prefill ceiling
+        "active": True,
+        "expires_at": 0.0,  # expired
+        "last_progress_ts": now,  # fresh progress
+        "model_name": model_name,
+    }
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_extends_recent_progress_when_probe_inconclusive(monkeypatch):
+    """LP-0MVIQ0FJC000YLX0 AC2: when the /slots probe fails or is
+    inconclusive but the record has recent progress, the lease is EXTENDED
+    (fail-closed), not orphan-cleaned. A stream must never lose its slot to
+    a probe that timed out under prefill load."""
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    srv = _make_orphan_srv(records={
+        "sess-recent": _expired_active_record_recent_progress(),
+    })
+    # Probe fails (llama-server unreachable / event loop busy).
+    monkeypatch.setattr(
+        "proxy.router_helpers._query_slot_processing",
+        AsyncMock(side_effect=TimeoutError("slots query timed out")),
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    assert removed == 0, "Recent-progress record must not be orphan-cleaned"
+    assert "sess-recent" in srv.local_dispatch_records, (
+        "Recent-progress lease must be preserved on inconclusive probe"
+    )
+    record = srv.local_dispatch_records["sess-recent"]
+    assert record["expires_at"] > time.monotonic(), (
+        "Lease must be extended past the present"
+    )
+    # No orphan_cleanup warning for the preserved stream.
+    warnings = [
+        call for call in srv.logger.warning.call_args_list
+        if "reason=orphan_cleanup" in str(call)
+    ]
+    assert not warnings, "No orphan_cleanup warning for extended lease"
+    # A distinct INFO log marks the fail-closed extension.
+    infos = [
+        str(call) for call in srv.logger.info.call_args_list
+        if "lease_verified_active" in str(call)
+    ]
+    assert len(infos) == 1, "Expected lease_verified_active INFO log"
+    # Counter consistency: local_active_queries was NOT decremented.
+    assert srv.local_active_queries == 1
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_probe_timeout_treated_as_alive_with_recent_progress(monkeypatch):
+    """LP-0MVIQ0FJC000YLX0 AC2: a /slots probe that TIMES OUT (rather than
+    returning idle) is treated as alive when progress is recent — the probe
+    timing out under a heavy prefill means the event loop is busy, not that
+    the slot is dead."""
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    srv = _make_orphan_srv(records={
+        "sess-busy": _expired_active_record_recent_progress(),
+    })
+    monkeypatch.setattr(
+        "proxy.router_helpers._query_slot_processing",
+        AsyncMock(return_value=False),  # probe returned "idle" — but progress is fresh
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    assert removed == 0, "Fresh-progress record must be extended even on idle probe"
+    assert "sess-busy" in srv.local_dispatch_records
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_cancels_upstream_stream_on_genuine_orphan(monkeypatch):
+    """LP-0MVIQ0FJC000YLX0 AC3: a genuinely wedged record (no recent
+    progress) with a captured ``stream_cm`` is orphan-cleaned AND its
+    upstream stream is cancelled (``stream_cm.__aexit__``) so the
+    llama-server slot is actually freed."""
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    calls = []
+
+    class _FakeStreamCM:
+        def __init__(self):
+            self.exits = 0
+
+        async def __aexit__(self, *args):
+            self.exits += 1
+            calls.append("aexit")
+
+    stream_cm = _FakeStreamCM()
+    srv = _make_orphan_srv(records={
+        # Legacy-shaped record: no progress clock, so the no-progress watchdog
+        # declines to act (phase 1) and the expired active record reaches the
+        # phase-3 orphan path — which must now cancel the upstream stream.
+        "sess-wedged": {
+            "backend": "local",
+            "started_at": time.monotonic() - 1000,
+            "active": True,
+            "expires_at": 0.0,  # expired
+            "model_name": "Qwen3",
+            "stream_cm": stream_cm,
+        },
+    })
+    monkeypatch.setattr(
+        "proxy.router_helpers._query_slot_processing",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        "proxy.session._free_slot_assignment", lambda *a, **k: None
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    assert removed == 1, "Genuinely wedged record must be cleaned"
+    assert "sess-wedged" not in srv.local_dispatch_records
+    assert calls == ["aexit"], (
+        f"Upstream stream must be cancelled on orphan cleanup, got {calls}"
+    )
+    assert stream_cm.exits == 1
+    # Counter consistency: local_active_queries was decremented for the
+    # orphaned record.
+    assert srv.local_active_queries == 0
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_fail_closed_is_scoped_to_fresh_progress(monkeypatch):
+    """LP-0MVIQ0FJC000YLX0 boundary: fail-closed applies only to a FRESH
+    progress clock. With the no-progress watchdog disabled
+    (``local_dispatch_no_progress_timeout_seconds: 0``) a stale expired
+    active record is still orphan-cleaned — the fail-closed extension never
+    becomes an unbounded lease."""
+    from proxy.router_helpers import _cleanup_stale_local_dispatch
+
+    srv = _make_orphan_srv(records={
+        "sess-stale": {
+            "backend": "local",
+            "started_at": time.monotonic() - 10,
+            "active": True,
+            "expires_at": 0.0,  # expired
+            "last_progress_ts": time.monotonic() - 900,  # stale
+            "model_name": "Qwen3",
+        },
+    })
+    # Disable the watchdog so the phase-3 fail-closed verdict is what decides.
+    srv.config["server"]["local_dispatch_no_progress_timeout_seconds"] = 0
+    monkeypatch.setattr(
+        "proxy.router_helpers._query_slot_processing",
+        AsyncMock(return_value=False),
+    )
+
+    removed = await _cleanup_stale_local_dispatch(srv)
+
+    assert removed == 1, "Stale-progress record must still be orphan-cleaned"
+    assert "sess-stale" not in srv.local_dispatch_records
+    assert srv.local_active_queries == 0
+
 # ---------------------------------------------------------------------------
 # Prefill-aware dispatch guard (LP-0MTJET4I5009EHNX)
 # ---------------------------------------------------------------------------

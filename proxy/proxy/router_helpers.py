@@ -1941,10 +1941,11 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None, e
     query targets that llama-server instance so per-endpoint dispatch
     records are verified against the correct server (LP-0MRPILSMW004T4H8).
 
-    Returns False (do not treat as alive) when the session has no slot
-    assignment, no *model_name* is known (the router requires a model
-    param), or the query fails/times out — the caller then proceeds with
-    normal orphan cleanup.
+    Returns False (probe inconclusive) when the session has no slot
+    assignment, no *model_name* is known, or the query fails/times out.
+    The caller must apply fail-closed semantics (LP-0MVIQ0FJC000YLX0):
+    if the record has recent ``last_progress_ts``, treat it as alive
+    rather than orphaning on an inconclusive probe.
     """
     if not session_id or not model_name:
         return False
@@ -2059,9 +2060,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
        still processing, the lease is extended by the chunk-refresh buffer
        instead (``lease_verified_active ... stream_abandoned=False``), so a
        long silent generation cannot lose its lease mid-flight
-       (LP-0MSUO6XRP001MCB2). Genuinely idle slots are orphan-cleaned as
+       (LP-0MSUO6XRP001MCB2). LP-0MVIQ0FJC000YLX0: also extended when the
+       /slots probe is inconclusive (fail-closed) but the record has recent
+       ``last_progress_ts``. Genuinely idle slots are orphan-cleaned as
        before, logged at WARNING level with ``reason=orphan_cleanup`` plus
-       an INFO-level ``lease_released reason=orphan_cleanup`` for parity
+       an INFO-level ``lease_released reason=orphan_cleanup`` for parity.
+       On genuine orphan cleanup, the upstream HTTP stream is cancelled
+       (``stream_cm.__aexit__``) so the llama-server slot is actually freed.
        with existing log consumers.
 
     Active records whose *expires_at* is still in the future are preserved
@@ -2164,10 +2169,11 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
         pass
 
     # Phase 2 (outside the lock): verify which candidates still have a
-    # processing slot on llama-server. A failed / unverifiable query means
-    # "not verified alive" — the record is orphan-cleaned below (fail-open,
-    # matching pre-existing behaviour). The no-progress watchdog already ran
-    # in phase 1, so records reaching here have shown recent progress.
+    # processing slot on llama-server. A failed/unverifiable query means
+    # the record is not in ``alive`` — Phase 3 applies fail-closed semantics
+    # (LP-0MVIQ0FJC000YLX0): if the record has recent ``last_progress_ts``,
+    # extend the lease rather than orphaning. The no-progress watchdog already
+    # ran in phase 1, so records reaching here have shown recent progress.
     alive: set[str] = set()
     for sid, record in verify_candidates:
         try:
@@ -2213,7 +2219,35 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         except Exception:
                             pass
                         continue
+                    # LP-0MVIQ0FJC000YLX0: fail-closed on unverifiable liveness.
+                    # If the /slots probe failed or timed out (session not in
+                    # ``alive``) but the record has recent progress, treat it
+                    # as alive and extend the lease rather than orphaning. This
+                    # prevents orphaning streams that are still generating but
+                    # whose /slots query timed out under heavy prefill load.
+                    no_progress_timeout = _get_no_progress_timeout_seconds(srv)
+                    last_progress_ts = current.get("last_progress_ts")
+                    if last_progress_ts is not None and no_progress_timeout > 0:
+                        now = time.monotonic()
+                        if now - last_progress_ts <= no_progress_timeout:
+                            # Recent progress detected — extend the lease.
+                            current["expires_at"] = (
+                                time.monotonic()
+                                + _get_chunk_refresh_buffer_seconds(srv)
+                            )
+                            try:
+                                srv.logger.info(
+                                    "lease_verified_active session=%s "
+                                    "reason=recent_progress stream_abandoned=False",
+                                    _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+                                )
+                            except Exception:
+                                pass
+                            continue
                     # Genuinely orphaned active record past its expires_at
+                    # Capture stream_cm before deleting so we can cancel
+                    # the upstream request and actually free the llama-server slot.
+                    stream_cm = current.pop("stream_cm", None)
                     del srv.local_dispatch_records[sid]
                     try:
                         _p = getattr(srv, "local_prefill_in_flight", None)
@@ -2222,6 +2256,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     except Exception:
                         pass
                     removed += 1
+                    # LP-0MVIQ0FJC000YLX0: cancel the upstream stream so the
+                    # llama-server slot is actually freed. Without this the
+                    # slot stays occupied on the backend while the proxy
+                    # thinks it is free (LP-0MUGQHPJ50046LV8).
+                    if stream_cm is not None:
+                        try:
+                            await stream_cm.__aexit__(None, None, None)
+                        except Exception:
+                            pass
                     # Free the slot registry entry so the slot can be
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
                     try:

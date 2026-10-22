@@ -62,6 +62,41 @@ sessions that are actively generating tokens. The key design choices are:
   (LP-0MTYAWDCQ006RGYU). This self-healing mechanism recovers the pool within
   ~20 seconds without a proxy restart.
 
+#### Dispatch-lease orphan cleanup: fail-closed liveness (LP-0MVIQ0FJC000YLX0)
+
+Every local dispatch holds an **active dispatch record** (lease + slot
+registry entry) until it finishes. A periodic sweep
+(`_cleanup_stale_local_dispatch`) releases records whose `expires_at` has
+passed. Because a stream can finish late or its release-on-finish can be
+skipped, the sweep verifies liveness before freeing a lease:
+
+- **Primary evidence is progress, not `/slots`.** llama-server blocks
+  `/slots` for the whole prompt-processing batch, so under a heavy prefill the
+  probe times out and used to be read as "dead" (fail-open) — freeing the
+  lease and slot of a stream that was still working (measured 298
+  `orphan_cleanup` vs 6 `lease_verified_active` in 24 h, with 81 of 118 long
+  streams orphan-cleaned mid-flight yet finishing later).
+- **Fail-closed rule.** When the `/slots` probe is inconclusive (timeout,
+  error, no slot assignment) but the record's `last_progress_ts` is inside
+  `server.local_dispatch_no_progress_timeout_seconds` (default 180 s), the
+  lease is **extended** (logged `lease_verified_active
+  reason=recent_progress stream_abandoned=False`) instead of orphaned. A busy
+  backend is not a dead backend.
+- **Bounded, not unbounded.** The no-progress watchdog
+  (`reason=no_progress_watchdog`) and the max-prefill ceiling
+  (`server.local_dispatch_max_prefill_seconds`, default 900 s) still release
+  a genuinely wedged record — fail-closed only protects a *fresh* progress
+  clock.
+- **Genuine orphans cancel upstream.** When a record really is orphaned, the
+  sweep cancels the captured upstream stream context (`stream_cm.__aexit__`)
+  before freeing the lease, so the llama-server slot is actually released —
+  matching what the no-progress-watchdog path already did. Without this the
+  proxy freed its bookkeeping while the backend kept prefilling, admitting new
+  long prefills onto a busy GPU.
+- **Counters stay consistent.** `local_active_queries`, the slot registry and
+  `local_prefill_in_flight` are updated on the same paths as the lease, so
+  admission and serialisation never see a slot the backend is still using.
+
 ### 5. Remote Model Handling
 
 For remote models (`proxy_to_remote()`):

@@ -245,10 +245,14 @@ async def test_lease_held_past_stream_end_busy_until_idle_timeout_then_idle():
         assert j2["active_query"] is True
         assert j2["local_owner_session_id"] == h.SESSION
 
-        # Idle-timeout: expires_at passes. The periodic cleanup removes the
-        # orphan lease (decrementing the local counter); the recovery loop
-        # then resets the stuck global counter.
+        # Idle-timeout: expires_at passes. Also age the last_progress_ts so
+        # the fail-closed check (LP-0MVIQ0FJC000YLX0) does not extend the
+        # lease — the record's progress clock is older than the no-progress
+        # timeout, confirming it is a genuine orphan.
         server.local_dispatch_records[h.SESSION]["expires_at"] = time.monotonic() - 1.0
+        server.local_dispatch_records[h.SESSION]["last_progress_ts"] = (
+            time.monotonic() - 300
+        )
         removed = await _cleanup_stale_local_dispatch(server)
         assert removed == 1
         assert h.SESSION not in server.local_dispatch_records
@@ -371,6 +375,12 @@ async def test_herdr_polling_after_recovery_passes_continuous_idle_gate():
         await _increment_active_queries(server)
         await _increment_local_active_queries(server, session_key=h.SESSION, backend="local")
         server.local_dispatch_records[h.SESSION]["expires_at"] = time.monotonic() - 1.0
+        # Age last_progress_ts so fail-closed (LP-0MVIQ0FJC000YLX0) doesn't
+        # extend the lease — the record's progress clock is older than the
+        # no-progress timeout.
+        server.local_dispatch_records[h.SESSION]["last_progress_ts"] = (
+            time.monotonic() - 300
+        )
         await _recovery_tick()
         assert server.active_queries == 0
         assert server.local_active_queries == 0
