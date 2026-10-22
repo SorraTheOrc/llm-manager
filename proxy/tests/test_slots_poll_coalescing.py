@@ -205,12 +205,12 @@ async def test_query_slots_updates_last_known_counts(monkeypatch):
 # cancellation path (leader cancelled, leader vanished) is exercised, which is
 # what these three regression tests pin.
 #
-# TDD red phase: the assertions are marked ``xfail(strict=True)`` so ``dev``
-# stays green until the fix item LP-0MVK1YDKB0009HTM resolves/cancels the
-# shared future on leader cancellation and bounds the follower wait. That item
-# removes the markers, turning each into a plain assertion (same convention as
-# ``test_compaction_headers_contract.py``, LP-0MU44KR5F0015D7A). The verified
-# pre-fix RED output is recorded on LP-0MVK1YCVV007HNAG.
+# These tests were written failing-first under ``xfail(strict=True)`` on
+# LP-0MVK1YCVV007HNAG (pre-fix RED output recorded there).
+# LP-0MVK1YDKB0009HTM resolved/cancelled the shared future on leader
+# cancellation and bounded the follower wait, and removed the markers so each
+# assertion is now enforced (RED-before / GREEN-after evidence is recorded on
+# that item).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _URL = "http://localhost:8080/slots?model=m"
@@ -271,14 +271,6 @@ async def _bounded_wait(tasks, deadline: float):
     return done, pending
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RED phase: a cancelled leader leaves the single-flight future pending, so "
-        "followers hang forever until LP-0MVK1YDKB0009HTM resolves it and bounds the "
-        "follower wait (LP-0MVJML600003CQ6Y)"
-    ),
-)
 @pytest.mark.asyncio
 async def test_cancelled_leader_releases_followers():
     """AC1: cancelling the owner of the fetch must release its followers.
@@ -324,14 +316,6 @@ async def test_cancelled_leader_releases_followers():
         obs._slots_poll_inflight.pop(_URL, None)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RED phase: a cancelled leader leaves the single-flight future pending, so "
-        "followers hang forever until LP-0MVK1YDKB0009HTM resolves it and bounds the "
-        "follower wait (LP-0MVJML600003CQ6Y)"
-    ),
-)
 @pytest.mark.asyncio
 async def test_follower_recovers_when_leader_disappears_without_resolving(monkeypatch):
     """AC2: a follower wait is bounded even when the leader simply vanishes.
@@ -370,14 +354,6 @@ async def test_follower_recovers_when_leader_disappears_without_resolving(monkey
             orphan.cancel()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RED phase: a cancelled leader leaves the single-flight future pending, so "
-        "followers hang forever until LP-0MVK1YDKB0009HTM resolves it and bounds the "
-        "follower wait (LP-0MVJML600003CQ6Y)"
-    ),
-)
 @pytest.mark.asyncio
 async def test_cancelled_leader_leaves_no_pending_future_or_leak_warnings(caplog):
     """AC3: cancel-owning request must not leak a pending future or warnings.
