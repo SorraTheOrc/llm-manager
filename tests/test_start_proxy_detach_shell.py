@@ -12,12 +12,11 @@ Covers AC3 of LP-0MVGT0E6W000Q8CY via the test-first child
 LP-0MVK3K4IL0055DEQ: the launched server must survive a ``SIGKILL`` of the
 launcher's entire process group (a foreground ``exec`` of uvicorn does not).
 
-RED phase — the harness is written before the change it pins (child
-LP-0MVK3KIPZ002SR32), so it fails against today's foreground ``exec`` launch.
-The marker is ``strict``: it records that expected failure without hiding a
-regression, and it cannot outlive the fix — once the detach launch lands, a
-leftover marker makes the harness's success a hard ``XPASS(strict)`` failure,
-which the implementation child must clear by removing this decorator.
+GREEN phase — the detach launch now lives in ``start-proxy.sh``
+(LP-0MVK3KIPZ002SR32), so the harness must pass on its own. It was written
+first (child LP-0MVK3K4IL0055DEQ) under a ``strict`` xfail marker that failed
+hard if the fix landed without clearing it; that marker is gone now that the
+fix is in, and this wrapper's success is the regression gate.
 """
 
 from __future__ import annotations
@@ -32,13 +31,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = Path("tests/test_start_proxy_detach.sh")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RED until LP-0MVK3KIPZ002SR32 implements the detached-by-default "
-        "launch in start-proxy.sh (parent LP-0MVGT0E6W000Q8CY)"
-    ),
-)
 def test_detach_survival_harness_passes() -> None:
     """Run the sandboxed shell harness; it must exit 0 with no failures."""
     bash = shutil.which("bash")

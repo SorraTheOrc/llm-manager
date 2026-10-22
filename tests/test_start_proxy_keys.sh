@@ -153,6 +153,12 @@ USE_ENV_KEYS=""
 
 run_proxy() {
     # Usage: run_proxy [start-proxy.sh args...]
+    #
+    # --foreground is REQUIRED here: this harness intercepts the final
+    # `exec uvicorn` via the fake python3 shim and asserts on the shim's output.
+    # start-proxy.sh now detaches by default (LP-0MVGT0E6W000Q8CY), which would
+    # send the shim's output to the log file instead of this captured stream and
+    # make every key assertion vacuous.
     local -a envp=(
         "HOME=$SANDBOX/home"
         "PATH=$SANDBOX:$PATH"
@@ -163,7 +169,7 @@ run_proxy() {
 
     local out
     out=$(cd "$PROXY_DIR" && env -u "$ENV_VAR" -u LLAMA_PROXY_USE_ENV_KEYS \
-        "${envp[@]}" bash scripts/start-proxy.sh --port "$TEST_PORT" "$@" 2>&1)
+        "${envp[@]}" bash scripts/start-proxy.sh --foreground --port "$TEST_PORT" "$@" 2>&1)
     LAST_RC=$?
     printf '%s\n' "$out" > "$RUN_LOG"
 }
