@@ -1402,6 +1402,21 @@ async def _handle_remote_streaming(
         except Exception:
             pass
 
+        # Count local↔remote provider transitions per session
+        # (LP-0MVI2VRT2000V1AP AC5): one ``routing_hop`` line per real change,
+        # so a thrash pattern is countable without log archaeology.
+        try:
+            from proxy.provider import note_routing_hop
+
+            note_routing_hop(
+                session_id,
+                provider or "remote",
+                model_name=model_name,
+                entry=entry,
+            )
+        except Exception:
+            pass
+
         # Per-chunk idle timeout and retry state (LP-0MRE52D3C001KP1H)
         _retry_count = 0
         # Bounded provider failover deadline (LP-0MU1RXEPL005CK97): wall-clock

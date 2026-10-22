@@ -140,3 +140,145 @@ Note: herdr's shipped `evaluateIdle` still applies its documented Q7
 degradation (`N < total` ⇒ require ALL slots free) until the ContextHub
 consumer item WL-0MSG7P9N8009PCKG lands; this item delivers the
 proxy-side enabler the consumer will build on.
+
+---
+
+# Truthful local capacity: slot phase + prefill ETA (LP-0MVGDUVGE0024YAI)
+
+`GET /llama/local/status` now publishes enough per-slot detail for a
+dispatcher to tell a slot that is **actually working** from one that is merely
+**reserved but idle**, and to price the wait before it launches a session. The
+change is additive and versioned (`status_schema_version: 2`); a client that
+ignores the new fields behaves exactly as before (contract test:
+`test_new_capacity_fields_are_additive_and_versioned`).
+
+## Payload (new fields)
+
+```json
+{
+  "status_schema_version": 2,
+  "total_slots": 2,
+  "available_slots": 0,
+  "contention_queue_depth": 3,          // existing, elsewhere in the payload
+  "capacity_hint": "prefill_bound",
+  "prefill_budget_seconds": 120.0,
+  "queue_eta_seconds": 240.0,
+  "slots": [
+    {"slot_id": 0, "is_processing": true, "n_decoded": 0,
+     "context_tokens": 102345, "owner_session_id": "…",
+     "lease_state": "generating", "phase": "prefill",
+     "prefill_eta_seconds": 187.0},
+    {"slot_id": 1, "is_processing": false, "n_decoded": null,
+     "context_tokens": null, "owner_session_id": "…",
+     "lease_state": "idle_leased", "phase": null,
+     "prefill_eta_seconds": null}
+  ]
+}
+```
+
+Per-slot fields (all additive):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `owner_session_id` | `str \| null` | Session holding a live dispatch lease on the slot (active, or post-stream cooldown). `null` when unowned. |
+| `lease_state` | `"generating" \| "idle_leased" \| "free"` | `generating` whenever `is_processing` is true (never `free` while a prefill or decode is in flight); `idle_leased` when not processing but a live lease still reserves it; `free` otherwise. |
+| `phase` | `"prefill" \| "decode" \| null` | Inferred proxy-side (see below); `null` when the slot is not processing. |
+| `context_tokens` | `int \| null` | Prompt progress (`max(n_past, n_prompt_tokens_processed)`) when the llama.cpp build reports it, else `null`. |
+| `prefill_eta_seconds` | `float \| null` | Shared calibrated prefill cost of the slot's loaded context, only for a slot in `prefill`; `null` otherwise or when not computable. |
+
+Top-level fields: `capacity_hint`, `prefill_budget_seconds`,
+`status_schema_version` (plus the existing `prefill_eta_seconds` /
+`queue_eta_seconds`).
+
+## `lease_state` (AC2)
+
+- `generating` — `is_processing` is true. Takes precedence, so a working slot is
+  **never** reported `free`.
+- `idle_leased` — not processing, but the slot's session still holds a live
+  dispatch lease (active, or inactive inside its post-stream cooldown window,
+  `expires_at` in the future). This is the reserved-but-idle case behind 2,633
+  of 2,641 `local_dispatch_denied` events while local decoded only 29.3 % of
+  wall clock.
+- `free` — not processing and no live lease. An **expired** inactive lease
+  does not keep a slot `idle_leased`.
+
+Source: `_build_status_slot_owners()` joins the slot registry
+(`proxy.session._slot_owners`, `(endpoint, slot_id) → session`) to the
+per-session dispatch records (`srv.local_dispatch_records`), normalising keys
+through `_dispatch_key_session_id()`.
+
+## `phase` inference (AC5)
+
+llama-server exposes no phase field, so it is derived proxy-side from
+`/slots` signals (`infer_slot_phase()`):
+
+- not processing → `null`;
+- processing and `next_token.n_decoded` is `None` or `0` → `prefill` (prompt
+  progress, when present, corroborates — including the transition where
+  `n_past` advances while `n_decoded` stays at zero);
+- processing and `n_decoded > 0` → `decode`.
+
+The rule is deliberately conservative for very short prefills: a processing
+slot with no decode signal is reported `prefill`, never guessed as `decode`.
+
+## ETA fields (AC3) — one source of truth
+
+Every ETA comes from the shared calibration / admission guard in
+`proxy/proxy/prefill_eta.py`; there is no second estimator.
+
+- per-slot `prefill_eta_seconds` — `prefill_eta.per_slot_prefill_eta_seconds()`,
+  a thin wrapper over `estimate_prefill_seconds()` (cache-cold, the conservative
+  case used by the published reference estimate). `null` when the slot is not
+  in `prefill`, or when `context_tokens` is unknown (modern llama.cpp builds
+  dropped `n_past`/`n_prompt_tokens_processed`) — never a misleading `0`.
+- `queue_eta_seconds` / `prefill_eta_seconds` (top level) — unchanged, from
+  `prefill_eta.status_estimate()`.
+- `prefill_budget_seconds` — the admission guard's own wait budget
+  (`prefill_eta.wait_budget_seconds()`, i.e. the contention-queue max wait);
+  `null` when no budget is resolvable.
+
+## `capacity_hint` decision table (AC4)
+
+Evaluated **in order** (`compute_capacity_hint()`):
+
+1. `idle` — at least one slot is `free` **or** every occupied slot is
+   `idle_leased` (nothing is actually generating).
+2. `prefill_bound` — no slot is free and at least one occupied slot is in
+   `prefill`.
+3. `saturated` — no slot is free and every occupied slot is in `decode`.
+
+Two documented extensions: an empty `slots` array (server down / no model / no
+cached detail) is `idle` (fail-open — never claim saturation without evidence),
+and a pool with no free slot, no prefill and mixed `decode` / `idle_leased`
+occupancy is `saturated` (genuine decode work, nothing available to a newcomer).
+
+## Freshness honesty (AC7)
+
+`slots_stale` semantics are unchanged. When the served slot data came from the
+last-known cache (a failed fresh `/slots` query), **both per-slot and top-level
+ETA fields are `null`** — a dispatcher never acts on a stale wait estimate.
+`prefill_budget_seconds` is a configuration constant (not poll-derived) and
+stays truthful.
+
+## Consumer contract — herdr `downtime-worker.ts` (AC6)
+
+The consumer change lives in ContextHub
+`packages/herdr/src/downtime-worker.ts` and is a separate ContextHub work item
+(referenced from this item's description); this document defines the contract it
+gates on. Its `parseLlamaStatus` / `LlamaSlot` parser notes already accept an
+optional per-slot `owner_session_id`; extend them to also read:
+
+- `slots[].lease_state` — prefer this over "non-empty `owner_session_id` ⇒
+  busy". A slot is genuinely busy only when `lease_state === "generating"`;
+  `idle_leased` is reserved-but-idle (the false-busy case); `free` is available.
+- `slots[].phase` and `slots[].prefill_eta_seconds` — price the wait for a
+  prefilling slot instead of treating all busy time as equal (prefill dominates
+  hold time: p50 61.8 s, p90 269.8 s).
+- `capacity_hint` — a one-field summary: `idle` (safe to dispatch),
+  `prefill_bound` (a prefill is in flight), `saturated` (all occupied slots are
+  decoding).
+- `prefill_budget_seconds` — the admission guard's budget, so the dispatcher
+  paces to the same number the proxy enforces.
+
+All of these are optional: the existing `is_processing` / `n_decoded` /
+`available_slots` reads keep working unchanged (AC1).

@@ -12,6 +12,15 @@ Context bypasses (``context_too_large`` / ``large_context_bypass``) are
 physical capacity limits and are NEVER queued — provider.py evaluates the
 skip decision before enqueueing.
 
+Lease-owner retention priority (LP-0MVI2VRT2000V1AP): a session that already
+holds a local lease, or was granted one within
+``contention_queue_lease_grace_seconds`` and still has local cache history,
+is a *retained* waiter. Retained waiters are inserted ahead of non-retained
+ones (FIFO within each class) so a returning session reclaims the slot it
+just left instead of queueing behind a newcomer for the full budget and
+detouring to a paid provider. A retained session without cache history (its
+prefix was genuinely evicted) gets no priority.
+
 Wake signals (F3 AC2): the queue wakes on BOTH ``local_active_queries``
 decrement (a local stream ended → a slot freed) AND slot-persistence /
 lease release (slot save/restore frees the backend during model switches).
@@ -26,16 +35,26 @@ A — bounded by the wait/depth caps.
 """
 
 import asyncio
+import logging
 import time
 from collections import deque
 from collections.abc import Callable
+
+logger = logging.getLogger("llama-proxy")
 
 # ---------------------------------------------------------------------------
 # Cross-session queue state (module-level = process-wide)
 # ---------------------------------------------------------------------------
 
-_waiters: deque = deque()  # deque of (enqueued_at, asyncio.Event)
+# Each waiter: (enqueued_at, asyncio.Event, session_id, retained).
+_waiters: deque = deque()
 _condition: asyncio.Condition | None = None
+
+#: ``session_id -> monotonic`` time of its most recent local lease grant.
+_local_grant_times: dict[str, float] = {}
+
+#: Cap on the grant registry (one entry per session, pruned on insert).
+_MAX_GRANT_ENTRIES = 1000
 
 
 def _get_condition() -> asyncio.Condition:
@@ -50,11 +69,87 @@ def reset() -> None:
     global _waiters, _condition
     _waiters = deque()
     _condition = None
+    _local_grant_times.clear()
 
 
 def queue_depth() -> int:
     """Current number of waiters in the cross-session queue."""
     return len(_waiters)
+
+
+# ---------------------------------------------------------------------------
+# Lease-owner retention registry (LP-0MVI2VRT2000V1AP)
+# ---------------------------------------------------------------------------
+
+def note_local_grant(session_id: str | None, *, now: float | None = None) -> None:
+    """Record that *session_id* was granted a local dispatch lease.
+
+    Called from the dispatch-lease acquisition path. The timestamp is what
+    makes a session a *returning* session after it releases its lease: within
+    ``contention_queue_lease_grace_seconds`` it keeps retention priority.
+    Never raises — a bookkeeping failure must not affect dispatch.
+    """
+    if not session_id:
+        return
+    try:
+        timestamp = time.monotonic() if now is None else float(now)
+        if session_id not in _local_grant_times and len(_local_grant_times) >= _MAX_GRANT_ENTRIES:
+            try:
+                _local_grant_times.pop(next(iter(_local_grant_times)), None)
+            except StopIteration:
+                pass
+        _local_grant_times[session_id] = timestamp
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("note_local_grant failed", exc_info=True)
+
+
+def forget_local_grant(session_id: str | None) -> None:
+    """Drop the grant record for *session_id* (session invalidated)."""
+    if not session_id:
+        return
+    _local_grant_times.pop(session_id, None)
+
+
+def is_recent_local_owner(
+    session_id: str | None,
+    grace_seconds: float,
+    *,
+    now: float | None = None,
+) -> bool:
+    """True when *session_id* held a local lease within *grace_seconds*.
+
+    ``grace_seconds <= 0`` disables retention entirely (the rollback path).
+    """
+    if not session_id or grace_seconds <= 0:
+        return False
+    granted = _local_grant_times.get(session_id)
+    if granted is None:
+        return False
+    current = time.monotonic() if now is None else float(now)
+    return (current - granted) <= grace_seconds
+
+
+def is_retained_local_owner(
+    session_id: str | None,
+    model_name: str | None,
+    *,
+    grace_seconds: float,
+) -> bool:
+    """Full retention predicate: recent local owner AND surviving cache history.
+
+    The cache-history half is what keeps the priority honest: when the
+    session's prefix was genuinely evicted (its ratio record was cleared and
+    no measurement survives), re-admitting it is no cheaper than a newcomer,
+    so it earns no priority (LP-0MVI2VRT2000V1AP AC3).
+    """
+    if not is_recent_local_owner(session_id, grace_seconds):
+        return False
+    try:
+        from proxy.provider import _get_cached_ratio_source
+
+        return _get_cached_ratio_source(model_name, session_id) is not None
+    except Exception:  # pragma: no cover - defensive
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +178,7 @@ async def wake_all() -> None:
     stuck-counter recovery)."""
     cond = _get_condition()
     async with cond:
-        for _, ev in _waiters:
+        for _, ev, *_rest in _waiters:
             ev.set()
 
 
@@ -91,10 +186,35 @@ async def wake_all() -> None:
 # Bounded wait
 # ---------------------------------------------------------------------------
 
+def _enqueue(
+    entry: tuple,
+    retained: bool,
+) -> int:
+    """Insert *entry* into ``_waiters``, retained waiters ahead of newcomers.
+
+    Returns the number of non-retained waiters the entry jumped ahead of
+    (0 when appended FIFO). Retained entries are appended after any existing
+    retained ones, so ordering within a class stays FIFO.
+    """
+    if not retained:
+        _waiters.append(entry)
+        return 0
+    insert_at = 0
+    for index, existing in enumerate(_waiters):
+        if existing[3] if len(existing) > 3 else False:
+            insert_at = index + 1
+        else:
+            break
+    _waiters.insert(insert_at, entry)
+    return len(_waiters) - insert_at - 1
+
+
 async def wait_for_local_slot(
     max_wait_seconds: float,
     max_depth: int,
     slot_free_check: Callable[[], bool],
+    session_id: str | None = None,
+    retained: bool = False,
 ) -> float | None:
     """Wait (bounded, cross-session) for a local slot to free.
 
@@ -104,6 +224,10 @@ async def wait_for_local_slot(
 
     *slot_free_check* is a zero-arg callable returning True when a local
     slot is currently free (e.g. ``lambda: _get_local_concurrency_info(config)[0] < max_local``).
+
+    *retained* marks a returning session (see the module docstring): its
+    waiter is placed ahead of non-retained waiters and the reorder is logged
+    naming both sessions and the reason (LP-0MVI2VRT2000V1AP AC1).
     """
     cond = _get_condition()
     started = time.monotonic()
@@ -115,7 +239,22 @@ async def wait_for_local_slot(
             # Slot already free (race between the decision point and here).
             return 0.0
         ev = asyncio.Event()
-        _waiters.append((started, ev))
+        ahead_of = _enqueue((started, ev, session_id, retained), retained)
+        if retained and ahead_of > 0:
+            try:
+                overtaken = next(
+                    (w[2] for w in _waiters if not (w[3] if len(w) > 3 else False)),
+                    "unknown",
+                )
+                logger.info(
+                    "contention_queue_retention session=%s ahead_of=%s "
+                    "reason=lease_owner_retention depth=%d",
+                    session_id or "unknown",
+                    overtaken or "unknown",
+                    len(_waiters),
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
     try:
         while True:
             remaining = max_wait_seconds - (time.monotonic() - started)
@@ -132,7 +271,7 @@ async def wait_for_local_slot(
             ev.clear()
     finally:
         async with cond:
-            for i, (t, e) in enumerate(_waiters):
-                if e is ev:
+            for i, waiter in enumerate(_waiters):
+                if waiter[1] is ev:
                     del _waiters[i]
                     break

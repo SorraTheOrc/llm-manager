@@ -1228,3 +1228,99 @@ async def test_lease_denied_budget_expires_all_remotes_out_of_window_terminal(le
     assert "contention_queue_fallback_after_queue" in " ".join(
         r.getMessage() for r in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# Lease-owner retention grace resolution (LP-0MVI63OM1009K51W)
+# ---------------------------------------------------------------------------
+
+
+def test_lease_grace_default_is_not_clamped_and_logs_nothing(caplog):
+    """AC1/AC3: the shipped 300 s default survives the resolver silently.
+
+    Regression: the grace was clamped to ``contention_queue_max_wait_seconds``
+    (120), so every per-request resolution emitted a WARNING and the default
+    could never take effect.
+    """
+    import logging
+
+    from proxy.router import _get_contention_queue_config
+
+    caplog.set_level(logging.WARNING, logger="llama-proxy")
+    cfg = {
+        "contention_queue_policy": "queue",
+        "contention_queue_max_wait_seconds": 120,
+        "contention_queue_max_depth": 8,
+    }
+
+    resolved = _get_contention_queue_config(cfg)
+
+    assert resolved["lease_grace_seconds"] == 300.0
+    resolved_again = _get_contention_queue_config(cfg)
+    assert resolved_again["lease_grace_seconds"] == 300.0
+    assert caplog.records == [], (
+        "a valid configuration must not log per request: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+
+
+def test_lease_grace_clamps_to_the_runtime_ceiling(caplog):
+    """AC2: above the guardrail ceiling → clamped once, with a warning."""
+    import logging
+
+    from proxy.router import _get_contention_queue_config
+
+    caplog.set_level(logging.WARNING, logger="llama-proxy")
+    resolved = _get_contention_queue_config(
+        {
+            "contention_queue_policy": "queue",
+            "contention_queue_max_wait_seconds": 120,
+            "contention_queue_lease_grace_seconds": 99999,
+            "session_guardrail_max_runtime_seconds": 1800,
+        }
+    )
+
+    assert resolved["lease_grace_seconds"] == 1800.0
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_lease_grace_seconds" in messages
+    assert "clamped" in messages
+    assert "session_guardrail_max_runtime_seconds" in messages
+
+
+def test_lease_grace_zero_disables_retention_without_warning(caplog):
+    """AC2: 0 is a valid value (rollback path), not a clamp."""
+    import logging
+
+    from proxy.router import _get_contention_queue_config
+
+    caplog.set_level(logging.WARNING, logger="llama-proxy")
+    assert (
+        _get_contention_queue_config(
+            {"contention_queue_lease_grace_seconds": 0}
+        )["lease_grace_seconds"]
+        == 0.0
+    )
+    assert caplog.records == []
+
+
+def test_lease_grace_negative_and_garbage_clamp_to_zero(caplog):
+    """AC2: negative clamps to 0; garbage falls back to the 300 s default."""
+    import logging
+
+    from proxy.router import _get_contention_queue_config
+
+    caplog.set_level(logging.WARNING, logger="llama-proxy")
+    assert (
+        _get_contention_queue_config(
+            {"contention_queue_lease_grace_seconds": -5}
+        )["lease_grace_seconds"]
+        == 0.0
+    )
+    assert (
+        _get_contention_queue_config(
+            {"contention_queue_lease_grace_seconds": "soon"}
+        )["lease_grace_seconds"]
+        == 300.0
+    )
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "Invalid contention_queue_lease_grace_seconds" in messages

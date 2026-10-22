@@ -230,6 +230,11 @@ async def test_cold_start_caps_concurrent_dispatches_then_lifts():
     assert acquired_b is False, "Second concurrent prefill must be deferred while cold"
 
     # A's prefill completes -> first data byte -> cache warm -> cap lifts.
+    # The first byte also releases A's prefill hold, which is what opens the
+    # prefill-serialisation gate (LP-0MVGDUUV3001XFRJ) for the deferred session.
+    from proxy.router_helpers import _increment_generating_only_slot
+
+    await _increment_generating_only_slot(srv, "large-a")
     cold_start.mark_warm()
     assert not cold_start.is_cold(cfg)
     warm_max = cold_start.effective_max_concurrent(cfg, configured_max)
@@ -430,6 +435,11 @@ async def test_proxy_to_local_warm_bypasses_cold_cap(monkeypatch):
             "max_concurrent_queries": 16,
             "local_cold_start_grace_seconds": 120,
             "local_cold_start_max_concurrent": 1,
+            # Prefill serialisation is a separate axis (LP-0MVGDUUV3001XFRJ);
+            # this harness intentionally has one prefill already in flight, so
+            # the gate is disabled here to keep the cold-start behaviour under
+            # test rather than the prefill cap.
+            "local_max_concurrent_prefills": 0,
         }
     }
     _install_router_harness(monkeypatch, server_cfg)

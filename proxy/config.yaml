@@ -109,6 +109,34 @@
 #                        api_key_env: SOME_FREE_KEY
 #                        rate_limit_rpm: 15
 #
+# Per-model budget knobs (optional, LP-0MVDVK5TM004TQQV):
+#   The four *behaviour* knobs (reserve_ratio, wait_max_seconds, max_waiters,
+#   affinity_ttl_seconds) may be tuned per fallback chain via a
+#   `models.<name>.budget` block, and per provider entry via that entry's own
+#   `budget` block. Precedence is ENTRY > MODEL > SERVER > built-in default, per
+#   knob, so a layer sets only what it cares about and absent keys fall through.
+#   Values are clamped exactly as the server knobs are (ratio to [0, 1], wait /
+#   TTL / waiters to >= 0); malformed values are logged and fall back to the
+#   next layer (fail open). The budget BUCKET stays keyed by provider entry — a
+#   `models.plan` and `models.code` block tuning the same entry still share one
+#   `rate_limit_rpm` window (one account quota); the blocks only change how each
+#   chain treats that window. Example:
+#     models:
+#       plan:
+#         budget:
+#           reserve_ratio: 0.4
+#           wait_max_seconds: 10
+#           max_waiters: 4
+#           affinity_ttl_seconds: 600
+#         providers:
+#           - name: some-free-tier
+#             type: remote
+#             endpoint: https://api.example.com/v1
+#             api_key_env: SOME_FREE_KEY
+#             rate_limit_rpm: 15
+#             budget:            # optional per-entry behaviour override
+#               reserve_ratio: 0.2
+#
 # Upstream rate-limit headers (optional, remote providers only):
 #   respect_ratelimit_headers - when true, an HTTP 429 carrying
 #                    `x-ratelimit-reset-requests` / `-tokens` /
@@ -339,6 +367,19 @@ models:
   # OpenCode Go #2, then DeepSeek direct.
   # Slot exhaustion on the local model falls through to remote tiers.
   # Requires OPENCODE_API_KEY and DEEPSEEK_API_KEY env vars (or pi auth.json fallback).
+  #
+  # Per-model budget tuning (LP-0MVDVK5TM004TQQV) — all keys optional, absent
+  # keys fall through to server.* then the built-in default:
+  #   budget:
+  #     reserve_ratio: 0.4        # share of rate_limit_rpm kept for sessions
+  #                               # already using the entry (server: 0.3)
+  #     wait_max_seconds: 10      # per-request wait cap for those sessions
+  #                               # (server: 15; 0 never waits)
+  #     max_waiters: 4            # concurrent waiter cap (server: 8)
+  #     affinity_ttl_seconds: 600 # how long a session counts as in progress
+  #                               # (server: 900)
+  # The bucket stays per provider entry, so plan/author/code tuning the same
+  # entry share one rate_limit_rpm window — only the behaviour differs.
   plan:
     providers:
       - name: local-qwen3
@@ -382,12 +423,15 @@ models:
         # requests from NEW sessions pass straight through to the next tier
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
-        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        # Deliberately conservative at 2/min (LP-0MVF19DKR008VCHO): the free
+        # Tune per chain with `models.<name>.budget` or per entry with this
+        # entry's own `budget` block (LP-0MVDVK5TM004TQQV); otherwise the
+        # server.provider_rate_limit_wait_* / provider_affinity_ttl_* defaults
+        # apply.
+        # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
         # tier is a bonus tier, so bursts spill to the paid tiers instead.
-        # floor(2 x 0.3) = 0 reserve slots, so new and in-progress sessions
-        # both see the full 2-per-window cap.
-        rate_limit_rpm: 2
+        # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 3-per-window cap.
+        rate_limit_rpm: 3
       - name: opencode-go-3
         display_name: OpenCode Go 3
         type: remote
@@ -574,12 +618,15 @@ models:
         # requests from NEW sessions pass straight through to the next tier
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
-        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        # Deliberately conservative at 2/min (LP-0MVF19DKR008VCHO): the free
+        # Tune per chain with `models.<name>.budget` or per entry with this
+        # entry's own `budget` block (LP-0MVDVK5TM004TQQV); otherwise the
+        # server.provider_rate_limit_wait_* / provider_affinity_ttl_* defaults
+        # apply.
+        # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
         # tier is a bonus tier, so bursts spill to the paid tiers instead.
-        # floor(2 x 0.3) = 0 reserve slots, so new and in-progress sessions
-        # both see the full 2-per-window cap.
-        rate_limit_rpm: 2
+        # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 3-per-window cap.
+        rate_limit_rpm: 3
       - name: opencode-go-3
         display_name: OpenCode Go 3
         type: remote
@@ -740,12 +787,15 @@ models:
         # requests from NEW sessions pass straight through to the next tier
         # (never parked); a session already served by this entry waits a
         # bounded time for the window to reset, preserving its prompt cache.
-        # Tune with server.provider_rate_limit_wait_* / provider_affinity_ttl_*.
-        # Deliberately conservative at 2/min (LP-0MVF19DKR008VCHO): the free
+        # Tune per chain with `models.<name>.budget` or per entry with this
+        # entry's own `budget` block (LP-0MVDVK5TM004TQQV); otherwise the
+        # server.provider_rate_limit_wait_* / provider_affinity_ttl_* defaults
+        # apply.
+        # Deliberately conservative at 3/min (LP-0MVF19DKR008VCHO): the free
         # tier is a bonus tier, so bursts spill to the paid tiers instead.
-        # floor(2 x 0.3) = 0 reserve slots, so new and in-progress sessions
-        # both see the full 2-per-window cap.
-        rate_limit_rpm: 2
+        # floor(3 x 0.3) = 0 reserve slots, so new and in-progress sessions
+        # both see the full 3-per-window cap.
+        rate_limit_rpm: 3
       - name: opencode-go-3
         display_name: OpenCode Go 3
         type: remote
@@ -1015,6 +1065,11 @@ server:
   #   - provider_affinity_ttl_seconds: how long a session counts as "in
   #     progress" on a gated entry (default 900 = 15 min; 0 disables affinity,
   #     so every request is treated as new).
+  # These four are the GLOBAL defaults — a `models.<name>.budget` block, or a
+  # provider entry's own `budget` block, overrides any of them per chain/entry
+  # (precedence: entry > model > server > default, LP-0MVDVK5TM004TQQV;
+  # see the header comment for the full example). The budget bucket itself
+  # stays per provider entry, shared by every model that routes through it.
   provider_rate_limit_reserve_ratio: 0.3
   provider_rate_limit_wait_max_seconds: 15
   provider_rate_limit_wait_max_waiters: 8
@@ -1237,17 +1292,35 @@ server:
   # term is the latency/utilisation limit. Only WARM is clamped/capped; COLD
   # is the economic new-token threshold and is left unchanged so the
   # (cold, warm] band stays non-empty (LP-0MSI2M5BT004BCDP).
-  local_large_context_warm_cache_threshold: 100000
+  #
+  # CO-CHANGE (LP-0MVHSET0A008VU95): this value is only an UPPER BOUND on the
+  # economic ceiling (`round(ratio x local_model_ctx_size)`), so setting it
+  # above that ceiling leaves it unused and the effective warm cap unmoved.
+  # Raising it therefore REQUIRES raising
+  # local_large_context_economic_ceiling_ratio alongside it; startup now
+  # reports a config-consistency WARNING when the ceiling shadows this value
+  # (validate_local_routing_config).
+  #
+  # 120000 (was 100000, LP-0MVHSET0A008VU95): the 2026-10-20/21 proxy-usage
+  # report showed local busy only 21.4% of the window while 44.4% of routing
+  # decisions (~2,462) were skipped as context_too_large, i.e. a context cap
+  # problem, not a capacity one. Resolves to 120000 at 1-2 slots (physical
+  # clamp 258048 / 126976) and is still bounded by the 83285 physical clamp
+  # at 3 slots.
+  local_large_context_warm_cache_threshold: 120000
 
   # Latency-derived economic-ceiling ratio for the WARM threshold
   # (LP-0MU466L1X003RTHN). The ceiling scales linearly with the model context
   # size (not the slot count) so a profile change (smaller model, different
-  # slot count) needs no manual threshold recalculation. Shipped 0.3815 =
-  # 100000 / 262144, calibrated to the ~37 tok/s @100K prefill floor: warm
-  # contexts are capped at ~30-38% of the model context. 0 falls back to the
-  # absolute local_large_context_warm_cache_threshold; both 0 disables the
-  # warm cap.
-  local_large_context_economic_ceiling_ratio: 0.3815
+  # slot count) needs no manual threshold recalculation. Shipped 0.4578 =
+  # 120000 / 262144 (was 0.3815 = 100000/262144, LP-0MVHSET0A008VU95), which
+  # keeps the ~37 tok/s @100K prefill floor as the reference point while
+  # letting the ceiling reach the configured 120K warm cap: warm contexts are
+  # capped at ~30-46% of the model context. 0 falls back to the absolute
+  # local_large_context_warm_cache_threshold; both 0 disables the warm cap.
+  # This ratio and the absolute warm value are a CO-CHANGE — raising the
+  # absolute alone is a silent no-op (LP-0MVHSET0A008VU95).
+  local_large_context_economic_ceiling_ratio: 0.4578
 
   # `local_hard_routing_cap_ratio_fast` RETIRED (LP-0MTVXP7DG00613ZB AC3):
   # the single `compaction_trigger_ratio` below is the only session detection
@@ -1482,6 +1555,63 @@ server:
   session_slot_pool_size: 2
 
   # -----------------------------------------------------------------------
+  # Prefill serialisation (LP-0MVGDUUV3001XFRJ)
+  # -----------------------------------------------------------------------
+  # Maximum concurrent local PREFILLS (dispatch → first byte). Decoding in
+  # other slots is unaffected — only prefill-vs-prefill is serialised (decode
+  # keeps running in parallel).
+  #
+  # Measured 2026-10-19 → 10-20 (460 paired local dispatches): 47.8 % of
+  # prefills shared the GPU with at least one other; per-request first-byte
+  # p50 was 85.0 s with one overlap vs 23.4 s alone, while aggregate prefill
+  # throughput stayed flat (~254 tok/s) — concurrency added latency, not
+  # capacity. 1 = serialise (default); 0 = disable the gate (the cap becomes
+  # the slot pool, i.e. the behaviour before this change). A malformed or
+  # negative value falls back to 1.
+  #
+  # A request that cannot start its prefill waits in the bounded contention
+  # queue above (when the policy allows) and falls back to remote exactly as
+  # before when the caps are hit; the prefill-ETA admission guard refuses
+  # waits that cannot succeed. Server restart required to change.
+  local_max_concurrent_prefills: 1
+
+  # -----------------------------------------------------------------------
+  # Capacity-based local admission (LP-0MVGDUVS6003T2IX)
+  # -----------------------------------------------------------------------
+  # The economic gate is a fixed NEW-TOKEN threshold
+  # (local_large_context_cold_cache_threshold: 38000) and the physical cap is
+  # the per-slot clamp. Those thresholds are UNCHANGED by this feature: raising
+  # them was rejected twice (LP-0MVGCOZMZ003I6PF, LP-0MVGD9YLM0055SFF) because
+  # the 38k-124k band needs ~100 slot-hours per 24h when cache-cold against
+  # ~26 h of measured idle headroom - it only fits with warm caches.
+  #
+  # Instead the economic band may be admitted locally while its projected
+  # slot-seconds fit inside a share of MEASURED idle slot time:
+  #   projected_s = prefill ETA (calibrated from dispatch_first_byte_ms)
+  #                 + local_capacity_admission_decode_seconds
+  #   budget_s    = local_capacity_admission_budget_ratio *
+  #                 (slots * horizon - union(busy slot intervals in horizon))
+  # The prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ) and prefill
+  # serialisation (LP-0MVGDUUV3001XFRJ) supply the admission control this
+  # depends on.
+  #
+  # DEFAULT OFF. Enable only after cache warmth (LP-0MVGD9YXH008O304), the
+  # prefill-ETA guard and prefill serialisation are live in the RUNNING proxy
+  # and the 24h measurement (LP-0MVGHXD59008UOUD) is green.
+  # Rollback: local_capacity_admission_enabled: false (read per request; no
+  # llama-server restart needed).
+  #
+  # Achieved warm threshold: unchanged - the hard routing cap (~126,976 at
+  # N=2, ctx 262144, minus output headroom). Reason: the measured cold share of
+  # local dispatches in the 24h window ending 2026-10-20 11:00 is 39.4%
+  # (206/523), better than the 45.7% baseline but not low enough to justify
+  # widening a fixed threshold; capacity-based admission is used instead.
+  local_capacity_admission_enabled: false
+  local_capacity_admission_budget_ratio: 0.8
+  local_capacity_admission_horizon_seconds: 3600
+  local_capacity_admission_decode_seconds: 30
+
+  # -----------------------------------------------------------------------
   # Contention queue (merged from the retired config-fast/cheap overlays)
   # -----------------------------------------------------------------------
   # The per-mode queue policy was declared by the mode overlays
@@ -1495,6 +1625,124 @@ server:
   contention_queue_policy: queue
   contention_queue_max_wait_seconds: 120
   contention_queue_max_depth: 8
+  # Lease-owner retention priority (LP-0MVI2VRT2000V1AP). A session that
+  # already holds a local lease, or was granted one within this grace window
+  # AND still has local cache history, is placed ahead of non-retained
+  # waiters in the contention queue (FIFO within each class). Rationale: a
+  # returning session otherwise re-queues behind newcomers, waits the full
+  # 120 s budget and detours to a paid provider, then comes back and
+  # re-prefills — measured on 2026-10-21 as 7 local<->remote transitions in
+  # 12 minutes for one session, with no ETA or context-size cause.
+  # The cache-history requirement keeps the priority honest: a session whose
+  # prefix was evicted is no cheaper than a newcomer and earns no priority.
+  # Each reorder logs ``contention_queue_retention session=... ahead_of=...
+  # reason=lease_owner_retention``. Bounds [0, session_guardrail_max_runtime_
+  # seconds] (1800); the grace deliberately MAY exceed
+  # ``contention_queue_max_wait_seconds`` so a returning session always
+  # re-queues as retained. ``0`` disables retention (the rollback path: queue
+  # order returns to plain FIFO) with no warning.
+  contention_queue_lease_grace_seconds: 300
+
+  # -----------------------------------------------------------------------
+  # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ)
+  # -----------------------------------------------------------------------
+  # Before entering the contention queue the proxy costs the projected local
+  # prefill from OBSERVED dispatches (dispatch_first_byte_ms, per model and
+  # context bucket, rolling window) and compares it with the caller's wait
+  # budget (``contention_queue_max_wait_seconds`` above; ``high`` priority
+  # never queues, so it has no budget). When the prefill cannot finish inside
+  # the budget the wait is a guaranteed loss — the request would park for up
+  # to the full budget and then fall back remote anyway (measured 2026-10-19
+  # → 10-20: 4,947 of 5,805 queued waits = 85 % abandoned) — so local
+  # admission is refused immediately and the request falls through to the
+  # next provider. A request refused this way that finds no remote provider
+  # receives a retryable 429 with ``Retry-After`` and ``X-Local-Admission*``
+  # headers.
+  #
+  # The comparison is OCCUPANCY-AWARE (LP-0MVICD2YW004DJPV): the quantity
+  # tested against the budget is
+  # ``projected_wait = eta_prefill * (busy_slots + 1)`` — the own prefill
+  # repeated for the occupied gate ahead of it (``busy_slots`` = the larger of
+  # the generating concurrency and ``prefills in flight``, capped at the slot
+  # pool). With prefills serialised (``local_max_concurrent_prefills: 1``)
+  # the in-flight prefill is always ahead of a newcomer, and ignoring it
+  # admitted waits that ``/llama/local/status``'s own ``queue_eta_seconds``
+  # had already flagged as unservable (2026-10-21 window: 261 of 302 queued
+  # waits fell back after queueing, 215 at the full budget). The same function
+  # computes ``queue_eta_seconds`` on /llama/local/status, so the published
+  # estimate and the enforced verdict cannot drift. An in-flight prefill with
+  # unobservable progress is charged the calibrated estimate (never "free
+  # soon").
+  #
+  # Fail-open: the change can only refuse further DOOMED admissions, never
+  # admit more than before, and an uncalibrated bucket still admits.
+  #
+  #   reject  — refuse admission when the projected wait exceeds the budget
+  #             (default)
+  #   observe — log the decision (``local_admission_guard decision=…``) but
+  #             never refuse; use to validate calibration on live traffic
+  #   off     — do not evaluate the guard at all
+  #
+  # The guard is INERT (today's queueing behaviour, byte-for-byte) until a
+  # (model, context bucket) window holds ``local_admission_guard_min_samples``
+  # observations, so it can never refuse on a guess. Decisions and their
+  # ETAs are counted by the proxy-usage-analysis report; each logged decision
+  # carries ``eta_prefill_s``, ``eta_occupancy_s``, ``projected_wait_s``,
+  # ``budget_s``, ``busy_slots`` and ``in_flight_prefills``.
+  #
+  # Local admission reservations + fallback intent
+  # ----------------------------------------------
+  # (LP-0MVIKPCSG002B0NL) A dispatcher can claim local capacity ATOMICALLY
+  # before sending: ``POST /llama/local/reserve {estimated_tokens, ...}`` runs
+  # the same estimator and occupancy probe as this guard (never a second ETA
+  # implementation) and returns either a short-TTL single-use ticket
+  # (``X-Local-Reservation: <id>`` on the follow-up dispatches without
+  # re-checking or queueing) or an immediate 429 with ``reason`` /
+  # ``queue_eta_s`` / ``budget_s`` / ``retry_after_s``. Tickets are default-
+  # 10 s, capped at 60 s, cancellable via
+  # ``DELETE /llama/local/reserve/<id>`` and pruned on expiry.
+  #
+  # ``X-Local-Preference: prefer-local|local-only|remote-ok`` expresses intent
+  # per request: ``local-only`` returns the 429 admission response instead of
+  # falling back remote (even when remotes exist); ``remote-ok`` removes the
+  # local provider from the chain; unknown values and an absent header behave
+  # exactly as ``prefer-local`` (today). ``high`` priority keeps its
+  # never-queue semantics under every preference.
+  #
+  # Interaction with the queue: ``contention_queue_max_wait_seconds`` is the
+  # wait budget both this guard and ``/reserve`` compare against, and
+  # ``contention_queue_max_depth`` still bounds the requests that DO queue —
+  # a reserved dispatch does not consume queue depth. Every response carries
+  # ``X-Local-Route: local|remote|refused`` (plus ``X-Local-Fallback-Reason``
+  # on remote/refused), and ``/llama/local/status`` publishes the reservation
+  # counters (``reserved_issued``/``used``/``cancelled``/``expired``) so
+  # reserved-but-unused tickets are observable.
+  local_admission_guard_policy: reject
+  local_admission_guard_min_samples: 5
+  local_admission_guard_window_samples: 200
+  # Prompt size used for the published estimate on /llama/local/status when
+  # no dispatch has been observed yet for the current model.
+  local_admission_guard_reference_tokens: 32000
+
+  # -----------------------------------------------------------------------
+  # Expected-reuse prefix credit (LP-0MVI2XOTY008Q4UV)
+  # -----------------------------------------------------------------------
+  # The routing ``cached_ratio`` is measured on the PREVIOUS local response,
+  # so a session's genuinely cold first turn records 0.0 and the second turn
+  # used to inherit it — every turn of a growing session was costed as fully
+  # cache-cold. The proxy now also records each local prompt's measured size
+  # plus a fingerprint of its message list; when the incoming message list
+  # extends that recorded prefix (the same prefix-match rule the slot-snapshot
+  # sidecar uses), the expected reusable prefix is credited as
+  # ``cached_prefix_credit_margin × min(prev_prompt_tokens, estimate)``.
+  #
+  # The measured ratio remains a floor (a warm measured ratio always wins),
+  # a changed head or truncated history earns no credit, and a brand-new
+  # session still routes cold. The margin matches the snapshot sidecar's
+  # safety margin: llama.cpp may invalidate its own checkpoints on this hybrid
+  # architecture, so credit less than the full recorded prompt. Set to 0.0 to
+  # disable the credit and restore the previous behaviour exactly.
+  cached_prefix_credit_margin: 0.9
 
   # -----------------------------------------------------------------------
   # Priority routing cheap window (LP-0MVDT94F0003VHUA AC1)

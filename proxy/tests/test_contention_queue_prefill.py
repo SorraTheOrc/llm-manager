@@ -61,6 +61,11 @@ def _cfg(max_wait: float = 60.0, max_depth: int = 4, slots: int = 1) -> dict:
         "provider_cooldown_seconds": 60,
         "server": {
             "session_slot_pool_size": slots,
+            # These tests pin the POOL-sized prefill cap semantics (N in
+            # flight blocks, N-1 does not), which is now opt-in:
+            # ``local_max_concurrent_prefills`` defaults to 1
+            # (LP-0MVGDUUV3001XFRJ serialises prefills in production).
+            "local_max_concurrent_prefills": slots,
             "contention_queue_policy": "queue",
             "contention_queue_max_wait_seconds": max_wait,
             "contention_queue_max_depth": max_depth,

@@ -162,6 +162,39 @@ CONTENTION_FALLBACK_AFTER_QUEUE = (
     "queued_duration=60.00s"
 )
 
+# --- Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ) ---------------------
+
+LOCAL_ADMISSION_GUARD_REJECT = (
+    "2026-08-02 14:12:00,000 - INFO - local_admission_guard decision=reject "
+    "reason=eta_exceeds_budget enforced=true eta_prefill_s=468.0 budget_s=120.0 "
+    "priority=low policy=reject model=Qwen3 samples=12 provider=local-qwen3 "
+    "session=019fc245-cccc-7e5c-871e-57ab32f875f3"
+)
+
+LOCAL_ADMISSION_GUARD_ADMIT = (
+    "2026-08-02 14:13:00,000 - INFO - local_admission_guard decision=admit "
+    "reason=within_budget enforced=true eta_prefill_s=91.8 budget_s=120.0 "
+    "priority=low policy=reject model=Qwen3 samples=12 provider=local-qwen3 "
+    "session=019fc245-dddd-7e5c-871e-57ab32f875f3"
+)
+
+# --- Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J) ---------------------
+
+ROUTING_IDLE_ADMIT = (
+    "2026-08-02 14:15:00,000 - INFO - routing_idle_admit provider=local-qwen3 "
+    "model=Qwen3 reason=economic_bypass_idle idle_seconds=412.3 "
+    "threshold_seconds=60.0 estimated_tokens=64000 new_tokens=61000 "
+    "cached_ratio=0.05 cache_state=cold "
+    "session=019fc245-ffff-7e5c-871e-57ab32f875f3"
+)
+
+LOCAL_ADMISSION_GUARD_OBSERVE = (
+    "2026-08-02 14:14:00,000 - INFO - local_admission_guard decision=reject "
+    "reason=eta_exceeds_budget enforced=false eta_prefill_s=468.0 budget_s=120.0 "
+    "priority=low policy=observe model=Qwen3 samples=12 provider=local-qwen3 "
+    "session=019fc245-eeee-7e5c-871e-57ab32f875f3"
+)
+
 # --- Error events (real lines from /var/log/llama-proxy, Aug 3 window) ------
 
 # Stream finished with reason=error (client-visible synthetic error; carries

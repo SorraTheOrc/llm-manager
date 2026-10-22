@@ -310,6 +310,14 @@ def build_report(
     remote_only = [s for s in sessions if s.local_requests == 0 and s.remote_requests > 0]
 
     fallback_rate = (len(summary.fallback_events) / total) if total else 0.0
+    # Prefill-ETA admission-guard tallies (LP-0MVGDUV5E005UWBQ AC2).
+    guard_events = getattr(summary, "local_admission_events", []) or []
+    local_admission_rejects = sum(
+        1 for e in guard_events if getattr(e, "decision", None) == "reject"
+    )
+    local_admission_admits = sum(
+        1 for e in guard_events if getattr(e, "decision", None) == "admit"
+    )
     schedule = bucketing.schedule_from_config(
         config, (config or {}).get("session_slot_pool_size")
     )
@@ -373,6 +381,17 @@ def build_report(
        f"- | {len(summary.contention_dispatch_events)} |")
     ap(f"| Fallback after queue | {len(summary.contention_fallback_events)} | "
        f"- | {len(summary.contention_fallback_events)} |")
+    ap(f"| Local admission refused (prefill ETA) | {local_admission_rejects} | "
+       f"- | {local_admission_rejects} |")
+    ap(f"| Local admission admitted (prefill ETA) | {local_admission_admits} | "
+       f"- | {local_admission_admits} |")
+    # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): economic cold-cache
+    # bypasses overridden because the GPU had been idle for at least the
+    # configured threshold. Local-only by construction (it *is* a local serve),
+    # so it sits in the local column.
+    idle_admits = len(getattr(summary, "idle_admit_events", []) or [])
+    ap(f"| Local admitted while GPU idle (cold-cache override) | {idle_admits} | "
+       f"- | {idle_admits} |")
     ap(f"| Dispatch denied | {summary.dispatch_denied_count} | "
        f"{d['dispatch_denied']} ({_pct(d['dispatch_denied'], summary.dispatch_denied_count):.1f}%) | "
        f"{n['dispatch_denied']} ({_pct(n['dispatch_denied'], summary.dispatch_denied_count):.1f}%) |")
@@ -1632,6 +1651,29 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "fallback_rate": round((len(summary.fallback_events) / total) if total else 0.0, 4),
         "contention_dispatch": len(summary.contention_dispatch_events),
         "contention_fallback_after_queue": len(summary.contention_fallback_events),
+        # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ AC2): verdicts taken
+        # at the contention-queue point, and how many of the refusals were
+        # actually enforced (``enforced=false`` rows are an ``observe``
+        # rollout, i.e. would-be refusals).
+        "local_admission_reject": sum(
+            1
+            for e in getattr(summary, "local_admission_events", []) or []
+            if getattr(e, "decision", None) == "reject"
+        ),
+        "local_admission_reject_enforced": sum(
+            1
+            for e in getattr(summary, "local_admission_events", []) or []
+            if getattr(e, "decision", None) == "reject"
+            and getattr(e, "enforced", None) != "false"
+        ),
+        "local_admission_admit": sum(
+            1
+            for e in getattr(summary, "local_admission_events", []) or []
+            if getattr(e, "decision", None) == "admit"
+        ),
+        # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J AC3): economic
+        # bypasses served locally because the GPU was idle.
+        "local_idle_admit": len(getattr(summary, "idle_admit_events", []) or []),
         "contention_queued_duration_seconds": round(
             sum(float(e.queued_duration or 0.0) for e in summary.contention_dispatch_events)
             + sum(float(e.queued_duration or 0.0) for e in summary.contention_fallback_events),

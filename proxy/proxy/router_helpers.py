@@ -857,39 +857,54 @@ def _get_first_byte_timeout_seconds(srv) -> float:
 _WARM_CACHE_RATIO_THRESHOLD = 0.5
 
 
-def _classify_cache_state(cached_ratio: float) -> str:
-    """Return ``"warm"`` when *cached_ratio* >= _WARM_CACHE_RATIO_THRESHOLD.
+def _classify_cache_state(cached_ratio: float, source: str | None = None) -> str:
+    """Return the cache-state label for a local dispatch's routing ratio.
+
+    Labels:
+
+    - ``"restored"`` — the ratio was seeded from a persisted slot snapshot and
+      reaches the warm threshold, i.e. a restored-prefix win
+      (LP-0MVGD9YXH008O304 AC4);
+    - ``"warm"`` — *cached_ratio* >= _WARM_CACHE_RATIO_THRESHOLD;
+    - ``"cold"`` — everything else.
+
+    Keeping ``restored`` distinct from ``warm`` lets reporting separate
+    restored-prefix wins from genuine prompt-cache hits. A restored ratio
+    below the warm threshold classifies cold so a weak credit never inflates
+    the restored/warm statistics.
 
     Fail-open: non-numeric / NaN / missing values classify COLD so the
     warm-cache p99 target is never diluted by unknown cases.
     """
     try:
-        return (
-            "warm"
-            if float(cached_ratio) >= _WARM_CACHE_RATIO_THRESHOLD
-            else "cold"
-        )
+        warm = float(cached_ratio) >= _WARM_CACHE_RATIO_THRESHOLD
     except (TypeError, ValueError):
         return "cold"
+    if warm and source == "restored":
+        return "restored"
+    return "warm" if warm else "cold"
 
 
 def _lookup_dispatch_cache_state(model_name: str, session_id: str | None):
     """Return ``(cache_state, cached_ratio)`` for a local dispatch.
 
     Reads the routing cached-token ratio for ``(model_name, session_id)``
-    (``provider._get_cached_ratio`` — 0.0 when absent/unknown). Feeds the
-    ``dispatch_first_byte_ms`` log line so warm-cache dispatches are
+    (``provider._get_cached_ratio`` — 0.0 when absent/unknown) together with
+    its provenance label, so a ratio seeded from a persisted slot snapshot is
+    reported as ``restored`` rather than ``warm`` (LP-0MVGD9YXH008O304 AC4).
+    Feeds the ``dispatch_first_byte_ms`` log line so warm-cache dispatches are
     identifiable and the warm-cache p99 can be measured
     (LP-0MV6CFMU9005WU2E). Never raises: the metric path must not break the
     streaming loop (provider failures classify cold/0.0).
     """
     try:
-        from proxy.provider import _get_cached_ratio
+        from proxy.provider import _get_cached_ratio, _get_cached_ratio_source
 
         ratio = float(_get_cached_ratio(model_name, session_id) or 0.0)
+        source = _get_cached_ratio_source(model_name, session_id)
     except Exception:
         return "cold", 0.0
-    return _classify_cache_state(ratio), ratio
+    return _classify_cache_state(ratio, source), ratio
 
 
 async def _query_prefill_progress(
@@ -1393,6 +1408,64 @@ def _get_generating_only_count(srv) -> int:
         return 0
 
 
+DEFAULT_MAX_CONCURRENT_PREFILLS = 1
+"""Default cap on concurrent local prefills (serialised prefills, LP-0MVGDUUV3001XFRJ)."""
+
+
+def _max_concurrent_prefills(server_config: dict | None) -> int:
+    """Return ``server.local_max_concurrent_prefills`` (0 = cap disabled).
+
+    Measured 2026-10-19 → 10-20: 47.8 % of local prefills shared the GPU with at
+    least one other prefill, halving per-request prefill throughput (p50 85 s
+    overlapped vs 23.4 s solitary) while aggregate throughput stayed flat at
+    ~254 tok/s — concurrency adds latency, not capacity. Prefills are therefore
+    serialised by default.
+
+    Validation (AC1): a missing value defaults to 1, ``0`` disables the cap
+    (restoring the previous slot-pool-sized behaviour), and a malformed or
+    negative value falls back to the default rather than silently disabling a
+    latency protection.
+    """
+    if not isinstance(server_config, dict):
+        return DEFAULT_MAX_CONCURRENT_PREFILLS
+    raw = server_config.get(
+        "local_max_concurrent_prefills", DEFAULT_MAX_CONCURRENT_PREFILLS
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_CONCURRENT_PREFILLS
+    if value < 0:
+        return DEFAULT_MAX_CONCURRENT_PREFILLS
+    return value
+
+
+def _effective_prefill_cap(server_config: dict | None, max_local: int) -> int:
+    """Return the effective prefill concurrency cap for a slot pool of *max_local*.
+
+    The configured cap can never exceed the slot pool (a larger value is
+    equivalent to no cap), and ``0`` means "disabled" — the pool size is then
+    the cap, which is the behaviour before LP-0MVGDUUV3001XFRJ.
+    """
+    try:
+        pool = max(1, int(max_local or 1))
+    except (TypeError, ValueError):
+        pool = 1
+    configured = _max_concurrent_prefills(server_config)
+    if configured <= 0:
+        return pool
+    return min(configured, pool)
+
+
+def _server_config_of(srv) -> dict:
+    """Return the ``server`` config block from *srv* (fail-open to ``{}``)."""
+    try:
+        cfg = srv.config
+        return cfg.get("server", cfg) if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
 def _get_prefill_in_flight_count(srv) -> int:
     """Return the number of sessions currently in prefill (dispatch→first-byte).
 
@@ -1689,7 +1762,14 @@ async def _try_acquire_local_dispatch(
                         # Prefill-aware guard (LP-0MTJET4I5009EHNX): cap
                         # concurrent prefills to ``parallel`` (max_local) so
                         # the llama-server internal queue does not saturate.
-                        if _prefill_count >= max_local:
+                        # Serialised by default since LP-0MVGDUUV3001XFRJ: at
+                        # most ``local_max_concurrent_prefills`` (default 1)
+                        # prefills share the GPU, because prefills do not scale
+                        # (47.8 % shared the GPU, halving per-request prefill
+                        # throughput at flat aggregate tok/s).
+                        if _prefill_count >= _effective_prefill_cap(
+                            _server_config_of(srv), max_local
+                        ):
                             active_owner = None
                             for ek, er in srv.local_dispatch_records.items():
                                 if ek != record_key and er.get("active"):
@@ -1736,6 +1816,16 @@ async def _try_acquire_local_dispatch(
                     _p = getattr(srv, "local_prefill_in_flight", None)
                     if _p is not None:
                         _p[session_key] = True
+                except Exception:
+                    pass
+                # Lease-owner retention priority (LP-0MVI2VRT2000V1AP): note
+                # the grant so this session keeps contention-queue priority
+                # for ``contention_queue_lease_grace_seconds`` after it
+                # releases, instead of re-queueing behind a newcomer.
+                try:
+                    from proxy import contention_queue
+
+                    contention_queue.note_local_grant(session_key)
                 except Exception:
                     pass
 

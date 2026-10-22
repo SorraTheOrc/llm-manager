@@ -103,6 +103,7 @@ Models can define an ordered list of `providers` for automatic failover. The `pr
 | `headers` | dict | remote (optional) | Additional headers to include |
 | `llama_model` | string | local | Name of the local model |
 | `rate_limit_rpm` | int | optional | Maximum dispatches to this entry per rolling **60-second** window (LP-0MVDQ1GMO00801PL). Intended for free tiers with a per-minute allowance (e.g. `munitoai-free`). Default: unset/`0` = ungated. |
+| `budget` | dict | optional | Per-**entry** behaviour override for the free-tier budget knobs (`reserve_ratio`, `wait_max_seconds`, `max_waiters`, `affinity_ttl_seconds`) — precedence: entry > model > server > default (LP-0MVDVK5TM004TQQV; see [Per-model and per-entry budget knobs](#per-model-and-per-entry-budget-knobs-budget)). |
 | `max_context_tokens` | int | optional | Maximum **estimated prompt context** the entry may serve (LP-0MVF9N2QL001CDA7). A request whose routing estimate exceeds this ceiling SKIPS the entry and falls through to the next eligible provider — a size mismatch, not a failure (no cooldown/affinity/usage-limit/queue side effects). Absent, `0` or non-positive disables the gate (byte-for-byte previous behaviour). Shipped `config.yaml` values are sourced (upstream context window / provider per-minute token allowance) and recorded in a config comment; see [Per-entry context limits](#per-entry-context-limits-max_context_tokens). Applies to local entries too: composes as an additional hard cap (`min(existing local thresholds, max_context_tokens)`). |
 | `display_name` | string | optional | Human-readable tier label for the X-Resolved-Model header (e.g. `MunitoAI Free`, `OpenCode Go 3`). Overrides the `provider` brand in the display string only — failure-domain, cooldown and usage-limit keying still use `provider`. Use it to distinguish same-brand tiers/accounts (LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62). |
 
@@ -200,11 +201,39 @@ capacity-aware:
         rate_limit_rpm: 15
 ```
 
-Tuning knobs (all under `server:`): `provider_rate_limit_reserve_ratio` (share
+Tuning knobs (all optional, precedence is **entry `budget` > `models.<name>.budget` > `server.*` > default**): `provider_rate_limit_reserve_ratio` (share
 of the window reserved for in-progress sessions, default 0.3),
-`provider_rate_limit_wait_max_seconds` (default 15), 
+`provider_rate_limit_wait_max_seconds` (default 15),
 `provider_rate_limit_wait_max_waiters` (default 8) and
-`provider_affinity_ttl_seconds` (default 900).
+`provider_affinity_ttl_seconds` (default 900). A model block tunes a whole
+chain; an entry `budget` block tunes one entry:
+
+```yaml
+models:
+  plan:
+    budget:
+      reserve_ratio: 0.4
+      wait_max_seconds: 10
+      max_waiters: 4
+      affinity_ttl_seconds: 600
+    providers:
+      - name: some-free-tier
+        type: remote
+        endpoint: https://api.example.com/v1
+        api_key_env: SOME_FREE_KEY
+        rate_limit_rpm: 15
+        budget:
+          reserve_ratio: 0.2
+```
+
+All keys are optional at every layer; absent keys fall through to the next
+layer, so existing configs behave exactly as before (no migration). The budget
+**bucket stays keyed by provider entry**: models sharing an entry share its
+`rate_limit_rpm` window — the blocks change how each chain treats that window,
+never its size. A skip/wait log names the winning layer as
+`budget_source=<knob>@<layer>` (only when a model/entry block contributed).
+Note: `models.compact` is not budget-gated — the summarizer dispatches to its
+providers directly (LP-0MVFYYYXS0011T58).
 
 Skip decisions are logged as `Provider budget exhausted: skipping provider=…`
 (with limit, remaining and reason) and recorded in the request diagnostics as
