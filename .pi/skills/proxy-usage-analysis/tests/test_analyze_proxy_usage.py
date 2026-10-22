@@ -375,6 +375,196 @@ class TestTtftParsing:
         assert ev.kind == "ttft"
         assert ev.kind != "stream_started"
 
+    def test_dispatch_first_byte_real_warm_line(self):
+        """A real warm-cache line from /var/log/llama-proxy parses field-exact.
+
+        AC2: ``parse_log_line()`` yields ``kind=ttft`` with ``ttft_ms`` plus
+        ``dispatch_to_first_byte_ms``, ``queue_wait_ms``, ``cache_state``,
+        ``cached_ratio``, ``session`` and ``model``, matching the real-line
+        format exactly.
+        """
+        ev = log_parser.parse_log_line(fixtures.DISPATCH_FIRST_BYTE_WARM)
+        assert ev is not None
+        assert ev.kind == "ttft"
+        assert ev.ttft_ms == pytest.approx(29546.0)
+        assert ev.dispatch_to_first_byte_ms == pytest.approx(29545.3)
+        assert ev.queue_wait_ms == pytest.approx(0.6)
+        assert ev.cache_state == "warm"
+        assert ev.cached_ratio == pytest.approx(0.992)
+        assert ev.session == fixtures.PREFILL_SESSION
+        assert ev.model == "Qwen3"
+        assert ev.ts == datetime(2026, 10, 22, 21, 15, 42, 7000)
+
+    def test_dispatch_first_byte_real_cold_line(self):
+        """A real cold-cache line (zero cached ratio) parses field-exact."""
+        ev = log_parser.parse_log_line(fixtures.DISPATCH_FIRST_BYTE_COLD)
+        assert ev is not None
+        assert ev.kind == "ttft"
+        assert ev.ttft_ms == pytest.approx(55656.5)
+        assert ev.dispatch_to_first_byte_ms == pytest.approx(55655.9)
+        assert ev.cache_state == "cold"
+        assert ev.cached_ratio == pytest.approx(0.0)
+        assert ev.session == fixtures.PREFILL_SESSION
+
+    def test_dispatch_first_byte_queue_wait_split(self):
+        """The service-time split is consistent: total − queue wait = service.
+
+        Real line: 26.6 s dispatch → first byte, of which 16.2 s was spent
+        queued for the single slot, leaving 10.4 s of service time.
+        """
+        ev = log_parser.parse_log_line(fixtures.DISPATCH_FIRST_BYTE_QUEUE_WAIT)
+        assert ev is not None
+        assert ev.queue_wait_ms == pytest.approx(16169.9)
+        assert ev.dispatch_to_first_byte_ms == pytest.approx(10403.1)
+        assert ev.ttft_ms - ev.queue_wait_ms == pytest.approx(ev.dispatch_to_first_byte_ms)
+
+    def test_remote_ttft_line_has_no_prefill_fields(self):
+        """Remote ``ttft_seconds=`` lines carry none of the local prefill fields."""
+        line = (
+            "2026-08-02 14:35:00,200 - INFO - "
+            "ttft_seconds=0.823 session=def456 provider=opencode-go "
+            "model=deepseek-v4-flash"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "ttft"
+        assert ev.dispatch_to_first_byte_ms is None
+        assert ev.queue_wait_ms is None
+        assert ev.cache_state is None
+        assert ev.cached_ratio is None
+
+
+class TestPrefillPairing:
+    """FIFO pairing of ``dispatch_first_byte_ms`` events to local streams.
+
+    For each session the Nth TTFT event pairs with the Nth ``stream_started``
+    event by timestamp (AC3); streams with no TTFT event surface as
+    ``PrefillMatch`` with ``ttft=None`` — unknown prefill — instead of being
+    silently dropped (AC4).
+    """
+
+    @staticmethod
+    def _parse(lines: list[str]) -> list[log_parser.LogEvent]:
+        return [e for e in (log_parser.parse_log_line(ln) for ln in lines) if e is not None]
+
+    def test_fifo_pairs_nth_ttft_with_nth_stream_real_session(self):
+        """Three real TTFT lines pair FIFO with the three starts of the same
+        session, in timestamp order."""
+        events = self._parse(
+            [
+                fixtures.STREAM_STARTED_PREFILL_COLD,
+                fixtures.DISPATCH_FIRST_BYTE_COLD,
+                fixtures.STREAM_STARTED_PREFILL_COLD_FAST,
+                fixtures.DISPATCH_FIRST_BYTE_COLD_FAST,
+                fixtures.STREAM_STARTED_PREFILL_WARM,
+                fixtures.DISPATCH_FIRST_BYTE_WARM,
+            ]
+        )
+        starts = [e for e in events if e.kind == "stream_started"]
+        ttfts = [e for e in events if e.kind == "ttft"]
+        matches = log_parser.pair_ttft_to_streams(ttfts, starts)
+
+        assert len(matches) == 3
+        # FIFO by timestamp: the 55.7 s cold prefill pairs with the first
+        # stream, the 1.1 s cold with the second, the 29.5 s warm with the
+        # third.
+        assert [m.prefill_seconds for m in matches] == pytest.approx(
+            [55.6565, 1.1005, 29.546]
+        )
+        for m in matches:
+            assert m.known_prefill
+            assert m.stream.session == fixtures.PREFILL_SESSION
+            assert m.ttft.session == fixtures.PREFILL_SESSION
+            # dispatch time is back-calculated: ts − prefill duration.
+            assert m.dispatch_ts == m.ttft.ts - timedelta(milliseconds=m.ttft.ttft_ms)
+        # Matches are ordered by stream start time.
+        assert [m.stream.ts for m in matches] == sorted(m.stream.ts for m in matches)
+
+    def test_single_request_session_pairs_its_ttft(self):
+        events = self._parse(
+            [fixtures.STREAM_STARTED_PREFILL_COLD, fixtures.DISPATCH_FIRST_BYTE_COLD]
+        )
+        matches = log_parser.pair_ttft_to_streams(
+            [e for e in events if e.kind == "ttft"],
+            [e for e in events if e.kind == "stream_started"],
+        )
+        assert len(matches) == 1
+        assert matches[0].prefill_seconds == pytest.approx(55.6565)
+
+    def test_multi_session_pairing_by_timestamp(self):
+        """Sessions pair independently; interleaved starts keep their order."""
+        starts = [
+            log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 10), session="s1"),
+            log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 20), session="s2"),
+            log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 30), session="s1"),
+        ]
+        ttfts = [
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 12), session="s1", ttft_ms=500.0),
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 22), session="s2", ttft_ms=200.0),
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 32), session="s1", ttft_ms=700.0),
+        ]
+        matches = log_parser.pair_ttft_to_streams(ttfts, starts)
+        assert [(m.stream.session, m.prefill_seconds) for m in matches] == [
+            ("s1", 0.5),
+            ("s2", 0.2),
+            ("s1", 0.7),
+        ]
+
+    def test_aborted_stream_reported_as_unknown_prefill(self):
+        """A stream that dies before first byte has no TTFT line: it is kept
+        in the pairing as unknown prefill rather than silently dropped."""
+        events = self._parse(
+            [
+                fixtures.STREAM_STARTED_ABORTED_LOCAL,
+                fixtures.STREAM_ERROR_ABORTED_LOCAL,
+                fixtures.STREAM_STARTED_PREFILL_COLD,
+                fixtures.DISPATCH_FIRST_BYTE_COLD,
+            ]
+        )
+        matches = log_parser.pair_ttft_to_streams(
+            [e for e in events if e.kind == "ttft"],
+            [e for e in events if e.kind == "stream_started"],
+        )
+        assert len(matches) == 2
+        aborted = next(m for m in matches if m.stream.session == "audit-WL-0MVFRRMX3003UPP3-phase2_child_6-11d812e7")
+        assert not aborted.known_prefill
+        assert aborted.ttft is None
+        assert aborted.prefill_seconds is None
+        assert aborted.dispatch_ts is None
+        # The completed stream still pairs normally.
+        completed = next(m for m in matches if m.stream.session == fixtures.PREFILL_SESSION)
+        assert completed.known_prefill
+        assert completed.prefill_seconds == pytest.approx(55.6565)
+
+    def test_extra_ttft_events_without_a_stream_are_ignored(self):
+        """More TTFT events than streams: the surplus has no stream to
+        attribute to and is ignored (not fabricated)."""
+        starts = [log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 10), session="s1")]
+        ttfts = [
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 12), session="s1", ttft_ms=500.0),
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 22), session="s1", ttft_ms=999.0),
+        ]
+        matches = log_parser.pair_ttft_to_streams(ttfts, starts)
+        assert len(matches) == 1
+        assert matches[0].prefill_seconds == pytest.approx(0.5)
+
+    def test_session_less_events_are_not_paired(self):
+        """Session-less TTFT/start events cannot be paired and are skipped."""
+        starts = [log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 10), session=None)]
+        ttfts = [log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 12), session=None, ttft_ms=500.0)]
+        assert log_parser.pair_ttft_to_streams(ttfts, starts) == []
+
+    def test_dispatch_interval_before_window_still_reconstructs(self):
+        """A dispatch that starts before the window still reconstructs its
+        interval (boundary-crossing input for the union-interval busy
+        calculation): the pairing is window-agnostic."""
+        ttft = log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 5), session="s1", ttft_ms=60000.0)
+        start = log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 13, 59, 0), session="s1")
+        match = log_parser.pair_ttft_to_streams([ttft], [start])[0]
+        assert match.dispatch_ts == datetime(2026, 8, 2, 13, 59, 5)  # 60 s before first byte
+        assert match.ttft.ts > WINDOW_START
+        assert match.dispatch_ts < WINDOW_START  # pre-window dispatch
+
 
 class TestErrorLineParsing:
     """Error events are parsed into distinct error kinds with the fields the
@@ -2468,6 +2658,78 @@ class TestBusyStats:
         assert res.busy.streams == 2
         assert res.busy.busy_seconds == 20.0
         assert res.busy.peak_concurrency == 2
+
+    def test_prefill_interval_buckets_identically_to_stream_start(self):
+        """AC5: for a session whose dispatch and first byte fall in the same
+        fast/cheap period, the interval buckets identically whether it starts
+        at ``Stream started`` or at the back-calculated dispatch time.
+
+        The interval start handed to ``compute_busy_stats`` is the
+        ``stream_started`` timestamp; modelling the new interval is therefore
+        a start event at the dispatch time (09:30:00) rather than at first
+        byte (09:30:05).
+        """
+        start = datetime(2026, 8, 2, 9, 0, 0)
+        end = datetime(2026, 8, 2, 11, 0, 0)
+        finish = _local_event("stream_finished", datetime(2026, 8, 2, 9, 30, 15), "s1")
+        decode_only = aggregation.compute_busy_stats(
+            [_local_event("stream_started", datetime(2026, 8, 2, 9, 30, 5), "s1"), finish],
+            start,
+            end,
+            _schedule(),
+        )
+        with_prefill = aggregation.compute_busy_stats(
+            [_local_event("stream_started", datetime(2026, 8, 2, 9, 30, 0), "s1"), finish],
+            start,
+            end,
+            _schedule(),
+        )
+        assert decode_only is not None and with_prefill is not None
+        assert decode_only.cheap_busy_seconds == 10.0
+        assert with_prefill.cheap_busy_seconds == 15.0
+        # Both intervals lie wholly in the cheap period: the *split* (all
+        # cheap, no fast) is identical; only the duration grows by the 5 s of
+        # prefill.
+        assert decode_only.fast_busy_seconds == with_prefill.fast_busy_seconds == 0.0
+        assert with_prefill.cheap_busy_seconds - decode_only.cheap_busy_seconds == 5.0
+
+    def test_prefill_interval_crossing_period_boundary_splits_buckets(self):
+        """AC4/AC5: a prefill interval that straddles the fast/cheap boundary
+        attributes each side to its own bucket (5 s cheap + 20 s fast)."""
+        start = datetime(2026, 8, 2, 9, 0, 0)
+        end = datetime(2026, 8, 2, 11, 0, 0)
+        # Dispatch 09:59:55 (cheap), first byte 10:00:05, finish 10:00:20 (fast).
+        busy = aggregation.compute_busy_stats(
+            [
+                _local_event("stream_started", datetime(2026, 8, 2, 9, 59, 55), "s1"),
+                _local_event("stream_finished", datetime(2026, 8, 2, 10, 0, 20), "s1"),
+            ],
+            start,
+            end,
+            _schedule(),
+        )
+        assert busy is not None
+        assert busy.cheap_busy_seconds == 5.0
+        assert busy.fast_busy_seconds == 20.0
+        assert busy.busy_seconds == 25.0
+
+    def test_prefill_interval_starting_before_window_is_clipped(self):
+        """AC4: a dispatch before the window (boundary-crossing interval) is
+        clipped to the window start for the union busy calculation."""
+        start = datetime(2026, 8, 2, 9, 0, 0)
+        end = datetime(2026, 8, 2, 11, 0, 0)
+        busy = aggregation.compute_busy_stats(
+            [
+                _local_event("stream_started", datetime(2026, 8, 2, 8, 59, 50), "s1"),
+                _local_event("stream_finished", datetime(2026, 8, 2, 9, 0, 30), "s1"),
+            ],
+            start,
+            end,
+            _schedule(),
+        )
+        assert busy is not None
+        assert busy.busy_seconds == 30.0  # 20 s pre-window clipped away
+        assert busy.streams == 1
 
 
 class TestSummaryByHourActivity:

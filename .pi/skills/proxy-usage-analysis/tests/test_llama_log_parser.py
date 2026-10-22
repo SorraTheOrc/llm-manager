@@ -310,11 +310,14 @@ class TestSpeedStats:
         assert stats.files_skipped == 0
 
     def test_files_without_qwen3_port_are_counted_and_skipped(self, tmp_path):
+        # Fixture: eval lines present, but no discoverable Qwen3 child port
+        # (only a non-Qwen3 spawn line). Parses without error and reports zero
+        # samples — the "undiscoverable Qwen3 port" empty-eval diagnostic path
+        # (LP-0MVJN025B001I8AL AC6).
         log_dir = tmp_path / "logs2"
         log_dir.mkdir()
         (log_dir / "llama-server.log").write_text(
-            "srv load: spawning server instance with name=mxbai-embed on port 51973\n"
-            "[51973]        eval time =    10.00 ms /     1 tokens (   10.00 ms per token,   100.00 tokens per second)\n"
+            fixtures.LLAMA_LOG_UNDISCOVERABLE_QWEN3_PORT + "\n"
         )
         _set_mtime(log_dir / "llama-server.log", MOCK_MTIME)
         files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
@@ -325,12 +328,17 @@ class TestSpeedStats:
         assert stats.prompt_eval["total"].count == 0
 
     def test_empty_files_no_stats(self, tmp_path):
+        # Fixture: spawn line present but no eval-timing lines at all. The
+        # file is parsed (port discovered), yields zero samples, and does not
+        # error — the empty-eval diagnostic path (LP-0MVJN025B001I8AL AC6).
         log_dir = tmp_path / "logs3"
         log_dir.mkdir()
-        (log_dir / "llama-server.log").write_text(fixtures.QWEN3_SPAWN_LINE + "\n")
+        (log_dir / "llama-server.log").write_text(fixtures.LLAMA_LOG_NO_EVAL_LINES + "\n")
         _set_mtime(log_dir / "llama-server.log", MOCK_MTIME)
         files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
         stats = llama_log_parser.build_speed_stats(files, WINDOW_START, WINDOW_END, _schedule())
+        assert stats.files_parsed == 1
+        assert stats.files_skipped == 0
         assert stats.decode["total"].count == 0
         assert stats.prompt_eval["total"].count == 0
 

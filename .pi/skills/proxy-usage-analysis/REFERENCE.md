@@ -223,6 +223,15 @@ entry is a local runtime edit, not a committed artifact.
    into the event's `chain_hold_cycle` field (LP-0MU5AIAAY003KVM0); lines
    without the token (pre-chain-hold rotated logs) parse with
    `chain_hold_cycle=None`, which aggregates as cycle 0 (genuine demand).
+   Local `dispatch_first_byte_ms=` lines (LP-0MTSSM5SO003PKU0) parse into
+   `ttft` events carrying the prefill breakdown: `ttft_ms` (dispatch → first
+   byte total), `dispatch_to_first_byte_ms` (total minus queued wait),
+   `queue_wait_ms`, `cache_state` and `cached_ratio`, plus `session` and
+   `model` (LP-0MVJN025B001I8AL). `log_parser.pair_ttft_to_streams()` pairs
+   them FIFO per session (Nth TTFT ↔ Nth `stream_started`, the same
+   convention the busy-time calculation uses for start/finish pairs); streams
+   without a TTFT line pair with `ttft=None` — unknown prefill, reported
+   rather than dropped.
    Unparseable lines are counted and skipped, never fatal.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the

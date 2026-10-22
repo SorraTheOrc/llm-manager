@@ -71,6 +71,83 @@ STREAM_FINISHED_LOCAL = (
     "provider=local model=Qwen3 request=[{'type': 'text', 'text': '/plan SA-0MSAS108O009DYKT'}]"
 )
 
+# --- Prefill TTFT lines (real /var/log/llama-proxy/proxy.log lines) --------
+#
+# Local requests log ``dispatch_first_byte_ms`` (dispatch → first byte, the
+# total including any single-slot queue wait), its service-time split
+# ``dispatch_to_first_byte_ms`` (= total − ``queue_wait_ms``) and the
+# prompt-cache outcome (``cache_state``/``cached_ratio``). The line's
+# timestamp is the **first-byte** time, so dispatch time is back-calculated as
+# ``ts - dispatch_first_byte_ms``. The three dispatch lines plus their three
+# ``Stream started`` lines below all belong to one real multi-request session,
+# so they double as the FIFO pairing fixture.
+
+PREFILL_SESSION = "audit-TTS-0MVJN64VK0095ZOP-false-positive-screen-b53084c3"
+
+STREAM_STARTED_PREFILL_COLD = (
+    "2026-10-22 21:15:02,477 - INFO - Stream started: provider=local model=Qwen3 "
+    f"session={PREFILL_SESSION} request=[{{'type': 'text', 'text': "
+    "'[READ-ONLY AUDIT] You are performing a read-only audi..."
+)
+
+STREAM_STARTED_PREFILL_COLD_FAST = (
+    "2026-10-22 21:15:09,614 - INFO - Stream started: provider=local model=Qwen3 "
+    f"session={PREFILL_SESSION} request=[{{'type': 'text', 'text': "
+    "'[READ-ONLY AUDIT] You are performing a read-only audi..."
+)
+
+STREAM_STARTED_PREFILL_WARM = (
+    "2026-10-22 21:15:42,006 - INFO - Stream started: provider=local model=Qwen3 "
+    f"session={PREFILL_SESSION} request=[{{'type': 'text', 'text': "
+    "'[READ-ONLY AUDIT] You are performing a read-only audi..."
+)
+
+# Cold prompt cache: 55.7 s dispatch → first byte (the bulk of it prefill).
+DISPATCH_FIRST_BYTE_COLD = (
+    "2026-10-22 21:15:02,477 - INFO - dispatch_first_byte_ms=55656.5 "
+    "dispatch_to_first_byte_ms=55655.9 cache_state=cold cached_ratio=0.000 "
+    f"queue_wait_ms=0.6 session={PREFILL_SESSION} model=Qwen3"
+)
+
+# Second request in the same session, cold but fast (short prompt).
+DISPATCH_FIRST_BYTE_COLD_FAST = (
+    "2026-10-22 21:15:09,615 - INFO - dispatch_first_byte_ms=1100.5 "
+    "dispatch_to_first_byte_ms=1100.1 cache_state=cold cached_ratio=0.000 "
+    f"queue_wait_ms=0.4 session={PREFILL_SESSION} model=Qwen3"
+)
+
+# Warm prompt cache: 29.5 s dispatch → first byte at a 0.992 cached ratio.
+DISPATCH_FIRST_BYTE_WARM = (
+    "2026-10-22 21:15:42,007 - INFO - dispatch_first_byte_ms=29546.0 "
+    "dispatch_to_first_byte_ms=29545.3 cache_state=warm cached_ratio=0.992 "
+    f"queue_wait_ms=0.6 session={PREFILL_SESSION} model=Qwen3"
+)
+
+# Queue contention: 16.2 s of the 26.6 s dispatch → first byte was spent
+# waiting for the single slot, so service time is only 10.4 s (real line).
+DISPATCH_FIRST_BYTE_QUEUE_WAIT = (
+    "2026-10-22 15:04:48,715 - INFO - dispatch_first_byte_ms=26573.0 "
+    "dispatch_to_first_byte_ms=10403.1 cache_state=warm cached_ratio=0.994 "
+    "queue_wait_ms=16169.9 session=herdr-1792667491-1086302-15476 model=Qwen3"
+)
+
+# Aborted local stream: a stream that dies before first byte emits **no**
+# ``dispatch_first_byte_ms=`` line (the 2 aborted streams in the intake
+# window have rotated out of retention). The start/error line formats are
+# copied verbatim from real /var/log/llama-proxy lines; the shared session
+# matches a real abort chronology.
+STREAM_STARTED_ABORTED_LOCAL = (
+    "2026-10-21 23:28:35,414 - INFO - Stream started: provider=local model=Qwen3 "
+    "session=audit-WL-0MVFRRMX3003UPP3-phase2_child_6-11d812e7 "
+    "request=[{'type': 'text', 'text': '[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — CHI..."
+)
+
+STREAM_ERROR_ABORTED_LOCAL = (
+    "2026-10-21 23:28:36,512 - WARNING - Stream error: "
+    "session=audit-WL-0MVFRRMX3003UPP3-phase2_child_6-11d812e7 "
+    "provider=local model=Qwen3 error=ReadTimeout"
+)
+
 # --- Fallback triggered (never carries a session UUID) ----------------------
 
 FALLBACK_CONCURRENCY = (
@@ -390,6 +467,35 @@ SLOT_RELEASE_IGNORED = (
 )
 SRV_LOAD_IGNORED = "srv          load: spawning server instance with name=mxbai-embed on port 51973"
 MALFORMED_EVAL_LINE = "[32999] eval time = not-a-number ms / many tokens"
+
+# --- Empty eval-timing diagnostic fixtures ---------------------------------
+#
+# The two ways an analysis window can contain no eval-timing samples: the log
+# carries no eval lines at all (llama-server verbosity/build), or the Qwen3
+# child port cannot be discovered so its eval lines cannot be attributed
+# (real observable case: only a non-Qwen3 child spawn line is present).
+
+# Spawn line present, but the file holds no ``eval time`` lines whatsoever.
+LLAMA_LOG_NO_EVAL_LINES = "\n".join(
+    [
+        QWEN3_SPAWN_LINE,
+        SLOT_PRINT_TIMING_IGNORED,
+        SLOT_RELEASE_IGNORED,
+        "srv  log_server_r: done request: GET /slots 127.0.0.1 200",
+    ]
+)
+
+# Eval lines present, but the Qwen3 port cannot be discovered (the only
+# spawn line announces a different child instance), so nothing is attributed.
+LLAMA_LOG_UNDISCOVERABLE_QWEN3_PORT = "\n".join(
+    [
+        SRV_LOAD_IGNORED,
+        "[51973] prompt eval time =   29504.01 ms / 11449 tokens "
+        "(    2.58 ms per token,   388.05 tokens per second)",
+        "[51973]        eval time =    3776.71 ms /   153 tokens "
+        "(   24.68 ms per token,    40.51 tokens per second)",
+    ]
+)
 
 
 # --- Config fixture (proxy/config.yaml fragment, real values) ---------------

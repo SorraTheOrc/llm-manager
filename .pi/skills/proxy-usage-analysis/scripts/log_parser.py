@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import gzip
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -59,6 +59,14 @@ RE_SESSION = re.compile(r"\bsession=([A-Za-z0-9_.-]+)")
 RE_DISPATCH_FIRST_BYTE = re.compile(
     r"dispatch_first_byte_ms=([\d.]+)"
 )
+# Service-time split of the same local dispatch line (LP-0MV6CFMU9005WU2E):
+# ``dispatch_to_first_byte_ms`` = total minus the single-slot queue wait, and
+# ``queue_wait_ms`` is that queued component. ``cache_state``/``cached_ratio``
+# describe the prompt-cache outcome of the request.
+RE_DISPATCH_TO_FIRST_BYTE = re.compile(r"dispatch_to_first_byte_ms=([\d.]+)")
+RE_QUEUE_WAIT_MS = re.compile(r"queue_wait_ms=([\d.]+)")
+RE_CACHE_STATE = re.compile(r"\bcache_state=(\w+)")
+RE_CACHED_RATIO = re.compile(r"\bcached_ratio=([\d.]+)")
 RE_TTFT_SECONDS = re.compile(
     r"ttft_seconds=([\d.]+)"
 )
@@ -407,6 +415,16 @@ class LogEvent:
     # logging (LP-0MTSSM5SO003PKU0). Populated by dispatch_first_byte_ms=
     # (local) or ttft_seconds= (remote) log lines.
     ttft_ms: float | None = None
+    # Prefill breakdown carried by the local ``dispatch_first_byte_ms=`` line
+    # (LP-0MVJN025B001I8AL): ``ttft_ms`` is the dispatch→first-byte *total*,
+    # ``dispatch_to_first_byte_ms`` is the same interval minus the queued wait
+    # (``queue_wait_ms``), and ``cache_state``/``cached_ratio`` report the
+    # prompt-cache outcome. All four are ``None`` on remote ``ttft_seconds=``
+    # lines and on historical logs that predate the split.
+    dispatch_to_first_byte_ms: float | None = None
+    queue_wait_ms: float | None = None
+    cache_state: str | None = None
+    cached_ratio: float | None = None
     # Chain-hold cycle stamp (LP-0MU5AIAAY003KVM0): 0 = first (pre-hold)
     # cycle, incremented on every hold restart; ``None`` when the line does
     # not carry the token (pre-chain-hold logs). Populated on
@@ -433,11 +451,95 @@ def _first(pattern: re.Pattern, text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _float(pattern: re.Pattern, text: str) -> float | None:
+    """Tolerant float extraction for a key=value field (``None`` if absent)."""
+    token = _first(pattern, text)
+    if token is None:
+        return None
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
 def _session_from(text: str) -> str | None:
     token = _first(RE_SESSION, text)
     if token is None or token == "unknown":
         return None
     return token
+
+
+@dataclass(frozen=True)
+class PrefillMatch:
+    """One local stream paired FIFO with its ``dispatch_first_byte_ms`` event.
+
+    ``ttft`` is ``None`` when the stream produced no first-byte line: an
+    aborted request (client disconnect, stream error) or a logging gap. Such
+    streams are **unknown prefill** — they must be reported as such rather
+    than silently dropped from the count (LP-0MVJN025B001I8AL AC4).
+    """
+
+    stream: LogEvent
+    ttft: LogEvent | None = None
+
+    @property
+    def known_prefill(self) -> bool:
+        """Whether this stream's prefill duration is observable."""
+        return self.ttft is not None and self.ttft.ttft_ms is not None
+
+    @property
+    def prefill_seconds(self) -> float | None:
+        """Dispatch→first-byte seconds, or ``None`` when unknown."""
+        if self.ttft is None or self.ttft.ttft_ms is None:
+            return None
+        return self.ttft.ttft_ms / 1000.0
+
+    @property
+    def dispatch_ts(self) -> datetime | None:
+        """Back-calculated dispatch time (``ttft.ts - ttft_ms``), or ``None``.
+
+        The dispatch line is written at first-byte time and carries only a
+        duration, so the prefill interval is
+        ``[dispatch_ts, ttft.ts]`` (LP-0MVJGCQ421005IXGC intake brief).
+        """
+        if self.ttft is None or self.ttft.ttft_ms is None:
+            return None
+        return self.ttft.ts - timedelta(milliseconds=self.ttft.ttft_ms)
+
+
+def pair_ttft_to_streams(
+    ttft_events: Iterable[LogEvent],
+    started_events: Iterable[LogEvent],
+) -> list[PrefillMatch]:
+    """Pair local streams with their TTFT events per session, FIFO by time.
+
+    TTFT lines carry ``session=``, so the Nth ``dispatch_first_byte_ms``
+    event of a session pairs with that session's Nth ``stream_started`` event
+    (the same FIFO convention ``aggregation.compute_busy_stats`` uses for
+    start/finish pairs). Streams are returned sorted by their start timestamp;
+    streams with no TTFT paired are included with ``ttft=None`` so callers can
+    count them as unknown prefill instead of losing them. TTFT events beyond a
+    session's stream count have no stream to attribute to and are ignored.
+    Session-less events cannot be paired and are skipped.
+    """
+    starts: dict[str, list[LogEvent]] = {}
+    for ev in started_events:
+        if ev.session is not None:
+            starts.setdefault(ev.session, []).append(ev)
+    ttfts: dict[str, list[LogEvent]] = {}
+    for ev in ttft_events:
+        if ev.session is not None:
+            ttfts.setdefault(ev.session, []).append(ev)
+
+    matches: list[PrefillMatch] = []
+    for session_id, session_starts in starts.items():
+        ordered_starts = sorted(session_starts, key=lambda e: e.ts)
+        ordered_ttfts = sorted(ttfts.get(session_id, []), key=lambda e: e.ts)
+        for index, stream in enumerate(ordered_starts):
+            ttft = ordered_ttfts[index] if index < len(ordered_ttfts) else None
+            matches.append(PrefillMatch(stream=stream, ttft=ttft))
+    matches.sort(key=lambda m: m.stream.ts)
+    return matches
 
 
 def _attribution_from(msg: str) -> tuple[str | None, str | None, str | None]:
@@ -816,6 +918,10 @@ def parse_log_line(line: str) -> LogEvent | None:
                 model=_first(RE_MODEL, msg),
                 session=_session_from(msg),
                 ttft_ms=ttft_ms_val,
+                dispatch_to_first_byte_ms=_float(RE_DISPATCH_TO_FIRST_BYTE, msg),
+                queue_wait_ms=_float(RE_QUEUE_WAIT_MS, msg),
+                cache_state=_first(RE_CACHE_STATE, msg),
+                cached_ratio=_float(RE_CACHED_RATIO, msg),
                 raw=line,
             )
 
