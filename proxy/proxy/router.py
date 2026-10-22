@@ -117,6 +117,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _get_chunk_refresh_buffer_seconds,
     _get_first_byte_timeout_seconds,
     _get_lease_timeout_seconds,
+    _get_prefill_deadline_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
@@ -248,11 +249,38 @@ def _get_contention_queue_config(server_config: dict) -> dict:
             "(bounds [0, session_guardrail_max_runtime_seconds=%s])",
             raw_grace, lease_grace_seconds, max_runtime,
         )
+    # ETA-aware admission ordering (LP-0MVIQ0G2M0006QF6 AC1): within a
+    # retention class, admit the shortest projected prefill first so a long
+    # prefill cannot be head-of-line blocking for a queue of short turns.
+    # ``contention_queue_eta_ordering`` (default on) is the rollback switch;
+    # ``contention_queue_eta_promotion_seconds`` bounds starvation by
+    # promoting a waiter older than this to the front of its class.
+    raw_eta_ordering = server_config.get("contention_queue_eta_ordering", True)
+    if isinstance(raw_eta_ordering, str):
+        eta_ordering = raw_eta_ordering.strip().lower() not in (
+            "false", "0", "no", "off", "",
+        )
+    else:
+        eta_ordering = bool(raw_eta_ordering)
+    raw_promotion = server_config.get(
+        "contention_queue_eta_promotion_seconds", 30
+    )
+    try:
+        promotion = float(raw_promotion) if raw_promotion is not None else 30.0
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid contention_queue_eta_promotion_seconds=%r — using default 30",
+            raw_promotion,
+        )
+        promotion = 30.0
+    eta_promotion_seconds = max(0.0, min(promotion, float(max(1, max_runtime))))
     return {
         "policy": policy,
         "max_wait_seconds": max_wait_seconds,
         "max_depth": max_depth,
         "lease_grace_seconds": lease_grace_seconds,
+        "eta_ordering": eta_ordering,
+        "eta_promotion_seconds": eta_promotion_seconds,
     }
 
 
@@ -1465,14 +1493,31 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     except Exception as _exc:
                         # LP-0MUCEFB8E003YVFF: distinct, observable log line
                         # when the first-byte ceiling aborts a stuck prefill.
+                        # LP-0MVIQ0G2M0006QF6: when the (tighter) prefill
+                        # deadline is what fired, log it as the safety detour
+                        # so the automatics are attributable.
                         if isinstance(_exc, asyncio.TimeoutError):
                             try:
-                                srv.logger.warning(
-                                    "dispatch_first_byte_timeout session=%s "
-                                    "ceiling=%.0fs",
-                                    session_id if session_id else "unknown",
-                                    _first_byte_ceiling,
-                                )
+                                _prefill_deadline = _get_prefill_deadline_seconds(srv)
+                                if (
+                                    _prefill_deadline > 0
+                                    and _first_byte_ceiling <= _prefill_deadline
+                                ):
+                                    srv.logger.warning(
+                                        "prefill_deadline_exceeded session=%s "
+                                        "deadline=%.0fs → cancelling local "
+                                        "dispatch and detouring to the next "
+                                        "provider",
+                                        session_id if session_id else "unknown",
+                                        _prefill_deadline,
+                                    )
+                                else:
+                                    srv.logger.warning(
+                                        "dispatch_first_byte_timeout session=%s "
+                                        "ceiling=%.0fs",
+                                        session_id if session_id else "unknown",
+                                        _first_byte_ceiling,
+                                    )
                             except Exception:
                                 pass
                         srv.backend_ready = False

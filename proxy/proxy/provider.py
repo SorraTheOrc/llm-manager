@@ -5831,6 +5831,16 @@ async def _maybe_queue_for_local_slot(
         ),
         session_id=session_id,
         retained=_retained,
+        # ETA-aware ordering (LP-0MVIQ0G2M0006QF6 AC1): the admission guard
+        # already costed this request's prefill, so the queue can admit the
+        # shortest projected prefill first within its retention class.
+        eta_seconds=(
+            float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0)
+            if _admission is not None
+            else None
+        ),
+        eta_ordering=bool(cq.get("eta_ordering", False)),
+        promote_after_seconds=float(cq.get("eta_promotion_seconds", 0) or 0),
     )
     if elapsed is None:
         # Caps exceeded — the caller falls back. Surface the measured wait so

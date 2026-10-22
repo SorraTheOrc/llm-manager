@@ -691,6 +691,18 @@ Key semantics (see `proxy/proxy/provider.py` `_maybe_queue_for_local_slot` and
   in **cheap mode** it is recovered (the request proceeds to local and may
   queue); in **fast mode** it bypasses local and falls back to remote providers
   for tail latency.
+- **ETA-aware admission ordering** (LP-0MVIQ0G2M0006QF6): with
+  `local_max_concurrent_prefills: 1` one long prefill is head-of-line blocking
+  for every queued local request (1 827 prefill-saturated queue samples vs 468
+  generating in the 24 h baseline). Within each retention class the queue now
+  inserts a waiter by **ascending projected prefill ETA**, so a queue of 20 s
+  turns is not parked behind one 7-minute prefill. Retention priority is still
+  the primary tie-break (ordering only applies *within* a class), a missing
+  projection orders last, and a waiter older than
+  `contention_queue_eta_promotion_seconds` (default 30) is promoted to the
+  front of its class so a long prefill cannot starve. Each reorder logs
+  `contention_queue_eta_order ... reason=shortest_eta_first`;
+  `contention_queue_eta_ordering: false` restores plain FIFO.
 - **Wake signals**: the queue wakes on BOTH `local_active_queries` decrement
   (a local stream ended) AND slot-persistence / lease release (slot
   save/restore frees the backend during model switches).
@@ -917,6 +929,33 @@ Every response carries `X-Local-Route`:
 expired` is the reserved-but-unused signal for ticket hoarding.
 
 ## Stream Error Handling (recovery-first + informative-error fallback)
+
+### Prefill deadline (LP-0MVIQ0G2M0006QF6)
+
+Before the first byte, a local dispatch is bounded by
+`server.local_prefill_deadline_seconds` (default **90 s**, 0 disables). The
+effective first-byte ceiling is the tighter of this and
+`local_dispatch_first_byte_timeout_seconds` (840 s), so by default the deadline
+is the bound that fires. On expiry the pending upstream request is cancelled
+(the monitor cancels its `open_task`), the local dispatch aborts with the
+retryable 503 the first-byte ceiling already produces — so the chain detours
+to the next provider — and the dispatch lease/slot is released by the normal
+cleanup path (no orphan survives). The event logs
+`prefill_deadline_exceeded session=… deadline=…s` so the detour is
+attributable; `dispatch_first_byte_timeout` is logged when the (looser) wedge
+ceiling is what fired instead.
+
+The deadline sits **above** the admission budget
+(`contention_queue_max_wait_seconds`, 60 s) so a request legitimately admitted
+inside its budget is never cut off, and **below**
+`local_dispatch_max_prefill_seconds` (900 s, unchanged). It is the hard
+backstop that does not depend on ETA-estimator quality.
+
+Note: the existing `stream_heartbeat_interval_seconds` (default 10 s) emits
+`data: {"type":"heartbeat",…}` frames during prefill **after** the upstream
+SSE headers arrive. Frames *before* the headers (the strict prefill window)
+need the local dispatch to return a streaming response before the upstream
+first byte; that gap is tracked separately.
 
 When a routed stream fails, the proxy follows a **recovery-first** strategy
 with an **informative-error fallback** (from the Aug 3 error analysis,

@@ -841,7 +841,49 @@ def _get_first_byte_timeout_seconds(srv) -> float:
     ceiling=900s``, LP-0MU1S617L002Q9PR AC1). The lifetime wedge bound
     (``local_dispatch_max_prefill_seconds``) is unchanged. Returns 0 to
     disable the first-byte ceiling entirely.
+
+    The effective ceiling is the tighter of this value and
+    :func:`_get_prefill_deadline_seconds` — the prefill deadline
+    (LP-0MVIQ0G2M0006QF6) is a *safety detour* deliberately set well below
+    the wedge bound so a stalled local prefill becomes a fast remote answer
+    instead of a multi-minute hang.
     """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_dispatch_first_byte_timeout_seconds", 840)
+        ceiling = float(raw) if raw is not None else 840.0
+    except Exception:
+        ceiling = 840.0
+    deadline = _get_prefill_deadline_seconds(srv)
+    if deadline > 0:
+        # Tighten toward the deadline; a zero wedge bound means "no ceiling".
+        return deadline if ceiling <= 0 else min(ceiling, deadline)
+    return ceiling
+
+
+def _get_prefill_deadline_seconds(srv) -> float:
+    """Return the prefill deadline in seconds (default 90; 0 disables).
+
+    A hard backstop *independent of ETA-estimator quality*
+    (LP-0MVIQ0G2M0006QF6 AC3): if a local dispatch has produced no first byte
+    by this deadline, the pending upstream request is cancelled and the local
+    dispatch aborts with the existing retryable 503, so the chain falls
+    through to the next provider instead of leaving the client on a silent
+    socket for minutes (baseline: 48 local dispatches >120 s, max 592 s).
+
+    It is deliberately set well ABOVE the admission budget
+    (``contention_queue_max_wait_seconds``, 60 s) so a request legitimately
+    admitted inside its budget is never cut off, and strictly BELOW
+    ``local_dispatch_first_byte_timeout_seconds`` (840 s) so it is the bound
+    that actually fires. Precedence: the prefill deadline wins over the wedge
+    bound; both are bounded by ``local_dispatch_max_prefill_seconds``.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_prefill_deadline_seconds", 90)
+        return float(raw) if raw is not None else 90.0
+    except Exception:
+        return 90.0
     try:
         server_cfg = srv.config.get("server", {})
         raw = server_cfg.get("local_dispatch_first_byte_timeout_seconds", 840)

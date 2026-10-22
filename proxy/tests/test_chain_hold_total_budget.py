@@ -249,18 +249,46 @@ def _make_srv(server_cfg_overrides: dict | None = None) -> SimpleNamespace:
 
 
 def test_first_byte_timeout_default_below_client_deadline():
-    from proxy.router_helpers import _get_first_byte_timeout_seconds
+    from proxy.router_helpers import (
+        _get_first_byte_timeout_seconds,
+        _get_prefill_deadline_seconds,
+    )
 
-    timeout = _get_first_byte_timeout_seconds(_make_srv())
-    assert timeout == 840.0
+    srv = _make_srv()
+    # The effective ceiling is the tighter of the wedge bound (840) and the
+    # prefill deadline (90) — LP-0MVIQ0G2M0006QF6 AC3: the safety detour is
+    # the bound that actually fires. The wedge bound is unchanged.
+    assert _get_prefill_deadline_seconds(srv) == 90.0
+    timeout = _get_first_byte_timeout_seconds(srv)
+    assert timeout == 90.0
+    assert timeout == _get_prefill_deadline_seconds(srv)
     assert timeout < CLIENT_QUEUE_TIMEOUT
 
 
 def test_first_byte_timeout_respects_override_and_zero():
     from proxy.router_helpers import _get_first_byte_timeout_seconds
 
-    srv = _make_srv({"local_dispatch_first_byte_timeout_seconds": 600})
-    assert _get_first_byte_timeout_seconds(srv) == 600.0
+    # A wedge ceiling tighter than the deadline wins.
+    srv = _make_srv({"local_dispatch_first_byte_timeout_seconds": 30})
+    assert _get_first_byte_timeout_seconds(srv) == 30.0
 
+    # A looser one is tightened to the deadline (90).
+    srv = _make_srv({"local_dispatch_first_byte_timeout_seconds": 600})
+    assert _get_first_byte_timeout_seconds(srv) == 90.0
+
+    # Disabling the wedge ceiling must not disable the deadline backstop.
     srv = _make_srv({"local_dispatch_first_byte_timeout_seconds": 0})
+    assert _get_first_byte_timeout_seconds(srv) == 90.0
+
+    # Disabling BOTH restores the previous "no ceiling" behaviour (0).
+    srv = _make_srv(
+        {
+            "local_dispatch_first_byte_timeout_seconds": 0,
+            "local_prefill_deadline_seconds": 0,
+        }
+    )
     assert _get_first_byte_timeout_seconds(srv) == 0.0
+
+    # The legacy default is still honoured when the deadline is disabled.
+    srv = _make_srv({"local_prefill_deadline_seconds": 0})
+    assert _get_first_byte_timeout_seconds(srv) == 840.0
