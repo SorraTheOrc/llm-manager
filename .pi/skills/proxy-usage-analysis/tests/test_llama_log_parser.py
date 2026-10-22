@@ -11,6 +11,7 @@ Fixtures are derived from real lines in /var/log/llama-proxy/llama-server.log
 from __future__ import annotations
 
 import csv
+import gzip
 import os
 import sys
 from datetime import datetime
@@ -369,6 +370,229 @@ class TestSpeedStats:
 
 
 # ---------------------------------------------------------------------------
+# Date-named rotation discovery (LP-0MVJNIZRO008S031)
+# ---------------------------------------------------------------------------
+# The live log is rotated daily into ``llama-server.log-YYYY-MM-DD`` and then
+# gzip-compressed (``llama-server.log-YYYY-MM-DD.gz``) — the naming scheme the
+# original parser did not recognise, which is why eval-timing windows appeared
+# empty after a rotation.
+
+
+class TestDatedRotation:
+    def _dir(self, tmp_path: Path) -> Path:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        return log_dir
+
+    def test_dated_file_discovered_and_parsed(self, tmp_path):
+        log_dir = self._dir(tmp_path)
+        (log_dir / "llama-server.log-2026-08-02").write_text(
+            fixtures.QWEN3_SPAWN_LINE + "\n" + fixtures.DECODE_EVAL_REAL + "\n"
+        )
+        _set_mtime(log_dir / "llama-server.log-2026-08-02", MOCK_MTIME)
+        files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
+        assert [p.name for p in files] == ["llama-server.log-2026-08-02"]
+        stats = llama_log_parser.build_speed_stats(
+            files, WINDOW_START, WINDOW_END, _schedule(), log_dir=log_dir
+        )
+        assert stats.decode["total"].count == 1
+        assert stats.files_parsed == 1
+        assert stats.file_diagnostics[0].port_source == "spawn_line"
+
+    def test_dated_gz_file_discovered_and_parsed(self, tmp_path):
+        log_dir = self._dir(tmp_path)
+        raw = (fixtures.QWEN3_SPAWN_LINE + "\n" + fixtures.DECODE_EVAL_REAL + "\n").encode()
+        with gzip.open(log_dir / "llama-server.log-2026-08-02.gz", "wb") as fh:
+            fh.write(raw)
+        _set_mtime(log_dir / "llama-server.log-2026-08-02.gz", MOCK_MTIME)
+        files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
+        assert [p.name for p in files] == ["llama-server.log-2026-08-02.gz"]
+        stats = llama_log_parser.build_speed_stats(
+            files, WINDOW_START, WINDOW_END, _schedule(), log_dir=log_dir
+        )
+        assert stats.decode["total"].count == 1
+        assert stats.files_parsed == 1
+
+    def test_dated_file_outside_window_not_discovered(self, tmp_path):
+        log_dir = self._dir(tmp_path)
+        (log_dir / "llama-server.log-2026-08-01").write_text(
+            fixtures.QWEN3_SPAWN_LINE + "\n" + fixtures.DECODE_EVAL_REAL + "\n"
+        )
+        _set_mtime(log_dir / "llama-server.log-2026-08-01", datetime(2026, 8, 1, 12, 0))
+        files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
+        assert files == []
+
+
+# ---------------------------------------------------------------------------
+# Empty-eval-timing diagnostics (LP-0MVJNIZRO008S031)
+# ---------------------------------------------------------------------------
+# When the window has no samples the report must state why, naming the log
+# path, the files scanned and the lines matched — never an unattributed
+# blank. The distinguishable causes: nothing to scan (empty window / missing
+# dir), rotation (files outside the window), verbosity/build (no eval-timing
+# lines in the files at all), and attribution failure (Qwen3 child port
+# undiscoverable).
+
+
+class TestEmptyEvalDiagnostics:
+    def _dir(self, tmp_path: Path, files: dict) -> Path:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        for name, content in files.items():
+            (log_dir / name).write_text(content)
+        return log_dir
+
+    def test_empty_window_reports_no_files(self, tmp_path):
+        log_dir = self._dir(tmp_path, {"proxy.log": "no llama logs here\n"})
+        stats = llama_log_parser.build_speed_stats(
+            [], WINDOW_START, WINDOW_END, _schedule(), log_dir=log_dir
+        )
+        assert stats.log_dir == str(log_dir)
+        assert stats.files_discovered == []
+        assert stats.files_parsed == 0
+        assert stats.files_skipped == 0
+        assert stats.outside_window_files == []
+        reasons = llama_log_parser.empty_window_reasons(stats)
+        assert len(reasons) == 1
+        assert "no llama-server log files" in reasons[0]
+        assert str(log_dir) in reasons[0]
+
+    def test_missing_port_diagnostic(self, tmp_path):
+        # Fixture: eval lines present but only a non-Qwen3 spawn line, so the
+        # Qwen3 port cannot be determined (the eval-line port belongs to the
+        # announced embed child). Skipped with a named reason, never fatal.
+        log_dir = self._dir(
+            tmp_path, {"llama-server.log": fixtures.LLAMA_LOG_UNDISCOVERABLE_QWEN3_PORT + "\n"}
+        )
+        _set_mtime(log_dir / "llama-server.log", MOCK_MTIME)
+        files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
+        stats = llama_log_parser.build_speed_stats(
+            files, WINDOW_START, WINDOW_END, _schedule(), log_dir=log_dir
+        )
+        assert stats.files_parsed == 0
+        assert stats.files_skipped == 1
+        d = stats.file_diagnostics[0]
+        assert d.status == llama_log_parser.STATUS_MISSING_PORT
+        assert d.port is None
+        assert d.eval_lines == 2
+        assert d.eval_lines_matched == 0
+        assert "51973" in d.reason
+        reasons = llama_log_parser.empty_window_reasons(stats)
+        assert any("attribution" in r for r in reasons)
+
+    def test_outside_window_rotation_diagnostic(self, tmp_path):
+        # A rotated file whose last write is after the window end yields no
+        # samples and is reported as rotation, not silently dropped.
+        log_dir = self._dir(
+            tmp_path,
+            {"llama-server.1.log": fixtures.QWEN3_SPAWN_LINE + "\n" + fixtures.DECODE_EVAL_REAL + "\n"},
+        )
+        _set_mtime(log_dir / "llama-server.1.log", datetime(2026, 8, 2, 17, 0))
+        files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
+        stats = llama_log_parser.build_speed_stats(
+            files, WINDOW_START, WINDOW_END, _schedule(), log_dir=log_dir
+        )
+        assert stats.decode["total"].count == 0
+        d = stats.file_diagnostics[0]
+        assert d.status == llama_log_parser.STATUS_OUTSIDE_WINDOW
+        assert "llama-server.1.log" in stats.outside_window_files
+        reasons = llama_log_parser.empty_window_reasons(stats)
+        assert any("rotation" in r for r in reasons)
+
+    def test_verbosity_build_diagnostic(self, tmp_path):
+        # In-window file parses but contains no eval-timing lines at all — the
+        # verbosity/build cause.
+        log_dir = self._dir(tmp_path, {"llama-server.log": fixtures.LLAMA_LOG_NO_EVAL_LINES + "\n"})
+        _set_mtime(log_dir / "llama-server.log", MOCK_MTIME)
+        files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
+        stats = llama_log_parser.build_speed_stats(
+            files, WINDOW_START, WINDOW_END, _schedule(), log_dir=log_dir
+        )
+        assert stats.files_parsed == 1
+        d = stats.file_diagnostics[0]
+        assert d.status == llama_log_parser.STATUS_PARSED
+        assert d.eval_lines == 0
+        reasons = llama_log_parser.empty_window_reasons(stats)
+        assert any("verbosity" in r and "no `eval time`" in r for r in reasons)
+
+    def test_port_inference_restores_ingestion(self, tmp_path):
+        # No Qwen3 spawn line, but every eval-timing line carries the same,
+        # otherwise-unannounced port (real case: child-log rotation splits the
+        # spawn line away, e.g. llama-server.2.log). The port is inferred and
+        # the samples are attributed — ingestion restored.
+        content = "\n".join(
+            [
+                "[50193] srv          stop: cancel task, id_task = 109035",
+                "[50193]        eval time =    100.00 ms /    10 tokens (   10.00 ms per token,    40.00 tokens per second)",
+                "[50193] prompt eval time =     10.00 ms /    10 tokens (    1.00 ms per token,   200.00 tokens per second)",
+            ]
+        ) + "\n"
+        log_dir = self._dir(tmp_path, {"llama-server.log": content})
+        _set_mtime(log_dir / "llama-server.log", MOCK_MTIME)
+        files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
+        stats = llama_log_parser.build_speed_stats(
+            files, WINDOW_START, WINDOW_END, _schedule(), log_dir=log_dir
+        )
+        d = stats.file_diagnostics[0]
+        assert d.status == llama_log_parser.STATUS_PARSED
+        assert d.port == 50193
+        assert d.port_source == "inferred"
+        assert d.eval_lines == 2
+        assert d.eval_lines_matched == 2
+        assert d.samples_in_window == 2
+        assert stats.decode["total"].count == 1
+        assert stats.prompt_eval["total"].count == 1
+        assert stats.qwen3_ports == [50193]
+
+    def test_ambiguous_ports_are_skipped_with_named_reason(self, tmp_path):
+        # Two distinct, otherwise-unannounced ports in one file: cannot tell
+        # which is Qwen3, so the file is skipped with a named reason.
+        content = "\n".join(
+            [
+                "[50193]        eval time =    100.00 ms /    10 tokens (   10.00 ms per token,    40.00 tokens per second)",
+                "[51973]        eval time =    100.00 ms /    10 tokens (   10.00 ms per token,    50.00 tokens per second)",
+            ]
+        ) + "\n"
+        log_dir = self._dir(tmp_path, {"llama-server.log": content})
+        _set_mtime(log_dir / "llama-server.log", MOCK_MTIME)
+        files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
+        stats = llama_log_parser.build_speed_stats(
+            files, WINDOW_START, WINDOW_END, _schedule(), log_dir=log_dir
+        )
+        d = stats.file_diagnostics[0]
+        assert d.status == llama_log_parser.STATUS_MISSING_PORT
+        assert "50193" in d.reason and "51973" in d.reason
+        assert stats.files_skipped == 1
+        assert stats.decode["total"].count == 0
+
+    def test_report_prints_named_diagnostic(self, tmp_path):
+        # End-to-end: an empty eval-timing window renders the log path, the
+        # files scanned, the lines matched and a named reason — no blank.
+        log_dir = self._dir(
+            tmp_path, {"llama-server.log": fixtures.LLAMA_LOG_UNDISCOVERABLE_QWEN3_PORT + "\n"}
+        )
+        _set_mtime(log_dir / "llama-server.log", MOCK_MTIME)
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        out_dir = tmp_path / "out"
+        _ = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out_dir,
+            config=None,
+        )
+        md = (out_dir / "report.md").read_text()
+        assert "## Decode speed" in md
+        decode_section = md.split("## Decode speed", 1)[1].split("## ", 1)[0]
+        assert "No llama-server eval timing samples" in decode_section
+        assert "Log directory scanned:" in decode_section
+        assert "llama-server.log" in decode_section
+        assert "attribution" in decode_section.lower()
+        assert "51973" in decode_section
+        assert str(log_dir) in decode_section
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: report section + CSV column
 # ---------------------------------------------------------------------------
 
@@ -453,3 +677,32 @@ class TestEndToEnd:
         assert data["decode_speed"]["samples"] == 2
         assert data["decode_speed"]["median_tok_s"] == 40.9
         assert data["prompt_eval_speed"]["samples"] == 2
+
+    def test_summary_to_json_includes_diagnostics(self, tmp_path):
+        # LP-0MVJNIZRO008S031: the machine-readable summary carries the same
+        # diagnostic context the report prints (log dir, files, lines matched).
+        log_dir = tmp_path / "logs_json_diag"
+        log_dir.mkdir()
+        (log_dir / "llama-server.log").write_text(
+            fixtures.LLAMA_LOG_UNDISCOVERABLE_QWEN3_PORT + "\n"
+        )
+        _set_mtime(log_dir / "llama-server.log", MOCK_MTIME)
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out_json_diag",
+            config=None,
+        )
+        speed = reporting.summary_to_json(result.summary)["decode_speed"]
+        assert speed["samples"] == 0
+        assert speed["log_dir"] == str(log_dir)
+        assert speed["files_discovered"] == ["llama-server.log"]
+        assert speed["files_parsed"] == 0
+        assert speed["files_skipped"] == 1
+        assert speed["eval_lines_total"] == 2
+        assert speed["eval_lines_matched"] == 0
+        assert speed["file_diagnostics"][0]["status"] == llama_log_parser.STATUS_MISSING_PORT
+        assert "empty_window_reasons" in speed
+        assert any("attribution" in r for r in speed["empty_window_reasons"])

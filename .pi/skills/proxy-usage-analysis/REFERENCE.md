@@ -13,6 +13,11 @@ limitations. The skill itself is a thin, CLI-focused wrapper — see
   net (`proxy.log-YYYY-MM-DD_HH`, dash) — and either may be gzipped (`.gz`).
   The script discovers all of them and decompresses `.gz` transparently; the
   log directory should contain both types.
+- llama-server log source (read-only): `/var/log/llama-proxy/llama-server.log`
+  plus its rotations — numbered in-process rotations
+  (`llama-server.N.log`) and logrotate daily archives
+  (`llama-server.log-YYYY-MM-DD[.gz]`) — used for the Decode speed /
+  Prompt eval speed sections (see [How it works](#how-it-works) step 9).
 - Config (reference only, for slot schedule + thresholds):
   `proxy/config.yaml` in the llm project (auto-discovered by walking up from
   the current directory, or pass `--config`). When the persisted operating
@@ -405,13 +410,29 @@ entry is a local runtime edit, not a committed artifact.
    (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
    are streamed from `llama-server.log*`, filtered to the Qwen3 child port
    (discovered per file from the `name=Qwen3 on port <port>` spawn line;
-   the port changes on every restart). Samples are bucketed Total / Fast /
-   Cheap via the slot schedule and summarised as median / p90 / p10 tok/s.
-   Because llama-server.log lines carry no timestamps, each sample is
+   the port changes on every restart). Rotation is recognised in both
+   schemes: numbered in-process rotations (`llama-server.N.log`) and the
+   logrotate daily archives (`llama-server.log-YYYY-MM-DD`), decompressing
+   `.gz` transparently. When rotation splits the Qwen3 spawn line away from a
+   child log, the port is **inferred** from the single, otherwise-unannounced
+   port carried by that file's eval lines (ports announced for other models,
+   e.g. `name=mxbai-embed on port N`, are excluded); a file whose port stays
+   ambiguous is skipped with a named reason. Samples are bucketed Total /
+   Fast / Cheap via the slot schedule and summarised as median / p90 / p10
+   tok/s. Because llama-server.log lines carry no timestamps, each sample is
    bucketed by its log file's last-write time (approximate; documented in
-   the report). The per-session CSV `decode_tok_s` column is derived from
-   proxy.log instead (local completion tokens ÷ local active span) and stays
-   empty when not derivable.
+   the report). An empty window is **self-diagnosing**: the section prints
+   the log directory scanned, the files scanned, the eval lines matched and
+   a named cause — `verbosity/build` (no `eval time` lines in the files at
+   all), `rotation` (files outside the window), or `attribution failure`
+   (Qwen3 port undeterminable) — instead of an unattributed blank
+   (LP-0MVJNIZRO008S031). The same context is in the `--json` summary under
+   `decode_speed` / `prompt_eval_speed` (`log_dir`, `files_discovered`,
+   `files_outside_window`, `files_unrecognised`, `qwen3_ports`,
+   `eval_lines_total`, `eval_lines_matched`, `file_diagnostics`, and
+   `empty_window_reasons` when the window is empty). The per-session CSV
+   `decode_tok_s` column is derived from proxy.log instead (local completion
+   tokens ÷ local active span) and stays empty when not derivable.
 
 ## Interpreting the report
 
@@ -436,6 +457,15 @@ entry is a local runtime edit, not a committed artifact.
     (credentials, rate limits) — not slot-related.
 - **Context pressure**: sessions whose max context approaches
   `local_model_ctx_size / slots` can force `large_context_bypass`.
+- **Decode speed / Prompt eval speed**: when these sections are empty, read
+  the **Why no eval-timing samples** block rather than assuming a data
+  problem: `verbosity/build` means the files were read but carry no
+  `eval time` lines (llama-server log verbosity or build flags), `rotation`
+  means every `llama-server*` file falls outside the window (retention/-
+  rotation too aggressive for the window), and `attribution failure` means
+  the eval lines exist but no Qwen3 child port could be determined (an
+  ambiguous or non-Qwen3 port). The block always names the log directory,
+  the files scanned and the eval lines matched.
 - **Local model utilization**: busy time is the share of the window with at
   least one local slot occupied **from dispatch to finish** (prefill +
   decode, LP-0MVJN9H2I00116FP); the retained decode-only figure is its

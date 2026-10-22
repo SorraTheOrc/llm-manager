@@ -508,10 +508,18 @@ def build_report(
         "use this report's `large_context_bypass` data. See the skill's SKILL.md for interpretation."
     )
     ap(
-        "- Decode/prompt-eval speeds come from llama-server eval-timing lines, filtered to the Qwen3 "
-        "child port (discovered per log file). llama-server.log lines carry no timestamps, so the "
-        "fast/cheap split and window filtering are approximate: each sample is bucketed by its log "
-        "file's last-write time. Files whose Qwen3 port cannot be discovered are skipped."
+        "- Decode/prompt-eval speeds come from llama-server eval-timing lines, "
+        "filtered to the Qwen3 child port (discovered per log file from the "
+        "router's `name=Qwen3 on port` spawn line, or inferred when rotation "
+        "split the spawn line away and the file's eval lines carry a single "
+        "unambiguous port). llama-server.log lines carry no timestamps, so the "
+        "fast/cheap split and window filtering are approximate: each sample is "
+        "bucketed by its log file's last-write time. Rotated files follow both "
+        "the numbered (`llama-server.N.log`) and daily "
+        "(`llama-server.log-YYYY-MM-DD[.gz]`) naming schemes. Files whose Qwen3 "
+        "port cannot be determined are skipped, and a window with no samples "
+        "prints a named reason (log path, files scanned, lines matched) instead "
+        "of an unattributed blank (LP-0MVJNIZRO008S031)."
     )
     ap(
         "- Compaction events (LP-0MTHCTLAF00147IT): the proxy emits `compaction_event` lines for "
@@ -1594,6 +1602,52 @@ def _speed_cell(value: float | None) -> str:
     return f"{value:.1f}" if value is not None else "-"
 
 
+def _append_speed_diagnostic(ap, speed: llama_log_parser.SpeedStats) -> None:
+    """Render the named, self-diagnosing reason for an empty eval-timing
+    window (LP-0MVJNIZRO008S031): the log path scanned, the files found, the
+    eval-timing lines matched, and the distinguishing cause(s) — verbosity /
+    build, rotation, or attribution failure — instead of an unattributed
+    blank.
+    """
+    ap("")
+    ap("**Why no eval-timing samples**")
+    ap("")
+    ap(f"- Log directory scanned: `{speed.log_dir or '<unknown>'}`")
+    if speed.files_discovered:
+        ap(
+            f"- Files scanned ({len(speed.files_discovered)}): "
+            + llama_log_parser._summarise_names(
+                [f"`{n}`" for n in speed.files_discovered]
+            )
+        )
+    else:
+        ap("- Files scanned: **none**")
+    total_eval = sum(d.eval_lines for d in speed.file_diagnostics)
+    matched = sum(d.samples_in_window for d in speed.file_diagnostics)
+    ap(
+        f"- Files parsed: {speed.files_parsed} | skipped: "
+        f"{speed.files_skipped} | outside window (rotation): "
+        f"{len(speed.outside_window_files)} | unrecognised rotation names: "
+        f"{len(speed.ignored_logs)}"
+    )
+    ap(f"- Eval-timing lines found: {total_eval} | matched to Qwen3: {matched}")
+    ap("")
+    for reason in llama_log_parser.empty_window_reasons(speed):
+        ap(f"- {reason}")
+    if speed.file_diagnostics:
+        rows = [d for d in speed.file_diagnostics if d.status != llama_log_parser.STATUS_OUTSIDE_WINDOW]
+        if rows:
+            ap("")
+            ap("| File | Status | Qwen3 port (source) | Lines | Eval lines (matched/total) | Samples |")
+            ap("|---|---|---|---|---|---|")
+            for d in rows:
+                port = f"{d.port} ({d.port_source})" if d.port is not None else "-"
+                ap(
+                    f"| `{d.name}` | {d.status} | {port} | {d.lines_scanned} | "
+                    f"{d.eval_lines_matched}/{d.eval_lines} | {d.samples_in_window} |"
+                )
+
+
 def _append_speed_section(
     ap,
     title: str,
@@ -1602,6 +1656,12 @@ def _append_speed_section(
 ) -> None:
     """Append a speed section (``## Decode speed`` / ``## Prompt eval speed``)
     to the report, one row per (model, bucket) with samples / median / p90 / p10.
+
+    When the window has no samples the section renders a named,
+    self-diagnosing reason (log path, files scanned, lines matched and the
+    cause) instead of an unattributed blank (LP-0MVJNIZRO008S031); the
+    diagnostic is additive and the table layout is unchanged when samples do
+    exist.
     """
     ap("")
     ap(f"## {title}")
@@ -1613,6 +1673,7 @@ def _append_speed_section(
     total = buckets[TOTAL]
     if total.count == 0:
         ap("_No llama-server eval timing samples in window._")
+        _append_speed_diagnostic(ap, speed)
         return
     ap("| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |")
     ap("|---|---|---|---|---|---|")
@@ -1628,7 +1689,7 @@ def _append_speed_section(
     if speed.files_skipped:
         ap("")
         ap(f"_Note: {speed.files_skipped} llama-server log file(s) skipped "
-           "(Qwen3 child port not found)._")
+           "(Qwen3 child port not found)._", )
 
 
 def _bucket_key(bucket: str | None) -> str:
@@ -1770,7 +1831,7 @@ def run_analysis(
 
     llama_files = llama_log_parser.discover_llama_logs(llama_log_dir, window_start)
     summary.speed = llama_log_parser.build_speed_stats(
-        llama_files, window_start, window_end, schedule, mode_map
+        llama_files, window_start, window_end, schedule, mode_map, log_dir=llama_log_dir
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2043,10 +2104,14 @@ def compaction_json(summary: AnalysisResult) -> dict:
 
 
 def _speed_json(speed: llama_log_parser.SpeedStats, kind: str = "decode") -> dict:
-    """JSON-friendly speed summary (total bucket only)."""
+    """JSON-friendly speed summary (total bucket only), plus the diagnostic
+    context that lets an empty window explain itself (LP-0MVJNIZRO008S031):
+    the log directory scanned, the files discovered/outside/unrecognised and
+    the per-file scan outcomes.
+    """
     buckets = speed.decode if kind == "decode" else speed.prompt_eval
     b = buckets[TOTAL]
-    return {
+    out = {
         "samples": b.count,
         "median_tok_s": b.median,
         "p90_tok_s": b.p90,
@@ -2054,3 +2119,29 @@ def _speed_json(speed: llama_log_parser.SpeedStats, kind: str = "decode") -> dic
         "files_parsed": speed.files_parsed,
         "files_skipped": speed.files_skipped,
     }
+    out["log_dir"] = speed.log_dir
+    out["files_discovered"] = speed.files_discovered
+    out["files_outside_window"] = list(speed.outside_window_files or [])
+    out["files_unrecognised"] = list(speed.ignored_logs or [])
+    out["qwen3_ports"] = list(speed.qwen3_ports or [])
+    out["eval_lines_total"] = sum(d.eval_lines for d in speed.file_diagnostics)
+    out["eval_lines_matched"] = sum(d.samples_in_window for d in speed.file_diagnostics)
+    out["file_diagnostics"] = [
+        {
+            "file": d.name,
+            "status": d.status,
+            "reason": d.reason,
+            "port": d.port,
+            "port_source": d.port_source,
+            "mtime": d.mtime,
+            "lines_scanned": d.lines_scanned,
+            "eval_lines": d.eval_lines,
+            "eval_lines_matched": d.eval_lines_matched,
+            "samples_in_window": d.samples_in_window,
+            "ports_seen": d.ports_seen,
+        }
+        for d in speed.file_diagnostics
+    ]
+    if b.count == 0:
+        out["empty_window_reasons"] = llama_log_parser.empty_window_reasons(speed)
+    return out
