@@ -945,8 +945,10 @@ def evaluate(
         )
         recommendation["follow_up"] = (
             "Enable `server.local_idle_admit_enabled: true` (threshold "
-            "`server.local_idle_admit_seconds`, default 60), restart the proxy to start "
-            "the window, then re-run this tool with a post-deploy window of >= 24 h."
+            "`server.local_idle_admit_seconds`, default 60), commit it, make the running "
+            "proxy read it with `POST /admin/reload-config` (no restart, so in-flight "
+            "streams survive and the process-local idle clock is not reset), then re-run "
+            "this tool with a post-deploy window of >= 24 h."
         )
     elif paired < min_idle_samples:
         recommendation["reasons"].append(
