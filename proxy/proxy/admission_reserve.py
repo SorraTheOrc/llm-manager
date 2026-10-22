@@ -299,7 +299,7 @@ def claim(ticket_id: str | None) -> Reservation | None:
     from the store; otherwise ``None`` (the caller falls back to today's
     ordinary path — never a hard failure).
     """
-    global _used
+    global _used, _expired
     if not ticket_id:
         return None
     _prune_expired()

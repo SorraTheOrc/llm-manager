@@ -245,6 +245,43 @@ def test_expired_ticket_is_not_honoured(monkeypatch):
     assert ar_mod.claim("t-expired") is None, "expired claim falls back (AC3)"
 
 
+def test_claim_of_expired_ticket_counts_expiry_without_raising(monkeypatch):
+    """LP-0MVJXC9MK003UET8: the expired-claim branch must not raise F823.
+
+    ``claim()`` incremented the module-global ``_expired`` without declaring
+    it ``global``, so the branch made ``_expired`` a local read-before-
+    assignment (``UnboundLocalError``). The race is real: a ticket can expire
+    between ``_prune_expired()`` and the ``is_expired()`` check, because both
+    sample ``time.monotonic()``. Drive that exact interleaving by having the
+    first monotonic read (inside ``_prune_expired``) land inside the TTL and
+    the second (inside ``claim``) land past it.
+    """
+    import proxy.admission_reserve as ar_mod
+
+    admission_reserve._reservations["t-race"] = admission_reserve.Reservation(
+        ticket_id="t-race",
+        estimated_tokens=_TOKENS,
+        cached_ratio=0.0,
+        priority=None,
+        provider="Qwen3",
+        session_id=None,
+        created_at=0.0,
+        ttl_seconds=2.0,
+    )
+    before = admission_reserve.stats()["reserved_expired"]
+    # monotonic() is called by _prune_expired (t=1.0, inside the 2 s TTL) and
+    # then by Reservation.is_expired() inside claim (t=3.0, past it).
+    readings = iter([1.0, 3.0])
+    monkeypatch.setattr(ar_mod.time, "monotonic", lambda: next(readings, 3.0))
+
+    assert admission_reserve.claim("t-race") is None, (
+        "an expired claim must fall back to the ordinary path"
+    )
+    assert admission_reserve.stats()["reserved_expired"] == before + 1, (
+        "the expiry must be counted in the reserved_expired stat"
+    )
+
+
 def test_cancelled_ticket_is_not_honoured_and_releases_the_gate():
     _seed_calibration()
     status, payload = admission_reserve.reserve(
