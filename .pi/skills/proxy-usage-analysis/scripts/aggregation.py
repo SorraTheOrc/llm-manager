@@ -35,9 +35,17 @@ from log_parser import (
     FALLBACK_ATTRIBUTION_WINDOW_SECONDS,
     LOCAL_PROVIDER,
     LogEvent,
+    PrefillMatch,
+    pair_ttft_to_streams,
 )
 
 UNKNOWN_LABEL = "(unknown)"
+
+# Unit of the prefill figures on :class:`PrefillStats` and
+# :attr:`BusyStats.prefill_stats` (LP-0MVJN45LF009CO2V). Prefill is reported as
+# slot-seconds — the integral of concurrency, i.e. the sum of the per-stream
+# dispatch → first-byte durations — which is NOT wall-clock elapsed time.
+PREFILL_UNIT = "slot-seconds"
 
 # Root-cause classification for stream errors (LP-0MUQO82LJ008F1FS).
 # A stream error is the client-visible synthetic ``finish_reason: error``
@@ -348,6 +356,118 @@ class AnalysisResult:
             result[key] = (inp, out, inp + out)
         return dict(sorted(result.items(), key=lambda kv: kv[1][2], reverse=True))
 
+
+def _percentile(sorted_values: list[float], p: float) -> float | None:
+    """Linear-interpolation percentile (numpy default) over sorted values.
+
+    Matches the percentile convention used by the rest of the skill
+    (``reporting._percentile`` / ``llama_log_parser._percentile``); returns
+    ``None`` for an empty sample set and rounds to one decimal place.
+    """
+    n = len(sorted_values)
+    if n == 0:
+        return None
+    if n == 1:
+        return round(sorted_values[0], 1)
+    pos = p / 100.0 * (n - 1)
+    lo = int(pos)
+    frac = pos - lo
+    hi = min(lo + 1, n - 1)
+    value = sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
+    return round(value, 1)
+
+
+@dataclass(frozen=True)
+class PrefillSample:
+    """One local stream's prefill measurement.
+
+    ``seconds`` is ``None`` for an unknown prefill — a stream that produced no
+    first-byte line (aborted request, log gap), so ``first_byte_ts`` is then
+    ``None`` as well. ``session`` keeps the pairing attributable per stream.
+    """
+
+    session: str | None
+    first_byte_ts: datetime | None
+    seconds: float | None
+
+    @property
+    def known(self) -> bool:
+        """Whether this stream's prefill duration is observable."""
+        return self.seconds is not None
+
+
+@dataclass(frozen=True)
+class PrefillStats:
+    """Per-stream local prefill (dispatch → first byte) statistics.
+
+    Every figure here is **slot-time, not wall-clock**: ``total_seconds`` is
+    the sum of the per-stream prefill durations (the total prefill *work*), so
+    two concurrent 10 s prefills contribute 20 slot-seconds while occupying
+    only 10 s of wall clock. It is therefore deliberately distinct from the
+    wall-clock union reported as :attr:`BusyStats.busy_seconds` and must not
+    be compared against it.
+
+    ``streams`` holds one :class:`PrefillSample` per local stream (in stream
+    order). Streams whose first-byte line is missing are **unknown prefill**:
+    they are excluded from ``samples`` and from the percentiles, but retained
+    in ``streams``/``stream_count`` so the unknown prefill is visible rather
+    than silently dropped.
+    """
+
+    streams: tuple[PrefillSample, ...] = ()
+    unit: str = PREFILL_UNIT
+
+    @property
+    def samples(self) -> tuple[float, ...]:
+        """Known per-stream prefill durations in seconds (percentile input)."""
+        return tuple(s.seconds for s in self.streams if s.seconds is not None)
+
+    @property
+    def count(self) -> int:
+        """Number of streams with an observable prefill duration."""
+        return len(self.samples)
+
+    @property
+    def unknown_count(self) -> int:
+        """Number of streams whose prefill could not be observed."""
+        return sum(1 for stream in self.streams if not stream.known)
+
+    @property
+    def stream_count(self) -> int:
+        """All local streams considered: known prefill + unknown prefill."""
+        return len(self.streams)
+
+    @property
+    def has_samples(self) -> bool:
+        """Whether any stream had an observable prefill duration."""
+        return self.count > 0
+
+    @property
+    def total_seconds(self) -> float:
+        """Window total prefill in slot-seconds (sum of per-stream prefill).
+
+        This is total prefill *work*, not the wall-clock union of the prefill
+        intervals (see the class docstring).
+        """
+        return round(sum(self.samples), 1)
+
+    @property
+    def p10(self) -> float | None:
+        return _percentile(sorted(self.samples), 10)
+
+    @property
+    def p50(self) -> float | None:
+        return _percentile(sorted(self.samples), 50)
+
+    @property
+    def p90(self) -> float | None:
+        return _percentile(sorted(self.samples), 90)
+
+    @property
+    def max_seconds(self) -> float | None:
+        return round(max(self.samples), 1) if self.samples else None
+
+
 @dataclass
 class BusyStats:
     """Local-model utilization over the analysis window.
@@ -386,6 +506,12 @@ class BusyStats:
     fast_window_seconds: float
     cheap_window_seconds: float
     hourly_busy: list[tuple[datetime, float]]
+    # Per-stream local prefill (dispatch → first byte) statistics
+    # (LP-0MVJN45LF009CO2V). Populated when the caller supplies the local
+    # TTFT events; ``None`` when they were not supplied at all, so a caller
+    # that never asked for prefill is distinguishable from one that found no
+    # first-byte lines (an empty :class:`PrefillStats`).
+    prefill_stats: PrefillStats | None = None
 
     @property
     def busy_pct(self) -> float:
@@ -626,12 +752,77 @@ def _attribute_interval(
         hourly[hour_key] = hourly.get(hour_key, 0.0) + (hi - lo).total_seconds()
 
 
+def _prefill_seconds(match: PrefillMatch) -> float | None:
+    """Prefill duration (dispatch → first byte) for one paired stream.
+
+    Resolution order, most authoritative first:
+
+    1. ``dispatch_first_byte_ms`` (the paired TTFT event's ``ttft_ms``): the
+       dispatch line is written at first byte and carries the total interval
+       including the single-slot queue wait.
+    2. ``dispatch_to_first_byte_ms + queue_wait_ms``: the logged service/queue
+       split of the same interval, summed back to the total when
+       ``dispatch_first_byte_ms`` itself is missing from a rotated log.
+    3. Pairing the dispatch and first-byte timestamps: ``ttft.ts - stream.ts``.
+       Only a **positive** difference is accepted — the proxy logs
+       ``Stream started`` at first byte, so a zero/negative delta carries no
+       evidence and the stream stays unknown prefill rather than claiming a
+       0 s prefill.
+
+    Returns ``None`` when no source yields evidence (unknown prefill).
+    """
+    ttft = match.ttft
+    if ttft is None:
+        return None
+    if ttft.ttft_ms is not None:
+        return max(0.0, ttft.ttft_ms / 1000.0)
+    if ttft.dispatch_to_first_byte_ms is not None and ttft.queue_wait_ms is not None:
+        return max(0.0, (ttft.dispatch_to_first_byte_ms + ttft.queue_wait_ms) / 1000.0)
+    delta = (ttft.ts - match.stream.ts).total_seconds()
+    return delta if delta > 0 else None
+
+
+def _compute_prefill_stats(
+    started_events: list[LogEvent],
+    ttft_events: Iterable[LogEvent],
+    window_start: datetime,
+    window_end: datetime,
+) -> PrefillStats:
+    """Per-stream local prefill statistics for the window.
+
+    TTFT events are paired FIFO to the local streams per session (same
+    convention as the busy start/finish pairing), so each stream gets at most
+    one prefill interval ``[ttft.ts - ttft_ms/1000, ttft.ts]``. A stream is
+    attributed to the window whose bounds contain its first-byte timestamp
+    (its ``Stream started`` timestamp when it has no first-byte line, which
+    the proxy logs at the same instant); intervals are **not** clipped, so a
+    dispatch that started before ``window_start`` keeps its full duration and
+    a first byte after ``window_end`` belongs to the next window (no
+    double-counting).
+    """
+    streams: list[PrefillSample] = []
+    for match in pair_ttft_to_streams(ttft_events, started_events):
+        anchor = match.ttft.ts if match.ttft is not None else match.stream.ts
+        if not (window_start <= anchor <= window_end):
+            continue
+        streams.append(
+            PrefillSample(
+                session=match.stream.session,
+                first_byte_ts=match.ttft.ts if match.ttft is not None else None,
+                seconds=_prefill_seconds(match),
+            )
+        )
+    return PrefillStats(streams=tuple(streams))
+
+
 def compute_busy_stats(
     local_events: Iterable[LogEvent],
     window_start: datetime,
     window_end: datetime,
     schedule: bucketing.SlotSchedule,
     mode_map: bucketing.ModeScheduleMap | None = None,
+    *,
+    ttft_events: Iterable[LogEvent] | None = None,
 ) -> BusyStats | None:
     """Compute local-model utilization from local stream events.
 
@@ -649,14 +840,31 @@ def compute_busy_stats(
     (LP-0MSPZUD4G007IYGH), so busy seconds during cheap hours count as cheap
     even when the analysis runs in fast mode. Returns ``None`` when there is
     no local traffic in the window.
+
+    ``ttft_events`` are the local ``dispatch_first_byte_ms`` TTFT events
+    (LP-0MVJN45LF009CO2V). When supplied they are paired FIFO to the local
+    streams per session and reported as :attr:`BusyStats.prefill_stats`:
+    p10/p50/p90/max plus the window total of the prefill interval
+    ``[ttft.ts - ttft_ms/1000, ttft.ts]``. Every prefill figure is
+    **slot-time, not wall-clock** (the per-stream durations are summed, not
+    unioned), unlike ``busy_seconds``. When ``dispatch_first_byte_ms`` is
+    absent the duration falls back to the logged
+    ``dispatch_to_first_byte_ms + queue_wait_ms`` split and then to pairing the
+    dispatch and first-byte timestamps (see :func:`_prefill_seconds`). Streams
+    with no first-byte line are counted as unknown prefill: excluded from the
+    percentiles, retained in the stream count. ``prefill_stats`` is ``None``
+    only when ``ttft_events`` was not supplied at all.
     """
     started: dict[str, list[datetime]] = {}
     finished: dict[str, list[datetime]] = {}
+    started_events: list[LogEvent] = []
     for ev in local_events:
         if ev.session is None:
             continue
         bucket = started if ev.kind == "stream_started" else finished
         bucket.setdefault(ev.session, []).append(ev.ts)
+        if ev.kind == "stream_started":
+            started_events.append(ev)
 
     intervals: list[tuple[datetime, datetime]] = []
     unfinished = 0
@@ -679,8 +887,17 @@ def compute_busy_stats(
                 pre_window_unfinished += 1
             elif ts <= window_end:
                 unfinished += 1
+    prefill_stats = (
+        _compute_prefill_stats(started_events, ttft_events, window_start, window_end)
+        if ttft_events is not None
+        else None
+    )
     if not intervals:
-        return None
+        # No paired stream duration. Prefill evidence (a known sample or an
+        # unknown-prefill stream) can still exist when every stream is
+        # unfinished, so only report "no local traffic" when there is none.
+        if prefill_stats is None or prefill_stats.stream_count == 0:
+            return None
 
     intervals.sort()
     merged: list[list[datetime]] = []
@@ -743,6 +960,7 @@ def compute_busy_stats(
         fast_window_seconds=round(fast_window, 1),
         cheap_window_seconds=round(cheap_window, 1),
         hourly_busy=sorted(hourly.items()),
+        prefill_stats=prefill_stats,
     )
 
 
@@ -917,6 +1135,12 @@ def aggregate(
     # busy-time calculation; ``iter_events`` yields a margin beyond the window
     # so boundary-crossing streams pair correctly (clipped in compute_busy_stats).
     local_stream_events: list[LogEvent] = []
+    # Local TTFT events (``dispatch_first_byte_ms`` lines) across the same
+    # margin-widened stream: paired FIFO to the local streams to derive the
+    # per-stream prefill statistics (LP-0MVJN45LF009CO2V). The dispatch line
+    # carries no ``provider=`` field, so ``provider is None`` marks it as local
+    # (remote ``ttft_seconds=`` lines always name their provider).
+    local_ttft_events: list[LogEvent] = []
     # Operating-mode transitions across the (margin-widened) event stream:
     # the mode timeline used for fast/cheap session bucketing. Carries the
     # attribution markers (source/actor/reason) parsed by log_parser
@@ -958,6 +1182,8 @@ def aggregate(
             continue
         if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
             local_stream_events.append(ev)
+        if ev.kind == "ttft" and ev.provider in (None, LOCAL_PROVIDER):
+            local_ttft_events.append(ev)
         if not (window_start <= ev.ts <= window_end):
             continue
         total_lines += 1
@@ -1054,7 +1280,14 @@ def aggregate(
             continue
         sessions[sid] = _build_session(builder, routing_skips, fallback_events, schedule, mode_map)
 
-    busy = compute_busy_stats(local_stream_events, window_start, window_end, schedule, mode_map)
+    busy = compute_busy_stats(
+        local_stream_events,
+        window_start,
+        window_end,
+        schedule,
+        mode_map,
+        ttft_events=local_ttft_events,
+    )
 
     return AnalysisResult(
         window_start=window_start,

@@ -2395,6 +2395,20 @@ def _local_event(kind: str, ts: datetime, session: str = "s1") -> log_parser.Log
     )
 
 
+def _ttft_event(
+    ts: datetime,
+    session: str = "s1",
+    ttft_ms: float | None = 5000.0,
+    **kwargs: object,
+) -> log_parser.LogEvent:
+    """A local ``dispatch_first_byte_ms`` TTFT event.
+
+    Mirrors the real dispatch log line, which carries no ``provider=`` field
+    (so ``provider`` stays ``None``, the local marker used by the parser).
+    """
+    return log_parser.LogEvent("ttft", ts, session=session, ttft_ms=ttft_ms, **kwargs)
+
+
 class TestBusyStats:
     def test_sequential_streams_single_session(self):
         events = [
@@ -2730,6 +2744,336 @@ class TestBusyStats:
         assert busy is not None
         assert busy.busy_seconds == 30.0  # 20 s pre-window clipped away
         assert busy.streams == 1
+
+
+class TestPrefillStats:
+    """Per-stream local prefill statistics (LP-0MVJN45LF009CO2V).
+
+    ``compute_busy_stats`` takes the local ``dispatch_first_byte_ms`` TTFT
+    events, pairs them FIFO to the local streams per session, and reports the
+    prefill interval ``[ttft.ts - ttft_ms/1000, ttft.ts]`` as slot-seconds
+    (the integral of concurrency), never as wall-clock.
+    """
+
+    @staticmethod
+    def _busy(
+        stream_events: list[log_parser.LogEvent],
+        ttft_events: list[log_parser.LogEvent],
+        start: datetime = WINDOW_START,
+        end: datetime = WINDOW_END,
+    ) -> aggregation.BusyStats | None:
+        return aggregation.compute_busy_stats(
+            stream_events, start, end, _schedule(), ttft_events=ttft_events
+        )
+
+    def test_per_stream_prefill_from_dispatch_first_byte_ms(self):
+        """AC1: prefill comes from ``dispatch_first_byte_ms`` per local
+        stream — 5 s for the first stream, 30 s for the second."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 30), "s2"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0),
+            _ttft_event(datetime(2026, 8, 2, 14, 5, 0), "s2", 30000.0),
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([5.0, 30.0])
+        assert stats.count == 2
+        assert stats.unknown_count == 0
+        assert stats.stream_count == 2
+        assert stats.total_seconds == pytest.approx(35.0)
+        assert stats.has_samples
+
+    def test_percentiles_use_linear_interpolation(self):
+        """AC3: p10/p50/p90/max over the per-stream samples.
+
+        4 samples of 10/20/30/40 s -> p10 13 s, p50 25 s, p90 37 s, max 40 s
+        (linear interpolation, matching the rest of the skill's percentiles).
+        """
+        streams: list[log_parser.LogEvent] = []
+        ttfts: list[log_parser.LogEvent] = []
+        for index, prefill_s in enumerate((10, 20, 30, 40)):
+            ts = datetime(2026, 8, 2, 14, index, 0)
+            session = f"s{index}"
+            streams.append(_local_event("stream_started", ts, session))
+            streams.append(_local_event("stream_finished", ts + timedelta(seconds=60), session))
+            ttfts.append(_ttft_event(ts, session, prefill_s * 1000.0))
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.p10 == pytest.approx(13.0)
+        assert stats.p50 == pytest.approx(25.0)
+        assert stats.p90 == pytest.approx(37.0)
+        assert stats.max_seconds == pytest.approx(40.0)
+        assert stats.total_seconds == pytest.approx(100.0)
+
+    def test_concurrent_prefill_is_slot_seconds_not_wall_clock(self):
+        """AC3/AC5: two concurrent 10 s prefills (13:59:50 -> 14:00:00) are
+        20 slot-seconds of prefill work but only 10 s of wall-clock, so the
+        window total must be the per-stream sum, not a union."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s2"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 0), "s1", 10000.0),
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 0), "s2", 10000.0),
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.total_seconds == pytest.approx(20.0)  # slot-seconds
+        assert stats.unit == "slot-seconds"
+        # The wall-clock union of the same prefills is only 10 s, and the
+        # busy figure is the (decode-window) union, a different quantity.
+        assert busy.busy_seconds == pytest.approx(20.0)
+
+    def test_stream_without_ttft_is_unknown_prefill(self):
+        """AC4: a stream with no first-byte line is counted as unknown
+        prefill — excluded from the percentiles, retained in the count."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "aborted"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 2), "aborted"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.count == 1
+        assert stats.unknown_count == 1
+        assert stats.stream_count == 2
+        assert list(stats.samples) == pytest.approx([5.0])
+        assert stats.p50 == pytest.approx(5.0)  # unknown sample not averaged in
+        assert stats.total_seconds == pytest.approx(5.0)
+
+    def test_no_ttft_events_reports_every_stream_as_unknown(self):
+        """AC4: with no TTFT events at all, every local stream is unknown
+        prefill (empty percentiles, zero total) rather than a silent zero."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        busy = self._busy(streams, [])
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.count == 0
+        assert stats.unknown_count == 1
+        assert stats.stream_count == 1
+        assert stats.total_seconds == 0.0
+        assert not stats.has_samples
+        assert stats.p10 is None and stats.p50 is None and stats.p90 is None
+        assert stats.max_seconds is None
+
+    def test_fallback_pairs_dispatch_and_first_byte_timestamps(self):
+        """AC2: with ``dispatch_first_byte_ms`` absent, prefill falls back to
+        pairing the dispatch (``Stream started``) and first-byte timestamps:
+        14:00:02 -> 14:00:10 is 8 s."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 2), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", None)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([8.0])
+        assert stats.unknown_count == 0
+
+    def test_fallback_reconstructs_total_from_the_logged_split(self):
+        """AC2: when only the service/queue split survived, the prefill total
+        is reconstructed from ``dispatch_to_first_byte_ms + queue_wait_ms``
+        (real queue-contention fixture: 10.403 s service + 16.170 s queued)."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 48), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 1, 30), "s1"),
+        ]
+        ttfts = [
+            _ttft_event(
+                datetime(2026, 8, 2, 14, 0, 48),
+                "s1",
+                None,
+                dispatch_to_first_byte_ms=10403.1,
+                queue_wait_ms=16169.9,
+            )
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([26.573])
+
+    def test_fallback_rejects_non_positive_timestamp_pairing(self):
+        """AC2/AC4: the timestamp fallback needs positive evidence. The proxy
+        logs ``Stream started`` at first byte, so a zero difference is not a
+        measurement — the stream stays unknown prefill."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", None)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.count == 0
+        assert stats.unknown_count == 1
+
+    def test_fifo_pairing_attributes_prefill_to_the_right_stream(self):
+        """AC1: the Nth TTFT of a session pairs with that session's Nth
+        stream, independent of the order the events are supplied in."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 5), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 30), "s1"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 6), "s1", 55656.5),
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 21), "s1", 1100.5),
+        ]
+        ordered = self._busy(streams, ttfts)
+        reversed_order = self._busy(streams, list(reversed(ttfts)))
+        assert ordered is not None and reversed_order is not None
+        assert ordered.prefill_stats is not None
+        assert reversed_order.prefill_stats is not None
+        assert list(ordered.prefill_stats.samples) == pytest.approx([55.6565, 1.1005])
+        assert list(reversed_order.prefill_stats.samples) == list(
+            ordered.prefill_stats.samples
+        )
+
+    def test_dispatch_before_window_start_keeps_full_prefill(self):
+        """AC6 boundary: a first byte inside the window whose dispatch
+        predates it keeps its full prefill duration (60 s)."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 5), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 5), "s1", 60000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([60.0])  # dispatch 13:59:05
+        assert stats.total_seconds == pytest.approx(60.0)
+
+    def test_first_byte_after_window_end_is_not_a_window_sample(self):
+        """AC6 boundary: a TTFT after the window end belongs to the next
+        window — it is not counted (and never double-counted)."""
+        streams = [
+            # In-window stream so busy stats exist at all.
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 30), "s1"),
+            # Next-window stream: first byte after window_end.
+            _local_event("stream_started", datetime(2026, 8, 2, 15, 0, 10), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 15, 0, 30), "s2"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0),
+            _ttft_event(datetime(2026, 8, 2, 15, 0, 10), "s2", 9000.0),
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([5.0])
+        assert stats.stream_count == 1
+        assert stats.unknown_count == 0
+        assert stats.total_seconds == pytest.approx(5.0)
+
+    def test_stream_outside_window_without_ttft_is_not_unknown(self):
+        """AC6 boundary: a stream that started before the window and has no
+        first-byte line belongs to an earlier window, so it is not this
+        window's unknown prefill."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 13, 59, 50), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 5), "s1"),
+        ]
+        busy = self._busy(streams, [])
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.unknown_count == 0
+        assert stats.stream_count == 0
+
+    def test_streams_expose_per_stream_attribution(self):
+        """AC1: the measurements stay attributable per local stream (session
+        + first-byte timestamp), so unknown prefill can be named."""
+        first_byte = datetime(2026, 8, 2, 14, 0, 10)
+        streams = [
+            _local_event("stream_started", first_byte, "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "aborted"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 2), "aborted"),
+        ]
+        ttfts = [_ttft_event(first_byte, "s1", 5000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        known, unknown = stats.streams
+        assert (known.session, known.first_byte_ts, known.seconds) == ("s1", first_byte, 5.0)
+        assert known.known
+        assert (unknown.session, unknown.first_byte_ts, unknown.seconds) == (
+            "aborted",
+            None,
+            None,
+        )
+        assert not unknown.known
+
+    def test_prefill_stats_absent_when_ttft_events_not_supplied(self):
+        """Callers that do not pass TTFT events get no prefill statistics
+        rather than a fabricated empty measurement (backward compatible)."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None
+        assert busy.prefill_stats is None
+
+    def test_aggregate_populates_prefill_stats_from_real_dispatch_lines(self):
+        """AC1 end-to-end: ``aggregate()`` feeds the real TTFT events to the
+        busy computation, so a real session's three dispatch lines become
+        three prefill samples and the aborted stream stays unknown."""
+        start = datetime(2026, 10, 21, 22, 0, 0)
+        end = datetime(2026, 10, 22, 22, 0, 0)
+        lines = [
+            fixtures.STREAM_STARTED_PREFILL_COLD,
+            fixtures.DISPATCH_FIRST_BYTE_COLD,
+            fixtures.STREAM_STARTED_PREFILL_COLD_FAST,
+            fixtures.DISPATCH_FIRST_BYTE_COLD_FAST,
+            fixtures.STREAM_STARTED_PREFILL_WARM,
+            fixtures.DISPATCH_FIRST_BYTE_WARM,
+            fixtures.STREAM_STARTED_ABORTED_LOCAL,
+            fixtures.STREAM_ERROR_ABORTED_LOCAL,
+        ]
+        result = aggregation.aggregate(_events(lines), start, end, _schedule())
+        assert result.busy is not None
+        stats = result.busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([55.6565, 1.1005, 29.546])
+        assert stats.count == 3
+        assert stats.unknown_count == 1
+        assert stats.stream_count == 4
+        assert stats.total_seconds == pytest.approx(86.3)
+        assert stats.unit == "slot-seconds"
 
 
 class TestSummaryByHourActivity:

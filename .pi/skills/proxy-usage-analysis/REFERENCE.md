@@ -269,6 +269,28 @@ entry is a local runtime edit, not a committed artifact.
    pre-window leftovers from earlier windows, tracked separately in
    `pre_window_unfinished`, and streams started after the window end belong
    to the next window (LP-0MSVRRO3L0056N6C).
+   **Prefill statistics** (LP-0MVJN45LF009CO2V) are computed in the same pass
+   from the local `dispatch_first_byte_ms=` events: `aggregate()` hands the
+   margin-widened local TTFT events to `compute_busy_stats(ttft_events=...)`,
+   which pairs them FIFO per session to the local streams and reports
+   `BusyStats.prefill_stats` (`PrefillStats`). Each stream's prefill interval
+   is `[ttft.ts − ttft_ms/1000, ttft.ts]`; the duration comes from
+   `dispatch_first_byte_ms`, falling back to the logged
+   `dispatch_to_first_byte_ms + queue_wait_ms` split and then to pairing the
+   dispatch and first-byte timestamps (a non-positive pairing is not
+   evidence). `PrefillStats` exposes one `PrefillSample` per stream (session,
+   first-byte timestamp, seconds) plus `p10`/`p50`/`p90`/`max_seconds` and
+   `total_seconds`. **Every prefill figure is slot-seconds, not wall-clock**
+   (`unit`): `total_seconds` sums the per-stream durations (total prefill
+   work), so it is deliberately *not* comparable with the wall-clock union in
+   `BusyStats.busy_seconds`. Streams with no first-byte line are unknown
+   prefill — excluded from the percentiles but retained in
+   `stream_count`, so an aborted request is visible instead of silently
+   dropped. A stream is attributed to the window containing its first-byte
+   timestamp, and its interval is not clipped: a dispatch before
+   `window_start` keeps its full duration and a first byte after
+   `window_end` belongs to the next window (no double counting).
+   `prefill_stats` is `None` only when the caller supplied no TTFT events.
 5. **Fast/cheap bucketing** — each session is bucketed by the **operating
    mode** active at its first in-window stream, reconstructed from the
    `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
