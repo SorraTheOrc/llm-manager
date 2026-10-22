@@ -10,7 +10,16 @@ push:
    `dev`.
 2. **Context-budget regression gate** — the pi session startup context
    surface must stay within the committed thresholds
-   (`docs/dev/context-budget.thresholds.json`).
+   (`docs/dev/context-budget.thresholds.json`, measured by the framework's
+   `context-audit` skill). The gate is fail-open when the measuring tool is
+   not installed.
+   *Thresholds were re-pinned on 2026-10-22* (LP-0MVFFJWPW007ZEPK): the file
+   still pinned `total: 967` B while this repo's `AGENTS.md` had grown to
+   3487 B, so the gate would have refused **every** `dev` push the moment it
+   was activated. It now pins the approved surface (`project_agents` /
+   `total` = 4096 B, measured 4040 B). Growing `AGENTS.md` past the pinned
+   budget fails the push until the budget is deliberately re-pinned with the
+   measurement recorded — that is the gate working, not a defect.
 3. **Full-suite test gate on `dev`/`main` pushes** — a push whose target ref
    is `refs/heads/dev` or `refs/heads/main` runs the **full test suite**
    (`run_tests.py --scope full --strict-git-env`) and is **refused** while
