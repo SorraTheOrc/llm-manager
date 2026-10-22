@@ -225,10 +225,34 @@ def _get_contention_queue_config(server_config: dict) -> dict:
             "contention_queue_max_depth=%r clamped to %s (bounds [1, 16])",
             raw_depth, max_depth,
         )
+    # Lease-owner retention grace (LP-0MVI2VRT2000V1AP): [0, max_runtime].
+    # 0 disables retention priority (the rollback path). The ceiling is the
+    # session guardrail ceiling (the same one the wait cap uses), NOT the wait
+    # cap itself: the grace must be able to exceed one queue budget so a
+    # returning session always re-queues as retained, and clamping to the wait
+    # cap made the shipped 300 s default unrepresentable — it logged a WARNING
+    # on every request (LP-0MVI63OM1009K51W).
+    raw_grace = server_config.get("contention_queue_lease_grace_seconds", 300)
+    try:
+        grace = float(raw_grace) if raw_grace is not None else 300.0
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid contention_queue_lease_grace_seconds=%r — using default 300",
+            raw_grace,
+        )
+        grace = 300.0
+    lease_grace_seconds = max(0.0, min(grace, float(max(1, max_runtime))))
+    if lease_grace_seconds != grace:
+        logger.warning(
+            "contention_queue_lease_grace_seconds=%r clamped to %s "
+            "(bounds [0, session_guardrail_max_runtime_seconds=%s])",
+            raw_grace, lease_grace_seconds, max_runtime,
+        )
     return {
         "policy": policy,
         "max_wait_seconds": max_wait_seconds,
         "max_depth": max_depth,
+        "lease_grace_seconds": lease_grace_seconds,
     }
 
 
@@ -472,6 +496,7 @@ async def _update_session_and_slot(
     # true cache-hit fraction when available. The save-success 1.0 below
     # remains the fallback when no usage data is present.
     _real_usage_applied = False
+    _measured_prompt_tokens = 0
     if session_id and srv.current_model:
         try:
             from proxy.provider import (
@@ -512,7 +537,24 @@ async def _update_session_and_slot(
                         cached_tokens=_cached,
                         prompt_tokens=_prompt,
                     )
+                    # Record the prompt size + message fingerprints so the
+                    # *next* turn can earn expected-reuse credit even when
+                    # this turn measured 0 cached tokens (LP-0MVI2XOTY008Q4UV).
+                    try:
+                        from proxy.provider import record_prompt_prefix
+
+                        record_prompt_prefix(
+                            srv.current_model,
+                            session_id,
+                            _prompt,
+                            list(body_json.get("messages", []))
+                            if isinstance(body_json, dict)
+                            else None,
+                        )
+                    except Exception:
+                        pass
                     _real_usage_applied = True
+                    _measured_prompt_tokens = _prompt
         except Exception:
             srv.logger.debug(
                 "update_cached_ratio from usage failed", exc_info=True
@@ -539,16 +581,49 @@ async def _update_session_and_slot(
                 # as a FALLBACK when no real usage data was reported.
                 if session_id and srv.current_model and not _real_usage_applied:
                     try:
-                        from proxy.provider import update_cached_ratio
+                        from proxy.provider import (
+                            _CACHED_RATIO_SOURCE_SAVE,
+                            update_cached_ratio,
+                        )
                         update_cached_ratio(
                             srv.current_model,
                             session_id,
                             cached_tokens=1,
                             prompt_tokens=1,
+                            source=_CACHED_RATIO_SOURCE_SAVE,
                         )
                     except Exception:
                         srv.logger.debug(
                             "update_cached_ratio failed", exc_info=True
+                        )
+                # Persist the routing cache state next to the snapshot so it
+                # survives a proxy restart (LP-0MVGD9YXH008O304 AC1/AC6): the
+                # served prompt's tokens are now resident in the saved KV
+                # cache, so a later request whose message list extends this
+                # one can be credited for them at routing time. Only MEASURED
+                # usage is recorded — without a usage block the sidecar is
+                # left untouched (conservative; today's behaviour).
+                if session_id and srv.current_model and _measured_prompt_tokens > 0:
+                    try:
+                        from proxy.slot_cache_ratio import (
+                            write_slot_ratio_sidecar,
+                        )
+
+                        write_slot_ratio_sidecar(
+                            slot_filename,
+                            session_id=session_id,
+                            model=srv.current_model,
+                            cached_tokens=_measured_prompt_tokens,
+                            prompt_tokens=_measured_prompt_tokens,
+                            messages=(
+                                body_json.get("messages")
+                                if isinstance(body_json, dict)
+                                else None
+                            ),
+                        )
+                    except Exception:
+                        srv.logger.debug(
+                            "slot ratio sidecar write failed", exc_info=True
                         )
 
         except Exception:
@@ -591,6 +666,26 @@ async def _cleanup_after_request(
     caller's client identity (``client_ip`` / ``client_port``) for poller
     attribution (LP-0MSKV3IEQ004ZV88).
     """
+    # Idle-aware routing signal (LP-0MVGD9Z8Z0055Y5J): the request ending is
+    # the last local-activity event, so an idle backend is measurable from the
+    # moment its final stream closed.
+    try:
+        from proxy.local_activity import record_local_activity
+
+        record_local_activity("finish")
+    except Exception:
+        pass
+    # Capacity accounting (LP-0MVGDUVS6003T2IX): record this dispatch's
+    # slot-busy interval so idle slot-time is measured, not assumed.
+    try:
+        from proxy.capacity_admission import record_slot_busy
+
+        record_slot_busy(
+            getattr(request, "_local_dispatch_started_at", None),
+            time.monotonic(),
+        )
+    except Exception:
+        pass
     await _decrement_active_queries(srv)
     await _decrement_per_model_query(srv, model_name)
     if decrement_local:
@@ -1206,6 +1301,20 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         _dispatch_start = time.monotonic()
     except Exception:
         pass
+    # Idle-aware routing signal (LP-0MVGD9Z8Z0055Y5J): a dispatch is local
+    # activity, so the idle clock restarts here.
+    try:
+        from proxy.local_activity import record_local_activity
+
+        record_local_activity("dispatch")
+    except Exception:
+        pass
+    # Capacity accounting (LP-0MVGDUVS6003T2IX): stamp the dispatch start so
+    # the completion path can record the slot-busy interval.
+    try:
+        request._local_dispatch_started_at = _dispatch_start
+    except Exception:
+        pass
 
     # Forward headers (strip hop-by-hop transport headers)
     headers = normalize_upstream_request_headers(request.headers)
@@ -1537,6 +1646,17 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         except Exception:
                             pass
 
+                        # Count local↔remote provider transitions per session
+                        # (LP-0MVI2VRT2000V1AP AC5).
+                        try:
+                            from proxy.provider import note_routing_hop
+
+                            note_routing_hop(
+                                session_id, "local", model_name=model_name
+                            )
+                        except Exception:
+                            pass
+
                         try:
                             # Use asyncio.wait(FIRST_COMPLETED) to concurrently
                             # listen for two events:
@@ -1736,6 +1856,19 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     txt.strip()
                                     and not txt.strip().startswith(":")
                                 )
+                                # Idle-aware routing signal
+                                # (LP-0MVGD9Z8Z0055Y5J): a forwarded chunk is
+                                # local activity, so a long stream never looks
+                                # idle.
+                                if _has_actual_data:
+                                    try:
+                                        from proxy.local_activity import (
+                                            record_local_activity,
+                                        )
+
+                                        record_local_activity("chunk")
+                                    except Exception:
+                                        pass
 
                                 # SSE finish indicators
                                 try:
@@ -1798,6 +1931,24 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     session_id or "unknown",
                                                     model_name or "unknown",
                                                 )
+                                                # Feed the prefill-ETA calibration window
+                                                # (LP-0MVGDUV5E005UWBQ): the observed service
+                                                # time for this prompt/cache state becomes a
+                                                # sample of the per-(model, context-bucket)
+                                                # prefill cost. Never breaks the stream.
+                                                try:
+                                                    from proxy.prefill_eta import (
+                                                        record_dispatch_sample,
+                                                    )
+
+                                                    record_dispatch_sample(
+                                                        model_name,
+                                                        _estimated_tokens,
+                                                        _cached_ratio,
+                                                        _first_byte_service_ms,
+                                                    )
+                                                except Exception:
+                                                    pass
                                             _first_byte_emitted = True
                                         except Exception:
                                             try:

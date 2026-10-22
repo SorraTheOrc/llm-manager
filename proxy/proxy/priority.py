@@ -400,6 +400,50 @@ def provider_chain_for_priority(
     return list(model_config.get("providers") or [])
 
 
+def local_preference_for_request(request) -> str:
+    """Return the request's ``X-Local-Preference`` (default ``prefer-local``).
+
+    LP-0MVIKPCSG002B0NL: the header is additive — missing or unknown values
+    keep today's behaviour (AC8). The parsed value is cached on the request so
+    every routing decision in the same request agrees.
+    """
+    cached = getattr(request, "_local_preference", None)
+    if cached:
+        return cached
+    try:
+        from proxy.admission_reserve import parse_preference
+
+        preference = parse_preference(getattr(request, "headers", {}) or {})
+    except Exception:
+        preference = "prefer-local"
+    try:
+        setattr(request, "_local_preference", preference)
+    except Exception:
+        pass
+    return preference
+
+
+def apply_local_preference(chain: list[dict], preference: str) -> list[dict]:
+    """Filter *chain* by the client's ``X-Local-Preference``.
+
+    Only ``remote-ok`` changes the chain: it removes every ``type: local``
+    entry so the local route is never attempted (LP-0MVIKPCSG002B0NL AC5).
+    ``local-only`` and ``prefer-local`` keep the chain intact — their
+    difference is enforced at the admission decision (a ``local-only`` refusal
+    returns 429 instead of falling through).
+
+    A chain that becomes empty is returned as-is (empty) so the caller's
+    exhaustion path reports the truth rather than silently re-adding local.
+    """
+    if preference != "remote-ok":
+        return chain
+    return [
+        entry
+        for entry in chain
+        if not (isinstance(entry, dict) and entry.get("type") == "local")
+    ]
+
+
 def effective_chain_for_request(
     request, model_config: dict, server_config: dict | None = None
 ) -> list[dict]:
@@ -407,11 +451,13 @@ def effective_chain_for_request(
 
     Convenience used by the dispatch cycles: computes the effective priority
     (cheap-window capped), stamps it on the request, and returns the
-    priority-selected provider chain.
+    priority-selected provider chain. The client's ``X-Local-Preference`` is
+    applied last so ``remote-ok`` never attempts the local route
+    (LP-0MVIKPCSG002B0NL AC5).
     """
     priority = request_priority(request, server_config)
     set_request_priority(request, priority)
     chain = provider_chain_for_priority(model_config, priority)
-    if chain:
-        return chain
-    return list(model_config.get("providers") or [])
+    if not chain:
+        chain = list(model_config.get("providers") or [])
+    return apply_local_preference(chain, local_preference_for_request(request))

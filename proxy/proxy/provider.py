@@ -52,6 +52,7 @@ from proxy.priority import (
 from proxy.provider_budget import (
     RATE_LIMIT_WINDOW_SECONDS,
     acquire_provider_budget,
+    affinity_ttl_seconds,
     record_provider_affinity,
 )
 from proxy.utils import _is_empty_response
@@ -64,6 +65,7 @@ def _maybe_record_provider_affinity(
     session_id: str | None,
     response,
     config: dict | None = None,
+    model_config: dict | None = None,
 ) -> None:
     """Record session -> gated-entry affinity after a successful dispatch.
 
@@ -72,6 +74,11 @@ def _maybe_record_provider_affinity(
     must reflect a real success: a 4xx/5xx response (e.g. the upstream 429 that
     proves the allowance is spent) must never create affinity. Entries without
     ``rate_limit_rpm`` are not gated and record nothing.
+
+    The TTL resolves through the same precedence as the gate itself
+    (entry ``budget`` > ``models.<name>.budget`` > ``server.*`` > default,
+    LP-0MVDVK5TM004TQQV), so the recorded affinity lifetime always matches the
+    model whose request created it.
     """
     try:
         if int(getattr(response, "status_code", 0) or 0) >= 400:
@@ -79,10 +86,28 @@ def _maybe_record_provider_affinity(
         if int(provider_cfg.get("rate_limit_rpm", 0) or 0) <= 0:
             return
         record_provider_affinity(
-            session_id, str(provider_cfg.get("name") or ""), config
+            session_id,
+            str(provider_cfg.get("name") or ""),
+            config,
+            ttl_seconds=affinity_ttl_seconds(
+                config, model_config=model_config, provider_cfg=provider_cfg
+            ),
         )
     except Exception:  # pragma: no cover - affinity is best-effort telemetry
         pass
+
+
+def _budget_diagnostics(decision) -> dict[str, str]:
+    """Budget knob provenance for an attempt diagnostic entry.
+
+    Returns ``{"budget_source": "reserve_ratio@model"}`` when a
+    ``models.<name>.budget`` or entry ``budget`` block supplied any effective
+    knob, and ``{}`` when the server config / built-in defaults decided — so a
+    config without ``budget`` blocks records exactly the same diagnostics as
+    before (LP-0MVDVK5TM004TQQV AC3/AC6).
+    """
+    label = getattr(decision, "source_label", "")
+    return {"budget_source": label} if label else {}
 
 # ---------------------------------------------------------------------------
 # Cooldown / circuit-breaker state
@@ -151,7 +176,10 @@ _usage_reset_guessed: set[str] = set()
 _USAGE_LIMIT_RESET_MARGIN_SECONDS = 120
 
 # Fallback durations per metadata.limitName when the upstream message carries
-# no explicit "Resets in ..." duration (daily/weekly/monthly periods).
+# no explicit "Resets in ..." duration (daily/weekly/monthly periods). These
+# are the FALLBACK-ONLY guess for an ``opencode-*`` account whose fresh quota
+# snapshot is unavailable (stale/absent/disabled): with a fresh snapshot the
+# authoritative ``/v1/usage`` ``seconds_to_reset`` wins (LP-0MVF7MPZN009GOJB).
 _PERIOD_DEFAULT_SECONDS = {
     "daily": 24 * 3600,
     "weekly": 7 * 24 * 3600,
@@ -509,6 +537,64 @@ _WINDOW_PARSE_CACHE: dict[tuple[str, ...], tuple[tuple[int, int], ...] | None] =
 # (LP-0MRP44W7I0085I6N)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Routing-hop counter (LP-0MVI2VRT2000V1AP AC5)
+# ---------------------------------------------------------------------------
+# Per-session count of provider *transitions* (local↔remote, remote↔remote).
+# One routing-thrash case (LP-0MVI2VRT2000V1AP) alternated local↔remote seven
+# times in twelve minutes; without a counter that is only visible by reading
+# raw log lines by hand. ``note_routing_hop`` returns the session's new hop
+# count (0 = same provider as last time) and emits a ``routing_hop`` log line
+# only when the provider actually changes, so the count is a direct aggregate.
+#
+# ``_last_routing_hop``: (model, session) -> (last_provider, hops).
+_last_routing_hop: dict[tuple[str, str], tuple[str, int]] = {}
+_MAX_ROUTING_HOP_ENTRIES = 1000
+
+
+def note_routing_hop(
+    session_id: str | None,
+    provider_name: str | None,
+    *,
+    model_name: str | None = None,
+    **context,
+) -> int:
+    """Record the provider a request was served by; return its hop count.
+
+    Returns the number of provider transitions observed for the session so
+    far (0 for the first sighting). A ``routing_hop`` log line is emitted only
+    when the provider changes, carrying ``from``/``to``/``hops`` plus any
+    keyword *context* (e.g. ``reason=``), so the usage analysis can count
+    thrash per session without re-deriving it from stream lines.
+    """
+    if not session_id or not provider_name:
+        return 0
+    key = (str(model_name or ""), session_id)
+    previous, hops = _last_routing_hop.get(key, ("", 0))
+    if previous == provider_name:
+        return hops
+    hops = hops + 1 if previous else 0
+    if key not in _last_routing_hop and len(_last_routing_hop) >= _MAX_ROUTING_HOP_ENTRIES:
+        try:
+            _last_routing_hop.pop(next(iter(_last_routing_hop)), None)
+        except StopIteration:
+            pass
+    _last_routing_hop[key] = (provider_name, hops)
+    try:
+        extra = " ".join(f"{k}={v}" for k, v in context.items() if v is not None)
+        logger.info(
+            "routing_hop session=%s from=%s to=%s hops=%d%s",
+            session_id,
+            previous or "none",
+            provider_name,
+            hops,
+            f" {extra}" if extra else "",
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return hops
+
+
 # Per-(model, session) cached-tokens ratio: (model_name, session_id) -> ratio.
 # The ratio is cached_tokens / prompt_tokens from the last local response.
 # A ratio of 1.0 means ALL tokens were cached (fully warm).
@@ -520,12 +606,61 @@ _last_cached_ratio: dict[tuple[str, str], float] = {}
 # Maximum number of entries in _last_cached_ratio to prevent unbounded growth.
 _MAX_CACHED_RATIO_ENTRIES = 1000
 
+# Where each ratio came from — recorded alongside the ratio so the proxy can
+# label restored-prefix wins separately from genuine prompt-cache hits
+# (LP-0MVGD9YXH008O304 AC4).  Values: ``"usage"`` (measured on a previous local
+# response), ``"save"`` (slot snapshot saved, no usage data), ``"restored"``
+# (seeded from a persisted slot snapshot — see ``proxy/slot_cache_ratio.py``).
+_CACHED_RATIO_SOURCE_USAGE = "usage"
+_CACHED_RATIO_SOURCE_SAVE = "save"
+_cached_ratio_source: dict[tuple[str, str], str] = {}
+
+
+def set_cached_ratio(
+    model_name: str,
+    session_id: str | None,
+    ratio: float,
+    source: str = _CACHED_RATIO_SOURCE_USAGE,
+) -> None:
+    """Record a pre-computed cached-tokens ratio for a (model, session) pair.
+
+    The ratio is clamped to ``[0.0, 1.0]``; the *source* label is stored so
+    observability can distinguish a restored slot-prefix credit
+    (``"restored"``) from a measured prompt-cache hit (``"usage"``).
+
+    To prevent unbounded memory growth, both dicts are capped at
+    ``_MAX_CACHED_RATIO_ENTRIES``. When the cap is reached, the oldest entry
+    (first inserted) is evicted.
+    """
+    if not model_name or not session_id:
+        return
+    try:
+        value = float(ratio)
+    except (TypeError, ValueError):
+        return
+    if math.isnan(value):
+        return
+    value = min(1.0, max(0.0, value))
+    key = (model_name, session_id)
+    # Enforce cap: if adding a new entry would exceed the limit, evict oldest
+    if key not in _last_cached_ratio and len(_last_cached_ratio) >= _MAX_CACHED_RATIO_ENTRIES:
+        try:
+            # Evict oldest entry (dict maintains insertion order in Python 3.7+)
+            oldest = next(iter(_last_cached_ratio))
+            _last_cached_ratio.pop(oldest)
+            _cached_ratio_source.pop(oldest, None)
+        except (StopIteration, KeyError):
+            pass
+    _last_cached_ratio[key] = value
+    _cached_ratio_source[key] = source or _CACHED_RATIO_SOURCE_USAGE
+
 
 def update_cached_ratio(
     model_name: str,
     session_id: str | None,
     cached_tokens: int,
     prompt_tokens: int,
+    source: str = _CACHED_RATIO_SOURCE_USAGE,
 ) -> None:
     """Update the cached-tokens ratio for a (model, session) pair.
 
@@ -542,15 +677,7 @@ def update_cached_ratio(
         ratio = 0.0
     else:
         ratio = min(1.0, cached_tokens / prompt_tokens)
-    key = (model_name, session_id)
-    # Enforce cap: if adding a new entry would exceed the limit, evict oldest
-    if key not in _last_cached_ratio and len(_last_cached_ratio) >= _MAX_CACHED_RATIO_ENTRIES:
-        try:
-            # Evict oldest entry (dict maintains insertion order in Python 3.7+)
-            _last_cached_ratio.pop(next(iter(_last_cached_ratio)))
-        except (StopIteration, KeyError):
-            pass
-    _last_cached_ratio[key] = ratio
+    set_cached_ratio(model_name, session_id, ratio, source=source)
 
 
 def _get_cached_ratio(model_name: str, session_id: str | None) -> float:
@@ -561,6 +688,159 @@ def _get_cached_ratio(model_name: str, session_id: str | None) -> float:
     if not model_name or not session_id:
         return 0.0
     return _last_cached_ratio.get((model_name, session_id), 0.0)
+
+
+def _get_cached_ratio_source(model_name: str, session_id: str | None) -> str | None:
+    """Return the provenance label for a (model, session) ratio.
+
+    ``None`` when no ratio has been recorded yet (unknown → treated as cold).
+    """
+    if not model_name or not session_id:
+        return None
+    return _cached_ratio_source.get((model_name, session_id))
+
+
+# ---------------------------------------------------------------------------
+# Expected-reuse credit from the previous prompt (LP-0MVI2XOTY008Q4UV)
+# ---------------------------------------------------------------------------
+#
+# The measured ratio above describes the *previous* prompt's hit fraction:
+# a session's first local turn is genuinely cold (nothing cached), so it
+# records ``cached_ratio=0.0`` and every later request inherits that zero
+# until a later response happens to report a hit.  Turn 2 of a growing
+# session was therefore always costed as fully cache-cold even though turn
+# 1's tokens are resident in the KV slot.
+#
+# The prefix record closes that gap: after each successful local dispatch
+# (measured prompt_tokens from usage), we store the prompt size together
+# with a fingerprint of the message list.  At routing time, if the recorded
+# message list is a strict prefix of the incoming one (proven by
+# ``slot_cache_ratio.prefix_matches`` — the same check the persisted
+# snapshot sidecar uses), the expected reusable prefix is the recorded
+# prompt size, safety-margined so we never over-credit a restored prefix
+# that llama.cpp may have had to erase (hybrid-arch checkpoint invalidation).
+# The measured ratio remains a floor: a warm measured ratio always wins.
+
+#: Per-(model, session) recorded prompt prefix: (prompt_tokens, fingerprints).
+#: Only written when a local response reported real usage prompt_tokens, so
+#: today's behaviour is unchanged when no usage data is present.
+_last_prompt_prefix: dict[tuple[str, str], tuple[int, list[str]]] = {}
+
+#: Fraction of the recorded prompt credited at routing time (matches the
+#: sidecar's safety margin; llama.cpp may invalidate its own checkpoints).
+_DEFAULT_PREFIX_CREDIT_MARGIN = 0.9
+
+
+def record_prompt_prefix(
+    model_name: str,
+    session_id: str | None,
+    prompt_tokens: int,
+    messages: list | None,
+) -> None:
+    """Record the prompt size and message fingerprints of one local dispatch.
+
+    Called from the local streaming loop alongside ``update_cached_ratio``
+    (usage path).  *prompt_tokens* is the measured prompt size of the request
+    the KV slot now holds, so a later request whose message list extends this
+    one can be credited for them.  Never raises: a metric path must not break
+    a stream.  Also re-caps the dict like ``set_cached_ratio``.
+    """
+    if not model_name or not session_id:
+        return
+    try:
+        tokens = int(prompt_tokens or 0)
+        if tokens <= 0:
+            return
+        from proxy.slot_cache_ratio import message_fingerprints
+
+        fingerprints = message_fingerprints(messages)
+        if not fingerprints:
+            return
+    except Exception:
+        logger.debug("record_prompt_prefix failed", exc_info=True)
+        return
+    key = (model_name, session_id)
+    if key not in _last_prompt_prefix and len(_last_prompt_prefix) >= _MAX_CACHED_RATIO_ENTRIES:
+        try:
+            oldest = next(iter(_last_prompt_prefix))
+            _last_prompt_prefix.pop(oldest, None)
+        except (StopIteration, KeyError):
+            pass
+    _last_prompt_prefix[key] = (tokens, fingerprints)
+
+
+def expected_cached_ratio(
+    model_name: str | None,
+    session_id: str | None,
+    estimated_tokens: int,
+    messages: list | None,
+    server_config: dict | None = None,
+) -> float:
+    """Routing ratio for *estimated_tokens* of the current prompt.
+
+    Returns the measured ratio plus any prefix credit from the previous
+    local dispatch:
+
+    - no recorded prefix, no prefix match, or no estimate → measured ratio
+      (today's behaviour — cold 0.0 for a fresh session);
+    - a matching recorded prefix → ``max(measured, min(1.0, margin *
+      prev_prompt / estimate))`` so the credit is proportionate to the
+      incoming prompt and never over-credits.
+    """
+    measured = _get_cached_ratio(model_name, session_id)
+    if not model_name or not session_id:
+        return measured
+    try:
+        estimate = max(0, int(estimated_tokens or 0))
+        if estimate <= 0:
+            return measured
+    except (TypeError, ValueError):
+        return measured
+    record = _last_prompt_prefix.get((model_name, session_id))
+    if record is None:
+        return measured
+    prev_tokens, fingerprints = record
+    try:
+        margin = float(
+            (server_config or {}).get("cached_prefix_credit_margin", _DEFAULT_PREFIX_CREDIT_MARGIN)
+        )
+        if not 0.0 <= margin <= 1.0:
+            margin = _DEFAULT_PREFIX_CREDIT_MARGIN
+    except (TypeError, ValueError):
+        margin = _DEFAULT_PREFIX_CREDIT_MARGIN
+    try:
+        from proxy.slot_cache_ratio import message_fingerprints, prefix_matches
+
+        if not prefix_matches(fingerprints, message_fingerprints(messages)):
+            return measured
+    except Exception:
+        logger.debug("prefix credit check failed", exc_info=True)
+        return measured
+    credit = min(1.0, margin * min(prev_tokens, estimate) / estimate)
+    return max(measured, credit)
+
+
+def clear_cached_ratio_for_session(session_id: str | None) -> None:
+    """Forget every ratio (and its source) recorded for *session_id*.
+
+    Used by session invalidation: the slot snapshot and its sidecar are being
+    discarded, so any restored credit for that session is no longer valid.
+    """
+    if not session_id:
+        return
+    keys = [k for k in _last_cached_ratio if k[1] == session_id]
+    for key in keys:
+        _last_cached_ratio.pop(key, None)
+        _cached_ratio_source.pop(key, None)
+    for key in [k for k in _cached_ratio_source if k[1] == session_id]:
+        _cached_ratio_source.pop(key, None)
+    # The recorded prompt prefix is equally invalid: the slot snapshot and
+    # sidecar are being discarded, so no credit may survive (LP-0MVI2XOTY008Q4UV).
+    for key in [k for k in _last_prompt_prefix if k[1] == session_id]:
+        _last_prompt_prefix.pop(key, None)
+    # A discarded session starts a fresh hop count (LP-0MVI2VRT2000V1AP).
+    for key in [k for k in _last_routing_hop if k[1] == session_id]:
+        _last_routing_hop.pop(key, None)
 
 
 def _extract_cached_tokens_from_usage(usage: dict | None) -> int:
@@ -1446,6 +1726,32 @@ def effective_large_context_economic_ceiling(config: dict) -> int:
     return ceiling
 
 
+def warm_cap_ceiling_shortfall(config: dict) -> int:
+    """Tokens of a configured warm cap that the economic ceiling shadows.
+
+    ``local_large_context_warm_cache_threshold`` only supplies an UPPER
+    bound on the economic ceiling (``round(ratio x local_model_ctx_size)``),
+    so raising the absolute value above that ceiling does not move the
+    effective warm cap at all — the economic term still binds. That silent
+    no-op is what makes the two knobs a co-change (LP-0MVHSET0A008VU95).
+
+    Returns:
+        ``configured_absolute - economic_ceiling`` when the economic term is
+        the smaller of the two, else 0. Also 0 when either knob is disabled
+        (a ratio of 0 uses the absolute verbatim) or when there is no model
+        ctx size to scale with — in both cases nothing is shadowed.
+    """
+    ratio = _get_economic_ceiling_ratio(config)
+    warm_override = _get_warm_cache_threshold(config)
+    if ratio <= 0 or warm_override <= 0:
+        return 0
+    ctx_size = _get_local_model_ctx_size(config)
+    if ctx_size <= 0:
+        return 0
+    ceiling = round(ratio * ctx_size)
+    return max(0, warm_override - ceiling)
+
+
 def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
     """Return (cold, warm) thresholds under the 3-term warm model.
 
@@ -1805,6 +2111,27 @@ def validate_local_routing_config(config: dict) -> list[str]:
             "server section (LP-0MTCZ35X7009IZKE)."
         )
 
+    # --- warm cap shadowed by the economic ceiling (LP-0MVHSET0A008VU95) ---
+    # effective_warm = min(physical clamp, economic ceiling, absolute), where
+    # the economic ceiling is round(ratio x local_model_ctx_size). An absolute
+    # value ABOVE that ceiling never binds, so raising it alone is a silent
+    # no-op. Reported independently of min_local_routing_threshold so the two
+    # knobs stay a co-change.
+    shortfall = warm_cap_ceiling_shortfall(config)
+    if shortfall > 0:
+        warm_abs = _get_warm_cache_threshold(config)
+        ratio = _get_economic_ceiling_ratio(config)
+        ctx = _get_local_model_ctx_size(config)
+        problems.append(
+            f"local_large_context_warm_cache_threshold={warm_abs} is shadowed "
+            f"by the economic ceiling round({ratio} x {ctx}) = {warm_abs - shortfall}"
+            f": the effective warm cap will be {warm_abs - shortfall}, not "
+            f"{warm_abs} ({shortfall} tokens lost). Raise "
+            "local_large_context_economic_ceiling_ratio to at least "
+            f"{warm_abs}/{ctx} (the two knobs must move together, "
+            "LP-0MVHSET0A008VU95)."
+        )
+
     if min_threshold <= 0:
         return problems  # minimum check disabled (min_local_routing_threshold: 0)
 
@@ -2023,7 +2350,12 @@ def _should_skip_local(
         return (False, None)
 
     # Check 2: Dynamic new-token calculation
-    ratio = _get_cached_ratio(model_name, session_id)
+    ratio = expected_cached_ratio(
+        model_name,
+        session_id,
+        estimated_tokens,
+        (body_json or {}).get("messages") if isinstance(body_json, dict) else None,
+    )
     new_tokens = int(estimated_tokens * (1 - ratio))
     if new_tokens <= cold_cache_threshold:
         return (False, None)
@@ -2036,6 +2368,165 @@ def _should_skip_local(
         return (False, None)
 
     return (True, "large_context_bypass")
+
+
+# ---------------------------------------------------------------------------
+# Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
+#
+# Routing is size/economics-driven and ignores whether the backend is doing
+# anything, so a large or cache-cold prompt is bypassed while both slots sit
+# unused (measured: 187 ``local_dispatch_denied`` in an hour where local busy
+# was 2.5 %). When the local model has demonstrably been idle, the economic
+# cold-cache bypass is overridden and the request is served locally.
+# ---------------------------------------------------------------------------
+
+IDLE_ADMIT_REASON = "economic_bypass_idle"
+"""Skip-admission reason recorded when the idle override admits a request."""
+
+DEFAULT_IDLE_ADMIT_SECONDS = 60.0
+
+def _idle_admit_config(server_config: dict | None) -> tuple[bool, float]:
+    """Return ``(enabled, idle_seconds_threshold)`` for the idle override.
+
+    Disabled by default (``local_idle_admit_enabled: false``). A missing,
+    malformed, or non-positive ``local_idle_admit_seconds`` (default 60)
+    disables the override rather than admitting on a guess — the guard must
+    never widen admission because of a config typo.
+    """
+    if not isinstance(server_config, dict):
+        return False, DEFAULT_IDLE_ADMIT_SECONDS
+    raw_seconds = server_config.get(
+        "local_idle_admit_seconds", DEFAULT_IDLE_ADMIT_SECONDS
+    )
+    try:
+        seconds = float(raw_seconds)
+    except (TypeError, ValueError):
+        return False, DEFAULT_IDLE_ADMIT_SECONDS
+    if seconds <= 0:
+        return False, seconds
+    return bool(server_config.get("local_idle_admit_enabled", False)), seconds
+
+
+def _local_idle_blocker(endpoint: str | None) -> str | None:
+    """Return why idle admission must not fire, or ``None`` when it may.
+
+    Fail-safe checks (AC2/AC3): nothing may be admitted while the backend is
+    unhealthy, self-healing, switching/loading a model, holding a lease, or
+    prefilling — or while any request is queued for a slot.
+    """
+    try:
+        import proxy.server as srv
+    except Exception:
+        return "server_unavailable"
+
+    try:
+        if srv.backend_recovery_state.get("in_progress"):
+            return "self_healing"
+    except Exception:
+        pass
+
+    # Model switch / background load in progress.
+    try:
+        if int(getattr(srv, "model_switch_refcount", 0) or 0) > 0:
+            return "model_switch"
+    except Exception:
+        pass
+    try:
+        lock = getattr(srv, "model_switch_lock", None)
+        if lock is not None and lock.locked():
+            return "model_switch"
+    except Exception:
+        pass
+    try:
+        if bool(getattr(srv, "background_loads", None)):
+            return "model_loading"
+    except Exception:
+        pass
+
+    # Local backend health. An explicit provider ``endpoint`` points at an
+    # externally managed llama-server, so the single-process ready gate does
+    # not apply to it (LP-0MRPILSMW004T4H8).
+    if not endpoint:
+        if not bool(getattr(srv, "backend_ready", False)):
+            return "backend_not_ready"
+        if getattr(srv, "llama_process", None) is None:
+            return "backend_not_running"
+
+    # Lease / prefill / generation in flight: the GPU is not idle.
+    try:
+        if int(getattr(srv, "local_active_queries", 0) or 0) > 0:
+            return "local_active"
+    except Exception:
+        pass
+    try:
+        if int(getattr(srv, "local_generating_queries", 0) or 0) > 0:
+            return "generating"
+    except Exception:
+        pass
+    try:
+        if getattr(srv, "local_prefill_in_flight", None):
+            return "prefill_in_flight"
+    except Exception:
+        pass
+
+    # A queued request means the next slot must go to interactive traffic.
+    try:
+        from proxy import contention_queue
+
+        if contention_queue.queue_depth() > 0:
+            return "queue_not_empty"
+    except Exception:
+        pass
+
+    return None
+
+
+def _evaluate_idle_admission_override(
+    config: dict,
+    provider_cfg: dict,
+    estimated_tokens: int,
+) -> dict | None:
+    """Decide whether idle local capacity should serve a bypassed request.
+
+    Only the **economic** band (``large_context_bypass``) is eligible: the
+    physical ``context_too_large`` cap is a capacity limit and is never
+    overridden. When the local backend has been idle for at least
+    ``local_idle_admit_seconds`` and :func:`_local_idle_blocker` reports no
+    blocker, a decision dict is returned; otherwise ``None`` (today's
+    behaviour, byte-for-byte).
+
+    Returns:
+        ``{"reason", "idle_seconds", "threshold_seconds"}`` when the request
+        should be admitted locally, else ``None``.
+    """
+    try:
+        server_config = config.get("server", config) if isinstance(config, dict) else {}
+        enabled, threshold = _idle_admit_config(server_config)
+        if not enabled:
+            return None
+        endpoint = _get_local_provider_endpoint(provider_cfg, config)
+        blocker = _local_idle_blocker(endpoint)
+        if blocker is not None:
+            logger.debug(
+                "idle_admit_blocked reason=%s endpoint=%s estimated_tokens=%d",
+                blocker,
+                endpoint or "default",
+                max(0, int(estimated_tokens or 0)),
+            )
+            return None
+        from proxy.local_activity import local_idle_seconds
+
+        idle_seconds = local_idle_seconds()
+        if idle_seconds < threshold:
+            return None
+        return {
+            "reason": IDLE_ADMIT_REASON,
+            "idle_seconds": idle_seconds,
+            "threshold_seconds": threshold,
+        }
+    except Exception:
+        logger.debug("idle admission evaluation failed", exc_info=True)
+        return None
 
 
 def _provider_context_limit(provider_cfg: dict) -> int:
@@ -4227,6 +4718,69 @@ def _build_reasoning_content_roundtrip_error() -> Response:
 EXHAUSTION_CODE_ALL = "all_exhausted"
 EXHAUSTION_CODE_TIME_WINDOW = "outside_time_window"
 EXHAUSTION_CODE_SLOTS = "all_slots_exhausted"
+EXHAUSTION_CODE_LOCAL_ADMISSION = "local_admission_reject"
+
+
+def _build_local_admission_reject_response(
+    attempt: dict[str, Any], config: dict | None = None
+) -> Response:
+    """Retryable response for a request the prefill-ETA guard refused.
+
+    The guard refuses local admission *immediately* when the projected prefill
+    cannot finish inside the caller's wait budget, and the request normally
+    falls through to a remote provider. When the rest of the chain is
+    exhausted as well, the client gets this distinguishable 429 instead of the
+    generic exhaustion body: ``Retry-After`` carries how much longer the local
+    prefill would need than the caller was prepared to wait, and the
+    ``X-Local-Admission*`` headers expose the estimate so a dispatcher can pace
+    its next attempt (LP-0MVGDUV5E005UWBQ AC3).
+    """
+    from proxy.prefill_eta import suggested_retry_after_seconds
+
+    eta = float(attempt.get("eta_prefill_seconds") or 0.0)
+    budget = float(attempt.get("budget_seconds") or 0.0)
+    retry_after = suggested_retry_after_seconds(
+        eta, budget, maximum=_max_retry_after_seconds(config)
+    )
+    payload: dict[str, Any] = {
+        "error": "All providers exhausted",
+        "code": EXHAUSTION_CODE_LOCAL_ADMISSION,
+        "detail": (
+            "local admission refused: projected prefill exceeds the wait budget "
+            "and no remote provider is available"
+        ),
+        "eta_prefill_seconds": eta,
+        "budget_seconds": budget,
+        "retry_after": retry_after,
+        "suggested_action": (
+            "Retry after the advertised delay, reduce the prompt size (compact "
+            "the session) so the prefill fits the local wait budget, or route "
+            "the request to a remote provider."
+        ),
+    }
+    try:
+        payload["diagnostics"] = [attempt]
+    except Exception:
+        pass
+    headers = {
+        "Retry-After": str(retry_after),
+        "Cache-Control": "no-store",
+        "X-Local-Admission": "reject",
+        "X-Local-Admission-Eta": f"{eta:.1f}",
+        "X-Local-Admission-Budget": f"{budget:.1f}",
+        # LP-0MVIKPCSG002B0NL AC6: the refusal is a routing outcome, not a
+        # remote serve — say so on the response itself.
+        "X-Local-Route": "refused",
+        "X-Local-Fallback-Reason": str(
+            attempt.get("reason") or "eta_exceeds_budget"
+        ),
+    }
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=429,
+        media_type="application/json",
+        headers=headers,
+    )
 
 
 def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None, config: dict | None = None) -> Response:
@@ -4250,6 +4804,11 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     on the ``error`` prose, whose meaning is preserved for older clients
     (LP-0MU56ZM0K005F69G).
 
+    A request refused by the prefill-ETA admission guard
+    (LP-0MVGDUV5E005UWBQ) that then finds no remote provider yields a
+    retryable 429 carrying ``Retry-After`` plus the ETA guidance headers
+    instead of the generic exhaustion body, so the refusal is actionable.
+
     Verified end-to-end by ``proxy/tests/test_overnight_exhaustion_e2e.py``
     (LP-0MV728XBH00546FB): ``Retry-After`` / ``retry_after`` are identical,
     the stable ``code`` discriminator is present, the advertisement cap is
@@ -4268,6 +4827,10 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
             status_code=429,
             media_type="application/json",
         )
+
+    admission_reject = _local_admission_reject_payload(diagnostics)
+    if admission_reject is not None:
+        return _build_local_admission_reject_response(admission_reject, config)
 
     retry_after = _compute_retry_after(
         unavailable_providers, model_config=model_config, config=config
@@ -4638,12 +5201,22 @@ def _local_slot_saturation(
     except Exception:
         pass
     # Prefill-aware guard (LP-0MTJET4I5009EHNX): a prefill in flight holds a
-    # slot; never admit more concurrent prefills than the slot pool.
+    # slot; never admit more concurrent prefills than the prefill cap.
+    # Serialised prefills (LP-0MVGDUUV3001XFRJ): the cap is
+    # ``local_max_concurrent_prefills`` (default 1) rather than the slot pool,
+    # because concurrent prefills halve per-request throughput at flat
+    # aggregate tok/s.
     try:
         import proxy.server as _srv
-        from proxy.router_helpers import _get_prefill_in_flight_count
+        from proxy.router_helpers import (
+            _effective_prefill_cap,
+            _get_prefill_in_flight_count,
+        )
 
-        if _get_prefill_in_flight_count(_srv) >= max_local:
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        if _get_prefill_in_flight_count(_srv) >= _effective_prefill_cap(
+            server_cfg, max_local
+        ):
             return "prefill"
     except Exception:
         pass
@@ -4703,6 +5276,38 @@ def _contention_queue_enabled(config: dict, priority: str | None = None) -> bool
         return False
 
 
+async def _effective_routing_tokens(
+    config: dict,
+    model_config: dict,
+    request,
+    body_json: dict,
+) -> int:
+    """Authoritative prompt-token estimate shared by the local routing gates.
+
+    Uses the same pipeline as the smart-routing block below — native tokenizer
+    (``_get_tokenizer_for_model``) + session history + ``token_estimate_multiplier``
+    — so the contention-queue context bypass and the prefill-ETA admission
+    guard cost the prompt identically (LP-0MSEQ71IF0003FRT).
+
+    Fail-open: an estimate failure yields 0 ("no prompt to measure"), which
+    keeps every gate open — an estimate error must never drop local from the
+    chain.
+    """
+    try:
+        _tokenizer, _multiplier = _get_tokenizer_for_model(model_config, config)
+        _tokens = await _estimate_effective_prompt_tokens_for_routing(
+            request, body_json, tokenizer=_tokenizer,
+        )
+        if _multiplier != 1.0:
+            _tokens = int(_tokens * _multiplier)
+        return max(0, int(_tokens or 0))
+    except Exception:
+        logger.debug(
+            "routing token estimate failed; gates fail open", exc_info=True
+        )
+        return 0
+
+
 async def _queue_context_bypass(
     config: dict,
     model_config: dict,
@@ -4711,6 +5316,7 @@ async def _queue_context_bypass(
     body_json: dict,
     session_id: str | None,
     priority: str | None = None,
+    estimated_tokens: int | None = None,
 ) -> tuple[bool, str | None]:
     """Mirror of the smart-routing large-context skip decision.
 
@@ -4721,6 +5327,10 @@ async def _queue_context_bypass(
     (LP-0MU5A4QBR003YJM0).  Keeps the same
     thresholds/tokenizer/estimate/``_should_skip_local`` pipeline as the main
     smart-routing block below; returns ``(skip_local, skip_reason)``.
+
+    *estimated_tokens* is the caller's already-computed estimate
+    (``_effective_routing_tokens``) so the same queue decision point does not
+    pay for the tokenizer twice; ``None`` recomputes it here.
     """
     _llama_model = provider_cfg.get("llama_model", "")
     _cold_threshold, _warm_threshold = _effective_large_context_thresholds(config)
@@ -4734,12 +5344,12 @@ async def _queue_context_bypass(
             if _warm_threshold > 0
             else _local_context_limit
         )
-    _tokenizer, _multiplier = _get_tokenizer_for_model(model_config, config)
-    _estimated_tokens = await _estimate_effective_prompt_tokens_for_routing(
-        request, body_json, tokenizer=_tokenizer,
-    )
-    if _multiplier != 1.0:
-        _estimated_tokens = int(_estimated_tokens * _multiplier)
+    if estimated_tokens is None:
+        _estimated_tokens = await _effective_routing_tokens(
+            config, model_config, request, body_json
+        )
+    else:
+        _estimated_tokens = max(0, int(estimated_tokens))
     # Pass the priority-driven recovery flag (AC3): low priority recovers
     # economic bypasses locally even when the base config flag is off.
     _recover_economic = _economic_bypass_serves_local(config, priority)
@@ -4750,6 +5360,277 @@ async def _queue_context_bypass(
         economic_bypass_serves_local=_recover_economic,
     )
     return _skip_local, _skip_reason
+
+
+def _local_gate_occupancy(
+    config: dict, max_local: int, endpoint: str | None = None
+) -> tuple[int, int]:
+    """Return ``(busy_slots, in_flight_prefills)`` for this request's gate.
+
+    LP-0MVICD2YW004DJPV: the admission guard must compare the wait *including
+the occupied gate ahead of it* against the budget, so it needs the number of
+    occupants — not just the newcomer's own prefill. Two occupancy sources are
+    combined, taking the larger (a conservative over-estimate is the safe
+    direction, and both can be true at once):
+
+    - the generating concurrency from ``_local_concurrency_info`` (slots that
+      will hold the gate while they decode), and
+    - the prefill-in-flight count (``_get_prefill_in_flight_count``), which is
+      the signal that remains when per-slot prefill progress is unobservable
+      (``prefill_progress_unobservable``, ``alive=False``). An in-flight
+      prefill must never be read as "free soon".
+
+    Never raises: a routing decision must not break on an observability gap.
+    """
+    in_flight = 0
+    try:
+        import proxy.server as _srv
+        from proxy.router_helpers import _get_prefill_in_flight_count
+
+        in_flight = max(0, int(_get_prefill_in_flight_count(_srv) or 0))
+    except Exception:
+        in_flight = 0
+    cur_local = 0
+    try:
+        cur_local, _ = _local_concurrency_info(config, endpoint=endpoint)
+        cur_local = max(0, int(cur_local or 0))
+    except Exception:
+        cur_local = 0
+    try:
+        pool = max(1, int(max_local or 1))
+    except (TypeError, ValueError):
+        pool = 1
+    # Never claim more occupants than the gate can physically hold: a stale
+    # counter must not multiply the occupancy term without bound.
+    busy = min(pool, max(cur_local, in_flight))
+    return busy, in_flight
+
+
+def _note_local_fallback_reason(request, reason: str | None) -> None:
+    """Record why local was not used, for ``X-Local-Fallback-Reason``.
+
+    LP-0MVIKPCSG002B0NL AC6: a client must be able to observe its loss at the
+    moment it happens. The reason is stamped on the request as the routing
+    cycle falls back and surfaced by ``_stamp_local_route_headers`` at the
+    top-level return, so every fallback path is covered by one choke point.
+    Never raises: header bookkeeping must not break routing.
+    """
+    try:
+        setattr(request, "_local_fallback_reason", reason)
+    except Exception:
+        pass
+
+
+_PREF_LOCAL_ONLY = "local-only"
+_PREF_REMOTE_OK = "remote-ok"
+
+
+def _request_local_preference(request) -> str:
+    """Return the request's ``X-Local-Preference`` (default ``prefer-local``).
+
+    Unknown values fall back to today's behaviour (AC8). The parsed value is
+    cached on the request so both routing cycles and the refusal path agree.
+    """
+    cached = getattr(request, "_local_preference", None)
+    if cached:
+        return cached
+    try:
+        from proxy import admission_reserve
+
+        preference = admission_reserve.parse_preference(
+            getattr(request, "headers", {}) or {}
+        )
+    except Exception:
+        preference = "prefer-local"
+    try:
+        setattr(request, "_local_preference", preference)
+    except Exception:
+        pass
+    return preference
+
+
+def _build_local_only_refusal_response(
+    attempt: dict[str, Any] | None, config: dict | None = None
+) -> Response:
+    """429 for a ``local-only`` request the admission guard refused (AC4).
+
+    Unlike the exhaustion path, this response is produced **while remote
+    providers are still available**: the client said local-only, so moving it
+    remote would silently violate its intent. It carries the same retryable
+    contract as the exhaustion refusal (``Retry-After``, ``X-Local-Admission*``)
+    plus ``X-Local-Route: refused``.
+    """
+    from proxy.prefill_eta import suggested_retry_after_seconds
+
+    attempt = attempt or {}
+    eta = float(attempt.get("eta_prefill_seconds") or 0.0)
+    budget = float(attempt.get("budget_seconds") or 0.0)
+    projected = float(attempt.get("projected_wait_seconds") or eta)
+    reason = str(attempt.get("reason") or "eta_exceeds_budget")
+    retry_after = attempt.get("retry_after_s")
+    if retry_after is None:
+        retry_after = suggested_retry_after_seconds(
+            eta, budget, maximum=_max_retry_after_seconds(config)
+        )
+    payload: dict[str, Any] = {
+        "error": "Local admission refused",
+        "code": EXHAUSTION_CODE_LOCAL_ADMISSION,
+        "detail": (
+            "local admission refused: the projected wait exceeds the wait "
+            "budget and X-Local-Preference: local-only forbids remote fallback"
+        ),
+        "reason": reason,
+        "eta_prefill_seconds": eta,
+        "projected_wait_seconds": projected,
+        "budget_seconds": budget,
+        "retry_after": retry_after,
+        "suggested_action": (
+            "Retry after the advertised delay, reduce the prompt size so the "
+            "prefill fits the local wait budget, or send "
+            "X-Local-Preference: prefer-local to allow a remote fallback."
+        ),
+    }
+    headers = {
+        "Retry-After": str(retry_after),
+        "Cache-Control": "no-store",
+        "X-Local-Admission": "reject",
+        "X-Local-Admission-Eta": f"{eta:.1f}",
+        "X-Local-Admission-Budget": f"{budget:.1f}",
+        "X-Local-Route": "refused",
+        "X-Local-Fallback-Reason": reason,
+    }
+    return Response(
+        content=json.dumps(payload).encode("utf-8"),
+        status_code=429,
+        media_type="application/json",
+        headers=headers,
+    )
+
+
+def _stamp_local_route_headers(
+    response: Response, request, model_config: dict
+) -> Response:
+    """Add ``X-Local-Route`` / ``X-Local-Fallback-Reason`` to *response*.
+
+    Single choke point on the top-level return path so local success, remote
+    success, refusal and exhaustion are all covered (LP-0MVIKPCSG002B0NL AC6).
+    A response that already carries the route header (a local-only refusal) is
+    left untouched; every other response is classified by the ``X-Provider``
+    that served it.
+    """
+    try:
+        from proxy import admission_reserve
+
+        return admission_reserve.stamp_route_headers(
+            response,
+            model_config,
+            fallback_reason=getattr(request, "_local_fallback_reason", None),
+        )
+    except Exception:  # pragma: no cover - header stamping is best-effort
+        logger.debug("route header stamping failed", exc_info=True)
+        return response
+
+
+async def _prefill_admission_guard(
+    config: dict,
+    provider_cfg: dict,
+    estimated_tokens: int,
+    session_id: str | None,
+    priority: str | None = None,
+    messages: list | None = None,
+    max_local: int = 1,
+    endpoint: str | None = None,
+):
+    """Evaluate (and log) the prefill-ETA admission guard.
+
+    Returns the :class:`proxy.prefill_eta.AdmissionDecision` when the guard
+    actually decided (a calibrated ETA against a real wait budget), else
+    ``None`` — an inert guard leaves today's queueing behaviour untouched
+    (LP-0MVGDUV5E005UWBQ AC1/AC3). Never raises: the guard must not be able to
+    break local routing.  *messages* (the request message list) lets the guard
+    cost the *expected* reusable prefix (LP-0MVI2XOTY008Q4UV) rather than the
+    raw measured ratio.
+
+    The verdict is occupancy-aware (LP-0MVICD2YW004DJPV): *max_local* and
+    *endpoint* let it read the occupied gate ahead of this request, so the
+    projected wait it compares against the budget includes the in-flight
+    prefill rather than the own-prefill term alone.
+    """
+    try:
+        from proxy import prefill_eta
+
+        if estimated_tokens <= 0:
+            return None
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        guard_cfg = prefill_eta.resolve_config(server_cfg)
+        if guard_cfg.policy == prefill_eta.POLICY_OFF:
+            return None
+        if prefill_eta.wait_budget_seconds(config, priority) <= 0:
+            # ``high`` priority never queues, so there is no budget to guard.
+            return None
+        model_name = (
+            provider_cfg.get("llama_model", "")
+            if isinstance(provider_cfg, dict)
+            else ""
+        )
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        ratio = expected_cached_ratio(
+            model_name,
+            session_id,
+            estimated_tokens,
+            messages,
+            server_config=server_cfg,
+        )
+        # Occupancy-aware verdict (LP-0MVICD2YW004DJPV): the wait a newcomer
+        # actually faces is its own prefill *plus* the occupied gate ahead of
+        # it, so the guard needs the occupants before it can compare against
+        # the budget.
+        occupancy, in_flight_prefills = _local_gate_occupancy(
+            config, max_local, endpoint=endpoint
+        )
+        decision = prefill_eta.evaluate_admission(
+            config,
+            model_name,
+            estimated_tokens,
+            ratio,
+            priority,
+            busy_slots=occupancy,
+            in_flight_prefills=in_flight_prefills,
+        )
+        if not decision.active:
+            return None
+        prefill_eta.record_guard_decision(
+            decision,
+            provider=(provider_cfg.get("name") if isinstance(provider_cfg, dict) else None),
+            session_id=session_id,
+            model=model_name,
+            priority=priority,
+        )
+        return decision
+    except Exception:
+        logger.debug(
+            "prefill-ETA admission guard failed; admitting as today", exc_info=True
+        )
+        return None
+
+
+def _local_admission_reject_payload(attempts: list | None) -> dict | None:
+    """Return the ETA-guard rejection diagnostic from *attempts*, if any.
+
+    A request refused by the prefill-ETA admission guard falls through to the
+    remote chain; when that chain is exhausted too, the client must see a
+    retryable status (with ``Retry-After`` and the ETA guidance headers)
+    rather than a generic exhaustion error, so the refusal is recoverable
+    (LP-0MVGDUV5E005UWBQ AC3).
+    """
+    if not attempts:
+        return None
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        if attempt.get("status") == "local_admission_reject":
+            return attempt
+    return None
 
 
 def _set_queue_wait_on_request(request, elapsed: float) -> None:
@@ -4790,17 +5671,105 @@ async def _maybe_queue_for_local_slot(
       - ``"fallback_policy"`` — policy is fallback / high priority never
         queues; the caller keeps today's ``local_concurrency_limit``
         behavior.
+      - ``"admission_reject"`` — the prefill-ETA admission guard refused
+        local admission because the projected prefill cannot finish inside
+        the wait budget; the caller falls through to the next provider
+        immediately (no queueing) and records the ETA diagnostic
+        (LP-0MVGDUV5E005UWBQ).
+      - ``"refused_local_only"`` — the guard refused and the caller set
+        ``X-Local-Preference: local-only``: the caller must return the
+        retryable 429 admission response instead of falling back to a remote
+        provider (LP-0MVIKPCSG002B0NL AC4).
+
+    A valid ``X-Local-Reservation`` ticket is consumed first: a reservation is
+    a pre-granted admission, so the follow-up request dispatches without
+    re-checking or queueing (LP-0MVIKPCSG002B0NL AC1).
     """
+    # Atomic local-admission reservation (LP-0MVIKPCSG002B0NL): a ticket
+    # claimed via POST /llama/local/reserve is a pre-granted admission. It is
+    # single-use and TTL-bound, so consuming it here is what makes the
+    # follow-up dispatch skip both the admission re-check and the queue. A
+    # stale / missing / already-consumed ticket simply falls through to the
+    # ordinary path — never a hard failure (AC3).
+    try:
+        from proxy import admission_reserve as _reservations
+
+        _ticket_id = _reservations.reservation_id_from_headers(
+            getattr(request, "headers", {}) or {}
+        )
+        _ticket = _reservations.peek(_ticket_id)
+        if _ticket is not None:
+            # Reservations are scoped per provider/model: a ticket for another
+            # local model must not fast-path (nor consume) this endpoint's
+            # gate (the work item's "per-gate, scoped per provider endpoint"
+            # constraint).
+            _ticket_local_model = (
+                provider_cfg.get("llama_model", "")
+                if isinstance(provider_cfg, dict)
+                else ""
+            )
+            if _ticket_local_model and _ticket.provider and (
+                _ticket.provider != _ticket_local_model
+            ):
+                _ticket = None
+            else:
+                _ticket = _reservations.claim(_ticket_id)
+    except Exception:
+        _ticket = None
+    if _ticket is not None:
+        _note_local_fallback_reason(request, None)
+        logger.info(
+            "local_admission_reserve_claimed ticket=%s session=%s tokens=%d",
+            _ticket.ticket_id,
+            _ticket.session_id or "unknown",
+            _ticket.estimated_tokens,
+        )
+        return ("dispatch", "reserved", 0.0)
+
     if not _contention_queue_enabled(config, priority):
         return ("fallback_policy", None, None)
+    # One authoritative prompt estimate, shared by the context-bypass check,
+    # the smart-routing mirror and the prefill-ETA guard below.
+    _estimated_tokens = await _effective_routing_tokens(
+        config, model_config, request, body_json
+    )
     # Context bypasses never queue (AC4): a request that cannot fit the KV
     # slot must fall back exactly as today.
     skip_local, skip_reason = await _queue_context_bypass(
         config, model_config, provider_cfg, request, body_json, session_id,
-        priority=priority,
+        priority=priority, estimated_tokens=_estimated_tokens,
     )
     if skip_local:
         return ("context_bypass", skip_reason, None)
+
+    # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ): a wait that cannot
+    # finish the prefill inside the budget is a guaranteed loss (measured 85 %
+    # of queued waits were abandoned after up to 120 s and went remote). Refuse
+    # immediately and let the caller fall through instead. Inert (``None``)
+    # when uncalibrated, so today's queueing behaviour is unchanged.
+    _admission = await _prefill_admission_guard(
+        config,
+        provider_cfg,
+        _estimated_tokens,
+        session_id,
+        priority=priority,
+        messages=body_json.get("messages") if isinstance(body_json, dict) else None,
+        max_local=max_local,
+        endpoint=endpoint,
+    )
+    if _admission is not None and not _admission.admit:
+        try:
+            setattr(request, "_local_admission_decision", _admission)
+        except Exception:
+            pass
+        # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): with
+        # ``X-Local-Preference: local-only`` the client must never be moved
+        # remote. The caller turns this into the retryable 429 admission
+        # response instead of falling through to the next provider.
+        _preference = _request_local_preference(request)
+        if _preference == _PREF_LOCAL_ONLY:
+            return ("refused_local_only", _admission.reason, None)
+        return ("admission_reject", _admission.reason, None)
 
     from proxy.router import _get_contention_queue_config
 
@@ -4813,19 +5782,46 @@ async def _maybe_queue_for_local_slot(
 
     # LP-0MU498TWH008DBCI AC5: record which gate the request waits on so
     # generating-saturation and prefill-saturation waits are distinguishable.
+    # LP-0MVGDUUV3001XFRJ AC4: the saturation is stamped on the request so the
+    # local-dispatch path can emit ``prefill_gate_wait_ms`` (the time this
+    # request waited specifically for the prefill gate).
     _saturation = _local_slot_saturation(config, max_local, endpoint=endpoint)
+    try:
+        setattr(request, "_local_queue_saturation", _saturation)
+    except Exception:
+        pass
     logger.info(
         "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s",
         cq["max_wait_seconds"], cq["max_depth"], _saturation or "none",
     )
 
     _wait_started = _time.monotonic()
+    # Lease-owner retention priority (LP-0MVI2VRT2000V1AP): a session that
+    # holds, or has just released, a local lease and still has cache history
+    # queues ahead of newcomers, so it reclaims the slot it just left instead
+    # of burning the full budget and detouring to a paid provider.
+    _retained = False
+    try:
+        _grace = float(cq.get("lease_grace_seconds", 300) or 0)
+        _retained = contention_queue.is_retained_local_owner(
+            session_id,
+            (
+                provider_cfg.get("llama_model", "")
+                if isinstance(provider_cfg, dict)
+                else None
+            ),
+            grace_seconds=_grace,
+        )
+    except Exception:
+        logger.debug("retention check failed; queueing as a newcomer", exc_info=True)
     elapsed = await contention_queue.wait_for_local_slot(
         max_wait_seconds=cq["max_wait_seconds"],
         max_depth=cq["max_depth"],
         slot_free_check=lambda: _local_slot_free(
             config, max_local, endpoint=endpoint
         ),
+        session_id=session_id,
+        retained=_retained,
     )
     if elapsed is None:
         # Caps exceeded — the caller falls back. Surface the measured wait so
@@ -5350,6 +6346,12 @@ class _UsageLimitReset(NamedTuple):
 def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
     """Return the cap applied to a guessed (period-name-only) quarantine.
 
+    FALLBACK-ONLY (LP-0MVF7MPZN009GOJB): this cap is applied only when an
+    ``opencode-*`` account has no fresh quota snapshot (stale/absent/disabled
+    quota state) or the entry is not quota-managed at all; with a fresh
+    snapshot the authoritative ``/v1/usage`` reset is used instead. See
+    :func:`_usage_limit_reset_info` for the resolution order.
+
     Resolution order: ``server.usage_limit_guess_cap_seconds`` (accepting a
     flat or nested ``server:`` config), then the
     ``LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS`` env override, then the
@@ -5373,20 +6375,77 @@ def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
     return float(_USAGE_LIMIT_GUESS_MAX_SECONDS)
 
 
+def _quota_snapshot_reset_seconds(
+    provider_cfg: dict | None, config: dict | None = None
+) -> float | None:
+    """Return the authoritative reset for *provider_cfg* from quota state.
+
+    Only ``opencode-*`` entries are quota-managed, and the value is honoured
+    only while the quota source is strictly **enabled** for routing
+    (:func:`proxy.quota_state.quota_behaviour`): a disabled (kill switch),
+    stale (suspended) or dry-run quota mode returns ``None`` so the reactive
+    usage-limit handling keeps its pre-feature guessed/message behaviour for
+    every other case (LP-0MVF7MPZN009GOJB).
+
+    The returned value is the account-level
+    :attr:`~proxy.quota_state.QuotaSnapshot.seconds_to_reset` (the monthly
+    allowance window, resolved per account from ``monthly.resetsAt`` — the
+    same value surge and ``available_times`` treat as authoritative) rather
+    than the guessed cap from :func:`_usage_limit_guess_cap_seconds`. A
+    missing/unparseable reset, an absent snapshot, a stale snapshot or a
+    non-positive value all return ``None`` (fail open to the existing
+    message/guess cascade). Never blocks, never polls and never raises: a
+    pure cache read on the request path with a fail-safe exception guard.
+    """
+    if not isinstance(provider_cfg, dict):
+        return None
+    try:
+        if not quota_state.is_quota_provider(provider_cfg, config):
+            return None
+        if not quota_state.quota_behaviour(config).applies:
+            return None
+        snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+        if snapshot is None:
+            return None
+        seconds = snapshot.seconds_to_reset
+    except Exception:
+        logger.info(
+            "usage-limit snapshot reset unavailable; falling back to the "
+            "message/guess path",
+            exc_info=True,
+        )
+        return None
+    if seconds <= 0:
+        return None
+    return float(seconds)
+
+
 def _usage_limit_reset_info(
-    response: Response, body_text: str, config: dict | None = None
+    response: Response,
+    body_text: str,
+    config: dict | None = None,
+    provider_cfg: dict | None = None,
 ) -> _UsageLimitReset | None:
     """Return the resolved usage-limit reset for a 429 error response.
 
     Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ) and any usage-limit
     error variant that carries a reset duration in its message (including
-    ``FreeUsageLimitError`` responses that include one). An explicit
-    ``Resets in 22hr 43min`` duration is honoured in full. When the message
+    ``FreeUsageLimitError`` responses that include one).
+
+    Resolution order (LP-0MVF7MPZN009GOJB): for an ``opencode-*`` entry with a
+    **fresh** quota snapshot the snapshot's authoritative ``seconds_to_reset``
+    is used (monthly window, + the 2-minute margin) and returned as a hard
+    ``explicit=True`` quarantine -- the guessed cap path is unreachable for
+    that case. Otherwise (non-``opencode-*`` entry, or stale/absent/disabled
+    quota state) the previous cascade is unchanged: an explicit
+    ``Resets in 22hr 43min`` duration is honoured in full; when the message
     has no explicit duration, ``metadata.limitName`` (daily/weekly/monthly)
-    supplies a GUESSED period that is capped at
+    supplies a GUESSED period capped at
     :func:`_usage_limit_guess_cap_seconds` (24h by default) — the full 30-day
     period is never used without explicit evidence (LP-0MUQTCMW2001VXH8). The
-    2-minute safety margin is added to the returned duration.
+    2-minute safety margin is added to the returned duration. The guess path
+    is therefore retained purely as the stale/absent fallback, never for a
+    fresh-snapshot ``opencode-*`` account.
 
     Returns ``None`` when the response is not a 429 usage-limit error or no
     reset duration can be computed — callers then fall back to the existing
@@ -5422,8 +6481,39 @@ def _usage_limit_reset_info(
     if err_type not in ("gousagelimiterror", "freeusagelimiterror"):
         return None
 
+    if provider_cfg is not None:
+        snapshot_seconds = _quota_snapshot_reset_seconds(provider_cfg, config)
+        if snapshot_seconds is not None:
+            logger.info(
+                "usage-limit reset source=snapshot provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                _usage_limit_account_key(provider_cfg),
+                snapshot_seconds,
+                limit_name or "",
+            )
+            return _UsageLimitReset(
+                snapshot_seconds + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                True,
+                limit_name,
+            )
+
+    account = (
+        _usage_limit_account_key(provider_cfg)
+        if isinstance(provider_cfg, dict)
+        else None
+    )
     seconds = _parse_resets_in(message) if message else None
     if seconds is not None:
+        if account is not None:
+            logger.info(
+                "usage-limit reset source=message provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                account,
+                float(seconds),
+                limit_name or "",
+            )
         return _UsageLimitReset(
             float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS, True, limit_name
         )
@@ -5432,6 +6522,15 @@ def _usage_limit_reset_info(
             float(_PERIOD_DEFAULT_SECONDS[limit_name]),
             _usage_limit_guess_cap_seconds(config),
         )
+        if account is not None:
+            logger.info(
+                "usage-limit reset source=guess provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                account,
+                guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                limit_name,
+            )
         return _UsageLimitReset(
             guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, limit_name
         )
@@ -5439,13 +6538,17 @@ def _usage_limit_reset_info(
 
 
 def _usage_limit_reset_seconds(
-    response: Response, body_text: str, config: dict | None = None
+    response: Response,
+    body_text: str,
+    config: dict | None = None,
+    provider_cfg: dict | None = None,
 ) -> float | None:
     """Backwards-compatible wrapper returning only the reset duration.
 
-    See :func:`_usage_limit_reset_info` for the explicit-vs-guessed detail.
+    See :func:`_usage_limit_reset_info` for the snapshot-vs-message-vs-guessed
+    detail and the optional ``provider_cfg`` snapshot preference.
     """
-    info = _usage_limit_reset_info(response, body_text, config)
+    info = _usage_limit_reset_info(response, body_text, config, provider_cfg)
     return info.seconds if info is not None else None
 
 
@@ -7053,14 +8156,21 @@ async def _proxy_with_remote_fallback_cycle(
     from proxy.priority import set_request_priority
 
     set_request_priority(request, _priority)
+    _preference = _request_local_preference(request)
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
+    elif _preference == _PREF_REMOTE_OK:
+        # ``remote-ok`` with no remote-capable provider in the chain: the
+        # client asked for no local route, so the chain is genuinely empty
+        # (AC5).
+        model_config = {**model_config, "providers": []}
     logger.info(
-        "priority_routing model=%s priority=%s providers=%d",
+        "priority_routing model=%s priority=%s providers=%d preference=%s",
         model_config.get("name") or "unknown",
         _priority,
         len(_chain or model_config.get("providers") or []),
+        _preference,
     )
 
     # Per-entry context ceiling (LP-0MVF9N2QL001CDA7): parse the body once so
@@ -7127,6 +8237,7 @@ async def _proxy_with_remote_fallback_cycle(
             # its prompt cache/prefix continuity.
             _budget = await acquire_provider_budget(
                 provider_cfg, config, _budget_session_id, request,
+                model_config=model_config,
             )
             if not _budget.allowed:
                 _record_attempt(
@@ -7141,6 +8252,7 @@ async def _proxy_with_remote_fallback_cycle(
                     reserve_slots=_budget.reserve_slots,
                     remaining=_budget.remaining,
                     elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                    **_budget_diagnostics(_budget),
                 )
                 fallback_reason = "rate_limited"
                 prev_provider = provider_name
@@ -7158,11 +8270,13 @@ async def _proxy_with_remote_fallback_cycle(
                     reserve_slots=_budget.reserve_slots,
                     remaining=_budget.remaining,
                     elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                    **_budget_diagnostics(_budget),
                 )
 
             response = await ptr(request, path, provider_cfg)
             _maybe_record_provider_affinity(
                 provider_cfg, _budget_session_id, response, config,
+                model_config=model_config,
             )
 
             # Pre-flight remote streaming responses: detect a pre-content
@@ -7279,7 +8393,9 @@ async def _proxy_with_remote_fallback_cycle(
                 # API-key ACCOUNT until the computed reset time + 2m margin.
                 # Not the whole endpoint: distinct api_key_env entries on the
                 # same gateway have independent limits (LP-0MSMBWB23009XYPW).
-                _reset_info = _usage_limit_reset_info(response, body_text, config)
+                _reset_info = _usage_limit_reset_info(
+                    response, body_text, config, provider_cfg=provider_cfg
+                )
                 if _reset_info is not None:
                     _reset_account = _usage_limit_account_key(provider_cfg)
                     _set_usage_limit_quarantine(_reset_account, _reset_info)
@@ -7506,9 +8622,10 @@ async def proxy_with_remote_fallback(
         A ``Response`` from a successful provider, or the 503/429 exhaustion
         response once the hold-retry bound is reached.
     """
-    return await _run_chain_cycles(
+    response = await _run_chain_cycles(
         request, path, model_config, config, _proxy_with_remote_fallback_cycle,
     )
+    return _stamp_local_route_headers(response, request, model_config)
 
 
 async def _evaluate_compaction_for_bypass(
@@ -7680,14 +8797,21 @@ async def _proxy_with_fallback_cycle(
     from proxy.priority import set_request_priority
 
     set_request_priority(request, _priority)
+    _preference = _request_local_preference(request)
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
+    elif _preference == _PREF_REMOTE_OK:
+        # ``remote-ok`` with no remote-capable provider in the chain: the
+        # client asked for no local route, so the chain is genuinely empty
+        # (AC5).
+        model_config = {**model_config, "providers": []}
     logger.info(
-        "priority_routing model=%s priority=%s providers=%d",
+        "priority_routing model=%s priority=%s providers=%d preference=%s",
         model_config.get("name") or "unknown",
         _priority,
         len(_chain or model_config.get("providers") or []),
+        _preference,
     )
 
     # Shared per-cycle routing estimate (LP-0MVF9N2QL001CDA7 AC4): computed
@@ -7804,6 +8928,7 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = "fallback_after_queue"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
                             "session=%s queued_duration=%.2fs",
@@ -7824,7 +8949,61 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = _cq_reason
                         prev_provider = provider_name
                         all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, _cq_reason)
                         continue
+                    elif _cq_action == "admission_reject":
+                        # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ):
+                        # the projected prefill cannot finish inside the wait
+                        # budget, so refuse local admission NOW and fall
+                        # through to the next provider instead of parking in
+                        # the contention queue for the full budget.
+                        _admission = getattr(
+                            request, "_local_admission_decision", None
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_admission_reject",
+                            reason=_cq_reason,
+                            eta_prefill_seconds=round(
+                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
+                            ),
+                            budget_seconds=round(
+                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
+                            ),
+                        )
+                        fallback_reason = "local_admission_guard"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
+                        continue
+                    elif _cq_action == "refused_local_only":
+                        # AC4 (LP-0MVIKPCSG002B0NL): the client set
+                        # X-Local-Preference: local-only and the admission
+                        # guard refused. Unlike admission_reject, the request
+                        # must NOT fall through to a remote provider — return
+                        # the retryable 429 with X-Local-Route: refused now.
+                        _admission = getattr(
+                            request, "_local_admission_decision", None
+                        )
+                        _note_local_fallback_reason(request, _cq_reason)
+                        _refusal_attempt = {
+                            "status": "local_admission_reject",
+                            "reason": _cq_reason or "eta_exceeds_budget",
+                            "eta_prefill_seconds": round(
+                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
+                            ),
+                            "budget_seconds": round(
+                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
+                            ),
+                            "projected_wait_seconds": round(
+                                float(getattr(_admission, "projected_wait_seconds", 0.0) or 0.0), 1
+                            ),
+                        }
+                        return _build_local_only_refusal_response(
+                            _refusal_attempt, config
+                        )
                     else:  # fallback_policy — fast mode unchanged
                         _record_attempt(
                             attempts,
@@ -7837,6 +9016,7 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = "local_concurrency_limit"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
                         continue
 
                 # Smart routing: skip local when cache is cold and request is large
@@ -7876,15 +9056,58 @@ async def _proxy_with_fallback_cycle(
                 # (LP-0MSEGPO77005CYCQ F2). The estimate itself is shared per
                 # cycle (_RoutingEstimateCache) with the per-entry ceiling.
                 _estimated_tokens = await _routing_estimate.get()
-                # Compute once for reuse in logs and reason detection
-                _routing_cached_ratio = _get_cached_ratio(_llama_model, _session_id)
+                # Seed the routing ratio from the persisted local slot snapshot
+                # (LP-0MVGD9YXH008O304): a session whose KV prefix is already on
+                # disk is warm even though this process has no in-memory record
+                # of it (fresh session, or any request after a proxy restart).
+                # Fail-open: any problem keeps today's cached_ratio (cold).
+                try:
+                    from proxy.slot_cache_ratio import seed_cached_ratio
+
+                    seed_cached_ratio(
+                        config.get("server", config)
+                        if isinstance(config, dict)
+                        else {},
+                        body_json,
+                        _llama_model,
+                        _session_id,
+                        _estimated_tokens,
+                        endpoint=_get_local_provider_endpoint(provider_cfg, config),
+                    )
+                except Exception:
+                    logger.debug(
+                        "slot snapshot ratio seeding failed", exc_info=True
+                    )
+                # Compute once for reuse in logs and reason detection. The
+                # expected-reuse credit (LP-0MVI2XOTY008Q4UV) makes the first
+                # turn after a cold start non-zero when the prompt extends the
+                # previous local prompt.
+                _routing_cached_ratio = expected_cached_ratio(
+                    _llama_model,
+                    _session_id,
+                    _estimated_tokens,
+                    body_json.get("messages") if isinstance(body_json, dict) else None,
+                    server_config=(
+                        config.get("server", config) if isinstance(config, dict) else None
+                    ),
+                )
+                try:
+                    from proxy.router_helpers import _classify_cache_state
+
+                    _routing_cache_state = _classify_cache_state(
+                        _routing_cached_ratio,
+                        _get_cached_ratio_source(_llama_model, _session_id),
+                    )
+                except Exception:
+                    _routing_cache_state = "cold"
                 _routing_new_tokens = int(
                     _estimated_tokens * (1 - _routing_cached_ratio)
                 )
                 logger.info(
                     "routing_check provider=%s model=%s "
                     "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                    "new_tokens=%d cached_ratio=%.2f messages=%d session=%s "
+                    "new_tokens=%d cached_ratio=%.2f cache_state=%s "
+                    "messages=%d session=%s "
                     "chain_hold_cycle=%d",
                     provider_name,
                     _llama_model or "unknown",
@@ -7893,6 +9116,7 @@ async def _proxy_with_fallback_cycle(
                     _warm_threshold,
                     _routing_new_tokens,
                     _routing_cached_ratio,
+                    _routing_cache_state,
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
                     _session_id or "unknown",
                     _get_chain_hold_cycle(request),
@@ -7937,11 +9161,108 @@ async def _proxy_with_fallback_cycle(
                     warm_cache_threshold=_warm_threshold,
                     economic_bypass_serves_local=_recover_economic,
                 )
+                # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): spend
+                # obviously idle GPU capacity instead of paying for a remote
+                # call. Only the ECONOMIC bypass is overridable — the physical
+                # ``context_too_large`` cap still applies (the request cannot
+                # fit the KV slot).
+                if _skip_local and _skip_reason == "large_context_bypass":
+                    _idle_admit = _evaluate_idle_admission_override(
+                        config, provider_cfg, _estimated_tokens
+                    )
+                    if _idle_admit is not None:
+                        logger.info(
+                            "routing_idle_admit provider=%s model=%s "
+                            "reason=%s idle_seconds=%.1f threshold_seconds=%.1f "
+                            "estimated_tokens=%d new_tokens=%d cached_ratio=%.2f "
+                            "cache_state=%s session=%s",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _idle_admit["reason"],
+                            _idle_admit["idle_seconds"],
+                            _idle_admit["threshold_seconds"],
+                            _estimated_tokens,
+                            _routing_new_tokens,
+                            _routing_cached_ratio,
+                            _routing_cache_state,
+                            _session_id or "unknown",
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="idle_admit",
+                            reason=_idle_admit["reason"],
+                            estimated_tokens=_estimated_tokens,
+                            idle_seconds=round(_idle_admit["idle_seconds"], 1),
+                            threshold_seconds=_idle_admit["threshold_seconds"],
+                        )
+                        _skip_local = False
+                        _skip_reason = None
+                # Capacity-based admission (LP-0MVGDUVS6003T2IX): admit the
+                # economic band locally while the projected slot-seconds of
+                # admissions stay inside a share of MEASURED idle slot time.
+                # The physical ``context_too_large`` cap is never overridden.
+                # Default-off: the rollback switch is
+                # ``local_capacity_admission_enabled``.
+                if _skip_local and _skip_reason == "large_context_bypass":
+                    try:
+                        from proxy.capacity_admission import (
+                            evaluate_capacity_admission,
+                        )
+
+                        _capacity_admit = evaluate_capacity_admission(
+                            config,
+                            _llama_model,
+                            _estimated_tokens,
+                            _routing_cached_ratio,
+                        )
+                    except Exception:
+                        _capacity_admit = None
+                    if _capacity_admit is not None:
+                        logger.info(
+                            "routing_capacity_admit provider=%s model=%s "
+                            "reason=%s projected_s=%.1f admitted_s=%.1f "
+                            "budget_s=%.1f idle_s=%.1f budget_ratio=%.2f "
+                            "horizon_s=%.0f estimated_tokens=%d "
+                            "cached_ratio=%.2f cache_state=%s warm_threshold=%d "
+                            "session=%s",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _capacity_admit["reason"],
+                            _capacity_admit["projected_seconds"],
+                            _capacity_admit["admitted_seconds"],
+                            _capacity_admit["budget_seconds"],
+                            _capacity_admit["idle_seconds"],
+                            _capacity_admit["budget_ratio"],
+                            _capacity_admit["horizon_seconds"],
+                            _estimated_tokens,
+                            _routing_cached_ratio,
+                            _routing_cache_state,
+                            _warm_threshold,
+                            _session_id or "unknown",
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="capacity_admit",
+                            reason=_capacity_admit["reason"],
+                            estimated_tokens=_estimated_tokens,
+                            projected_seconds=round(
+                                _capacity_admit["projected_seconds"], 1
+                            ),
+                            budget_seconds=round(
+                                _capacity_admit["budget_seconds"], 1
+                            ),
+                        )
+                        _skip_local = False
+                        _skip_reason = None
                 if _skip_local:
                     logger.info(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                        "new_tokens=%d cached_ratio=%.2f "
+                        "new_tokens=%d cached_ratio=%.2f cache_state=%s "
                         "reason=%s → skipping local, routing to next remote provider "
                         "session=%s chain_hold_cycle=%d",
                         provider_name,
@@ -7951,6 +9272,7 @@ async def _proxy_with_fallback_cycle(
                         _warm_threshold,
                         _routing_new_tokens,
                         _routing_cached_ratio,
+                        _routing_cache_state,
                         _skip_reason,
                         _session_id or "unknown",
                         _get_chain_hold_cycle(request),
@@ -7965,11 +9287,13 @@ async def _proxy_with_fallback_cycle(
                         warm_threshold=_warm_threshold,
                         new_tokens=_routing_new_tokens,
                         cached_ratio=_routing_cached_ratio,
+                        cache_state=_routing_cache_state,
                         reason=_skip_reason,
                     )
                     fallback_reason = _skip_reason
                     prev_provider = provider_name
                     all_slot_exhaustion = False
+                    _note_local_fallback_reason(request, _skip_reason)
 
                     # Server-side compaction rescue (LP-0MU5ARWSP001BYYB).
                     # The bypass used to ``continue`` here, before any session
@@ -8072,7 +9396,7 @@ async def _proxy_with_fallback_cycle(
                     logger.info(
                         "routing_economic_bypass_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
-                        "new_tokens=%d cached_ratio=%.2f session=%s",
+                        "new_tokens=%d cached_ratio=%.2f cache_state=%s session=%s",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
@@ -8080,6 +9404,7 @@ async def _proxy_with_fallback_cycle(
                         _warm_threshold,
                         _routing_new_tokens,
                         _routing_cached_ratio,
+                        _routing_cache_state,
                         _session_id or "unknown",
                     )
                     _record_attempt(
@@ -8094,6 +9419,45 @@ async def _proxy_with_fallback_cycle(
                         cached_ratio=_routing_cached_ratio,
                         reason="economic_bypass_local_serve",
                     )
+
+                # Prefill-gate wait accounting (LP-0MVGDUUV3001XFRJ AC4): how
+                # long this request waited specifically for the prefill gate.
+                # ``_local_queue_saturation`` is stamped by
+                # ``_maybe_queue_for_local_slot`` before the wait and
+                # ``_contention_queue_wait_seconds`` records the measured wait,
+                # so both are read here (0.0 when the request was never
+                # prefill-gated).
+                _prefill_gate_wait_ms = 0.0
+                try:
+                    if (
+                        getattr(request, "_local_queue_saturation", None)
+                        == "prefill"
+                    ):
+                        _prefill_gate_wait_ms = max(
+                            0.0,
+                            float(
+                                getattr(
+                                    request,
+                                    "_contention_queue_wait_seconds",
+                                    0.0,
+                                )
+                                or 0.0
+                            ),
+                        ) * 1000.0
+                except Exception:
+                    _prefill_gate_wait_ms = 0.0
+                try:
+                    logger.info(
+                        "prefill_gate_wait_ms=%.1f saturation=%s session=%s "
+                        "model=%s provider=%s",
+                        _prefill_gate_wait_ms,
+                        getattr(request, "_local_queue_saturation", None) or "none",
+                        _session_id or "unknown",
+                        _llama_model or "unknown",
+                        provider_name,
+                    )
+                except Exception:
+                    pass
 
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 
@@ -8140,6 +9504,7 @@ async def _proxy_with_fallback_cycle(
                 # a bounded time for the window to reset.
                 _budget = await acquire_provider_budget(
                     provider_cfg, config, _session_id, request,
+                    model_config=model_config,
                 )
                 if not _budget.allowed:
                     _record_attempt(
@@ -8154,6 +9519,7 @@ async def _proxy_with_fallback_cycle(
                         reserve_slots=_budget.reserve_slots,
                         remaining=_budget.remaining,
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                        **_budget_diagnostics(_budget),
                     )
                     fallback_reason = "rate_limited"
                     prev_provider = provider_name
@@ -8171,11 +9537,13 @@ async def _proxy_with_fallback_cycle(
                         reserve_slots=_budget.reserve_slots,
                         remaining=_budget.remaining,
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
+                        **_budget_diagnostics(_budget),
                     )
 
                 response = await ptr_remote(request, path, provider_cfg)
                 _maybe_record_provider_affinity(
                     provider_cfg, _session_id, response, config,
+                    model_config=model_config,
                 )
 
             # Pre-flight remote streaming responses: detect a pre-content
@@ -8388,6 +9756,53 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = _lease_reason
                         all_slot_exhaustion = False
                         continue
+                    elif _lease_action == "admission_reject":
+                        # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ) on
+                        # the lease-denial path: refuse the wait immediately.
+                        _admission = getattr(
+                            request, "_local_admission_decision", None
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="local_admission_reject",
+                            reason=_lease_reason,
+                            eta_prefill_seconds=round(
+                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
+                            ),
+                            budget_seconds=round(
+                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
+                            ),
+                        )
+                        fallback_reason = "local_admission_guard"
+                        all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
+                        continue
+                    elif _lease_action == "refused_local_only":
+                        # AC4 (LP-0MVIKPCSG002B0NL): local-only + guard refusal
+                        # on the lease path — return the 429 instead of
+                        # falling through to a remote provider.
+                        _admission = getattr(
+                            request, "_local_admission_decision", None
+                        )
+                        _note_local_fallback_reason(request, _lease_reason)
+                        _refusal_attempt = {
+                            "status": "local_admission_reject",
+                            "reason": _lease_reason or "eta_exceeds_budget",
+                            "eta_prefill_seconds": round(
+                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
+                            ),
+                            "budget_seconds": round(
+                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
+                            ),
+                            "projected_wait_seconds": round(
+                                float(getattr(_admission, "projected_wait_seconds", 0.0) or 0.0), 1
+                            ),
+                        }
+                        return _build_local_only_refusal_response(
+                            _refusal_attempt, config
+                        )
                     else:
                         # Queue disabled / fallback policy: preserve the
                         # pre-existing immediate remote fallback.
@@ -8608,7 +10023,9 @@ async def _proxy_with_fallback_cycle(
                     # API-key ACCOUNT until the computed reset time + 2m margin.
                     # Not the whole endpoint: distinct api_key_env entries on the
                     # same gateway have independent limits (LP-0MSMBWB23009XYPW).
-                    _reset_info = _usage_limit_reset_info(response, body_text, config)
+                    _reset_info = _usage_limit_reset_info(
+                        response, body_text, config, provider_cfg=provider_cfg
+                    )
                     if _reset_info is not None:
                         _reset_account = _usage_limit_account_key(provider_cfg)
                         _set_usage_limit_quarantine(_reset_account, _reset_info)
@@ -9006,6 +10423,7 @@ async def proxy_with_fallback(
         A ``Response`` from a successful provider, or the 503/429 exhaustion
         response once the hold-retry bound is reached.
     """
-    return await _run_chain_cycles(
+    response = await _run_chain_cycles(
         request, path, model_config, config, _proxy_with_fallback_cycle,
     )
+    return _stamp_local_route_headers(response, request, model_config)

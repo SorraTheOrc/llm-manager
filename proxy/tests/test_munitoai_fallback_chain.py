@@ -41,8 +41,8 @@ MUNITOAI_FREE_ENTRY = {
     "max_context_tokens": 150000,
     # Free-tier request budget (LP-0MVDQ1GMO00801PL): a small per-60s window,
     # so the tier is only used while it has capacity. Deliberately conservative
-    # at 2/min (LP-0MVF19DKR008VCHO) — bursts spill to the paid tiers.
-    "rate_limit_rpm": 2,
+    # at 3/min (LP-0MVGGI4Y0003K4AZ) — bursts spill to the paid tiers.
+    "rate_limit_rpm": 3,
     # Honour the upstream's x-ratelimit-reset-* headers on 429
     # (LP-0MVBHDNLB007ALLJ): MunitoAI sends no Retry-After, so the reset header
     # supplies the cooldown instead of a blind backoff guess.

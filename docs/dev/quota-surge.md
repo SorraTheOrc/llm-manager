@@ -114,6 +114,13 @@ and one poll — `test_shared_api_key_env_shares_one_snapshot_and_poll`).
   a guessed reset (`test_missing_or_invalid_resets_at_yields_zero`). This
   retires the class of failure behind LP-0MUQTCMW2001VXH8, where a guessed
   reset locked an account out for up to 30 days.
+- **The reactive `GoUsageLimitError` quarantine consumes this authoritative
+  value** (LP-0MVF7MPZN009GOJB). For an `opencode-*` account with a fresh
+  snapshot and quota behaviour enabled, a 429 usage-limit error quarantines the
+  account for exactly the snapshot's `seconds_to_reset` (monthly window) plus
+  the 2-minute margin — the `metadata.limitName` guess is now fallback-only,
+  reachable only when the snapshot is stale/absent or the quota source is
+  disabled/dry-run (`source=snapshot|message|guess` in the proxy log).
 - **The account-level `seconds_to_reset` reports the monthly window** — the
   allowance period that resets per account. The rolling and weekly windows
   reset on much shorter cadences and are exposed per window for callers that
@@ -268,7 +275,10 @@ object, so "all quota behaviour off" is provable by construction
   (`test_rate_limited_entry_still_skipped_under_surge`,
   `test_circuit_broken_entry_still_skipped_under_surge`,
   `test_usage_limit_quarantined_entry_still_skipped_under_surge`,
-  `test_failure_domain_sibling_still_excluded_under_surge`). An exhausted entry
+  `test_failure_domain_sibling_still_excluded_under_surge`). The quarantine
+  itself is now derived from the authoritative quota snapshot for a fresh
+  `opencode-*` account (LP-0MVF7MPZN009GOJB), so a quota-driven skip can never
+  outlive the monthly reset it is protecting. An exhausted entry
   is never bypassed (`test_exhausted_entry_is_not_bypassed`), the bypass clears
   once the reset passes (`test_bypass_clears_once_the_reset_passes`), and it is
   per account, not global (`test_bypass_window_is_per_account`).
@@ -478,4 +488,6 @@ Leading indicators from the baseline (as of deployment evening, 2026-10-19):
 - Epic discovery findings (2026-10-19) — LP-0MVF4FIP1001RD8P.
 - Related: LP-0MS4ETBNO0022QAC (`available_times`), LP-0MSLJPOCC0001ROJ
   (`GoUsageLimitError` quarantine), LP-0MUQTCMW2001VXH8 (retired guessed
-  reset), LP-0MVDQ1GMO00801PL (per-provider request budget).
+  reset), LP-0MVF7MPZN009GOJB (fresh-snapshot `seconds_to_reset` retires the
+  guess for `opencode-*` accounts), LP-0MVDQ1GMO00801PL (per-provider request
+  budget).

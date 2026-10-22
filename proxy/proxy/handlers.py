@@ -370,9 +370,35 @@ async def get_llama_local_status(request: Request):
          "llama_server_running": bool,
          "available_slots": int,
          "total_slots": int,
-         "slots": [{"slot_id": int, "is_processing": bool, "n_decoded": int | None}],
+         "slots": [{"slot_id": int, "is_processing": bool, "n_decoded": int | None,
+                    "context_tokens": int | None, "owner_session_id": str | None,
+                    "lease_state": str, "phase": str | None,
+                    "prefill_eta_seconds": float | None}],
          "local_owner_session_id": str | None,
-         "local_owner_lease_remaining_seconds": float | None}
+         "local_owner_lease_remaining_seconds": float | None,
+         "local_idle_seconds": float | None,
+         "local_last_activity_at": str | None,
+         "local_last_activity_source": str | None,
+         "prefill_eta_seconds": float | None,
+         "queue_eta_seconds": float | None,
+         "prefill_budget_seconds": float | None,
+         "capacity_hint": str,
+         "status_schema_version": int}
+
+    ``local_idle_seconds`` reports how long the local backend has been idle
+    (LP-0MVGD9Z8Z0055Y5J) — the same monotonic signal the idle-aware routing
+    override reads — with ``local_last_activity_at`` (wall clock) and
+    ``local_last_activity_source`` (dispatch/chunk/finish/...).
+
+    ``prefill_eta_seconds`` and ``queue_eta_seconds`` publish the calibrated
+    prefill-ETA estimate (LP-0MVGDUV5E005UWBQ): the projected prefill cost of
+    the reference prompt (the most recent dispatch for the current model, else
+    ``server.local_admission_guard_reference_tokens``, assumed cache-cold) and
+    the wait a *newcomer* would face (the prefills of the currently occupied
+    slots plus its own). Dispatchers can pace themselves from these instead of
+    discovering a contended 120 s wait. ``prefill_eta_calibrated`` reports
+    whether the rolling calibration has enough samples; with too few samples
+    the guard is inert and the wait behaviour is unchanged.
 
     ``available_slots`` and ``total_slots`` reflect the model-serving slot
     state reported by llama-server's ``/slots`` endpoint. When the server is
@@ -402,6 +428,28 @@ async def get_llama_local_status(request: Request):
     a malformed payload. The fetch reuses ``_query_slots_detail()``'s own
     httpx timeout bounded by the ``STATUS_QUERY_TIMEOUT`` window so a slow
     /slots response cannot blow the endpoint's response budget.
+
+    Per-slot capacity (LP-0MVGDUVGE0024YAI, ``status_schema_version: 2``):
+    each slot also carries ``owner_session_id`` and ``lease_state``
+    (``generating`` | ``idle_leased`` | ``free``) so a dispatcher can tell a
+    slot that is actually working from one that is merely reserved-but-idle
+    (the case behind 2,633 of 2,641 local dispatch denials while local decoded
+    29.3 % of wall clock). ``phase`` (``prefill`` | ``decode`` | ``null``) is
+    inferred proxy-side from ``is_processing``/``n_decoded`` (AC5);
+    ``context_tokens`` is the slot's prompt progress when the build reports it
+    and ``prefill_eta_seconds`` is the shared calibrated prefill cost for it
+    (null when not computable). ``lease_state`` is never ``free`` while a
+    prefill or decode is in flight.
+
+    The top level publishes the same calibration's ``prefill_budget_seconds``
+    (the admission guard's wait budget) and a ``capacity_hint`` summarising
+    the pool, evaluated in order: ``idle`` when a slot is free or every
+    occupied slot is ``idle_leased``; ``prefill_bound`` when nothing is free
+    and at least one slot is prefilling; ``saturated`` when nothing is free
+    and every occupied slot is decoding. All new fields are additive — a
+    client that ignores them behaves exactly as before (AC1), and the ETA
+    fields are ``null`` (never stale numbers) when ``slots_stale`` is true
+    (AC7).
 
     ``local_active_query`` mirrors ``active_query`` but is derived from the
     local-only counter (``local_active_queries``), so remote provider
@@ -570,6 +618,29 @@ async def get_llama_local_status(request: Request):
                 total_slots = 3
             available_slots = total_slots
 
+    # -- per-slot capacity annotation (LP-0MVGDUVGE0024YAI) -----------------
+    # Add owner_session_id / lease_state / phase / context_tokens /
+    # prefill_eta_seconds to each slot so a dispatcher can distinguish a slot
+    # that is *generating* from one that is merely *leased but idle* (the
+    # reserved-but-idle false-busy case) and can read the shared calibrated
+    # prefill ETA. ``slots_stale`` nulls the per-slot ETA: a cached /slots
+    # snapshot must never be presented with a fresh-looking number (AC7).
+    try:
+        from proxy.observability import (
+            annotate_slots_for_status,
+        )
+
+        slots = annotate_slots_for_status(
+            slots,
+            srv,
+            cm,
+            srv.config if isinstance(getattr(srv, "config", None), dict) else {},
+            stale=slots_stale,
+        )
+    except Exception:
+        # Annotation is best-effort; the base slot fields remain valid.
+        pass
+
     # -- local dispatch lease info (LP-0MR9G183O004SJLO) --------------------
     # The owner id is normalised to its bare session-id string: per-endpoint
     # leases are keyed by ``(endpoint, session_id)`` tuples and the raw key
@@ -596,8 +667,85 @@ async def get_llama_local_status(request: Request):
     except Exception:
         pass
 
+    # -- prefill / queue ETA estimate (LP-0MVGDUV5E005UWBQ) -----------------
+    # Published so a dispatcher can pace BEFORE launching a session instead of
+    # discovering a 120 s contended wait. Both fields come from the calibrated
+    # prefill cost of the reference prompt (most recent dispatch for the
+    # current model, else ``local_admission_guard_reference_tokens``); they are
+    # ``None`` only if the estimate itself failed (fail-open payload).
+    prefill_eta: dict = {}
+    try:
+        from proxy.prefill_eta import status_estimate
+
+        prefill_eta = status_estimate(
+            srv.config if isinstance(srv.config, dict) else {},
+            cm,
+            total_slots=total_slots,
+            available_slots=available_slots,
+            active_queries=int(getattr(srv, "local_active_queries", 0) or 0),
+        )
+    except Exception:
+        prefill_eta = {}
+
+    # AC7 (LP-0MVGDUVGE0024YAI): when the served slot data came from the
+    # last-known cache, a poll-derived ETA is not a fresh number. Null it
+    # rather than let a dispatcher act on a stale estimate. The budget is a
+    # configuration constant (not poll-derived) and stays truthful.
+    if slots_stale:
+        prefill_eta = dict(prefill_eta)
+        prefill_eta["prefill_eta_seconds"] = None
+        prefill_eta["queue_eta_seconds"] = None
+
+    # AC4 (LP-0MVGDUVGE0024YAI): summarise whether the pool is genuinely
+    # working — ``idle`` (a free slot, or only idle leases), ``prefill_bound``
+    # (no free slot, at least one prefill) or ``saturated`` (no free slot, all
+    # decode). Computed from the annotated slots by the pure decision table.
+    try:
+        from proxy.observability import compute_capacity_hint as _capacity_hint
+
+        capacity_hint = _capacity_hint(slots)
+    except Exception:
+        capacity_hint = "idle"
+
+    # -- prefill gate state (LP-0MVGDUUV3001XFRJ AC4) ----------------------
+    # Prefills are serialised by default (``local_max_concurrent_prefills``),
+    # so a dispatcher needs to see how many prefills are in flight, what the
+    # cap is, and how many requests are waiting behind the gate.
+    try:
+        from proxy.router_helpers import (
+            _effective_prefill_cap,
+            _get_prefill_in_flight_count,
+        )
+
+        _server_cfg_for_prefill = (
+            srv.config.get("server", srv.config)
+            if isinstance(getattr(srv, "config", None), dict)
+            else {}
+        )
+        prefill_in_flight = _get_prefill_in_flight_count(srv)
+        prefill_cap = _effective_prefill_cap(
+            _server_cfg_for_prefill, int(total_slots or 1)
+        )
+    except Exception:
+        prefill_in_flight = 0
+        prefill_cap = 0
+    try:
+        from proxy.contention_queue import queue_depth as _queue_depth
+
+        prefill_gate_waiters = _queue_depth()
+    except Exception:
+        prefill_gate_waiters = 0
+
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
+    # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): idle age of the local
+    # backend, the signal the routing override reads.
+    try:
+        from proxy.local_activity import activity_snapshot as _activity_snapshot
+
+        _idle_snapshot = _activity_snapshot()
+    except Exception:
+        _idle_snapshot = {}
     client_ip, client_ip_source = _resolve_client_ip(request)
     status_extra = {
         "client_ip": client_ip,
@@ -612,8 +760,13 @@ async def get_llama_local_status(request: Request):
         "available_slots": available_slots,
         "total_slots": total_slots,
         "slots_stale": slots_stale,
+        "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
+        "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
+        "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
+        "capacity_hint": capacity_hint,
+        "status_schema_version": 2,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -641,9 +794,147 @@ async def get_llama_local_status(request: Request):
         # when not running / no model / no cached data, so herdr can track
         # same-slot idleness.
         "slots": slots,
+        # Prefill / queue ETA (LP-0MVGDUV5E005UWBQ): the projected prefill cost
+        # of the reference prompt and the wait a newcomer would face (the
+        # prefills of the occupied slots plus its own). Additive fields;
+        # ``None`` when the estimate is unavailable.
+        "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
+        "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
+        "prefill_eta_reference_tokens": prefill_eta.get(
+            "prefill_eta_reference_tokens"
+        ),
+        "prefill_eta_samples": prefill_eta.get("prefill_eta_samples", 0),
+        "prefill_eta_calibrated": bool(
+            prefill_eta.get("prefill_eta_calibrated", False)
+        ),
+        # Admission-guard budget (LP-0MVGDUVGE0024YAI AC3), sourced from the
+        # shared prefill_eta calibration: the wait a prefill must fit inside
+        # (``None`` when unresolvable — never a fabricated 0).
+        "prefill_budget_seconds": prefill_eta.get("prefill_budget_seconds"),
+        # Whether the local pool is genuinely working (LP-0MVGDUVGE0024YAI
+        # AC4): ``idle`` | ``prefill_bound`` | ``saturated``.
+        "capacity_hint": capacity_hint,
+        # Additive payload version (AC1): bumped when per-slot/top-level
+        # capacity fields change meaning. Consumers that ignore it behave
+        # exactly as before.
+        "status_schema_version": 2,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
+        # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local
+        # backend has been idle (monotonic-derived) and when it last worked.
+        # ``idle_seconds`` is the signal the routing override reads; the
+        # timestamps are for operators.
+        "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
+        "local_last_activity_at": _idle_snapshot.get("last_activity_at"),
+        "local_last_activity_source": _idle_snapshot.get("last_activity_source"),
+        # Prefill serialisation (LP-0MVGDUUV3001XFRJ AC4): in-flight prefills,
+        # the effective cap (0 when the gate is disabled) and the requests
+        # waiting for it (the contention queue depth).
+        "local_prefills_in_flight": prefill_in_flight,
+        "local_max_concurrent_prefills": prefill_cap,
+        "prefill_gate_waiters": prefill_gate_waiters,
+        # Local-admission reservations (LP-0MVIKPCSG002B0NL): outstanding /
+        # issued / used / cancelled / expired tickets. ``reserved_issued -
+        # reserved_used - reserved_cancelled - reserved_expired`` is the
+        # reserved-but-unused signal the work item asks to monitor.
+        **(admission_reserve_stats()),
     }
+
+
+# ---------------------------------------------------------------------------
+# /llama/local/reserve — atomic local-admission reservations
+# (LP-0MVIKPCSG002B0NL)
+# ---------------------------------------------------------------------------
+
+def admission_reserve_stats() -> dict:
+    """Reservation counters for the status payload (fail-open)."""
+    try:
+        from proxy.admission_reserve import stats
+
+        return stats()
+    except Exception:
+        return {}
+
+
+@router.post("/llama/local/reserve")
+async def reserve_local_slot(request: Request):
+    """Claim a local-admission ticket for a specific request, atomically.
+
+    The client sends the prompt size it is about to send and receives either a
+    ticket (``200 {"admit": true, "reservation_id", ...}``) that a follow-up
+    request honours via ``X-Local-Reservation: <id>``, or an immediate refusal
+    (``429 {"admit": false, "reason", "queue_eta_s", "budget_s",
+    "retry_after_s"}``) telling it to defer. The verdict shares the occupancy-
+    aware estimator the admission guard uses, so the two are identical for
+    identical inputs (AC7).
+
+    ``dry_run=true`` returns the verdict without claiming a ticket (this is
+    also the ``local-only`` preamble). Tickets are TTL-bound, single-use and
+    cancellable via ``DELETE /llama/local/reserve/<id>``.
+    """
+    from proxy import admission_reserve
+    from proxy import provider as provider_mod
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    srv = _srv()
+    config = getattr(srv, "config", {})
+    if not isinstance(config, dict):
+        config = {}
+    server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+
+    # The current local model (the same one the admission guard would cost)
+    # and the occupancy probe the guard uses. Sharing the probe is what keeps
+    # ``/reserve`` and the in-flight guard identical (AC7).
+    cm = getattr(srv, "current_model", None) or server_cfg.get("llama_model")
+    current_concurrency = (0, 1)
+    busy_slots = 0
+    in_flight_prefills = 0
+    try:
+        current_concurrency = provider_mod._local_concurrency_info(
+            config, endpoint=None
+        )
+        busy_slots, in_flight_prefills = provider_mod._local_gate_occupancy(
+            config, current_concurrency[1] or 1, endpoint=None
+        )
+    except Exception:
+        busy_slots, in_flight_prefills = 0, 0
+
+    status, payload = admission_reserve.reserve(
+        body,
+        config,
+        model=cm,
+        busy_slots=busy_slots,
+        in_flight_prefills=in_flight_prefills,
+    )
+    headers: dict[str, str] = {
+        "Cache-Control": "no-store",
+    }
+    if status == 429:
+        headers.update(
+            admission_reserve.headers_for_route(
+                "refused", payload.get("reason")
+            )
+        )
+        headers["Retry-After"] = str(payload.get("retry_after_s", 1))
+        headers["X-Local-Admission"] = "reject"
+        headers["X-Local-Admission-Eta"] = str(payload.get("queue_eta_s", 0))
+        headers["X-Local-Admission-Budget"] = str(payload.get("budget_s", 0))
+    return JSONResponse(status_code=status, content=payload, headers=headers)
+
+
+@router.delete("/llama/local/reserve/{reservation_id}")
+async def cancel_reservation(reservation_id: str):
+    """Cancel an outstanding reservation, releasing its gate claim."""
+    from proxy import admission_reserve
+
+    status, payload = admission_reserve.cancel(reservation_id)
+    return JSONResponse(status_code=status, content=payload)
 
 
 # ---------------------------------------------------------------------------

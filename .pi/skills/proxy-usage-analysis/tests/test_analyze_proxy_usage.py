@@ -5021,3 +5021,139 @@ class TestAttributionInReport:
         section_text = report[section_start:next_heading] if next_heading > 0 else report[section_start:]
         # 'unknown' should appear (for the mode_switch without attribution)
         assert "unknown" in section_text
+
+
+# =========================================================================
+# Prefill-ETA admission guard decisions (LP-0MVGDUV5E005UWBQ AC2)
+# =========================================================================
+
+
+class TestLocalAdmissionGuard:
+    """AC2: the guard's admit/refuse decisions are logged and counted."""
+
+    def test_parses_reject_decision(self):
+        ev = log_parser.parse_log_line(fixtures.LOCAL_ADMISSION_GUARD_REJECT)
+        assert ev.kind == "local_admission_guard"
+        assert ev.decision == "reject"
+        assert ev.enforced == "true"
+        assert ev.reason == "eta_exceeds_budget"
+        assert ev.eta_prefill_s == "468.0"
+        assert ev.budget_s == "120.0"
+        assert ev.provider == "local-qwen3"
+        assert ev.model == "Qwen3"
+
+    def test_parses_admit_decision(self):
+        ev = log_parser.parse_log_line(fixtures.LOCAL_ADMISSION_GUARD_ADMIT)
+        assert ev.kind == "local_admission_guard"
+        assert ev.decision == "admit"
+        assert ev.reason == "within_budget"
+        assert ev.eta_prefill_s == "91.8"
+
+    def test_parses_observe_decision(self):
+        ev = log_parser.parse_log_line(fixtures.LOCAL_ADMISSION_GUARD_OBSERVE)
+        assert ev.kind == "local_admission_guard"
+        assert ev.decision == "reject"
+        assert ev.enforced == "false"
+
+    def test_events_collected_globally(self):
+        lines = [
+            fixtures.LOCAL_ADMISSION_GUARD_REJECT,
+            fixtures.LOCAL_ADMISSION_GUARD_ADMIT,
+            fixtures.LOCAL_ADMISSION_GUARD_OBSERVE,
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+        assert len(res.local_admission_events) == 3
+        assert [e.decision for e in res.local_admission_events] == [
+            "reject",
+            "admit",
+            "reject",
+        ]
+
+    def test_report_row_and_json_counters(self, tmp_path):
+        log_dir = tmp_path / "logs_guard"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            "\n".join(
+                [
+                    fixtures.LOCAL_ADMISSION_GUARD_REJECT,
+                    fixtures.LOCAL_ADMISSION_GUARD_ADMIT,
+                    fixtures.LOCAL_ADMISSION_GUARD_OBSERVE,
+                ]
+            )
+            + "\n"
+        )
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out_guard",
+            config=None,
+        )
+
+        md = (tmp_path / "out_guard" / "report.md").read_text()
+        section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
+        assert "| Local admission refused (prefill ETA) | 2 | - | 2 |" in section
+        assert "| Local admission admitted (prefill ETA) | 1 | - | 1 |" in section
+
+        data = reporting.summary_to_json(result.summary)
+        assert data["local_admission_reject"] == 2
+        # Only the enforced refusal counts; the observe-mode verdict does not.
+        assert data["local_admission_reject_enforced"] == 1
+        assert data["local_admission_admit"] == 1
+        json.dumps(data)
+
+# =========================================================================
+# Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J AC3)
+# =========================================================================
+
+
+class TestIdleAdmitCounter:
+    """AC3: idle-admitted requests are greppable and counted by the report."""
+
+    def test_parses_idle_admit_event(self):
+        ev = log_parser.parse_log_line(fixtures.ROUTING_IDLE_ADMIT)
+        assert ev.kind == "idle_admit"
+        assert ev.reason == "economic_bypass_idle"
+        assert ev.idle_seconds == "412.3"
+        assert ev.threshold_seconds == "60.0"
+        assert ev.provider == "local-qwen3"
+        assert ev.model == "Qwen3"
+        assert ev.session == "019fc245-ffff-7e5c-871e-57ab32f875f3"
+
+    def test_adjacent_events_still_parse(self):
+        """The idle-admit branch must not shadow the admission-guard branch."""
+        ev = log_parser.parse_log_line(fixtures.LOCAL_ADMISSION_GUARD_REJECT)
+        assert ev.kind == "local_admission_guard"
+
+    def test_report_row_and_json_counter(self, tmp_path):
+        log_dir = tmp_path / "logs_idle"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            "\n".join(
+                [fixtures.ROUTING_IDLE_ADMIT, fixtures.ROUTING_IDLE_ADMIT]
+            )
+            + "\n"
+        )
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out_idle",
+            config=None,
+        )
+
+        md = (tmp_path / "out_idle" / "report.md").read_text()
+        section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
+        assert (
+            "| Local admitted while GPU idle (cold-cache override) | 2 | - | 2 |"
+            in section
+        )
+
+        data = reporting.summary_to_json(result.summary)
+        assert data["local_idle_admit"] == 2
+        json.dumps(data)

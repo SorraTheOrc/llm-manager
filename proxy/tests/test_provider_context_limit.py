@@ -121,7 +121,7 @@ def _remote_ptr(calls: list[str]):
 
 
 def _budget_spy(calls: list[str]):
-    async def _budget(provider_cfg, config, session_id, request=None):
+    async def _budget(provider_cfg, config, session_id, request=None, model_config=None):
         calls.append(provider_cfg.get("name"))
         return BudgetDecision(allowed=True, reason="unlimited")
 

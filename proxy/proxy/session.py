@@ -1249,12 +1249,18 @@ async def _invalidate_session_and_slot(
     # Clear cached ratio entries for this session (LP-0MRMMBZ7T007ER59)
     if session_id:
         try:
-            from proxy.provider import _last_cached_ratio
-            keys_to_delete = [
-                k for k in _last_cached_ratio if k[1] == session_id
-            ]
-            for k in keys_to_delete:
-                _last_cached_ratio.pop(k, None)
+            from proxy.provider import clear_cached_ratio_for_session
+
+            clear_cached_ratio_for_session(session_id)
+        except Exception:
+            pass
+        # The session no longer owns a slot: drop its retention priority so a
+        # parked waiter cannot jump the queue on stale credit
+        # (LP-0MVI2VRT2000V1AP).
+        try:
+            from proxy import contention_queue
+
+            contention_queue.forget_local_grant(session_id)
         except Exception:
             pass
 
@@ -1263,6 +1269,14 @@ async def _invalidate_session_and_slot(
     if slot_filename:
         try:
             Path(slot_filename).unlink(missing_ok=True)
+        except Exception:
+            pass
+        # The routing cache-state sidecar describes the snapshot being
+        # discarded, so it must go too (LP-0MVGD9YXH008O304).
+        try:
+            from proxy.slot_cache_ratio import delete_slot_ratio_sidecar
+
+            delete_slot_ratio_sidecar(slot_filename)
         except Exception:
             pass
 

@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.1.24 (2026-10-22)
+### Features
+- Prefill-ETA admission guard ignores occupancy: admits guaranteed-loss contention-queue waits (LP-0MVICD2YW004DJPV)
+- Local dispatch starves returning sessions: contention queue causes local<->remote routing thrash (LP-0MVI2VRT2000V1AP)
+- Enable low-priority fallback to opencode-go during its off-peak windows (LP-0MVF17VP70053JXX)
+- Give the model/fallback-chain config control over free-tier budget knobs (LP-0MVDVK5TM004TQQV)
+- Web UI to log input and output tokens (LP-0MVE592AU008VAP4)
+- Publish truthful local capacity on /llama/local/status (slot phase + prefill ETA) (LP-0MVGDUVGE0024YAI)
+- Idle-aware local admission: serve large/cold prompts when the GPU is idle (LP-0MVGD9Z8Z0055Y5J)
+### Bug Fixes
+- [test-failure] tests/test_config_merge.py::TestGoldenMergedConfig::test_load_config_matches_golden — failing test (LP-0MUYQ6CYZ0083X38)
+- contention_queue_lease_grace_seconds default 300 clamped to 120 on every request (log spam, config contradicts docs) (LP-0MVI63OM1009K51W)
+- Prefill-ETA admission guard: stop starting local work that cannot finish in budget (LP-0MVGDUV5E005UWBQ)
+- Proxy: atomic local-admission reservations + explicit fallback intent (X-Local-Preference / X-Local-Route) (LP-0MVIKPCSG002B0NL)
+- Second-turn cached_ratio scored 0.00 after a successful cold first local turn (bootstrap defect in update_cached_ratio) (LP-0MVI2XOTY008Q4UV)
+### Other
+- Re-evaluate session_slot_pool_size against measured GPU busy-time and contention history (LP-0MVGCQ3QN009HRE8)
+- Serialise local prefills so one prefill at a time gets the full GPU (LP-0MVGDUUV3001XFRJ)
+- Raise local warm-context routing cap 100K -> 120K (and the economic-ceiling ratio that binds it) (LP-0MVHSET0A008VU95)
+- Verify off-peak low-priority fallback in a live window (LP-0MVF1FTPQ005ZMYO)
+- Retire guessed usage-limit reset for opencode accounts using /v1/usage seconds_to_reset (LP-0MVF7MPZN009GOJB)
+- Seed cached_ratio from the persisted local slot snapshot (LP-0MVGD9YXH008O304)
+- Re-widen local size gates only once cache warmth is proven (capacity-gated) (LP-0MVGDUVS6003T2IX)
+- Increase munitoai-free rate_limit_rpm to 3 (LP-0MVGGI4Y0003K4AZ)
+
 ## v0.1.23 (2026-10-20)
 ### Features
 - Respect MunitoAI x-ratelimit-* reset headers on quota 429s (LP-0MVDNP36J006430L)

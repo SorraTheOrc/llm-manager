@@ -21,13 +21,15 @@ from proxy.provider import (
     _get_economic_ceiling_ratio,
     effective_large_context_economic_ceiling,
     effective_per_slot_threshold,
+    warm_cap_ceiling_shortfall,
 )
 
-SHIPPED_RATIO = 0.3815
+SHIPPED_RATIO = 0.4578
+SHIPPED_WARM = 120000
 SHIPPED_CTX = 262144
 
 
-def _cfg(ctx=SHIPPED_CTX, slots=1, ratio=SHIPPED_RATIO, warm=100000, cold=38000):
+def _cfg(ctx=SHIPPED_CTX, slots=1, ratio=SHIPPED_RATIO, warm=SHIPPED_WARM, cold=38000):
     """Build a nested-config test fixture mirroring the production surface."""
     server = {
         "local_model_ctx_size": ctx,
@@ -45,13 +47,13 @@ class TestEconomicCeilingHelper:
     the absolute warm value."""
 
     def test_ratio_scales_with_ctx(self):
-        """0.3815 × 131072 = 50003.968 → 50004 (linear scaling, no warm cap)."""
+        """0.4578 × 131072 = 60004.8 → 60005 (linear scaling, no warm cap)."""
         cfg = _cfg(ctx=131072, ratio=SHIPPED_RATIO, warm=0)
-        assert effective_large_context_economic_ceiling(cfg) == 50004
+        assert effective_large_context_economic_ceiling(cfg) == 60005
 
     def test_capped_by_absolute_warm_override(self):
-        """0.3815 × 262144 = 100007.936 → 100008, capped to the absolute 100000."""
-        assert effective_large_context_economic_ceiling(_cfg()) == 100000
+        """0.4578 × 262144 = 120001.6 → 120002, capped to the absolute 120000."""
+        assert effective_large_context_economic_ceiling(_cfg()) == 120000
 
     def test_ratio_zero_falls_back_to_absolute(self):
         """A ratio of 0 uses the absolute warm value verbatim (legacy)."""
@@ -67,10 +69,10 @@ class TestEconomicCeilingHelper:
         """Flat (non-nested) config keys resolve identically."""
         cfg = {
             "local_model_ctx_size": SHIPPED_CTX,
-            "local_large_context_warm_cache_threshold": 100000,
+            "local_large_context_warm_cache_threshold": SHIPPED_WARM,
             "local_large_context_economic_ceiling_ratio": SHIPPED_RATIO,
         }
-        assert effective_large_context_economic_ceiling(cfg) == 100000
+        assert effective_large_context_economic_ceiling(cfg) == SHIPPED_WARM
 
     def test_no_ctx_falls_back_to_absolute(self):
         """No ctx to scale with → the absolute warm value is used."""
@@ -94,28 +96,28 @@ class TestEffectiveThresholdsThreeTermModel:
 
     @pytest.mark.parametrize(
         "slots,expected_warm",
-        [(1, 100000), (2, 100000), (3, 83285)],
+        [(1, 120000), (2, 120000), (3, 83285)],
     )
     def test_shipped_ratio_slot_scaling(self, slots, expected_warm):
-        """Shipped config: fast 1-slot = 100000, 2-slot = 100000,
-        cheap 3-slot = 83285 (physical clamp binds at 3 slots)."""
+        """Shipped config: fast 1-slot = 120000, 2-slot = 120000 (physical
+        126976 does not bind), 3-slot = 83285 (physical clamp binds)."""
         _, warm = _effective_large_context_thresholds(_cfg(slots=slots))
         assert warm == expected_warm
 
     def test_fast_warm_never_exceeds_economic_ceiling(self):
         """AC6: on the 1-slot profile the physical clamp is 258048, but the
-        economic ceiling (100000) must bind — warm may not exceed it."""
+        economic ceiling (120000) must bind — warm may not exceed it."""
         cfg = _cfg(slots=1)
         _, warm = _effective_large_context_thresholds(cfg)
-        assert warm == 100000
+        assert warm == SHIPPED_WARM
         assert warm <= effective_large_context_economic_ceiling(cfg)
 
     def test_ceiling_scales_with_model_ctx(self):
-        """AC3: ctx 131072 / 1 slot → warm ≈ 50000 (physical 126976 does not
+        """AC3: ctx 131072 / 1 slot → warm ≈ 60005 (physical 126976 does not
         bind; the economic ceiling does)."""
         _, warm = _effective_large_context_thresholds(_cfg(ctx=131072, slots=1))
-        assert warm == 50004
-        assert 49500 <= warm <= 50500
+        assert warm == 60005
+        assert 59000 <= warm <= 61000
 
     def test_physical_clamp_binds_when_smaller_than_ceiling(self):
         """The per-slot clamp dominates the economic ceiling at 3 slots."""
@@ -138,7 +140,7 @@ class TestEffectiveThresholdsThreeTermModel:
         """No local_model_ctx_size → the per-slot clamp is disabled; warm is
         still the economic ceiling (which may be capped by the absolute)."""
         _, warm = _effective_large_context_thresholds(_cfg(ctx=0, slots=0))
-        assert warm == 100000
+        assert warm == SHIPPED_WARM
 
     @pytest.mark.parametrize(
         "slots,cold",
@@ -169,14 +171,23 @@ class TestShippedConfigDerivesExpectedValues:
 
     def test_base_config_declares_ratio(self):
         cfg = self._load("config.yaml")
-        assert cfg["server"]["local_large_context_economic_ceiling_ratio"] == 0.3815
+        server = cfg["server"]
+        assert server["local_large_context_economic_ceiling_ratio"] == 0.4578
+        assert server["local_large_context_warm_cache_threshold"] == 120000
 
     def test_fast_profile_effective_warm(self):
         cold, warm = _effective_large_context_thresholds(
             self._load("config.yaml")
         )
         assert cold == 38000
-        assert warm == 100000
+        assert warm == 120000
+
+    def test_shipped_ratio_does_not_shadow_the_absolute_cap(self):
+        """LP-0MVHSET0A008VU95 AC1/AC3: the shipped ratio must be large enough
+        that the economic ceiling reaches the configured absolute warm cap,
+        otherwise raising the absolute value is a silent no-op."""
+        cfg = self._load("config.yaml")
+        assert warm_cap_ceiling_shortfall(cfg) == 0
 
     def test_mode_overlays_removed(self):
         # AC4 (LP-0MVDT94F0003VHUA): the fast/cheap overlays were merged into
@@ -188,7 +199,54 @@ class TestShippedConfigDerivesExpectedValues:
         # The unified profile resolves through the base alone.
         cold, warm = _effective_large_context_thresholds(self._load("config.yaml"))
         assert cold == 38000
-        assert warm == 100000
+        assert warm == 120000
+
+
+class TestWarmCapCeilingShadowing:
+    """LP-0MVHSET0A008VU95: raising the absolute warm cap alone is a silent
+    no-op whenever the economic ceiling (`round(ratio x ctx)`) is the smaller
+    term. `warm_cap_ceiling_shortfall` surfaces that so the validator and the
+    operator see it."""
+
+    def test_shipped_config_has_no_shortfall(self):
+        assert warm_cap_ceiling_shortfall(_cfg()) == 0
+
+    def test_absolute_raised_alone_is_shadowed(self):
+        """The pre-change ratio (0.3815) with a 120000 absolute: the economic
+        ceiling still binds at 100008, so 19992 tokens of the raise are lost."""
+        cfg = _cfg(ratio=0.3815, warm=120000)
+        assert warm_cap_ceiling_shortfall(cfg) == 120000 - 100008
+
+    def test_shadowed_config_does_not_reach_the_requested_cap(self):
+        """Regression guard: the shadowed pairing must NOT resolve to the
+        configured absolute, proving the ratio is a required co-change."""
+        _, warm = _effective_large_context_thresholds(_cfg(ratio=0.3815, warm=120000))
+        assert warm == 100008
+        assert warm < 120000
+
+    def test_ceiling_above_absolute_is_not_shadowed(self):
+        """When the economic ceiling already exceeds the absolute, the
+        absolute binds and nothing is shadowed."""
+        cfg = _cfg(ratio=0.4578, warm=90000)
+        assert warm_cap_ceiling_shortfall(cfg) == 0
+
+    def test_ratio_zero_is_not_shadowed(self):
+        """A disabled ratio falls back to the absolute verbatim."""
+        assert warm_cap_ceiling_shortfall(_cfg(ratio=0, warm=120000)) == 0
+
+    def test_absolute_zero_is_not_shadowed(self):
+        assert warm_cap_ceiling_shortfall(_cfg(warm=0)) == 0
+
+    def test_no_ctx_is_not_shadowed(self):
+        assert warm_cap_ceiling_shortfall(_cfg(ctx=0, warm=120000)) == 0
+
+    def test_flat_config_supported(self):
+        cfg = {
+            "local_model_ctx_size": SHIPPED_CTX,
+            "local_large_context_warm_cache_threshold": 120000,
+            "local_large_context_economic_ceiling_ratio": 0.3815,
+        }
+        assert warm_cap_ceiling_shortfall(cfg) == 120000 - 100008
 
 
 class TestStartupThresholdLogging:
@@ -215,9 +273,34 @@ class TestStartupThresholdLogging:
 
         msg = captured.get("msg", "")
         assert "cold=38000" in msg
-        assert "warm=100000" in msg
+        assert "warm=120000" in msg
         assert "per_slot_cap=258048" in msg
-        assert "economic_ceiling=100000" in msg
+        assert "economic_ceiling=120000" in msg
+
+    def test_warns_when_absolute_cap_is_shadowed(self, monkeypatch):
+        """LP-0MVHSET0A008VU95: a configured absolute above the economic
+        ceiling is reported at startup, naming both knobs."""
+        import proxy.server as srv
+
+        warnings: list[str] = []
+
+        class _RecordingLogger:
+            def info(self, msg, *args):
+                pass
+
+            def warning(self, msg, *args):
+                warnings.append(msg % args)
+
+            def error(self, *args, **kwargs):  # pragma: no cover - unused
+                pass
+
+        monkeypatch.setattr(srv, "logger", _RecordingLogger(), raising=False)
+        srv._startup_validate_local_routing_config(_cfg(ratio=0.3815, warm=120000))
+
+        joined = " ".join(warnings)
+        assert "economic ceiling" in joined
+        assert "120000" in joined
+        assert "local_large_context_economic_ceiling_ratio" in joined
 
     def test_log_is_best_effort_never_raises(self, monkeypatch):
         """A broken logger must not break startup (exceptions swallowed)."""

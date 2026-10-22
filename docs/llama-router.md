@@ -284,9 +284,18 @@ context-size check before committing to local, in
    dominates when `slots == 1`. The absolute
    `local_large_context_warm_cache_threshold` is retained as an upper bound;
    a ratio of `0` falls back to the absolute value, and both `0` disables the
-   warm cap. The shipped ratio is `0.3815` (= `100000 / 262144`, the ~37 tok/s
-   @100K prefill floor), which reproduces the previous absolutes
-   (fast 1-slot = 100000, 2-slot = 100000, cheap 3-slot = 83285).
+   warm cap. The shipped ratio is `0.4578` (= `120000 / 262144`, raised from
+   `0.3815` by LP-0MVHSET0A008VU95), which resolves to fast 1-slot = 120000,
+   2-slot = 120000, cheap 3-slot = 83285 (the physical clamp binds there).
+
+   > **The absolute value and the ratio are a co-change.** Because the
+   > absolute warm value only caps the economic ceiling, setting it *above*
+   > `round(ratio × local_model_ctx_size)` leaves it unused: the effective
+   > warm cap stops at the ceiling and raising the absolute alone is a silent
+   > no-op (observed 2026-10-21: `abs=115000` with the old ratio resolved to
+   > 100008). `validate_local_routing_config` reports a startup
+   > config-consistency warning naming both knobs whenever the ceiling shadows
+   > the configured absolute (LP-0MVHSET0A008VU95).
 
 2. **Cold-cache new-token check:** The number of uncached tokens is computed
    as `new_tokens = estimated_tokens × (1 − cached_ratio)`. If
@@ -304,8 +313,8 @@ Config keys (both nested under `server:` and flat forms are supported):
 ```yaml
 server:
   local_large_context_cold_cache_threshold: 38000     # cold-cache new-token cap
-  local_large_context_warm_cache_threshold: 100000    # absolute warm upper bound
-  local_large_context_economic_ceiling_ratio: 0.3815  # warm scales with model ctx
+  local_large_context_warm_cache_threshold: 120000    # absolute warm upper bound
+  local_large_context_economic_ceiling_ratio: 0.4578  # warm scales with model ctx
 ```
 
 > **Mode-aware cold threshold (LP-0MSOMVOPH004ATAK):** the cold threshold is
@@ -316,10 +325,10 @@ server:
 > - `proxy/config.yaml` (authoritative base, default/fallback) — `38000`.
 > - `proxy/config-fast.yaml` — inherits `38000` from the base (fast mode runs
 >   1 slot × 262144 total ctx, LP-0MU03AL730000B5W, so the warm clamp is
->   `min(100000, 262144//1 − 4096 = 258048) = 100000`; recaptures the old
+>   `min(120000, 262144//1 − 4096 = 258048) = 120000`; recaptures the old
 >   (30000, 38000] cold-cache bypass band).
 > - `proxy/config-cheap.yaml` — overrides to `42000` (3 slots → warm resolves
->   to `min(100000, 262144//3 − 4096 = 83285) = 83285`; the 60000 raise failed
+>   to `min(120000, 262144//3 − 4096 = 83285) = 83285`; the 60000 raise failed
 >   guardrails and was reverted to 38000 before the cheap-only raise to 42000
 >   — LP-0MSOMVOPH004ATAK / LP-0MSRM54YO007YG0K / LP-0MSY0V4ZO002ANPL /
 >   LP-0MT50SMU1005ZAD6 / LP-0MT50WCCP000DU00).
@@ -329,7 +338,7 @@ server:
 >
 > **Auto-derived warm threshold (LP-0MU466L1X003RTHN):** the effective warm
 > threshold is `min(physical per-slot clamp, economic ceiling)` where the
-> economic ceiling is `round(0.3815 × local_model_ctx_size)` (capped by the
+> economic ceiling is `round(0.4578 × local_model_ctx_size)` (capped by the
 > absolute warm value). Startup logs the computed physical clamp, economic
 > ceiling and effective warm/cold thresholds so an operator can confirm the
 > runtime value.

@@ -20,6 +20,19 @@ import pytest
 # Cached per-slot detail fallback (LP-0MUFSVXID0039ZAQ)
 # ======================================================================
 
+_LEGACY_SLOT_KEYS = ("slot_id", "is_processing", "n_decoded")
+
+
+def _legacy_slots(slots):
+    """Project served slots to the pre-change base fields.
+
+    ``/llama/local/status`` now annotates each slot additively with capacity
+    fields (LP-0MVGDUVGE0024YAI); identity/cache behaviour is asserted on the
+    legacy base fields so these tests keep their original purpose.
+    """
+    return [{k: s[k] for k in _LEGACY_SLOT_KEYS} for s in slots]
+
+
 
 class _FakeLock:
     def locked(self):
@@ -113,7 +126,7 @@ class TestSlotsDetailCacheFallback:
             slots_counts=(2, 3),
             slots_detail=self._FAKE_SLOTS,
         )
-        assert j["slots"] == self._FAKE_SLOTS
+        assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
         assert j["slots_stale"] is False
         detail_mock.assert_awaited_once()
 
@@ -127,7 +140,7 @@ class TestSlotsDetailCacheFallback:
                 {"slot_id": 99, "is_processing": True, "n_decoded": 0},
             ],
         )
-        assert j["slots"] == self._FAKE_SLOTS
+        assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
         assert j["slots_stale"] is False
 
     @pytest.mark.asyncio
@@ -138,7 +151,7 @@ class TestSlotsDetailCacheFallback:
             slots_detail=[],
             cache_value=self._FAKE_SLOTS,
         )
-        assert j["slots"] == self._FAKE_SLOTS
+        assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
         assert j["slots_stale"] is True
 
     @pytest.mark.asyncio
@@ -149,7 +162,7 @@ class TestSlotsDetailCacheFallback:
             slots_detail=[],
             cache_value=self._FAKE_SLOTS,
         )
-        assert j["slots"] == self._FAKE_SLOTS
+        assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
         assert j["slots_stale"] is True
 
     @pytest.mark.asyncio
@@ -182,7 +195,7 @@ class TestSlotsDetailCacheFallback:
             slots_detail_side_effect=TimeoutError("slots detail timed out"),
             cache_value=self._FAKE_SLOTS,
         )
-        assert j["slots"] == self._FAKE_SLOTS
+        assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
         assert j["slots_stale"] is True
 
     @pytest.mark.asyncio
@@ -193,12 +206,13 @@ class TestSlotsDetailCacheFallback:
             slots_detail_side_effect=ConnectionError("connection refused"),
             cache_value=self._FAKE_SLOTS,
         )
-        assert j["slots"] == self._FAKE_SLOTS
+        assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
         assert j["slots_stale"] is True
 
     @pytest.mark.asyncio
     async def test_slots_detail_preserves_cache_content(self):
-        """AC4: cached slot data is passed through unchanged — no re-projection."""
+        """AC4: cached base slot values are preserved; capacity fields are
+        added additively (LP-0MVGDUVGE0024YAI) without re-projecting them."""
         cached_slots = [
             {"slot_id": 0, "is_processing": True, "n_decoded": 100},
         ]
@@ -207,7 +221,11 @@ class TestSlotsDetailCacheFallback:
             slots_detail=[],
             cache_value=cached_slots,
         )
-        assert j["slots"] == cached_slots
+        assert _legacy_slots(j["slots"]) == cached_slots
+        # The annotation is additive: the cached identity is intact and the
+        # new capacity fields are present.
+        assert j["slots"][0]["lease_state"] == "generating"
+        assert "phase" in j["slots"][0]
 
     @pytest.mark.asyncio
     async def test_slots_stale_true_when_both_counts_and_detail_from_cache(self):
@@ -218,7 +236,7 @@ class TestSlotsDetailCacheFallback:
             cache_value=self._FAKE_SLOTS,
         )
         assert j["slots_stale"] is True
-        assert j["slots"] == self._FAKE_SLOTS
+        assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
         # Counts were from cache too (total_slots=0 from fresh query)
         assert counts_mock.return_value == (0, 0)
 
@@ -230,7 +248,7 @@ class TestSlotsDetailCacheFallback:
             slots_detail=[],
             cache_value=self._FAKE_SLOTS,
         )
-        assert j["slots"] == self._FAKE_SLOTS
+        assert _legacy_slots(j["slots"]) == self._FAKE_SLOTS
         assert j["slots_stale"] is True
         # Counts were fresh — the stale flag is driven by detail cache hit
         assert counts_mock.return_value == (2, 3)
@@ -308,7 +326,7 @@ class TestSlotsDetailResponseBudget:
         assert resp.status_code == 200
         _, kwargs = detail_mock.await_args
         assert kwargs["timeout"] == 0.25
-        assert resp.json()["slots"] == self._CACHED_SLOTS
+        assert _legacy_slots(resp.json()["slots"]) == self._CACHED_SLOTS
 
     @pytest.mark.asyncio
     async def test_cached_fallback_response_within_budget(self):

@@ -90,6 +90,52 @@ failure-domain gates (which only react *after* a failure).
 | Client disconnects during the wait | Wait aborts promptly (`reason=rate_limited_disconnect`). |
 | `rate_limit_rpm` unset or `0` | Ungated: behaviour exactly as before; no affinity recorded. |
 
+**Per-model / per-entry knobs (`budget`, LP-0MVDVK5TM004TQQV).** Every
+behaviour knob in the table (`reserve_ratio`, `wait_max_seconds`,
+`max_waiters`, `affinity_ttl_seconds`) resolves through
+**provider entry `budget` block > `models.<name>.budget` block > `server.*` >
+built-in default**, per knob — so `plan`, `author` and `code` can trade
+latency against free-tier utilisation independently (e.g. an interactive chain
+may wait longer, a background chain may pass through immediately) without
+changing any other chain. All layers are optional; absent keys fall through, so
+a config without `budget` blocks behaves byte-for-byte as before (identical
+`BudgetDecision` values and log lines). Example:
+
+```yaml
+models:
+  plan:
+    budget:
+      reserve_ratio: 0.4        # overrides the default 0.3 for this chain
+      wait_max_seconds: 10
+      max_waiters: 4
+      affinity_ttl_seconds: 600
+    providers:
+      - name: munitoai-free
+        rate_limit_rpm: 15
+        budget:                 # overrides the model block for this entry only
+          reserve_ratio: 0.2
+```
+
+- **Validation** matches the server knobs exactly: the ratio is clamped to
+  `[0, 1]` and wait/TTL/waiter counts to `>= 0`; a malformed value is logged
+  and falls back to the next layer. Never raises, never blocks a request
+  (fail open). A non-mapping `budget:` value is ignored with a warning.
+- **Provenance.** The effective knob's source layer is logged as
+  `budget_source=<knob>@<layer>` (e.g. `budget_source=reserve_ratio@model`)
+  on the skip/wait lines and recorded in the diagnostics attempt entry
+  `budget_source` — present only when a model/entry block supplied the value,
+  so server-defaulted runs keep today's exact log lines.
+- **Boundary: the bucket is per provider entry, not per model.** Two models
+  tuning the same entry share **one** `rate_limit_rpm` window (one account
+  quota); their `budget` blocks change behaviour against that window, never
+  its size. Per-model *quota* is out of scope by design.
+- **`models.compact` caveat.** `models.compact` is consumed only by the
+  compaction summarizer (`proxy/proxy/compaction_summarizer.py`), which calls
+  its providers directly over httpx and never reaches
+  `acquire_provider_budget()` — a `models.compact.budget` block is accepted and
+  resolvable but has **no runtime effect** until that dispatch is gated
+  (tracked as LP-0MVFYYYXS0011T58).
+
 **Why the reserve exists (LP-0MVDUN5CY009VD20).** Affinity is recorded on the
 first successful dispatch, so *every* later turn of that session counts as
 "in-progress". Without a reserve, established sessions queued behind new-session
@@ -98,9 +144,9 @@ traffic and waited 15–55 s per turn, which dominated first-token latency
 Reserving `floor(rate_limit_rpm × provider_rate_limit_reserve_ratio)` slots
 (4 of 15 at the former budget) keeps a slot available for them, so waits become
 rare; the default 15 s cap bounds whatever remains. The reserve rounds down and
-is clamped to `rate_limit_rpm - 1`, so at the current budget of 2/min the
+is clamped to `rate_limit_rpm - 1`, so at the current budget of 3/min the
 reserve is **0**: there are no reserved slots and both new and in-progress
-sessions share the 2-slot window.
+sessions share the 3-slot window.
 
 Affinity is `session → entry`, TTL-scoped by
 `server.provider_affinity_ttl_seconds` (default 900), and is **never** shared
@@ -110,7 +156,7 @@ session already on the free tier keeps its provider, while a batch of new
 agent sessions passes straight through instead of queueing behind an exhausted
 allowance.
 
-`munitoai-free` ships with `rate_limit_rpm: 2` in `config.yaml` (the former
+`munitoai-free` ships with `rate_limit_rpm: 3` in `config.yaml` (the former
 fast/cheap overlay files were removed with priority-based routing,
 LP-0MVDT94F0003VHUA); tune the value from the `remaining=` field in the skip
 logs.
@@ -126,17 +172,27 @@ peak and reverts to 10 if it exceeds ~10 % of minutes.
 
 **Value history (LP-0MVF19DKR008VCHO):** lowered from 15 to **2** on 2026-10-19
 at the operator's request — the free tier is treated as a bonus tier, so bursts
-spill to the paid tiers rather than consuming the free allowance. At 2/min the
-reserve ratio (`provider_rate_limit_reserve_ratio`, default 0.3) rounds down to
-0 slots, so new and in-progress sessions both see the full 2-per-window cap;
-in-progress sessions can still wait for the window to drain (bounded by
-`provider_rate_limit_wait_max_seconds`). Takes effect at the next proxy
-restart.
+spill to the paid tiers rather than consuming the free allowance. At the 2/min
+budget the reserve ratio (`provider_rate_limit_reserve_ratio`, default 0.3)
+rounded down to 0 slots, so new and in-progress sessions both saw the full
+2-per-window cap; in-progress sessions could still wait for the window to drain
+(bounded by `provider_rate_limit_wait_max_seconds`). Took effect at the next
+proxy restart.
+
+**Value history (LP-0MVGGI4Y0003K4AZ):** raised from 2 to **3** on 2026-10-20
+at the operator's request — a modest bump that stays far below the measured
+upstream 429 onset (≈20 dispatches/rolling-60 s), so the free tier's real
+allowance is used a little closer to capacity and requests spill to the paid
+tiers less often. The reserve ratio still rounds down
+(`floor(3 × 0.3) = 0`), so new and in-progress sessions both see the full
+3-per-window cap; in-progress sessions can still wait for the window to drain
+(bounded by `provider_rate_limit_wait_max_seconds`). Takes effect at the next
+proxy restart.
 
 ### Off-peak paid tiers in the `low` chain (LP-0MVF17VP70053JXX)
 
 `low` priority prefers local and queues over paid remote fallback, then uses the
-free tier (`munitoai-free`, `rate_limit_rpm: 2`). Because that free tier is the
+free tier (`munitoai-free`, `rate_limit_rpm: 3`). Because that free tier is the
 last entry of the chain, exhausted local slots plus an exhausted free budget
 used to leave the request nowhere to go but an upstream 429. `plan`, `author`
 and `code` therefore extend their `low` chain with the three `opencode-go`
@@ -217,7 +273,7 @@ Enable it per provider entry, or globally under `server`:
 ```yaml
 - name: munitoai-free
   type: remote
-  rate_limit_rpm: 2
+  rate_limit_rpm: 3
   respect_ratelimit_headers: true   # entry flag wins over server.*
 ```
 
@@ -384,6 +440,194 @@ the proxy logs a `routing_economic_bypass_local` line with the token counts
 and cached ratio. The `routing_skip_local` line (with `reason=large_context_bypass`)
 remains parseable by reporting tools and only appears for fast mode.
 
+## Restored-prefix warmness: seeding `cached_ratio` from the slot snapshot (LP-0MVGD9YXH008O304)
+
+The economic check above is only as good as `cached_ratio`. Historically that
+ratio came *only* from `provider._last_cached_ratio`, an in-memory dict written
+by a previous local response — so a session whose KV prefix was already saved to
+disk was still scored cold (82.8 % of routing decisions reported
+`cached_ratio=0.00`), every session above 38k tokens was permanently bypassed
+(`large_context_bypass`), and each proxy restart reset the whole fleet to cold.
+
+`proxy/proxy/slot_cache_ratio.py` closes that gap with a sidecar written next to
+each snapshot (`slot_<session>.bin` → `slot_<session>.bin.ratio.json`):
+
+- **Writer** — after a *successful* `slot_save`, the proxy records the measured
+  `prompt_tokens` from the upstream `usage` block (the whole served prompt is
+  now resident in the saved KV cache) plus a SHA-256 fingerprint of every
+  message in the request. No usage block → no sidecar (today's behaviour).
+- **Reader** — before the cold-cache gate reads the ratio, the snapshot's
+  sidecar is validated and used to seed it:
+
+  ```
+  cached_ratio = min(1.0, cached_tokens / estimated_tokens) * safety_margin
+  ```
+
+  with `session_slot_ratio_safety_margin` (default `0.9`) and
+  `session_slot_ratio_ttl_seconds` (default `86400`) configurable on the
+  `server` block. The measured fraction is a hard ceiling, so restoration can
+  never over-credit (AC3), and the margin absorbs llama.cpp dropping its own
+  checkpoints (`forcing full prompt re-processing`).
+- **Correctness guard (AC2)** — the recorded message fingerprints must be a
+  prefix of the incoming message list. A changed system prompt or a history
+  truncated from the front fails the check and earns `cached_ratio = 0`; a
+  weak partial credit is still subject to the normal cold-cache gate, so it
+  cannot mask an expensive prefill.
+- **Fail-open** — missing/corrupt/expired sidecar, other model, absent
+  `session_slot_save_path`, or any error degrades to the previous behaviour
+  (`cached_ratio = 0`, conservative). Session invalidation deletes both the
+  snapshot and its sidecar and clears the in-memory ratio.
+- **Restart-safe (AC6)** — the sidecar lives on disk, so the first request of a
+  session after a proxy restart is scored warm when the snapshot is present
+  and valid.
+
+**Observability (AC4):** `routing_check`, `routing_skip_local`,
+`routing_economic_bypass_local` and `dispatch_first_byte_ms` now carry
+`cache_state=cold|warm|restored`. `restored` means the ratio was seeded from a
+snapshot *and* cleared the warm threshold, so restored-prefix wins are counted
+separately from genuine prompt-cache hits. `slot_ratio_restored` is logged once
+per seed with `cached_tokens`, `estimated_tokens` and the credited
+`cached_ratio`.
+
+## Capacity-based local admission (LP-0MVGDUVS6003T2IX)
+
+The economic gate (`local_large_context_cold_cache_threshold`, 38 000 new
+tokens) and the physical cap (per-slot clamp, ~126 976 at N=2 / ctx 262 144)
+are **unchanged**. Raising them was rejected twice (LP-0MVGCOZMZ003I6PF,
+LP-0MVGD9YLM0055SFF): the 38k–124k band needs ~100 slot-hours per 24 h when
+cache-cold against ~26 h of measured idle headroom, so it only fits with warm
+caches plus admission control.
+
+Instead, the economic band may be admitted locally while the **projected
+slot-seconds** of admissions fit inside a share of **measured** idle slot time:
+
+```
+projected_s = prefill ETA (calibrated from dispatch_first_byte_ms) + decode allowance
+busy_s      = union of local dispatch intervals inside the horizon
+idle_s      = slots * horizon - busy_s
+budget_s    = local_capacity_admission_budget_ratio * idle_s
+
+admit iff admitted_s + projected_s <= budget_s
+```
+
+```yaml
+server:
+  local_capacity_admission_enabled: false   # rollback switch, default off
+  local_capacity_admission_budget_ratio: 0.8
+  local_capacity_admission_horizon_seconds: 3600
+  local_capacity_admission_decode_seconds: 30
+```
+
+- **Not a threshold widening.** Both existing thresholds keep their values;
+  only the *effective* treatment of the economic band changes, and only while
+  measured idle capacity supports it.
+- **Rolling, data-driven inputs.** `busy_s` is recorded from real dispatch
+  intervals (`router.py::_cleanup_after_request`), and the prefill ETA comes
+  from `proxy/prefill_eta.py`'s calibration over observed
+  `dispatch_first_byte_ms` samples — no fixed capacity constants.
+- **Burst-safe.** Admissions are recorded in a rolling ledger inside the
+  horizon, so a burst of band requests cannot collectively over-commit the
+  budget; once the budget is exhausted the bypass stands (today's behaviour).
+- **Never overrides the physical cap.** `context_too_large` still routes
+  remote; a prompt that cannot fit a KV slot is never admitted by capacity.
+- **Observability.** Each admit logs `routing_capacity_admit provider=… model=…
+  reason=capacity_admission projected_s=… admitted_s=… budget_s=… idle_s=…
+  budget_ratio=… horizon_s=… estimated_tokens=… cached_ratio=… cache_state=…
+  warm_threshold=… session=…` and records a `status=capacity_admit` attempt.
+- **Rollout / rollback.** Ships **off**. Enable only once cache warmth
+  (LP-0MVGD9YXH008O304), the prefill-ETA guard (LP-0MVGDUV5E005UWBQ) and
+  prefill serialisation (LP-0MVGDUUV3001XFRJ) are live in the running proxy and
+  the 24 h measurement (LP-0MVGHXD59008UOUD) is green; revert by setting
+  `local_capacity_admission_enabled: false` (read per request, no restart).
+
+## Prefill serialisation (LP-0MVGDUUV3001XFRJ)
+
+Prefill (dispatch → first byte) does not scale with concurrency on this
+backend. Measured 2026-10-19 → 10-20 over 460 paired local dispatches:
+
+| Overlapping prefills | n | first-byte p50 | new tok/s p50 |
+| --- | ---: | ---: | ---: |
+| 0 | 190 | **23.4 s** | **253.8** |
+| 1 | 220 | 85.0 s | 156.6 |
+| 2 | 48 | 119.7 s | 128.8 |
+
+47.8 % of prefills shared the GPU with at least one other and aggregate
+throughput stayed flat (~254 tok/s) — i.e. concurrency added latency, not
+capacity, and inflated total prefill wall time 2.3×.
+
+At most `server.local_max_concurrent_prefills` prefills now run at once:
+
+```yaml
+server:
+  local_max_concurrent_prefills: 1   # 1 = serialise (default); 0 = disabled
+```
+
+- **Decode is not affected** — only prefill-vs-prefill is serialised; a slot
+  that is already generating does not block another slot's prefill.
+- **Waiting is bounded by the existing machinery** — a second prefill waits
+  in the contention queue (policy/depth/wait caps) and falls back to remote
+  exactly as before when those caps are hit; the prefill-ETA admission guard
+  refuses waits that cannot succeed rather than parking the request.
+- **No added delay for a lone request** — with nothing else prefilling the
+  gate is open (the in-flight count is 0).
+- **Observability** — each local dispatch logs
+  `prefill_gate_wait_ms=… saturation=… session=… model=… provider=…` (the time
+  the request waited specifically for the prefill gate; `0.0` when it was not
+  prefill-gated), and `/llama/local/status` publishes
+  `local_prefills_in_flight`, `local_max_concurrent_prefills` and
+  `prefill_gate_waiters` (the contention queue depth).
+
+## Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
+
+Routing is size/economics-driven and used to ignore whether the backend was
+doing anything, so a large or cache-cold prompt was bypassed to a paid remote
+provider while both slots sat unused (measured: **187**
+`local_dispatch_denied` in an hour where local busy was **2.5 %**, and
+`large_context_bypass` 1,284/24 h). The economic cold-cache bypass is now
+overridable when the GPU has demonstrably been idle:
+
+```yaml
+server:
+  local_idle_admit_enabled: false   # default off
+  local_idle_admit_seconds: 60      # idle age required before overriding
+```
+
+**Scope:** only the economic band (`large_context_bypass`) is overridable. The
+physical `context_too_large` cap is a capacity limit — a prompt that cannot fit
+the KV slot never goes local because of idleness.
+
+**Idle signal** (`proxy/proxy/local_activity.py`, exposed on
+`/llama/local/status` as `local_idle_seconds`, `local_last_activity_at`,
+`local_last_activity_source`): a monotonic timestamp updated when a local
+dispatch starts, on every forwarded SSE chunk, and when the request finishes.
+The baseline is process start, so a freshly restarted idle proxy reports its
+true idle age rather than "unknown".
+
+**Fail-safe blockers** — any of these keeps today's bypass (fail-closed):
+
+| Condition | Blocker |
+| --- | --- |
+| Idle age below `local_idle_admit_seconds` (or the knob is missing/malformed/non-positive) | no override |
+| Any waiter in the contention queue | `queue_not_empty` |
+| A local lease, generation, or prefill is in flight | `local_active` / `generating` / `prefill_in_flight` |
+| Backend self-healing | `self_healing` |
+| Model switch or background load in progress | `model_switch` / `model_loading` |
+| Default local backend not ready / no process (explicit `endpoint` entries are externally managed and skip this gate) | `backend_not_ready` / `backend_not_running` |
+
+**Observability:** each override logs
+`routing_idle_admit provider=… model=… reason=economic_bypass_idle
+idle_seconds=… threshold_seconds=… estimated_tokens=… new_tokens=…
+cached_ratio=… cache_state=… session=…` and records a `local_admit`-class
+dispatch attempt (`status=idle_admit`). `proxy-usage-analysis` parses the line
+into an `idle_admit` event and reports it as the
+`Local admitted while GPU idle (cold-cache override)` row and the
+`local_idle_admit` JSON counter.
+
+Idle-admitted requests are expected to be **slow** (prefill p90 269.8 s, max
+817 s in the baseline window) — that is the deliberate trade of idle GPU time
+for remote spend, and it is why the override never fires while anything is
+queued or in flight.
+
 ## Slot Contention: Per-Mode Queue vs Fallback (LP-0MSORQVK50012Q4D)
 
 When every local slot is busy (``local_active_queries >= session_slot_pool_size``),
@@ -450,6 +694,187 @@ The queue engages only when ``contention_queue_policy`` is ``queue`` AND the
 proxy is in the corresponding operating mode. Absent keys default to
 ``fallback`` for backward compatibility.
 
+## Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ)
+
+Queuing only helps when the local prefill can actually finish inside the wait
+budget. Evidence for 2026-10-19 07:23 → 2026-10-20 07:23: of 5,805 queued waits
+only 855 were dispatched local — **4,947 (85 %) were abandoned after up to
+120 s and then went remote anyway**, while local prefill times during the same
+window were p50 61.8 s / p90 269.8 s / max 817 s. Waiting 120 s to maybe avoid
+a remote call whose median TTFT is 27 ms is a losing trade unless the prompt
+is genuinely cache-warm.
+
+Before a request enters the contention queue (and before a dispatch that
+would start another concurrent prefill), the proxy therefore costs the
+projected prefill and compares the **occupancy-aware projected wait** with the
+caller's wait budget:
+
+```
+eta_prefill = coded_tokens * coded_ms_per_token + new_tokens * prefill_ms_per_token
+  coded_tokens = est_tokens * cached_ratio          # served from the prompt cache
+  new_tokens   = est_tokens * (1 - cached_ratio)    # must actually be prefilled
+
+projected_wait = eta_prefill * (busy_slots + 1)
+  busy_slots = min(slot_pool, max(generating_concurrency, prefills_in_flight))
+
+admit  if projected_wait <= wait_budget
+else   refuse local admission immediately -> next provider in the chain
+```
+
+The occupancy term matters because prefills are serialised
+(`local_max_concurrent_prefills: 1`): the in-flight prefill holds the gate
+first, so a newcomer's real wait is its own prefill **plus** the service the
+gate already owes. Comparing the own-prefill term alone admitted waits the
+proxy's own `/llama/local/status` payload had already flagged as unservable —
+the 2026-10-21 14:56→16:49 window produced 302 queued waits, 261 of which fell
+back after queueing, 215 of them at the full 120 s budget (25,804 s of
+aggregate wasted wait), with 247 of the 325 full-budget losses entering the
+queue `saturation=prefill`. The occupancy floor is also what the guard uses
+when per-slot prefill progress is unobservable
+(`prefill_progress_unobservable`, `alive=False`, `in_flight=True`): an
+in-flight prefill is treated as occupying the gate for at least the calibrated
+estimate, never as "free soon".
+
+`projected_wait` is computed by a single function
+(`prefill_eta.projected_wait_seconds`) that also produces the published
+`queue_eta_seconds`, so the number a dispatcher paces against and the verdict
+the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
+
+- **Data-driven coefficients** (`proxy/proxy/prefill_eta.py`): every local
+  dispatch records `(coded_tokens, new_tokens, dispatch_to_first_byte_ms)` —
+  the service time from the existing `dispatch_first_byte_ms` line, queue wait
+  excluded — in a rolling window (default 200 samples) keyed by
+  `(model, context bucket)` (buckets: <16k, 16k–64k, 64k–128k, ≥128k). A
+  two-coefficient least-squares fit produces the per-bucket coefficients,
+  which pass through a conservatism factor (1.2 — over-estimating prefers the
+  fast remote call) and are clamped to plausible bounds. Defaults (0.5 ms per
+  cached token, 3.9 ms per fresh token ≈ 254 tok/s solitary) apply until a
+  bucket is calibrated.
+- **Inert until calibrated**: with fewer than
+  `local_admission_guard_min_samples` (5) observations a bucket, the guard is
+  inert — today's queueing behaviour is byte-for-byte unchanged. It can never
+  refuse on a guess.
+- **Cache-warm stays local**: a 90 %-cached 100k prompt costs
+  `0.9*100k*0.5 ms + 0.1*100k*3.9 ms ≈ 84 s` of its own prefill and is
+  admitted behind a *free* gate, while the same prompt cache-cold costs
+  ≈ 390 s and is refused. Behind an occupied gate the occupancy term applies
+  to both, so a wait only stays admissible when the whole projected wait fits
+  the budget. Locality is kept where it actually pays.
+- **Priority semantics are unchanged**: `high` never queues, so it has no
+  wait budget and the guard never applies to it; `low`/`medium` use
+  `contention_queue_max_wait_seconds`.
+- **Refusal is immediate and visible**: the request falls through to the next
+  provider without waiting. If the whole chain is exhausted, the client
+  receives a retryable `429` with `Retry-After` (how much longer the prefill
+  would need than the budget) and `X-Local-Admission: reject` /
+  `X-Local-Admission-Eta` / `X-Local-Admission-Budget` headers, plus the
+  machine-readable `code: local_admission_reject`.
+- **Observability**: each decision logs
+  `local_admission_guard decision=admit|reject reason=… enforced=true|false
+  eta_prefill_s=… eta_occupancy_s=… projected_wait_s=… budget_s=…
+  busy_slots=… in_flight_prefills=…`, i.e. the own prefill, the occupancy
+  contribution, the projected wait actually compared against the budget and
+  the occupancy evidence behind it — a refusal (or a surprising admit) is
+  diagnosable from the log line alone. The 24h report counts them as
+  `local_admission_reject` / `local_admission_reject_enforced` /
+  `local_admission_admit`. `/llama/local/status` publishes
+  `prefill_eta_seconds` (cost of the reference prompt, cache-cold) and
+  `queue_eta_seconds` (that same cost repeated for every occupied slot, plus
+  the newcomer's own — the guard's `projected_wait`), with
+  `queue_eta_occupancy_seconds` / `queue_eta_busy_slots` breaking out the
+  occupancy term, so a dispatcher can pace *before* launching a session.
+
+Rollout control (`server.local_admission_guard_policy`):
+
+| Value | Behaviour |
+|-------|-----------|
+| `reject` (default) | Refuse admission when the projected wait exceeds the budget |
+| `observe` | Log the verdict (`enforced=false`) but keep queuing — use to validate calibration on live traffic |
+| `off` | Do not evaluate the guard at all |
+
+Verification target (48h after rollout): `contention_queue_fallback_after_queue`
+drops well below the 4,947 baseline, client-visible latency for refused
+requests approaches the remote TTFT baseline instead of ~120 s, local serve
+share stays above 2.6 %, and mid-stream error counts do not increase.
+
+## Local Admission Reservations and Fallback Intent (LP-0MVIKPCSG002B0NL)
+
+Polling `/llama/local/status` and then sending is racy: two clients can observe
+the same idle window, and the admission decision is taken *after* the work has
+been sent (queue depth reached 7 while `available_slots` still reported 2 with
+the prefill gate saturated). The reservation handshake lets a dispatcher
+**claim** local capacity atomically, before sending, and express what it wants
+to happen if local capacity is not available.
+
+### `POST /llama/local/reserve`
+
+```
+POST /llama/local/reserve
+{"estimated_tokens": 48000, "session_id": "herdr-...",
+ "priority": "medium", "cached_ratio": 0.35,
+ "ttl_seconds": 10, "dry_run": false}
+
+200 {"admit": true, "reservation_id": "<opaque>",
+     "projected_wait_s": 63.1, "ttl_s": 10}
+429 {"admit": false, "reason": "eta_exceeds_budget",
+     "queue_eta_s": 187.2, "budget_s": 120.0, "retry_after_s": 68}
+```
+
+- The verdict is the **same** occupancy-aware decision the admission guard
+  enforces (`prefill_eta.evaluate_admission`), with the same occupancy probe,
+  so the two can never disagree for identical inputs.
+- `200` claims a ticket: a follow-up request carrying
+  `X-Local-Reservation: <id>` dispatches **without re-checking and without
+  queueing**. Tickets are single-use, TTL-bound (default 10 s, capped at
+  60 s) and scoped to the local model they were issued for.
+- `429` refuses immediately: the client defers instead of queueing behind a
+  doomed wait. `queue_eta_s` is the projected wait (`prefill_eta_seconds ×
+  (busy_slots + 1)`), `budget_s` is `contention_queue_max_wait_seconds`, and
+  `retry_after_s` is the overshoot.
+- `DELETE /llama/local/reserve/<id>` cancels an outstanding ticket and
+  releases its gate claim, so the next ticket can be issued.
+- `dry_run: true` returns the verdict without claiming (the "local-only
+  preamble").
+- A stale, expired, cancelled or mismatched ticket is ignored: the request
+  takes today's ordinary path (never a hard failure).
+- Fail-open: an uncalibrated estimator admits (the endpoint never rejects on a
+  guess), and a missing `estimated_tokens` is a `400`.
+
+Interaction with the queue: the reservation replaces the *admission* decision,
+not the capacity model. `contention_queue_max_wait_seconds` remains the wait
+budget both the guard and `/reserve` compare against, and
+`contention_queue_max_depth` still bounds the requests that do queue; a
+reserved dispatch does not consume queue depth.
+
+### `X-Local-Preference` request header
+
+| Value | Behaviour |
+|-------|-----------|
+| `prefer-local` (default) | Today's behaviour: use local when it can serve within the budget, else fall through to the next provider |
+| `local-only` | Never fall back remote. If the request cannot be admitted within the budget the proxy returns the retryable `429` admission response **even when remote providers are available** |
+| `remote-ok` | Skip the local route entirely (background / low-priority work). The local provider is removed from the chain |
+
+Unknown values (and an absent header) behave as `prefer-local`, so the header
+is purely additive. `high` priority keeps its "never queue" semantics under
+every preference.
+
+### Response headers
+
+Every response carries `X-Local-Route`:
+
+- `local` — served by a local provider.
+- `remote` — served by a remote provider; `X-Local-Fallback-Reason` names why
+  local was not used (`eta_exceeds_budget`, `local_concurrency_limit`,
+  `cached_tokens_skip`/`large_context_bypass`, `remote_ok`, …).
+- `refused` — local-only refusal or exhausted chain; `X-Local-Fallback-Reason`
+  carries the refusal reason. Refusals also carry `Retry-After` and the
+  `X-Local-Admission*` estimate headers.
+
+`/llama/local/status` publishes the reservation counters
+(`reserved_outstanding`, `reserved_issued`, `reserved_used`,
+`reserved_cancelled`, `reserved_expired`) — `issued − used − cancelled −
+expired` is the reserved-but-unused signal for ticket hoarding.
+
 ## Stream Error Handling (recovery-first + informative-error fallback)
 
 When a routed stream fails, the proxy follows a **recovery-first** strategy
@@ -507,19 +932,40 @@ still quenches normally. The window is re-armed per restart by
 
 HTTP 429 responses whose error type is `GoUsageLimitError` (a usage-limit
 variant distinct from `FreeUsageLimitError`) are treated as usage-limit
-**reset** events rather than generic rate-limit events. The proxy parses the
-reset duration from the provider message (`Resets in 22hr 43min`) — falling
-back to `metadata.limitName` (daily/weekly/monthly) when the message carries
-no explicit duration — adds a 2-minute safety margin, and quarantines the
-**whole failure domain** (all entries sharing the endpoint, e.g. both
-`opencode-go` and `opencode-go-2` on `https://opencode.ai/zen/go`) until the
-computed reset time passes. Routing decisions during the block log
-`usage_limit_reset_pending` with the reset time and do not contact the
-upstream; once the reset time arrives the domain becomes eligible again
-without operator intervention. `FreeUsageLimitError` responses without a
-reset time get the default 3-hour cooldown (10800s; per-provider overrides
-were retired with `opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in
-**LP-0MSLJPOCC0001ROJ**.
+**reset** events rather than generic rate-limit events. The quarantine is
+**account-scoped** (`_usage_limit_account_key` = `api_key_env@endpoint`):
+distinct API keys on the same gateway keep independent limits
+(LP-0MSMBWB23009XYPW), and the 2-minute `_USAGE_LIMIT_RESET_MARGIN_SECONDS`
+safety margin is always added.
+
+The reset duration is resolved in this order (LP-0MVF7MPZN009GOJB):
+
+1. **Authoritative quota snapshot** — for an `opencode-*` account with a
+   **fresh** quota snapshot and quota behaviour strictly enabled, the
+   snapshot's account-level `seconds_to_reset` (the monthly window derived
+   from `monthly.resetsAt` by the `/v1/usage` poller, LP-0MVF4FIP1001RD8P) is
+   used and logged as `source=snapshot`. This is a hard (`explicit`)
+   quarantine: it is exempt from the guessed-quarantine 24 h cap and is
+   persisted. The snapshot wins over any `Resets in ...` text in the message.
+2. **Message duration** — for a non-`opencode-*` entry (no quota source), or
+   when the snapshot is stale/absent or the quota source is disabled
+   (`quota_surge_enabled: false`) / dry-run, an explicit `Resets in 22hr
+   43min` duration in the message is honoured in full (`source=message`).
+3. **Guessed period** — when there is no explicit duration, `metadata.limitName`
+   (daily/weekly/monthly) supplies a guessed period capped at
+   `_usage_limit_guess_cap_seconds` (24 h by default), logged as
+   `source=guess`. This guessed branch is **fallback-only**: it is unreachable
+   for a fresh-snapshot `opencode-*` account, and the full 30-day period is
+   never used without explicit evidence (LP-0MUQTCMW2001VXH8).
+
+Routing decisions during the block log `usage_limit_reset_pending` with the
+reset time and do not contact the upstream; once the reset time arrives the
+account becomes eligible again without operator intervention.
+`FreeUsageLimitError` responses without a reset time get the default 3-hour
+cooldown (10800s; per-provider overrides were retired with
+`opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in
+**LP-0MSLJPOCC0001ROJ**; the snapshot-based retirement of the guess is
+**LP-0MVF7MPZN009GOJB**.
 
 ## Sibling-fallback circuit breaker (LP-0MTPMF03P0046MFG)
 

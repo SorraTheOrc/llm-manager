@@ -415,6 +415,25 @@ def _record_slots_query_failure(reason: str) -> None:
         pass
 
 
+def _slot_context_tokens(slot: dict) -> int | None:
+    """Return the slot's current context-token usage (prompt progress).
+
+    The maximum of the slot's ``n_past`` and ``n_prompt_tokens_processed``
+    fields when present (older llama.cpp builds that still report per-slot
+    prefill progress; LP-0MSE05J53004C6EL), else ``None``. llama.cpp b8782
+    removed both fields from the ``/slots`` response
+    (LP-0MSUO5Z0K007HBSS), so ``None`` is the *honest* value on modern
+    builds — the caller must not fabricate a context size (LP-0MVGDUVGE0024YAI
+    AC3/AC7: null ETA rather than a misleading estimate).
+    """
+    candidates = [
+        c
+        for c in (slot.get("n_past"), slot.get("n_prompt_tokens_processed"))
+        if isinstance(c, (int, float)) and c >= 0
+    ]
+    return int(max(candidates)) if candidates else None
+
+
 async def _query_slots_detail(
     llama_port: int,
     timeout: float = 2.0,
@@ -443,6 +462,10 @@ async def _query_slots_detail(
     - ``slot_id`` (int) — slot identifier from the response.
     - ``is_processing`` (bool) — whether the slot is actively processing.
     - ``n_decoded`` (int or ``None``) — the number of decoded tokens so far.
+    - ``context_tokens`` (int or ``None``) — current prompt progress
+      (``max(n_past, n_prompt_tokens_processed)``) when the build reports it,
+      else ``None``; feeds per-slot ``phase``/``prefill_eta_seconds``
+      (LP-0MVGDUVGE0024YAI AC5/AC3).
 
     Returns an empty list on any failure (HTTP error, connection error,
     timeout, or unexpected response shape).
@@ -478,6 +501,10 @@ async def _query_slots_detail(
                     "slot_id": slot.get("id", i),
                     "is_processing": is_processing,
                     "n_decoded": n_decoded,
+                    # Per-slot prompt progress (LP-0MVGDUVGE0024YAI AC3/AC5):
+                    # the single source for context_tokens, sourced from the
+                    # same raw fields ``_query_slots_progress`` reads.
+                    "context_tokens": _slot_context_tokens(slot),
                 })
             return result
     except Exception as exc:
@@ -542,11 +569,7 @@ async def _query_slots_progress(
                 if not isinstance(slot, dict):
                     continue
                 sid = slot.get("id", i)
-                candidates = [
-                    c for c in (slot.get("n_past"), slot.get("n_prompt_tokens_processed"))
-                    if isinstance(c, (int, float)) and c >= 0
-                ]
-                progress = int(max(candidates)) if candidates else None
+                progress = _slot_context_tokens(slot)
                 result[sid] = {
                     "progress": progress,
                     "processing": bool(slot.get("is_processing", False)),
@@ -1296,6 +1319,274 @@ def _build_slot_to_lease_map(srv) -> dict[int, dict]:
             "remaining_seconds": round(remaining, 1),
         }
     return result
+
+
+# ===================================================================
+# Truthful local capacity (LP-0MVGDUVGE0024YAI)
+#
+# ``/llama/local/status`` publishes a per-slot ``lease_state`` and ``phase``
+# plus a top-level ``capacity_hint`` so a dispatcher can distinguish a slot
+# that is *generating* from one that is merely *leased but idle* (the
+# "reserved-but-idle GPU" false-busy case: 2,633 of 2,641 local dispatch
+# denials had ``active=2`` lease records while local decoded only 29.3 % of
+# wall clock). The helpers here are pure so they can be unit-tested against
+# the decision tables without an HTTP request; the annotation below wires
+# them to live dispatch-lease state.
+# ===================================================================
+
+
+LEASE_STATE_GENERATING = "generating"
+LEASE_STATE_IDLE_LEASED = "idle_leased"
+LEASE_STATE_FREE = "free"
+
+PHASE_PREFILL = "prefill"
+PHASE_DECODE = "decode"
+
+CAPACITY_IDLE = "idle"
+CAPACITY_PREFILL_BOUND = "prefill_bound"
+CAPACITY_SATURATED = "saturated"
+
+
+def slot_lease_state(is_processing: bool, owner_session_id: str | None) -> str:
+    """Classify a slot's lease state (LP-0MVGDUVGE0024YAI AC2).
+
+    - ``generating`` — the slot is processing (prefill or decode in flight).
+      This takes precedence so a working slot is NEVER reported ``free``.
+    - ``idle_leased`` — not processing, but a session still holds a live
+      (active or post-stream cooldown) lease on the slot: the reserved-but-idle
+      case a dispatcher must not confuse with genuine GPU work.
+    - ``free`` — not processing and no lease holder.
+    """
+    if is_processing:
+        return LEASE_STATE_GENERATING
+    if owner_session_id:
+        return LEASE_STATE_IDLE_LEASED
+    return LEASE_STATE_FREE
+
+
+def infer_slot_phase(
+    is_processing: bool,
+    n_decoded: int | None,
+    context_tokens: int | None = None,
+) -> str | None:
+    """Infer a slot's generation phase from ``/slots`` signals (AC5).
+
+    llama-server exposes no phase field, so it is derived proxy-side from
+    ``is_processing`` and ``next_token.n_decoded`` (with prompt progress —
+    ``context_tokens`` — as corroboration on builds that still report it):
+
+    - ``None`` when the slot is not processing.
+    - ``prefill`` while processing has not produced any decoded token
+      (``n_decoded`` is ``None`` or ``0``) — the prompt is still being
+      consumed, including the transition where prompt progress advances while
+      ``n_decoded`` stays at zero.
+    - ``decode`` once tokens are being generated (``n_decoded > 0``).
+
+    The heuristic is deliberately conservative for very short prefills: a
+    processing slot with no decode signal at all is reported ``prefill``
+    rather than guessed as ``decode``.
+    """
+    if not is_processing:
+        return None
+    try:
+        decoded = int(n_decoded) if n_decoded is not None else 0
+    except (TypeError, ValueError):
+        decoded = 0
+    if decoded > 0:
+        return PHASE_DECODE
+    return PHASE_PREFILL
+
+
+def compute_capacity_hint(slots: list[dict]) -> str:
+    """Summarise whether the local slot pool is genuinely working (AC4).
+
+    Decision table, evaluated **in order**:
+
+    1. ``idle`` — at least one slot is ``free`` **or** every occupied slot is
+       ``idle_leased`` (nothing is actually being generated).
+    2. ``prefill_bound`` — no slot is free and at least one occupied slot is
+       in ``prefill``.
+    3. ``saturated`` — no slot is free and every occupied slot is in
+       ``decode``.
+
+    Two documented extensions cover states the table leaves open: an empty
+    ``slots`` array (server down / no model / no cached detail) is ``idle``
+    (fail-open — never claim saturation with no evidence), and a pool with no
+    free slot, no prefill and mixed ``decode``/``idle_leased`` occupancy is
+    ``saturated`` (genuine decode work with nothing available to a newcomer).
+    """
+    if not slots:
+        return CAPACITY_IDLE
+    states = [str(s.get("lease_state") or LEASE_STATE_FREE) for s in slots]
+    if LEASE_STATE_FREE in states:
+        return CAPACITY_IDLE
+    occupied = [
+        s
+        for s in slots
+        if str(s.get("lease_state") or LEASE_STATE_FREE) != LEASE_STATE_FREE
+    ]
+    if not occupied:
+        return CAPACITY_IDLE
+    if all(str(s.get("lease_state")) == LEASE_STATE_IDLE_LEASED for s in occupied):
+        return CAPACITY_IDLE
+    if any(s.get("phase") == PHASE_PREFILL for s in occupied):
+        return CAPACITY_PREFILL_BOUND
+    if all(s.get("phase") == PHASE_DECODE for s in occupied):
+        return CAPACITY_SATURATED
+    # No free slot, no prefill: either every occupied slot is decoding or the
+    # remaining holders are idle leases alongside a decoding slot. Both mean
+    # the pool is genuinely working with no capacity for a newcomer.
+    if any(str(s.get("lease_state")) == LEASE_STATE_GENERATING for s in occupied):
+        return CAPACITY_SATURATED
+    return CAPACITY_IDLE
+
+
+def _build_status_slot_owners(srv) -> dict[int, dict]:
+    """Map llama-server slot_id -> the dispatch lease reserving it.
+
+    Used by ``/llama/local/status`` to publish a truthful per-slot
+    ``owner_session_id`` / ``lease_state`` (LP-0MVGDUVGE0024YAI AC2). The
+    slot registry (``proxy.session._slot_owners``) binds a session to a
+    llama-server slot id; each owning session's dispatch record carries the
+    lease ``active`` flag and ``expires_at``. Records are normalised through
+    ``_dispatch_key_session_id`` so both legacy bare string keys and
+    per-endpoint ``(endpoint, session_id)`` tuple keys resolve
+    (WL-0MUKY4MAX0008I0L).
+
+    A slot is included only while its lease is live: active, or inactive but
+    still inside its post-stream cooldown (``expires_at`` in the future) — the
+    exact window in which an idle lease holder looks busy to a naive consumer.
+
+    Returns ``{slot_id: {"session_id", "active", "remaining_seconds"}}``;
+    best-effort (never raises), empty when nothing is leased.
+    """
+    try:
+        from proxy.router_helpers import _dispatch_key_session_id
+        from proxy.session import (
+            _slot_key_endpoint,
+            _slot_key_slot_id,
+            _slot_owners,
+        )
+
+        records = dict(getattr(srv, "local_dispatch_records", {}) or {})
+        now = time.monotonic()
+
+        # Normalise the dispatch records to ``session_id -> record``. A
+        # session may carry both a bare and a tuple-keyed record; an active
+        # record wins over an inactive one for the same session.
+        by_session: dict[str, dict] = {}
+        for key, rec in records.items():
+            if not isinstance(rec, dict):
+                continue
+            session_id = _dispatch_key_session_id(key)
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            previous = by_session.get(session_id)
+            if previous is None or (not previous.get("active") and rec.get("active")):
+                by_session[session_id] = rec
+
+        result: dict[int, dict] = {}
+        for key, session_id in list(_slot_owners.items()):
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            slot_id = _slot_key_slot_id(key)
+            if not isinstance(slot_id, int):
+                continue
+            rec = by_session.get(session_id)
+            if not rec:
+                # A slot binding without a dispatch record is a stale
+                # registry entry, not a lease: do not report it as leased.
+                continue
+            remaining = max(0.0, float(rec.get("expires_at", 0) or 0) - now)
+            active = bool(rec.get("active"))
+            if not active and remaining <= 0:
+                continue  # expired lease: the slot is genuinely free
+            endpoint = _slot_key_endpoint(key)
+            # A slot id can be registered on several backends; prefer the
+            # local (empty-endpoint) registry entry for the local status.
+            if slot_id in result and endpoint:
+                continue
+            result[slot_id] = {
+                "session_id": session_id,
+                "active": active,
+                "remaining_seconds": round(remaining, 1),
+            }
+        return result
+    except Exception:
+        return {}
+
+
+def annotate_slots_for_status(
+    slot_details: list[dict],
+    srv,
+    model: str | None,
+    config: dict | None = None,
+    stale: bool = False,
+) -> list[dict]:
+    """Annotate compact ``/slots`` dicts with capacity fields (AC2/AC3/AC5).
+
+    Adds, per slot: ``owner_session_id``, ``lease_state``, ``phase``,
+    ``context_tokens`` and ``prefill_eta_seconds``. Never mutates the input
+    dicts (the per-slot detail cache must stay pristine) and never raises —
+    a failure leaves the base fields intact. Per-slot ETAs are ``None`` when
+    the underlying ``/slots`` poll is stale (AC7) rather than echoing a stale
+    number, and the estimate comes from the shared ``prefill_eta`` calibration
+    (AC3), never a second estimator.
+    """
+    if not slot_details:
+        return []
+    try:
+        from proxy.prefill_eta import per_slot_prefill_eta_seconds
+    except Exception:  # pragma: no cover - defensive
+        per_slot_prefill_eta_seconds = None
+
+    try:
+        owners = _build_status_slot_owners(srv)
+    except Exception:
+        owners = {}
+    try:
+        # Secondary binding: dispatch leases matched to processing slots
+        # (covers a processing slot whose persistence binding is absent).
+        processing_map = _build_slot_to_session_map(srv, slot_details=slot_details)
+    except Exception:
+        processing_map = {}
+
+    annotated: list[dict] = []
+    for slot in slot_details:
+        entry = dict(slot) if isinstance(slot, dict) else {}
+        slot_id = entry.get("slot_id")
+        is_processing = bool(entry.get("is_processing", False))
+
+        owner_session_id = None
+        lease = owners.get(slot_id) if slot_id is not None else None
+        if lease:
+            owner_session_id = lease.get("session_id")
+        elif slot_id in processing_map:
+            owner_session_id = processing_map.get(slot_id)
+
+        phase = infer_slot_phase(
+            is_processing, entry.get("n_decoded"), entry.get("context_tokens")
+        )
+
+        prefill_eta = None
+        if (
+            not stale
+            and per_slot_prefill_eta_seconds is not None
+            and phase == PHASE_PREFILL
+        ):
+            prefill_eta = per_slot_prefill_eta_seconds(
+                model, entry.get("context_tokens"), config
+            )
+
+        entry["owner_session_id"] = owner_session_id
+        entry["lease_state"] = slot_lease_state(is_processing, owner_session_id)
+        entry["phase"] = phase
+        # Always present (defaults to None for pre-change cache entries / builds
+        # that no longer report prompt progress) so the payload contract is stable.
+        entry["context_tokens"] = entry.get("context_tokens")
+        entry["prefill_eta_seconds"] = prefill_eta
+        annotated.append(entry)
+    return annotated
 
 
 def _resolve_slot_details_for_enrichment(slot_details: list[dict] | None) -> list[dict]:

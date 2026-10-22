@@ -504,6 +504,7 @@ When a request arrives for a model with a `providers` list, the proxy tries each
 | `llama_model` | string | local | Name of the local model |
 | `available_times` | list | no | List of `"HH:MM-HH:MM"` UTC windows during which this provider may be used (timed access, see below) |
 | `rate_limit_rpm` | int | no | Maximum dispatches to this entry per rolling 60-second window (free-tier request budget — see [Free-tier request budgets](#free-tier-request-budgets-rate_limit_rpm)) |
+| `budget` | dict | no | Per-**entry** behaviour override for the free-tier budget knobs (`reserve_ratio`, `wait_max_seconds`, `max_waiters`, `affinity_ttl_seconds`) — wins over the model block and the `server.*` defaults, see [Per-model and per-entry budget knobs](#per-model-and-per-entry-budget-knobs-budget) |
 | `max_context_tokens` | int | no | Maximum estimated prompt context the entry may serve. A request estimated above it skips the entry and falls through to the next provider — a size mismatch, not a failure (no cooldown/affinity/queue side effects). Absent/`0` = ungated. Shipped values are sourced — see [Per-entry context limits](#per-entry-context-limits-max_context_tokens) (LP-0MVF9N2QL001CDA7, LP-0MVF9N31A0006VH5) |
 | `display_name` | string | no | Human-readable tier label for the X-Resolved-Model header (e.g. `MunitoAI Free`, `OpenCode Go 3`). Overrides the `provider` brand in the display string only — failure-domain, cooldown and usage-limit keying still use `provider`. Use it to distinguish same-brand tiers/accounts (LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62). |
 
@@ -517,7 +518,7 @@ retrying into it:
 - while the rolling 60-second window has capacity the entry is used normally;
 - a fraction of the window (`server.provider_rate_limit_reserve_ratio`,
   default `0.3`) is **reserved for in-progress sessions**: a **new** session may
-  use at most `rate_limit_rpm - reserve` dispatches (2 of 2 for
+  use at most `rate_limit_rpm - reserve` dispatches (3 of 3 for
   `munitoai-free` — the reserve rounds down, so the current budget has no
   reserved slots) and, once that is spent, skips the entry immediately — it
   never waits, so parked requests cannot compound the contention;
@@ -542,6 +543,47 @@ remaining=<n> reason=rate_limited …` and appear in the exhaustion
         api_key_env: SOME_FREE_KEY
         rate_limit_rpm: 15
 ```
+
+#### Per-model and per-entry budget knobs (`budget`)
+
+The four *behaviour* knobs above are global defaults. Any fallback chain can
+override them with a `budget` block on its model entry, and any provider entry
+with its own `budget` block — **precedence is entry > model > server > built-in
+default**, per knob, so a layer sets only what it cares about
+(LP-0MVDVK5TM004TQQV):
+
+```yaml
+models:
+  plan:
+    budget:
+      reserve_ratio: 0.4        # share of rate_limit_rpm reserved for in-progress
+      wait_max_seconds: 10      # per-request wait cap for in-progress sessions
+      max_waiters: 4            # concurrent waiter cap
+      affinity_ttl_seconds: 600 # how long a session counts as in-progress
+    providers:
+      - name: munitoai-free
+        rate_limit_rpm: 15      # entry-level override of the budget size
+        budget:                 # optional per-entry behaviour override
+          reserve_ratio: 0.2
+```
+
+- All five keys are optional at every layer; absent keys fall through to the
+  next layer, so **existing configs behave exactly as before** (byte-identical
+  `BudgetDecision` values and log lines when no `budget` block is present).
+- Values are clamped/validated exactly as the server-level knobs are (ratio to
+  `[0, 1]`, wait/TTL/waiter counts to `>= 0`); malformed values are logged and
+  fall back to the next layer — fail open, never fail closed.
+- The effective value's **source layer** is visible in the budget skip/wait log
+  lines and the `diagnostics` attempt entries as `budget_source=<knob>@<layer>`
+  (e.g. `budget_source=reserve_ratio@model`); skipped only when server/default
+  supplied every knob.
+- The budget **bucket remains keyed by provider entry**: `plan`, `author` and
+  `code` tuning the same entry still share one `rate_limit_rpm` window (one
+  account quota). Per-model tuning changes *how* a chain treats that shared
+  window, never the size of the window.
+- `models.compact` is *not* budget-gated: the summarizer dispatches to its
+  providers directly and a `budget` block there is accepted but inert until
+  that dispatch is gated (LP-0MVFYYYXS0011T58).
 
 #### Example: Remote Fallback
 
@@ -2409,7 +2451,8 @@ contaminate another session's routing decisions:
 - **Warm** — The session has confirmed cache persistence. Large-context requests
   bypass local at the **effective warm threshold** — the minimum of the
   physical per-slot clamp and a latency-derived economic ceiling
-  (LP-0MU466L1X003RTHN; default effective value: 100K tokens in fast mode).
+  (LP-0MU466L1X003RTHN; default effective value: 120K tokens in fast mode,
+  raised from 100K by LP-0MVHSET0A008VU95).
 - **No session ID** — Falls back to model-level cache state (conservative).
   Sessions without a session_id header default to the same cold behavior.
 
@@ -2430,9 +2473,15 @@ disabled, non-streaming proxy-only mode) does **not** warm the cache.
 
 ```yaml
 local_large_context_cold_cache_threshold: 38000   # fast mode: 38K (was 30K); 0 = disable cold bypass
-local_large_context_warm_cache_threshold: 100000  # absolute warm upper bound; 0 = disable
-local_large_context_economic_ceiling_ratio: 0.3815  # warm economic ceiling = ratio x model ctx
+local_large_context_warm_cache_threshold: 120000  # absolute warm upper bound; 0 = disable
+local_large_context_economic_ceiling_ratio: 0.4578  # warm economic ceiling = ratio x model ctx
 ```
+
+> **These two warm knobs are a co-change** (LP-0MVHSET0A008VU95). The absolute
+> value is only an **upper bound** on the economic ceiling, so setting it above
+> `round(ratio x local_model_ctx_size)` leaves it unused — raising the absolute
+> alone is a silent no-op. `validate_local_routing_config` reports a startup
+> config-consistency warning when the ceiling shadows the configured absolute.
 
 The effective warm threshold is resolved through a **3-term model**
 (LP-0MU466L1X003RTHN):
@@ -2458,8 +2507,8 @@ which does not override it) uses `38000`; `config-cheap.yaml` overrides it to
 raise breached the cheap queue guardrails and was reverted —
 LP-0MSRM54YO007YG0K AC7).
 Each value stays below its mode's effective warm threshold (fast resolves to
-`min(258048, min(round(0.3815 x 262144), 100000)) = 100000`; cheap resolves to
-`min(83285, 100000) = 83285`) so the (cold, warm] band never collapses
+`min(258048, min(round(0.4578 x 262144), 120000)) = 120000`; cheap resolves to
+`min(83285, 120000) = 83285`) so the (cold, warm] band never collapses
 (LP-0MSI2M5BT004BCDP). Prompts above the effective warm threshold are never
 routed local (`context_too_large` — physical capacity).
 
