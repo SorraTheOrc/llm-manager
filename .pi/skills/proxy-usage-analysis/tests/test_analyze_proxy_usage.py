@@ -3317,6 +3317,231 @@ class TestDispatchToFinishBusy:
         assert "40s (1.1%)" in section
 
 
+class TestDecodeStats:
+    """Per-stream local decode (first byte → finish) slot-seconds
+    (LP-0MVJNDOUU0059MMO).
+
+    Decode is measured on the same paired streams as busy, but reported as
+    **slot-seconds** (the sum of the per-stream decode durations — the integral
+    of concurrency), never as wall-clock, so it can be added to the prefill
+    slot-seconds to split phase slot time.
+    """
+
+    def test_concurrent_decode_is_slot_seconds_not_wall_clock(self):
+        """Two concurrent 10 s decodes are 20 slot-seconds of decode work but
+        only 10 s of wall clock."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s2"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None and busy.decode_stats is not None
+        assert busy.decode_stats.total_seconds == pytest.approx(20.0)
+        assert busy.decode_stats.unit == "slot-seconds"
+        # The wall-clock union of the same decodes is only 10 s.
+        assert busy.decode_busy_seconds == pytest.approx(10.0)
+
+    def test_decode_percentiles_use_linear_interpolation(self):
+        """p10/p50/p90/max over the per-stream decode durations, matching the
+        prefill percentiles: 10/20/30/40 s -> 13/25/37/40 s."""
+        streams: list[log_parser.LogEvent] = []
+        for index, decode_s in enumerate((10, 20, 30, 40)):
+            ts = datetime(2026, 8, 2, 14, index, 0)
+            session = f"s{index}"
+            streams.append(_local_event("stream_started", ts, session))
+            streams.append(
+                _local_event("stream_finished", ts + timedelta(seconds=decode_s), session)
+            )
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None and busy.decode_stats is not None
+        stats = busy.decode_stats
+        assert stats.count == 4
+        assert stats.p10 == pytest.approx(13.0)
+        assert stats.p50 == pytest.approx(25.0)
+        assert stats.p90 == pytest.approx(37.0)
+        assert stats.max_seconds == pytest.approx(40.0)
+        assert stats.total_seconds == pytest.approx(100.0)
+
+    def test_unfinished_stream_is_unknown_decode(self):
+        """A stream with no logged finish has unknown decode time: excluded
+        from the percentiles, retained in the stream count."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "aborted"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None and busy.decode_stats is not None
+        assert busy.decode_stats.count == 1
+        assert busy.decode_stats.unknown_count == 1
+        assert busy.decode_stats.stream_count == 2
+        assert busy.decode_stats.total_seconds == pytest.approx(10.0)
+
+    def test_decode_stats_available_without_ttft_events(self):
+        """Decode does not depend on the first-byte lines: with no TTFT events
+        supplied the prefill stats are absent but decode is still reported."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 25), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None
+        assert busy.prefill_stats is None
+        assert busy.decode_stats is not None
+        assert busy.decode_stats.total_seconds == pytest.approx(15.0)
+
+
+class TestPrefillVsDecodeSection:
+    """``## Prefill vs decode`` report section (LP-0MVJNDOUU0059MMO).
+
+    The section splits local phase slot time into prefill (dispatch → first
+    byte) and decode (first byte → finish) as absolute slot-seconds and as a
+    percentage of combined phase slot-time that always sums to 100%, with
+    p10/p50/p90/max per phase, an explicit slot-seconds-not-wall-clock
+    statement, and a named reason plus an eval-timing pointer when no prefill
+    samples exist.
+    """
+
+    @staticmethod
+    def _summary(lines: list[str]) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events(lines), WINDOW_START, WINDOW_END, _schedule()
+        )
+
+    @staticmethod
+    def _section(md: str) -> str:
+        return md.split("## Prefill vs decode", 1)[1].split("\n## ", 1)[0]
+
+    @staticmethod
+    def _row(section: str, label: str) -> list[str]:
+        line = next(
+            ln for ln in section.splitlines() if ln.startswith(f"| {label}")
+        )
+        return [cell.strip() for cell in line.strip("|").split("|")]
+
+    def test_section_splits_phase_slot_seconds_and_sums_to_100_percent(self):
+        """A 30 s prefill + 10 s decode stream reports 30 / 10 slot-seconds
+        and 75.0% / 25.0% of combined phase slot-time."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        summary = self._summary(lines)
+        assert summary.busy is not None
+        section = self._section(reporting.build_report(summary, None))
+        prefill = self._row(section, "Prefill (dispatch → first byte)")
+        decode = self._row(section, "Decode (first byte → finish)")
+        assert prefill[1] == "30s"
+        assert decode[1] == "10s"
+        assert float(prefill[2].rstrip("%")) == pytest.approx(75.0)
+        assert float(decode[2].rstrip("%")) == pytest.approx(25.0)
+        assert float(prefill[2].rstrip("%")) + float(decode[2].rstrip("%")) == pytest.approx(100.0)
+        total = self._row(section, "Total")
+        assert total[1] == "40s"
+        assert total[2] == "100.0%"
+
+    def test_section_states_slot_seconds_not_wall_clock(self):
+        """The header must say the figures are slot-seconds (the integral of
+        concurrency), not wall-clock."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        section = self._section(reporting.build_report(self._summary(lines), None))
+        flattened = " ".join(section.split())
+        assert "slot-seconds" in flattened
+        assert "integral of concurrency" in flattened
+        assert "not wall-clock" in flattened
+
+    def test_section_reports_prefill_and_decode_percentiles(self):
+        """p10/p50/p90/max are reported per phase over the per-stream samples."""
+        lines: list[str] = []
+        for index, prefill_s in enumerate((10, 20, 30, 40)):
+            ts = f"2026-08-02 14:0{index}:00,000"
+            lines.append(
+                f"{ts} - INFO - Stream started: provider=local model=Qwen3 session=s{index} request=[]"
+            )
+            lines.append(
+                "2026-08-02 14:0" + str(index) + ":59,000 - INFO - Stream finished: "
+                f"reason=stop tokens=100/10/110 session=s{index} provider=local model=Qwen3 request=[]"
+            )
+            lines.append(
+                f"{ts} - INFO - dispatch_first_byte_ms={prefill_s * 1000.0} "
+                f"dispatch_to_first_byte_ms={prefill_s * 1000.0} cache_state=warm "
+                f"cached_ratio=0.900 queue_wait_ms=0.0 session=s{index} model=Qwen3"
+            )
+        section = self._section(reporting.build_report(self._summary(lines), None))
+        prefill = self._row(section, "Prefill (dispatch → first byte)")
+        decode = self._row(section, "Decode (first byte → finish)")
+        # p10, median, p90, max, samples
+        assert [float(v) for v in prefill[3:7]] == [13.0, 25.0, 37.0, 40.0]
+        assert prefill[7] == "4"
+        assert [float(v) for v in decode[3:7]] == [59.0, 59.0, 59.0, 59.0]
+        assert decode[7] == "4"
+
+    def test_section_without_prefill_samples_names_reason_and_eval_timing_pointer(self):
+        """With no first-byte lines the section prints a named reason and
+        points at the llama-server eval-timing diagnostic instead of leaving an
+        unattributed blank; decode is still attributed."""
+        lines = [
+            "2026-08-02 14:00:10,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:20,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        section = self._section(reporting.build_report(self._summary(lines), None))
+        assert "No prefill samples" in section
+        assert "unknown prefill" in section
+        assert "`## Decode speed` / `## Prompt eval speed`" in section
+        assert "eval-timing" in section
+        prefill = self._row(section, "Prefill (dispatch → first byte)")
+        decode = self._row(section, "Decode (first byte → finish)")
+        assert prefill[1] == "-" and prefill[2] == "-"
+        assert decode[1] == "10s" and decode[2] == "100.0%"
+
+    def test_section_with_no_local_traffic_renders_named_reason(self):
+        """An empty window prints a named reason rather than an empty table."""
+        section = self._section(
+            reporting.build_report(self._summary([]), None)
+        )
+        assert "No local traffic" in section
+        assert section.count("|") == 0
+
+    def test_json_summary_exposes_phase_split(self):
+        """The machine-readable summary carries the same phase split."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        data = reporting.summary_to_json(self._summary(lines))
+        phase = data["local_busy"]["prefill_vs_decode"]
+        assert phase["unit"] == "slot-seconds"
+        assert phase["prefill"]["slot_seconds"] == pytest.approx(30.0)
+        assert phase["prefill"]["pct"] == pytest.approx(75.0)
+        assert phase["decode"]["slot_seconds"] == pytest.approx(10.0)
+        assert phase["decode"]["pct"] == pytest.approx(25.0)
+        assert phase["prefill"]["samples"] == 1
+        assert phase["decode"]["samples"] == 1
+        json.dumps(data)
+
+
 class TestSummaryByHourActivity:
     """Per-hour activity columns in the top-of-report ``## Summary by hour``
     table (LP-0MTYAZFGN003BYQS).

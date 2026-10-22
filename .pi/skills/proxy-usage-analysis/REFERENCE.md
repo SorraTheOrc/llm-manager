@@ -123,7 +123,12 @@ Outputs written to:
   `hourly_session_classification`, all keyed by absolute hour, **Local model
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
-  fast/cheap split — when the window has local traffic), **Time to first
+  fast/cheap split — when the window has local traffic) followed by
+  **Prefill vs decode** (phase slot-time split: prefill dispatch → first byte
+  vs decode first byte → finish, each as slot-seconds and % of combined phase
+  slot time summing to 100%, with p10/p50/p90/max per phase and unknown-stream
+  counts; the `--json` summary exposes it as `local_busy.prefill_vs_decode`),
+  **Time to first
   token** (p10 / median / p90 of dispatch → first-token latency, split into
   **Total / Fast / Cheap** rows using the same mode-aware session bucketing as
   the other breakdowns, from local `dispatch_first_byte_ms=` and remote
@@ -306,6 +311,26 @@ entry is a local runtime edit, not a committed artifact.
    `window_start` keeps its full duration and a first byte after
    `window_end` belongs to the next window (no double counting).
    `prefill_stats` is `None` only when the caller supplied no TTFT events.
+   **Decode statistics** (LP-0MVJNDOUU0059MMO) are computed in the same pass
+   on the same paired local streams, without needing TTFT events:
+   `BusyStats.decode_stats` (`DecodeStats`) holds one `DecodeSample` per
+   stream whose `Stream started` (first byte) falls in the window, with the
+   duration `Stream finished` − `Stream started`. Like prefill it is
+   **slot-seconds, not wall-clock** (`unit`), attributed by first-byte
+   timestamp and not clipped; a stream with no logged finish is unknown
+   decode (excluded from the percentiles, retained in `stream_count`).
+   `PrefillStats` and `DecodeStats` share the `SlotSecondsStats` base
+   (samples, percentiles, `total_seconds`, `unknown_count`), so the two
+   phases are directly additive: the `## Prefill vs decode` section
+   (LP-0MVJNDOUU0059MMO) splits local phase slot time into prefill and decode
+   as absolute slot-seconds and as a percentage of combined phase slot-time
+   that always sums to 100%, with p10/p50/p90/max per phase and an explicit
+   slot-seconds-not-wall-clock statement. A window with no prefill samples
+   prints a named reason and points at the `## Decode speed` /
+   `## Prompt eval speed` eval-timing diagnostic rather than leaving an
+   unattributed blank (a window with no local traffic prints a named "no
+   local traffic" reason). The same split is in the JSON summary at
+   `local_busy.prefill_vs_decode`.
 5. **Fast/cheap bucketing** — each session is bucketed by the **operating
    mode** active at its first in-window stream, reconstructed from the
    `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
@@ -415,7 +440,13 @@ entry is a local runtime edit, not a committed artifact.
   least one local slot occupied **from dispatch to finish** (prefill +
   decode, LP-0MVJN9H2I00116FP); the retained decode-only figure is its
   labelled lower bound, and a stream with no first-byte line never inflates
-  it. A low busy % with high fallback volume
+  it. The **Prefill vs decode** section then splits the *phase* slot time
+  into prefill (dispatch → first byte) and decode (first byte → finish) as
+  slot-seconds and as a share of combined phase slot time (always 100%
+  together, LP-0MVJNDOUU0059MMO) — read it for where slot time goes (prefill
+  rarely dominates at 46% local occupancy, but it does on large cold
+  prompts), not for window occupancy: phase slot-seconds sum per-stream
+  durations and are not comparable with the wall-clock busy %. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
   fallback reasons), not that local is underprovisioned. The **Summary by
   hour** table at the top of the report shows per-hour busy % and per-hour

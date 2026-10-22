@@ -463,6 +463,7 @@ def build_report(
     _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
 
     _append_busy_section(ap, summary, schedule)
+    _append_prefill_vs_decode_section(ap, summary)
 
     _append_mode_timeline_section(ap, summary, mode_map)
 
@@ -1266,6 +1267,139 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
        "follows the slot schedule.")
 
 
+def _phase_cell(value: float | None) -> str:
+    """Format a slot-seconds percentile (``-`` when there are no samples)."""
+    return f"{value:.1f}" if value is not None else "-"
+
+
+def _phase_row(
+    label: str,
+    stats: aggregation.SlotSecondsStats | None,
+    pct: float,
+) -> str:
+    """One phase row of the ``## Prefill vs decode`` table."""
+    if stats is None or not stats.has_samples:
+        return f"| {label} | - | - | - | - | - | - | 0 |"
+    return (
+        f"| {label} | {_fmt_duration(stats.total_seconds)} | {pct:.1f}% | "
+        f"{_phase_cell(stats.p10)} | {_phase_cell(stats.p50)} | "
+        f"{_phase_cell(stats.p90)} | {_phase_cell(stats.max_seconds)} | "
+        f"{stats.count} |"
+    )
+
+
+def _phase_split(busy: aggregation.BusyStats) -> tuple[float, float, float, float]:
+    """``(prefill_total, decode_total, combined, prefill_pct)`` in slot-seconds.
+
+    ``combined`` is the measured phase slot-time (prefill + decode) and the
+    returned prefill percentage is its complement-base, so
+    ``prefill_pct + (100 - prefill_pct) == 100`` exactly.
+    """
+    prefill = busy.prefill_stats
+    decode = busy.decode_stats
+    prefill_total = prefill.total_seconds if prefill is not None else 0.0
+    decode_total = decode.total_seconds if decode is not None else 0.0
+    combined = round(prefill_total + decode_total, 1)
+    prefill_pct = round(prefill_total / combined * 100.0, 1) if combined else 0.0
+    return prefill_total, decode_total, combined, prefill_pct
+
+
+def _append_prefill_vs_decode_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Prefill vs decode`` section to the report.
+
+    Splits local phase **slot time** into prefill (dispatch → first byte) and
+    decode (first byte → finish), each as an absolute slot-seconds total and as
+    a percentage of the combined phase slot-time (always summing to 100%),
+    with p10/p50/p90/max per phase (LP-0MVJNDOUU0059MMO). Every figure is
+    slot-seconds — the integral of concurrency — never wall-clock, which the
+    header states explicitly. A window without prefill samples prints a named
+    reason and points at the llama-server eval-timing diagnostic instead of
+    leaving an unattributed blank; a window without local traffic prints a
+    named "no local traffic" reason.
+    """
+    ap("")
+    ap("## Prefill vs decode")
+    ap("")
+    busy = summary.busy
+    if busy is None:
+        ap(
+            "_No local traffic in window: no local slot time to attribute to "
+            "prefill or decode._"
+        )
+        return
+    ap(
+        "Where local slot time goes, by phase. Every figure here is "
+        "**slot-seconds** — the integral of concurrency (the sum of the "
+        "per-stream phase durations), **not wall-clock**: two concurrent 10 s "
+        "prefills are 20 slot-seconds but only 10 s of wall clock. The phase "
+        "totals are therefore not comparable with the wall-clock busy/idle "
+        "figures in `## Local model utilization`."
+    )
+    ap("")
+    ap(
+        "| Phase | Slot-seconds | % of phase slot-time | p10 (s) | Median (s) "
+        "| p90 (s) | Max (s) | Samples |"
+    )
+    ap("|---|---|---|---|---|---|---|---|")
+    prefill = busy.prefill_stats
+    decode = busy.decode_stats
+    _prefill_total, _decode_total, combined, prefill_pct = _phase_split(busy)
+    decode_pct = round(100.0 - prefill_pct, 1) if combined else 0.0
+    ap(_phase_row("Prefill (dispatch → first byte)", prefill, prefill_pct))
+    ap(_phase_row("Decode (first byte → finish)", decode, decode_pct))
+    known = (prefill.count if prefill is not None else 0) + (
+        decode.count if decode is not None else 0
+    )
+    total_pct = "100.0%" if combined else "-"
+    ap(f"| Total | {_fmt_duration(combined)} | {total_pct} | - | - | - | - | {known} |")
+    ap("")
+    ap(
+        "Percentages are of the combined measured phase slot-time (prefill + "
+        "decode) and always sum to 100.0%. A phase the logs cannot measure is "
+        "excluded from the percentiles and totals rather than counted as 0 s."
+    )
+    unknown_parts: list[str] = []
+    if prefill is not None and prefill.unknown_count:
+        unknown_parts.append(f"{prefill.unknown_count} unknown prefill")
+    if decode is not None and decode.unknown_count:
+        unknown_parts.append(
+            f"{decode.unknown_count} unknown decode (no `Stream finished`)"
+        )
+    if unknown_parts:
+        ap("")
+        ap(
+            "_Unknown phase durations (aborted or still-running streams): "
+            f"{', '.join(unknown_parts)}; they are excluded from the "
+            "percentiles and totals rather than counted as 0 s._"
+        )
+    if prefill is None or not prefill.has_samples:
+        if prefill is None:
+            reason = (
+                "no local TTFT events were supplied to the analysis, so no "
+                "`dispatch_first_byte_ms` first-byte line was available"
+            )
+        else:
+            reason = (
+                f"none of the {prefill.stream_count} local stream(s) carried "
+                "a `dispatch_first_byte_ms` first-byte line "
+                f"({prefill.unknown_count} unknown prefill)"
+            )
+        if combined:
+            tail = (
+                f"the decode figures above are {decode_pct:.1f}% of measured "
+                "phase slot-time only"
+            )
+        else:
+            tail = "no phase slot time could be measured"
+        ap("")
+        ap(
+            f"_No prefill samples in window — {reason}. Prefill slot-time is "
+            f"unattributed; {tail}. For the llama-server-side breakdown see "
+            "the `## Decode speed` / `## Prompt eval speed` eval-timing "
+            "diagnostic sections._"
+        )
+
+
 def _fmt_tokens(n: int) -> str:
     """Format a token count with comma separators."""
     return f"{n:,}"
@@ -1789,6 +1923,50 @@ def _ttft_json(
     }
 
 
+def _phase_json(stats: aggregation.SlotSecondsStats | None) -> dict:
+    """JSON-friendly slot-seconds statistics for one local phase.
+
+    Absent stats render as zeros/Nones (no samples), never as a missing key, so
+    a JSON consumer can always read ``prefill`` and ``decode``.
+    """
+    if stats is None:
+        return {
+            "slot_seconds": 0.0,
+            "pct": 0.0,
+            "samples": 0,
+            "unknown_streams": 0,
+            "p10": None,
+            "p50": None,
+            "p90": None,
+            "max_seconds": None,
+        }
+    return {
+        "slot_seconds": stats.total_seconds,
+        "pct": 0.0,  # filled by :func:`_prefill_vs_decode_json`
+        "samples": stats.count,
+        "unknown_streams": stats.unknown_count,
+        "p10": stats.p10,
+        "p50": stats.p50,
+        "p90": stats.p90,
+        "max_seconds": stats.max_seconds,
+    }
+
+
+def _prefill_vs_decode_json(busy: aggregation.BusyStats) -> dict:
+    """Machine-readable phase slot-time split (LP-0MVJNDOUU0059MMO)."""
+    _prefill_total, _decode_total, combined, prefill_pct = _phase_split(busy)
+    prefill = _phase_json(busy.prefill_stats)
+    decode = _phase_json(busy.decode_stats)
+    prefill["pct"] = prefill_pct
+    decode["pct"] = round(100.0 - prefill_pct, 1) if combined else 0.0
+    return {
+        "unit": aggregation.SLOT_SECONDS_UNIT,
+        "combined_slot_seconds": combined,
+        "prefill": prefill,
+        "decode": decode,
+    }
+
+
 def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
     """JSON-friendly local-model utilization summary (None when no local traffic)."""
     if busy is None:
@@ -1814,6 +1992,9 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
             {"hour": _fmt_ts(hour), "seconds": seconds}
             for hour, seconds in busy.hourly_busy
         ],
+        # Phase slot-time split (LP-0MVJNDOUU0059MMO): prefill vs decode as
+        # slot-seconds and % of combined phase slot-time (sums to 100%).
+        "prefill_vs_decode": _prefill_vs_decode_json(busy),
     }
 
 

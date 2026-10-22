@@ -41,11 +41,16 @@ from log_parser import (
 
 UNKNOWN_LABEL = "(unknown)"
 
-# Unit of the prefill figures on :class:`PrefillStats` and
-# :attr:`BusyStats.prefill_stats` (LP-0MVJN45LF009CO2V). Prefill is reported as
+# Unit of the slot-seconds figures on :class:`SlotSecondsStats` (and its
+# :class:`PrefillStats` / :class:`DecodeStats` subclasses) and on
+# :attr:`BusyStats.prefill_stats` / :attr:`BusyStats.decode_stats`
+# (LP-0MVJN45LF009CO2V, LP-0MVJNDOUU0059MMO). A phase is reported as
 # slot-seconds — the integral of concurrency, i.e. the sum of the per-stream
-# dispatch → first-byte durations — which is NOT wall-clock elapsed time.
-PREFILL_UNIT = "slot-seconds"
+# phase durations — which is NOT wall-clock elapsed time.
+SLOT_SECONDS_UNIT = "slot-seconds"
+
+# Back-compat alias for the original prefill-only name (LP-0MVJN45LF009CO2V).
+PREFILL_UNIT = SLOT_SECONDS_UNIT
 
 # Busy definition (LP-0MVJN9H2I00116FP). Local "busy" is at least one local slot
 # occupied **from dispatch to finish** (prefill + decode), not decode only: the
@@ -410,56 +415,75 @@ class PrefillSample:
 
 
 @dataclass(frozen=True)
-class PrefillStats:
-    """Per-stream local prefill (dispatch → first byte) statistics.
+class DecodeSample:
+    """One local stream's decode (first byte → finish) measurement.
 
-    Every figure here is **slot-time, not wall-clock**: ``total_seconds`` is
-    the sum of the per-stream prefill durations (the total prefill *work*), so
-    two concurrent 10 s prefills contribute 20 slot-seconds while occupying
-    only 10 s of wall clock. It is therefore deliberately distinct from the
-    wall-clock union reported as :attr:`BusyStats.busy_seconds` and must not
-    be compared against it.
-
-    ``streams`` holds one :class:`PrefillSample` per local stream (in stream
-    order). Streams whose first-byte line is missing are **unknown prefill**:
-    they are excluded from ``samples`` and from the percentiles, but retained
-    in ``streams``/``stream_count`` so the unknown prefill is visible rather
-    than silently dropped.
+    ``seconds`` is ``None`` for an unknown decode — a stream with no logged
+    ``Stream finished`` line (aborted or still running), so its decode time is
+    unknown rather than zero. ``session`` keeps the pairing attributable per
+    stream.
     """
 
-    streams: tuple[PrefillSample, ...] = ()
-    unit: str = PREFILL_UNIT
+    session: str | None
+    seconds: float | None
+
+    @property
+    def known(self) -> bool:
+        """Whether this stream's decode duration is observable."""
+        return self.seconds is not None
+
+
+@dataclass(frozen=True)
+class SlotSecondsStats:
+    """Shared slot-seconds statistics for one local phase.
+
+    Every figure here is **slot-time, not wall-clock**: ``total_seconds`` is
+    the sum of the per-stream phase durations (the total phase *work*), so two
+    concurrent 10 s prefills contribute 20 slot-seconds while occupying only
+    10 s of wall clock. Phase totals are therefore deliberately distinct from
+    the wall-clock unions on :class:`BusyStats` and must not be compared
+    against them.
+
+    ``streams`` holds one sample per local stream (in stream order). Streams
+    whose phase duration cannot be observed are **unknown**: excluded from
+    ``samples`` and the percentiles, but retained in
+    ``streams``/``stream_count`` so the unknown time is visible rather than
+    silently dropped.
+    """
+
+    streams: tuple[PrefillSample | DecodeSample, ...] = ()
+    unit: str = SLOT_SECONDS_UNIT
 
     @property
     def samples(self) -> tuple[float, ...]:
-        """Known per-stream prefill durations in seconds (percentile input)."""
+        """Known per-stream phase durations in seconds (percentile input)."""
         return tuple(s.seconds for s in self.streams if s.seconds is not None)
 
     @property
     def count(self) -> int:
-        """Number of streams with an observable prefill duration."""
+        """Number of streams with an observable phase duration."""
         return len(self.samples)
 
     @property
     def unknown_count(self) -> int:
-        """Number of streams whose prefill could not be observed."""
+        """Number of streams whose phase duration could not be observed."""
         return sum(1 for stream in self.streams if not stream.known)
 
     @property
     def stream_count(self) -> int:
-        """All local streams considered: known prefill + unknown prefill."""
+        """All local streams considered: known + unknown phase duration."""
         return len(self.streams)
 
     @property
     def has_samples(self) -> bool:
-        """Whether any stream had an observable prefill duration."""
+        """Whether any stream had an observable phase duration."""
         return self.count > 0
 
     @property
     def total_seconds(self) -> float:
-        """Window total prefill in slot-seconds (sum of per-stream prefill).
+        """Window total in slot-seconds (sum of the per-stream durations).
 
-        This is total prefill *work*, not the wall-clock union of the prefill
+        This is total phase *work*, not the wall-clock union of the phase
         intervals (see the class docstring).
         """
         return round(sum(self.samples), 1)
@@ -479,6 +503,28 @@ class PrefillStats:
     @property
     def max_seconds(self) -> float | None:
         return round(max(self.samples), 1) if self.samples else None
+
+
+@dataclass(frozen=True)
+class PrefillStats(SlotSecondsStats):
+    """Per-stream local prefill (dispatch → first byte) statistics.
+
+    See :class:`SlotSecondsStats` for the shared slot-seconds semantics. A
+    stream whose first-byte line is missing is **unknown prefill**.
+    """
+
+    streams: tuple[PrefillSample, ...] = ()
+
+
+@dataclass(frozen=True)
+class DecodeStats(SlotSecondsStats):
+    """Per-stream local decode (first byte → finish) statistics.
+
+    See :class:`SlotSecondsStats` for the shared slot-seconds semantics. A
+    stream with no logged ``Stream finished`` line is **unknown decode**.
+    """
+
+    streams: tuple[DecodeSample, ...] = ()
 
 
 @dataclass
@@ -533,6 +579,11 @@ class BusyStats:
     # that never asked for prefill is distinguishable from one that found no
     # first-byte lines (an empty :class:`PrefillStats`).
     prefill_stats: PrefillStats | None = None
+    # Per-stream local decode (first byte → finish) statistics
+    # (LP-0MVJNDOUU0059MMO). Populated alongside ``prefill_stats`` so the
+    # report can split phase slot time; unlike prefill it needs no TTFT
+    # events, so it is present whenever there is local traffic.
+    decode_stats: DecodeStats | None = None
     # Decode-only busy union (``Stream started`` → ``Stream finished``),
     # clipped to the window — the lower bound of the busy figure
     # (LP-0MVJN9H2I00116FP). It is what the report called "busy" before the
@@ -941,6 +992,14 @@ def compute_busy_stats(
     only when ``ttft_events`` was not supplied at all — in that case every
     busy interval falls back to its decode interval, so ``busy_seconds`` and
     ``decode_busy_seconds`` coincide.
+
+    ``decode_stats`` (:class:`DecodeStats`, LP-0MVJNDOUU0059MMO) reports the
+    same paired streams' decode durations (first byte → finish) as
+    slot-seconds with p10/p50/p90/max, attributed to the window containing the
+    stream's first byte and not clipped (matching the prefill samples), so the
+    report can split phase slot time into prefill vs decode. It needs no TTFT
+    events, so it is present whenever local traffic exists; streams without a
+    logged finish are unknown decode.
     """
     started: dict[str, list[LogEvent]] = {}
     finished: dict[str, list[LogEvent]] = {}
@@ -969,6 +1028,7 @@ def compute_busy_stats(
 
     intervals: list[tuple[datetime, datetime]] = []
     decode_intervals: list[tuple[datetime, datetime]] = []
+    decode_samples: list[DecodeSample] = []
     prefill_extended = 0
     unfinished = 0
     pre_window_unfinished = 0
@@ -981,6 +1041,17 @@ def compute_busy_stats(
             d_lo, d_hi = max(start_ev.ts, window_start), min(finish_ev.ts, window_end)
             if d_hi > d_lo:
                 decode_intervals.append((d_lo, d_hi))
+            # Decode slot-seconds (LP-0MVJNDOUU0059MMO): the per-stream
+            # duration, attributed to the window containing its first byte
+            # (``Stream started``) and not clipped — matching the prefill
+            # sample attribution, so both phases cover the same streams.
+            if window_start <= start_ev.ts <= window_end:
+                decode_samples.append(
+                    DecodeSample(
+                        session=session_id,
+                        seconds=max(0.0, (finish_ev.ts - start_ev.ts).total_seconds()),
+                    )
+                )
             # Busy interval (dispatch → finish): the same pair extended back to
             # its measured dispatch time when a first-byte line exists.
             measured_dispatch = dispatch_start.get(id(start_ev))
@@ -1002,6 +1073,9 @@ def compute_busy_stats(
                 pre_window_unfinished += 1
             elif start_ev.ts <= window_end:
                 unfinished += 1
+                # No finish line: the decode duration is unknown, not zero.
+                if window_start <= start_ev.ts:
+                    decode_samples.append(DecodeSample(session=session_id, seconds=None))
     prefill_stats = (
         _compute_prefill_stats(matches, window_start, window_end)
         if ttft_list is not None
@@ -1077,6 +1151,7 @@ def compute_busy_stats(
         cheap_window_seconds=round(cheap_window, 1),
         hourly_busy=sorted(hourly.items()),
         prefill_stats=prefill_stats,
+        decode_stats=DecodeStats(streams=tuple(decode_samples)),
         decode_busy_seconds=round(decode_busy, 1),
         decode_fast_busy_seconds=round(decode_bucket_busy.get("fast", 0.0), 1),
         decode_cheap_busy_seconds=round(decode_bucket_busy.get("cheap", 0.0), 1),
