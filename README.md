@@ -99,6 +99,17 @@ Testing
   ```
   Prefer `/skill:test` above; the direct command bypasses the cache.
 
+Git hooks
+- Activate the committed hooks once per clone (idempotent):
+  ```
+  scripts/install_git_hooks.sh          # sets core.hooksPath=.githooks
+  scripts/install_git_hooks.sh --check  # verify
+  ```
+  `.githooks/pre-push` runs the **full test suite** on every push to
+  `dev`/`main` and refuses a red push; feature-branch pushes skip the suite.
+  See [docs/dev/git-hooks.md](docs/dev/git-hooks.md) for bypass knobs,
+  timeouts, and a stdin based push simulation.
+
 #### Persistence-cap integration tests
 
 The following test modules exercise the persistence-cap pin fix (LP-0MTIFR5W3006UAX8 / LP-0MTE9HAF8008909G):

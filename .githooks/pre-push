@@ -1,13 +1,24 @@
 #!/bin/sh
-# worklog:pre-push-hook:v2
-# 1. Auto-sync Worklog data before pushing (committed hooks).
-# 2. Enforce branch naming policy: block pushes to protected branches.
-# 3. Context-budget regression gate (F6, SA-0MSLK7XNZ00366YY): fail the push
+# worklog:pre-push-hook:v3
+# 1. Enforce branch naming policy: block pushes to protected branches.
+# 2. Context-budget regression gate (F6, SA-0MSLK7XNZ00366YY): fail the push
 #    when the startup context surface exceeds committed thresholds.
+# 3. Scope-aware full-suite gate (LP-0MVFFJWPW007ZEPK, v3-equivalent of
+#    SA-0MT6CEN8D0073F61): run the FULL suite when pushing to
+#    refs/heads/dev|main; feature-branch pushes skip test execution
+#    (implementation validated changed-scope only; the full suite first runs
+#    at this dev-push integration gate — SA-0MVECQUGF0064U81). The runner is
+#    resolved repo-local first, then the global pi skill install, because this
+#    repo ships no repo-local skill/ tree.
+# 4. Auto-sync Worklog data before pushing (committed hooks).
 #
 # Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
 # Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).
 # Set CONTEXT_BUDGET_SKIP=1 to bypass the context-budget gate (not recommended).
+# Set TEST_SCOPE_SKIP=1 to bypass the full-suite gate (not recommended).
+#
+# Installed (and verified) by scripts/install_git_hooks.sh; see
+# docs/dev/git-hooks.md.
 set -e
 
 # ── Branch policy enforcement ────────────────────────────────────────────────
@@ -61,6 +72,97 @@ if [ "$CONTEXT_BUDGET_SKIP" != "1" ]; then
   fi
 fi
 
+# ── stdin capture + scope-aware full-suite gate ─────────────────────────────
+# git feeds one line per pushed ref on stdin:
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>
+# Read every line ONCE (stdin is consumed by the first reader) and capture the
+# push targets used by both the test gate and the worklog sync below.
+need_full_suite=0
+skip_worklog_sync=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "$remote_ref" ] || continue
+  case "$remote_ref" in
+    refs/heads/dev|refs/heads/main) need_full_suite=1 ;;
+    refs/worklog/data) skip_worklog_sync=1 ;;
+  esac
+done
+
+# Mirror the test-runner cache entries written by a gate run into the main
+# checkout's cache. The runner caches per git state under
+# <repo>/.worklog/cache (else <git-dir>/test-cache when the repo has no
+# .worklog). implement.py pushes from linked worktrees, which have no
+# .worklog — a gate run there caches into the worktree's private git dir
+# (<main>/.git/worktrees/<name>/test-cache), invisible to the main
+# checkout's post-push verification and the audit skill. Copy any entries the
+# fresh main checkout does not yet have (keys are content-addressed, so an
+# identical key is an identical run). Fail-soft: cache plumbing must never
+# decide the push's outcome.
+mirror_suite_cache() {
+  wt_root="$1"
+  git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+  [ -n "$git_dir" ] && [ -d "$git_dir" ] || return 0
+  if [ -d "$wt_root/.worklog" ]; then
+    wt_cache="$wt_root/.worklog/cache"
+  else
+    wt_cache="$git_dir/test-cache"
+  fi
+  [ -d "$wt_cache" ] && [ -n "$(ls -A "$wt_cache" 2>/dev/null)" ] || return 0
+  common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  case "$common_dir" in
+    /*) main_git_dir="$common_dir" ;;
+    *) main_git_dir="$(cd "$wt_root" && pwd)/$common_dir" ;;
+  esac
+  main_root="$(dirname "$main_git_dir")"
+  [ "$main_root" != "$wt_root" ] || return 0
+  main_cache="$main_root/.worklog/cache"
+  [ -d "$main_cache" ] || return 0
+  for entry in "$wt_cache"/*; do
+    [ -d "$entry" ] || continue
+    name="$(basename "$entry")"
+    [ -e "$main_cache/$name" ] && continue
+    if cp -a "$entry" "$main_cache/$name" 2>/dev/null; then
+      echo "pre-push: mirrored gate cache entry $name into $main_root/.worklog/cache" >&2
+    else
+      echo "pre-push: warning: could not mirror cache entry $name into $main_root/.worklog/cache" >&2
+    fi
+  done
+  return 0
+}
+
+# Full-suite gate for pushes targeting dev/main (release gates). Partial
+# runs are never full-suite evidence, so the gate always runs scope=full.
+if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  runner=""
+  if [ -n "$repo_root" ] && [ -f "$repo_root/skill/test/scripts/run_tests.py" ]; then
+    runner="$repo_root/skill/test/scripts/run_tests.py"
+  elif [ -f "$HOME/.pi/agent/skills/test/scripts/run_tests.py" ]; then
+    runner="$HOME/.pi/agent/skills/test/scripts/run_tests.py"
+  fi
+  if [ -n "$repo_root" ] && [ -n "$runner" ] && [ -f "$runner" ]; then
+    echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full --strict-git-env (this can take a while on a cold cache)" >&2
+    suite_log="$(mktemp 2>/dev/null || echo "/tmp/pre-push-suite.$$")"
+    if python3 "$runner" --scope full --strict-git-env --project-root "$repo_root" --json >"$suite_log" 2>&1; then
+      echo "pre-push: full suite green (cached runs make repeat pushes cheap)" >&2
+      mirror_suite_cache "$repo_root"
+    else
+      echo "ERROR: Full test suite failed — pushes to dev/main require a green suite." >&2
+      echo "  Run: python3 \"$runner\" --scope full  (or implement.py finish) and fix failures." >&2
+      echo "  Set TEST_SCOPE_SKIP=1 to bypass (not recommended)." >&2
+      echo "  Runner output (last 40 lines):" >&2
+      tail -n 40 "$suite_log" | sed 's/^/    /' >&2 || true
+      rm -f "$suite_log"
+      exit 1
+    fi
+    rm -f "$suite_log"
+  else
+    echo "ERROR: no test runner found — cannot run the full-suite gate for a dev/main push." >&2
+    echo "  Install the pi test skill (run_tests.py at ~/.pi/agent/skills/test/scripts/run_tests.py)" >&2
+    echo "  or a repo-local skill/test/scripts/run_tests.py. Set TEST_SCOPE_SKIP=1 to bypass (not recommended)." >&2
+    exit 1
+  fi
+fi
+
 # ── Worklog sync ─────────────────────────────────────────────────────────────
 if [ "$WORKLOG_SKIP_PRE_PUSH" = "1" ]; then
   echo "worklog: pre-push sync skipped (WORKLOG_SKIP_PRE_PUSH=1)"
@@ -83,16 +185,7 @@ if [ "$(git rev-parse --git-dir 2>/dev/null)" != "$(git rev-parse --git-common-d
   exit 0
 fi
 
-# Read stdin to check which refs are being pushed.
-# If pushing to refs/worklog/data, skip the sync to avoid infinite loops.
-skip=0
-while read local_ref local_sha remote_ref remote_sha; do
-  if [ "$remote_ref" = "refs/worklog/data" ]; then
-    skip=1
-  fi
-done
-
-if [ "$skip" = "1" ]; then
+if [ "$skip_worklog_sync" = "1" ]; then
   exit 0
 fi
 
