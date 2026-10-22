@@ -2,21 +2,18 @@
 set -euo pipefail
 
 # Start the proxy application
-# Usage: ./scripts/start-proxy.sh [--restart] [--reason "<text>"] [--verbose] [--use-env-keys] [--foreground] [--log-file <path>] [uvicorn-args...]
+# Usage: ./scripts/start-proxy.sh [--restart] [--keep-llama-server] [--reason "<text>"] [--verbose] [--use-env-keys] [--foreground] [--log-file <path>] [uvicorn-args...]
 #
 # Flags:
 #   --foreground
-#               Run uvicorn in the foreground (today's blocking `exec`) for
-#               interactive debugging. By DEFAULT the script validates, then
-#               detaches uvicorn into its own session/process group with its
-#               stdout/stderr redirected to a log file, prints a single handoff
-#               line and exits 0 (LP-0MVGT0E6W000Q8CY). A launcher killed by an
-#               agent tool-call timeout (which SIGKILLs the whole process group)
-#               therefore cannot take the server down. Unattended callers that
-#               cannot pass flags may set START_PROXY_FOREGROUND=1 instead.
+#               Blocking `exec` of uvicorn for interactive debugging. DEFAULT:
+#               validate, then detach uvicorn into its own session with stdio in
+#               a log file, print one handoff line and exit 0 — a launcher killed
+#               by an agent tool-call timeout can then no longer take the server
+#               down (LP-0MVGT0E6W000Q8CY). Unattended callers may instead set
+#               START_PROXY_FOREGROUND=1.
 #   --log-file <path>
-#               Where the detached server's stdout/stderr are written
-#               (default: /tmp/proxy-startup.log). Ignored with --foreground.
+#               Detached server's stdout/stderr (default /tmp/proxy-startup.log).
 #   --restart   Kill all running proxy/llama-server/TTS processes before starting
 #   --reason    Restart reason echoed into the new process's startup log
 #               (LP-0MVAPNC2900145RH; flag > LLAMA_PROXY_RESTART_REASON >
