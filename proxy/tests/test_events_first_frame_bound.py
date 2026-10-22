@@ -31,14 +31,13 @@ headroom over the 5 s budget candidate recorded on the fix item
 LP-0MVK1YDW900757Q9 (which reuses the existing ``/slots`` 5 s detail timeout as
 the single worst case).
 
-TDD red phase
--------------
-The two liveness assertions are marked ``xfail(strict=True)`` so ``dev`` stays
-green until LP-0MVK1YDW900757Q9 bounds the initial payload. That item removes
-the markers, turning each into a plain assertion (same convention as
-``test_slots_poll_coalescing.py`` on the sibling item LP-0MVK1YCVV007HNAG and
-``test_compaction_headers_contract.py``, LP-0MU44KR5F0015D7A). The verified
-pre-fix RED output is recorded on LP-0MVK1YD81004DPYZ.
+TDD history
+-----------
+The two liveness assertions were marked ``xfail(strict=True)`` while ``dev``
+stayed green during the RED phase; the verified pre-fix RED output is recorded
+on LP-0MVK1YD81004DPYZ. The markers were removed by the fix that bounded the
+initial payload (LP-0MVK1YDW900757Q9), so every test here is now an enforced
+assertion — a regression re-opens the original defect loudly.
 """
 
 from __future__ import annotations
@@ -91,6 +90,10 @@ _PROMPT_STATUS = {
 }
 
 _BROADCAST_MARKER = "broadcast-after-stalled-first-frame"
+
+# The disconnect test waits this long for the generator to park on the stalled
+# backend; it is a liveness guard, not a timing assertion.
+_STARTED_DEADLINE = 2.0
 
 
 def _mock_srv() -> MagicMock:
@@ -178,14 +181,6 @@ def _assert_liveness_frame(raw: str) -> str:
     return "payload"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RED phase: status_events() awaits query_llama_status() before its keepalive "
-        f"loop, so a stalled backend yields no first frame until {_FIX_ITEM} bounds "
-        "the initial payload (LP-0MVJML600003CQ6Y AC4)"
-    ),
-)
 @pytest.mark.asyncio
 async def test_first_frame_arrives_when_status_query_stalls():
     """AC1: a stalled ``query_llama_status()`` cannot leave the stream silent.
@@ -203,14 +198,6 @@ async def test_first_frame_arrives_when_status_query_stalls():
         await _close(iterator)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RED phase: the generator never reaches its broadcast/keepalive loop while "
-        f"the initial payload is unbounded, so no second frame is produced until "
-        f"{_FIX_ITEM} bounds it (LP-0MVJML600003CQ6Y AC4)"
-    ),
-)
 @pytest.mark.asyncio
 async def test_stream_keeps_producing_frames_after_a_stalled_first_frame():
     """AC2: the generator resumes into its broadcast loop after the first frame.
@@ -292,3 +279,79 @@ async def test_prompt_path_payload_keeps_its_full_contract():
         assert payload["quota"] is None
     finally:
         await _close(iterator)
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_while_initial_payload_stalls_releases_queue():
+    """AC4: a disconnect during the bounded initial query must not leak a queue.
+
+    Starlette's ``StreamingResponse`` cancels the streaming task when the peer
+    goes away, which raises ``CancelledError`` at the generator's await point.
+    The endpoint's ``finally`` must still discard the client queue, otherwise a
+    client that disconnects while the initial payload is slow leaves a dead
+    queue registered and every later broadcast pays for it.
+    """
+    started = asyncio.Event()
+
+    async def _stall() -> dict:
+        started.set()
+        await asyncio.sleep(_STALL_SECONDS)
+        return dict(_PROMPT_STATUS)
+
+    srv = _mock_srv()
+    srv.query_llama_status = AsyncMock(side_effect=_stall)
+    response = await _open_stream(srv)
+    iterator = response.body_iterator
+    assert len(srv.sse_clients) == 1, (
+        "status_events() must register the client queue before streaming"
+    )
+
+    pending = asyncio.ensure_future(iterator.__anext__())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=_STARTED_DEADLINE)
+        assert not pending.done(), (
+            "the generator must still be inside the bounded initial payload"
+        )
+
+        # Peer disconnect: cancel the pending read, which cancels the
+        # generator at its await point (the ASGI disconnect path).
+        pending.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pending
+
+        assert srv.sse_clients == set(), (
+            "a client disconnect during the initial payload must discard the "
+            f"client queue; leaked: {srv.sse_clients!r}"
+        )
+    finally:
+        if not pending.done():
+            pending.cancel()
+            with contextlib.suppress(BaseException):
+                await pending
+        await _close(iterator)
+
+
+@pytest.mark.asyncio
+async def test_queue_released_after_a_timed_out_initial_payload():
+    """AC4: the degraded (timed-out) path keeps no queue after a disconnect.
+
+    A timed-out payload must leave the client *connected* — the queue stays
+    registered while the stream is live — and must still release it on close,
+    so a timeout never strands a queue on ``sse_clients``.
+    """
+    srv = _stalling_srv()
+    response = await _open_stream(srv)
+    iterator = response.body_iterator
+    try:
+        raw = await _first_frame(iterator, _FIRST_FRAME_DEADLINE)
+        _assert_liveness_frame(raw)
+        assert len(srv.sse_clients) == 1, (
+            "a degraded stream must keep its client queue while connected"
+        )
+    finally:
+        await _close(iterator)
+
+    assert srv.sse_clients == set(), (
+        "closing a degraded stream must discard the client queue; "
+        f"leaked: {srv.sse_clients!r}"
+    )
