@@ -636,12 +636,12 @@ active mode config:
 
 | Mode (config file) | `contention_queue_policy` | Slot-contention behavior |
 |--------------------|---------------------------|--------------------------|
-| cheap (config-cheap.yaml) | `queue` | Queued cross-session, bounded by `contention_queue_max_wait_seconds` (120) and `contention_queue_max_depth` (8); dispatched local when a slot frees in time, otherwise falls back to the next remote provider |
-| fast (config-fast.yaml) | `queue` | Short-queue: bounded by `contention_queue_max_wait_seconds` (45) and `contention_queue_max_depth` (3); falls back to remotes sooner than cheap to minimise latency |
+| cheap (config-cheap.yaml) | `queue` | Queued cross-session, bounded by `contention_queue_max_wait_seconds` (60) and `contention_queue_max_depth` (8); dispatched local when a slot frees in time, otherwise falls back to the next remote provider |
+| fast (config-fast.yaml) | `queue` | Historical: bounded by `contention_queue_max_wait_seconds` (45) and `contention_queue_max_depth` (3); unified to cheap caps (depth 8, wait 60s) in LP-0MV881O5C007PSL4 / LP-0MVIQ0EXV00673HO |
 
-Fast mode defaults (depth 3 / wait 45s) are deliberately smaller than cheap
-(depth 8 / wait 120s) so burst traffic during peak hours spills to remotes
-more quickly — see LP-0MTQYIK4Z008XF2V for the tuning rationale.
+Fast and cheap now share the same queue caps (depth 8, wait 60s) since
+LP-0MV881O5C007PSL4 unified them; the fast mode note above is historical.
+See LP-0MTQYIK4Z008XF2V / LP-0MVIQ0EXV00673HO for tuning rationale.
 
 Key semantics (see `proxy/proxy/provider.py` `_maybe_queue_for_local_slot` and
 `proxy/proxy/contention_queue.py`):
@@ -681,13 +681,8 @@ Config reference:
 server:
   # cheap profile (config-cheap.yaml)
   contention_queue_policy: queue
-  contention_queue_max_wait_seconds: 120    # clamped to [1, max_runtime_seconds]
-  contention_queue_max_depth: 8             # clamped to [1, 16]
-
-  # fast profile (config-fast.yaml)
-  contention_queue_policy: queue
-  contention_queue_max_wait_seconds: 45     # clamped to [1, max_runtime_seconds]
-  contention_queue_max_depth: 3             # clamped to [1, 16]
+  contention_queue_max_wait_seconds: 60    # clamped to [1, max_runtime_seconds]
+  contention_queue_max_depth: 8            # clamped to [1, 16]
 ```
 
 The queue engages only when ``contention_queue_policy`` is ``queue`` AND the
@@ -699,8 +694,8 @@ proxy is in the corresponding operating mode. Absent keys default to
 Queuing only helps when the local prefill can actually finish inside the wait
 budget. Evidence for 2026-10-19 07:23 → 2026-10-20 07:23: of 5,805 queued waits
 only 855 were dispatched local — **4,947 (85 %) were abandoned after up to
-120 s and then went remote anyway**, while local prefill times during the same
-window were p50 61.8 s / p90 269.8 s / max 817 s. Waiting 120 s to maybe avoid
+the full budget and then went remote anyway**, while local prefill times during the same
+window were p50 61.8 s / p90 269.8 s / max 817 s. Waiting the full budget to maybe avoid
 a remote call whose median TTFT is 27 ms is a losing trade unless the prompt
 is genuinely cache-warm.
 
@@ -727,7 +722,7 @@ first, so a newcomer's real wait is its own prefill **plus** the service the
 gate already owes. Comparing the own-prefill term alone admitted waits the
 proxy's own `/llama/local/status` payload had already flagged as unservable —
 the 2026-10-21 14:56→16:49 window produced 302 queued waits, 261 of which fell
-back after queueing, 215 of them at the full 120 s budget (25,804 s of
+back after queueing, 215 of them at the full budget (25,804 s of
 aggregate wasted wait), with 247 of the 325 full-budget losses entering the
 queue `saturation=prefill`. The occupancy floor is also what the guard uses
 when per-slot prefill progress is unobservable
@@ -817,7 +812,7 @@ POST /llama/local/reserve
 200 {"admit": true, "reservation_id": "<opaque>",
      "projected_wait_s": 63.1, "ttl_s": 10}
 429 {"admit": false, "reason": "eta_exceeds_budget",
-     "queue_eta_s": 187.2, "budget_s": 120.0, "retry_after_s": 68}
+     "queue_eta_s": 187.2, "budget_s": 60.0, "retry_after_s": 28}
 ```
 
 - The verdict is the **same** occupancy-aware decision the admission guard

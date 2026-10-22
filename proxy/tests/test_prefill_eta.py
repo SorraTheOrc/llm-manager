@@ -32,7 +32,7 @@ def _cfg(**server_overrides) -> dict:
     server = {
         "session_slot_pool_size": 1,
         "contention_queue_policy": "queue",
-        "contention_queue_max_wait_seconds": 120,
+        "contention_queue_max_wait_seconds": 60,
         "contention_queue_max_depth": 8,
     }
     server.update(server_overrides)
@@ -143,7 +143,7 @@ def test_window_is_bounded():
 # ---------------------------------------------------------------------------
 
 def test_eta_above_budget_rejects_immediately():
-    """AC3: a cache-cold 100k prompt cannot prefill in 120 s ⇒ refuse."""
+    """AC3: a cache-cold 100k prompt cannot prefill in 60 s ⇒ refuse."""
     _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
     decision = prefill_eta.evaluate_admission(_cfg(), "Qwen3", 100_000, 0.0, "low")
 
@@ -151,11 +151,11 @@ def test_eta_above_budget_rejects_immediately():
     assert decision.active is True
     assert decision.reason == "eta_exceeds_budget"
     assert decision.eta_prefill_seconds > decision.budget_seconds
-    assert decision.budget_seconds == pytest.approx(120.0)
+    assert decision.budget_seconds == pytest.approx(60.0)
 
 
 def test_eta_within_budget_admits():
-    """AC3: a small cache-cold prompt prefills well inside 120 s ⇒ admit."""
+    """AC3: a small cache-cold prompt prefills well inside 60 s ⇒ admit."""
     _seed_samples(tokens=2_000, ratio=0.0, ms_per_token=3.9, count=6)
     decision = prefill_eta.evaluate_admission(_cfg(), "Qwen3", 2_000, 0.0, "low")
 
@@ -226,14 +226,17 @@ def test_clamped_wait_cap_still_yields_a_budget():
 # ---------------------------------------------------------------------------
 
 def test_warm_cache_prompt_is_admitted_even_when_bucket_is_cold_calibrated():
-    """AC5: 90 %-cached 100k prompt ⇒ the expensive ``new_tokens`` term is only
-    10k tokens, so the projected prefill fits the 120 s budget."""
-    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
-    decision = prefill_eta.evaluate_admission(_cfg(), "Qwen3", 100_000, 0.9, "low")
+    """AC5: 90 %-cached prompt ⇒ the expensive ``new_tokens`` term is small
+    enough that the projected prefill fits the 60 s budget.
+
+    Seeded at 55 k (bucket 1, same as eval) cold; warm eval at 55 k fits
+    within 60 s because the cached fraction is cheap (LP-0MVIQ0EXV00673HO)."""
+    _seed_samples(tokens=55_000, ratio=0.0, ms_per_token=3.9, count=6)
+    decision = prefill_eta.evaluate_admission(_cfg(), "Qwen3", 55_000, 0.9, "low")
 
     assert decision.admit is True, decision
     assert decision.reason == "within_budget"
-    # 90k cached × 0.5 ms + 10k new × fitted-4.68 ms ≈ 91.8 s < 120 s.
+    # 49.5k cached × 0.6 ms + 5.5k new × fitted-4.68 ms ≈ 55.4 s < 60 s.
     assert decision.eta_prefill_seconds < decision.budget_seconds
 
 
@@ -326,7 +329,7 @@ def test_status_estimate_publishes_admission_budget():
     """LP-0MVGDUVGE0024YAI AC3: the published budget is the guard's own wait
     budget (one source of truth), and ``None`` when none is resolvable."""
     fields = prefill_eta.status_estimate(_cfg(), "Qwen3", total_slots=1, available_slots=1)
-    assert fields["prefill_budget_seconds"] == 120.0
+    assert fields["prefill_budget_seconds"] == 60.0
     # The published budget is exactly wait_budget_seconds (null when the
     # guard resolves no budget), never an independent number.
     resolved = prefill_eta.wait_budget_seconds(

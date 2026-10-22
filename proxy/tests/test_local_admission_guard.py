@@ -66,7 +66,7 @@ def _queue_cfg(**server_overrides) -> dict:
     server = {
         "session_slot_pool_size": 1,
         "contention_queue_policy": "queue",
-        "contention_queue_max_wait_seconds": 120,
+        "contention_queue_max_wait_seconds": 60,
         "contention_queue_max_depth": 4,
     }
     server.update(server_overrides)
@@ -248,11 +248,10 @@ async def test_eta_within_budget_still_queues_and_dispatches_local(
 @pytest.mark.asyncio
 async def test_warm_cache_prompt_is_admitted_and_queued(mixed_model_config, caplog):
     """AC5 (LP-0MVGDUV5E005UWBQ) under occupancy: a cache-warm prompt stays
-    queueable even when the prefill gate is fully occupied (own ETA ~34 s,
-    projected wait ~68 s — inside the 120 s budget). The original fixture
-    (100k tokens, fully occupied gate) crosses the 120 s budget once the
-    occupancy term is counted (LP-0MVICD2YW004DJPV) — that refusal is the
-    point of the change."""
+    queueable even when the prefill gate is fully occupied (own ETA ~17 s,
+    projected wait ~34 s — inside the 60 s budget). With the 120 s budget
+    the original fixture (40k tokens) was also admissible; LP-0MVIQ0EXV00673HO
+    halved the budget so the prompt was reduced to stay under the new cap."""
     caplog.set_level(logging.INFO, logger="llama-proxy")
     _seed_calibration(tokens=40_000, ms_per_token=3.9)
     concurrency = _MutableConcurrency(1, 1)
@@ -273,7 +272,7 @@ async def test_warm_cache_prompt_is_admitted_and_queued(mixed_model_config, capl
         patch("proxy.server.proxy_to_remote", _remote),
         patch("proxy.provider._get_local_concurrency_info", concurrency),
         patch("proxy.provider.request_priority", return_value="low"),
-        _guard_patches(tokens=40_000, cached_ratio=0.9),
+        _guard_patches(tokens=20_000, cached_ratio=0.9),
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
@@ -442,7 +441,7 @@ def test_exhausted_chain_after_refusal_returns_retryable_429_with_retry_after():
             "status": "local_admission_reject",
             "reason": "eta_exceeds_budget",
             "eta_prefill_seconds": 468.0,
-            "budget_seconds": 120.0,
+            "budget_seconds": 60.0,  # halved from 120 (LP-0MVIQ0EXV00673HO)
         }
     ]
     response = provider._build_exhausted_response(
@@ -453,16 +452,16 @@ def test_exhausted_chain_after_refusal_returns_retryable_429_with_retry_after():
     )
 
     assert response.status_code == 429
-    assert response.headers["Retry-After"] == "348"
+    assert response.headers["Retry-After"] == "408"  # 468 - 60 = 408
     assert response.headers["X-Local-Admission"] == "reject"
     assert response.headers["X-Local-Admission-Eta"] == "468.0"
-    assert response.headers["X-Local-Admission-Budget"] == "120.0"
+    assert response.headers["X-Local-Admission-Budget"] == "60.0"
 
     payload = json.loads(response.body)
     assert payload["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
     assert payload["eta_prefill_seconds"] == 468.0
-    assert payload["budget_seconds"] == 120.0
-    assert payload["retry_after"] == 348
+    assert payload["budget_seconds"] == 60.0
+    assert payload["retry_after"] == 408
     assert payload["diagnostics"] == diagnostics
 
 

@@ -216,7 +216,7 @@ async def test_overnight_gap_lease_denied_remote_window_contract(monkeypatch):
         "server": {
             "session_slot_pool_size": 1,
             "contention_queue_policy": "queue",
-            "contention_queue_max_wait_seconds": 120,
+            "contention_queue_max_wait_seconds": 60,
             "contention_queue_max_depth": 4,
         },
     }

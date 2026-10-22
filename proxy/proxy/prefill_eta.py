@@ -4,12 +4,12 @@ Problem
 -------
 
 When every local slot is busy, a request enters the bounded contention queue
-(bounded by ``contention_queue_max_wait_seconds``, 120 s in the shipped
-config) and waits. For a large cache-cold prompt the local prefill cannot
-finish inside that budget, so the wait is a *guaranteed loss*: the request
-burns up to the full wait and then falls back to a remote provider anyway
-(measured 2026-10-19/20: 5,805 waits → 855 dispatched, 4,947 = 85 % abandoned
-after up to 120 s).
+(bounded by ``contention_queue_max_wait_seconds``, 60 s in the shipped
+config — halved from 120 in LP-0MVIQ0EXV00673HO) and waits. For a large
+cache-cold prompt the local prefill cannot finish inside that budget, so the
+wait is a *guaranteed loss*: the request burns up to the full wait and then
+falls back to a remote provider anyway (measured 2026-10-19/20: 5,805 waits
+→ 855 dispatched, 4,947 = 85 % abandoned after up to the previous 120 s).
 
 The guard
 ---------

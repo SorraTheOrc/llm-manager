@@ -807,7 +807,7 @@ async def test_status_publishes_prefill_and_queue_eta(_eta_calibration):
     server_config = {
         "server": {
             "llama_server_port": 8080,
-            "contention_queue_max_wait_seconds": 120,
+            "contention_queue_max_wait_seconds": 60,
         }
     }
     j = await _EtaStatusHarness().get(server_config, local_active_queries=1)
@@ -905,7 +905,7 @@ class _CapacityStatusHarness:
         resolved_config = config if config is not None else {
             "server": {
                 "llama_server_port": 8080,
-                "contention_queue_max_wait_seconds": 120,
+                "contention_queue_max_wait_seconds": 60,
             }
         }
         with patch("proxy.server.query_llama_status", side_effect=fake_query):
@@ -1100,7 +1100,7 @@ async def test_per_slot_prefill_eta_sourced_from_shared_calibration(_eta_calibra
     config = {
         "server": {
             "llama_server_port": 8080,
-            "contention_queue_max_wait_seconds": 120,
+            "contention_queue_max_wait_seconds": 60,
         }
     }
     j = await _CapacityStatusHarness().get(
@@ -1115,7 +1115,7 @@ async def test_per_slot_prefill_eta_sourced_from_shared_calibration(_eta_calibra
     assert slot["prefill_eta_seconds"] == round(expected, 1)
     assert slot["prefill_eta_seconds"] > 0
     # The budget is the admission guard's own wait budget, not a second source.
-    assert j["prefill_budget_seconds"] == 120.0
+    assert j["prefill_budget_seconds"] == 60.0
 
 
 @pytest.mark.asyncio

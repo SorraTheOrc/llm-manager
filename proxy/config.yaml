@@ -1615,7 +1615,8 @@ server:
   # Contention queue (merged from the retired config-fast/cheap overlays)
   # -----------------------------------------------------------------------
   # The per-mode queue policy was declared by the mode overlays
-  # (config-fast.yaml / config-cheap.yaml, both ``queue`` depth 8 / wait 120s);
+  # (config-fast.yaml / config-cheap.yaml, both ``queue`` depth 8 / wait 120s;
+  # unified to a single value, 60 s since LP-0MVIQ0EXV00673HO);
   # with the mode axis removed the policy is a single server-level knob.
   # Circuit: a request that finds all local slots busy QUEUES (bounded by
   # these caps) instead of immediately falling back to a paid remote
@@ -1623,14 +1624,14 @@ server:
   # ``queue``; ``low`` always queues (cheap semantics); ``high`` never
   # queues (immediate remote fallback) — see proxy/proxy/priority.py.
   contention_queue_policy: queue
-  contention_queue_max_wait_seconds: 120
+  contention_queue_max_wait_seconds: 60   # halved from 120 → 60 (LP-0MVIQ0EXV00673HO: 1 481 full-120-s fallbacks in 24h were wasted; 60 s is the documented optimum for this queue); Server restart required to change.
   contention_queue_max_depth: 8
   # Lease-owner retention priority (LP-0MVI2VRT2000V1AP). A session that
   # already holds a local lease, or was granted one within this grace window
   # AND still has local cache history, is placed ahead of non-retained
   # waiters in the contention queue (FIFO within each class). Rationale: a
   # returning session otherwise re-queues behind newcomers, waits the full
-  # 120 s budget and detours to a paid provider, then comes back and
+  # 60 s budget and detours to a paid provider, then comes back and
   # re-prefills — measured on 2026-10-21 as 7 local<->remote transitions in
   # 12 minutes for one session, with no ETA or context-size cause.
   # The cache-history requirement keeps the priority honest: a session whose
@@ -1655,7 +1656,8 @@ server:
   # to the full budget and then fall back remote anyway (measured 2026-10-19
   # → 10-20: 4,947 of 5,805 queued waits = 85 % abandoned) — so local
   # admission is refused immediately and the request falls through to the
-  # next provider. A request refused this way that finds no remote provider
+  # next provider (LP-0MVIQ0EXV00673HO: halved budget from 120→60 s as 1 481
+  # full-120-s waits were wasted in 24h). A request refused this way that finds no remote provider
   # receives a retryable 429 with ``Retry-After`` and ``X-Local-Admission*``
   # headers.
   #
