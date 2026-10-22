@@ -781,6 +781,8 @@ def record_guard_decision(
     session_id: str | None = None,
     model: str | None = None,
     priority: str | None = None,
+    reason_label: str | None = None,
+    free_slot: bool = False,
 ) -> None:
     """Emit the ``local_admission_guard`` log line for *decision*.
 
@@ -794,6 +796,12 @@ def record_guard_decision(
     prefills, then the verdict — so a refusal (or a surprising admit) is
     diagnosable from the log alone. ``eta_prefill_s`` keeps its historical
     meaning (the own-prefill term) so existing parsers keep working.
+
+    *reason_label* overrides the logged reason so the direct (free-slot)
+    dispatch guard (LP-0MVIQ0F8T002FS42) is distinguishable from the
+    queue-entry guard: the same decision emitted one step earlier is logged
+    ``reason=eta_exceeds_budget_direct`` (with ``free_slot=true``), and the
+    line is emitted exactly once — the caller must not log a second copy.
     """
     if not decision.active or decision.eta_prefill_seconds is None:
         return
@@ -801,7 +809,11 @@ def record_guard_decision(
     # ``enforced`` flag distinguishes an enforced refusal from an ``observe``
     # rollout, so the usage report can count would-be refusals during a
     # validation window.
-    verdict = "reject" if decision.reason == "eta_exceeds_budget" else "admit"
+    verdict = (
+        "reject"
+        if str(decision.reason).startswith("eta_exceeds_budget")
+        else "admit"
+    )
     projected = (
         decision.projected_wait_seconds
         if decision.projected_wait_seconds is not None
@@ -810,10 +822,10 @@ def record_guard_decision(
     logger.info(
         "local_admission_guard decision=%s reason=%s enforced=%s "
         "eta_prefill_s=%.1f eta_occupancy_s=%.1f projected_wait_s=%.1f "
-        "budget_s=%.1f busy_slots=%d in_flight_prefills=%d "
+        "budget_s=%.1f busy_slots=%d in_flight_prefills=%d free_slot=%s "
         "priority=%s policy=%s model=%s samples=%d provider=%s session=%s",
         verdict,
-        decision.reason,
+        reason_label or decision.reason,
         "false" if decision.admit else "true",
         float(decision.eta_prefill_seconds),
         float(decision.eta_occupancy_seconds or 0.0),
@@ -821,6 +833,7 @@ def record_guard_decision(
         float(decision.budget_seconds or 0.0),
         int(decision.busy_slots or 0),
         int(decision.in_flight_prefills or 0),
+        "true" if free_slot else "false",
         priority or "unknown",
         decision.policy,
         model or "unknown",

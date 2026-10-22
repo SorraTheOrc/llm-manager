@@ -1653,9 +1653,10 @@ server:
   contention_queue_lease_grace_seconds: 300
 
   # -----------------------------------------------------------------------
-  # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ)
+  # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ,
+  # LP-0MVIQ0F8T002FS42)
   # -----------------------------------------------------------------------
-  # Before entering the contention queue the proxy costs the projected local
+  # Before dispatching a local request the proxy costs the projected local
   # prefill from OBSERVED dispatches (dispatch_first_byte_ms, per model and
   # context bucket, rolling window) and compares it with the caller's wait
   # budget (``contention_queue_max_wait_seconds`` above; ``high`` priority
@@ -1668,6 +1669,16 @@ server:
   # full-120-s waits were wasted in 24h). A request refused this way that finds no remote provider
   # receives a retryable 429 with ``Retry-After`` and ``X-Local-Admission*``
   # headers.
+  #
+  # The guard runs on BOTH local dispatch paths (LP-0MVIQ0F8T002FS42):
+  #   - queue entry, when every local slot is busy; and
+  #   - the DIRECT (free-slot) path, immediately before dispatch. A free slot
+  #     is not permission to start a 40-80k-token prefill the caller will
+  #     abandon — baseline 48 of 606 local dispatches had a first byte after
+  #     >120 s, most of them on a free slot. The direct decision logs
+  #     ``reason=eta_exceeds_budget_direct free_slot=true`` (the queue
+  #     decision keeps ``reason=eta_exceeds_budget``); both use this one
+  #     estimator and this one budget knob — there is no second budget.
   #
   # The comparison is OCCUPANCY-AWARE (LP-0MVICD2YW004DJPV): the quantity
   # tested against the budget is

@@ -477,3 +477,222 @@ def test_generic_exhaustion_is_unchanged_without_a_refusal():
     assert response.status_code == 503
     assert "X-Local-Admission" not in response.headers
     assert json.loads(response.body)["code"] == provider.EXHAUSTION_CODE_ALL
+
+
+# ---------------------------------------------------------------------------
+# Direct (free-slot) dispatch guard (LP-0MVIQ0F8T002FS42)
+#
+# The queue-entry guard above only runs when every local slot is busy. A
+# request that finds a FREE slot used to dispatch with no ETA ceiling, so a
+# 40-80k-token prefill that could not finish inside the budget was started
+# anyway and abandoned by the caller (baseline: 48 of 606 local dispatches
+# had a first byte after >120 s). These tests cover the same decision applied
+# one step earlier, on the free-slot path.
+# ---------------------------------------------------------------------------
+
+def _free_slot_cfg(**server_overrides) -> dict:
+    """Config for the direct-dispatch path: a slot is free (cur < max)."""
+    return _queue_cfg(**server_overrides)
+
+
+@pytest.mark.asyncio
+async def test_direct_dispatch_refused_when_projected_prefill_exceeds_budget(
+    mixed_model_config, caplog
+):
+    """AC1: a request whose projected prefill exceeds the budget is NEVER
+    dispatched locally, including when a local slot is free."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    # Cache-cold 100k prompt at ~3.9 ms/token ≈ 468 s ≫ 60 s budget.
+    _seed_calibration(tokens=100_000, ms_per_token=3.9)
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        # Free slot: 0 active of 1 — the direct-dispatch path, not the queue.
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=100_000),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", mixed_model_config,
+            _free_slot_cfg(),
+        )
+
+    assert result.status_code == 200
+    assert calls == ["remote"], (
+        "a free slot must NOT bypass the ETA ceiling: over-budget local "
+        "dispatches must fall through to remote"
+    )
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "local_admission_guard decision=reject" in messages
+    assert "reason=eta_exceeds_budget_direct" in messages
+    assert "eta_prefill_s=" in messages
+    assert "budget_s=" in messages
+    assert "contention_queue_wait" not in messages, "must not enter the queue"
+
+
+@pytest.mark.asyncio
+async def test_direct_dispatch_admitted_when_projected_prefill_fits_budget(
+    mixed_model_config,
+):
+    """AC2: a request whose projected prefill fits the budget is still
+    dispatched locally on a free slot — no regression for the common case."""
+    _seed_calibration(tokens=100_000, ms_per_token=3.9)
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        # 10k cold ≈ 47 s < 60 s budget ⇒ admit.
+        _guard_patches(tokens=10_000),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", mixed_model_config,
+            _free_slot_cfg(),
+        )
+
+    assert result.status_code == 200
+    assert calls == ["local"], "within-budget free-slot dispatch must stay local"
+
+
+@pytest.mark.asyncio
+async def test_direct_dispatch_inert_without_calibration(mixed_model_config, caplog):
+    """AC3: cold start — with no estimator samples the guard is inert and the
+    free-slot dispatch behaves exactly as today (conservative fail-open)."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=100_000),  # no calibration seeded
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", mixed_model_config,
+            _free_slot_cfg(),
+        )
+
+    assert result.status_code == 200
+    assert calls == ["local"], "an uncalibrated guard must not refuse local work"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "reason=eta_exceeds_budget_direct" not in messages
+
+
+@pytest.mark.asyncio
+async def test_direct_dispatch_uses_the_single_wait_budget(mixed_model_config, caplog):
+    """AC3/AC4: the direct guard compares against the SAME budget source as
+    the queue guard (``contention_queue_max_wait_seconds``) — no second knob.
+    Raising the budget admits work the 60 s budget refused."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_calibration(tokens=100_000, ms_per_token=3.9)
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=100_000),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", mixed_model_config,
+            _free_slot_cfg(contention_queue_max_wait_seconds=600),
+        )
+
+    assert result.status_code == 200
+    assert calls == ["local"], (
+        "the same budget knob must govern the direct path: a 600 s budget "
+        "admits the 468 s projection"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_dispatch_logs_one_labelled_guard_line(mixed_model_config, caplog):
+    """AC4: the direct refusal emits exactly ONE guard line, labelled
+    ``reason=eta_exceeds_budget_direct free_slot=true`` — it must not be
+    double-counted as a queue-entry refusal, and it must carry the ETA and
+    budget that drove the decision."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    _seed_calibration(tokens=100_000, ms_per_token=3.9)
+
+    async def _local(_req, _path):
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=100_000),
+    ):
+        await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", mixed_model_config,
+            _free_slot_cfg(),
+        )
+
+    guard_lines = [
+        r.getMessage() for r in caplog.records
+        if "local_admission_guard decision=" in r.getMessage()
+    ]
+    assert len(guard_lines) == 1, (
+        f"expected exactly one guard line, got {len(guard_lines)}: {guard_lines}"
+    )
+    line = guard_lines[0]
+    assert "decision=reject" in line
+    assert "reason=eta_exceeds_budget_direct" in line
+    assert "free_slot=true" in line
+    assert "eta_prefill_s=" in line
+    assert "budget_s=" in line
+    # The fallback target is recorded for the operator (AC4): the refusal
+    # names the reason and the chain records which provider serves instead.
+    assert any(
+        "local_admission_guard_direct_fallback" in r.getMessage()
+        and "free_slot=true" in r.getMessage()
+        for r in caplog.records
+    ), "the direct refusal must name its reason at the dispatch point"
+    assert any(
+        "Fallback triggered" in r.getMessage()
+        and "to=remote-fallback" in r.getMessage()
+        and "reason=local_admission_guard" in r.getMessage()
+        for r in caplog.records
+    ), "the chosen fallback provider must be logged"

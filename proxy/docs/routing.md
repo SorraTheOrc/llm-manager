@@ -724,7 +724,7 @@ The queue engages only when ``contention_queue_policy`` is ``queue`` AND the
 proxy is in the corresponding operating mode. Absent keys default to
 ``fallback`` for backward compatibility.
 
-## Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ)
+## Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ, LP-0MVIQ0F8T002FS42)
 
 Queuing only helps when the local prefill can actually finish inside the wait
 budget. Evidence for 2026-10-19 07:23 → 2026-10-20 07:23: of 5,805 queued waits
@@ -734,10 +734,10 @@ window were p50 61.8 s / p90 269.8 s / max 817 s. Waiting the full budget to may
 a remote call whose median TTFT is 27 ms is a losing trade unless the prompt
 is genuinely cache-warm.
 
-Before a request enters the contention queue (and before a dispatch that
-would start another concurrent prefill), the proxy therefore costs the
-projected prefill and compares the **occupancy-aware projected wait** with the
-caller's wait budget:
+Before a request enters the contention queue **and on the direct (free-slot)
+dispatch path immediately before the local request is sent upstream**, the
+proxy costs the projected prefill and compares the **occupancy-aware projected
+wait** with the caller's wait budget:
 
 ```
 eta_prefill = coded_tokens * coded_ms_per_token + new_tokens * prefill_ms_per_token
@@ -802,10 +802,10 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
 - **Observability**: each decision logs
   `local_admission_guard decision=admit|reject reason=… enforced=true|false
   eta_prefill_s=… eta_occupancy_s=… projected_wait_s=… budget_s=…
-  busy_slots=… in_flight_prefills=…`, i.e. the own prefill, the occupancy
-  contribution, the projected wait actually compared against the budget and
-  the occupancy evidence behind it — a refusal (or a surprising admit) is
-  diagnosable from the log line alone. The 24h report counts them as
+  busy_slots=… in_flight_prefills=… free_slot=…`, i.e. the own prefill, the
+  occupancy contribution, the projected wait actually compared against the
+  budget and the occupancy evidence behind it — a refusal (or a surprising
+  admit) is diagnosable from the log line alone. The 24h report counts them as
   `local_admission_reject` / `local_admission_reject_enforced` /
   `local_admission_admit`. `/llama/local/status` publishes
   `prefill_eta_seconds` (cost of the reference prompt, cache-cold) and
@@ -813,6 +813,17 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   the newcomer's own — the guard's `projected_wait`), with
   `queue_eta_occupancy_seconds` / `queue_eta_busy_slots` breaking out the
   occupancy term, so a dispatcher can pace *before* launching a session.
+- **Direct (free-slot) dispatch guard** (LP-0MVIQ0F8T002FS42): the same
+  decision is applied one step earlier, before a request that found a *free*
+  slot is dispatched. A free slot is not permission to start a prefill the
+  caller will abandon — baseline 48 of 606 local dispatches had a first byte
+  after >120 s, most on a free slot. The direct refusal logs
+  `reason=eta_exceeds_budget_direct free_slot=true` (queue-entry refusals keep
+  `reason=eta_exceeds_budget`), records a `local_admission_reject` attempt so
+  the chosen fallback provider appears in the diagnostics, and falls through
+  to the next provider. It reuses the same estimator and the same single
+  budget (`contention_queue_max_wait_seconds`) — there is no second budget
+  knob, and a cold/uncalibrated bucket still admits.
 
 Rollout control (`server.local_admission_guard_policy`):
 

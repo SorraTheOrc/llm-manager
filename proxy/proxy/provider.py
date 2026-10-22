@@ -5540,6 +5540,8 @@ async def _prefill_admission_guard(
     messages: list | None = None,
     max_local: int = 1,
     endpoint: str | None = None,
+    reason_label: str | None = None,
+    free_slot: bool = False,
 ):
     """Evaluate (and log) the prefill-ETA admission guard.
 
@@ -5555,6 +5557,11 @@ async def _prefill_admission_guard(
     *endpoint* let it read the occupied gate ahead of this request, so the
     projected wait it compares against the budget includes the in-flight
     prefill rather than the own-prefill term alone.
+
+    *reason_label* / *free_slot* let the direct (free-slot) dispatch guard
+    (LP-0MVIQ0F8T002FS42) reuse this one implementation and one budget source
+    while logging the decision as ``eta_exceeds_budget_direct`` — the log line
+    is emitted exactly once, by this helper.
     """
     try:
         from proxy import prefill_eta
@@ -5605,6 +5612,8 @@ async def _prefill_admission_guard(
             session_id=session_id,
             model=model_name,
             priority=priority,
+            reason_label=reason_label,
+            free_slot=free_slot,
         )
         return decision
     except Exception:
@@ -9458,6 +9467,101 @@ async def _proxy_with_fallback_cycle(
                     )
                 except Exception:
                     pass
+
+                # Prefill-ETA guard on the DIRECT (free-slot) dispatch path
+                # (LP-0MVIQ0F8T002FS42). The queue-entry guard only runs when
+                # every local slot is busy; without this a request that finds a
+                # free slot starts a 40-80k-token prefill that cannot finish
+                # inside the caller's wait budget and is abandoned (baseline: 48
+                # of 606 local dispatches had a first byte after >120 s). Same
+                # estimator, same single budget source
+                # (``contention_queue_max_wait_seconds``) — this is the same
+                # decision applied one step earlier. Inert (``None``) when the
+                # bucket is uncalibrated, so cold start behaves exactly as
+                # today.
+                _direct_admission = await _prefill_admission_guard(
+                    config,
+                    provider_cfg,
+                    _estimated_tokens,
+                    _session_id,
+                    priority=_priority,
+                    messages=(
+                        body_json.get("messages")
+                        if isinstance(body_json, dict)
+                        else None
+                    ),
+                    max_local=max_local,
+                    endpoint=local_endpoint,
+                    reason_label="eta_exceeds_budget_direct",
+                    free_slot=True,
+                )
+                if _direct_admission is not None and not _direct_admission.admit:
+                    _direct_reason = "eta_exceeds_budget_direct"
+                    try:
+                        setattr(request, "_local_admission_decision", _direct_admission)
+                    except Exception:
+                        pass
+                    # The guard helper already emitted the single
+                    # ``local_admission_guard ... reason=eta_exceeds_budget_direct``
+                    # line (ETA, budget, free_slot=true). Record the attempt so
+                    # the fallback provider and the diagnostics carry it too
+                    # (AC4).
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="local_admission_reject",
+                        reason=_direct_reason,
+                        eta_prefill_seconds=round(
+                            float(
+                                getattr(
+                                    _direct_admission,
+                                    "eta_prefill_seconds",
+                                    0.0,
+                                )
+                                or 0.0
+                            ),
+                            1,
+                        ),
+                        budget_seconds=round(
+                            float(
+                                getattr(_direct_admission, "budget_seconds", 0.0)
+                                or 0.0
+                            ),
+                            1,
+                        ),
+                    )
+                    try:
+                        logger.info(
+                            "local_admission_guard_direct_fallback "
+                            "provider=%s model=%s session=%s "
+                            "reason=%s free_slot=true → routing to next provider",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _session_id or "unknown",
+                            _direct_reason,
+                        )
+                    except Exception:
+                        pass
+                    # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): a
+                    # local-only client must never be moved remote — the
+                    # caller turns the decision into the retryable 429.
+                    if _preference == _PREF_LOCAL_ONLY:
+                        fallback_reason = "local_admission_guard"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
+                        return _build_exhausted_response(
+                            all_local_slot_exhaustion=False,
+                            unavailable_providers={},
+                            diagnostics=attempts,
+                            config=config,
+                        )
+                    fallback_reason = "local_admission_guard"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _note_local_fallback_reason(request, fallback_reason)
+                    continue
 
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 
