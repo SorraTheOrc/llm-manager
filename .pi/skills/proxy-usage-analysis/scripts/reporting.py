@@ -1194,11 +1194,18 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
 def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSchedule) -> None:
     """Append the ``## Local model utilization`` section to the report.
 
-    Covers busy/idle time over the window (union of active local streams,
-    clipped to the window), total compute (slot-seconds), and concurrency.
-    The section is omitted when the window has no local traffic. (The
-    former hourly busy profile moved to the top of the report as the
-    ``## Summary by hour`` table, LP-0MTFO210Q0044TTF.)
+    Busy is the union of **dispatch → finish** intervals (prefill + decode,
+    LP-0MVJN9H2I00116FP): at least one local slot occupied from the stream's
+    back-calculated dispatch time until its ``Stream finished`` line. The
+    definition change is stated in the section header, the previous
+    decode-only figure is retained as the labelled **lower bound**, and the
+    dispatch → finish union is the labelled **upper bound** (a stream with no
+    first-byte line contributes its decode interval only, so the upper bound
+    is never overstated). All figures — busy/idle, total compute
+    (slot-seconds), concurrency, and the fast/cheap split — are computed on
+    the new intervals. The section is omitted when the window has no local
+    traffic. (The former hourly busy profile moved to the top of the report
+    as the ``## Summary by hour`` table, LP-0MTFO210Q0044TTF.)
     """
     if summary.busy is None:
         return
@@ -1206,15 +1213,23 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap("")
     ap("## Local model utilization")
     ap("")
-    ap("Busy = at least one local slot actively generating (local streams paired "
-       "per session, clipped to the window, overlapping streams merged).")
+    ap("Busy = at least one local slot active **from dispatch to finish** "
+       "(prefill + decode). This redefines busy: it previously counted decode only "
+       "(`Stream started` → `Stream finished`), which excluded prompt processing. "
+       "The decode-only figure is retained below as the lower bound.")
     ap("")
     ap("| Metric | Total | Standard | Low |")
     ap("|---|---|---|---|")
     fast_win = b.fast_window_seconds or 0.0
     cheap_win = b.cheap_window_seconds or 0.0
-    ap(f"| Busy time | {_busy_cell(b.busy_seconds, b.window_seconds)} | "
+    ap(f"| Busy time — upper bound (dispatch → finish) | "
+       f"{_busy_cell(b.busy_seconds, b.window_seconds)} | "
        f"{_busy_cell(b.fast_busy_seconds, fast_win)} | {_busy_cell(b.cheap_busy_seconds, cheap_win)} |")
+    ap(f"| Decode-only busy — lower bound (`Stream started` → finish) | "
+       f"{_busy_cell(b.decode_busy_seconds, b.window_seconds)} | "
+       f"{_busy_cell(b.decode_fast_busy_seconds, fast_win)} | "
+       f"{_busy_cell(b.decode_cheap_busy_seconds, cheap_win)} |")
+    ap(f"| Prefill busy (upper − lower) | {_fmt_duration(b.prefill_busy_seconds)} | - | - |")
     ap(f"| Idle time | {_busy_cell(b.idle_seconds, b.window_seconds)} | "
        f"{_busy_cell(fast_win - b.fast_busy_seconds, fast_win)} | "
        f"{_busy_cell(cheap_win - b.cheap_busy_seconds, cheap_win)} |")
@@ -1223,6 +1238,12 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap(f"| Total compute (slot-time) | {_fmt_duration(b.total_compute_seconds)} | - | - |")
     ap(f"| Avg concurrency (while busy) | {b.avg_concurrency:.2f} | - | - |")
     ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
+    ap("")
+    ap(f"_Bounds: lower = {aggregation.BUSY_LOWER_BOUND_LABEL}; upper = "
+       f"{aggregation.BUSY_UPPER_BOUND_LABEL}. {b.prefill_extended_streams} of "
+       f"{b.streams} stream(s) contributed a measured prefill (a first-byte line); "
+       "the rest fall back to their decode interval, so the upper bound is never "
+       "overstated._")
     if b.unfinished_streams or b.pre_window_unfinished:
         ap("")
         ap(f"_Note: {b.unfinished_streams} local stream(s) started inside the window "
@@ -1236,7 +1257,9 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap("")
     ap("Method: streams are paired per session (FIFO) across the margin-widened "
        f"event stream (48h collection margin, max({log_parser.BUSY_WINDOW_MARGIN} "
-       "busy-pairing, 48h mode timeline)), then clipped to the window so "
+       "busy-pairing, 48h mode timeline)), each pair extended back to its "
+       "back-calculated dispatch time (`ttft.ts - ttft_ms/1000`) when a "
+       "`dispatch_first_byte_ms` line exists, then clipped to the window so "
        "boundary-crossing streams are counted exactly; unfinished streams are those "
        "started inside the window or within its 1h busy-pairing margin with no "
        "logged finish (earlier starts are pre-window leftovers); fast/cheap split "

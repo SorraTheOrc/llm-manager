@@ -2834,9 +2834,13 @@ class TestPrefillStats:
         assert stats is not None
         assert stats.total_seconds == pytest.approx(20.0)  # slot-seconds
         assert stats.unit == "slot-seconds"
-        # The wall-clock union of the same prefills is only 10 s, and the
-        # busy figure is the (decode-window) union, a different quantity.
+        # The wall-clock union of the same prefills is only 10 s. The busy
+        # figure is the dispatch → finish union (LP-0MVJN9H2I00116FP), but
+        # here both dispatches (13:59:50) predate the 14:00:00 window start
+        # and are clipped away, so busy equals the 20 s decode-only union.
         assert busy.busy_seconds == pytest.approx(20.0)
+        assert busy.decode_busy_seconds == pytest.approx(20.0)
+        assert busy.prefill_busy_seconds == pytest.approx(0.0)
 
     def test_stream_without_ttft_is_unknown_prefill(self):
         """AC4: a stream with no first-byte line is counted as unknown
@@ -3074,6 +3078,243 @@ class TestPrefillStats:
         assert stats.stream_count == 4
         assert stats.total_seconds == pytest.approx(86.3)
         assert stats.unit == "slot-seconds"
+
+
+class TestDispatchToFinishBusy:
+    """Busy = union of **dispatch → finish** intervals (LP-0MVJN9H2I00116FP).
+
+    ``busy_seconds`` is the union of ``[ttft.ts - ttft_ms/1000, Stream
+    finished]`` intervals (prefill + decode), with the decode-only union
+    retained as ``decode_busy_seconds`` — the labelled lower bound. Total
+    compute, (peak/avg) concurrency, the fast/cheap split and the hourly split
+    are all recomputed on the new intervals. A stream with no first-byte line
+    falls back to its decode interval and is attributed to the lower bound, so
+    the busy figure is never overstated.
+    """
+
+    @staticmethod
+    def _busy(
+        stream_events: list[log_parser.LogEvent],
+        ttft_events: list[log_parser.LogEvent],
+        start: datetime = WINDOW_START,
+        end: datetime = WINDOW_END,
+    ) -> aggregation.BusyStats | None:
+        return aggregation.compute_busy_stats(
+            stream_events, start, end, _schedule(), ttft_events=ttft_events
+        )
+
+    def test_busy_union_spans_dispatch_to_finish(self):
+        """AC1: the busy interval starts at ``ttft.ts - ttft_ms/1000`` — a
+        30 s prefill extends the 10 s decode interval to 40 s of busy."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 30), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 30), "s1", 30000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.busy_seconds == 40.0  # dispatch 14:00:00 → finish 14:00:40
+        assert busy.busy_definition == "dispatch_to_finish"
+        assert busy.busy_upper_bound_seconds == 40.0
+        assert busy.prefill_extended_streams == 1
+        assert busy.total_compute_seconds == 40.0
+        assert busy.avg_stream_duration == pytest.approx(40.0)
+        # Retained decode-only figure (lower bound) and wall-clock prefill span.
+        assert busy.decode_busy_seconds == 10.0
+        assert busy.busy_lower_bound_seconds == 10.0
+        assert busy.prefill_busy_seconds == 30.0
+
+    def test_decode_only_figure_is_retained_and_feedless_stream_stays_low(self):
+        """AC2/AC5: the decode-only union is reported alongside; a stream
+        without a TTFT line contributes its decode interval to the lower bound
+        only, so the upper bound is not inflated by it."""
+        streams = [
+            # Measured prefill: busy 14:00:05 → 14:00:20 (15 s), decode 10 s.
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            # No first-byte line: contributes decode only (30 s).
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 30), "s2"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.decode_busy_seconds == 40.0  # 10 s + 30 s
+        assert busy.busy_seconds == 45.0  # 15 s (extended) + 30 s (feedless)
+        assert busy.prefill_busy_seconds == 5.0  # only the measured prefill
+        assert busy.prefill_extended_streams == 1
+        assert busy.prefill_stats is not None
+        assert busy.prefill_stats.unknown_count == 1  # s2 visible as unknown
+
+    def test_overlapping_prefill_and_decode_intervals_merge(self):
+        """AC6: one stream's prefill overlapping another's decode merges into
+        a single union interval — no double counting."""
+        start, end = datetime(2026, 8, 2, 13, 0, 0), datetime(2026, 8, 2, 15, 0, 0)
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 30), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s2"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 0), "s1", 10000.0)]
+        busy = self._busy(streams, ttfts, start, end)
+        assert busy is not None
+        # s1 dispatch 13:59:50 → 14:00:30; s2 14:00:10–20 inside it: union 40 s.
+        assert busy.busy_seconds == 40.0
+        assert busy.decode_busy_seconds == 30.0  # 14:00:00–30 (s2 inside s1)
+        assert busy.prefill_busy_seconds == 10.0
+        assert busy.total_compute_seconds == pytest.approx(50.0)  # 40 + 10
+        assert busy.peak_concurrency == 2  # s2's decode overlaps s1's prefill
+        assert busy.avg_concurrency == pytest.approx(50.0 / 40.0)
+
+    def test_unknown_prefill_stream_keeps_decode_interval(self):
+        """A stream paired with a TTFT whose duration is unknown stays at its
+        decode interval (a zero-delta timestamp pairing is not evidence): busy
+        equals decode and the stream is counted as unknown prefill."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", None)]  # no duration
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.busy_seconds == 10.0
+        assert busy.decode_busy_seconds == 10.0
+        assert busy.prefill_busy_seconds == 0.0
+        assert busy.prefill_extended_streams == 0
+        assert busy.prefill_stats is not None and busy.prefill_stats.unknown_count == 1
+
+    def test_unfinished_stream_with_dispatch_does_not_inflate_busy(self):
+        """AC6 boundary: a stream with a measured prefill but no logged finish
+        contributes nothing (its compute time is unknown), even though its
+        dispatch time is derivable."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 30), "aborted"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 10), "s2"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 30), "aborted", 30000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.busy_seconds == 10.0  # s2 decode only, no invented prefill
+        assert busy.unfinished_streams == 1
+        assert busy.prefill_extended_streams == 0
+
+    def test_dispatch_before_window_start_is_clipped_for_busy(self):
+        """AC6 boundary: a dispatch before the window (boundary-crossing
+        interval) is clipped to the window start; the in-window part still
+        includes the prefill seconds that fall inside the window."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 5), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 5), "s1", 60000.0)]
+        busy = self._busy(streams, ttfts)  # dispatch 13:59:05, window starts 14:00:00
+        assert busy is not None
+        assert busy.busy_seconds == 40.0  # 35 s decode + 5 s in-window prefill
+        assert busy.decode_busy_seconds == 35.0
+        assert busy.prefill_busy_seconds == 5.0
+
+    def test_fast_cheap_split_on_dispatch_intervals(self):
+        """AC3: fast/cheap bucketing runs on the new intervals — a prefill
+        straddling the cheap→fast boundary attributes each side to its own
+        bucket (10 s cheap + 20 s fast), and the decode-only split is retained
+        separately."""
+        start, end = datetime(2026, 8, 2, 9, 0, 0), datetime(2026, 8, 2, 11, 0, 0)
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 10, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 10, 0, 20), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 10, 0, 10), "s1", 20000.0)]
+        busy = self._busy(streams, ttfts, start, end)
+        assert busy is not None
+        assert busy.cheap_busy_seconds == 10.0  # 09:59:50–10:00:00
+        assert busy.fast_busy_seconds == 20.0
+        assert busy.busy_seconds == 30.0
+        # Decode-only layer keeps the old all-fast behaviour.
+        assert busy.decode_cheap_busy_seconds == 0.0
+        assert busy.decode_fast_busy_seconds == 10.0
+
+    def test_hourly_busy_recomputed_on_dispatch_intervals(self):
+        """AC3: ``hourly_busy`` attributes the prefill to its dispatch hour
+        (09:59:50 → hour 9) and the rest to the first-byte hour."""
+        start, end = datetime(2026, 8, 2, 9, 0, 0), datetime(2026, 8, 2, 11, 0, 0)
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 10, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 10, 0, 20), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 10, 0, 10), "s1", 20000.0)]
+        busy = self._busy(streams, ttfts, start, end)
+        assert busy is not None
+        hourly = dict(busy.hourly_busy)
+        assert hourly[datetime(2026, 8, 2, 9, 0, 0)] == 10.0
+        assert hourly[datetime(2026, 8, 2, 10, 0, 0)] == 20.0
+
+    def test_no_ttft_events_keeps_disambiguation_compat(self):
+        """AC3 compat: without TTFT events every interval falls back to its
+        decode interval, so the busy figure stays the decode-only figure and
+        the bounds coincide."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 15), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 25), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(streams, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.busy_seconds == 10.0
+        assert busy.decode_busy_seconds == 10.0
+        assert busy.prefill_busy_seconds == 0.0
+        assert busy.busy_lower_bound_seconds == busy.busy_upper_bound_seconds == 10.0
+        assert busy.prefill_extended_streams == 0
+
+    def test_aggregate_wires_dispatch_intervals_end_to_end(self):
+        """AC1 end-to-end through ``aggregate()``: a real dispatch line extends
+        the busy union back to its back-calculated dispatch time."""
+        start = datetime(2026, 10, 22, 20, 0, 0)
+        end = datetime(2026, 10, 22, 22, 0, 0)
+        lines = [
+            fixtures.STREAM_STARTED_PREFILL_COLD,  # 21:15:02,477 (= first byte)
+            fixtures.DISPATCH_FIRST_BYTE_COLD,  # ttft_ms=55656.5 -> dispatch 21:14:06.8
+            # Synthesised finish 10 s after the first byte.
+            "2026-10-22 21:15:12,477 - INFO - Stream finished: reason=stop "
+            f"tokens=1000/20/1020 session={fixtures.PREFILL_SESSION} provider=local "
+            "model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), start, end, _schedule())
+        assert summary.busy is not None
+        busy = summary.busy
+        assert busy.streams == 1
+        assert busy.decode_busy_seconds == 10.0
+        assert busy.busy_seconds == pytest.approx(65.7, abs=0.1)  # 55.6565 s prefill + 10 s
+        assert busy.prefill_busy_seconds == pytest.approx(55.7, abs=0.1)
+        assert busy.prefill_extended_streams == 1
+        assert busy.prefill_stats is not None
+        assert list(busy.prefill_stats.samples) == pytest.approx([55.6565])
+
+    def test_report_renders_definition_and_labelled_bounds(self):
+        """AC2/AC3: the ``## Local model utilization`` section states the
+        dispatch → finish definition, retains the decode-only row as the
+        labelled lower bound, and labels the busy figure as the upper bound."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert summary.busy is not None
+        md = reporting.build_report(summary, None)
+        section = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "from dispatch to finish" in section
+        assert "prefill + decode" in section
+        assert "upper bound (dispatch → finish)" in section
+        assert "Decode-only busy — lower bound" in section
+        assert "| Prefill busy (upper − lower) | 30s |" in section
+        assert "1 of 1 stream(s) contributed a measured prefill" in section
+        # Busy of 40 s over the 1h window.
+        assert "40s (1.1%)" in section
 
 
 class TestSummaryByHourActivity:

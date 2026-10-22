@@ -241,10 +241,25 @@ entry is a local runtime edit, not a committed artifact.
    `Stream finished` events are collected across the analysis's effective
    margin beyond the window (48h, shared with the mode timeline in step 5;
    see `MODE_TIMELINE_MARGIN`), paired per session (FIFO), clipped back to
-   the window, and merged. Busy time is the union of active intervals (at
-   least one slot generating), total compute is the sum of clipped stream
-   durations (slot-seconds), and peak concurrency comes from a sweep over
-   interval endpoints. Busy seconds are attributed to **absolute** hours and
+   the window, and merged. **Busy is the union of dispatch → finish
+   intervals** (LP-0MVJN9H2I00116FP): each paired stream's interval starts at
+   its back-calculated dispatch time (`ttft.ts - ttft_ms/1000`, i.e. the
+   prefill line's first-byte timestamp minus its measured duration) and ends
+   at its `Stream finished` line, so the prefill (prompt-processing) phase is
+   counted alongside decode. A stream with no first-byte line falls back to
+   its decode interval (`Stream started` → `Stream finished`) and is
+   attributed to the lower bound — busy is never overstated by a fabricated
+   prefill. The decode-only union is retained as
+   `BusyStats.decode_busy_seconds`, the labelled **lower bound** of the busy
+   figure; `busy_seconds` is the labelled **upper bound**
+   (`BUSY_DEFINITION = "dispatch_to_finish"`,
+   `BUSY_UPPER_BOUND_LABEL`/`BUSY_LOWER_BOUND_LABEL`). All derived figures work
+   on the new intervals: total compute is the sum of clipped stream durations
+   (slot-seconds), peak concurrency comes from a sweep over interval
+   endpoints, and the fast/cheap and hourly splits are attributed from the
+   dispatch → finish union (`fast_busy_seconds`, `cheap_busy_seconds`,
+   `hourly_busy`); `prefill_busy_seconds` is the wall-clock prefill span
+   (upper − lower). Busy seconds are attributed to **absolute** hours and
    to fast/cheap periods (slot schedule) by splitting at hour and period
    boundaries. The top-of-report **Summary by hour** table
    (LP-0MTFO210Q0044TTF, reworked by LP-0MTYAZFGN003BYQS) then renders one
@@ -397,7 +412,10 @@ entry is a local runtime edit, not a committed artifact.
 - **Context pressure**: sessions whose max context approaches
   `local_model_ctx_size / slots` can force `large_context_bypass`.
 - **Local model utilization**: busy time is the share of the window with at
-  least one local slot generating. A low busy % with high fallback volume
+  least one local slot occupied **from dispatch to finish** (prefill +
+  decode, LP-0MVJN9H2I00116FP); the retained decode-only figure is its
+  labelled lower bound, and a stream with no first-byte line never inflates
+  it. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
   fallback reasons), not that local is underprovisioned. The **Summary by
   hour** table at the top of the report shows per-hour busy % and per-hour

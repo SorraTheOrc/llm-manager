@@ -47,6 +47,19 @@ UNKNOWN_LABEL = "(unknown)"
 # dispatch → first-byte durations — which is NOT wall-clock elapsed time.
 PREFILL_UNIT = "slot-seconds"
 
+# Busy definition (LP-0MVJN9H2I00116FP). Local "busy" is at least one local slot
+# occupied **from dispatch to finish** (prefill + decode), not decode only: the
+# interval starts at the stream's back-calculated dispatch time
+# (``ttft.ts - ttft_ms/1000``) and ends at its ``Stream finished`` line. The
+# previous decode-only figure is retained as
+# :attr:`BusyStats.decode_busy_seconds` and labels the **lower bound** of the
+# busy figure, while the dispatch → finish union labels the **upper bound**:
+# a stream with no first-byte line contributes only its decode interval, so the
+# upper bound is never overstated by a fabricated prefill.
+BUSY_DEFINITION = "dispatch_to_finish"
+BUSY_UPPER_BOUND_LABEL = "dispatch → finish union (prefill + decode)"
+BUSY_LOWER_BOUND_LABEL = "decode-only union (Stream started → Stream finished)"
+
 # Root-cause classification for stream errors (LP-0MUQO82LJ008F1FS).
 # A stream error is the client-visible synthetic ``finish_reason: error``
 # (``stream_finish_error``) or its proxy-side companion (``stream_error``);
@@ -472,14 +485,22 @@ class PrefillStats:
 class BusyStats:
     """Local-model utilization over the analysis window.
 
-    "Busy" means at least one local slot is actively generating: streams are
-    paired per session (FIFO across the full event stream, not just the
-    window), each pair is clipped to ``[window_start, window_end]``, and the
-    clipped intervals are merged so overlapping streams do not double-count.
+    "Busy" means at least one local slot is occupied **from dispatch to
+    finish** (prefill + decode, LP-0MVJN9H2I00116FP): streams are paired per
+    session (FIFO across the full event stream, not just the window), each
+    pair's interval starts at its back-calculated dispatch time
+    (``ttft.ts - ttft_ms/1000``, falling back to ``Stream started`` when the
+    stream has no first-byte line) and ends at ``Stream finished``; each pair
+    is clipped to ``[window_start, window_end]`` and the clipped intervals are
+    merged so overlapping streams do not double-count.
 
     ``total_compute_seconds`` is the sum of all clipped stream durations
-    (slot-seconds, i.e. the integral of concurrency); ``busy_seconds`` is the
-    union of active intervals. ``avg_concurrency`` = total / busy.
+    (slot-seconds, i.e. the integral of concurrency) on those dispatch →
+    finish intervals; ``busy_seconds`` is their union. ``avg_concurrency`` =
+    total / busy. The decode-only union (``Stream started`` → ``Stream
+    finished``) is retained in :attr:`decode_busy_seconds` — the lower bound
+    of the busy figure, whose labelled upper bound is :attr:`busy_seconds`
+    (see :data:`BUSY_UPPER_BOUND_LABEL` / :data:`BUSY_LOWER_BOUND_LABEL`).
     """
 
     window_seconds: float
@@ -512,6 +533,44 @@ class BusyStats:
     # that never asked for prefill is distinguishable from one that found no
     # first-byte lines (an empty :class:`PrefillStats`).
     prefill_stats: PrefillStats | None = None
+    # Decode-only busy union (``Stream started`` → ``Stream finished``),
+    # clipped to the window — the lower bound of the busy figure
+    # (LP-0MVJN9H2I00116FP). It is what the report called "busy" before the
+    # dispatch → finish redefinition and stays visible for comparability.
+    decode_busy_seconds: float = 0.0
+    # The same decode-only union split across fast/cheap periods.
+    decode_fast_busy_seconds: float = 0.0
+    decode_cheap_busy_seconds: float = 0.0
+    # Number of paired streams whose busy interval was extended backwards to
+    # a measured dispatch time; the rest contribute their decode interval
+    # only (unknown prefill), which keeps the upper bound honest.
+    prefill_extended_streams: int = 0
+
+    @property
+    def busy_definition(self) -> str:
+        """Marker for the busy definition (``dispatch_to_finish``)."""
+        return BUSY_DEFINITION
+
+    @property
+    def busy_upper_bound_seconds(self) -> float:
+        """Upper bound of the busy figure: the dispatch → finish union."""
+        return self.busy_seconds
+
+    @property
+    def busy_lower_bound_seconds(self) -> float:
+        """Lower bound of the busy figure: the decode-only union."""
+        return self.decode_busy_seconds
+
+    @property
+    def prefill_busy_seconds(self) -> float:
+        """Wall-clock prefill occupancy: upper bound − lower bound.
+
+        This is the extra union time contributed by the measured prefills
+        (slot-time already spent before the first byte). It is a wall-clock
+        union, not the per-stream slot-seconds sum in
+        :class:`PrefillStats.total_seconds`.
+        """
+        return round(max(0.0, self.busy_seconds - self.decode_busy_seconds), 1)
 
     @property
     def busy_pct(self) -> float:
@@ -782,16 +841,29 @@ def _prefill_seconds(match: PrefillMatch) -> float | None:
     return delta if delta > 0 else None
 
 
+def _merge_intervals(
+    intervals: Iterable[tuple[datetime, datetime]],
+) -> list[list[datetime]]:
+    """Merge overlapping/touching ``(start, end)`` intervals into a union."""
+    ordered = sorted(intervals)
+    merged: list[list[datetime]] = []
+    for start, end in ordered:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
 def _compute_prefill_stats(
-    started_events: list[LogEvent],
-    ttft_events: Iterable[LogEvent],
+    matches: Iterable[PrefillMatch],
     window_start: datetime,
     window_end: datetime,
 ) -> PrefillStats:
     """Per-stream local prefill statistics for the window.
 
-    TTFT events are paired FIFO to the local streams per session (same
-    convention as the busy start/finish pairing), so each stream gets at most
+    ``matches`` are the streams paired FIFO to their TTFT events per session
+    (the same pairing the busy intervals use), so each stream gets at most
     one prefill interval ``[ttft.ts - ttft_ms/1000, ttft.ts]``. A stream is
     attributed to the window whose bounds contain its first-byte timestamp
     (its ``Stream started`` timestamp when it has no first-byte line, which
@@ -801,7 +873,7 @@ def _compute_prefill_stats(
     double-counting).
     """
     streams: list[PrefillSample] = []
-    for match in pair_ttft_to_streams(ttft_events, started_events):
+    for match in matches:
         anchor = match.ttft.ts if match.ttft is not None else match.stream.ts
         if not (window_start <= anchor <= window_end):
             continue
@@ -841,6 +913,19 @@ def compute_busy_stats(
     even when the analysis runs in fast mode. Returns ``None`` when there is
     no local traffic in the window.
 
+    Busy is the union of **dispatch → finish** intervals (prefill + decode,
+    LP-0MVJN9H2I00116FP): each paired stream's interval starts at
+    ``ttft.ts - ttft_ms/1000`` when a first-byte line is available and at
+    ``Stream started`` otherwise, and ends at ``Stream finished``. Busy,
+    total compute, peak/average concurrency, the fast/cheap split and the
+    hourly split are all computed on those intervals. The decode-only union
+    (``Stream started`` → ``Stream finished``) is retained as
+    :attr:`BusyStats.decode_busy_seconds`, the labelled lower bound of the
+    busy figure; the dispatch → finish union is the labelled upper bound.
+    A stream with no first-byte line falls back to its decode interval, so it
+    can only ever contribute its lower-bound time — the busy figure is never
+    overstated.
+
     ``ttft_events`` are the local ``dispatch_first_byte_ms`` TTFT events
     (LP-0MVJN45LF009CO2V). When supplied they are paired FIFO to the local
     streams per session and reported as :attr:`BusyStats.prefill_stats`:
@@ -853,43 +938,73 @@ def compute_busy_stats(
     dispatch and first-byte timestamps (see :func:`_prefill_seconds`). Streams
     with no first-byte line are counted as unknown prefill: excluded from the
     percentiles, retained in the stream count. ``prefill_stats`` is ``None``
-    only when ``ttft_events`` was not supplied at all.
+    only when ``ttft_events`` was not supplied at all — in that case every
+    busy interval falls back to its decode interval, so ``busy_seconds`` and
+    ``decode_busy_seconds`` coincide.
     """
-    started: dict[str, list[datetime]] = {}
-    finished: dict[str, list[datetime]] = {}
+    started: dict[str, list[LogEvent]] = {}
+    finished: dict[str, list[LogEvent]] = {}
     started_events: list[LogEvent] = []
     for ev in local_events:
         if ev.session is None:
             continue
-        bucket = started if ev.kind == "stream_started" else finished
-        bucket.setdefault(ev.session, []).append(ev.ts)
         if ev.kind == "stream_started":
+            started.setdefault(ev.session, []).append(ev)
             started_events.append(ev)
+        else:
+            finished.setdefault(ev.session, []).append(ev)
+
+    ttft_list = list(ttft_events) if ttft_events is not None else None
+    matches = (
+        pair_ttft_to_streams(ttft_list, started_events) if ttft_list is not None else []
+    )
+    # Dispatch start per paired stream: ``ttft.ts - prefill_seconds`` — the
+    # prefill interval start from LP-0MVJN9H2I00116FP AC1. Streams with unknown
+    # prefill are absent from the map and fall back to their decode interval.
+    dispatch_start: dict[int, datetime] = {}
+    for match in matches:
+        seconds = _prefill_seconds(match)
+        if seconds is not None and match.ttft is not None:
+            dispatch_start[id(match.stream)] = match.ttft.ts - timedelta(seconds=seconds)
 
     intervals: list[tuple[datetime, datetime]] = []
+    decode_intervals: list[tuple[datetime, datetime]] = []
+    prefill_extended = 0
     unfinished = 0
     pre_window_unfinished = 0
     margin_start = window_start - BUSY_WINDOW_MARGIN
-    for session_id, starts in started.items():
-        ss = sorted(starts)
-        ff = sorted(finished.get(session_id, []))
-        for b, e in zip(ss, ff):
-            cb, ce = max(b, window_start), min(e, window_end)
-            if ce > cb:
-                intervals.append((cb, ce))
+    for session_id, session_starts in started.items():
+        ss = sorted(session_starts, key=lambda e: e.ts)
+        ff = sorted(finished.get(session_id, []), key=lambda e: e.ts)
+        for start_ev, finish_ev in zip(ss, ff):
+            # Decode-only interval (``Stream started`` → ``Stream finished``).
+            d_lo, d_hi = max(start_ev.ts, window_start), min(finish_ev.ts, window_end)
+            if d_hi > d_lo:
+                decode_intervals.append((d_lo, d_hi))
+            # Busy interval (dispatch → finish): the same pair extended back to
+            # its measured dispatch time when a first-byte line exists.
+            measured_dispatch = dispatch_start.get(id(start_ev))
+            if measured_dispatch is not None:
+                busy_start = measured_dispatch
+                prefill_extended += 1
+            else:
+                busy_start = start_ev.ts
+            b_lo, b_hi = max(busy_start, window_start), min(finish_ev.ts, window_end)
+            if b_hi > b_lo:
+                intervals.append((b_lo, b_hi))
         # FIFO pairing: the earliest ``len(ff)`` starts pair with finishes;
         # the remaining starts are unpaired (no logged finish). Only starts
         # within the busy margin before the window (or inside it) count as
         # this window's unfinished; earlier starts are pre-window leftovers;
         # starts after the window end belong to the next window.
-        for ts in ss[len(ff):]:
-            if ts < margin_start:
+        for start_ev in ss[len(ff):]:
+            if start_ev.ts < margin_start:
                 pre_window_unfinished += 1
-            elif ts <= window_end:
+            elif start_ev.ts <= window_end:
                 unfinished += 1
     prefill_stats = (
-        _compute_prefill_stats(started_events, ttft_events, window_start, window_end)
-        if ttft_events is not None
+        _compute_prefill_stats(matches, window_start, window_end)
+        if ttft_list is not None
         else None
     )
     if not intervals:
@@ -899,15 +1014,11 @@ def compute_busy_stats(
         if prefill_stats is None or prefill_stats.stream_count == 0:
             return None
 
-    intervals.sort()
-    merged: list[list[datetime]] = []
-    for cb, ce in intervals:
-        if merged and cb <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], ce)
-        else:
-            merged.append([cb, ce])
+    merged = _merge_intervals(intervals)
+    decode_merged = _merge_intervals(decode_intervals)
 
     busy_seconds = sum((e - s).total_seconds() for s, e in merged)
+    decode_busy = sum((e - s).total_seconds() for s, e in decode_merged)
     total_compute = sum((e - s).total_seconds() for s, e in intervals)
     window_seconds = (window_end - window_start).total_seconds()
 
@@ -932,6 +1043,11 @@ def compute_busy_stats(
     hourly: dict[datetime, float] = {}
     for s, e in merged:
         _attribute_interval(s, e, periods, label_at, bucket_busy, hourly)
+    # The retained decode-only lower bound is bucketed the same way (its
+    # hourly split is not reported, so the throwaway dict is intentional).
+    decode_bucket_busy: dict[str, float] = {}
+    for s, e in decode_merged:
+        _attribute_interval(s, e, periods, label_at, decode_bucket_busy, {})
 
     fast_window = cheap_window = 0.0
     bounds = _segment_boundaries(window_start, window_end, periods)
@@ -961,6 +1077,10 @@ def compute_busy_stats(
         cheap_window_seconds=round(cheap_window, 1),
         hourly_busy=sorted(hourly.items()),
         prefill_stats=prefill_stats,
+        decode_busy_seconds=round(decode_busy, 1),
+        decode_fast_busy_seconds=round(decode_bucket_busy.get("fast", 0.0), 1),
+        decode_cheap_busy_seconds=round(decode_bucket_busy.get("cheap", 0.0), 1),
+        prefill_extended_streams=prefill_extended,
     )
 
 
