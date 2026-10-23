@@ -1,9 +1,3 @@
-
-# <!-- REFACTOR-LP-0MVKD3VPG00162QT
-# smell: modernization
-# severity: medium
-# description: Use format specifiers instead of percent format
-# -->
 #!/usr/bin/env python3
 """Behavioural tests for ``start-proxy.sh`` launch modes.
 
@@ -201,7 +195,7 @@ def test_default_launch_detaches_and_prints_one_handoff_line(tmp_path):
     assert proc.returncode == 0, proc.stderr
     handoff = [line for line in proc.stdout.splitlines() if str(log_file) in line]
     assert len(handoff) == 1, f"expected exactly one handoff line, got {handoff}"
-    assert "curl -sf http://127.0.0.1:%d/health" % port in handoff[0]
+    assert f"curl -sf http://127.0.0.1:{port}/health" in handoff[0]
     assert "FAKE_UVICORN" not in proc.stdout, "the child's output leaked into the caller's stdout"
 
     # The detached child re-executes the script with --foreground and reaches
