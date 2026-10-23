@@ -52,6 +52,10 @@ rocm_version: str = "unknown"
 # Set by the lifespan handler immediately before ``yield``.
 PROXY_START_TIME: float = 0.0
 
+# Exclusive single-instance lock handle (LP-0MVLHMAWV008EKTI AC2). Held for the
+# whole process lifetime and released on shutdown; ``None`` when not held.
+_instance_lock: Any | None = None
+
 # Session manager for incremental prompt ingestion
 session_manager: SessionManager = SessionManager(ttl_seconds=DEFAULT_SESSION_TTL_SECONDS)
 
@@ -487,6 +491,79 @@ def _log_restart_attribution() -> None:
     )
 
 
+def _startup_acquire_instance_lock(lock_path: Path | None = None) -> Any | None:
+    """Acquire the exclusive single-instance lock for the proxy log directory.
+
+    Only one proxy process may own a log directory: on 2026-10-23 a second
+    ``uvicorn proxy.server:app`` process stayed alive with no listener but
+    with ``proxy.log`` open for write, and two writers on one log lost a
+    3 h 35 m verification window. Port binding cannot catch a bound-less twin;
+    this ``flock`` can (LP-0MVLHMAWV008EKTI AC2).
+
+    Returns the held lock (idempotent — a second call in the same process
+    returns the same handle) or ``None`` when the guard is disabled with
+    ``LLAMA_PROXY_SKIP_INSTANCE_LOCK=1`` (dev/isolated runs).
+
+    Raises ``RuntimeError`` naming the holder pid when another live instance
+    owns the log directory, so the caller fails fast instead of starting a
+    second writer. ``flock`` is released by the kernel when the holder exits,
+    so a crashed process never leaves a stale lock behind.
+    """
+    global _instance_lock
+    if _instance_lock is not None:
+        return _instance_lock
+
+    import os
+
+    from proxy.single_instance import (
+        LOCK_FILENAME,
+        acquire_instance_lock,
+        read_holder_pid,
+    )
+
+    if os.environ.get("LLAMA_PROXY_SKIP_INSTANCE_LOCK") == "1":
+        logger.warning(
+            "Single-instance lock skipped (LLAMA_PROXY_SKIP_INSTANCE_LOCK=1); "
+            "ensure no other proxy writes this log directory"
+        )
+        return None
+
+    if lock_path is None:
+        lock_dir = log_dir or Path(__file__).parent.parent / "logs"
+        lock_path = Path(lock_dir) / LOCK_FILENAME
+
+    lock = acquire_instance_lock(lock_path)
+    if lock is None:
+        holder = read_holder_pid(lock_path)
+        message = (
+            "Another LLama Proxy instance is already running "
+            f"(holder pid {holder if holder is not None else 'unknown'}, "
+            f"lock {lock_path}); refusing to start a second writer for the "
+            "same log. Stop that process (kill the specific pid, never a "
+            "blanket kill) and retry."
+        )
+        logger.critical(message)
+        raise RuntimeError(message)
+
+    _instance_lock = lock
+    logger.info(
+        "Single-instance lock acquired: %s pid=%s", lock_path, lock.holder_pid
+    )
+    return lock
+
+
+def _startup_release_instance_lock() -> None:
+    """Release the single-instance lock (idempotent; kernel releases on exit)."""
+    global _instance_lock
+    lock, _instance_lock = _instance_lock, None
+    if lock is None:
+        return
+    try:
+        lock.release()
+    except Exception:  # pragma: no cover - release is best-effort at shutdown
+        pass
+
+
 def _startup_config_logging():
     """Load configuration and set up logging.
 
@@ -496,6 +573,9 @@ def _startup_config_logging():
     global config, logger
     config = load_config()
     logger = setup_logging(config)
+    # Exactly one proxy per log directory (LP-0MVLHMAWV008EKTI AC2): a second
+    # instance must fail fast, not become a second writer of the same log.
+    _startup_acquire_instance_lock()
     _startup_validate_local_routing_config(config)
     _startup_validate_compaction_config(config)
 
@@ -1164,6 +1244,7 @@ async def lifespan(app: FastAPI):
     await _shutdown_http_client()
     _shutdown_llama_server()
     await _shutdown_disconnect_reaper()
+    _startup_release_instance_lock()
 
 
 app = FastAPI(

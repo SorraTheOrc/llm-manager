@@ -27,6 +27,10 @@ What is measured and how (metric provenance):
     (pure, deterministic, unit-tested with synthetic lines).
   * AC3 — ``Stream finished ... provider=local`` events within a window after
     the last deadline release prove local decode resumed.
+  * Coverage — an adjacent-file gap larger than ``--max-log-gap-seconds``
+    inside the requested window fails the verdict, so a lost window (the
+    2026-10-23 18:29:12 -> 22:04:16 hole) is reported instead of silently
+    producing a partial read (LP-0MVLHMAWV008EKTI).
 
 Usage:
   ./scripts/prefill_recovery_verification.py --measure [--since ..] [--until ..] [--json]
@@ -56,7 +60,11 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from lib.proxy_logs import discover_proxy_log_files, open_proxy_log_text  # noqa: E402
+from lib.proxy_logs import (  # noqa: E402
+    discover_proxy_log_files,
+    measure_log_coverage,
+    open_proxy_log_text,
+)
 
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+")
 _DEADLINE_RE = re.compile(r"prefill_deadline_exceeded session=(\S+)")
@@ -573,6 +581,7 @@ def run_measure(
     min_attempts: int,
     recovery_bound: int,
     resume_window: int,
+    max_log_gap_seconds: float = 3600.0,
 ) -> dict:
     lines: list[str] = []
     for path in discover_proxy_log_files(log_dir):
@@ -603,11 +612,51 @@ def run_measure(
     )
     ac3 = local_serving_resumed(finishes_after)
 
+    # Coverage (LP-0MVLHMAWV008EKTI): a lost window must fail the verdict
+    # instead of silently producing a partial read. Adjacent-file gaps over
+    # the threshold are the incident shape (a file boundary spanning hours).
+    coverage = measure_log_coverage(
+        log_dir, since=since, until=until, max_gap_seconds=max_log_gap_seconds
+    )
+
     report = {
         "window": {
             "since": since.isoformat(sep=" ") if since else None,
             "until": until.isoformat(sep=" ") if until else None,
             "log_dir": str(log_dir),
+        },
+        "coverage": {
+            "max_gap_seconds": coverage.max_gap_seconds,
+            "files": [
+                {
+                    "file": span.path.name,
+                    "first": span.first.isoformat(sep=" "),
+                    "last": span.last.isoformat(sep=" "),
+                    "lines": span.line_count,
+                }
+                for span in coverage.spans
+            ],
+            "gaps": [
+                {
+                    "before_file": gap.before.name,
+                    "before_last": gap.before_last.isoformat(sep=" "),
+                    "after_file": gap.after.name,
+                    "after_first": gap.after_first.isoformat(sep=" "),
+                    "gap_seconds": round(gap.gap_seconds, 2),
+                }
+                for gap in coverage.gaps
+            ],
+            "window_start_gap_seconds": (
+                round(coverage.window_start_gap_seconds, 2)
+                if coverage.window_start_gap_seconds is not None
+                else None
+            ),
+            "window_end_gap_seconds": (
+                round(coverage.window_end_gap_seconds, 2)
+                if coverage.window_end_gap_seconds is not None
+                else None
+            ),
+            "verdict_met": coverage.covered,
         },
         "ac1": {
             "min_attempts": min_attempts,
@@ -638,18 +687,36 @@ def run_measure(
             "local_finishes_after_last_release": finishes_after,
             "verdict_met": ac3,
         },
-        "all_verdicts_met": ac1.clean and ac2.within_bound and ac3,
+        "all_verdicts_met": (
+            ac1.clean and ac2.within_bound and ac3 and coverage.covered
+        ),
     }
     return report
 
 
 def _render(report: dict) -> str:
     a1, a2, a3 = report["ac1"], report["ac2"], report["ac3"]
+    cov = report["coverage"]
     out = []
     out.append("Prefill-deadline recovery verification (LP-0MVKUKGER000TW2W)")
     out.append("=" * 66)
     out.append(f"window  : {report['window']['since'] or '(start)'} .. "
                f"{report['window']['until'] or '(end)'}")
+    out.append("")
+    out.append("Log coverage (LP-0MVLHMAWV008EKTI):")
+    out.append(f"  files in window                    : {len(cov['files'])}")
+    if not cov["files"]:
+        out.append("  !! no parseable logs in the window -- measurement is impossible")
+    for gap in cov["gaps"]:
+        out.append(
+            f"  !! gap {gap['before_file']} (ends {gap['before_last']}) -> "
+            f"{gap['after_file']} (starts {gap['after_first']}): "
+            f"{gap['gap_seconds']}s > {cov['max_gap_seconds']}s"
+        )
+    out.append(
+        f"  verdict                          : "
+        f"{'MET' if cov['verdict_met'] else 'NOT MET -- window has gaps'}"
+    )
     out.append("")
     out.append("AC1 (report figures):")
     out.append(f"  hours checked                    : {a1['hours_checked']}")
@@ -698,6 +765,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-attempts", type=int, default=10)
     parser.add_argument("--recovery-bound-seconds", type=int, default=300)
     parser.add_argument("--resume-window-seconds", type=int, default=3600)
+    parser.add_argument(
+        "--max-log-gap-seconds", type=float, default=3600.0,
+        help="adjacent-file coverage gap considered a lost window (default 3600)",
+    )
     parser.add_argument("--hour-records", default=None,
                         help="JSON file with the pipeline's hourly_activity "
                              "records (skips running the pipeline)")
@@ -769,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_attempts=args.min_attempts,
                 recovery_bound=args.recovery_bound_seconds,
                 resume_window=args.resume_window_seconds,
+                max_log_gap_seconds=args.max_log_gap_seconds,
             )
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
@@ -786,6 +858,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_attempts=args.min_attempts,
                 recovery_bound=args.recovery_bound_seconds,
                 resume_window=args.resume_window_seconds,
+                max_log_gap_seconds=args.max_log_gap_seconds,
             )
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)

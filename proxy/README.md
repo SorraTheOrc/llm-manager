@@ -2957,6 +2957,18 @@ Logs are written with time-based rotation:
 - **Retention**: 7 days
 - **Format**: `TIMESTAMP - LEVEL - MESSAGE`
 
+**Restart-safe, single-writer logging (LP-0MVLHMAWV008EKTI).** On startup a
+non-empty `proxy.log` is renamed aside to `proxy.log.YYYY-MM-DD_HHMMSS`
+(named for its last write, never overwriting an existing rotated file), so a
+restart archives the pre-restart window instead of risking its loss and the
+new process always starts a fresh file. Only one proxy may own a log
+directory: an exclusive `flock` on `proxy.lock` makes a second instance fail
+fast with the holder's pid, and `start-proxy.sh` reaps a bound-less stale twin
+(`reap-stale-proxy.sh`) before launching. Measurement scripts that assert log
+coverage call `measure_log_coverage()` (`scripts/lib/proxy_logs.py`), which
+turns an unexplained gap between adjacent files into a verdict failure. See
+[docs/dev/proxy-log-lifecycle.md](../docs/dev/proxy-log-lifecycle.md).
+
 Log entries include:
 - Incoming requests (method, path, target, body preview)
 - Responses (status code, body preview)

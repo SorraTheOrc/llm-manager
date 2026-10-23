@@ -227,5 +227,80 @@ class PromptGeneratorTest(unittest.TestCase):
         self.assertNotEqual(a, b, "two seeds must produce distinct prompts")
 
 
+class MeasureLogCoverageTest(unittest.TestCase):
+    """LP-0MVLHMAWV008EKTI: a lost window fails the measurement verdict.
+
+    ``--measure`` used to read whatever files it found and report on the lines
+    it managed to parse, so a 3 h 35 m hole (18:29:12 -> 22:04:16 on
+    2026-10-23) produced a silently partial window. Coverage is now part of
+    the report and of ``all_verdicts_met``.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.log_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, name, lines):
+        (self.log_dir / name).write_text("".join(lines), encoding="utf-8")
+
+    def _measure(self, **kwargs):
+        # hour_records=[] keeps AC1 independent of the analysis pipeline.
+        return prv.run_measure(
+            log_dir=self.log_dir,
+            since=None,
+            until=None,
+            hour_records=[],
+            analysis_cmd=[],
+            min_attempts=10,
+            recovery_bound=300,
+            resume_window=3600,
+            **kwargs,
+        )
+
+    def _covered_lines(self):
+        return [
+            "2026-10-23 10:00:00,000 - WARNING - prefill_deadline_exceeded session=A deadline=90s\n",
+            "2026-10-23 10:00:02,000 - INFO - lease_released session=A reason=prefill_deadline endpoint=default\n",
+            "2026-10-23 10:05:00,000 - INFO - Stream finished: reason=stop tokens=50/5/55 session=F provider=local model=Qwen3\n",
+        ]
+
+    def test_covered_window_keeps_all_verdicts_met(self):
+        self._write("proxy.log.2026-10-23_10", self._covered_lines())
+        report = self._measure(max_log_gap_seconds=3600)
+        self.assertTrue(report["coverage"]["verdict_met"])
+        self.assertEqual(report["coverage"]["gaps"], [])
+        self.assertTrue(report["all_verdicts_met"])
+
+    def test_missing_window_fails_coverage_and_all_verdicts(self):
+        self._write(
+            "proxy.log.2026-10-23_12",
+            [
+                "2026-10-23 10:00:00,000 - WARNING - prefill_deadline_exceeded session=A deadline=90s\n",
+                "2026-10-23 10:00:02,000 - INFO - lease_released session=A reason=prefill_deadline endpoint=default\n",
+                "2026-10-23 10:05:00,000 - INFO - Stream finished: reason=stop tokens=50/5/55 session=F provider=local model=Qwen3\n",
+                "2026-10-23 18:29:12,000 - INFO - status_request\n",
+            ],
+        )
+        self._write("proxy.log", ["2026-10-23 22:04:16,000 - INFO - status_request\n"])
+
+        report = self._measure(max_log_gap_seconds=3600)
+
+        self.assertFalse(report["coverage"]["verdict_met"])
+        self.assertEqual(len(report["coverage"]["gaps"]), 1)
+        gap = report["coverage"]["gaps"][0]
+        self.assertEqual(gap["before_file"], "proxy.log.2026-10-23_12")
+        self.assertEqual(gap["after_file"], "proxy.log")
+        self.assertGreater(gap["gap_seconds"], 3600)
+        # The other verdicts still hold for this synthetic window; coverage is
+        # what makes the overall measurement untrustworthy.
+        self.assertFalse(report["all_verdicts_met"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -349,6 +349,22 @@ if [ "$PORT_IN_USE" -eq 1 ]; then
   exit 1
 fi
 
+# LP-0MVLHMAWV008EKTI AC2: a proxy process that is alive but holds no listener
+# on its port is a wedged twin. It never fails the port check above, so it
+# survived every start on 2026-10-23 while keeping proxy.log open for write —
+# a second writer that could rotate/truncate the live window. The port check
+# has already refused when a *healthy* proxy owns the port, so any surviving
+# proxy.server process for this port here is stale: reap it before launching so
+# exactly one process owns the log. Killing it also releases its single-instance
+# lock (``flock`` dies with the holder), so the new process can acquire it.
+if [ "$RESTART" -eq 0 ]; then
+  if [ -x "$SCRIPT_DIR/reap-stale-proxy.sh" ]; then
+    bash "$SCRIPT_DIR/reap-stale-proxy.sh" --port "$PORT" >&2 || true
+  else
+    echo "Warning: $SCRIPT_DIR/reap-stale-proxy.sh not found; cannot reap a stale proxy twin." >&2
+  fi
+fi
+
 CONFIG_FILE="$REPO_ROOT/config.yaml"
 echo "Using config: $CONFIG_FILE" >&2
 
