@@ -1732,6 +1732,14 @@ server:
   # unobservable progress is charged the calibrated estimate (never "free
   # soon").
   #
+  # CONSERVATIVE ETA FOR LARGE PROMPTS (LP-0MVKUKF65008D5UN). The projected
+  # prefill above is costed from a conservative percentile of observed
+  # first-byte times for prompts >= 32k tokens
+  # (``local_admission_guard_eta_percentile``, default p75, never below the
+  # bucket's measured p50), so a large prompt is not admitted on the
+  # optimistic point estimate that the 90 s deadline then cancels. Set the
+  # percentile to 0 for the rollback (point estimate, byte-for-byte).
+  #
   # SECOND, INDEPENDENT BOUND — the prefill DEADLINE (LP-0MVKUKEU80022C3U).
   # The budget bound above only refuses when the projected wait exceeds the
   # queue budget, but nothing refused admission against the hard
@@ -1799,6 +1807,18 @@ server:
   # Prompt size used for the published estimate on /llama/local/status when
   # no dispatch has been observed yet for the current model.
   local_admission_guard_reference_tokens: 32000
+  # Conservative ETA pricing for large prompts (LP-0MVKUKF65008D5UN): the
+  # point least-squares estimate is optimistic for large prompts (measured
+  # first-byte times p50 16s / p90 189s / max 591s; a 19,940-token prompt was
+  # once modelled at 19.9s). Prompts >= 32k tokens are therefore priced at
+  # this PERCENTILE of the observed ``dispatch_first_byte_ms`` window for
+  # their (model, context bucket) — default 75 (p75) — and never below the
+  # window's measured p50, so an infeasible large prompt is refused at
+  # admission by the ``local_prefill_deadline_seconds`` backstop (C2) instead
+  # of starting a prefill the deadline will cancel. Smaller prompts are
+  # unchanged, and setting this to 0 disables the percentile pricing
+  # (documented rollback — byte-for-byte the point estimate).
+  local_admission_guard_eta_percentile: 75
   # Deadline-aware admission bound (LP-0MVKUKEU80022C3U): the guard ALSO
   # refuses local when the projected first-byte ETA exceeds this hard
   # backstop (default 90 s, same value as ``local_prefill_deadline_seconds``;

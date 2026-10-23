@@ -65,6 +65,22 @@ Fitted coefficients pass through a conservatism factor (an over-estimate
 prefers the cheap-but-fast remote call over a futile 120 s wait) and are
 clamped to plausible bounds.
 
+Conservative pricing for large prompts (LP-0MVKUKF65008D5UN)
+---------------------------------------------------------------
+
+The point fit is *optimistic* for large prompts: observed first-byte times for
+this workload span p50 16 s … p90 189 s … max 591 s, and a 19,940-token
+prompt was once modelled at 19.9 s while a 41,682-token prompt actually took
+~86 s to first byte. For prompts >= ``CONSERVATIVE_MIN_TOKENS`` (32k) the
+projected prefill is therefore priced from a conservative percentile of the
+observed ``dispatch_first_byte_ms`` in the ``(model, bucket)`` window
+(default p75, ``local_admission_guard_eta_percentile``) instead of the point
+estimate alone, and never below the window's measured p50. Combined with the
+C2 deadline bound (``local_prefill_deadline_seconds``, LP-0MVKUKEU80022C3U)
+an infeasible large prompt is refused at admission instead of starting a
+prefill the deadline will cancel. Setting the percentile to 0 restores the
+point estimate byte-for-byte (documented rollback).
+
 Rollout control
 ---------------
 
@@ -113,6 +129,19 @@ DEFAULT_POLICY = POLICY_REJECT
 
 DEFAULT_CODED_MS_PER_TOKEN = 0.5
 DEFAULT_PREFILL_MS_PER_TOKEN = 3.9
+
+#: Conservative ETA pricing (LP-0MVKUKF65008D5UN): percentile of the observed
+#: ``dispatch_first_byte_ms`` window that large prompts are priced at.
+#: 0 disables the percentile pricing (documented rollback — the estimator is
+#: byte-for-byte the point estimate).
+DEFAULT_ETA_PERCENTILE = 75.0
+ETA_PERCENTILE_KEY = "local_admission_guard_eta_percentile"
+
+#: Prompts >= this many tokens ("large prompt") are priced at the configured
+#: percentile of observed first-byte times, never below the bucket's measured
+#: p50 (AC2). Smaller prompts keep the point estimate exactly (small-prompt
+#: behaviour unchanged, AC3).
+CONSERVATIVE_MIN_TOKENS = 32_768
 
 #: Minimum samples in a ``(model, bucket)`` window before the guard may
 #: reject. Below this the guard is inert (today's behaviour is unchanged).
@@ -217,6 +246,9 @@ class GuardConfig:
     reference_tokens: int
     #: Projected-first-byte deadline (seconds); 0 disables the bound.
     prefill_deadline_seconds: float = float(DEFAULT_PREFILL_DEADLINE_SECONDS)
+    #: Percentile of the observed first-byte window large prompts are priced
+    #: at (LP-0MVKUKF65008D5UN); 0 disables conservative pricing.
+    eta_percentile: float = DEFAULT_ETA_PERCENTILE
 
 
 def resolve_config(config: dict | None) -> GuardConfig:
@@ -250,12 +282,24 @@ def resolve_config(config: dict | None) -> GuardConfig:
     deadline = _float_setting(
         server_cfg, PREFILL_DEADLINE_KEY, float(DEFAULT_PREFILL_DEADLINE_SECONDS),
     )
+    percentile = _float_setting(
+        server_cfg, ETA_PERCENTILE_KEY, float(DEFAULT_ETA_PERCENTILE),
+    )
+    if not 0.0 <= percentile <= 100.0:
+        logger.warning(
+            "Invalid %s=%r — using %r (valid: 0.0-100.0; 0 disables)",
+            ETA_PERCENTILE_KEY,
+            server_cfg.get(ETA_PERCENTILE_KEY),
+            DEFAULT_ETA_PERCENTILE,
+        )
+        percentile = DEFAULT_ETA_PERCENTILE
     return GuardConfig(
         policy=raw_policy,
         min_samples=min_samples,
         window_samples=window,
         reference_tokens=reference,
         prefill_deadline_seconds=deadline,
+        eta_percentile=percentile,
     )
 
 
@@ -310,12 +354,25 @@ def record_dispatch_sample(
 
 @dataclass(frozen=True)
 class Coefficients:
-    """Fitted (or default) per-token prefill coefficients, in milliseconds."""
+    """Fitted (or default) per-token prefill coefficients, in milliseconds.
+
+    ``eta_percentile`` / ``percentile_ms`` / ``floor_ms`` / ``uplift`` are
+    the conservative-pricing diagnostics (LP-0MVKUKF65008D5UN): for large
+    prompts (>= ``CONSERVATIVE_MIN_TOKENS``) the coefficients are uplifted so
+    the reference prompt prices at the configured percentile (never below the
+    window's p50); ``percentile_ms``/``floor_ms`` are those observed
+    first-byte thresholds (``None`` when conservative pricing did not apply)
+    and ``uplift`` is 1.0 when the point estimate already dominates.
+    """
 
     coded_ms_per_token: float
     prefill_ms_per_token: float
     samples: int
     calibrated: bool
+    eta_percentile: float = 0.0
+    percentile_ms: float | None = None
+    floor_ms: float | None = None
+    uplift: float = 1.0
 
 
 def _solve(
@@ -362,6 +419,25 @@ def _clamp(value: float, low: float, high: float) -> float:
     return min(high, max(low, value))
 
 
+def _percentile(values: list[float], pct: float) -> float:
+    """Linear-interpolated *pct* (0-100) of *values* (sorted ascending)."""
+    n = len(values)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(values[0])
+    idx = (pct / 100.0) * (n - 1)
+    lower = min(n - 1, int(math.floor(idx)))
+    upper = min(n - 1, lower + 1)
+    frac = max(0.0, min(1.0, idx - lower))
+    return values[lower] * (1.0 - frac) + values[upper] * frac
+
+
+def _median(values: list[float]) -> float:
+    """Median of *values* (the p50 percentile of the sorted window)."""
+    return _percentile(sorted(values), 50.0)
+
+
 def coefficients(model: str | None, prompt_tokens: int, config: dict | None = None
                  ) -> Coefficients:
     """Return the coefficients to use for *model* at *prompt_tokens*.
@@ -369,6 +445,13 @@ def coefficients(model: str | None, prompt_tokens: int, config: dict | None = No
     Falls back to the sane defaults (``calibrated=False``) when the bucket has
     fewer than ``min_samples`` observations or the fit is unusable — in which
     case the guard stays inert and today's behaviour is preserved.
+
+    For large prompts (``prompt_tokens >= CONSERVATIVE_MIN_TOKENS``) with a
+    configured ``eta_percentile > 0`` the fitted coefficients are uplifted so
+    the bucket's reference prompt prices at that percentile of the observed
+    first-byte times (never below its measured p50) — the conservative-ETA
+    change (LP-0MVKUKF65008D5UN). Smaller prompts and ``eta_percentile: 0``
+    (rollback) return the un-uplifted point estimate byte-for-byte.
     """
     guard_cfg = resolve_config(config)
     model_key = str(model or "").strip()
@@ -381,6 +464,7 @@ def coefficients(model: str | None, prompt_tokens: int, config: dict | None = No
             prefill_ms_per_token=DEFAULT_PREFILL_MS_PER_TOKEN,
             samples=len(samples),
             calibrated=False,
+            eta_percentile=guard_cfg.eta_percentile,
         )
     fitted = _fit(samples)
     if fitted is None:
@@ -389,6 +473,7 @@ def coefficients(model: str | None, prompt_tokens: int, config: dict | None = No
             prefill_ms_per_token=DEFAULT_PREFILL_MS_PER_TOKEN,
             samples=len(samples),
             calibrated=False,
+            eta_percentile=guard_cfg.eta_percentile,
         )
     fitted_coded, fitted_prefill = fitted
     coded_ms = (
@@ -401,19 +486,61 @@ def coefficients(model: str | None, prompt_tokens: int, config: dict | None = No
         if fitted_prefill is not None
         else DEFAULT_PREFILL_MS_PER_TOKEN
     )
+    coded_ms = _clamp(
+        coded_ms,
+        MIN_CODED_MS_PER_TOKEN,
+        MAX_CODED_MS_PER_TOKEN,
+    )
+    prefill_ms = _clamp(
+        prefill_ms,
+        MIN_PREFILL_MS_PER_TOKEN,
+        MAX_PREFILL_MS_PER_TOKEN,
+    )
+    # Conservative pricing for large prompts (LP-0MVKUKF65008D5UN): cost the
+    # projected prefill from a conservative percentile of the observed
+    # first-byte times rather than the optimistic point estimate. The uplift is
+    # anchored to the bucket's MEDIAN sample (``ref_coded``/``ref_new``): the
+    # median prompt priced this way lands exactly on the percentile threshold,
+    # and a prompt at that size never prices below the window's p50. An
+    # identical-sample window (p50 == p75 == point estimate) yields uplift 1.0,
+    # so calibration windows without variance are byte-for-byte unchanged.
+    percentile_ms = None
+    floor_ms = None
+    uplift = 1.0
+    if (
+        guard_cfg.eta_percentile > 0.0
+        and prompt_tokens >= CONSERVATIVE_MIN_TOKENS
+    ):
+        ref_coded = _median([float(c) for c, _, _ in samples])
+        ref_new = _median([float(n) for _, n, _ in samples])
+        pred_ref_ms = ref_coded * coded_ms + ref_new * prefill_ms
+        service = sorted(float(ms) for _, _, ms in samples)
+        percentile_ms = _percentile(service, guard_cfg.eta_percentile)
+        floor_ms = _percentile(service, 50.0)
+        target_ms = max(percentile_ms, floor_ms)
+        if pred_ref_ms > 0.0 and target_ms > pred_ref_ms:
+            uplift = target_ms / pred_ref_ms
+            coded_ms *= uplift
+            prefill_ms *= uplift
+            coded_ms = _clamp(
+                coded_ms,
+                MIN_CODED_MS_PER_TOKEN,
+                MAX_CODED_MS_PER_TOKEN,
+            )
+            prefill_ms = _clamp(
+                prefill_ms,
+                MIN_PREFILL_MS_PER_TOKEN,
+                MAX_PREFILL_MS_PER_TOKEN,
+            )
     return Coefficients(
-        coded_ms_per_token=_clamp(
-            coded_ms,
-            MIN_CODED_MS_PER_TOKEN,
-            MAX_CODED_MS_PER_TOKEN,
-        ),
-        prefill_ms_per_token=_clamp(
-            prefill_ms,
-            MIN_PREFILL_MS_PER_TOKEN,
-            MAX_PREFILL_MS_PER_TOKEN,
-        ),
+        coded_ms_per_token=coded_ms,
+        prefill_ms_per_token=prefill_ms,
         samples=len(samples),
         calibrated=True,
+        eta_percentile=guard_cfg.eta_percentile,
+        percentile_ms=percentile_ms,
+        floor_ms=floor_ms,
+        uplift=uplift,
     )
 
 
@@ -427,7 +554,10 @@ def estimate_prefill_seconds(
 
     Returns ``(seconds, coefficients)``. Coefficients come from the rolling
     per-``(model, bucket)`` calibration when available, otherwise from the
-    defaults (``coefficients.calibrated is False``).
+    defaults (``coefficients.calibrated is False``). For large prompts the
+    estimate is priced conservatively (see :func:`coefficients`): at or above
+    the configured percentile of observed first-byte times, and never below
+    the window's p50 (LP-0MVKUKF65008D5UN).
     """
     try:
         tokens = max(0, int(prompt_tokens or 0))
