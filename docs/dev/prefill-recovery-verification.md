@@ -163,15 +163,90 @@ marker cleared ~21:04), refusing other sessions with
 than the 5-minute bound. Filed as **LP-0MVLFVY6K003VYEL** with a blocking edge
 on the parent epic.
 
+## Full-window follow-up — coverage audit and intact-window measurement
+
+The 24 h follow-up (**LP-0MVLGNUDJ009NRX2**) needs a window the log set can
+actually cover. Audited on 2026-10-23 22:30, `/var/log/llama-proxy` does not
+cover the nominal window:
+
+| File | First timestamp | Last timestamp |
+|---|---|---|
+| `proxy.log.2026-10-23_12` | 2026-10-23 12:29:16 | 2026-10-23 18:29:12 |
+| *(no file covers this span)* | — | — |
+| `proxy.log` (birth 18:29:18, truncated) | 2026-10-23 22:04:16 | live |
+
+**3 h 35 m (18:29:12 → 22:04:16) is missing from every rotated and live file**,
+including the fix go-live (20:08:53) and the whole C7 window quoted above. The
+nominal `--since '2026-10-23 20:08:53'` window therefore cannot be measured in
+full. The window is **re-anchored to the 22:04:14 proxy restart** (PID 1934147,
+`dev` @ 60715de4 — a superset of C1-C5), so the full 24 h sample runs
+**2026-10-23 22:04:14 → 2026-10-24 22:04:14**. The log loss and the concurrent
+dual `uvicorn` processes that share `proxy.log` (PID 1923906 from 21:33 plus
+PID 1934147, only the latter owning `:8000`) are filed as **LP-0MVLHMAWV008EKTI**
+(critical, blocks the 24 h item).
+
+Measurement over the intact window (22:04:14 → 22:29:00):
+
+```json
+"ac1": {"min_attempts": 10, "thrash_hours": [], "lease_active_fallbacks": 9,
+        "hours_checked": 1, "verdict_met": false}
+"ac2": {"pairs": 5, "unreleased_sessions": [], "max_release_seconds": 0.0,
+        "verdict_met": true}
+"ac3": {"local_finishes_after_last_release": 15, "verdict_met": true}
+```
+
+`analyze_proxy_usage.py` over 20:08:53 → 22:12:00 (only the 22:00 hour has
+log data — the gap shows up as two `idle` hours):
+
+| Hour | State | Busy | Requests | Local attempts | Local served | Lease denials | Fallbacks |
+|---|---|---|---|---|---|---|---|
+| 20:08-21:00 | idle (no log data — see gap) | 0s | 0 | 0 | 0 | 0 | 0 |
+| 21:00-22:00 | idle (no log data — see gap) | 0s | 0 | 0 | 0 | 0 | 0 |
+| 22:00-22:12 | serving+lease-blocked | 1m 45s | 69 | 4 | 4 | 12 | 60 |
+
+What the intact window shows:
+
+- **No thrash hour**: `thrash_hours: []`, and llama-server evaluated real
+  batches throughout (`eval time = 2318.24 ms / 81 tokens`, …), unlike the
+  incident's zero-eval hours.
+- **Recovery still bounded**: 5 `prefill_deadline_exceeded` events, each
+  releasing its lease in **0.0 s**, none unreleased.
+- **Local serving works**: 20 local `Stream finished` events (15 after the
+  last release).
+- **`reason=local_lease_active` denials are NOT zero**: 9 in 25 min (3
+  `Fallback triggered … reason=local_lease_active` + 6
+  `contention_queue_fallback_after_queue … reason=local_lease_active`), 12
+  `local_dispatch_denied` against `owner=<other herdr session> active=1`.
+  One session (`herdr-1792789684-1790656-13656`) held the lease ~19 min with
+  continuous `lease_extended_during_prefill progress=None alive=False
+  in_flight=True` renewal while three others queued 60 s and fell back. The
+  holder did decode (so this is monopoly/fairness, not the wedge), but the
+  literal "zero `local_lease_active` fallbacks" AC is not satisfiable under
+  4-6 concurrent agent sessions on a 2-slot pool. Filed as
+  **LP-0MVLHMCN6003GAMD** with a decision (restate the AC to the wedge shape,
+  or scope a lease-fairness fix).
+
+Resume command for the full window once it exists (after 2026-10-24 22:04:14):
+
+```bash
+python3 scripts/prefill_recovery_verification.py --measure \
+    --log-dir /var/log/llama-proxy \
+    --since '2026-10-23 22:04:14' --until '2026-10-24 22:04:14' --json
+python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+    --start '2026-10-23 22:04:14' --end '2026-10-24 22:04:14' --json
+```
+
 ## Limitations
 
 1. **24 h sample.** The fix went live at 20:08:53 on 2026-10-23, so the
    post-fix window measurable in-session is under an hour; the full-window
-   check is tracked separately.
+   check is tracked separately (see the coverage audit above — the window is
+   re-anchored to 22:04:14 because the 18:29→22:04 log span was lost).
 2. **Log truncation.** A concurrent benchmark restarted the proxy repeatedly
    from ~21:08, truncating `proxy.log`; the post-fix figures above were captured
    from the analysis run at 21:03, the log excerpts quoted at the time, and a
-   snapshot of the stream/lease lines at 22:05.
+   snapshot of the stream/lease lines at 22:05. The 18:29:12 → 22:04:16 span
+   is absent from every file — see LP-0MVLHMAWV008EKTI.
 3. **Guard calibration.** After a restart the admission guard is inert until
    `local_admission_guard_min_samples` observations exist per (model, bucket);
    the deliberately stalled prompts were therefore admitted and exercised the
