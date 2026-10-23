@@ -1,0 +1,66 @@
+{
+  "checked_at": "2026-10-23T20:08:18.619255+00:00",
+  "checks": {
+    "llama_server_running": {
+      "detail": "llama_server_running=True",
+      "ok": true
+    },
+    "local_idle_seconds": {
+      "detail": "local_idle_seconds=515.9s",
+      "ok": true
+    },
+    "local_owner_session_id": {
+      "detail": "local dispatch lease held by session None",
+      "ok": true
+    },
+    "slot_capacity": {
+      "detail": "available_slots=2 total_slots=2",
+      "ok": true
+    },
+    "slots_free": {
+      "detail": "all slots free",
+      "ok": true
+    },
+    "slots_fresh": {
+      "detail": "slots_stale=False (slot data served from the last-known cache)",
+      "ok": true
+    },
+    "slots_idle": {
+      "detail": "no slot is processing",
+      "ok": true
+    },
+    "slots_present": {
+      "detail": "2 slot(s) in the status payload (per-slot detail required)",
+      "ok": true
+    }
+  },
+  "error": null,
+  "inputs": {
+    "available_slots": 2,
+    "llama_server_running": true,
+    "local_idle_seconds": 515.902,
+    "local_owner_session_id": null,
+    "slots": [
+      {
+        "is_processing": false,
+        "lease_state": "free",
+        "owner_session_id": null,
+        "phase": null,
+        "slot_id": 0
+      },
+      {
+        "is_processing": false,
+        "lease_state": "free",
+        "owner_session_id": null,
+        "phase": null,
+        "slot_id": 1
+      }
+    ],
+    "slots_stale": false,
+    "total_slots": 2
+  },
+  "min_idle_seconds": 120.0,
+  "quiet": true,
+  "reasons": [],
+  "status_url": "http://localhost:8000/llama/local/status"
+}

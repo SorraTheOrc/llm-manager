@@ -1,0 +1,494 @@
+Building prompt materials...
+  Shared content: ~938 tokens (target: 1,000)  [2,814 chars]
+  Varied content: ~576 tokens (target: 1,000)  [2,306 chars]  [generated per request]
+  Total: ~1,514 tokens (target: 2,000)
+  Concurrency: 3 concurrent requests
+
+############################################################
+#  Slot count: 2
+############################################################
+  config.yaml: session_slot_pool_size → 2
+  Slot cache preserved (--clean-cache not set)
+  Proxy restart recorded at: 2026-10-23T20:08:18.771681+00:00
+  Restarting proxy and llama-server...
+  Cleared: /var/log/llama-proxy/proxy.log
+  Cleared: /home/rgardler/projects/llm/logs/proxy-benchmark.log
+  Sent SIGTERM to proxy PID 1903525
+  Killed 1 stale llama-server process(es) on port 8080
+  New proxy started via start-proxy.sh (PID 1918492)
+  Proxy ready
+  llama-server ready
+  Llama-server ready at: 2026-10-23T20:08:29.473764+00:00
+
+============================================================
+  Slot count: 2
+  Requests: 3
+  ======================================================
+  [2026-10-23 21:08:29] Sending Request 1/3 turn 1/4...
+    Request 1/3 turn 1/4: (15s)  backend busy (health check timeout)  sessions=1  req_model=plan
+    Request 1/3 turn 1/4: (30s)  backend busy (health check timeout)  sessions=1  req_model=plan
+    Request 1/3 turn 1/4: (45s)  backend busy (health check timeout)  sessions=1  req_model=plan
+  [2026-10-23 21:09:29] Sending Request 2/3 turn 1/4...
+    Request 1/3 turn 1/4: (60s)  backend busy (health check timeout)  sessions=2  req_model=plan
+    Request 2/3 turn 1/4: (15s)  backend busy (health check timeout)  sessions=2  req_model=plan
+    Request 1/3 turn 1/4: (75s)  backend busy (health check timeout)  sessions=2  req_model=plan
+    Request 2/3 turn 1/4: done  via=OpenCode Go 3/deepseek-v4.1-flash
+    Request 2/3 turn 1/4: ✓  dur=22s  tokens=4493  via=OpenCode Go 3/deepseek-v4.1-flash
+  [2026-10-23 21:09:51] Sending Request 2/3 turn 2/4...
+    Request 1/3 turn 1/4: (90s)  backend busy (health check timeout)  sessions=2  req_model=plan
+    Request 2/3 turn 2/4: (15s)  sessions=2  req_model=plan
+    Request 2/3 turn 2/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 2/3 turn 2/4: ✓  dur=19s  tokens=4799  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:10:10] Sending Request 2/3 turn 3/4...
+    Request 1/3 turn 1/4: (105s)  sessions=2  req_model=plan
+    Request 2/3 turn 3/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 2/3 turn 3/4: ✓  dur=8s  tokens=1525  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:10:18] Sending Request 2/3 turn 4/4...
+    Request 2/3 turn 4/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 2/3 turn 4/4: ✓  dur=5s  tokens=925  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  Request 2/3: ✓  dur=54s  tokens=11742  (4 turns)
+  [2026-10-23 21:10:29] Sending Request 3/3 turn 1/4...
+    Request 1/3 turn 1/4: (120s)  sessions=3  req_model=plan
+    Request 3/3 turn 1/4: (15s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (135s)  sessions=3  req_model=plan
+    Request 3/3 turn 1/4: done  via=OpenCode Go 3/deepseek-v4.1-flash
+    Request 3/3 turn 1/4: ✓  dur=20s  tokens=4539  via=OpenCode Go 3/deepseek-v4.1-flash
+  [2026-10-23 21:10:49] Sending Request 3/3 turn 2/4...
+    Request 1/3 turn 1/4: (150s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (15s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (165s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (30s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (181s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (45s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (196s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (60s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 3/3 turn 2/4: ✓  dur=65s  tokens=1136  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:11:54] Sending Request 3/3 turn 3/4...
+    Request 1/3 turn 1/4: (211s)  sessions=3  req_model=plan
+    Request 3/3 turn 3/4: (15s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (226s)  sessions=3  req_model=plan
+    Request 3/3 turn 3/4: (30s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (242s)  sessions=3  req_model=plan
+    Request 3/3 turn 3/4: (45s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (257s)  sessions=3  req_model=plan
+    Request 3/3 turn 3/4: (60s)  sessions=3  req_model=plan
+    Request 3/3 turn 3/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 3/3 turn 3/4: ✓  dur=64s  tokens=857  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:12:58] Sending Request 3/3 turn 4/4...
+    Request 1/3 turn 1/4: (272s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (15s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (287s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (30s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (302s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (45s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (317s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (60s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (332s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (76s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (347s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (91s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (362s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (106s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (377s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (121s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (392s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (136s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (407s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (151s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (422s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (166s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (437s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (181s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 1/3 turn 1/4: ✓  dur=451s  tokens=6915  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:16:00] Sending Request 1/3 turn 2/4...
+    Request 1/3 turn 2/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 1/3 turn 2/4: ✓  dur=10s  tokens=1741  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:16:10] Sending Request 1/3 turn 3/4...
+    Request 3/3 turn 4/4: (196s)  sessions=3  req_model=plan
+    Request 1/3 turn 3/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 1/3 turn 3/4: ✓  dur=5s  tokens=1081  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:16:15] Sending Request 1/3 turn 4/4...
+    Request 3/3 turn 4/4: (211s)  sessions=3  req_model=plan
+    Request 1/3 turn 4/4: (15s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (226s)  sessions=3  req_model=plan
+    Request 1/3 turn 4/4: (30s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (242s)  sessions=3  req_model=plan
+    Request 1/3 turn 4/4: (45s)  sessions=3  req_model=plan
+    Request 1/3 turn 4/4: done  via=OpenCode Go 3/deepseek-v4.1-flash
+    Request 1/3 turn 4/4: ✓  dur=45s  tokens=4856  via=OpenCode Go 3/deepseek-v4.1-flash
+  Request 1/3: ✓  dur=511s  tokens=14593  (4 turns)
+    Request 3/3 turn 4/4: (257s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (272s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (287s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (302s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (317s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (332s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (347s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (362s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (377s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: (392s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (407s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (422s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (437s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (452s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (468s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (483s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (498s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (513s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (528s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (543s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (558s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (573s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (588s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (603s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (618s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (633s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (648s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (663s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (678s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (693s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (708s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (724s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (739s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (754s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (769s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (784s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (799s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (814s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (829s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (844s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (859s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (874s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (889s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (904s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (919s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (934s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (949s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (964s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (979s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (995s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1010s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1025s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1040s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1055s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1070s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1085s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1100s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1115s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1130s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1145s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1160s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1175s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: (1190s)  sessions=4  req_model=plan
+    Request 3/3 turn 4/4: ✗  dur=1200s  tokens=0  error=Timeout after 1200s: 
+  Request 3/3: ✓  dur=1349s  tokens=6532  (4 turns)
+
+  --- Slot count 2 summary ---
+  Completed: 11/12  Errors: 1
+  Avg duration: 65s  Avg TTFT: 0.03s  Avg TPS: 147.3
+  Total tokens generated: 32867  GPU memory: 0.2GB
+  Intermediate result saved to: /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3/slot_2.json
+  Cooling down (30s)...
+
+  Date: 2026-10-23 20:33 UTC
+
+ Slots   Completed   Errors   Avg Dur   Min Dur   Max Dur   Avg TPS   Avg TTFT     GPU Mem
+--------------------------------------------------------------------------------
+     2     11/ 12        1       65s        5s      451s    147.3      0.03s       0.2GB
+--------------------------------------------------------------------------------
+
+  Throughput scaling (completed requests x avg_tps):
+    2 slots -> 11 req in 11.9min total, 32867 tokens generated
+--------------------------------------------------------------------------------
+
+  CONTENTION METRICS (per slot count)
+    Queue-timeout = contention_queue_fallback_after_queue count
+    Queue rate    = queue-timeouts / queue-path arrivals (dispatch+timeout)
+    Local share   = local stream share (local / observed resolved streams)
+    Quarantine    = local quarantine episodes (from /health snapshots)
+
+ Slots   Queue t/o  Queue rate   Local share   Local streams   Quarant. episodes
+--------------------------------------------------------------------------------
+     2           2       66.7%          0.0%            0/11                   1
+--------------------------------------------------------------------------------
+
+  REPRODUCIBILITY + VIABILITY (per slot count)
+    slots=2:
+      command: /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/slot_benchmark.py --sweep --resume 2 --concurrency 3 --prompt-tokens 2000 --output-dir /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3
+      config: session_slot_pool_size 2 -> 2  |  model: plan -> local-qwen3/Qwen3
+      ctx: total=262144  per-slot(physical)=126976  observed slots=2
+      system MemAvailable: 84.5GB  llama_started: True
+      viability: no warnings
+
+############################################################
+#  Slot count: 3
+############################################################
+  config.yaml: session_slot_pool_size → 3
+  Slot cache preserved (--clean-cache not set)
+  Proxy restart recorded at: 2026-10-23T20:33:30.552962+00:00
+  Restarting proxy and llama-server...
+  Cleared: /var/log/llama-proxy/proxy.log
+  Cleared: /home/rgardler/projects/llm/logs/proxy-benchmark.log
+  Sent SIGTERM to proxy PID 1918508
+  Killed 1 stale llama-server process(es) on port 8080
+  New proxy started via start-proxy.sh (PID 1923876)
+  Proxy ready
+  llama-server ready
+  Llama-server ready at: 2026-10-23T20:33:41.606606+00:00
+
+============================================================
+  Slot count: 3
+  Requests: 3
+  ======================================================
+  [2026-10-23 21:33:41] Sending Request 1/3 turn 1/4...
+    Request 1/3 turn 1/4: (15s)  sessions=1  req_model=plan
+    Request 1/3 turn 1/4: (30s)  sessions=1  req_model=plan
+    Request 1/3 turn 1/4: (45s)  sessions=1  req_model=plan
+  [2026-10-23 21:34:41] Sending Request 2/3 turn 1/4...
+    Request 1/3 turn 1/4: (60s)  sessions=2  req_model=plan
+    Request 2/3 turn 1/4: (15s)  sessions=2  req_model=plan
+    Request 1/3 turn 1/4: (76s)  sessions=2  req_model=plan
+    Request 2/3 turn 1/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 2/3 turn 1/4: ✓  dur=26s  tokens=5843  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:35:08] Sending Request 2/3 turn 2/4...
+    Request 1/3 turn 1/4: (91s)  sessions=2  req_model=plan
+    Request 2/3 turn 2/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 2/3 turn 2/4: ✓  dur=6s  tokens=1172  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:35:13] Sending Request 2/3 turn 3/4...
+    Request 2/3 turn 3/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 2/3 turn 3/4: ✓  dur=6s  tokens=1226  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:35:19] Sending Request 2/3 turn 4/4...
+    Request 1/3 turn 1/4: (106s)  sessions=2  req_model=plan
+    Request 2/3 turn 4/4: (15s)  sessions=2  req_model=plan
+  [2026-10-23 21:35:41] Sending Request 3/3 turn 1/4...
+    Request 1/3 turn 1/4: (121s)  sessions=3  req_model=plan
+    Request 2/3 turn 4/4: done  via=OpenCode Go 3/deepseek-v4.1-flash
+    Request 2/3 turn 4/4: ✓  dur=29s  tokens=2398  via=OpenCode Go 3/deepseek-v4.1-flash
+  Request 2/3: ✓  dur=67s  tokens=10639  (4 turns)
+    Request 3/3 turn 1/4: (15s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (136s)  sessions=3  req_model=plan
+    Request 3/3 turn 1/4: done  via=OpenCode Go 3/deepseek-v4.1-flash
+    Request 3/3 turn 1/4: ✓  dur=19s  tokens=3882  via=OpenCode Go 3/deepseek-v4.1-flash
+  [2026-10-23 21:36:00] Sending Request 3/3 turn 2/4...
+    Request 1/3 turn 1/4: (151s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (15s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (166s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (30s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (181s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (45s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (196s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (60s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (211s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (75s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (227s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (90s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (242s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (105s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (257s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (120s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (272s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (135s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (287s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (150s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (302s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (165s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (317s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (181s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (332s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (196s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (347s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (211s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (362s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (226s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (377s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (241s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (392s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (256s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (407s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (271s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (422s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (286s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (437s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (301s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (452s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (316s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (468s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (331s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (483s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (346s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (498s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (361s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (513s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (376s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (528s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (391s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (543s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: (406s)  sessions=3  req_model=plan
+    Request 3/3 turn 2/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 3/3 turn 2/4: ✓  dur=407s  tokens=872  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:42:47] Sending Request 3/3 turn 3/4...
+    Request 1/3 turn 1/4: (558s)  sessions=3  req_model=plan
+    Request 3/3 turn 3/4: (15s)  sessions=3  req_model=plan
+    Request 3/3 turn 3/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 3/3 turn 3/4: ✓  dur=23s  tokens=5337  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 21:43:11] Sending Request 3/3 turn 4/4...
+    Request 1/3 turn 1/4: (573s)  sessions=3  req_model=plan
+    Request 3/3 turn 4/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 3/3 turn 4/4: ✓  dur=4s  tokens=923  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  Request 3/3: ✓  dur=454s  tokens=11014  (4 turns)
+    Request 1/3 turn 1/4: (588s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (603s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (618s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (633s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (648s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (663s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (678s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (693s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (708s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (723s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (738s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (753s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (768s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (784s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (799s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (814s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (829s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (844s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (859s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (874s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (889s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (904s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (919s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (934s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (949s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (964s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (980s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (995s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1010s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1025s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1040s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1055s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1070s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1085s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1100s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1115s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1130s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1145s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1161s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1176s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: (1191s)  sessions=3  req_model=plan
+    Request 1/3 turn 1/4: ✗  dur=1200s  tokens=0  error=Timeout after 1200s: 
+  [2026-10-23 21:53:41] Sending Request 1/3 turn 2/4...
+    Request 1/3 turn 2/4: (15s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (30s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (45s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (62s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (77s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (92s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (107s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (122s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (138s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (153s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (168s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (183s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (198s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (213s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (228s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (243s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (258s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (273s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (288s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (303s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (318s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (333s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (348s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (363s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (379s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (394s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (409s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (424s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (439s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (454s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (469s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (484s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (499s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (514s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (529s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (544s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (559s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (574s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (590s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: (605s)  sessions=3  req_model=plan
+    Request 1/3 turn 2/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 1/3 turn 2/4: ✓  dur=617s  tokens=922  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 22:03:58] Sending Request 1/3 turn 3/4...
+    Request 1/3 turn 3/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 1/3 turn 3/4: ✓  dur=6s  tokens=1059  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  [2026-10-23 22:04:04] Sending Request 1/3 turn 4/4...
+    Request 1/3 turn 4/4: done  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+    Request 1/3 turn 4/4: ✓  dur=4s  tokens=947  via=MunitoAI Free/deepseek-ai/deepseek-v4-flash
+  Request 1/3: ✓  dur=1827s  tokens=2928  (4 turns)
+
+  --- Slot count 3 summary ---
+  Completed: 11/12  Errors: 1
+  Avg duration: 104s  Avg TTFT: 0.16s  Avg TPS: 161.0
+  Total tokens generated: 24581  GPU memory: 0.2GB
+  Intermediate result saved to: /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3/slot_3.json
+
+  Date: 2026-10-23 21:04 UTC
+
+ Slots   Completed   Errors   Avg Dur   Min Dur   Max Dur   Avg TPS   Avg TTFT     GPU Mem
+--------------------------------------------------------------------------------
+     2     11/ 12        1       65s        5s      451s    147.3      0.03s       0.2GB
+     3     11/ 12        1      104s        4s      617s    161.0      0.16s       0.2GB
+--------------------------------------------------------------------------------
+
+  Throughput scaling (completed requests x avg_tps):
+    2 slots -> 11 req in 11.9min total, 32867 tokens generated
+    3 slots -> 11 req in 19.1min total, 24581 tokens generated
+--------------------------------------------------------------------------------
+
+  CONTENTION METRICS (per slot count)
+    Queue-timeout = contention_queue_fallback_after_queue count
+    Queue rate    = queue-timeouts / queue-path arrivals (dispatch+timeout)
+    Local share   = local stream share (local / observed resolved streams)
+    Quarantine    = local quarantine episodes (from /health snapshots)
+
+ Slots   Queue t/o  Queue rate   Local share   Local streams   Quarant. episodes
+--------------------------------------------------------------------------------
+     2           2       66.7%          0.0%            0/11                   1
+     3           0        0.0%          0.0%            0/11                   0
+--------------------------------------------------------------------------------
+
+  REPRODUCIBILITY + VIABILITY (per slot count)
+    slots=2:
+      command: /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/slot_benchmark.py --sweep --resume 2 --concurrency 3 --prompt-tokens 2000 --output-dir /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3
+      config: session_slot_pool_size 2 -> 2  |  model: plan -> local-qwen3/Qwen3
+      ctx: total=262144  per-slot(physical)=126976  observed slots=2
+      system MemAvailable: 84.5GB  llama_started: True
+      viability: no warnings
+    slots=3:
+      command: /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/slot_benchmark.py --sweep --resume 2 --concurrency 3 --prompt-tokens 2000 --output-dir /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3
+      config: session_slot_pool_size 2 -> 3  |  model: plan -> local-qwen3/Qwen3
+      ctx: total=262144  per-slot(physical)=83285  observed slots=3
+      system MemAvailable: 80.5GB  llama_started: True
+      viability: no warnings
+
+Restoring original config (session_slot_pool_size: 2)...
+  Restarting proxy and llama-server...
+  Cleared: /var/log/llama-proxy/proxy.log
+  Cleared: /home/rgardler/projects/llm/logs/proxy-benchmark.log
+  Sent SIGTERM to proxy PID 1923906
+  Killed 1 stale llama-server process(es) on port 8080
+  New proxy started via start-proxy.sh (PID 1934131)
+  Proxy ready
+  llama-server ready
+
+========================================================================
+  BENCHMARK COMPLETE
+  Report: /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3/slot_benchmark_report.json
+  Restored config: /home/rgardler/projects/llm/proxy/config.yaml -> session_slot_pool_size: 2
+  Summary: /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3/slot_benchmark_summary.txt
+========================================================================

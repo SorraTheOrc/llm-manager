@@ -1,0 +1,8 @@
+preflight_exit=0
+config_sha256_before=d1a7a154e99a224484e6d431281c9d40363c7676655ce87b5743672e61378dcc
+mem_available_before=44.3 GiB
+date_utc=2026-10-23T20:08:18Z
+llama_server_cmdline=1221444 /home/rgardler/llama.cpp/build/bin/llama-server --models-preset /home/rgardler/projects/llm/models.ini --models-max 2 --models-autoload --parallel 2 --host 0.0.0.0 --no-mmap -ngl 80 --threads 8 --port 8080 --batch-size 8192 --ubatch-size 1024 --slot-save-path /home/rgardler/projects/llm/slot-cache
+1221593 /home/rgardler/llama.cpp/build/bin/llama-server --embeddings --host 127.0.0.1 --no-mmap --pooling mean --port 32813 --slot-save-path /home/rgardler/projects/llm/slot-cache --alias mxbai-embed --batch-size 8192 --hf-repo magicunicorn/mxbai-embed-large-v1-Q8_0-GGUF:Q8_0 --n-gpu-layers 80 --parallel 2 --threads 8 --ubatch-size 1024
+1221597 /home/rgardler/llama.cpp/build/bin/llama-server --host 127.0.0.1 --no-mmap --no-mmproj-auto --port 35939 --reasoning-format deepseek --slot-save-path /home/rgardler/projects/llm/slot-cache --alias Qwen3 --batch-size 8192 --ctx-size 262144 --cache-ram 40960 --cache-type-k q8_0 --cache-type-v q8_0 --swa-checkpoints 32 --flash-attn true --hf-repo unsloth/Qwen3.6-35B-A3B-GGUF:Q5_K_M --n-gpu-layers 80 --parallel 2 --threads 8 --ubatch-size 1024
+llama_parallel_flag_before=--parallel 2
