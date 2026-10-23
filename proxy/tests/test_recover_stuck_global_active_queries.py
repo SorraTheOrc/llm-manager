@@ -280,13 +280,15 @@ async def test_lease_held_past_stream_end_busy_until_idle_timeout_then_idle():
 @pytest.mark.asyncio
 async def test_recovery_keeps_global_counter_while_anonymous_local_request_in_flight():
     """_recover_stuck_global_active_queries leaves the global counter intact
-    while a legitimate anonymous local request is in flight (local counter > 0).
+    while a legitimate local request is in flight (local counter > 0).
 
-    Anonymous sessions (no session affinity) increment the local counter
-    without creating a dispatch record (AC3's "local count > 0" branch).
-    The global counter must NOT be reset — an in-flight request is real
-    work, not a leak. Exercises the real increment helpers + recovery +
-    status endpoint end-to-end.
+    Non-explicit sessions (no session affinity) increment the local counter
+    and, in production, carry a dispatch lease because the router always
+    resolves a session id (``_handle_session``); the counter fallback exists
+    only in legacy mode (AC3's "local count > 0" branch). The global counter
+    must NOT be reset — an in-flight request is real work, not a leak.
+    Exercises the real increment helpers + recovery + status endpoint
+    end-to-end.
     """
     import proxy.server as server
     from proxy.router_helpers import (
@@ -296,18 +298,23 @@ async def test_recovery_keeps_global_counter_while_anonymous_local_request_in_fl
     )
 
     with _RcaStuckStateHarness() as h:
-        # Anonymous stream: counters incremented, NO lease record created.
+        # Stream start: counters incremented with a dispatch lease, as the
+        # router does for every local request (session ids are always
+        # resolved, so local work is always tracked by a record).
         await _increment_active_queries(server)
-        await _increment_local_active_queries(server)
+        await _increment_local_active_queries(
+            server, session_key="anon-session", backend="local"
+        )
         assert server.active_queries == 1
         assert server.local_active_queries == 1
-        assert server.local_dispatch_records == {}
+        assert server.local_dispatch_records["anon-session"]["active"] is True
 
         # Recovery must NOT reset while a local request is in flight.
         await _recover_stuck_global_active_queries(server)
         assert server.active_queries == 1
 
-        # Status still reports the in-flight local work.
+        # Status still reports the in-flight local work (driven by the live
+        # dispatch record — LP-0MVKSXR4P001V0CM AC1).
         j = await h.status()
         assert j["active_query"] is True
         assert j["local_active_query"] is True
@@ -391,14 +398,22 @@ async def test_herdr_polling_after_recovery_passes_continuous_idle_gate():
         for i in range(9):
             t = float(i * _POLL_EVERY_S)
             if i == 6:
-                # A new local request starts at t=180 — real handler reports busy.
+                # A new local request starts at t=180: the counters and the
+                # live dispatch record a real local dispatch creates
+                # (LP-0MVKSXR4P001V0CM AC1 — status derives local activity
+                # from active records, not from the bare counter).
                 server.active_queries = 1
                 server.local_active_queries = 1
+                server.local_dispatch_records[h.SESSION] = {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                }
             j = await h.status()
             if i == 6:
                 # The request finishes immediately; the idle window resumes.
                 server.active_queries = 0
                 server.local_active_queries = 0
+                server.local_dispatch_records.pop(h.SESSION, None)
             # Every poll carries countable slots (fail-closed consumer never
             # sees total_slots=0) and, when idle, all slots free.
             assert j["total_slots"] == 3

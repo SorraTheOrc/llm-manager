@@ -422,7 +422,7 @@ class _LocalStatusHarness:
         async def __aexit__(self, *exc):
             pass
 
-    async def get(self, active_queries, local_active_queries):
+    async def get(self, active_queries, local_active_queries, dispatch_records=None):
         """Issue a status request with the given global/local counter values."""
         from proxy.server import app
 
@@ -437,7 +437,9 @@ class _LocalStatusHarness:
                 with patch.object(server, "active_queries_lock", asyncio.Lock()):
                     with patch.object(server, "local_active_queries", local_active_queries):
                         with patch.object(server, "local_active_queries_lock", asyncio.Lock()):
-                            with patch.object(server, "local_dispatch_records", {}):
+                            with patch.object(
+                                server, "local_dispatch_records", dispatch_records or {}
+                            ):
                                 with patch.object(server, "local_dispatch_records_lock", self._FakeLock()):
                                     with patch.object(server, "model_switch_refcount", 0):
                                         with patch.object(server, "model_switch_lock", self._FakeLock()):
@@ -467,9 +469,35 @@ async def test_local_active_query_remote_only_streams():
 @pytest.mark.asyncio
 async def test_local_active_local_stream_sets_both():
     """A local stream in flight sets both active_query and local_active_query."""
-    j = await _LocalStatusHarness().get(active_queries=3, local_active_queries=1)
+    import time
+
+    j = await _LocalStatusHarness().get(
+        active_queries=3,
+        local_active_queries=1,
+        dispatch_records={
+            "live-session": {"active": True, "expires_at": time.monotonic() + 60}
+        },
+    )
     assert j["active_query"] is True
     assert j["local_active_query"] is True
+
+
+@pytest.mark.asyncio
+async def test_local_active_query_ignores_retained_lease_and_leaked_counter():
+    """AC1 (LP-0MVKSXR4P001V0CM): a retained post-stream lease plus a leaked
+    counter must not report local work in flight — no dispatch record is
+    ``active``, so the truthful in-flight count is zero."""
+    import time
+
+    j = await _LocalStatusHarness().get(
+        active_queries=2,
+        local_active_queries=4,
+        dispatch_records={
+            "idle-holder": {"active": False, "expires_at": time.monotonic() + 60}
+        },
+    )
+    assert j["local_active_query"] is False
+    assert j["local_in_flight_requests"] == 0
 
 
 @pytest.mark.asyncio
@@ -739,7 +767,7 @@ class TestPerSlotDetails:
             assert slot["prefill_eta_seconds"] is None or isinstance(
                 slot["prefill_eta_seconds"], (int, float)
             )
-        assert j["status_schema_version"] == 2  # AC1: additive + versioned
+        assert j["status_schema_version"] == 3  # AC1: additive + versioned
 
 
 # ======================================================================
@@ -883,12 +911,15 @@ class _CapacityStatusHarness:
         config=None,
         slot_owners=None,
         dispatch_records=None,
+        counts_outcome=None,
     ):
         """Issue /llama/local/status and return the parsed JSON body.
 
         ``stale_cache`` exercises the degraded path: the fresh detail query
         returns nothing and the last-known per-slot cache is served with
-        ``slots_stale=true``.
+        ``slots_stale=true``. ``counts_outcome`` simulates the fresh counts
+        query's ``status_out`` (e.g. ``{"status": 400, "reason": "http_400"}``
+        for an unloaded model) while still returning ``(0, 0)``.
         """
         from unittest.mock import AsyncMock
 
@@ -900,7 +931,16 @@ class _CapacityStatusHarness:
             return {"llama_server_running": True}
 
         detail_mock = AsyncMock(return_value=slots_detail or [])
-        counts_mock = AsyncMock(return_value=(0, 0))
+        if counts_outcome is None:
+            counts_mock = AsyncMock(return_value=(0, 0))
+        else:
+            async def _counts(*_args, **kwargs):
+                out = kwargs.get("status_out")
+                if isinstance(out, dict):
+                    out.update(counts_outcome)
+                return (0, 0)
+
+            counts_mock = AsyncMock(side_effect=_counts)
         transport = httpx.ASGITransport(app=app)
         resolved_config = config if config is not None else {
             "server": {
@@ -982,8 +1022,7 @@ async def test_new_capacity_fields_are_additive_and_versioned():
         slots_detail=[_slot(0, is_processing=False), _slot(1, is_processing=True, n_decoded=9)],
     )
 
-    assert j["status_schema_version"] == 2
-    # New fields exist...
+    assert j["status_schema_version"] == 3
     assert j["capacity_hint"] in ("idle", "prefill_bound", "saturated")
     assert "prefill_budget_seconds" in j
     for slot in j["slots"]:
@@ -1228,3 +1267,252 @@ async def test_stale_slots_null_eta_fields(_eta_calibration):
     assert j["slots"][0]["prefill_eta_seconds"] is None
     assert j["prefill_eta_seconds"] is None
     assert j["queue_eta_seconds"] is None
+
+
+# ======================================================================
+# Stale capacity honesty (LP-0MVKSXR4P001V0CM AC1/AC3)
+#
+# A `capacity_hint` computed from cached `/slots` detail must never claim
+# saturation without live evidence: stale `is_processing` is a fossil of a
+# previous request, and retained leases / a leaked counter are not work.
+# ======================================================================
+
+
+def _stale_decode_slot():
+    return {
+        "slot_id": 0,
+        "is_processing": True,
+        "n_decoded": 5,
+        "context_tokens": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_detail_without_live_work_reports_idle_capacity():
+    """AC3: a stale snapshot that looks saturated, with no in-flight local
+    request, degrades to ``idle`` and reconciles ``available_slots`` upward so
+    a dispatcher polling both fields sees an open gate."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[], stale_cache=[_stale_decode_slot()]
+    )
+
+    assert j["slots_stale"] is True
+    assert j["slots_detail_stale"] is True
+    assert j["capacity_hint"] == "idle"
+    # total_slots (0) is reconciled to the configured pool when no current
+    # counts are known, and the whole pool is reported available.
+    assert j["total_slots"] == 3
+    assert j["available_slots"] == 3
+
+
+@pytest.mark.asyncio
+async def test_stale_detail_with_live_work_never_reports_saturated():
+    """AC1/AC3: live in-flight work makes the pool busy, but a stale snapshot
+    alone is not evidence of decode — the hint is ``prefill_bound``, not
+    ``saturated``."""
+    import time
+    from unittest.mock import patch as _patch
+
+    with _patch(
+        "proxy.local_activity.activity_snapshot",
+        return_value={
+            "idle_seconds": 300.0,
+            "last_activity_at": None,
+            "last_activity_source": "startup",
+        },
+    ):
+        j = await _CapacityStatusHarness().get(
+            slots_detail=[],
+            stale_cache=[_stale_decode_slot()],
+            dispatch_records={
+                "live-session": {"active": True, "expires_at": time.monotonic() + 60}
+            },
+        )
+
+    assert j["slots_detail_stale"] is True
+    assert j["capacity_hint"] == "prefill_bound"
+    assert j["local_in_flight_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_detail_keeps_saturated_with_fresh_decode_evidence():
+    """AC3: fresh decode evidence (chunks arriving now) keeps the saturation
+    claim — the exception the AC carves out."""
+    import time
+    from unittest.mock import patch as _patch
+
+    with _patch(
+        "proxy.local_activity.activity_snapshot",
+        return_value={
+            "idle_seconds": 2.0,
+            "last_activity_at": None,
+            "last_activity_source": "chunk",
+        },
+    ):
+        j = await _CapacityStatusHarness().get(
+            slots_detail=[],
+            stale_cache=[_stale_decode_slot()],
+            dispatch_records={
+                "live-session": {"active": True, "expires_at": time.monotonic() + 60}
+            },
+        )
+
+    assert j["slots_detail_stale"] is True
+    assert j["capacity_hint"] == "saturated"
+
+
+@pytest.mark.asyncio
+async def test_stale_detail_ignores_leaked_counter_but_flags_in_flight_truthfully():
+    """AC1: a leaked counter with an inactive (lease-retained) record does not
+    hold the pool busy; ``local_active_query`` reflects live records only."""
+    import time
+
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[],
+        stale_cache=[_stale_decode_slot()],
+        dispatch_records={
+            "idle-holder": {"active": False, "expires_at": time.monotonic() + 60}
+        },
+    )
+
+    assert j["capacity_hint"] == "idle"
+    assert j["local_active_query"] is False
+    assert j["local_in_flight_requests"] == 0
+
+
+def test_downgrade_stale_capacity_hint_leaves_fresh_hints_alone():
+    from proxy.observability import downgrade_stale_capacity_hint
+
+    for hint in ("idle", "prefill_bound", "saturated"):
+        assert (
+            downgrade_stale_capacity_hint(
+                hint, stale=False, live_local_requests=0
+            )
+            == hint
+        )
+
+
+@pytest.mark.parametrize(
+    "live,source,idle,expected",
+    [
+        (0, None, None, "idle"),
+        (0, "chunk", 1.0, "idle"),  # no live request: a counter is not work
+        (1, None, None, "prefill_bound"),
+        (1, "dispatch", 1.0, "prefill_bound"),
+        (1, "chunk", 2.0, "saturated"),
+        (1, "chunk", 300.0, "prefill_bound"),  # evidence is stale
+    ],
+)
+def test_downgrade_stale_capacity_hint_decision_table(
+    live, source, idle, expected
+):
+    from proxy.observability import downgrade_stale_capacity_hint
+
+    assert (
+        downgrade_stale_capacity_hint(
+            "saturated",
+            stale=True,
+            live_local_requests=live,
+            activity_source=source,
+            idle_seconds=idle,
+        )
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_publishes_live_prefill_count_only():
+    """AC1/AC3: an orphaned prefill marker (no live dispatch record) is not
+    published as an in-flight prefill; a marker backed by an active record is."""
+    import time
+    from unittest.mock import patch as _patch
+
+    from proxy import server
+
+    with _patch.object(server, "local_prefill_in_flight", {"orphan": True}):
+        j = await _CapacityStatusHarness().get(
+            slots_detail=[_slot(0, is_processing=False)],
+            dispatch_records={},
+        )
+    assert j["local_prefills_in_flight"] == 0
+
+    with _patch.object(server, "local_prefill_in_flight", {"live": True}):
+        j = await _CapacityStatusHarness().get(
+            slots_detail=[_slot(0, is_processing=True, n_decoded=0)],
+            dispatch_records={
+                "live": {"active": True, "expires_at": time.monotonic() + 60}
+            },
+        )
+    assert j["local_prefills_in_flight"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unloaded_model_is_fresh_absence_not_stale_saturation():
+    """AC3: llama-server's router answers /slots?model=<name> with HTTP 400
+    when it has unloaded the idle model. That is a definitive, fresh "no
+    slots yet" — the handler must fail open on the configured pool and must
+    not resurrect the cached (fossil, `is_processing=true`) snapshot as
+    capacity."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[],
+        stale_cache=[_stale_decode_slot()],
+        counts_outcome={"status": 400, "reason": "http_400"},
+    )
+
+    assert j["slots_stale"] is False
+    assert j["slot_counts_stale"] is False
+    assert j["slots_detail_stale"] is False
+    assert j["slots"] == []
+    assert j["capacity_hint"] == "idle"
+    assert j["total_slots"] == 3
+    assert j["available_slots"] == 3
+
+
+@pytest.mark.asyncio
+async def test_server_error_still_uses_graceful_degradation():
+    """A transient 500 keeps the existing cache fallback, so the fossil is
+    still served (with slots_stale) — but the hint is reconciled to idle."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[],
+        stale_cache=[_stale_decode_slot()],
+        counts_outcome={"status": 500, "reason": "http_500"},
+    )
+
+    assert j["slots_stale"] is True
+    assert j["slots_detail_stale"] is True
+    assert j["capacity_hint"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_query_slots_reports_outcome_for_definitive_absence():
+    """``_query_slots(status_out=...)`` exposes the fresh query outcome so a
+    caller can tell a definitive model-absent answer from a transient fault."""
+    from unittest.mock import AsyncMock, patch as _patch
+
+    from proxy.observability import _query_slots
+
+    outcome: dict = {}
+    with _patch(
+        "proxy.observability._fetch_slots_payload",
+        AsyncMock(return_value=(400, None)),
+    ):
+        available, total = await _query_slots(None, 8080, model="m", status_out=outcome)
+    assert (available, total) == (0, 0)
+    assert outcome == {"status": 400, "reason": "http_400"}
+
+    outcome = {}
+    with _patch(
+        "proxy.observability._fetch_slots_payload",
+        AsyncMock(
+            return_value=(
+                200,
+                [
+                    {"id": 0, "is_processing": False},
+                    {"id": 1, "is_processing": True},
+                ],
+            )
+        ),
+    ):
+        available, total = await _query_slots(None, 8080, model="m", status_out=outcome)
+    assert (available, total) == (1, 2)
+    assert outcome == {"status": 200, "reason": None}

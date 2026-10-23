@@ -148,21 +148,27 @@ proxy-side enabler the consumer will build on.
 `GET /llama/local/status` now publishes enough per-slot detail for a
 dispatcher to tell a slot that is **actually working** from one that is merely
 **reserved but idle**, and to price the wait before it launches a session. The
-change is additive and versioned (`status_schema_version: 2`); a client that
+change is additive and versioned (`status_schema_version: 3`); a client that
 ignores the new fields behaves exactly as before (contract test:
-`test_new_capacity_fields_are_additive_and_versioned`).
+`test_new_capacity_fields_are_additive_and_versioned`). v3
+(LP-0MVKSXR4P001V0CM) adds stale-detail reconciliation of `capacity_hint` and
+truthful in-flight accounting.
 
 ## Payload (new fields)
 
 ```json
 {
-  "status_schema_version": 2,
+  "status_schema_version": 3,
   "total_slots": 2,
   "available_slots": 0,
   "contention_queue_depth": 3,          // existing, elsewhere in the payload
   "capacity_hint": "prefill_bound",
   "prefill_budget_seconds": 120.0,
   "queue_eta_seconds": 240.0,
+  "slots_stale": false,
+  "slots_detail_stale": false,
+  "slot_counts_stale": false,
+  "local_in_flight_requests": 1,
   "slots": [
     {"slot_id": 0, "is_processing": true, "n_decoded": 0,
      "context_tokens": 102345, "owner_session_id": "…",
@@ -252,13 +258,46 @@ cached detail) is `idle` (fail-open — never claim saturation without evidence)
 and a pool with no free slot, no prefill and mixed `decode` / `idle_leased`
 occupancy is `saturated` (genuine decode work, nothing available to a newcomer).
 
+The table is authoritative only while the served `/slots` detail is **fresh**.
+When `slots_detail_stale` is true, the cached `is_processing`/`phase` describe
+*past* work, so the hint is reconciled with live proxy state
+(`downgrade_stale_capacity_hint`, LP-0MVKSXR4P001V0CM AC3):
+
+1. **No live in-flight local request** (`local_in_flight_requests == 0`,
+   derived from active dispatch records — a retained lease or a leaked
+   counter is *not* work) → `idle`, and `available_slots` is reconciled
+   upward to the pool size (fail-open, matching the no-model-loaded branch).
+2. **In-flight work with fresh decode evidence** (proxy forwarded a chunk
+   within `STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS`) → stays `saturated`.
+3. **Any other in-flight work** → `prefill_bound` — never `saturated` on
+   stale data.
+
+This is the gate that starved herdr's downtime worker on 2026-10-22: a cached
+busy snapshot served for hours while the GPU was idle, and the leaked
+`local_active_queries` counter kept `local_active_query` true. Both are now
+truthful.
+
 ## Freshness honesty (AC7)
 
-`slots_stale` semantics are unchanged. When the served slot data came from the
-last-known cache (a failed fresh `/slots` query), **both per-slot and top-level
-ETA fields are `null`** — a dispatcher never acts on a stale wait estimate.
-`prefill_budget_seconds` is a configuration constant (not poll-derived) and
-stays truthful.
+`slots_stale` semantics are unchanged (counts **or** per-slot detail came from
+the last-known cache); the per-source flags `slot_counts_stale` and
+`slots_detail_stale` tell the two apart. When the served slot detail is stale,
+**both per-slot and top-level ETA fields are `null`** — a dispatcher never acts
+on a stale wait estimate. `prefill_budget_seconds` is a configuration constant
+(not poll-derived) and stays truthful.
+
+## Truthful in-flight accounting (LP-0MVKSXR4P001V0CM AC1/AC2)
+
+- `local_active_query` is driven by **active dispatch records**, not the
+  `local_active_queries` counter: a retained post-stream lease (record
+  `active: false`) or a leaked counter never reports local work in flight.
+  Legacy proxies without the record registry keep the counter fallback.
+- `local_in_flight_requests` publishes the active-record count itself.
+- `local_prefills_in_flight` publishes only prefills backed by a live dispatch
+  record (LP-0MVKUKFSO008GI6O AC3) — an orphaned marker is not published.
+- The 10 s `_dispatch_cleanup_loop` now **clamps** `local_active_queries` to
+  the active-record count instead of only resetting when no records are
+  active, so a leak that coexists with real work cannot persist (AC2).
 
 ## Consumer contract — herdr `downtime-worker.ts` (AC6)
 

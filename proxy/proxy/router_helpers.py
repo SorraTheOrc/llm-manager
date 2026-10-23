@@ -2798,16 +2798,17 @@ async def _recover_stuck_generating_queries(srv) -> None:
 
 
 async def _recover_stuck_local_active_queries(srv) -> None:
-    """Detect and reset a stuck ``local_active_queries`` counter.
+    """Detect and repair a stuck ``local_active_queries`` counter.
 
-    If ``local_active_queries > 0`` and **no** active dispatch records
-    exist, the counter is likely stuck (e.g., from a swallowed exception
-    in ``_decrement_local_active_queries``). Resets to 0 and logs a
-    WARNING-level message.
-
-    Designed to be called from ``_dispatch_cleanup_loop`` (server.py)
-    after ``_cleanup_stale_local_dispatch``, providing a periodic
-    self-recovery mechanism that runs every 10 seconds.
+    The counter can only be as large as the number of truly in-flight local
+    requests (LP-0MVKSXR4P001V0CM AC2). A leak that outlives the request —
+    e.g. a swallowed exception in ``_decrement_local_active_queries`` — is
+    repaired by clamping the counter to the number of **active** dispatch
+    records at every tick, rather than only resetting to 0 when *no* active
+    records exist. Without the clamp, a leak that coexists with any in-flight
+    request (``has_active`` true) survived indefinitely and made
+    ``/llama/local/status`` report busy while the GPU was idle (2026-10-22
+    night: 66 consecutive ``freeSlots: 0`` refusals).
 
     In legacy mode (no ``local_dispatch_records`` attribute), the counter
     is reset whenever it is > 0, since there is no dispatch-record-based
@@ -2821,18 +2822,19 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                     # Read the records snapshot (not holding records_lock).
                     # This is a self-correcting check that runs every 10s,
                     # so a slightly stale snapshot is acceptable.
-                    has_active = any(
-                        r.get("active", False) for r in records.values()
-                    )
-                    if not has_active:
+                    active_count = _count_active_local_dispatch_records(srv)
+                    active_count = active_count if active_count is not None else 0
+                    if srv.local_active_queries > active_count:
                         prev = srv.local_active_queries
-                        srv.local_active_queries = 0
+                        srv.local_active_queries = active_count
                         try:
                             srv.logger.warning(
                                 "local_active_queries counter recovered: "
-                                "reset from %d to 0 (no active dispatch "
+                                "reset from %d to %d (%d active dispatch "
                                 "records)",
                                 prev,
+                                active_count,
+                                active_count,
                             )
                         except Exception:
                             pass
@@ -2865,6 +2867,27 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                         pass
     except Exception:
         pass
+
+
+def _count_active_local_dispatch_records(srv) -> int | None:
+    """Count dispatch records still marked ``active`` (in-flight local work).
+
+    Returns ``None`` when the server has no dispatch-record registry (legacy
+    mode) so callers can distinguish "no records system" from "zero
+    in-flight". Best-effort snapshot without a lock, matching the periodic
+    recovery loop's tolerance for a slightly stale view.
+    """
+    records = getattr(srv, "local_dispatch_records", None)
+    if records is None:
+        return None
+    try:
+        return sum(
+            1
+            for r in records.values()
+            if isinstance(r, dict) and r.get("active")
+        )
+    except Exception:
+        return None
 
 
 async def _recover_stuck_global_active_queries(srv) -> None:

@@ -519,7 +519,7 @@ async def _fetch_slots_payload(
 async def _query_slots(
     client, llama_port: int, timeout: float = 2.0, model: str | None = None,
     base_url: str | None = None,
-
+    status_out: dict | None = None,
 ) -> tuple:
     """Query the llama-server ``/slots`` endpoint.
 
@@ -543,6 +543,14 @@ async def _query_slots(
     updated (graceful degradation, LP-0MSVP7XJ6008QPKX); on failure the
     ``llama_slots_query_failures_total`` metric is incremented so a
     sustained /slots outage surfaces as an alert.
+
+    ``status_out`` (optional, additive) is filled with the *outcome* of the
+    fresh query — ``{"status": int | None, "reason": str | None}`` — so a
+    caller can distinguish a definitive answer (e.g. HTTP 400 "model not
+    found": llama-server's router has unloaded the idle model) from a
+    transient failure (500/timeout/connection). Both collapse to ``(0, 0)``
+    here; only the caller can decide whether serving cached counts is
+    truthful (LP-0MVKSXR4P001V0CM AC3).
     """
     try:
         url = _build_llama_url(llama_port, "/slots", base_url=base_url)
@@ -561,19 +569,55 @@ async def _query_slots(
                 )
                 if total_slots > 0:
                     _record_last_slot_counts(available_slots, total_slots)
+                _set_slots_status_out(status_out, status=status)
                 return available_slots, total_slots
             _record_slots_query_failure("invalid_payload")
+            _set_slots_status_out(status_out, status=status, reason="invalid_payload")
             return 0, 0
         _record_slots_query_failure(f"http_{status}")
+        _set_slots_status_out(status_out, status=status, reason=f"http_{status}")
         return 0, 0
     except TimeoutError:
         _record_slots_query_failure("timeout")
+        _set_slots_status_out(status_out, reason="timeout")
     except Exception as exc:
         if isinstance(exc, (ConnectionError, OSError)):
             _record_slots_query_failure("connection_error")
+            _set_slots_status_out(status_out, reason="connection_error")
         else:
             _record_slots_query_failure("unknown")
+            _set_slots_status_out(status_out, reason="unknown")
     return 0, 0
+
+
+def _set_slots_status_out(
+    status_out: dict | None, *, status: int | None = None, reason: str | None = None
+) -> None:
+    """Fill the optional ``status_out`` dict from ``_query_slots``."""
+    if status_out is None:
+        return
+    try:
+        status_out["status"] = status
+        status_out["reason"] = reason
+    except Exception:
+        pass
+
+
+def slots_failure_is_definitive_model_absent(status_out: dict | None) -> bool:
+    """True when the fresh ``/slots`` failure is a definitive "no such model".
+
+    llama-server's router answers ``/slots?model=<name>`` with HTTP 400 (or
+    404) when no instance of *name* is loaded — its idle-model unload does
+    this, as does the window before a preload finishes. That is a fresh,
+    truthful "no slots right now", not a transient outage, so callers must
+    not substitute cached counts/detail (a fossil snapshot of the last
+    request) for it. Any other reason (500, timeout, connection error, bad
+    payload) is transient and keeps the graceful-degradation path
+    (LP-0MSVP7XJ6008QPKX, LP-0MVKSXR4P001V0CM AC3).
+    """
+    if not isinstance(status_out, dict):
+        return False
+    return status_out.get("reason") in ("http_400", "http_404")
 
 
 def _record_last_slot_counts(available_slots: int, total_slots: int) -> None:
@@ -1523,6 +1567,17 @@ CAPACITY_IDLE = "idle"
 CAPACITY_PREFILL_BOUND = "prefill_bound"
 CAPACITY_SATURATED = "saturated"
 
+STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS = 15.0
+"""Maximum proxy-observed idle age that still counts as fresh decode evidence.
+
+When the served ``/slots`` detail is stale, a cached ``is_processing`` /
+``n_decoded`` snapshot cannot prove the pool is still saturated
+(LP-0MVKSXR4P001V0CM AC3). A decoding stream forwards SSE chunks continuously,
+so a local-activity idle age within this window (source ``chunk``) is live
+evidence that decode is happening now; anything older is a fossil snapshot and
+must not keep a dispatcher waiting.
+"""
+
 
 def slot_lease_state(is_processing: bool, owner_session_id: str | None) -> str:
     """Classify a slot's lease state (LP-0MVGDUVGE0024YAI AC2).
@@ -1616,6 +1671,51 @@ def compute_capacity_hint(slots: list[dict]) -> str:
     if any(str(s.get("lease_state")) == LEASE_STATE_GENERATING for s in occupied):
         return CAPACITY_SATURATED
     return CAPACITY_IDLE
+
+
+def downgrade_stale_capacity_hint(
+    hint: str,
+    *,
+    stale: bool,
+    live_local_requests: int,
+    activity_source: str | None = None,
+    idle_seconds: float | None = None,
+) -> str:
+    """Reconcile a capacity hint computed from possibly-stale slot detail.
+
+    ``compute_capacity_hint`` reads ``is_processing`` / ``phase``, which are
+    only as fresh as the served ``/slots`` snapshot. When that snapshot came
+    from the last-known cache (``stale``), the cached fields describe a past
+    request, so a ``saturated`` verdict can starve a dispatcher through an
+    entire idle window (LP-0MVKSXR4P001V0CM: 66 consecutive ``freeSlots: 0``
+    refusals overnight while the GPU was idle).
+
+    Reconciliation rules (AC1/AC3):
+
+    1. Fresh detail → return ``hint`` unchanged (the decision table is
+       authoritative).
+    2. Stale detail and **no** live in-flight local requests → ``idle``. The
+       cached occupancy is contradicted by the proxy's own dispatch state
+       (retained leases and a leaked ``local_active_queries`` counter are not
+       work, and an unloaded model reports no slots at all).
+    3. Stale detail with live in-flight work and fresh decode evidence
+       (``activity_source == "chunk"`` within
+       ``STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS``) → ``saturated``.
+    4. Stale detail with live in-flight work but no decode evidence →
+       ``prefill_bound`` (busy, but never claimed as saturated on stale data).
+    """
+    if not stale:
+        return hint
+    if live_local_requests <= 0:
+        return CAPACITY_IDLE
+    recent_decode = (
+        activity_source == "chunk"
+        and idle_seconds is not None
+        and idle_seconds <= STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS
+    )
+    if recent_decode:
+        return CAPACITY_SATURATED
+    return CAPACITY_PREFILL_BOUND
 
 
 def _build_status_slot_owners(srv) -> dict[int, dict]:

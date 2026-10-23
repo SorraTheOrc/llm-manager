@@ -1466,11 +1466,16 @@ async def test_recover_resets_stuck_counter_when_no_active_records():
 
 
 @pytest.mark.asyncio
-async def test_recover_does_not_reset_when_active_records_exist():
-    """_recover_stuck_local_active_queries must NOT reset counter when active dispatch records exist.
+async def test_recover_clamps_counter_to_active_records_when_inflated():
+    """_recover_stuck_local_active_queries clamps an inflated counter.
 
-    Active dispatch records indicate legitimate in-flight requests; the
-    counter should not be reset to avoid terminating active requests.
+    LP-0MVKSXR4P001V0CM AC2: ``local_active_queries`` must never exceed the
+    number of truly in-flight local requests. One active dispatch record next
+    to a leaked counter of 2 means one of the two increments never decremented;
+    the counter is clamped to the active-record count (1), not left alone (the
+    pre-fix behaviour that let a leak coexist with real work and wedge the
+    dispatch gate overnight) and not reset to 0 (which would deny the genuinely
+    in-flight request on legacy paths).
     """
     from proxy.router_helpers import _recover_stuck_local_active_queries
 
@@ -1497,19 +1502,45 @@ async def test_recover_does_not_reset_when_active_records_exist():
 
     await _recover_stuck_local_active_queries(srv)
 
-    # Counter should NOT be reset - there are active requests
-    assert srv.local_active_queries == 2, (
-        "Counter must NOT be reset when active dispatch records exist"
+    assert srv.local_active_queries == 1, (
+        "Counter must be clamped to the number of active dispatch records"
     )
 
-    # No recovery warning should be logged
     warning_calls = [
         call for call in logger.warning.call_args_list
         if "local_active_queries counter recovered" in str(call)
     ]
-    assert len(warning_calls) == 0, (
-        "No recovery WARNING should be logged when active records exist"
+    assert len(warning_calls) == 1, (
+        "Expected a WARNING log about counter recovery"
     )
+    assert "2" in str(warning_calls[0]) and "1" in str(warning_calls[0]), (
+        "Warning should include the previous and repaired values"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_leaves_truthful_counter_alone():
+    """A counter that matches the active-record count is not touched."""
+    from proxy.router_helpers import _recover_stuck_local_active_queries
+
+    logger = MagicMock()
+    srv = SimpleNamespace(
+        local_active_queries=1,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={
+            "sess-active": {"active": True, "expires_at": 10**12},
+            "sess-finished": {"active": False, "expires_at": 10**12},
+        },
+        logger=logger,
+    )
+
+    await _recover_stuck_local_active_queries(srv)
+
+    assert srv.local_active_queries == 1
+    assert not [
+        call for call in logger.warning.call_args_list
+        if "local_active_queries counter recovered" in str(call)
+    ]
 
 
 @pytest.mark.asyncio

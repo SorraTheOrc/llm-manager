@@ -1986,12 +1986,18 @@ Response:
 | Field                     | Type          | Description                                                                 |
 |---------------------------|---------------|-----------------------------------------------------------------------------|
 | `active_query`            | `bool`        | `true` while a request is being processed (at least one in-flight request). |
-| `local_active_query`      | `bool`        | `true` only while LOCAL model work is in flight (remote provider streams are excluded — LP-0MSL2ZLLS009RVKR). |
+| `local_active_query`      | `bool`        | `true` only while LOCAL model work is in flight, derived from live dispatch records (a retained post-stream lease or a leaked counter does not count); remote provider streams are excluded (LP-0MSL2ZLLS009RVKR, LP-0MVKSXR4P001V0CM). |
+| `local_in_flight_requests`| `int|null`    | Number of active local dispatch records (`null` in legacy mode without the registry). |
 | `model_switch_in_progress`| `bool`        | `true` during a background model load or model switch.                     |
 | `current_model`           | `string|null` | Name of the currently loaded model, or `null` when no model is loaded.     |
 | `llama_server_running`    | `bool`        | `true` when the llama-server process is running and responsive.            |
-| `available_slots`         | `int`         | Number of model-serving slots that are currently idle (not processing).     |
+| `available_slots`         | `int`         | Number of model-serving slots that are currently idle (not processing). When the served slot detail is stale and the proxy has no in-flight local work, reconciled upward to the pool size so a stale snapshot cannot close the dispatch gate. |
 | `total_slots`             | `int`         | Total number of model-serving slots configured on the llama-server.         |
+| `capacity_hint`           | `string`      | `idle` \| `prefill_bound` \| `saturated`, from the per-slot decision table; reconciled with live dispatch/activity state when slot detail is stale (LP-0MVGDUVGE0024YAI, LP-0MVKSXR4P001V0CM). |
+| `slots_stale`             | `bool`        | The served slot counts **or** per-slot detail came from the last-known cache. |
+| `slots_detail_stale`      | `bool`        | The per-slot detail (and therefore `capacity_hint` input) is cached.       |
+| `slot_counts_stale`       | `bool`        | The `available_slots` / `total_slots` pair is cached.                      |
+| `status_schema_version`   | `int`         | Payload schema version (currently `3`).                                    |
 
 **Performance:**
 

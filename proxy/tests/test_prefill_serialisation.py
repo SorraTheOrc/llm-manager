@@ -281,6 +281,15 @@ class TestStatusPayload:
         from starlette.requests import Request
 
         srv.local_prefill_in_flight = {"sess-a": True}
+        # The gate state publishes only prefills backed by a live dispatch
+        # record (LP-0MVKUKFSO008GI6O AC3 / LP-0MVKSXR4P001V0CM AC3), so the
+        # in-flight session carries an active record.
+        srv.local_dispatch_records = {
+            "sess-a": {
+                "active": True,
+                "expires_at": time.monotonic() + 60.0,
+            }
+        }
         request = Request(
             {
                 "type": "http",
