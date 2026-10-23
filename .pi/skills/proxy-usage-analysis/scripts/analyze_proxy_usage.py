@@ -120,10 +120,16 @@ def main(argv: list[str] | None = None) -> int:
         busy = data.get("local_busy")
         busy_summary = ""
         if busy:
+            # Corrected busy figure (LP-0MVJNW6SN008AKH3): the dispatch →
+            # finish union, with the retained decode-only lower bound named
+            # next to it so the definition change stays visible in the text
+            # summary (``--quiet`` suppresses this line entirely).
             busy_summary = (
-                f", local model busy {busy['busy_pct']:.1f}% "
+                f", local model busy (dispatch → finish) {busy['busy_pct']:.1f}% "
                 f"({busy['busy_seconds']:.0f}s of {busy['window_seconds']:.0f}s "
-                f"window, peak concurrency {busy['peak_concurrency']})"
+                f"window, peak concurrency {busy['peak_concurrency']}), "
+                f"decode-only busy (lower bound) {busy['decode_busy_seconds']:.0f}s "
+                f"(prefill busy {busy['prefill_busy_seconds']:.0f}s)"
             )
         print(
             f"Analyzed {len(run.files)} log file(s) from {args.log_dir}: "

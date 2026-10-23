@@ -6229,3 +6229,195 @@ class TestIdleAdmitCounter:
         data = reporting.summary_to_json(result.summary)
         assert data["local_idle_admit"] == 2
         json.dumps(data)
+
+
+class TestMachineReadablePrefillAndBusyJson:
+    """Machine-readable prefill and redefined-busy JSON surface
+    (LP-0MVJNW6SN008AKH3).
+
+    ``summary_to_json`` gains a top-level ``local_prefill`` object (prefill
+    slot-seconds total, count, p10/p50/p90/max, unknown-prefill count and the
+    slot-seconds unit) and ``local_busy`` gains the dispatch → finish
+    definition marker, the retained decode-only union, the wall-clock prefill
+    span and the labelled lower/upper bounds — while every legacy key stays in
+    place so existing consumers keep working.
+    """
+
+    @staticmethod
+    def _summary(lines: list[str]) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events(lines), WINDOW_START, WINDOW_END, _schedule()
+        )
+
+    @staticmethod
+    def _prefill_lines(prefill_seconds: list[float]) -> list[str]:
+        """One local stream per prefill duration, each with a first-byte line."""
+        lines: list[str] = []
+        for index, seconds in enumerate(prefill_seconds):
+            ts = f"2026-08-02 14:0{index}:30,000"
+            lines.append(
+                f"{ts} - INFO - Stream started: provider=local model=Qwen3 "
+                f"session=s{index} request=[]"
+            )
+            lines.append(
+                "2026-08-02 14:0" + str(index) + ":40,000 - INFO - Stream finished: "
+                f"reason=stop tokens=100/10/110 session=s{index} provider=local "
+                "model=Qwen3 request=[]"
+            )
+            lines.append(
+                f"{ts} - INFO - dispatch_first_byte_ms={seconds * 1000.0} "
+                f"dispatch_to_first_byte_ms={seconds * 1000.0} cache_state=warm "
+                f"cached_ratio=0.900 queue_wait_ms=0.0 session=s{index} model=Qwen3"
+            )
+        return lines
+
+    def test_local_prefill_reports_slot_seconds_count_and_percentiles(self):
+        """A window with prefill samples exposes the total, count and
+        p10/p50/p90/max in slot-seconds."""
+        data = reporting.summary_to_json(
+            self._summary(self._prefill_lines([10, 20, 30, 40]))
+        )
+        prefill = data["local_prefill"]
+        assert prefill["unit"] == "slot-seconds"
+        assert prefill["slot_seconds"] == pytest.approx(100.0)
+        assert prefill["count"] == 4
+        assert prefill["streams"] == 4
+        assert prefill["unknown_prefill"] == 0
+        assert prefill["p10"] == pytest.approx(13.0)
+        assert prefill["p50"] == pytest.approx(25.0)
+        assert prefill["p90"] == pytest.approx(37.0)
+        assert prefill["max_seconds"] == pytest.approx(40.0)
+        json.dumps(data)  # round-trips
+
+    def test_local_prefill_without_samples_keeps_structure(self):
+        """Local traffic with no first-byte line keeps every key: zero total,
+        null percentiles and the stream counted as unknown prefill."""
+        lines = [
+            "2026-08-02 14:00:10,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:20,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        data = reporting.summary_to_json(self._summary(lines))
+        prefill = data["local_prefill"]
+        assert prefill["unit"] == "slot-seconds"
+        assert prefill["slot_seconds"] == 0.0
+        assert prefill["count"] == 0
+        assert prefill["streams"] == 1
+        assert prefill["unknown_prefill"] == 1
+        for key in ("p10", "p50", "p90", "max_seconds"):
+            assert prefill[key] is None
+        json.dumps(data)
+
+    def test_local_prefill_is_null_without_local_traffic(self):
+        """No local traffic means no busy or prefill object at all (matching
+        ``local_busy``'s None convention)."""
+        data = reporting.summary_to_json(self._summary([]))
+        assert data["local_busy"] is None
+        assert data["local_prefill"] is None
+        json.dumps(data)
+
+    def test_local_busy_exposes_definition_prefill_span_and_bounds(self):
+        """A 30 s prefill + 10 s decode stream reports the dispatch → finish
+        union as busy, the decode-only union as the lower bound, the prefill
+        wall-clock span as their difference, and the labelled bounds."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        busy = reporting.summary_to_json(self._summary(lines))["local_busy"]
+        assert busy["definition"] == "dispatch_to_finish"
+        assert busy["busy_seconds"] == pytest.approx(40.0)
+        assert busy["decode_busy_seconds"] == pytest.approx(10.0)
+        assert busy["prefill_busy_seconds"] == pytest.approx(30.0)
+        assert busy["upper_bound_label"] == aggregation.BUSY_UPPER_BOUND_LABEL
+        assert busy["lower_bound_label"] == aggregation.BUSY_LOWER_BOUND_LABEL
+        assert busy["prefill_extended_streams"] == 1
+
+    def test_local_busy_keeps_every_legacy_key(self):
+        """Legacy consumers keep working: the pre-change ``local_busy`` keys
+        are all still present, and the phase split still carries both totals."""
+        busy = reporting.summary_to_json(
+            self._summary(self._prefill_lines([30]))
+        )["local_busy"]
+        legacy = {
+            "window_seconds",
+            "busy_seconds",
+            "busy_pct",
+            "idle_seconds",
+            "idle_pct",
+            "total_compute_seconds",
+            "streams",
+            "avg_stream_duration_seconds",
+            "peak_concurrency",
+            "avg_concurrency",
+            "unfinished_streams",
+            "pre_window_unfinished",
+            "fast_busy_seconds",
+            "cheap_busy_seconds",
+            "fast_window_seconds",
+            "cheap_window_seconds",
+            "hourly_busy",
+            "prefill_vs_decode",
+        }
+        assert legacy <= set(busy)
+        phase = busy["prefill_vs_decode"]
+        assert phase["prefill"]["slot_seconds"] == pytest.approx(30.0)
+        assert phase["decode"]["slot_seconds"] == pytest.approx(10.0)
+        assert phase["prefill"]["pct"] + phase["decode"]["pct"] == pytest.approx(100.0)
+
+    def test_cli_json_summary_includes_new_keys(self, tmp_path, capsys):
+        """The ``--json`` CLI summary carries the new keys end to end."""
+        import analyze_proxy_usage as cli
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        rc = cli.main(
+            [
+                "--log-dir", str(log_dir),
+                "--start", "2026-08-02 14:00:00",
+                "--end", "2026-08-02 15:00:00",
+                "--output-dir", str(tmp_path / "out"),
+                "--json",
+            ]
+        )
+        assert rc == 0
+        data = json.loads(capsys.readouterr().out)
+        prefill = data["local_prefill"]
+        assert prefill["unit"] == "slot-seconds"
+        assert prefill["count"] == 0
+        # Both in-window local streams carry no first-byte line: unknown prefill.
+        assert prefill["unknown_prefill"] == 2
+        busy = data["local_busy"]
+        assert busy["definition"] == "dispatch_to_finish"
+        assert busy["decode_busy_seconds"] == pytest.approx(busy["busy_seconds"])
+        assert busy["prefill_busy_seconds"] == pytest.approx(0.0)
+        assert busy["upper_bound_label"] == aggregation.BUSY_UPPER_BOUND_LABEL
+        assert busy["lower_bound_label"] == aggregation.BUSY_LOWER_BOUND_LABEL
+
+    def test_cli_text_summary_references_the_corrected_busy_figure(self, tmp_path, capsys):
+        """The stdout summary names the dispatch → finish definition and keeps
+        the decode-only lower bound visible next to it."""
+        import analyze_proxy_usage as cli
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        rc = cli.main(
+            [
+                "--log-dir", str(log_dir),
+                "--start", "2026-08-02 14:00:00",
+                "--end", "2026-08-02 15:00:00",
+                "--output-dir", str(tmp_path / "out"),
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "local model busy (dispatch → finish)" in out
+        assert "decode-only busy (lower bound)" in out

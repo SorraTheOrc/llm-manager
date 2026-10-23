@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MVK966RV002TF35
+# smell: unused_import
+# severity: critical
+# description: Dictionary key literal `"idle_seconds"` repeated
+# -->
 """CSV and Markdown report generation, plus the end-to-end analysis runner.
 
 Outputs (per acceptance criteria):
@@ -1909,6 +1915,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "compaction": compaction_json(summary),
         "recommendations": len(recommendations.generate_recommendations(summary, None, mode_map)),
         "local_busy": _busy_json(summary.busy),
+        "local_prefill": _prefill_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
         "ttft": _ttft_json(summary.ttft_events, summary.sessions),
@@ -2028,14 +2035,72 @@ def _prefill_vs_decode_json(busy: aggregation.BusyStats) -> dict:
     }
 
 
+def _prefill_json(busy: aggregation.BusyStats | None) -> dict | None:
+    """JSON-friendly local prefill statistics for ``summary_to_json``
+    (LP-0MVJNW6SN008AKH3).
+
+    ``None`` when the window has no local traffic (mirrors ``local_busy``); a
+    zeros/Nones object when there is local traffic but no measurable prefill,
+    so a consumer can always read the keys. Every duration is
+    **slot-seconds** (the sum of the per-stream prefill work, not the
+    wall-clock union on :class:`aggregation.BusyStats`), labelled via
+    ``unit``; streams without an observable prefill are counted in
+    ``unknown_prefill`` and excluded from the percentiles.
+    """
+    if busy is None:
+        return None
+    stats = busy.prefill_stats
+    if stats is None or not stats.has_samples:
+        return {
+            "unit": aggregation.SLOT_SECONDS_UNIT,
+            "slot_seconds": 0.0,
+            "count": 0,
+            "streams": stats.stream_count if stats is not None else 0,
+            "unknown_prefill": stats.unknown_count if stats is not None else 0,
+            "p10": None,
+            "p50": None,
+            "p90": None,
+            "max_seconds": None,
+        }
+    return {
+        "unit": aggregation.SLOT_SECONDS_UNIT,
+        "slot_seconds": stats.total_seconds,
+        "count": stats.count,
+        "streams": stats.stream_count,
+        "unknown_prefill": stats.unknown_count,
+        "p10": stats.p10,
+        "p50": stats.p50,
+        "p90": stats.p90,
+        "max_seconds": stats.max_seconds,
+    }
+
+
 def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
-    """JSON-friendly local-model utilization summary (None when no local traffic)."""
+    """JSON-friendly local-model utilization summary (None when no local traffic).
+
+    ``busy_seconds`` is the **dispatch → finish** union
+    (LP-0MVJN9H2I00116FP); the retained decode-only union lands in
+    ``decode_busy_seconds`` (the labelled lower bound), the wall-clock
+    prefill span (upper − lower) in ``prefill_busy_seconds``, and the
+    definition marker in ``definition`` so a consumer never needs to infer
+    the semantics (LP-0MVJNW6SN008AKH3).
+    """
     if busy is None:
         return None
     return {
         "window_seconds": busy.window_seconds,
         "busy_seconds": busy.busy_seconds,
         "busy_pct": round(busy.busy_pct, 1),
+        # Busy definition (LP-0MVJNW6SN008AKH3): the dispatch → finish
+        # union, with the retained decode-only figure as the lower bound and
+        # the wall-clock prefill span (upper − lower) alongside.
+        "definition": busy.busy_definition,
+        "decode_busy_seconds": busy.decode_busy_seconds,
+        "prefill_busy_seconds": busy.prefill_busy_seconds,
+        "prefill_extended_streams": busy.prefill_extended_streams,
+        "upper_bound_label": aggregation.BUSY_UPPER_BOUND_LABEL,
+        "lower_bound_label": aggregation.BUSY_LOWER_BOUND_LABEL,
+        "idle_seconds": round(busy.idle_seconds, 1),
         "idle_seconds": round(busy.idle_seconds, 1),
         "idle_pct": round(busy.idle_pct, 1),
         "total_compute_seconds": busy.total_compute_seconds,

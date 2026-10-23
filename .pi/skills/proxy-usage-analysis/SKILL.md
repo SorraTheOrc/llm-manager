@@ -41,8 +41,8 @@ Options:
 | `--start` / `--end` | — | Explicit ISO window (`YYYY-MM-DD HH:MM:SS`); overrides `--hours` |
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary |
-| `--quiet` | off | Suppress the stdout summary |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `local_prefill`, and `local_busy.prefill_vs_decode`) |
+| `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
 
 ## Daily cadence (05:00 cron)
 

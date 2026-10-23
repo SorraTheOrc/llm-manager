@@ -269,7 +269,15 @@ entry is a local runtime edit, not a committed artifact.
    endpoints, and the fast/cheap and hourly splits are attributed from the
    dispatch → finish union (`fast_busy_seconds`, `cheap_busy_seconds`,
    `hourly_busy`); `prefill_busy_seconds` is the wall-clock prefill span
-   (upper − lower). Busy seconds are attributed to **absolute** hours and
+   (upper − lower). The `--json` summary exposes the same fields under
+   `local_busy` — the definition marker `"definition": "dispatch_to_finish"`,
+   `decode_busy_seconds` (retained decode-only union, the lower bound),
+   `prefill_busy_seconds` (prefill span, derivable from the two unions),
+   `prefill_extended_streams` (how many streams carried a measured prefill)
+   and the human labels `upper_bound_label` / `lower_bound_label` — so a
+   machine consumer never has to infer the busy semantics
+   (LP-0MVJNW6SN008AKH3). Every pre-change key is retained unchanged, and the
+   phase split stays at `local_busy.prefill_vs_decode`. Busy seconds are attributed to **absolute** hours and
    to fast/cheap periods (slot schedule) by splitting at hour and period
    boundaries. The top-of-report **Summary by hour** table
    (LP-0MTFO210Q0044TTF, reworked by LP-0MTYAZFGN003BYQS) then renders one
@@ -316,6 +324,14 @@ entry is a local runtime edit, not a committed artifact.
    `window_start` keeps its full duration and a first byte after
    `window_end` belongs to the next window (no double counting).
    `prefill_stats` is `None` only when the caller supplied no TTFT events.
+   The `--json` summary exposes the same statistics as a top-level
+   `local_prefill` object — `unit` (`slot-seconds`), `slot_seconds` (window
+   total), `count` (measurable samples), `streams` (all local streams
+   considered), `unknown_prefill` (streams with no observable prefill) and
+   `p10` / `p50` / `p90` / `max_seconds` — with `0`/`null` values (never a
+   missing key) when there is local traffic but no measurable prefill, and
+   `null` when the window has no local traffic at all (matching `local_busy`)
+   (LP-0MVJNW6SN008AKH3).
    **Decode statistics** (LP-0MVJNDOUU0059MMO) are computed in the same pass
    on the same paired local streams, without needing TTFT events:
    `BusyStats.decode_stats` (`DecodeStats`) holds one `DecodeSample` per
