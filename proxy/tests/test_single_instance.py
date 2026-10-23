@@ -177,3 +177,72 @@ def test_startup_guard_skip_env(lock_path: Path, monkeypatch):
     monkeypatch.setenv("LLAMA_PROXY_SKIP_INSTANCE_LOCK", "1")
     result = srv_mod._startup_acquire_instance_lock(lock_path=lock_path)
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Ordering: the lock is taken BEFORE the live log is archived
+# (LP-0MVLHMAWV008EKTI AC1+AC2)
+# ---------------------------------------------------------------------------
+
+
+def test_startup_guard_lock_lives_in_the_configured_log_directory(
+    tmp_path: Path, monkeypatch
+):
+    """The guard locks the same directory setup_logging() writes into.
+
+    If the lock path and the log directory ever diverge, the guard would protect
+    a directory nobody writes to and two processes could share a log again.
+    """
+    from proxy import server as srv_mod
+
+    log_dir = tmp_path / "logs"
+    config = {"logging": {"directory": str(log_dir)}}
+    monkeypatch.setattr(srv_mod, "config", config)
+
+    lock = srv_mod._startup_acquire_instance_lock()
+
+    assert lock is not None
+    assert lock.path == log_dir / "proxy.lock"
+    srv_mod._startup_release_instance_lock()
+
+
+def test_rejected_second_instance_leaves_the_live_log_in_place(
+    tmp_path: Path, monkeypatch
+):
+    """A refused second instance must not rename the owning process's log.
+
+    setup_logging() archives a non-empty ``proxy.log`` aside for restart
+    safety. If the single-instance guard ran *after* that archive, a rejected
+    second instance would rename the live log out from under the process that
+    owns it — the file path would go stale and that writer's output would land
+    in an archived inode. The guard therefore runs first: the rejection leaves
+    every log file exactly where it was.
+    """
+    from proxy.single_instance import acquire_instance_lock
+
+    from proxy import server as srv_mod
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True)
+    live = log_dir / "proxy.log"
+    live.write_text(
+        "2026-10-23 22:04:16,001 - INFO - pre-restart window line\n",
+        encoding="utf-8",
+    )
+
+    holder = acquire_instance_lock(log_dir / "proxy.lock")
+    assert holder is not None, "test setup: the first instance must hold the lock"
+    config = {"logging": {"directory": str(log_dir)}}
+    monkeypatch.setattr(srv_mod, "load_config", lambda: config)
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            srv_mod._startup_config_logging()
+    finally:
+        holder.release()
+
+    assert str(os.getpid()) in str(excinfo.value)
+    assert live.is_file(), "the owning process's live log must not be renamed away"
+    assert "pre-restart window line" in live.read_text(encoding="utf-8")
+    assert sorted(p.name for p in log_dir.glob("proxy.log.*")) == [], (
+        "a rejected instance must not create an archive of the live log"
+    )

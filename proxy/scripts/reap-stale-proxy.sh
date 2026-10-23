@@ -8,11 +8,13 @@
 # 3 h 35 m verification window vanished. start-proxy.sh's launch-time check
 # only refused on a *listening* port, so a bound-less twin was never caught.
 #
-# A *listening* proxy can never be reaped by this script: start-proxy.sh's
-# port check runs first and refuses. Any process matching the server command
-# line for a given port is therefore either a legitimate server that lost its
-# listener or a stale duplicate — in both cases it must not keep a second
-# writer attached to proxy.log, so it is terminated (SIGTERM, grace, SIGKILL).
+# A *listening* proxy can never be reaped by this script: if anything is
+# listening on the requested port, the script refuses outright (only kill the
+# specific pid by hand if you really mean it — never a blanket kill). Any
+# process matching the server command line for a port with **no** listener is a
+# legitimate server that lost its listener or a stale duplicate; in both cases
+# it must not keep a second writer attached to proxy.log, so it is terminated
+# (SIGTERM, grace, SIGKILL).
 #
 # Usage:
 #   reap-stale-proxy.sh [--port N] [--grace S] [--dry-run]
@@ -20,7 +22,8 @@
 #   --grace S    seconds between SIGTERM and SIGKILL (default 5)
 #   --dry-run    report what would be reaped without killing anything
 #
-# Exit status: 0 on success (including "nothing to reap"); 2 on usage errors.
+# Exit status: 0 on success (including "nothing to reap" or "port has a live
+# listener, refusing"); 2 on usage errors.
 set -uo pipefail
 
 PORT=8000
@@ -78,6 +81,37 @@ command -v pgrep >/dev/null 2>&1 || {
   echo "reap-stale-proxy: pgrep not available; cannot scan for stale proxies" >&2
   exit 0
 }
+
+# _port_in_use <port> -> 0 when something is listening (mirrors start-proxy.sh).
+_port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":$port$|\.$port$"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":$port$|\.$port$"
+  else
+    python3 -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(0.5)
+try:
+    s.connect(('127.0.0.1', $port))
+except Exception:
+    sys.exit(1)
+else:
+    sys.exit(0)
+" 2>/dev/null
+  fi
+}
+
+# Safety interlock: a listener on the port means a serving proxy owns it. Never
+# reap then — a healthy proxy must never be killed by this script (AGENTS.md:
+# never kill the proxy). start-proxy.sh already checked this, so the normal
+# launch path is unaffected.
+if _port_in_use "$PORT"; then
+  echo "reap-stale-proxy: port $PORT has a live listener; refusing to reap anything (a serving proxy owns it)"
+  exit 0
+fi
 
 # The full command line of a launched server is
 #   python3 -m uvicorn proxy.server:app --host 0.0.0.0 --port N [args...]

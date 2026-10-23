@@ -78,6 +78,15 @@ Two independent guards:
   exits (including `SIGKILL`), so a crash never leaves a stale lock. Set
   `LLAMA_PROXY_SKIP_INSTANCE_LOCK=1` for isolated/dev runs that intentionally
   share a log directory.
+
+  **Ordering matters:** the lock is acquired *before* `setup_logging()` runs,
+  because `setup_logging()` archives a non-empty live log (section 1). A
+  rejected second instance must do no filesystem work at all — otherwise it
+  would rename the live log out from under the process that owns it, leaving
+  the owner's writes in an archived inode and a stale `proxy.log` path behind.
+  The lock path is resolved through `proxy/utils.resolve_log_dir()`, the same
+  function `setup_logging()` uses, so the guard always protects the directory
+  that is actually written.
 - **Stale-twin reaping** (`proxy/scripts/reap-stale-proxy.sh`, called by
   `start-proxy.sh` on every non-`--restart` launch): a process shaped like
   `uvicorn proxy.server … --port N` that is **alive but holds no listener** is
@@ -85,7 +94,8 @@ Two independent guards:
   proxy owns the port, so any survivor at that point is stale: it is
   `SIGTERM`ed (grace 5 s) and `SIGKILL`ed if needed. Matching is per port, so a
   dev instance on another port is untouched; `--dry-run` reports without
-  killing.
+  killing. The script also refuses outright whenever **anything is listening**
+  on the port, so running it by hand can never kill a serving proxy.
 
 `ps` after any start/restart therefore shows a single `proxy.server:app`
 process, and a second instance that cannot bind exits instead of lingering.

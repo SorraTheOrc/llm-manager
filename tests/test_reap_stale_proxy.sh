@@ -13,7 +13,10 @@
 #   1. terminates the wedged twin for the requested port;
 #   2. leaves a proxy-shaped process on a *different* port alone;
 #   3. leaves unrelated processes alone;
-#   4. reports without killing under --dry-run, and is a no-op when clean.
+#   4. reports without killing under --dry-run, and is a no-op when clean;
+#   5. NEVER reaps while something is listening on the port — a serving proxy
+#      must never be killed by the safety-net script (AGENTS.md: never kill the
+#      proxy).
 #
 # No production proxy, llama-server, TTS, port 8000 or live log is touched.
 set -uo pipefail
@@ -143,7 +146,38 @@ bash "$REAPER" --port "$PORT_DRY" >/dev/null 2>&1
 _wait_gone "$DRY_PID" && pass "cleanup reap after --dry-run" \
   || fail "cleanup reap after --dry-run failed"
 
-# --- 4. a clean port is a no-op -------------------------------------------
+# --- 5. a live listener on the port is never reaped ------------------------
+# A healthy proxy holds the listener: the reaper must refuse, not kill it.
+PORT_LISTENING=$((PORT_CLEAN + 2))
+LISTENER_PID="$(_spawn_proxy_shaped "$PORT_LISTENING" "$TMP_DIR/listening.log")"
+# Give the stand-in a real listener on the requested port.
+python3 - "$PORT_LISTENING" <<'PY' >/dev/null 2>&1 &
+import socket, sys, time
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(1)
+time.sleep(120)
+PY
+SOCKET_PID=$!
+PIDS+=("$SOCKET_PID")
+sleep 1
+
+LISTEN_OUT="$(bash "$REAPER" --port "$PORT_LISTENING" 2>&1)"
+if kill -0 "$LISTENER_PID" 2>/dev/null; then
+  pass "a serving proxy on the port is never reaped"
+else
+  fail "reaper killed a proxy-shaped process whose port has a live listener"
+fi
+if echo "$LISTEN_OUT" | grep -qi "listener"; then
+  pass "reaper explains the listener interlock"
+else
+  fail "reaper output missing the listener interlock message: $LISTEN_OUT"
+fi
+kill -9 "$LISTENER_PID" "$SOCKET_PID" 2>/dev/null || true
+
+# --- 6. a clean port is a no-op -------------------------------------------
 CLEAN_OUT="$(bash "$REAPER" --port "$PORT_CLEAN" 2>&1)"
 RC=$?
 if [ "$RC" -eq 0 ] && echo "$CLEAN_OUT" | grep -qi "no stale"; then

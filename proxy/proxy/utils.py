@@ -939,6 +939,38 @@ def prune_logs(
     return deleted
 
 
+def resolve_log_dir(config: dict) -> Path:
+    """Return the log directory for *config*, creating it when possible.
+
+    Extracted from :func:`setup_logging` so the single-instance guard can
+    compute the same directory **before** logging is configured: the lock must
+    be taken before :func:`archive_live_log` runs, otherwise a rejected second
+    instance would rename the live log out from under the process that owns it
+    (LP-0MVLHMAWV008EKTI AC1/AC2).
+
+    Dev mode (``LLAMA_PROXY_DEV=1``) uses the XDG state directory; otherwise
+    the configured ``logging.directory`` is used, falling back to the package's
+    local ``logs/`` directory when the configured one is not writable.
+    """
+    if os.environ.get("LLAMA_PROXY_DEV") == "1":
+        xdg_state = os.environ.get(
+            "XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state")
+        )
+        dir_path = Path(xdg_state) / "llama-proxy-dev" / "logs"
+        dir_path.mkdir(parents=True, exist_ok=True)
+        return dir_path
+
+    log_config = config.get("logging", {})
+    dir_path = Path(log_config.get("directory", "/var/log/llama-proxy"))
+    try:
+        dir_path.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        dir_path = Path(__file__).parent.parent / "logs"
+        dir_path.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Using local log directory: {dir_path}")
+    return dir_path
+
+
 def setup_logging(config: dict) -> logging.Logger:
     """Setup logging with time-based rotation.
 
@@ -978,21 +1010,14 @@ def setup_logging(config: dict) -> logging.Logger:
     srv.verbose_chunks = verbose_chunks
 
     if is_dev:
-        # Dev mode: use XDG-based dev log directory with DEBUG level
-        xdg_state = os.environ.get("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state"))
-        dir_path = Path(xdg_state) / "llama-proxy-dev" / "logs"
-        dir_path.mkdir(parents=True, exist_ok=True)
+        # Dev mode: XDG-based dev log directory with DEBUG level.
         log_level = "DEBUG"
+        dir_path = resolve_log_dir(config)
         print(f"[INFO] Dev mode: using log directory {dir_path} at level {log_level}")
     else:
-        dir_path = Path(log_config.get("directory", "/var/log/llama-proxy"))
-        # Try to create log directory, fall back to local logs directory if permission denied
-        try:
-            dir_path.mkdir(parents=True, exist_ok=True)
-        except PermissionError:
-            dir_path = Path(__file__).parent.parent / "logs"
-            dir_path.mkdir(parents=True, exist_ok=True)
-            print(f"[INFO] Using local log directory: {dir_path}")
+        # Configured directory, falling back to the local logs directory when
+        # it is not writable.
+        dir_path = resolve_log_dir(config)
 
     # Assign log_dir to the server module for use by other modules
     srv.log_dir = dir_path

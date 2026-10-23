@@ -529,8 +529,13 @@ def _startup_acquire_instance_lock(lock_path: Path | None = None) -> Any | None:
         return None
 
     if lock_path is None:
-        lock_dir = log_dir or Path(__file__).parent.parent / "logs"
-        lock_path = Path(lock_dir) / LOCK_FILENAME
+        # Resolve the log directory the same way setup_logging() will, because
+        # the lock is taken *before* logging is configured (see
+        # _startup_config_logging): a rejected second instance must never touch
+        # the log files of the instance that owns them.
+        from proxy.utils import resolve_log_dir
+
+        lock_path = resolve_log_dir(config) / LOCK_FILENAME
 
     lock = acquire_instance_lock(lock_path)
     if lock is None:
@@ -572,10 +577,15 @@ def _startup_config_logging():
     """
     global config, logger
     config = load_config()
-    logger = setup_logging(config)
     # Exactly one proxy per log directory (LP-0MVLHMAWV008EKTI AC2): a second
     # instance must fail fast, not become a second writer of the same log.
+    # Acquired BEFORE setup_logging(): setup_logging() archives the live log
+    # (renames a non-empty proxy.log aside for restart safety), so a rejected
+    # second instance must be refused before that rename can strand the live
+    # writer's file. The message goes to stderr (logging is not configured yet);
+    # start-proxy.sh captures stderr into proxy-startup.log.
     _startup_acquire_instance_lock()
+    logger = setup_logging(config)
     _startup_validate_local_routing_config(config)
     _startup_validate_compaction_config(config)
 
