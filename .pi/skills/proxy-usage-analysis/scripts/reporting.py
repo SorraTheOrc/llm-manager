@@ -1,9 +1,4 @@
 
-# <!-- REFACTOR-LP-0MVK966RV002TF35
-# smell: unused_import
-# severity: critical
-# description: Dictionary key literal `"idle_seconds"` repeated
-# -->
 """CSV and Markdown report generation, plus the end-to-end analysis runner.
 
 Outputs (per acceptance criteria):
@@ -2148,7 +2143,6 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
         "prefill_extended_streams": busy.prefill_extended_streams,
         "upper_bound_label": aggregation.BUSY_UPPER_BOUND_LABEL,
         "lower_bound_label": aggregation.BUSY_LOWER_BOUND_LABEL,
-        "idle_seconds": round(busy.idle_seconds, 1),
         "idle_seconds": round(busy.idle_seconds, 1),
         "idle_pct": round(busy.idle_pct, 1),
         "total_compute_seconds": busy.total_compute_seconds,

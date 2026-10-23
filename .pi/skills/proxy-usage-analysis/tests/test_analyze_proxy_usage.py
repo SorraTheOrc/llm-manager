@@ -6366,6 +6366,19 @@ class TestMachineReadablePrefillAndBusyJson:
             "prefill_vs_decode",
         }
         assert legacy <= set(busy)
+
+    def test_local_busy_has_unique_keys(self):
+        """No dictionary key is duplicated — a regression guard for F601.
+
+        Duplicate key literals silently overwrite; this test catches any
+        accidental re-addition (LP-0MVKE63D2007WD0E)."""
+        busy = reporting.summary_to_json(
+            self._summary(self._prefill_lines([30]))
+        )["local_busy"]
+        keys = list(busy.keys())
+        assert len(keys) == len(set(keys)), (
+            f"Duplicate keys detected: {[k for k in keys if keys.count(k) > 1]}"
+        )
         phase = busy["prefill_vs_decode"]
         assert phase["prefill"]["slot_seconds"] == pytest.approx(30.0)
         assert phase["decode"]["slot_seconds"] == pytest.approx(10.0)
