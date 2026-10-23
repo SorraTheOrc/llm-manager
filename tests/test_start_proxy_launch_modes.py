@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MVKD3VPG00162QT
+# smell: modernization
+# severity: medium
+# description: Use format specifiers instead of percent format
+# -->
 #!/usr/bin/env python3
 """Behavioural tests for ``start-proxy.sh`` launch modes.
 
@@ -228,6 +234,38 @@ def test_detached_reexec_does_not_repeat_the_restart_phase(tmp_path):
             break
         time.sleep(0.05)
     assert "Restart requested:" not in log_text
+
+
+def test_nohup_backgrounded_caller_pattern_launches_once_and_returns(tmp_path):
+    """LP-0MVGT0E6W000Q8CY AC6: the pre-existing detached caller patterns
+    (``nohup bash scripts/start-proxy.sh --restart &>/tmp/proxy-startup.log &``
+    in the start-proxy skill and ``scripts/rebuild-and-restart-mtp.sh``) must
+    keep working with the new self-detaching default: the caller still gets a
+    working server, but the caller's own background job now exits promptly
+    (the script hands off instead of serving), and the server is launched
+    exactly once with one handoff line. No double-detach breakage."""
+    sandbox = _sandbox(tmp_path)
+    caller_log = tmp_path / "caller.log"
+
+    with caller_log.open("w", encoding="utf-8") as fh:
+        proc = subprocess.Popen(
+            ["nohup", "bash", "scripts/start-proxy.sh", "--restart"],
+            cwd=sandbox["proxy_dir"],
+            env=sandbox["env"],
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+        )
+
+    # The caller's job must exit by itself after the handoff (it no longer
+    # blocks serving the proxy).
+    assert proc.wait(timeout=60) == 0
+    calls = _uvicorn_calls(sandbox["argv_log"])
+    assert len(calls) == 1, f"expected exactly one uvicorn launch, got {calls}"
+
+    log_text = caller_log.read_text(encoding="utf-8")
+    assert log_text.count("Proxy launched detached:") == 1, log_text
+    assert "Proxy launched detached:" in log_text
+    assert "--restart" in log_text or "Restart" in log_text
 
 
 def test_unwritable_log_file_fails_fast(tmp_path):
