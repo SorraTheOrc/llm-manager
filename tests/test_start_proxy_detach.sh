@@ -28,6 +28,10 @@
 # server are never touched, and only PIDs this harness recorded are killed
 # (never a blanket pkill — the proxy shares the host with every consumer).
 #
+# The launcher is started from the sandbox (not the repo root) so the script
+# resolves the fake `python3` from PATH rather than a repository `.venv` — see
+# the launcher wrapper below.
+#
 # Usage:
 #   bash tests/test_start_proxy_detach.sh
 
@@ -222,6 +226,11 @@ EOF_RC_FILE="$SANDBOX/reader.rc"
 cat > "$SANDBOX/launcher.sh" <<'SH'
 #!/usr/bin/env bash
 echo "$$ $(ps -o pgid= -p $$ | tr -d ' ')" > "$LAUNCHER_PID_FILE"
+# Run from the sandbox, never from the repository root: start-proxy.sh prefers
+# <cwd>/.venv/bin/python3, so a launcher started in the repo root would pick the
+# real interpreter and try to import the real app instead of the fake uvicorn on
+# PATH (the sandbox mirrors only the top-level proxy package).
+cd "$SANDBOX" || exit 1
 bash "$SANDBOX/proxy/scripts/start-proxy.sh" --port "$TEST_PORT" --log-file "$LOG_FILE" "$@"
 rc=$?
 echo "$rc" > "$LAUNCHER_RC_FILE"
