@@ -368,6 +368,48 @@ class TestSpeedStats:
         assert stats.decode["cheap"].count == 1
         assert stats.decode["cheap"].median == 42.0
 
+    def test_priority_window_buckets_night_samples_cheap(self, tmp_path):
+        """With no mode timeline, the configured ``server.priority_window``
+        decides the fast/cheap speed buckets (LP-0MVKSXXIR006OBI2)."""
+        log_dir = tmp_path / "logs_pw"
+        log_dir.mkdir()
+        (log_dir / "llama-server.log").write_text(
+            fixtures.QWEN3_SPAWN_LINE
+            + "\n[32999]        eval time =    100.00 ms /    10 tokens (   10.00 ms per token,    42.00 tokens per second)\n"
+        )
+        # mtime at 03:00 (inside the 01:00-10:00 priority window).
+        _set_mtime(log_dir / "llama-server.log", datetime(2026, 8, 2, 3, 0, 0))
+        files = llama_log_parser.discover_llama_logs(log_dir, WINDOW_START)
+        window_start = datetime(2026, 8, 2, 0, 0)
+        window_end = datetime(2026, 8, 3, 0, 0)
+        window_map = bucketing.ModeScheduleMap.from_profiles(
+            {"default": {"session_slot_pool_size": 2}},
+            None,
+            2,
+            priority_window=bucketing.PriorityWindow(60.0, 600.0),
+        )
+        stats = llama_log_parser.build_speed_stats(
+            files, window_start, window_end, _schedule(), window_map
+        )
+        assert stats.decode["total"].count == 1
+        assert stats.decode["cheap"].count == 1
+        assert stats.decode["fast"].count == 0
+
+        # A disabled window attributes the same sample to fast.
+        disabled_map = bucketing.ModeScheduleMap.from_profiles(
+            {"default": {"session_slot_pool_size": 2}}, None, 2
+        )
+        stats_flat = llama_log_parser.build_speed_stats(
+            files, window_start, window_end, _schedule(), disabled_map
+        )
+        assert stats_flat.decode["cheap"].count == 1  # legacy slot schedule
+        flat_schedule = bucketing.schedule_from_config({}, 2)
+        stats_no_schedule = llama_log_parser.build_speed_stats(
+            files, window_start, window_end, flat_schedule, disabled_map
+        )
+        assert stats_no_schedule.decode["fast"].count == 1
+        assert stats_no_schedule.decode["cheap"].count == 0
+
 
 # ---------------------------------------------------------------------------
 # Date-named rotation discovery (LP-0MVJNIZRO008S031)

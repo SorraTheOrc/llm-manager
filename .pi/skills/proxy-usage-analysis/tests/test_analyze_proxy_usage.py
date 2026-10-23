@@ -6605,3 +6605,450 @@ class TestRegeneratedReportExpectedOrder:
         assert prefill["slot_seconds"] == pytest.approx(1080.0)
         assert prefill["count"] == 6
         json.dumps(data)  # round-trips
+
+
+# =========================================================================
+# Priority-window bucketing (LP-0MVKSXXIR006OBI2)
+#
+# The fast/cheap mode schedule is retired: ``server.priority_window`` (local
+# time, midnight-wrapping capable) is now the only cheap-mode signal for
+# windows whose logs carry no ``Mode scheduler`` evidence. Historical windows
+# that do carry mode evidence keep their mode-timeline attribution (AC5).
+# =========================================================================
+
+PRIORITY_CONFIG = {
+    "local_model_ctx_size": 262144,
+    "session_slot_pool_size": 2,
+    "priority_window": {
+        "enabled": True,
+        "start": "01:00",
+        "end": "10:00",
+        "start_minutes": 60,
+        "end_minutes": 600,
+    },
+}
+
+
+def _priority_mode_map(
+    start_minutes: float = 60,
+    end_minutes: float = 600,
+    wrap: bool = False,
+) -> bucketing.ModeScheduleMap:
+    """A mode map whose only fast/cheap source is the priority window."""
+    return bucketing.ModeScheduleMap.from_profiles(
+        {"default": {"session_slot_pool_size": 2, "local_model_ctx_size": 262144}},
+        None,
+        2,
+        priority_window=bucketing.PriorityWindow(
+            start_minutes=start_minutes, end_minutes=end_minutes
+        ),
+    )
+
+
+def _no_slot_schedule() -> bucketing.SlotSchedule:
+    """The unified config has no ``slot_schedule``: one flat fast period."""
+    return bucketing.schedule_from_config({}, 2)
+
+
+class TestPriorityWindowParsing:
+    """Window parsing: enabled/disabled, custom bounds, midnight wrap (AC4/AC6)."""
+
+    def test_normalize_parses_bounds_to_minutes(self):
+        window = config_loader.normalize_priority_window(
+            {"enabled": True, "start": "01:00", "end": "10:00"}
+        )
+        assert window == {
+            "enabled": True,
+            "start": "01:00",
+            "end": "10:00",
+            "start_minutes": 60,
+            "end_minutes": 600,
+        }
+
+    def test_normalize_custom_bounds(self):
+        window = config_loader.normalize_priority_window(
+            {"enabled": True, "start": "22:00", "end": "06:30"}
+        )
+        assert window["start_minutes"] == 22 * 60
+        assert window["end_minutes"] == 6 * 60 + 30
+
+    def test_normalize_disabled_flag(self):
+        window = config_loader.normalize_priority_window(
+            {"enabled": False, "start": "01:00", "end": "10:00"}
+        )
+        assert window["enabled"] is False
+
+    def test_normalize_invalid_bounds_fall_back_to_shipped_defaults(self):
+        window = config_loader.normalize_priority_window(
+            {"enabled": True, "start": "not-a-time", "end": "99:99"}
+        )
+        assert (window["start_minutes"], window["end_minutes"]) == (60, 600)
+
+    def test_normalize_absent_window(self):
+        assert config_loader.normalize_priority_window(None) is None
+        assert config_loader.priority_window_bounds({}) is None
+
+    def test_parse_config_text_reads_priority_window(self):
+        cfg = config_loader.parse_config_text(
+            "server:\n"
+            "  priority_window:\n"
+            "    enabled: true\n"
+            '    start: "22:00"\n'
+            '    end: "06:00"\n'
+        )
+        assert cfg["priority_window"]["start_minutes"] == 22 * 60
+        assert cfg["priority_window"]["end_minutes"] == 6 * 60
+        assert cfg["priority_window"]["enabled"] is True
+
+    def test_regex_fallback_parser_reads_priority_window(self):
+        cfg = config_loader._parse_config_text_regex(
+            "server:\n"
+            "  priority_window:\n"
+            "    enabled: false\n"
+            '    start: "02:30"\n'
+            '    end: "05:45"\n'
+        )
+        window = config_loader.normalize_priority_window(cfg["priority_window"])
+        assert window["enabled"] is False
+        assert (window["start_minutes"], window["end_minutes"]) == (150, 345)
+
+    def test_discover_configs_exposes_window_bounds(self, tmp_path):
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text(
+            "server:\n"
+            "  local_model_ctx_size: 131072\n"
+            "  priority_window:\n"
+            "    enabled: true\n"
+            '    start: "01:00"\n'
+            '    end: "10:00"\n'
+        )
+        configs = config_loader.discover_configs(start=tmp_path)
+        bounds = configs["priority_window_bounds"]
+        assert bounds["enabled"] is True
+        assert (bounds["start_minutes"], bounds["end_minutes"]) == (60, 600)
+
+
+class TestPriorityWindowSchedule:
+    """``PriorityWindow``/``ModeScheduleMap`` window semantics (AC1/AC4)."""
+
+    def test_segments_split_at_the_bounds(self):
+        window = bucketing.PriorityWindow(start_minutes=60, end_minutes=600)
+        assert window.segments() == [
+            (0.0, 60, "fast"),
+            (60, 600, "cheap"),
+            (600, float(bucketing.MINUTES_PER_DAY), "fast"),
+        ]
+
+    def test_midnight_wrap_is_split_across_midnight(self):
+        window = bucketing.PriorityWindow(
+            start_minutes=22 * 60, end_minutes=6 * 60
+        )
+        assert window.wraps is True
+        assert window.segments() == [
+            (0.0, 360, "cheap"),
+            (360, 1320, "fast"),
+            (1320, float(bucketing.MINUTES_PER_DAY), "cheap"),
+        ]
+        assert window.contains(23 * 60) is True
+        assert window.contains(3 * 60) is True
+        assert window.contains(12 * 60) is False
+
+    def test_disabled_window_yields_no_schedule(self):
+        assert bucketing.PriorityWindow.from_config(
+            {"priority_window": {"enabled": False, "start": "01:00", "end": "10:00"}}
+        ) is None
+        assert bucketing.PriorityWindow.from_config({}) is None
+        assert bucketing.PriorityWindow.from_config(None) is None
+
+    def test_from_config_accepts_raw_and_normalised_blocks(self):
+        raw = bucketing.PriorityWindow.from_config(
+            {"priority_window": {"enabled": True, "start": "02:00", "end": "04:00"}}
+        )
+        assert raw == bucketing.PriorityWindow(120.0, 240.0)
+        normalised = bucketing.PriorityWindow.from_config(PRIORITY_CONFIG)
+        assert normalised == bucketing.PriorityWindow(60.0, 600.0)
+
+    def test_profile_source_reports_priority_window(self):
+        assert _priority_mode_map().profile_source == "server.priority_window"
+
+    def test_profile_source_is_none_without_window_or_timeline(self):
+        mm = bucketing.ModeScheduleMap.from_profiles({"default": None}, None, 2)
+        assert mm.profile_source is None
+
+    def test_bucket_label_uses_window(self):
+        mm = _priority_mode_map()
+        schedule = _no_slot_schedule()
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 3, 0), schedule, mm) == "cheap"
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 12, 0), schedule, mm) == "fast"
+        # Bounds are inclusive-start / exclusive-end (local time).
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 1, 0), schedule, mm) == "cheap"
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 10, 0), schedule, mm) == "fast"
+
+    def test_bucket_label_falls_back_to_slot_schedule_without_window(self):
+        schedule = bucketing.schedule_from_entries([("23:59", 8), ("10:00", 6)])
+        mm = bucketing.ModeScheduleMap.from_profiles({"default": None}, None, 8)
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 3, 0), schedule, mm) == "cheap"
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 11, 0), schedule, mm) == "fast"
+        # And with no mode map at all (legacy call sites).
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 11, 0), schedule, None) == "fast"
+
+
+class TestPriorityWindowBucketing:
+    """Overnight bucketing with no mode-schedule evidence (AC1/AC2/AC5)."""
+
+    OVERNIGHT_START = datetime(2026, 10, 22, 0, 0, 0)
+    OVERNIGHT_END = datetime(2026, 10, 22, 12, 0, 0)
+
+    def test_overnight_window_attributes_cheap_seconds(self):
+        """cheap_window_seconds matches 01:00-10:00 with no ``Mode scheduler``
+        lines — the regression the nightly report showed (AC2)."""
+        events = [
+            _local_event("stream_started", datetime(2026, 10, 22, 3, 0, 0), "night"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 3, 0, 10), "night"),
+            _local_event("stream_started", datetime(2026, 10, 22, 11, 0, 0), "day"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 11, 0, 20), "day"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            events,
+            self.OVERNIGHT_START,
+            self.OVERNIGHT_END,
+            _no_slot_schedule(),
+            _priority_mode_map(),
+        )
+        assert busy is not None
+        assert busy.cheap_window_seconds == pytest.approx(9 * 3600.0)
+        assert busy.fast_window_seconds == pytest.approx(3 * 3600.0)
+        assert busy.cheap_busy_seconds == pytest.approx(10.0)
+        assert busy.fast_busy_seconds == pytest.approx(20.0)
+
+    def test_sessions_bucketed_cheap_inside_the_window(self):
+        lines = [
+            "2026-10-22 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=night request=[]",
+            "2026-10-22 03:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=night provider=local model=Qwen3 request=[]",
+            "2026-10-22 11:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=day request=[]",
+            "2026-10-22 11:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=day provider=local model=Qwen3 request=[]",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            self.OVERNIGHT_START,
+            self.OVERNIGHT_END,
+            _no_slot_schedule(),
+            _priority_mode_map(),
+        )
+        assert res.sessions["night"].bucket == "cheap"
+        assert res.sessions["day"].bucket == "fast"
+
+    def test_event_level_bucketing_follows_the_window(self):
+        """Session-less events (fallback/routing-skip reasons) are bucketed by
+        their own timestamp, so they land in the low-priority tables too."""
+        lines = [
+            "2026-10-22 03:30:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=context_too_large",
+            "2026-10-22 11:30:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=provider_error",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            self.OVERNIGHT_START,
+            self.OVERNIGHT_END,
+            _no_slot_schedule(),
+            _priority_mode_map(),
+        )
+        buckets = reporting._bucket_profile(
+            [], _no_slot_schedule(), res.fallback_events, [], [], _priority_mode_map()
+        )
+        assert buckets["cheap"]["fallback_reasons"]["context_too_large"] == 1
+        assert buckets["fast"]["fallback_reasons"]["provider_error"] == 1
+
+    def test_midnight_wrapping_window_is_honoured(self):
+        """A 22:00-06:00 window contributes cheap time on both sides of
+        midnight inside a single analysis window (AC4)."""
+        events = [
+            _local_event("stream_started", datetime(2026, 10, 22, 2, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 2, 0, 5), "s1"),
+            _local_event("stream_started", datetime(2026, 10, 22, 23, 0, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 23, 0, 5), "s2"),
+        ]
+        start = datetime(2026, 10, 22, 0, 0, 0)
+        end = datetime(2026, 10, 23, 0, 0, 0)
+        busy = aggregation.compute_busy_stats(
+            events, start, end, _no_slot_schedule(), _priority_mode_map(22 * 60, 6 * 60)
+        )
+        assert busy is not None
+        assert busy.cheap_window_seconds == pytest.approx(8 * 3600.0)
+        assert busy.fast_window_seconds == pytest.approx(16 * 3600.0)
+        assert busy.cheap_busy_seconds == pytest.approx(10.0)
+        assert busy.fast_busy_seconds == 0.0
+
+    def test_disabled_window_attributes_no_cheap_time(self):
+        events = [
+            _local_event("stream_started", datetime(2026, 10, 22, 3, 0, 0), "night"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 3, 0, 10), "night"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            events,
+            self.OVERNIGHT_START,
+            self.OVERNIGHT_END,
+            _no_slot_schedule(),
+            _priority_mode_map_with_window(enabled=False),
+        )
+        assert busy is not None
+        assert busy.cheap_window_seconds == 0.0
+        assert busy.cheap_busy_seconds == 0.0
+
+    def test_mode_timeline_evidence_wins_over_priority_window(self):
+        """AC5: a window whose logs still carry ``Mode scheduler`` evidence
+        keeps mode-timeline attribution; the priority window layers beneath."""
+        mm = _priority_mode_map(0, 6 * 60)  # would make 03:00 cheap
+        lines = [
+            "2026-08-14 10:00:02,000 - INFO - Mode scheduler: applied scheduled mode fast",
+            "2026-08-15 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=cheap-hours request=[]",
+            "2026-08-15 03:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=cheap-hours provider=local model=Qwen3 request=[]",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            TestModeTimelineBucketing.MODE_WINDOW_START,
+            TestModeTimelineBucketing.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        assert mm.profile_source == "mode_schedule"
+        # The mode timeline says fast at 03:00, so the priority window's cheap
+        # attribution must not override it.
+        assert res.sessions["cheap-hours"].bucket == "fast"
+
+
+def _priority_mode_map_with_window(enabled: bool) -> bucketing.ModeScheduleMap:
+    """A mode map over an explicitly disabled priority window."""
+    return bucketing.ModeScheduleMap.from_profiles(
+        {"default": {"session_slot_pool_size": 2}},
+        None,
+        2,
+        priority_window=bucketing.PriorityWindow.from_config(
+            {"priority_window": {"enabled": enabled, "start": "01:00", "end": "10:00"}}
+        ),
+    )
+
+
+class TestPriorityWindowReportNote:
+    """AC3: the timeline section names the attribution source."""
+
+    WINDOW_START = datetime(2026, 10, 22, 0, 0, 0)
+    WINDOW_END = datetime(2026, 10, 22, 12, 0, 0)
+
+    def _report(self, mode_map: bucketing.ModeScheduleMap, lines: list[str]) -> str:
+        res = aggregation.aggregate(
+            _events(lines), self.WINDOW_START, self.WINDOW_END, _no_slot_schedule(), mode_map
+        )
+        return reporting.build_report(res, PRIORITY_CONFIG, mode_map=mode_map)
+
+    def test_note_names_priority_window_when_mode_timeline_is_retired(self):
+        lines = [
+            "2026-10-22 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=night request=[]",
+            "2026-10-22 03:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=night provider=local model=Qwen3 request=[]",
+        ]
+        report = self._report(_priority_mode_map(), lines)
+        assert "## Priority window timeline & restarts" in report
+        section = report.split("## Priority window timeline & restarts", 1)[1].split("\n## ", 1)[0]
+        assert "server.priority_window" in section
+        assert "01:00–10:00" in section
+        assert "retired" in section
+
+    def test_note_marks_wrapping_window(self):
+        lines = [
+            "2026-10-22 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=night request=[]",
+        ]
+        report = self._report(_priority_mode_map(22 * 60, 6 * 60), lines)
+        section = report.split("## Priority window timeline & restarts", 1)[1].split("\n## ", 1)[0]
+        assert "22:00–06:00" in section
+        assert "wraps past midnight" in section
+
+    def test_note_says_mode_schedule_won_when_evidence_present(self):
+        mm = _priority_mode_map()
+        lines = ["2026-10-22 10:00:02,000 - INFO - Mode scheduler: applied scheduled mode fast"]
+        report = self._report(mm, lines)
+        section = report.split("## Priority window timeline & restarts", 1)[1].split("\n## ", 1)[0]
+        assert "active for this window" in section
+        assert "not applied" in section
+
+    def test_notes_and_limitations_mentions_priority_window(self):
+        report = self._report(_priority_mode_map(), [])
+        assert "`server.priority_window`" in report
+        assert "retired mode schedule" in report
+
+    def test_section_omitted_when_no_window_and_no_events(self):
+        mm = bucketing.ModeScheduleMap.from_profiles({"default": None}, None, 2)
+        report = self._report(mm, [])
+        assert "## Priority window timeline & restarts" not in report
+
+
+class TestPriorityWindowEndToEnd:
+    """Overnight run through ``run_analysis``: cheap CSV + JSON + report (AC1-AC3)."""
+
+    WINDOW_START = datetime(2026, 10, 22, 0, 0, 0)
+    WINDOW_END = datetime(2026, 10, 22, 12, 0, 0)
+
+    LINES = [
+        "2026-10-22 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=night request=[]",
+        "2026-10-22 03:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=night provider=local model=Qwen3 request=[]",
+        "2026-10-22 11:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=day request=[]",
+        "2026-10-22 11:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=day provider=local model=Qwen3 request=[]",
+    ]
+
+    def _run(self, tmp_path: Path, config: dict | None = None):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(self.LINES) + "\n")
+        return reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=self.WINDOW_START,
+            window_end=self.WINDOW_END,
+            output_dir=tmp_path / "out",
+            config=config if config is not None else PRIORITY_CONFIG,
+        )
+
+    def test_overnight_run_splits_low_priority_sessions(self, tmp_path):
+        run = self._run(tmp_path)
+        out_dir = tmp_path / "out"
+        assert run.summary.sessions["night"].bucket == "cheap"
+        assert run.summary.sessions["day"].bucket == "fast"
+
+        import csv
+
+        with (out_dir / "low_priority_sessions.csv").open() as f:
+            cheap_rows = list(csv.DictReader(f))
+        with (out_dir / "standard_sessions.csv").open() as f:
+            fast_rows = list(csv.DictReader(f))
+        assert {r["session_id"] for r in cheap_rows} == {"night"}
+        assert {r["session_id"] for r in fast_rows} == {"day"}
+
+        data = reporting.summary_to_json(run.summary, run.mode_map)
+        busy = data["local_busy"]
+        assert busy["cheap_window_seconds"] == pytest.approx(9 * 3600.0)
+        assert busy["fast_window_seconds"] == pytest.approx(3 * 3600.0)
+        assert busy["cheap_busy_seconds"] == pytest.approx(10.0)
+        assert busy["fast_busy_seconds"] == pytest.approx(10.0)
+        assert data["low_priority_sessions"] == 1
+        assert data["standard_sessions"] == 1
+
+        report_md = (out_dir / "report.md").read_text()
+        assert "server.priority_window" in report_md
+        assert "01:00–10:00" in report_md
+
+    def test_disabled_window_via_run_analysis_attributes_no_cheap_time(self, tmp_path):
+        disabled = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 2,
+            "priority_window": {
+                "enabled": False,
+                "start": "01:00",
+                "end": "10:00",
+                "start_minutes": 60,
+                "end_minutes": 600,
+            },
+        }
+        run = self._run(tmp_path, config=disabled)
+        assert run.summary.sessions["night"].bucket == "fast"
+        assert run.summary.busy is not None
+        assert run.summary.busy.cheap_window_seconds == 0.0
+        assert run.summary.busy.cheap_busy_seconds == 0.0

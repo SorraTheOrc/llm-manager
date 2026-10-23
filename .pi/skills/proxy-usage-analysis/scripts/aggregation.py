@@ -742,14 +742,13 @@ def _build_session(
 
     # Bucket by the operating mode active at the session's first in-window
     # stream (LP-0MSPZUD4G007IYGH): when the logs show mode transitions, the
-    # period is the mode's profile period labelled with the mode name; without
-    # transitions (a single-mode window) the legacy slot-count bucketing from
-    # the analysis-time schedule applies unchanged.
-    period: bucketing.SlotPeriod | None = None
-    if mode_map is not None and mode_map.transitions:
-        period = mode_map.period_for(start)
-    elif schedule.periods:
-        period = schedule.period_for(start)
+    # period is the mode's profile period labelled with the mode name; when
+    # they do not, the configured ``server.priority_window`` supplies the
+    # fast/cheap split (LP-0MVKSXXIR006OBI2), falling back to the legacy
+    # slot-count bucketing from the analysis-time schedule.
+    period: bucketing.SlotPeriod | None = bucketing.bucket_period(
+        start, schedule, mode_map
+    )
 
     local_req = sum(1 for e in started if e.provider == LOCAL_PROVIDER)
     remote_req = len(started) - local_req
@@ -827,12 +826,13 @@ def _period_label_at(
     schedule: bucketing.SlotSchedule,
     mode_map: bucketing.ModeScheduleMap | None,
 ) -> str:
-    """Fast/cheap label for ``dt``: mode-aware when the logs show mode
-    transitions (LP-0MSPZUD4G007IYGH), else the legacy slot-count label from
-    the analysis-time schedule."""
-    if mode_map is not None and mode_map.transitions:
-        return mode_map.period_for(dt).label
-    return schedule.period_for(dt).label if schedule.periods else "fast"
+    """Fast/cheap label for ``dt``.
+
+    Mode-aware when the logs show mode transitions (LP-0MSPZUD4G007IYGH), else
+    the configured priority window (LP-0MVKSXXIR006OBI2), else the legacy
+    slot-count label from the analysis-time schedule.
+    """
+    return bucketing.bucket_label(dt, schedule, mode_map)
 
 
 
@@ -960,9 +960,11 @@ def compute_busy_stats(
     ``pre_window_unfinished`` (LP-0MSVRRO3L0056N6C). Streams started after
     the window end are not counted (they belong to the next window).
     Fast/cheap attribution is mode-aware when the logs show mode transitions
-    (LP-0MSPZUD4G007IYGH), so busy seconds during cheap hours count as cheap
-    even when the analysis runs in fast mode. Returns ``None`` when there is
-    no local traffic in the window.
+    (LP-0MSPZUD4G007IYGH), falls back to the configured
+    ``server.priority_window`` when they do not (LP-0MVKSXXIR006OBI2), and
+    otherwise uses the legacy slot schedule, so busy seconds during cheap
+    hours count as cheap even when the analysis runs in fast mode. Returns
+    ``None`` when there is no local traffic in the window.
 
     Busy is the union of **dispatch → finish** intervals (prefill + decode,
     LP-0MVJN9H2I00116FP): each paired stream's interval starts at
@@ -1107,8 +1109,7 @@ def compute_busy_stats(
         cur += delta
         peak = max(peak, cur)
 
-    mode_aware = mode_map is not None and bool(mode_map.transitions)
-    periods = mode_map.all_periods if mode_aware else schedule.periods
+    periods = bucketing.bucket_periods(schedule, mode_map)
 
     def label_at(mid: datetime) -> str:
         return _period_label_at(mid, schedule, mode_map)

@@ -46,6 +46,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import bucketing
+
 # Optional "[<port>] " prefix + eval timing body. llama.cpp aligns columns with
 # variable whitespace, so all separators are whitespace-tolerant:
 #   "eval time = <ms> ms / <n> tokens (<ms/token> ms per token, <x> tokens per second)"
@@ -479,9 +481,10 @@ def build_speed_stats(
 
     Each sample is bucketed by its (mtime-approximated) timestamp using the
     fast/cheap periods — mode-aware (LP-0MSPZUD4G007IYGH) when the logs show
-    mode transitions, so samples written during cheap hours count as cheap
-    even when the analysis runs in fast mode; the total bucket always
-    accumulates every sample.
+    mode transitions, else the configured ``server.priority_window``
+    (LP-0MVKSXXIR006OBI2), else the slot schedule — so samples written during
+    cheap hours count as cheap even when the analysis runs in fast mode; the
+    total bucket always accumulates every sample.
 
     When ``log_dir`` is given the directory is also scanned so recognised
     ``llama-server*`` files that ``files`` does not contain (outside the
@@ -504,11 +507,7 @@ def build_speed_stats(
     qwen3_ports: list[int] = []
 
     def _bucket_key_for(ts: datetime) -> str:
-        if mode_map is not None and getattr(mode_map, "transitions", None):
-            return CHEAP if mode_map.period_for(ts).label == CHEAP else FAST
-        if schedule is not None and getattr(schedule, "periods", None):
-            return CHEAP if schedule.period_for(ts).label == CHEAP else FAST
-        return FAST
+        return CHEAP if bucketing.bucket_label(ts, schedule, mode_map) == CHEAP else FAST
 
     if log_dir is not None:
         log_dir_p: Path | None = Path(log_dir)

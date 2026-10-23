@@ -495,11 +495,15 @@ def build_report(
     )
     ap(
         "- A session is included when it has at least one `Stream started` inside the window; "
-        "fast/cheap bucketing uses the session start time and the operating-mode profile active at "
-        "that time (reconstructed from `Mode scheduler` lines for scheduled "
-        "transitions plus the `Grandfathering: enabled; ... (current=<mode>)` marker for "
-        "manual switches, LP-0MT1EE315007AKXG; windows without mode transitions use "
-        "the analysis-time config profile, LP-0MSPZUD4G007IYGH)."
+        "fast/cheap bucketing uses the timestamp of that first in-window `Stream started` and "
+        "the profile active at that time. The profile comes from the reconstructed operating-mode "
+        "timeline when the logs carry `Mode scheduler` lines for scheduled transitions plus the "
+        "`Grandfathering: enabled; ... (current=<mode>)` marker for manual switches "
+        "(LP-0MT1EE315007AKXG; windows without mode transitions fall through, LP-0MSPZUD4G007IYGH); "
+        "the retired mode schedule leaves the configured `server.priority_window` as the cheap-mode "
+        "signal, so a window with no mode evidence buckets traffic inside it as cheap/low and "
+        "everything else as fast (LP-0MVKSXXIR006OBI2). Windows with neither fall back to the "
+        "slot schedule of the analysis-time config."
     )
     ap(
         "- Sessions spanning a slot-schedule transition may observe 503s during the drain window; "
@@ -541,6 +545,20 @@ def build_report(
     return "\n".join(lines) + "\n"
 
 
+def _fmt_window(priority_window: object) -> str:
+    """``HH:MM–HH:MM`` rendering of a priority window (with a wrap marker)."""
+    start = float(getattr(priority_window, "start_minutes", 0))
+    end = float(getattr(priority_window, "end_minutes", 0))
+    wraps = bool(getattr(priority_window, "wraps", False))
+
+    def _hhmm(minutes: float) -> str:
+        total = int(minutes) % (24 * 60)
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    suffix = " (wraps past midnight)" if wraps else ""
+    return f"{_hhmm(start)}–{_hhmm(end)}{suffix}"
+
+
 def _append_mode_timeline_section(
     ap: callable, summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None
 ) -> None:
@@ -557,9 +575,15 @@ def _append_mode_timeline_section(
 
     Source values display consistently as the canonical ``scheduler`` /
     ``worker`` / ``api`` / ``manual`` labels (LP-0MVC144KS001PDR4).
+
+    When the window's fast/cheap profile came from the configured
+    ``server.priority_window`` rather than a reconstructed mode schedule (the
+    mode timeline is retired in the unified config), a note naming that source
+    is rendered so the attribution is auditable (LP-0MVKSXXIR006OBI2 AC3).
     """
     transitions = mode_map.transitions if mode_map else []
     restarts = summary.restart_events_sorted
+    priority_window = getattr(mode_map, "priority_window", None)
 
     # Merge mode transitions and restart events into a single timeline.
     # (timestamp, event_type, mode_or_kind, source, actor, reason)
@@ -578,12 +602,35 @@ def _append_mode_timeline_section(
         timeline.append((ev.ts, "restart", kind, ev.source, ev.actor, ev.reason))
 
     timeline.sort(key=lambda x: x[0])
-    if not timeline:
+    if not timeline and priority_window is None:
         return
 
     ap("")
     ap("## Priority window timeline & restarts")
     ap("")
+    if priority_window is not None and not transitions:
+        # AC3: name the attribution source explicitly.
+        ap(
+            "Mode schedule: **retired** — no `Mode scheduler` transition lines "
+            "were found in this window, so fast/cheap attribution is derived from "
+            f"the configured `{priority_window.source}` "
+            f"({_fmt_window(priority_window)}, local time): traffic inside the "
+            "window is bucketed **cheap** (low priority), traffic outside it "
+            "**fast**. The window is the only cheap-mode signal in the unified "
+            "config (LP-0MVDT94F0003VHUA)."
+        )
+        ap("")
+    elif priority_window is not None and transitions:
+        ap(
+            "Mode schedule: **active for this window** — the logs carry "
+            "`Mode scheduler` / `Grandfathering` evidence, so fast/cheap "
+            "attribution follows the reconstructed mode timeline and the "
+            f"configured `{priority_window.source}` "
+            f"({_fmt_window(priority_window)}) is not applied."
+        )
+        ap("")
+    if not timeline:
+        return
     ap(
         "Each line shows the timestamp, event type, and attribution "
         "(source / actor / reason) when available. Restart rows also show the "
@@ -1722,13 +1769,11 @@ def _bucket_profile(
     Covers sessions, requests, local/remote split, classification counts,
     context sizes, dispatch denials, and per-reason counters. Events without a
     session (fallbacks, routing skips, dispatch denials) are bucketed by their
-    own timestamp (mode-aware when the logs show mode transitions,
-    LP-0MSPZUD4G007IYGH).
+    own timestamp using :func:`bucketing.bucket_label` (mode timeline, else the
+    configured priority window, else the slot schedule; LP-0MVKSXXIR006OBI2).
     """
     def _label_at(ts: datetime) -> str:
-        if mode_map is not None and mode_map.transitions:
-            return mode_map.period_for(ts).label
-        return schedule.period_for(ts).label if schedule.periods else "fast"
+        return bucketing.bucket_label(ts, schedule, mode_map)
 
     buckets = {
         "fast": {
@@ -1803,8 +1848,10 @@ def run_analysis(
     switches, LP-0MT1EE315007AKXG), and each session is bucketed by the
     profile active at its start. ``mode_map``
     may be passed explicitly (tests); otherwise it is built from the
-    discovered config profiles (``config-fast.yaml`` / ``config-cheap.yaml``)
-    and the persisted ``proxy/.mode``.
+    discovered config profiles. When the logs carry no mode transitions the
+    configured ``server.priority_window`` supplies the fast/cheap schedule
+    (LP-0MVKSXXIR006OBI2), and only a window with neither signal falls back to
+    the legacy slot-schedule attribution.
     """
     log_dir = Path(log_dir)
     output_dir = Path(output_dir)
@@ -1820,6 +1867,7 @@ def run_analysis(
             configs["profiles"],
             configs["analysis_mode"],
             (config or {}).get("session_slot_pool_size"),
+            priority_window=bucketing.PriorityWindow.from_config(config),
         )
     schedule = bucketing.schedule_from_config(config, (config or {}).get("session_slot_pool_size"))
 

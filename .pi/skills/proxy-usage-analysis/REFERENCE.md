@@ -20,11 +20,13 @@ limitations. The skill itself is a thin, CLI-focused wrapper — see
   Prompt eval speed sections (see [How it works](#how-it-works) step 9).
 - Config (reference only, for slot schedule + thresholds):
   `proxy/config.yaml` in the llm project (auto-discovered by walking up from
-  the current directory, or pass `--config`). When the persisted operating
-  mode axis was removed (LP-0MVDT94F0003VHUA AC4), so the single unified
-  `proxy/config.yaml` is read, and the priority window
-  (`server.priority_window`) drives the standard/low session bucketing
-  and recommendations match the config the running proxy actually uses.
+  the current directory, or pass `--config`). The persisted operating-mode
+  axis was removed (LP-0MVDT94F0003VHUA AC4), so the single unified
+  `proxy/config.yaml` is read, and its `server.priority_window`
+  (`enabled` / `start` / `end`, local time) is the fast/cheap schedule when a
+  window's logs carry no mode-schedule evidence, so the standard/low session
+  bucketing and recommendations match the config the running proxy actually
+  uses (LP-0MVKSXXIR006OBI2).
 
 ## Outputs
 
@@ -135,7 +137,8 @@ Outputs written to:
   counts; the `--json` summary exposes it as `local_busy.prefill_vs_decode`),
   **Time to first
   token** (p10 / median / p90 of dispatch → first-token latency, split into
-  **Total / Fast / Cheap** rows using the same mode-aware session bucketing as
+  **Total / Fast / Cheap** rows using the same three-tier fast/cheap bucketing
+  (mode timeline → `server.priority_window` → slot schedule) as
   the other breakdowns, from local `dispatch_first_byte_ms=` and remote
   `ttft_seconds=` log lines; the `--json` summary exposes the same split under
   `ttft` with `total` / `fast` / `cheap` sub-objects), **Decode speed** and
@@ -352,25 +355,42 @@ entry is a local runtime edit, not a committed artifact.
    unattributed blank (a window with no local traffic prints a named "no
    local traffic" reason). The same split is in the JSON summary at
    `local_busy.prefill_vs_decode`.
-5. **Fast/cheap bucketing** — each session is bucketed by the **operating
-   mode** active at its first in-window stream, reconstructed from the
-   `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
-   plus the manual-switch marker `Grandfathering: enabled; other-mode
-   config ... (current=<mode>)` (a `POST /admin/set-mode` manual switch
-   restarts the proxy and logs the actually-active mode this way, without
-   an applied-scheduled-mode line; LP-0MT1EE315007AKXG) — so a window
-   crossing the 01:00/10:00 mode transitions, or containing a manual
-   switch, splits fast vs cheap correctly even when the analysis itself
-   runs in fast mode. The mode timeline is built with a 48h margin beyond
-   the window (a single streaming pass also serves the busy-time pairing),
-   so the nearest prior transition is always available. The bucket label is
-   the mode name, and the slots / per-period ctx come from that mode's
-   config profile (`config-fast.yaml`: 3 slots @ 131072; `config-cheap.yaml`:
-   2 slots @ 262144) — the CSV `slots`/`ctx_size` columns and the report's
-   per-slot context figures reflect the profile that was actually active.
-   Windows with no mode transition observed (single-mode windows) keep the
-   legacy behavior: bucketing from the slot schedule of the analysis-time
-   config profile; nothing is hardcoded.
+5. **Fast/cheap bucketing** — a session is bucketed by the **profile active
+   at its first in-window stream**, from three sources in precedence order
+   (LP-0MVKSXXIR006OBI2):
+   1. **Mode timeline** (historical windows) — reconstructed from the
+      `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
+      plus the manual-switch marker `Grandfathering: enabled; other-mode
+      config ... (current=<mode>)` (a `POST /admin/set-mode` manual switch
+      restarts the proxy and logs the actually-active mode this way, without
+      an applied-scheduled-mode line; LP-0MT1EE315007AKXG) — so a window
+      crossing the 01:00/10:00 mode transitions, or containing a manual
+      switch, splits fast vs cheap correctly even when the analysis itself
+      runs in fast mode. The mode timeline is built with a 48h margin beyond
+      the window (a single streaming pass also serves the busy-time pairing),
+      so the nearest prior transition is always available. The bucket label is
+      the mode name, and the slots / per-period ctx come from that mode's
+      config profile (`config-fast.yaml`: 3 slots @ 131072; `config-cheap.yaml`:
+      2 slots @ 262144) — the CSV `slots`/`ctx_size` columns and the report's
+      per-slot context figures reflect the profile that was actually active.
+      This source **wins** whenever the logs carry the evidence, so archived
+      windows keep their historical attribution.
+   2. **Priority window** (the current deployment) — the fast/cheap mode
+      schedule was retired (LP-0MVDT94F0003VHUA); cheap semantics now come
+      from `server.priority_window`, which caps every request to `low`
+      priority inside its local-time window. When no mode transitions exist,
+      that window is the fast/cheap schedule: traffic inside it is **cheap**,
+      traffic outside **fast**. `start`/`end` are inclusive/exclusive local
+      times and `start > end` wraps past midnight (e.g. `22:00`–`06:00`,
+      split into two cheap segments); `enabled: false` attributes no cheap
+      time at all. The profile's slots/ctx still come from the unified
+      config, so only the time axis is re-labelled.
+   3. **Slot schedule** (legacy fallback) — bucketing from the analysis-time
+      config's `slot_schedule` entries by slot count; nothing is hardcoded.
+   The report's `## Priority window timeline & restarts` section names which
+   source applied, so the attribution is auditable (a retired mode schedule
+   with a `server.priority_window` source shows the window bounds; a window
+   with mode evidence states that the priority window was not applied).
 6. **Total tokens** — a `## Total tokens` section rendered **immediately before**
    `## Fallback reasons` in every run, including zero-traffic windows (shows
    `0` counts with a `_No tokens in window._` note for the by-model table).
@@ -378,8 +398,9 @@ entry is a local runtime edit, not a committed artifact.
    authoritative `tokens=prompt/completion/total` on `Stream finished` lines
    (never payload truncation), with a top row for Input / Output / Total
    (absolute + % of grand total), a fast vs cheap sub-table (absolute +
-   % of total per bucket; bucketing follows the existing mode-aware fast/cheap
-   logic, unattributed streams excluded or documented), and a by-model
+   % of total per bucket; bucketing follows the same three-tier fast/cheap
+   logic (mode timeline → `server.priority_window` → slot schedule),
+   unattributed streams excluded or documented), and a by-model
    sub-table (one row per `provider/model`, absolute + %, sorted by Total desc;
    unknown provider/model renders as the `(unknown)` placeholder).
 7. **Recommendations** — rule-based heuristics, each citing the data that
@@ -434,10 +455,12 @@ entry is a local runtime edit, not a committed artifact.
    port carried by that file's eval lines (ports announced for other models,
    e.g. `name=mxbai-embed on port N`, are excluded); a file whose port stays
    ambiguous is skipped with a named reason. Samples are bucketed Total /
-   Fast / Cheap via the slot schedule and summarised as median / p90 / p10
-   tok/s. Because llama-server.log lines carry no timestamps, each sample is
-   bucketed by its log file's last-write time (approximate; documented in
-   the report). An empty window is **self-diagnosing**: the section prints
+   Fast / Cheap with the same three-tier fast/cheap attribution as the
+   session tables (mode timeline → `server.priority_window` → slot schedule)
+   and summarised as median / p90 / p10 tok/s. Because llama-server.log lines
+   carry no timestamps, each sample is bucketed by its log file's last-write
+   time (approximate; documented in the report). An empty window is
+   **self-diagnosing**: the section prints
    the log directory scanned, the files scanned, the eval lines matched and
    a named cause — `verbosity/build` (no `eval time` lines in the files at
    all), `rotation` (files outside the window), or `attribution failure`
@@ -516,7 +539,10 @@ entry is a local runtime edit, not a committed artifact.
   fast% + cheap% = 100% and model %s sum to 100%. A large Input / Output
   disparity can reveal long-prompt sessions driving capacity pressure.
 - **Fast vs cheap**: a large fallback-rate gap between buckets suggests the
-  slot schedule under-serves one period.
+  profile under-serves one period. Read the `## Priority window timeline &
+  restarts` note first: it states whether the split came from the mode
+  timeline (historical logs), the configured `server.priority_window` (the
+  current cheap window), or the legacy slot schedule.
 - **Error analysis** (see the **Error analysis** section and `errors.csv`):
   the taxonomy table counts each error type; the **Provider/model breakdown**
   table splits each type by provider and model (e.g. a spike of
@@ -629,8 +655,12 @@ entry is a local runtime edit, not a committed artifact.
   marker (manual switches, LP-0MT1EE315007AKXG) within a 48h margin of the
   window; sessions starting before the earliest observed transition in the
   available logs fall back to the analysis-time mode (documented in
-  LP-0MSPZUD4G007IYGH). A window entirely inside one mode (no transition
-  observed) keeps the legacy slot-schedule bucketing.
+  LP-0MSPZUD4G007IYGH). A window with no mode evidence buckets from the
+  configured `server.priority_window` (local time, wrap-aware, `enabled:
+  false` disables it; LP-0MVKSXXIR006OBI2) — the retired mode schedule's
+  replacement — and only a window with neither signal keeps the legacy
+  slot-schedule bucketing. The report's `## Priority window timeline &
+  restarts` section states which of the three sources was used.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events
   across the analysis's effective margin (48h, see `MODE_TIMELINE_MARGIN`)
   and clips streams to the window; a stream that started more than

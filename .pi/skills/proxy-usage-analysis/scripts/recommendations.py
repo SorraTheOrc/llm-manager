@@ -105,7 +105,8 @@ def _reason_counts_by_bucket(
 
     Mirrors ``_combined_reason_counts``: per-session reasons are bucketed by
     the session's bucket, global fallback events by their own timestamp
-    (mode-aware when the logs show mode transitions, LP-0MSPZUD4G007IYGH).
+    (:func:`bucketing.bucket_label` — mode timeline, else the configured
+    priority window, else the slot schedule).
     """
     buckets: dict[str, Counter] = {"fast": Counter(), "cheap": Counter()}
     for s in result.sessions.values():
@@ -113,12 +114,7 @@ def _reason_counts_by_bucket(
             buckets[_bucket_key(s.bucket)][s.fallback_reason] += 1
     for ev in result.fallback_events:
         if ev.reason:
-            if mode_map is not None and mode_map.transitions:
-                label = mode_map.period_for(ev.ts).label
-            elif schedule.periods:
-                label = schedule.period_for(ev.ts).label
-            else:
-                label = "fast"
+            label = bucketing.bucket_label(ev.ts, schedule, mode_map)
             buckets[_bucket_key(label)][ev.reason] += 1
     return buckets
 

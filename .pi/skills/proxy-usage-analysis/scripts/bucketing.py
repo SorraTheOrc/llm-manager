@@ -1,25 +1,35 @@
-"""Fast/cheap session bucketing derived from the proxy slot schedule.
+"""Fast/cheap session bucketing derived from the proxy configuration.
 
-The proxy's ``slot_schedule`` (in the active config profile,
-``proxy/config-fast.yaml`` or ``proxy/config-cheap.yaml``) defines
-transition times and the number of GPU slots active from that time until the
-next transition (midnight wrapping). This module turns those entries into
-contiguous day periods and labels them "fast" (fewer slots) vs "cheap" (more
-slots), so the analysis does not hardcode the split.
+Three attribution sources feed the fast/cheap split, in precedence order
+(LP-0MVKSXXIR006OBI2):
+
+1. **Mode timeline** (historical) — ``Mode scheduler: applied scheduled mode
+   <mode>`` / ``Grandfathering: ... (current=<mode>)`` log lines reconstruct
+   the operating mode active at any timestamp, and that mode names the bucket
+   (:class:`ModeScheduleMap`). Retired in the unified config, but archived
+   windows still carry the evidence, so it always wins when present.
+2. **Priority window** — the unified ``proxy/config.yaml`` routes cheap
+   semantics through ``server.priority_window`` (local time, midnight
+   wrapping): every request inside the window is capped to ``low`` priority.
+   When the logs show no mode transitions, the window's time-of-day bounds
+   are the fast/cheap schedule (:class:`PriorityWindow`).
+3. **Slot schedule** — the legacy fallback: the config's ``slot_schedule``
+   entries, labelled by slot count (fewest slots = "fast", most = "cheap").
 
 Terminology note (LP-0MSLMYEEU002IBH6): the operating modes are **fast**
-(cloud-backed; the old "day" period) and **cheap** (1-slot local pool,
-same models as fast, LP-0MSMIPPJI007GU9N; the old "night" period). The
-slot-count -> label mapping is unchanged: the period(s)
-with the fewest slots are labelled "fast", the period(s) with the most
-"cheap"; equal counts collapse to a single "fast" bucket.
+(cloud-backed; the old "day" period) and **cheap** (local, low priority; the
+old "night" period; the 1-slot local pool, same models as fast,
+LP-0MSMIPPJI007GU9N). The slot-count → label mapping of the legacy path is
+unchanged: the period(s) with the fewest slots are labelled "fast", the
+period(s) with the most "cheap"; equal counts collapse to a single "fast"
+bucket.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 @dataclass(order=True)
@@ -43,6 +53,104 @@ MINUTES_PER_DAY = 24 * 60
 def minute_of_day(dt: datetime) -> float:
     """Fractional minutes from midnight (seconds contribute a fraction)."""
     return dt.hour * 60 + dt.minute + dt.second / 60.0
+
+
+def parse_window_minutes(value: object, default: float) -> float:
+    """Parse a ``"HH:MM"`` clock bound to minutes from midnight.
+
+    Local time, matching ``proxy/proxy/priority.py::in_cheap_window`` (no UTC
+    conversion). Invalid/missing values fall back to ``default``.
+    """
+    try:
+        hh, mm = str(value).strip().split(":")[:2]
+        hours, minutes = int(hh), int(mm)
+    except (ValueError, AttributeError, TypeError):
+        return float(default)
+    if not (0 <= hours < 24 and 0 <= minutes < 60):
+        return float(default)
+    return float(hours * 60 + minutes)
+
+
+PRIORITY_WINDOW_SOURCE = "server.priority_window"
+
+
+@dataclass(frozen=True)
+class PriorityWindow:
+    """The proxy's ``server.priority_window`` cheap window (local time).
+
+    Inside the window the unified config routes every request as ``low``
+    priority (LP-0MVDT94F0003VHUA AC1); outside it requests keep their own
+    priority. For historical bucketing that makes the window the fast/cheap
+    schedule: inside = cheap, outside = fast. ``start_minutes`` is inclusive,
+    ``end_minutes`` exclusive, and ``end <= start`` wraps past midnight.
+    """
+
+    start_minutes: float
+    end_minutes: float
+    source: str = PRIORITY_WINDOW_SOURCE
+
+    @property
+    def wraps(self) -> bool:
+        return self.end_minutes <= self.start_minutes
+
+    def contains(self, minutes: float) -> bool:
+        if self.start_minutes == self.end_minutes:
+            return False  # zero-length window is never cheap
+        if self.wraps:
+            return minutes >= self.start_minutes or minutes < self.end_minutes
+        return self.start_minutes <= minutes < self.end_minutes
+
+    def segments(self) -> list[tuple[float, float, str]]:
+        """``(start, end, label)`` segments covering the whole day.
+
+        A midnight-wrapping window is split into two cheap segments plus the
+        intervening fast segment so every returned segment is non-wrapping
+        (``SlotPeriod.contains`` then never needs the wrap branch).
+        """
+        start, end = self.start_minutes, self.end_minutes
+        if start == end:
+            return [(0.0, float(MINUTES_PER_DAY), "fast")]
+        if not self.wraps:
+            out: list[tuple[float, float, str]] = []
+            if start > 0:
+                out.append((0.0, start, "fast"))
+            out.append((start, end, "cheap"))
+            if end < MINUTES_PER_DAY:
+                out.append((end, float(MINUTES_PER_DAY), "fast"))
+            return out
+        out = []
+        if end > 0:
+            out.append((0.0, end, "cheap"))
+        out.append((end, start, "fast"))
+        if start < MINUTES_PER_DAY:
+            out.append((start, float(MINUTES_PER_DAY), "cheap"))
+        return out
+
+    @classmethod
+    def from_config(cls, config: dict | None) -> PriorityWindow | None:
+        """Build from a parsed config's ``priority_window`` block.
+
+        Accepts both the canonical normalised form produced by
+        ``config_loader`` (``start_minutes``/``end_minutes``) and a raw
+        ``{"enabled": bool, "start": "HH:MM", "end": "HH:MM"}`` block.
+        Returns ``None`` when the window is absent or disabled, so the caller
+        falls through to the legacy slot-schedule attribution (AC4).
+        """
+        if not isinstance(config, dict):
+            return None
+        window = config.get("priority_window")
+        if not isinstance(window, dict):
+            return None
+        enabled = window.get("enabled", True)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() in ("true", "yes", "1")
+        if not enabled:
+            return None
+        start = window.get("start_minutes")
+        end = window.get("end_minutes")
+        start_m = float(start) if start is not None else parse_window_minutes(window.get("start"), 60)
+        end_m = float(end) if end is not None else parse_window_minutes(window.get("end"), 600)
+        return cls(start_minutes=start_m, end_minutes=end_m)
 
 
 @dataclass
@@ -203,6 +311,10 @@ class ModeScheduleMap:
     ctx_sizes: dict[str, int | None]
     default_mode: str
     transitions: list[ModeTransition] = field(default_factory=list)
+    # Cheap window from the unified config (LP-0MVKSXXIR006OBI2). ``None``
+    # when the priority window is absent or disabled, which keeps the legacy
+    # slot-schedule attribution for historical windows.
+    priority_window: PriorityWindow | None = field(default=None)
 
     @classmethod
     def from_profiles(
@@ -210,6 +322,7 @@ class ModeScheduleMap:
         profiles: dict[str, dict | None],
         analysis_mode: str | None,
         default_slots: int | None,
+        priority_window: PriorityWindow | None = None,
     ) -> ModeScheduleMap:
         """Build the per-mode schedules from the parsed config profiles.
 
@@ -237,6 +350,7 @@ class ModeScheduleMap:
             ctx_sizes=ctx_sizes,
             default_mode=analysis_mode or "fast",
             transitions=[],
+            priority_window=priority_window,
         )
 
     def schedule_for_mode(self, mode: str) -> SlotSchedule:
@@ -261,6 +375,52 @@ class ModeScheduleMap:
             if ts <= dt:
                 return mode
         return self.default_mode
+
+    @property
+    def profile_source(self) -> str | None:
+        """Which source attributes fast/cheap for this window.
+
+        ``"mode_schedule"`` when the logs carried mode-timeline evidence
+        (historical windows), ``"priority_window"`` when the configured
+        ``server.priority_window`` supplies the schedule, ``None`` when
+        neither applies (legacy slot-schedule attribution).
+        """
+        if self.transitions:
+            return "mode_schedule"
+        if self.priority_window is not None:
+            return PRIORITY_WINDOW_SOURCE
+        return None
+
+    def priority_periods(self) -> list[SlotPeriod]:
+        """Fast/cheap periods derived from ``server.priority_window``.
+
+        Slots / per-period ctx come from the default mode's slot schedule at
+        the period's midpoint: the unified config has one profile, so the
+        priority window only re-labels the time axis (cheap inside the
+        window), it does not change the resource figures. Empty when no
+        window is configured (or it is disabled).
+        """
+        window = self.priority_window
+        if window is None:
+            return []
+        template = self.schedule_for_mode(self.default_mode)
+        reference_day = datetime(2000, 1, 1)
+        periods: list[SlotPeriod] = []
+        for start, end, label in window.segments():
+            midpoint = reference_day + timedelta(minutes=(start + end) / 2.0)
+            base = template.period_for(midpoint)
+            periods.append(
+                SlotPeriod(start, end, base.slots, label, ctx_size=base.ctx_size)
+            )
+        return periods
+
+    def priority_period_for(self, dt: datetime) -> SlotPeriod | None:
+        """The priority-window period containing ``dt`` (``None`` if no window)."""
+        minutes = minute_of_day(dt)
+        for period in self.priority_periods():
+            if period.contains(minutes):
+                return period
+        return None
 
     def period_for(self, dt: datetime) -> SlotPeriod:
         """Return the slot period of the mode active at ``dt``, labelled with
@@ -291,3 +451,46 @@ class ModeScheduleMap:
                     seen.add(key)
                     out.append(p)
         return out
+
+
+def bucket_periods(
+    schedule: SlotSchedule | None, mode_map: ModeScheduleMap | None
+) -> list[SlotPeriod]:
+    """Period boundary candidates for fast/cheap attribution.
+
+    Precedence (LP-0MVKSXXIR006OBI2): mode timeline when the logs show mode
+    transitions, then the configured priority window, then the legacy
+    slot-schedule periods.
+    """
+    if mode_map is not None:
+        if mode_map.transitions:
+            return mode_map.all_periods
+        priority = mode_map.priority_periods()
+        if priority:
+            return priority
+    if schedule is not None and schedule.periods:
+        return schedule.periods
+    return []
+
+
+def bucket_period(
+    dt: datetime, schedule: SlotSchedule | None, mode_map: ModeScheduleMap | None
+) -> SlotPeriod | None:
+    """The fast/cheap period covering ``dt`` (``None`` when nothing applies)."""
+    if mode_map is not None:
+        if mode_map.transitions:
+            return mode_map.period_for(dt)
+        priority = mode_map.priority_period_for(dt)
+        if priority is not None:
+            return priority
+    if schedule is not None and schedule.periods:
+        return schedule.period_for(dt)
+    return None
+
+
+def bucket_label(
+    dt: datetime, schedule: SlotSchedule | None, mode_map: ModeScheduleMap | None
+) -> str:
+    """The fast/cheap label for ``dt`` (``"fast"`` when nothing applies)."""
+    period = bucket_period(dt, schedule, mode_map)
+    return period.label if period is not None else "fast"

@@ -6,11 +6,12 @@ description: "Generate the proxy usage report from the last 24 hours of llama-pr
 # Proxy Usage Analysis
 
 Turn the last 24 hours of llama-proxy session and fallback activity into a
-per-session CSV record (split into fast / cheap buckets per the slot
-schedule) and an operator-facing Markdown report with highlighted,
-data-backed recommendations — including an **error taxonomy** and a
-deterministic **root-cause breakdown** for any proxy errors observed in the
-window.
+per-session CSV record (split into fast / cheap buckets — from the mode
+timeline when the logs carry it, otherwise from the configured
+`server.priority_window`, otherwise the slot schedule) and an operator-facing
+Markdown report with highlighted, data-backed recommendations — including an
+**error taxonomy** and a deterministic **root-cause breakdown** for any proxy
+errors observed in the window.
 
 The pipeline is fully deterministic: every report section is produced by
 rule-based Python, not an LLM. The skill is a thin, CLI-focused wrapper
@@ -87,7 +88,9 @@ Run the full suite via the test skill (canonical, cached pipeline):
 ```
 
 The suite covers log-line parsing, session aggregation, fallback attribution,
-fast/cheap bucketing, recommendation rules, llama-server eval-timing parsing
+fast/cheap bucketing (mode timeline → `server.priority_window` → slot
+schedule, including window parsing, midnight wrapping and disabling),
+recommendation rules, llama-server eval-timing parsing
 (decode + prompt eval, Qwen3 port filtering, fast/cheap speed stats), and an
 end-to-end run, using fixtures copied from real `/var/log/llama-proxy`
 lines (`proxy.log` and `llama-server.log`).
