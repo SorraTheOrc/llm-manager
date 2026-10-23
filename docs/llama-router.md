@@ -423,3 +423,35 @@ join. The leased-but-not-yet-generating wait is observable as the
   legacy fallback to `local_max_concurrent_queries` has been removed in
   favour of `session_slot_pool_size` as the single-source limit
   (LP-0MTCZ35X7009IZKE).
+
+## Prefill-deadline recovery (LP-0MVKN9IRP003XJH6)
+
+A local dispatch that has produced no first byte by
+`local_prefill_deadline_seconds` (default 90 s) is cancelled and the chain
+detours to the next provider (`prefill_deadline_exceeded`). The same event now
+also:
+
+- releases the dispatch record **and** the session's `local_prefill_in_flight`
+  marker inline (`lease_released ... reason=prefill_deadline`) — before the fix
+  the record was retained with a future `expires_at` and the wedged session
+  re-dispatching the identical prompt held the local pool ~4 h on 2026-10-23;
+- arms a per-session cooldown (`local_prefill_thrash_cooldown_seconds`, default
+  600 s), during which that session's local routing skips with
+  `reason=prefill_thrash_cooldown` and other sessions are unaffected;
+- once the admission guard is calibrated for a (model, context bucket), refuses
+  local up front when the projected first-byte ETA is `>= local_prefill_
+  deadline_seconds` (`reason=prefill_eta_exceeds_deadline`), pricing prompts
+  >= 32k tokens at `local_admission_guard_eta_percentile` (default p75).
+
+Non-streaming dispatches receive response headers before the prefill finishes,
+so the deadline's first-byte wait does not bound them; the no-progress watchdog
+(`local_dispatch_no_progress_timeout_seconds`, default 180 s) is the bound that
+releases those, and `local_dispatch_max_prefill_seconds` (900 s) remains the
+lifetime ceiling.
+
+Live verification (2026-10-23, post-deploy): deadline → lease release 0 s,
+non-streaming stall → 189 s, zero `reason=local_lease_active` fallbacks in the
+post-fix window, and cooldown-throttled retries instead of the incident's 41
+local POSTs. Evidence, reproduction commands, and the outstanding 24 h sample:
+[docs/dev/prefill-recovery-verification.md](dev/prefill-recovery-verification.md);
+measurement tool: `scripts/prefill_recovery_verification.py`.
