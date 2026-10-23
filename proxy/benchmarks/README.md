@@ -206,6 +206,42 @@ python -m proxy.benchmarks.slot_benchmark --slots 3 \
     --concurrency 3 --prompt-tokens 2000
 ```
 
+### slot_benchmark.py quiet-window preflight (run this first)
+
+The slot sweep restarts llama-server between slot counts, so it must only run
+when no other session holds a local lease. A failed 2026-10-20 attempt ran the
+sweep while five concurrent sessions were using the local backend and every
+benchmark request stalled (LP-0MVGPEP3O000RKKD). Gate the host first
+("scripts/slot_sweep_preflight.py", LP-0MVK0969J004MTG3):
+
+```bash
+# Fail-closed: exits 0 only when the host is quiet, else lists the failing clauses.
+python3 scripts/slot_sweep_preflight.py --json
+# Tighten the required idle window (default 120 s) if desired:
+python3 scripts/slot_sweep_preflight.py --json --min-idle-seconds 300
+```
+
+The gate reads the existing `GET /llama/local/status` endpoint and requires:
+`llama_server_running == true`, `local_owner_session_id` null, every slot
+`lease_state == "free"` and `is_processing == false` (an `idle_leased` slot is
+**not** free even when `available_slots` still counts it),
+`available_slots == total_slots`, `local_idle_seconds >= --min-idle-seconds`,
+and fresh per-slot detail (`slots_stale` not true). Exit codes: 0 = quiet,
+1 = not quiet, 2 = status endpoint unreachable/non-200/unparsable.
+
+Validate the sweep command forms without touching the config first
+(`--dry-run` prints the resolved slot-count list and never writes
+`proxy/config.yaml`):
+
+```bash
+# The 1/2/3 sweep minus N=1 (already measured) -> runs 2 and 3:
+python -m proxy.benchmarks.slot_benchmark --sweep --resume 2 \
+    --concurrency 3 --prompt-tokens 2000 --dry-run
+# N=4 (memory permitting) -> runs 4:
+python -m proxy.benchmarks.slot_benchmark --slots 4 \
+    --concurrency 3 --prompt-tokens 2000 --dry-run
+```
+
 ### slot_benchmark.py contention metrics
 
 The harness reports the contention metrics the 1/2/3-slot verdict depends

@@ -1761,6 +1761,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_slot_counts(args: argparse.Namespace) -> list[int]:
+    """Resolve the ordered slot counts a run will execute.
+
+    ``--sweep`` runs ``SWEEP_SLOT_COUNTS``, ``--slots N`` a single count, and
+    ``--resume`` filters the sweep list to counts >= the resume point. An empty
+    list after filtering is a fatal configuration error (preserving the
+    historical inline behaviour). Shared by the live run and the ``--dry-run``
+    run-list printout.
+    """
+    if args.sweep:
+        slot_counts = SWEEP_SLOT_COUNTS.copy()
+    else:
+        slot_counts = SLOT_COUNTS.copy()
+    if args.slots is not None:
+        slot_counts = [args.slots]
+    if args.resume:
+        slot_counts = [s for s in slot_counts if s >= args.resume]
+        if not slot_counts:
+            print(f"No slot counts >= {args.resume} in {SLOT_COUNTS}")
+            sys.exit(1)
+    return slot_counts
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
@@ -1798,6 +1821,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Concurrency: {args.concurrency} concurrent requests")
 
     if args.dry_run:
+        # Print the resolved run list so a dry run proves *which* slot counts
+        # (and in which order) the real invocation would execute — e.g.
+        # ``--sweep --resume 2`` must show 2, 3 and no N=1
+        # (LP-0MVK0969J004MTG3 AC4).
+        if not args.test:
+            planned = resolve_slot_counts(args)
+            print(f"  Slot counts: {', '.join(str(s) for s in planned)}")
         print("\nDry run — config looks valid. Run without --dry-run to execute.")
         return
 
@@ -1813,17 +1843,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     # Determine slot counts to run
-    if args.sweep:
-        slot_counts = SWEEP_SLOT_COUNTS.copy()
-    else:
-        slot_counts = SLOT_COUNTS.copy()
-    if args.slots is not None:
-        slot_counts = [args.slots]
-    if args.resume:
-        slot_counts = [s for s in slot_counts if s >= args.resume]
-        if not slot_counts:
-            print(f"No slot counts >= {args.resume} in {SLOT_COUNTS}")
-            sys.exit(1)
+    slot_counts = resolve_slot_counts(args)
 
     # Snapshot the ORIGINAL slot count + full config so the sweep restores
     # exactly what it found (production value here is 1, not the historical 6;
