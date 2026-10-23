@@ -39,6 +39,41 @@ from log_parser import (
     pair_ttft_to_streams,
 )
 
+# Hourly local-availability states (LP-0MVKUKG3F0035I85): each hour's state is
+# derived **only from timestamped proxy-log evidence** (llama-server eval-timing
+# lines carry no per-line timestamps and cannot be attributed to an hour
+# deterministically — documented in REFERENCE.md "Limitations"). The four
+# states distinguish a wedged gate (lease held by a prefill that never decodes)
+# from a genuinely idle GPU, which busy-% alone cannot: busy is computed only
+# from paired ``Stream started``/``Stream finished`` events, so an outage where
+# work never yields a first byte renders as 0.0% idle.
+AVAILABILITY_SERVING = "serving"
+AVAILABILITY_PREFILL_ONLY_NO_DECODE = "prefill-only-no-decode"
+AVAILABILITY_LEASE_BLOCKED = "lease-blocked"
+AVAILABILITY_IDLE = "idle"
+# Canonical display order for multi-state hours (serving/prefill are derived
+# from decode/dispatch evidence; lease-blocked from refusal evidence).
+AVAILABILITY_ORDER = (
+    AVAILABILITY_SERVING,
+    AVAILABILITY_PREFILL_ONLY_NO_DECODE,
+    AVAILABILITY_LEASE_BLOCKED,
+)
+# Proxy ``reason=`` value that marks a local-lease refusal.
+LEASE_ACTIVE_REASON = "local_lease_active"
+
+# Extra per-hour counters feeding the availability classification, layered on
+# the LP-0MTYAZFGN003BYQS counters: ``local_dispatch_attempts`` (every
+# ``[local] POST`` to llama-server, including attempts that never stream),
+# ``local_denials`` (``local_dispatch_denied`` refusals) and
+# ``lease_active_fallbacks`` (``Fallback triggered`` /
+# ``contention_queue_fallback_after_queue`` with ``reason=local_lease_active``).
+AVAILABILITY_COUNTERS = (
+    "local_dispatch_attempts",
+    "local_served",
+    "local_denials",
+    "lease_active_fallbacks",
+)
+
 UNKNOWN_LABEL = "(unknown)"
 
 # Unit of the slot-seconds figures on :class:`SlotSecondsStats` (and its
@@ -1283,6 +1318,101 @@ def compaction_impact(
     }
 
 
+@dataclass(frozen=True)
+class HourAvailability:
+    """One hour's local-model availability classification
+    (LP-0MVKUKG3F0035I85).
+
+    ``states`` is a **non-exclusive, canonically ordered** tuple of
+    :data:`AVAILABILITY_ORDER` members (or ``(AVAILABILITY_IDLE,)``): a wedged
+    hour is simultaneously ``prefill-only-no-decode`` (dispatch attempts with
+    no completed local stream) and ``lease-blocked`` (demand refused by the
+    foreign lease), and a busy hour can be ``serving`` while still refusing
+    other sessions. ``label`` is the render/JSON form: ``+``-joined states.
+
+    The counters are the raw evidence, kept so the classification is
+    auditable from the report and the ``--json`` summary.
+    """
+
+    hour: datetime
+    states: tuple[str, ...]
+    local_dispatch_attempts: int = 0
+    local_served: int = 0
+    local_denials: int = 0
+    lease_active_fallbacks: int = 0
+
+    @property
+    def label(self) -> str:
+        return "+".join(self.states)
+
+    @property
+    def is_idle(self) -> bool:
+        return self.states == (AVAILABILITY_IDLE,)
+
+
+def classify_hour(
+    hour: datetime,
+    *,
+    local_dispatch_attempts: int = 0,
+    local_served: int = 0,
+    local_denials: int = 0,
+    lease_active_fallbacks: int = 0,
+) -> HourAvailability:
+    """Classify one hour from timestamped proxy-log evidence.
+
+    Deterministic and priority-free (states accumulate instead of competing):
+
+    - ``serving`` — at least one local ``Stream finished``: decode happened.
+    - ``prefill-only-no-decode`` — local dispatch was attempted
+      (``[local] POST`` to llama-server) but no local stream completed, i.e.
+      prompt work with no decode. Suppressed when ``serving`` — a completed
+      stream already proves decode.
+    - ``lease-blocked`` — local demand was refused because another session
+      held the dispatch lease (``local_dispatch_denied`` or a
+      ``reason=local_lease_active`` fallback).
+    - ``idle`` — no dispatch attempt, no refusal and no completed local
+      stream: genuinely no local demand (never a false positive for a wedged
+      or refused hour).
+
+    Only the log evidence decides; nothing is inferred from wall-clock level
+    or from the absence of config. Prefill evidence comes from the proxy's own
+    dispatch-attempt marker because llama-server eval lines carry no
+    timestamps (see ``REFERENCE.md`` → Limitations).
+    """
+    present: set[str] = set()
+    if local_served > 0:
+        present.add(AVAILABILITY_SERVING)
+    elif local_dispatch_attempts > 0:
+        present.add(AVAILABILITY_PREFILL_ONLY_NO_DECODE)
+    if local_denials > 0 or lease_active_fallbacks > 0:
+        present.add(AVAILABILITY_LEASE_BLOCKED)
+    # Canonical order (:data:`AVAILABILITY_ORDER`), independent of the
+    # accumulation order above.
+    states = tuple(s for s in AVAILABILITY_ORDER if s in present)
+    if not states:
+        states = (AVAILABILITY_IDLE,)
+    return HourAvailability(
+        hour=hour,
+        states=tuple(states),
+        local_dispatch_attempts=local_dispatch_attempts,
+        local_served=local_served,
+        local_denials=local_denials,
+        lease_active_fallbacks=lease_active_fallbacks,
+    )
+
+
+def hour_availability(hour: datetime, counts: Counter) -> HourAvailability:
+    """Classify one hourly-activity counter bucket
+    (``AnalysisResult.hourly_activity``)."""
+    return classify_hour(
+        hour,
+        local_dispatch_attempts=counts.get("local_dispatch_attempts", 0),
+        local_served=counts.get("local_served", 0),
+        local_denials=counts.get("local_denials", 0),
+        lease_active_fallbacks=counts.get("lease_active_fallbacks", 0),
+    )
+
+
 def aggregate(
     events: Iterable[LogEvent],
     window_start: datetime,
@@ -1394,8 +1524,23 @@ def aggregate(
                 counts["local_attempts"] += 1
         elif ev.kind == "stream_finished" and ev.provider == LOCAL_PROVIDER:
             hourly_activity.setdefault(hour_key, Counter())["local_served"] += 1
+        elif ev.kind == "local_dispatch":
+            # A ``[local] POST`` dispatch attempt (LP-0MVKUKG3F0035I85): counted
+            # regardless of whether the attempt ever produced a first byte or a
+            # ``Stream finished``, so wedged/prefill-only hours stay visible.
+            hourly_activity.setdefault(hour_key, Counter())["local_dispatch_attempts"] += 1
+        elif ev.kind == "dispatch_denied":
+            hourly_activity.setdefault(hour_key, Counter())["local_denials"] += 1
         elif ev.kind == "fallback":
-            hourly_activity.setdefault(hour_key, Counter())["fallbacks"] += 1
+            counts = hourly_activity.setdefault(hour_key, Counter())
+            counts["fallbacks"] += 1
+            if ev.reason == LEASE_ACTIVE_REASON:
+                counts["lease_active_fallbacks"] += 1
+        elif ev.kind == "contention_fallback_after_queue" and ev.reason == LEASE_ACTIVE_REASON:
+            # Contention-queue fallback refused by the local lease
+            # (``queued_duration=60s reason=local_lease_active``), a second
+            # ``local_lease_active`` refusal shape (LP-0MVKUKG3F0035I85).
+            hourly_activity.setdefault(hour_key, Counter())["lease_active_fallbacks"] += 1
         elif ev.kind == "routing_skip":
             # Demand counter for genuine skips only: a ``chain_hold_cycle > 0``
             # event is a hold-cycle re-emission, not new client demand
@@ -1410,6 +1555,12 @@ def aggregate(
             "upstream_http_error",
         ):
             error_events.append(ev)
+            continue
+        if ev.kind == "local_dispatch":
+            # Dispatch-attempt marker: consumed by the hourly counter above;
+            # nothing else aggregates it (no session is attributed to these
+            # lines — the echoed request body may itself contain ``session=``
+            # text, which is why the parser extracts no fields).
             continue
         if ev.kind == "fallback":
             fallback_events.append(ev)

@@ -2649,13 +2649,13 @@ class TestBusyStats:
         assert md.index("## Summary by hour") < md.index("## Session summary")
         # AC2/AC1: window-bounded rows with a % column; idle middle hour
         # listed; activity columns replace the classification columns.
-        assert "| Hour | Busy | % | Requests started | Local attempts | Local served | Fallbacks | Local-skip |" in section
-        assert "| 09:30-10:00 | 30s | 1.7% | 1 | 1 | 1 | 0 | 0 |" in section
-        assert "| 10:00-11:00 | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 |" in section
-        assert "| 11:00-11:45 | 15s | 0.6% | 1 | 1 | 1 | 0 | 0 |" in section
+        assert "| Hour | State | Busy | % | Requests started | Local attempts | Local served | Local dispatch | Lease denials | Fallbacks | Local-skip |" in section
+        assert "| 09:30-10:00 | serving | 30s | 1.7% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | idle | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| 11:00-11:45 | serving | 15s | 0.6% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
         # AC3: totals row = total busy over the window and overall busy % plus
         # the sum of each activity column over the window.
-        assert "| Totals | 45s | 0.6% | 2 | 2 | 2 | 0 | 0 |" in section
+        assert "| Totals | serving | 45s | 0.6% | 2 | 2 | 2 | 0 | 0 | 0 | 0 |" in section
         # The Local model utilization section no longer hosts the hourly table.
         util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
         assert "| Hour | Busy |" not in util
@@ -3611,11 +3611,11 @@ class TestSummaryByHourActivity:
         # window-bounded bucket duration.
         md = reporting.build_report(self._summary(), None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| Hour | Busy | % | Requests started | Local attempts | Local served | Fallbacks | Local-skip |" in section
-        assert "| 09:00-10:00 | 30s | 0.8% | 1 | 1 | 1 | 0 | 0 |" in section
-        assert "| 10:00-11:00 | 5s | 0.1% | 2 | 1 | 1 | 1 | 1 |" in section
-        assert "| 11:00-12:00 | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 |" in section
-        assert "| Totals | 35s | 0.3% | 4 | 2 | 2 | 1 | 1 |" in section
+        assert "| Hour | State | Busy | % | Requests started | Local attempts | Local served | Local dispatch | Lease denials | Fallbacks | Local-skip |" in section
+        assert "| 09:00-10:00 | serving | 30s | 0.8% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | serving | 5s | 0.1% | 2 | 1 | 1 | 0 | 0 | 1 | 1 |" in section
+        assert "| 11:00-12:00 | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| Totals | serving | 35s | 0.3% | 4 | 2 | 2 | 0 | 0 | 1 | 1 |" in section
 
     def test_long_running_session_contributes_to_each_hour(self):
         # A single session whose requests start in different hours: the second
@@ -3633,8 +3633,8 @@ class TestSummaryByHourActivity:
         assert summary.hourly_activity[datetime(2026, 8, 2, 10, 0, 0)]["requests_started"] == 1
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 09:00-10:00 | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 |" in section
-        assert "| 10:00-11:00 | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 |" in section
+        assert "| 09:00-10:00 | serving | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | serving | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
 
     def test_multiple_requests_same_hour_sum_activity(self):
         # Two local requests in hour 10 (s2 + s4): activity columns sum the
@@ -3646,8 +3646,8 @@ class TestSummaryByHourActivity:
         summary = aggregation.aggregate(_events(lines), self.WINDOW_START, self.WINDOW_END, _schedule())
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 10:00-11:00 | 15s | 0.4% | 3 | 2 | 2 | 1 | 1 |" in section
-        assert "| Totals | 45s | 0.4% | 5 | 3 | 3 | 1 | 1 |" in section
+        assert "| 10:00-11:00 | serving | 15s | 0.4% | 3 | 2 | 2 | 0 | 0 | 1 | 1 |" in section
+        assert "| Totals | serving | 45s | 0.4% | 5 | 3 | 3 | 0 | 0 | 1 | 1 |" in section
 
     def test_renders_without_local_traffic(self):
         # No local streams (busy is None): the table still renders at the top
@@ -3663,8 +3663,8 @@ class TestSummaryByHourActivity:
         md = reporting.build_report(summary, None)
         assert md.index("## Summary by hour") < md.index("## Session summary")
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 10:00-11:00 | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 |" in section
-        assert "| Totals | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| Totals | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
         assert "## Local model utilization" not in md
 
     def test_no_sessions_renders_no_data_note(self):
@@ -3673,8 +3673,8 @@ class TestSummaryByHourActivity:
         summary = aggregation.aggregate([], self.WINDOW_START, self.WINDOW_END, _schedule())
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| _No session data in window._ | - | - | - | - | - | - | - |" in section
-        assert "| Totals | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| _No session data in window._ | - | - | - | - | - | - | - | - | - | - |" in section
+        assert "| Totals | idle | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
 
     def test_json_summary_exposes_hourly_activity_and_classification(self):
         # The machine-readable summary exposes per-hour activity (matching the
@@ -3682,12 +3682,18 @@ class TestSummaryByHourActivity:
         # absolute hour and self-describing.
         data = reporting.summary_to_json(self._summary())
         assert data["hourly_activity"] == [
-            {"hour": "2026-08-02 09:00:00", "requests_started": 1, "local_attempts": 1,
-             "local_served": 1, "fallbacks": 0, "local_skip": 0},
-            {"hour": "2026-08-02 10:00:00", "requests_started": 2, "local_attempts": 1,
-             "local_served": 1, "fallbacks": 1, "local_skip": 1},
-            {"hour": "2026-08-02 11:00:00", "requests_started": 1, "local_attempts": 0,
-             "local_served": 0, "fallbacks": 0, "local_skip": 0},
+            {"hour": "2026-08-02 09:00:00", "state": "serving", "states": ["serving"],
+             "requests_started": 1, "local_attempts": 1,
+             "local_served": 1, "local_dispatch_attempts": 0, "local_denials": 0,
+             "lease_active_fallbacks": 0, "fallbacks": 0, "local_skip": 0},
+            {"hour": "2026-08-02 10:00:00", "state": "serving", "states": ["serving"],
+             "requests_started": 2, "local_attempts": 1,
+             "local_served": 1, "local_dispatch_attempts": 0, "local_denials": 0,
+             "lease_active_fallbacks": 0, "fallbacks": 1, "local_skip": 1},
+            {"hour": "2026-08-02 11:00:00", "state": "idle", "states": ["idle"],
+             "requests_started": 1, "local_attempts": 0,
+             "local_served": 0, "local_dispatch_attempts": 0, "local_denials": 0,
+             "lease_active_fallbacks": 0, "fallbacks": 0, "local_skip": 0},
         ]
         assert data["hourly_session_classification"] == [
             {"hour": "2026-08-02 09:00:00", "local_only": 1, "fell_back": 0, "remote_only": 0},
@@ -3859,10 +3865,11 @@ class TestHourlyRollingWindow:
         }
         for hour, busy in expected_busy.items():
             assert hour in rows, f"missing row {hour}"
-            assert rows[hour][1] == busy, f"{hour} busy {rows[hour][1]} != {busy}"
-            # Requests started | Local attempts | Local served | Fallbacks | Local-skip
-            assert rows[hour][3:8] == ["1", "1", "1", "0", "0"], hour
-        afternoon_started = sum(int(rows[h][3]) for h in expected_busy)
+            assert rows[hour][2] == busy, f"{hour} busy {rows[hour][2]} != {busy}"
+            # Hour | State | Busy | % | Requests started | Local attempts | Local served |
+            # Local dispatch | Lease denials | Fallbacks | Local-skip
+            assert rows[hour][4:11] == ["1", "1", "1", "0", "0", "0", "0"], hour
+        afternoon_started = sum(int(rows[h][4]) for h in expected_busy)
         assert afternoon_started == 7
 
     def test_no_row_exceeds_100_percent_and_no_duplicate_busy_duration(self):
@@ -3870,13 +3877,13 @@ class TestHourlyRollingWindow:
         # partials do not share a busy duration (7s vs 3m 00s), proving
         # absolute-hour keying rather than hour-of-day collision.
         rows = self._rows()
-        assert rows["11:04-12:00"][1] == "7s"
-        assert rows["11:04-12:00"][2] == "0.2%"
-        assert rows["11:00-11:04"][1] == "3m 00s"
-        assert rows["11:00-11:04"][2] == "75.0%"
-        pcts = [float(cell.rstrip("%")) for cell in (r[2] for r in rows.values())]
+        assert rows["11:04-12:00"][2] == "7s"
+        assert rows["11:04-12:00"][3] == "0.2%"
+        assert rows["11:00-11:04"][2] == "3m 00s"
+        assert rows["11:00-11:04"][3] == "75.0%"
+        pcts = [float(cell.rstrip("%")) for cell in (r[3] for r in rows.values())]
         assert pcts and all(p <= 100.0 for p in pcts)
-        busy_cells = [r[1] for label, r in rows.items() if label != "Totals"]
+        busy_cells = [r[2] for label, r in rows.items() if label != "Totals"]
         non_zero = [b for b in busy_cells if b != "0s"]
         assert len(non_zero) == len(set(non_zero))
 

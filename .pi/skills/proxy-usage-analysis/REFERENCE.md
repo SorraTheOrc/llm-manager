@@ -127,7 +127,12 @@ Outputs written to:
   (the previous hour-of-day keying could collide them and emit impossible
   >100% rows, LP-0MTYAZFGN003BYQS); the `--json` summary exposes the same
   per-hour activity as `hourly_activity`, plus `hourly_busy` and
-  `hourly_session_classification`, all keyed by absolute hour, **Local model
+  `hourly_session_classification`, all keyed by absolute hour. Each
+  `hourly_activity` entry (LP-0MVKUKG3F0035I85) carries `state` (the
+  `+`-joined availability label), `states` (the ordered tuple), and the raw
+  evidence counters `local_dispatch_attempts`, `local_denials`,
+  `lease_active_fallbacks` alongside `local_served`, so a machine consumer
+  can audit the availability verdict instead of trusting it, **Local model
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
   fast/cheap split — when the window has local traffic) followed by
@@ -214,7 +219,9 @@ entry is a local runtime edit, not a committed artifact.
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
-   `routing_skip_local`, `local_dispatch_denied`, the server-side
+   `routing_skip_local`, `local_dispatch_denied`, `[local] POST` (every
+   dispatch attempt at the local llama-server — including attempts that
+   never yield a first byte, LP-0MVKUKG3F0035I85), the server-side
    compaction events (`compaction_event`, `compaction_backstop`,
    `compaction_churn` — parsed tamerly with missing fields defaulting to
    None, LP-0MTHCTLAF00147IT), plus the operating-mode lines (`Mode
@@ -287,12 +294,16 @@ entry is a local runtime edit, not a committed artifact.
    row per **absolute wall-clock hour** of the report window — the first/last
    rows truncated to the window edges and every hour listed even when idle —
    with a busy-% column (busy seconds ÷ window-bounded bucket duration,
-   clamped to 100%) plus five per-hour activity columns counted by each
-   event's own timestamp in the bucket: `Requests started` (all
-   `Stream started`), `Local attempts` (local `Stream started`), `Local
-   served` (local `Stream finished`), `Fallbacks` (`Fallback triggered`), and
-   `Local-skip` (`routing_skip_local`); a final totals row gives the window
-   busy totals plus the sum of each activity column. Counting by event
+   clamped to 100%), a **State** column carrying the hour's local-availability
+   classification (LP-0MVKUKG3F0035I85, see below), plus seven per-hour
+   activity columns counted by each event's own timestamp in the bucket:
+   `Requests started` (all `Stream started`), `Local attempts` (local `Stream
+   started`), `Local served` (local `Stream finished`), `Local dispatch`
+   (every `[local] POST` dispatch attempt, including attempts that never
+   stream), `Lease denials` (`local_dispatch_denied` refusals), `Fallbacks`
+   (`Fallback triggered`), and `Local-skip` (`routing_skip_local`); a final
+   totals row gives the window-level state plus the window busy totals and
+   the sum of each activity column. Counting by event
    timestamp means long-running sessions contribute to every hour they touch,
    not just their first-request hour. It renders regardless of local traffic
    (busy columns read `0s` / `0.0%` when the window has no local streams;
@@ -523,7 +534,7 @@ entry is a local runtime edit, not a committed artifact.
   glance at the hourly pattern correlates demand with provider usage and
   shows when local was saturated vs idle; the totals row gives the
   window-wide busy % and the summed activity counts. `context_too_large`
-  is the largest lever: despite the legacy name (`warm_cache_bypass`) it
+  is the largest lever: despite the legacy name (`warm_cache_bypass`), it
   fires when the *estimated context* exceeds the effective warm-cache
   threshold (the per-slot clamp,
   `local_model_ctx_size // slots - headroom`, inflated by
@@ -532,6 +543,35 @@ entry is a local runtime edit, not a committed artifact.
   `local_concurrency_limit` / `local_lease_active` fallbacks. Note the
   slots-vs-context trade-off: more slots shrink per-slot context and *raise*
   bypass volume, so do not add slots without a matching ctx-size increase.
+- **Hour state (local availability)**: the **State** column of **Summary by
+  hour** answers "was the local model *idle*, or *unable to serve*?" — a
+  question busy-% cannot answer, because busy is computed only from paired
+  `Stream started`/`Stream finished` events, so an hour where work never
+  yields a first byte renders as `0s / 0.0%`. The four states are derived
+  only from the logs, and a short footnote after the table repeats their
+  definitions in every report:
+
+  | State | Meaning | Evidence |
+  |---|---|---|
+  | `serving` | decode happened | ≥1 local `Stream finished` |
+  | `prefill-only-no-decode` | prompts were prefilled, nothing was decoded | ≥1 `[local] POST` and **no** local `Stream finished` |
+  | `lease-blocked` | local demand was refused because another session held the dispatch lease | ≥1 `local_dispatch_denied` or `reason=local_lease_active` fallback |
+  | `idle` | no local demand at all | no dispatch attempt, no refusal, no local completion |
+
+  The states are **not exclusive** and are `+`-joined in the cell, in the
+  fixed order `serving`, `prefill-only-no-decode`, `lease-blocked`; `idle`
+  only ever appears alone. The 2026-10-23 02:00-03:00 incident is the canonical
+  example: a wedged prefill lease held the gate while the GPU prefilled ~2M
+  prompt tokens and decoded nothing, so the hour renders
+  `prefill-only-no-decode+lease-blocked | 0s | 0.0%` with `Local dispatch`
+  173, `Local served` 0 and `Lease denials` 141 — an outage, not idle. The
+  totals row carries the classification of the summed window evidence (the
+  window-level verdict, so a single wedged hour is still visible in a 24h
+  report). A high `lease-blocked` hour with a low busy % means the gate was
+  held (see the `local_lease_active` fallback guidance above);
+  `prefill-only-no-decode` without denials means dispatch happened but never
+  completed, i.e. cancelled/aborted prefill (check
+  `local_prefill_deadline_seconds` versus projected prefill ETA).
 - **Total tokens**: Input + Output + Total (prompt + completion summed from
   `tokens=prompt/completion/total` on `Stream finished` lines; streams without
   `tokens=` contribute `0`). Check the per-bucket and per-model tables in the
@@ -688,6 +728,20 @@ entry is a local runtime edit, not a committed artifact.
   section's window filtering and fast/cheap split are approximate: each
   sample is bucketed by its log file's last-write time. Files whose Qwen3
   child port cannot be discovered are counted and skipped (never fatal).
+- **The hour availability state uses proxy-log evidence only**
+  (LP-0MVKUKG3F0035I85). llama-server writes its prefill/decode evidence
+  (`prompt processing progress`, `slot update_slots`, `eval time`) with **no
+  per-line timestamp**, so those lines cannot be attributed to an hour
+  deterministically — for the 6-hourly rotation a wedge window's GPU evidence
+  can only be placed in wall-clock time by an analyst reconstructing a time
+  base externally. The proxy's own `[local] POST` dispatch-attempt marker is
+  therefore the per-hour "prefill started" signal: it is emitted for every
+  attempt (including ones that never produce a first byte) with an exact
+  timestamp, and its lack of a following local `Stream finished` is exactly
+  the "no decode" half of `prefill-only-no-decode`. Prompt-token volume and
+  `eval time` counts remain available at window level in the **Prefill vs
+  decode** and **Decode speed** sections; they do not feed the per-hour
+  state.
 - The per-session CSV `decode_tok_s` is a session-level average over the
   local active span (first→last local stream event); it includes
   inter-request gaps, so it is a conservative lower bound of the true decode

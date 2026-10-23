@@ -84,6 +84,10 @@ RE_ROUTING_SKIP_REASON = re.compile(r"\breason=([\w_]+)\s*→")
 # pre-chain-hold rotated logs → None (treated as cycle 0 downstream).
 RE_CHAIN_HOLD_CYCLE = re.compile(r"\bchain_hold_cycle=(\d+)")
 RE_DISPATCH_DENIED = re.compile(r"session=([A-Za-z0-9_.-]+) owner=([A-Za-z0-9_.-]+) active=(\d+)")
+# Bare ``reason=<token>`` extractor for lines whose reason is not followed by
+# the routing-skip arrow (e.g. ``contention_queue_fallback_after_queue ...
+# reason=local_lease_active``).
+RE_REASON_KV = re.compile(r"\breason=([\w_]+)")
 
 # Compaction events (LP-0MTHCTLAF00147IT): the proxy emits ``compaction_event``
 # for every compaction decision (compact / remote_with_guidance / backstop_*)
@@ -173,6 +177,14 @@ STREAM_FINISHED = "Stream finished"
 FALLBACK = "Fallback triggered"
 ROUTING_SKIP = "routing_skip_local"
 DISPATCH_DENIED = "local_dispatch_denied"
+# Local dispatch attempt marker (LP-0MVKUKG3F0035I85): the proxy logs one
+# ``[local] POST http://<backend>/... `` line for **every** attempt it makes at
+# the local llama-server, including attempts that never yield a first byte (a
+# wedged prefill lease, a cancelled dispatch). ``Stream started: provider=local``
+# only appears once the request is admitted, so it cannot see work that was
+# attempted-but-never-served; this marker is the per-hour local-dispatch
+# attempt evidence the availability classification needs.
+LOCAL_POST = "[local] POST"
 CONTENTION_DISPATCH = "contention_queue_dispatch"
 CONTENTION_FALLBACK_AFTER_QUEUE = "contention_queue_fallback_after_queue"
 LOCAL_ADMISSION_GUARD = "local_admission_guard"
@@ -327,9 +339,9 @@ class LogEvent:
     """One parsed structured log line.
 
     ``kind`` is one of ``stream_started``, ``stream_finished``, ``fallback``,
-    ``routing_skip``, ``dispatch_denied``, ``contention_dispatch``,
-    ``contention_fallback_after_queue``, ``idle_admit``, ``mode_switch``,
-    ``restart``,
+    ``routing_skip``, ``dispatch_denied``, ``local_dispatch``,
+    ``contention_dispatch``, ``contention_fallback_after_queue``,
+    ``idle_admit``, ``mode_switch``, ``restart``,
     ``compaction_event``, ``compaction_backstop``, ``compaction_churn``, or an
     error kind (``stream_error``, ``stream_finish_error``, ``slot_save_error``,
     ``backend_retry``, ``upstream_http_error``). Only the fields relevant to
@@ -639,6 +651,12 @@ def parse_log_line(line: str) -> LogEvent | None:
             reason=_normalize_reason(_first(RE_ROUTING_SKIP_REASON, msg)),
             chain_hold_cycle=int(cycle_m.group(1)) if cycle_m else None,
         )
+    if msg.startswith(LOCAL_POST):
+        # ``[local] POST http://... body={...} session_id=<uuid> session={...}``.
+        # The request body is echoed (truncated) into the line and may itself
+        # contain ``session=``/``provider=`` text, so no field is extracted
+        # here: the event is a per-attempt marker, counted by hour only.
+        return LogEvent("local_dispatch", ts)
     if msg.startswith(DISPATCH_DENIED):
         m2 = RE_DISPATCH_DENIED.search(msg)
         if m2 is None:
@@ -660,12 +678,14 @@ def parse_log_line(line: str) -> LogEvent | None:
         )
     if msg.startswith(CONTENTION_FALLBACK_AFTER_QUEUE):
         # "contention_queue_fallback_after_queue provider=... session=... queued_duration=1.23s"
+        # (optionally suffixed with ``reason=<token>``, e.g. ``local_lease_active``)
         return LogEvent(
             "contention_fallback_after_queue",
             ts,
             provider=_first(RE_PROVIDER, msg),
             session=_session_from(msg),
             queued_duration=_first(RE_CONTENTION_DURATION, msg),
+            reason=_normalize_reason(_first(RE_REASON_KV, msg)),
         )
     if msg.startswith(ROUTING_IDLE_ADMIT):
         # "routing_idle_admit provider=local model=Qwen3

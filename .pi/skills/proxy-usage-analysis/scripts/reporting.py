@@ -1131,8 +1131,41 @@ ACTIVITY_COLUMNS = (
     ("requests_started", "Requests started"),
     ("local_attempts", "Local attempts"),
     ("local_served", "Local served"),
+    ("local_dispatch_attempts", "Local dispatch"),
+    ("local_denials", "Lease denials"),
     ("fallbacks", "Fallbacks"),
     ("local_skip", "Local-skip"),
+)
+
+# Footnote defining the ``State`` column's vocabulary
+# (LP-0MVKUKG3F0035I85). Rendered once, immediately after the table, so the
+# operator can decode ``lease-blocked``/``prefill-only-no-decode`` rows without
+# consulting REFERENCE.md.
+AVAILABILITY_FOOTNOTE = (
+    "_Hour state (derived only from the logs; states are not exclusive and are "
+    "`+`-joined when several apply):_"
+)
+AVAILABILITY_STATE_NOTES = (
+    (
+        aggregation.AVAILABILITY_SERVING,
+        "at least one local stream completed (a local `Stream finished`), so the "
+        "local model actually decoded tokens.",
+    ),
+    (
+        aggregation.AVAILABILITY_PREFILL_ONLY_NO_DECODE,
+        "local work was dispatched (`[local] POST` to llama-server) but no local "
+        "stream completed, so prompts were prefilled without any decode.",
+    ),
+    (
+        aggregation.AVAILABILITY_LEASE_BLOCKED,
+        "local demand was refused because another session held the local dispatch "
+        "lease (`local_dispatch_denied` / `reason=local_lease_active`).",
+    ),
+    (
+        aggregation.AVAILABILITY_IDLE,
+        "no local dispatch attempt, no refusal and no completed local stream: no "
+        "local demand at all (a wedged or refused hour is never reported idle).",
+    ),
 )
 
 
@@ -1182,19 +1215,28 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
     (window-bounded buckets, partial first/last hours truncated to the
     window edges, idle hours listed as ``0s``), with busy time / busy-%
     columns (busy seconds ÷ window-bounded bucket duration, defensively
-    clamped to 100%) and five per-hour **activity** columns counted by each
+    clamped to 100%) and seven per-hour **activity** columns counted by each
     event's own timestamp (LP-0MTYAZFGN003BYQS): ``Requests started`` (all
     ``Stream started`` events), ``Local attempts`` (``Stream started`` with
     ``provider=local``), ``Local served`` (``Stream finished`` with
     ``provider=local``), ``Fallbacks`` (``Fallback triggered`` events), and
     ``Local-skip`` (``routing_skip_local`` events) — replacing the previous
-    session-first-hour classification columns. Buckets are keyed by absolute
-    hour, so a rolling window that straddles an hour emits two distinct edge
-    partials rather than two rows sharing one hour-of-day bucket. Always
-    rendered — also when the window has no local traffic (busy columns then
-    read ``0s`` / ``0.0%``); with no events at all the body shows a
-    ``No data`` note. Ends with a Totals row: window busy totals plus the sum
-    of each activity column over the window.
+    session-first-hour classification columns. ``Local dispatch`` (every
+    ``[local] POST`` attempt to llama-server, LP-0MVKUKG3F0035I85) and
+    ``Lease denials`` (``local_dispatch_denied`` refusals) were added so the
+    ``State`` column's verdict is auditable from the row itself. A **State**
+    column (LP-0MVKUKG3F0035I85) sits next to ``Hour``, carrying the
+    availability classification (``serving`` / ``prefill-only-no-decode`` /
+    ``lease-blocked`` / ``idle``, ``+``-joined when several apply) so an hour
+    whose gate was wedged no longer reads as ``0s / 0.0%`` idle; the state
+    vocabulary is defined in the footnote printed after the table. Buckets are
+    keyed by absolute hour, so a rolling window that straddles an hour emits
+    two distinct edge partials rather than two rows sharing one hour-of-day
+    bucket. Always rendered — also when the window has no local traffic (busy
+    columns then read ``0s`` / ``0.0%``); with no events at all the body shows
+    a ``No data`` note. Ends with a Totals row: the window-level state (the
+    classification of the summed window evidence), window busy totals and the
+    sum of each activity column over the window.
     """
     sessions = list(summary.sessions.values())
     hourly = dict(summary.busy.hourly_busy) if summary.busy else {}
@@ -1204,11 +1246,17 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
     ap("")
     ap("## Summary by hour")
     ap("")
-    ap("| Hour | Busy | % | " + " | ".join(label for _, label in ACTIVITY_COLUMNS) + " |")
-    ap("|" + "---|" * (3 + len(ACTIVITY_COLUMNS)))
+    # State column (LP-0MVKUKG3F0035I85): per-hour availability classification
+    # derived only from the logs (serving / prefill-only-no-decode /
+    # lease-blocked / idle), so a wedged gate stops reading as ``0s / 0.0%``
+    # idle. Placed next to ``Hour`` so the operator sees the outage before the
+    # busy columns.
+    ap("| Hour | State | Busy | % | " + " | ".join(label for _, label in ACTIVITY_COLUMNS) + " |")
+    ap("|" + "---|" * (4 + len(ACTIVITY_COLUMNS)))
     activity_totals: Counter = Counter()
+    window_evidence = Counter()
     if not has_data:
-        ap("| _No session data in window._ |" + " - |" * (2 + len(ACTIVITY_COLUMNS)))
+        ap("| _No session data in window._ |" + " - |" * (3 + len(ACTIVITY_COLUMNS)))
     else:
         # Window-bounded hour buckets keyed by ABSOLUTE hour
         # (LP-0MTYAZFGN003BYQS): each bucket's key is the top of its hour, so
@@ -1227,13 +1275,16 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
             # impossible, but never emit one even if inputs drift.
             pct = min(100.0, (seconds / duration * 100.0)) if duration else 0.0
             counts = summary.hourly_activity.get(bucket_key, Counter())
+            state = aggregation.hour_availability(bucket_key, counts).label
+            for key in aggregation.AVAILABILITY_COUNTERS:
+                window_evidence[key] += counts.get(key, 0)
             cells = []
             for key, _label in ACTIVITY_COLUMNS:
                 value = counts.get(key, 0)
                 activity_totals[key] += value
                 cells.append(str(value))
             ap(
-                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {_fmt_duration(seconds)} | {pct:.1f}% | "
+                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {state} | {_fmt_duration(seconds)} | {pct:.1f}% | "
                 + " | ".join(cells)
                 + " |"
             )
@@ -1241,11 +1292,22 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
 
     busy_seconds = summary.busy.busy_seconds if summary.busy else 0.0
     busy_pct = summary.busy.busy_pct if summary.busy else 0.0
+    window_state = aggregation.classify_hour(
+        summary.window_start,
+        local_dispatch_attempts=window_evidence.get("local_dispatch_attempts", 0),
+        local_served=window_evidence.get("local_served", 0),
+        local_denials=window_evidence.get("local_denials", 0),
+        lease_active_fallbacks=window_evidence.get("lease_active_fallbacks", 0),
+    ).label
     ap(
-        f"| Totals | {_fmt_duration(busy_seconds)} | {busy_pct:.1f}% | "
+        f"| Totals | {window_state} | {_fmt_duration(busy_seconds)} | {busy_pct:.1f}% | "
         + " | ".join(str(activity_totals.get(key, 0)) for key, _label in ACTIVITY_COLUMNS)
         + " |"
     )
+    ap("")
+    ap(AVAILABILITY_FOOTNOTE)
+    for state_name, note in AVAILABILITY_STATE_NOTES:
+        ap(f"- `{state_name}` — {note}")
 
 
 def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSchedule) -> None:
@@ -1988,18 +2050,33 @@ def _hourly_activity_json(summary: AnalysisResult) -> list[dict]:
 
     Mirrors the ``## Summary by hour`` activity columns so agents can query
     per-hour traffic without scraping the Markdown (LP-0MTYAZFGN003BYQS).
+
+    Each entry also carries the hour's local-availability classification
+    (LP-0MVKUKG3F0035I85): ``state`` is the rendered ``+``-joined label and
+    ``states`` the ordered tuple, accompanied by the raw evidence counters
+    (``local_dispatch_attempts`` / ``local_served`` / ``local_denials`` /
+    ``lease_active_fallbacks``) so a consumer can audit the verdict instead of
+    trusting it.
     """
-    return [
-        {
-            "hour": _fmt_ts(hour),
-            "requests_started": counts.get("requests_started", 0),
-            "local_attempts": counts.get("local_attempts", 0),
-            "local_served": counts.get("local_served", 0),
-            "fallbacks": counts.get("fallbacks", 0),
-            "local_skip": counts.get("local_skip", 0),
-        }
-        for hour, counts in sorted(summary.hourly_activity.items())
-    ]
+    entries: list[dict] = []
+    for hour, counts in sorted(summary.hourly_activity.items()):
+        availability = aggregation.hour_availability(hour, counts)
+        entries.append(
+            {
+                "hour": _fmt_ts(hour),
+                "state": availability.label,
+                "states": list(availability.states),
+                "requests_started": counts.get("requests_started", 0),
+                "local_attempts": counts.get("local_attempts", 0),
+                "local_served": counts.get("local_served", 0),
+                "local_dispatch_attempts": availability.local_dispatch_attempts,
+                "local_denials": availability.local_denials,
+                "lease_active_fallbacks": availability.lease_active_fallbacks,
+                "fallbacks": counts.get("fallbacks", 0),
+                "local_skip": counts.get("local_skip", 0),
+            }
+        )
+    return entries
 
 
 def _ttft_json(
