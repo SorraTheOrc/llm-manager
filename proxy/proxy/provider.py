@@ -5606,13 +5606,22 @@ async def _prefill_admission_guard(
         )
         if not decision.active:
             return None
+        # For the deadline refusal keep the decision's own reason so the
+        # log reason is ``prefill_eta_exceeds_deadline`` on both paths
+        # (LP-0MVKUKEU80022C3U AC1).  The budget refusal still gets the
+        # queue/direct suffix.
+        log_label = reason_label
+        if reason_label and str(decision.reason).startswith(
+            "prefill_eta_exceeds_deadline"
+        ):
+            log_label = decision.reason
         prefill_eta.record_guard_decision(
             decision,
             provider=(provider_cfg.get("name") if isinstance(provider_cfg, dict) else None),
             session_id=session_id,
             model=model_name,
             priority=priority,
-            reason_label=reason_label,
+            reason_label=log_label,
             free_slot=free_slot,
         )
         return decision
@@ -9506,7 +9515,14 @@ async def _proxy_with_fallback_cycle(
                     free_slot=True,
                 )
                 if _direct_admission is not None and not _direct_admission.admit:
-                    _direct_reason = "eta_exceeds_budget_direct"
+                    # Deadline refusal (LP-0MVKUKEU80022C3U) keeps its own
+                    # reason so the diagnostic says *why* local was refused.
+                    if str(_direct_admission.reason).startswith(
+                        "prefill_eta_exceeds_deadline"
+                    ):
+                        _direct_reason = "prefill_eta_exceeds_deadline"
+                    else:
+                        _direct_reason = "eta_exceeds_budget_direct"
                     try:
                         setattr(request, "_local_admission_decision", _direct_admission)
                     except Exception:

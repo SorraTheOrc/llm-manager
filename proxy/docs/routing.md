@@ -882,6 +882,12 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   to the next provider. It reuses the same estimator and the same single
   budget (`contention_queue_max_wait_seconds`) — there is no second budget
   knob, and a cold/uncalibrated bucket still admits.
+  **Deadline refusal** (LP-0MVKUKEU80022C3U): when the projected first-byte
+  ETA >= ``local_prefill_deadline_seconds`` (default 90 s) the guard also
+  refuses with ``reason=prefill_eta_exceeds_deadline`` (both paths). The
+  deadline reason dominates the budget reason whenever it fires — it names
+  the hard physical constraint that would cancel the dispatch; when the ETA
+  is below the deadline the budget reason is reported as before.
 
 Rollout control (`server.local_admission_guard_policy`):
 
@@ -916,6 +922,9 @@ POST /llama/local/reserve
 200 {"admit": true, "reservation_id": "<opaque>",
      "projected_wait_s": 63.1, "ttl_s": 10}
 429 {"admit": false, "reason": "eta_exceeds_budget",
+     "queue_eta_s": 187.2, "budget_s": 60.0, "retry_after_s": 28}
+# or (LP-0MVKUKEU80022C3U)
+429 {"admit": false, "reason": "prefill_eta_exceeds_deadline",
      "queue_eta_s": 187.2, "budget_s": 60.0, "retry_after_s": 28}
 ```
 

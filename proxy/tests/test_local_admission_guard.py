@@ -68,6 +68,9 @@ def _queue_cfg(**server_overrides) -> dict:
         "contention_queue_policy": "queue",
         "contention_queue_max_wait_seconds": 60,
         "contention_queue_max_depth": 4,
+        # Isolate the BUDGET bound in this file: the deadline bound
+        # (LP-0MVKUKEU80022C3U) is covered by tests/test_prefill_eta_deadline.py.
+        "local_prefill_deadline_seconds": 0,
     }
     server.update(server_overrides)
     return {"provider_cooldown_seconds": 60, "server": server}
@@ -491,7 +494,12 @@ def test_generic_exhaustion_is_unchanged_without_a_refusal():
 # ---------------------------------------------------------------------------
 
 def _free_slot_cfg(**server_overrides) -> dict:
-    """Config for the direct-dispatch path: a slot is free (cur < max)."""
+    """Config for the direct-dispatch path: a slot is free (cur < max).
+
+    The deadline bound (LP-0MVKUKEU80022C3U) is disabled here to isolate the
+    budget bound — the deadline bound is covered by
+    tests/test_prefill_eta_deadline.py.
+    """
     return _queue_cfg(**server_overrides)
 
 

@@ -1732,6 +1732,24 @@ server:
   # unobservable progress is charged the calibrated estimate (never "free
   # soon").
   #
+  # SECOND, INDEPENDENT BOUND — the prefill DEADLINE (LP-0MVKUKEU80022C3U).
+  # The budget bound above only refuses when the projected wait exceeds the
+  # queue budget, but nothing refused admission against the hard
+  # ``local_prefill_deadline_seconds`` (default 90 s) backstop. A prompt
+  # whose projected first-byte ETA >= the deadline is a guaranteed loss —
+  # the dispatch is cancelled by the deadline before its first byte
+  # (deterministic, measured 2026-10-23: 130-265 s prefills vs a 90 s
+  # deadline). The guard therefore ALSO refuses when
+  # ``eta_prefill >= local_prefill_deadline_seconds``, logging
+  # ``reason=prefill_eta_exceeds_deadline`` on BOTH paths (the deadline is
+  # the binding constraint — no second budget knob). Ordering to keep:
+  # ``contention_queue_max_wait_seconds < local_prefill_deadline_seconds <
+  # local_dispatch_first_byte_timeout_seconds <
+  # local_dispatch_max_prefill_seconds`` — an admitted request must never
+  # be cut off by the deadline (budget < deadline), and the deadline must
+  # fire before the first-byte ceiling and the wedge bound. Setting the
+  # deadline to 0 disables this bound (documented rollback).
+  #
   # Fail-open: the change can only refuse further DOOMED admissions, never
   # admit more than before, and an uncalibrated bucket still admits.
   #
@@ -1781,6 +1799,12 @@ server:
   # Prompt size used for the published estimate on /llama/local/status when
   # no dispatch has been observed yet for the current model.
   local_admission_guard_reference_tokens: 32000
+  # Deadline-aware admission bound (LP-0MVKUKEU80022C3U): the guard ALSO
+  # refuses local when the projected first-byte ETA exceeds this hard
+  # backstop (default 90 s, same value as ``local_prefill_deadline_seconds``;
+  # 0 disables the bound). See the guard documentation above for the
+  # ordering: ``budget < deadline < first-byte ceiling < max prefill``.
+  local_prefill_deadline_seconds: 90
 
   # -----------------------------------------------------------------------
   # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)

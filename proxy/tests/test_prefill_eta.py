@@ -34,6 +34,9 @@ def _cfg(**server_overrides) -> dict:
         "contention_queue_policy": "queue",
         "contention_queue_max_wait_seconds": 60,
         "contention_queue_max_depth": 8,
+        # Isolate the BUDGET bound in this file (the deadline bound is covered
+        # by tests/test_prefill_eta_deadline.py, LP-0MVKUKEU80022C3U).
+        "local_prefill_deadline_seconds": 0,
     }
     server.update(server_overrides)
     return {"server": server}

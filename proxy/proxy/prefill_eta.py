@@ -135,6 +135,13 @@ MAX_CODED_MS_PER_TOKEN = 3.0
 MIN_PREFILL_MS_PER_TOKEN = 1.0
 MAX_PREFILL_MS_PER_TOKEN = 30.0
 
+# Default local-prefill deadline (seconds).  0 disables the bound.
+#: When the projected first-byte ETA is >= this value the guard refuses
+#: local dispatch so we never start a prefill the deadline will later
+#: cancel (LP-0MVKUKEU80022C3U).
+DEFAULT_PREFILL_DEADLINE_SECONDS = 90
+PREFILL_DEADLINE_KEY = "local_prefill_deadline_seconds"
+
 #: Upper bounds of the context buckets: <16k, 16k-64k, 64k-128k, >=128k.
 CONTEXT_BUCKET_BOUNDS = (16_384, 65_536, 131_072)
 
@@ -208,6 +215,8 @@ class GuardConfig:
     min_samples: int
     window_samples: int
     reference_tokens: int
+    #: Projected-first-byte deadline (seconds); 0 disables the bound.
+    prefill_deadline_seconds: float = float(DEFAULT_PREFILL_DEADLINE_SECONDS)
 
 
 def resolve_config(config: dict | None) -> GuardConfig:
@@ -238,11 +247,15 @@ def resolve_config(config: dict | None) -> GuardConfig:
         server_cfg, "local_admission_guard_reference_tokens",
         DEFAULT_REFERENCE_TOKENS,
     ))
+    deadline = _float_setting(
+        server_cfg, PREFILL_DEADLINE_KEY, float(DEFAULT_PREFILL_DEADLINE_SECONDS),
+    )
     return GuardConfig(
         policy=raw_policy,
         min_samples=min_samples,
         window_samples=window,
         reference_tokens=reference,
+        prefill_deadline_seconds=deadline,
     )
 
 
@@ -512,11 +525,17 @@ class AdmissionDecision:
     eta_occupancy_seconds: float | None = None
     busy_slots: int = 0
     in_flight_prefills: int = 0
+    #: Projected first-byte deadline (seconds) used by this decision.
+    prefill_deadline_seconds: float = 0.0
 
     @property
     def active(self) -> bool:
         """True when the guard actually made a decision (not inert)."""
-        return self.reason in ("within_budget", "eta_exceeds_budget")
+        return self.reason in (
+            "within_budget",
+            "eta_exceeds_budget",
+            "prefill_eta_exceeds_deadline",
+        )
 
 
 def wait_budget_seconds(config: dict | None, priority: str | None = None) -> float:
@@ -556,12 +575,18 @@ def evaluate_admission(
 ) -> AdmissionDecision:
     """Decide whether a local dispatch can finish inside the wait budget.
 
-    The comparison is occupancy-aware (LP-0MVICD2YW004DJPV): the *projected
-    wait* (own prefill plus the remaining service of the occupied prefill
-    gate, :func:`projected_wait_seconds`) is compared against the budget, not
-    the own-prefill term alone. Comparing the own term alone admitted waits
-    that the proxy's own published ``queue_eta_seconds`` already flagged as
-    unservable (measured 86 % of queued waits fell back after up to 120 s).
+    Two independent bounds, both enforced when the policy is ``reject``:
+
+    1. **Budget bound (LP-0MVGDUV5E005UWBQ).** The *projected wait*
+       (own prefill plus the remaining service of the occupied prefill
+       gate, :func:`projected_wait_seconds`) is compared against the wait
+       budget (``contention_queue_max_wait_seconds``).
+
+    2. **Deadline bound (LP-0MVKUKEU80022C3U).** The projected first-byte
+       ETA (own-prefill term only, no occupancy) is compared against
+       ``local_prefill_deadline_seconds`` (default 90 s). When the ETA
+       exceeds the deadline the guard refuses so we never start a prefill
+       that the deadline will later cancel.
 
     *busy_slots* is the number of occupied gate slots ahead of this request
     (``max(generating concurrency, prefills in flight)``); *in_flight_prefills*
@@ -570,8 +595,8 @@ def evaluate_admission(
 
     Fail-open by construction: the guard is inert (``admit=True``) when the
     policy is ``off``, the priority never queues, the bucket is not yet
-    calibrated, or no budget can be resolved. Only a calibrated projected wait
-    that exceeds the budget refuses admission, and only when the policy is
+    calibrated, or no budget can be resolved. Only a calibrated projected
+    wait that exceeds a bound refuses admission, and only when the policy is
     ``reject`` (``observe`` logs the same verdict without refusing).
     """
     guard_cfg = resolve_config(config)
@@ -604,6 +629,7 @@ def evaluate_admission(
             ),
             busy_slots=projected.busy_slots if projected else occupancy,
             in_flight_prefills=in_flight,
+            prefill_deadline_seconds=guard_cfg.prefill_deadline_seconds,
         )
 
     if guard_cfg.policy == POLICY_OFF:
@@ -621,6 +647,15 @@ def evaluate_admission(
     within = projected.projected_seconds <= budget
     reason = "within_budget" if within else "eta_exceeds_budget"
     admit = within or guard_cfg.policy == POLICY_OBSERVE
+    # Second independent bound: deadline check (LP-0MVKUKEU80022C3U).
+    # If the projected first-byte ETA >= the prefill deadline we refuse
+    # *now* so we never start a prefill the deadline will later cancel.
+    # The deadline is the dominant reason when it fires (AC1) and, like
+    # the budget bound, honours ``observe`` (log but never refuse).
+    deadline = guard_cfg.prefill_deadline_seconds
+    if deadline > 0 and eta >= deadline:
+        reason = "prefill_eta_exceeds_deadline"
+        admit = guard_cfg.policy == POLICY_OBSERVE
     return AdmissionDecision(
         admit=admit,
         reason=reason,
@@ -633,6 +668,7 @@ def evaluate_admission(
         eta_occupancy_seconds=projected.occupancy_seconds,
         busy_slots=projected.busy_slots,
         in_flight_prefills=in_flight,
+        prefill_deadline_seconds=deadline,
     )
 
 
@@ -802,6 +838,9 @@ def record_guard_decision(
     queue-entry guard: the same decision emitted one step earlier is logged
     ``reason=eta_exceeds_budget_direct`` (with ``free_slot=true``), and the
     line is emitted exactly once — the caller must not log a second copy.
+    The deadline refusal (LP-0MVKUKEU80022C3U) keeps its own reason
+    (``prefill_eta_exceeds_deadline``) on BOTH paths; ``free_slot=true``
+    already identifies the direct path, so the override does not apply.
     """
     if not decision.active or decision.eta_prefill_seconds is None:
         return
@@ -812,6 +851,7 @@ def record_guard_decision(
     verdict = (
         "reject"
         if str(decision.reason).startswith("eta_exceeds_budget")
+        or str(decision.reason).startswith("prefill_eta_exceeds_deadline")
         else "admit"
     )
     projected = (
@@ -819,18 +859,28 @@ def record_guard_decision(
         if decision.projected_wait_seconds is not None
         else decision.eta_prefill_seconds
     )
+    # The deadline refusal keeps its own reason on both paths so AC1 holds
+    # literally (``reason=prefill_eta_exceeds_deadline``); ``free_slot``
+    # already distinguishes the direct dispatch.
+    effective_label = reason_label
+    if reason_label and str(decision.reason).startswith(
+        "prefill_eta_exceeds_deadline"
+    ):
+        effective_label = decision.reason
     logger.info(
         "local_admission_guard decision=%s reason=%s enforced=%s "
         "eta_prefill_s=%.1f eta_occupancy_s=%.1f projected_wait_s=%.1f "
-        "budget_s=%.1f busy_slots=%d in_flight_prefills=%d free_slot=%s "
-        "priority=%s policy=%s model=%s samples=%d provider=%s session=%s",
+        "budget_s=%.1f deadline_s=%.1f busy_slots=%d in_flight_prefills=%d "
+        "free_slot=%s priority=%s policy=%s model=%s samples=%d provider=%s "
+        "session=%s",
         verdict,
-        reason_label or decision.reason,
+        effective_label or decision.reason,
         "false" if decision.admit else "true",
         float(decision.eta_prefill_seconds),
         float(decision.eta_occupancy_seconds or 0.0),
         float(projected),
         float(decision.budget_seconds or 0.0),
+        float(decision.prefill_deadline_seconds or 0.0),
         int(decision.busy_slots or 0),
         int(decision.in_flight_prefills or 0),
         "true" if free_slot else "false",

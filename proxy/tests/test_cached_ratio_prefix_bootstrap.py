@@ -188,6 +188,9 @@ class TestPrefillEtaGuard:
                 "local_admission_guard_policy": "reject",
                 "local_admission_guard_min_samples": 1,
                 "contention_queue_max_wait_seconds": 60,
+                # Isolate the BUDGET bound (the deadline bound is covered by
+                # tests/test_prefill_eta_deadline.py, LP-0MVKUKEU80022C3U).
+                "local_prefill_deadline_seconds": 0,
             }
         }
 
