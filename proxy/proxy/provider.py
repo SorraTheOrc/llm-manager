@@ -8900,6 +8900,62 @@ async def _proxy_with_fallback_cycle(
                 # explicit ``endpoint`` the legacy default is used, keeping
                 # single-server deployments working without changes.
                 local_endpoint = _get_local_provider_endpoint(provider_cfg, config)
+                # LP-0MVKUKFHH005UDWL: post-deadline prefill-thrash cooldown.
+                # A session whose last local dispatch was cancelled by the
+                # prefill deadline must not immediately re-dispatch the
+                # identical prompt and burn the whole prefill again (the
+                # 2026-10-23 incident: 41 local POSTs, 35 inside 02:00-03:00,
+                # re-prefilling near-duplicates of the same prompt). While the
+                # session cools down, local is skipped here — BEFORE the
+                # concurrency / queue / smart-routing gates, so the request
+                # never queues for a slot it would then be forbidden to use —
+                # and the chain reaches the next provider (AC1/AC4). The
+                # window is armed by router.py on the deadline event, cleared
+                # on expiry or a successful local first byte, and per-session
+                # (AC2 cross-session isolation).
+                _thrash_cooldown_remaining = 0.0
+                try:
+                    from proxy.router_helpers import (
+                        _prefill_thrash_cooldown_remaining,
+                    )
+
+                    _thrash_cooldown_remaining = (
+                        _prefill_thrash_cooldown_remaining(
+                            _session_id,
+                            config,
+                        )
+                        or 0.0
+                    )
+                except Exception:
+                    _thrash_cooldown_remaining = 0.0
+                if _thrash_cooldown_remaining > 0:
+                    logger.info(
+                        "routing_skip_local provider=%s model=%s "
+                        "session=%s cooldown_remaining=%.0fs "
+                        "reason=prefill_thrash_cooldown → skipping local, "
+                        "routing to next remote provider",
+                        provider_name,
+                        provider_cfg.get("llama_model") or "unknown",
+                        _session_id or "unknown",
+                        _thrash_cooldown_remaining,
+                    )
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="cached_tokens_skip",
+                        reason="prefill_thrash_cooldown",
+                        cooldown_remaining_seconds=round(
+                            _thrash_cooldown_remaining, 1
+                        ),
+                    )
+                    fallback_reason = "prefill_thrash_cooldown"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _note_local_fallback_reason(
+                        request, "prefill_thrash_cooldown"
+                    )
+                    continue
                 # Local concurrency limit check (LP-0MR5MAJNM005R905):
                 # if local concurrency limit (session_slot_pool_size) is exceeded, skip to next
                 # provider without marking local as unavailable. The check is

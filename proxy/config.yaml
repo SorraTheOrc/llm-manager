@@ -1825,6 +1825,21 @@ server:
   # 0 disables the bound). See the guard documentation above for the
   # ordering: ``budget < deadline < first-byte ceiling < max prefill``.
   local_prefill_deadline_seconds: 90
+  # Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL): when a
+  # local dispatch is cancelled by the prefill deadline
+  # (``prefill_deadline_exceeded``), that session is kept OFF local for
+  # ``local_prefill_thrash_cooldown_seconds`` (default **600 s**; 0 disables)
+  # so the identical prompt is not re-prefilled every turn — the 2026-10-23
+  # incident re-dispatched the same 28k-124k-token prompt 41 times (35 inside
+  # 02:00-03:00), each burning a full prefill before the 90 s deadline
+  # cancelled it. During the window that session's local routing skips
+  # (``routing_skip_local reason=prefill_thrash_cooldown``,
+  # ``cooldown_remaining=Ns``) and the chain reaches the next provider
+  # immediately; OTHER sessions are unaffected (per-session key). The window
+  # clears early on a successful local first byte and expires lazily; this
+  # knob is the documented rollback — 0 restores the pre-fix behaviour
+  # (no cooldown, no skip).
+  local_prefill_thrash_cooldown_seconds: 600
 
   # -----------------------------------------------------------------------
   # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)

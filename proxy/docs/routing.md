@@ -1012,6 +1012,36 @@ SSE headers arrive. Frames *before* the headers (the strict prefill window)
 need the local dispatch to return a streaming response before the upstream
 first byte; that gap is tracked separately.
 
+#### Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL)
+
+A deadline cancellation is *evidence that the prefill cannot complete* — the
+root cause of the thrash: the client re-dispatches the identical
+prompt and the whole prefill burns again (the incident's 41 local POSTs, 35
+inside 02:00-03:00, re-prefilling near-duplicates of the same 28k-124k-token
+prompts). To suppress that loop, the deadline event arms a **per-session
+cooldown** (`server.local_prefill_thrash_cooldown_seconds`, default **600 s**;
+0 disables):
+
+1. On `prefill_deadline_exceeded` router.py logs
+   `prefill_thrash_cooldown_started session=… cooldown_s=…` and arms the
+   window for that session.
+2. While armed, the session's local routing skips once per request
+   (`routing_skip_local … session=… cooldown_remaining=Ns
+   reason=prefill_thrash_cooldown → skipping local`) — *before* the
+   concurrency/queue/smart-routing gates, so the request never queues for a
+   slot it would then be forbidden to use — and the chain reaches the next
+   provider immediately.
+3. The window clears on expiry (lazy, at the next request) and on a
+   successful local first byte (`_clear_prefill_thrash_cooldown` in the
+   router's success path), and is keyed per session, so other sessions are
+   unaffected. Setting the knob to 0 disables the arming and the skip
+   (documented rollback).
+
+The cooldown is in-process (a proxy restart resets routing state, matching
+its own leases) and lives in `proxy/proxy/router_helpers.py`
+(`_prefill_thrash_cooldowns` + the `_…_prefill_thrash…` helpers); unit and
+routing-level behaviour are pinned by `proxy/tests/test_prefill_thrash_cooldown.py`.
+
 #### Regression coverage for the prefill-thrash wedge
 
 `proxy/tests/test_prefill_thrash_wedge.py` reproduces the 2026-10-23 02:00-

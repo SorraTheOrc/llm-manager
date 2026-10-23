@@ -106,6 +106,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _call_with_backend_retries,
     _call_with_empty_retry,
     _check_slot_availability,
+    _clear_prefill_thrash_cooldown,
     _client_identity_extra,
     _compute_request_timeout,
     _decrement_active_queries,
@@ -118,12 +119,14 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _get_first_byte_timeout_seconds,
     _get_lease_timeout_seconds,
     _get_prefill_deadline_seconds,
+    _get_prefill_thrash_cooldown_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
     _increment_local_active_queries,
     _increment_per_model_query,
     _normalize_outgoing_headers,
+    _record_prefill_thrash_cooldown,
     _request_dedup_hash,
     _schedule_recv_token_increment,
     _schedule_token_increment,
@@ -1468,6 +1471,12 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             model_name=model_name,
                             slot_id=slot_id,
                         )
+                        # LP-0MVKUKFHH005UDWL AC3: a successful local first
+                        # byte clears the session's post-deadline cooldown —
+                        # this dispatch just proved prefill works again, so
+                        # the next request may route local without waiting
+                        # out the window.
+                        _clear_prefill_thrash_cooldown(session_id)
                         srv.backend_ready = True
                         # LP-0MUGQHPJ50046LV8: pin the stream context manager
                         # on the dispatch record so the watchdog can cancel the
@@ -1511,6 +1520,30 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                         session_id if session_id else "unknown",
                                         _prefill_deadline,
                                     )
+                                    # LP-0MVKUKFHH005UDWL: the deadline just
+                                    # proved this session cannot get a first
+                                    # byte inside the window — re-dispatching
+                                    # the identical prompt would burn the
+                                    # whole prefill again (the incident's 41
+                                    # local POSTs). Arm the session cooldown
+                                    # so the next request from this session
+                                    # skips local (provider.py) until it
+                                    # expires or a successful first byte
+                                    # clears it.
+                                    _prefill_cooldown_deadline = (
+                                        _record_prefill_thrash_cooldown(
+                                            session_id, server_config
+                                        )
+                                    )
+                                    if _prefill_cooldown_deadline > 0:
+                                        srv.logger.info(
+                                            "prefill_thrash_cooldown_started "
+                                            "session=%s cooldown_s=%.0f",
+                                            session_id if session_id else "unknown",
+                                            _get_prefill_thrash_cooldown_seconds(
+                                                server_config
+                                            ),
+                                        )
                                 else:
                                     srv.logger.warning(
                                         "dispatch_first_byte_timeout session=%s "

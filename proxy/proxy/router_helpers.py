@@ -892,6 +892,122 @@ def _get_prefill_deadline_seconds(srv) -> float:
         return 840.0
 
 
+# ===================================================================
+# Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL)
+# ===================================================================
+#
+# Root cause 3 of 3 of the 2026-10-23 wedged prefill incident
+# (LP-0MVKN9IRP003XJH6): after ``prefill_deadline_exceeded`` cancels a local
+# dispatch, the client re-dispatched the *identical* prompt and burned the
+# whole prefill again — 41 local POSTs in the incident hour (35 inside
+# 02:00-03:00) re-prefilling near-duplicates of the same 28k-124k-token
+# prompts (93,038 x2, 93,006 x3, …) with zero tokens delivered.
+#
+# The cooldown is a per-session, in-process window armed by router.py when
+# the prefill deadline fires. While it is armed, provider.py skips local for
+# that session (``routing_skip_local reason=prefill_thrash_cooldown``) so the
+# request reaches the next provider immediately instead of re-prefilling.
+# Other sessions are untouched. The window is cleared on expiry (lazy prune)
+# and on a successful local first byte, and ``0`` disables it (documented
+# rollback).
+
+DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS = 600.0
+"""Default post-deadline cooldown for a thrashing session (10 minutes)."""
+
+#: Session id → monotonic deadline. In-process by design: a proxy restart
+#: resets the routing state, exactly like the dispatch leases it guards.
+_prefill_thrash_cooldowns: dict[str, float] = {}
+
+
+def _prefill_thrash_config_section(config) -> Mapping:
+    """Return the ``server`` config section of *config* (flat configs too)."""
+    if not isinstance(config, Mapping):
+        return {}
+    server = config.get("server")
+    if isinstance(server, Mapping):
+        return server
+    return config
+
+
+def _get_prefill_thrash_cooldown_seconds(config) -> float:
+    """Return the post-deadline cooldown in seconds (default 600; 0 disables).
+
+    ``server.local_prefill_thrash_cooldown_seconds`` is the rollback knob: 0
+    disables the cooldown entirely (both the arming on a deadline event and
+    the routing skip). A missing or malformed value falls back to the default
+    so a config typo cannot silently switch the protection off.
+    """
+    section = _prefill_thrash_config_section(config)
+    raw = section.get(
+        "local_prefill_thrash_cooldown_seconds",
+        DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS,
+    )
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS
+    return max(0.0, seconds)
+
+
+def _record_prefill_thrash_cooldown(session_id, config, now=None) -> float:
+    """Arm (or re-arm) *session_id*'s cooldown; return its deadline.
+
+    Called by router.py when ``prefill_deadline_exceeded`` cancels a local
+    dispatch. Returns the monotonic deadline, or 0 when the cooldown is
+    disabled or no session id is known (a cooldown needs a session to scope
+    to — an anonymous one-shot request has nothing to suppress).
+    """
+    if not session_id:
+        return 0.0
+    seconds = _get_prefill_thrash_cooldown_seconds(config)
+    if seconds <= 0:
+        _prefill_thrash_cooldowns.pop(session_id, None)
+        return 0.0
+    _now = time.monotonic() if now is None else now
+    deadline = _now + seconds
+    _prefill_thrash_cooldowns[session_id] = deadline
+    return deadline
+
+
+def _prefill_thrash_cooldown_remaining(session_id, config=None, now=None) -> float:
+    """Return the seconds left in *session_id*'s cooldown (0 when clear).
+
+    Expired windows are pruned here, so expiry needs no timer. A live config
+    flip to 0 also clears the window (documented rollback).
+    """
+    if not session_id:
+        return 0.0
+    deadline = _prefill_thrash_cooldowns.get(session_id)
+    if deadline is None:
+        return 0.0
+    if config is not None and _get_prefill_thrash_cooldown_seconds(config) <= 0:
+        _prefill_thrash_cooldowns.pop(session_id, None)
+        return 0.0
+    _now = time.monotonic() if now is None else now
+    remaining = deadline - _now
+    if remaining <= 0:
+        _prefill_thrash_cooldowns.pop(session_id, None)
+        return 0.0
+    return remaining
+
+
+def _clear_prefill_thrash_cooldown(session_id) -> bool:
+    """Clear *session_id*'s cooldown; return True when one was armed.
+
+    Called by router.py on a successful local first byte: a healthy dispatch
+    proves prefill works for this session again, so holding it off local would
+    only cost the local answer.
+    """
+    if not session_id:
+        return False
+    return _prefill_thrash_cooldowns.pop(session_id, None) is not None
+
+
+def _reset_prefill_thrash_cooldowns() -> None:
+    """Clear every cooldown window (test isolation / explicit reset)."""
+    _prefill_thrash_cooldowns.clear()
+
+
 #: Cached-token ratio at or above which a local dispatch counts as a
 #: warm-cache request for the re-scoped AC2 first-byte metric
 #: (LP-0MV6CFMU9005WU2E). Matching the routing intent: a request whose prompt
