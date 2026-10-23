@@ -6421,3 +6421,187 @@ class TestMachineReadablePrefillAndBusyJson:
         out = capsys.readouterr().out
         assert "local model busy (dispatch → finish)" in out
         assert "decode-only busy (lower bound)" in out
+
+
+# ---------------------------------------------------------------------------
+# Regenerated report end-to-end verification (LP-0MVJO4382002FJF2)
+# ---------------------------------------------------------------------------
+
+
+class TestRegeneratedReportExpectedOrder:
+    """End-to-end verification of a regenerated report.
+
+    The fixture mirrors the intake brief's measured shape
+    (LP-0MVGCQ421005IXGC): per-stream prefill (dispatch → first byte)
+    dominates decode (first byte → finish) at a 180 s / 100 s ratio (the
+    brief's ≈14.3 h prefill vs ≈7.8 h decode), and the six streams are spaced
+    so their dispatch → finish intervals never overlap. That reproduces the
+    brief's expected order — ≈16 % decode-only busy becoming ≈46 % busy
+    (dispatch → finish union) — so the regenerated report must show the
+    corrected figure and the new ``## Prefill vs decode`` breakdown
+    (LP-0MVJO4382002FJF2 AC1/AC2/AC3/AC5).
+    """
+
+    PREFILL_S = 180.0
+    DECODE_S = 100.0
+    STREAMS = 6
+
+    @classmethod
+    def _stream_events(cls, index: int) -> list[str]:
+        """One local stream: dispatch at 14:0X:00, first byte after the
+        180 s prefill, finish after a further 100 s decode. The
+        ``dispatch_first_byte_ms`` line is stamped at first-byte time (real
+        proxy format) and carries the prefill duration."""
+        first_byte = datetime(2026, 8, 2, 14, 0, 0) + timedelta(
+            minutes=2 + index * 10, seconds=cls.PREFILL_S
+        )
+        finish = first_byte + timedelta(seconds=cls.DECODE_S)
+        session = f"verify-s{index}"
+        ts = first_byte.strftime("%Y-%m-%d %H:%M:%S")
+        return [
+            f"{ts},000 - INFO - Stream started: provider=local model=Qwen3 session={session} request=[]",
+            f"{finish.strftime('%Y-%m-%d %H:%M:%S')},000 - INFO - Stream finished: "
+            f"reason=stop tokens=1000/100/1100 session={session} provider=local model=Qwen3 request=[]",
+            f"{ts},000 - INFO - dispatch_first_byte_ms={cls.PREFILL_S * 1000.0:.1f} "
+            f"dispatch_to_first_byte_ms={cls.PREFILL_S * 1000.0 - 1.0:.1f} "
+            f"cache_state=warm cached_ratio=0.900 queue_wait_ms=0.0 "
+            f"session={session} model=Qwen3",
+        ]
+
+    @classmethod
+    def _write_logs(cls, tmp_path: Path, with_llama_log: bool = True) -> Path:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True)
+        lines = [
+            line
+            for index in range(cls.STREAMS)
+            for line in cls._stream_events(index)
+        ]
+        (log_dir / "proxy.log").write_text("\n".join(lines) + "\n")
+        if with_llama_log:
+            (log_dir / "llama-server.log").write_text(
+                fixtures.QWEN3_SPAWN_LINE
+                + "\n" + fixtures.PROMPT_EVAL_REAL
+                + "\n" + fixtures.DECODE_EVAL_REAL
+                + "\n" + fixtures.PROMPT_EVAL_REAL2
+                + "\n" + fixtures.DECODE_EVAL_REAL2
+                + "\n"
+            )
+        return log_dir
+
+    @staticmethod
+    def _row(section: str, label: str) -> list[str]:
+        line = next(
+            ln for ln in section.splitlines() if ln.startswith(f"| {label}")
+        )
+        return [cell.strip() for cell in line.strip("|").split("|")]
+
+    def test_regenerated_report_shows_corrected_busy_and_phase_split(self, tmp_path):
+        """AC1/AC3/AC5: the regenerated report over a brief-shaped window
+        shows the dispatch → finish busy figure as the upper bound with the
+        decode-only figure retained as the labelled lower bound plus the
+        definition-change note, and the busy % is materially higher than the
+        pre-change decode-only busy % (≈16 % → ≈46 % expected order)."""
+        log_dir = self._write_logs(tmp_path)
+        out_dir = tmp_path / "out"
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out_dir,
+            config=None,
+        )
+        md = (out_dir / "report.md").read_text()
+
+        # -- Local model utilization: both figures + definition-change note --
+        util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "Busy = at least one local slot active **from dispatch to finish**" in util
+        assert "previously counted decode only" in util
+        # 6 × 280 s dispatch→finish = 1680 s = 46.7% of the 1 h window.
+        assert "| Busy time — upper bound (dispatch → finish) | 28m 00s (46.7%)" in util
+        # Retained decode-only lower bound: 6 × 100 s = 600 s = 16.7%.
+        assert "| Decode-only busy — lower bound (`Stream started` → finish) | 10m 00s (16.7%)" in util
+        # Prefill busy = upper − lower = 1080 s.
+        assert "| Prefill busy (upper − lower) | 18m 00s |" in util
+
+        # -- Prefill vs decode split: prefill dominant, totals to 100% --
+        section = md.split("## Prefill vs decode", 1)[1].split("\n## ", 1)[0]
+        assert "slot-seconds" in section and "not wall-clock" in section
+        prefill = self._row(section, "Prefill (dispatch → first byte)")
+        decode = self._row(section, "Decode (first byte → finish)")
+        assert prefill[1] == "18m 00s"
+        assert decode[1] == "10m 00s"
+        assert float(prefill[2].rstrip("%")) == pytest.approx(64.3, abs=0.1)
+        assert float(decode[2].rstrip("%")) == pytest.approx(35.7, abs=0.1)
+        assert float(prefill[2].rstrip("%")) + float(decode[2].rstrip("%")) == pytest.approx(100.0)
+        total = self._row(section, "Total")
+        assert total[1] == "28m 00s" and total[2] == "100.0%"
+
+        # -- Busy % materially higher than the decode-only busy % (AC5) --
+        busy = result.summary.busy
+        assert busy is not None
+        decode_pct = busy.decode_busy_seconds / busy.window_seconds * 100
+        assert 15.0 <= decode_pct <= 17.5  # brief's ≈16 %
+        assert 44.0 <= busy.busy_pct <= 49.0  # brief's ≈46 %
+        assert busy.busy_pct >= 2.5 * decode_pct  # materially higher, same order
+
+    def test_speed_sections_are_never_an_unattributed_blank(self, tmp_path):
+        """AC4: ``## Decode speed`` / ``## Prompt eval speed`` render real
+        samples when llama-server eval timing exists, or a named,
+        self-diagnosing reason (log dir + scanned files, never a bare blank)
+        when it does not."""
+        for with_llama_log in (True, False):
+            log_dir = self._write_logs(
+                tmp_path / f"logs_{with_llama_log}", with_llama_log=with_llama_log
+            )
+            out_dir = tmp_path / f"out_{with_llama_log}"
+            reporting.run_analysis(
+                log_dir=log_dir,
+                window_start=WINDOW_START,
+                window_end=WINDOW_END,
+                output_dir=out_dir,
+                config=None,
+            )
+            md = (out_dir / "report.md").read_text()
+            for title in ("## Decode speed", "## Prompt eval speed"):
+                section = md.split(title, 1)[1].split("\n## ", 1)[0]
+                assert "| Model | Bucket | Samples |" in section or (
+                    "No llama-server eval timing samples" in section
+                    and "**Why no eval-timing samples**" in section
+                    and "Log directory scanned: `" in section
+                ), f"{title} in run with_llama_log={with_llama_log} is an unattributed blank"
+
+    def test_json_summary_matches_report_phase_split(self, tmp_path):
+        """AC2/AC5 cross-check: the machine-readable summary carries the same
+        corrected busy figure and phase split as the report, and the busy
+        union decomposes into decode lower bound + prefill span."""
+        log_dir = self._write_logs(tmp_path)
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out_json",
+            config=None,
+        )
+        data = reporting.summary_to_json(result.summary)
+        busy = data["local_busy"]
+        assert busy["definition"] == "dispatch_to_finish"
+        assert busy["busy_seconds"] == pytest.approx(1680.0)
+        assert busy["decode_busy_seconds"] == pytest.approx(600.0)
+        assert busy["prefill_busy_seconds"] == pytest.approx(1080.0)
+        assert busy["busy_pct"] == pytest.approx(1680.0 / 3600 * 100, abs=0.05)
+        assert busy["prefill_busy_seconds"] == pytest.approx(
+            busy["busy_seconds"] - busy["decode_busy_seconds"]
+        )
+        phase = busy["prefill_vs_decode"]
+        assert phase["unit"] == aggregation.SLOT_SECONDS_UNIT
+        assert phase["prefill"]["slot_seconds"] == pytest.approx(1080.0)
+        assert phase["decode"]["slot_seconds"] == pytest.approx(600.0)
+        assert phase["prefill"]["pct"] + phase["decode"]["pct"] == pytest.approx(100.0)
+        # The brief's expected-order sanity check: prefill ≈ 14.3 h / decode
+        # ≈ 7.8 h → prefill ≈ 65 % of combined phase slot-time.
+        assert 60.0 <= phase["prefill"]["pct"] <= 70.0
+        prefill = data["local_prefill"]
+        assert prefill["slot_seconds"] == pytest.approx(1080.0)
+        assert prefill["count"] == 6
+        json.dumps(data)  # round-trips
