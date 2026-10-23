@@ -79,10 +79,21 @@
    ```bash
    sudo systemctl restart llama-proxy
    ```
-   Or restart the proxy process directly:
+   Or restart the proxy process directly (`--restart` kills the running proxy
+   and detaches the replacement by default — the launcher prints one handoff
+   line and exits 0, so poll `/health`; startup failures land in
+   `/tmp/proxy-startup.log`, use `--log-file <path>` to move it):
    ```bash
-   pkill -f 'uvicorn proxy.server' && sleep 2 && bash proxy/scripts/start-proxy.sh
+   bash proxy/scripts/start-proxy.sh --restart
+   curl -sf http://127.0.0.1:8000/health
    ```
+
+   > **If the proxy alone is dead while llama-server/TTS are alive, and the
+   > triggering command timed out (`Command timed out after <N> seconds`) after
+   > running `start-proxy.sh` in the foreground:** that is the tool-timeout
+   > failure mode of LP-0MVGT0E6W000Q8CY (log ends with no `Shutting down`
+   > line). Recover with `bash proxy/scripts/start-proxy.sh --restart`; a warm
+   > llama-server is preserved by default when its signature matches.
 
 2. **Restart llama-server** (if the backend is unresponsive or crashed):
    ```bash

@@ -40,6 +40,18 @@ set -euo pipefail
 #               consumed here and never forwarded to uvicorn
 #               (LP-0MVF7DRMK001NHT8).
 #
+# Detached launch contract (LP-0MVGT0E6W000Q8CY): by default every
+# pre-launch check (port free, provider API keys resolved, config readable,
+# restart/cleanup) runs synchronously; then uvicorn is launched in its own
+# session with stdout/stderr in the log file, one handoff line is printed
+# (child PID, log path, curl /health command) and the script exits 0. Startup
+# failures AFTER the handoff (bind errors, model load, import errors) appear
+# only in the log — the exit code cannot report them, so callers MUST poll
+# /health instead of relying on the launcher's status. Never run in the
+# foreground under an agent tool call: a tool-call timeout SIGKILLs the whole
+# process group, taking uvicorn down with it; use `--foreground` only for an
+# interactive terminal session.
+#
 # Automatically resolves required API keys from:
 #   1. Environment variables (already set) — verified against auth.json; a
 #      stale value refuses startup unless --use-env-keys /
