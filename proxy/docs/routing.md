@@ -1003,6 +1003,32 @@ SSE headers arrive. Frames *before* the headers (the strict prefill window)
 need the local dispatch to return a streaming response before the upstream
 first byte; that gap is tracked separately.
 
+#### Regression coverage for the prefill-thrash wedge
+
+`proxy/tests/test_prefill_thrash_wedge.py` reproduces the 2026-10-23 02:00-
+03:00 incident (LP-0MVKN9IRP003XJH6): a session whose prefill never produces a
+first byte hits `prefill_deadline_exceeded`, detours, and — pre-fix — the
+detour only marks the dispatch record inactive with a future `expires_at`
+(`lease_renewed timeout=…s`) while the `local_prefill_in_flight` marker
+survives. The same session re-acquires immediately (`_extend_lease_during_prefill`
+refreshes `last_progress_ts` from the in-flight marker, so the 180 s
+no-progress watchdog never fires), and for anonymous sessions the leaked
+marker saturates the prefill cap so every other session is denied
+(`local_dispatch_denied` / `contention_queue_fallback_after_queue
+reason=local_lease_active`).
+
+The module drives the real routing helpers (`_try_acquire_local_dispatch`,
+`_await_first_byte_with_prefill_monitor`, `_extend_lease_during_prefill`,
+`_cleanup_after_request`, `_cleanup_stale_local_dispatch`) with a stubbed
+stale-`/slots` llama-server and an injected monotonic clock, so the whole
+5-minute simulated window runs in well under a second. Its post-fix contract
+assertions — lease and in-flight marker released on the detour, at most one
+local dispatch inside the window — are carried as
+`pytest.mark.xfail(strict=True)` during the RED phase (the repo convention, cf.
+`tests/test_events_first_frame_bound.py`) and are flipped to green, markers
+removed, by LP-0MVKUKFHH005UDWL (post-deadline thrash cooldown) and
+LP-0MVKUKFSO008GI6O (truthful lease and in-flight accounting).
+
 When a routed stream fails, the proxy follows a **recovery-first** strategy
 with an **informative-error fallback** (from the Aug 3 error analysis,
 LP-0MSDFKCK4007CPMY; see `proxy/docs/error-analysis-2026-08-03.md`):
