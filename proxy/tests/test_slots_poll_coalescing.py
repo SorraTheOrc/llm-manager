@@ -203,7 +203,8 @@ async def test_query_slots_updates_last_known_counts(monkeypatch):
 #
 # The eight tests above are happy-path / TTL / backoff only: neither
 # cancellation path (leader cancelled, leader vanished) is exercised, which is
-# what these three regression tests pin.
+# what these three cancellation regression tests pin (the fourth test here
+# covers the unobserved-failure warning, LP-0MVK6QUAQ002KFHU).
 #
 # These tests were written failing-first under ``xfail(strict=True)`` on
 # LP-0MVK1YCVV007HNAG (pre-fix RED output recorded there).
@@ -211,6 +212,22 @@ async def test_query_slots_updates_last_known_counts(monkeypatch):
 # cancellation and bounded the follower wait, and removed the markers so each
 # assertion is now enforced (RED-before / GREEN-after evidence is recorded on
 # that item).
+#
+# Leak-warning assertions and the ``asyncio`` logger (LP-0MVK6QUAQ002KFHU)
+# ---------------------------------------------------------------------------
+# "Future exception was never retrieved" is emitted from ``Future.__del__``,
+# not when the future settles, so it lands in whichever test happens to run the
+# cyclic ``gc.collect()`` that reclaims the traceback cycle. Because the
+# ``asyncio`` logger is process-global, a warning caused by an *earlier* test
+# would otherwise fail a leak assertion here (the 7f7785db flake: the warning
+# came from ``test_slots_500_fix``'s stubbed ConnectionError). Two rules follow:
+#
+#   1. Collect *before* opening a leak-warning window (``gc.collect()`` then
+#      ``caplog.clear()``) so the window covers only objects the test creates.
+#   2. Production code must not leave an unobserved future exception behind at
+#      all — a leader's failure is marked as retrieved by its owner, since the
+#      usual case is a lone poller that nothing follows
+#      (``_consume_slots_inflight_outcome``).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _URL = "http://localhost:8080/slots?model=m"
@@ -366,6 +383,14 @@ async def test_cancelled_leader_leaves_no_pending_future_or_leak_warnings(caplog
     loop = asyncio.get_running_loop()
     previous_debug = loop.get_debug()
     loop.set_debug(True)
+    # The ``asyncio`` logger is process-global: "Future exception was never
+    # retrieved" is emitted from ``Future.__del__``, i.e. whenever the cyclic
+    # GC happens to reclaim the future's traceback cycle. Collect first, then
+    # drop those records, so this test's verdict covers only warnings emitted
+    # for objects it creates itself rather than leftovers from any earlier test
+    # in the same process (LP-0MVK6QUAQ002KFHU).
+    gc.collect()
+    caplog.clear()
     caplog.set_level(logging.ERROR, logger="asyncio")
     baseline_tasks = asyncio.all_tasks()
     client = _StallingClient(delay=30.0)
@@ -421,3 +446,52 @@ async def test_cancelled_leader_leaves_no_pending_future_or_leak_warnings(caplog
         if shared is not None and not shared.done():
             shared.cancel()
         loop.set_debug(previous_debug)
+
+
+@pytest.mark.asyncio
+async def test_leader_failure_without_follower_logs_no_never_retrieved(caplog):
+    """A failed leader with no follower must not log a late asyncio warning.
+
+    LP-0MVK6QUAQ002KFHU: the shared future is a broadcast channel that is
+    *usually* unobserved — the common case is a single poller whose fetch
+    fails (ConnectionError on a restarting llama-server). Setting the failure
+    on a future nobody retrieves makes ``Future.__del__`` log "Future exception
+    was never retrieved" whenever the GC later reclaims the traceback cycle,
+    which is both production log noise and a cross-test flake source: that
+    message lands in whichever *later* test happens to run ``gc.collect()``.
+
+    The leader re-raises to its own caller (unchanged), while the shared
+    future's outage is marked as retrieved by its owner.
+    """
+
+    class _RefusingClient:
+        async def get(self, url):
+            raise ConnectionError("connection refused")
+
+    # Collect first so warnings from earlier tests land outside this window.
+    gc.collect()
+    caplog.clear()
+    caplog.set_level(logging.ERROR, logger="asyncio")
+
+    with pytest.raises(ConnectionError):
+        await obs._fetch_slots_payload(_URL, 2.0, _RefusingClient())
+
+    # The failure's traceback holds a reference cycle back to the shared
+    # future, so only a cyclic collection finalises it — exactly the delayed
+    # window in which the warning used to surface.
+    gc.collect()
+    await asyncio.sleep(0)
+    gc.collect()
+
+    noisy = [
+        record.getMessage()
+        for record in caplog.records
+        if any(fragment in record.getMessage() for fragment in _LEAK_WARNING_FRAGMENTS)
+    ]
+    assert not noisy, (
+        f"a failed /slots leader left an unretrieved future exception: {noisy}"
+    )
+    assert obs._slots_poll_inflight.get(_URL) is None, (
+        "the single-flight registry entry must not leak after a failed leader "
+        "with no followers"
+    )

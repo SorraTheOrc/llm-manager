@@ -45,6 +45,7 @@ See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
 
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -226,7 +227,10 @@ def last_known_slot_counts() -> tuple[int, int] | None:
 #
 #   1. The shared single-flight future is ALWAYS settled before its owner
 #      stops owning it: ``set_result``/``set_exception`` on a completed fetch,
-#      or ``cancel()`` when the leader itself is cancelled. The second case is
+#      or ``cancel()`` when the leader itself is cancelled. A failure nobody is
+#      following is marked as retrieved by its owner (``_consume_slots_inflight_outcome``)
+#      so asyncio logs no "Future exception was never retrieved" at arbitrary
+#      GC times for the usual lone-failure case (LP-0MVK6QUAQ002KFHU). The second case is
 #      the 2026-10-22 Web UI freeze: ``asyncio.CancelledError`` derives from
 #      ``BaseException``, so a browser disconnect cancelling the SSE handler
 #      bypassed the old ``except Exception`` and left the future pending with
@@ -346,9 +350,31 @@ async def _do_slots_fetch(
     return status, None
 
 
+def _consume_slots_inflight_outcome(fut: "asyncio.Future") -> None:
+    """Retrieve a settled shared future's outcome so asyncio logs no late warning.
+
+    The single-flight future is a broadcast channel that is usually
+    *unobserved*: the common case is a lone poller whose ``/slots`` fetch fails
+    (e.g. ConnectionError while llama-server restarts) and no follower ever
+    calls ``fut.result()``. A settled exception nobody retrieves makes
+    ``Future.__del__`` log "Future exception was never retrieved" whenever the
+    cyclic GC later reclaims the traceback cycle -- production log noise whose
+    timestamp is pure GC timing, and a cross-test flake source in the suite
+    (LP-0MVK6QUAQ002KFHU). Calling ``exception()`` here marks the outcome as
+    observed without changing semantics: a follower that does call
+    ``fut.result()`` still re-raises the leader's failure.
+    """
+    if fut.cancelled():
+        return
+    with contextlib.suppress(BaseException):
+        fut.exception()
+
+
 def _new_slots_inflight_future() -> "asyncio.Future":
     """Create the shared single-flight future on the running loop."""
-    return asyncio.get_running_loop().create_future()
+    fut = asyncio.get_running_loop().create_future()
+    fut.add_done_callback(_consume_slots_inflight_outcome)
+    return fut
 
 
 async def _release_slots_inflight(url: str, fut: "asyncio.Future") -> None:
