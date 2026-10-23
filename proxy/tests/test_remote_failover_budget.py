@@ -14,6 +14,14 @@ These tests assert observable stream behaviour via the public
 - AC2: the retry budget is configurable and the exhaustion is logged.
 - AC4: bounded failover for a stalling-then-empty upstream.
 - Content-bearing streams are unaffected by the pre-content budget.
+
+Attempt-count assertions are deliberately jitter-tolerant bounds (``<= N``)
+rather than exact counts (LP-0MVK8BMGW0059W5S): at these tiny test budgets the
+number of attempts a stalled upstream gets before the wall-clock deadline
+depends on scheduler jitter, so a stalled-first-attempt can legitimately
+exhaust the budget after one call under load. The deterministic proofs are the
+terminal ``retry_budget_exhausted`` event and the budget value carried in the
+failover warning log.
 """
 
 import asyncio
@@ -205,11 +213,13 @@ async def test_failover_budget_bounds_stalling_gateway():
     elapsed = time.monotonic() - start
 
     assert isinstance(result, StreamingResponse)
-    # Initial attempt + one bounded retry (0.1s stall + 0.02s backoff +
-    # remaining 0.08s capped read = ~0.2s budget), not the full 1 + 3
-    # retries (4 x idle timeout).
-    assert client.stream.call_count == 2, (
-        f"expected 2 stream() calls (bounded failover), got {client.stream.call_count}"
+    # Initial attempt + at most one bounded retry (0.1s stall + 0.02s backoff
+    # + remaining 0.08s capped read = ~0.2s budget), never the full 1 + 3
+    # retries (4 x idle timeout). The bound is what matters: under load the
+    # first stall can straddle the 0.2s deadline and legitimately exhaust the
+    # budget after a single attempt (LP-0MVK8BMGW0059W5S).
+    assert 1 <= client.stream.call_count <= 2, (
+        f"expected bounded stream() calls (<=2), got {client.stream.call_count}"
     )
     assert elapsed < 1.0, f"failover took {elapsed:.2f}s (budget 0.2s)"
     assert _last_error_type(collected) == "retry_budget_exhausted"
@@ -295,7 +305,12 @@ async def test_failover_budget_read_from_config_and_logged():
         upstream_retry_connect_timeout_seconds=0.05,
     )
 
-    assert client.stream.call_count == 2
+    # Bounded by the 0.1s config budget; the exact attempt count depends on
+    # wall-clock jitter around the deadline (LP-0MVK8BMGW0059W5S). The config
+    # value is proven deterministically by the budget-log assertion below.
+    assert 1 <= client.stream.call_count <= 2, (
+        f"expected bounded stream() calls (<=2), got {client.stream.call_count}"
+    )
     assert _last_error_type(collected) == "retry_budget_exhausted"
 
     budget_logs = [
@@ -343,9 +358,33 @@ async def test_failover_budget_param_overrides_config():
     )
     elapsed = time.monotonic() - start
 
-    assert client.stream.call_count == 2
+    # Bounded by the 0.1s explicit budget; the exact attempt count depends on
+    # wall-clock jitter around the deadline (LP-0MVK8BMGW0059W5S) because the
+    # first stall alone can straddle the budget under load. The override is
+    # proven deterministically by the terminal error type and the budget value
+    # in the warning log: a config-300 budget would exhaust
+    # upstream_retry_max_attempts first and emit `stall_exhausted` after 4 calls.
+    assert 1 <= client.stream.call_count <= 2, (
+        f"expected bounded stream() calls (<=2), got {client.stream.call_count}"
+    )
     assert elapsed < 1.0, f"explicit param did not override config: {elapsed:.2f}s"
     assert _last_error_type(collected) == "retry_budget_exhausted"
+
+    budget_logs = [
+        call for call in srv.logger.warning.call_args_list
+        if "failover budget exhausted" in str(call.args[0])
+    ]
+    assert len(budget_logs) == 1, (
+        f"expected exactly one failover-budget warning, got {len(budget_logs)}"
+    )
+    # The explicit parameter (0.1s) must win over the config value (300s).
+    assert 0.1 in budget_logs[0].args, (
+        f"explicit param must override config: expected budget 0.1, "
+        f"got {budget_logs[0].args}"
+    )
+    assert 300 not in budget_logs[0].args, (
+        f"config budget 300 must not be used: {budget_logs[0].args}"
+    )
 
 
 # ===================================================================
