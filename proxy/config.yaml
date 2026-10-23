@@ -1454,14 +1454,21 @@ server:
   #   signal under load — llama-server holds it for the duration of a
   #   prompt-processing batch (measured 8.7s, then >15s, versus the 1s
   #   ``STATUS_QUERY_TIMEOUT``), and a queued request's slot reports
-  #   ``is_processing=False``. The extension therefore also refreshes
-  #   ``last_progress_ts`` whenever the upstream request is still in flight
-  #   with no error (``prefill_in_flight``), which is authoritative and does not
+  #   ``is_processing=False``. The extension therefore also keeps the lease
+  #   valid whenever the caller's OWN upstream request is still in flight with
+  #   no error (``prefill_in_flight``), which is authoritative and does not
   #   depend on ``/slots``. Without it every prefill or queue wait longer than
   #   this timeout was released, its upstream stream cancelled, and the client
-  #   retried into a full re-prefill forever. A genuinely wedged slot (no
-  #   response, no chunks) is still bounded by
-  #   ``local_dispatch_max_prefill_seconds`` below.
+  #   retried into a full re-prefill forever.
+  #   NOTE (LP-0MVKUKFSO008GI6O): an open request is NOT progress. The in-flight
+  #   signal pushes ``expires_at`` out but does NOT refresh ``last_progress_ts``,
+  #   so a genuinely progress-less in-flight record is still released by this
+  #   timeout (only observed numeric progress or observed slot liveness refreshes
+  #   the clock). Refreshing it on the in-flight signal alone defeated this
+  #   watchdog and held the local pool ~4 h on 2026-10-23. The in-flight signal
+  #   is also own-session only (another session's marker never extends this
+  #   lease), and ``local_dispatch_max_prefill_seconds`` below remains the
+  #   lifetime backstop.
   #   NOTE (LP-0MVIQ0FJC000YLX0): the orphan-cleanup sweep now applies the SAME
   #   fail-closed rule at the point of release — an expired active lease whose
   #   ``/slots`` probe is inconclusive (timeout/error/no slot) but whose
@@ -1502,7 +1509,11 @@ server:
   #   so a request admitted inside its budget is never cut off, and BELOW the
   #   840 s wedge ceiling so it is the bound that actually fires. Precedence:
   #   deadline < first-byte ceiling < ``local_dispatch_max_prefill_seconds``.
-  #   Logged as ``prefill_deadline_exceeded`` when it is what fired.
+  #   Logged as ``prefill_deadline_exceeded`` when it is what fired. On that
+  #   event the dispatch record and the session's
+  #   ``local_prefill_in_flight`` marker are released immediately
+  #   (``lease_released reason=prefill_deadline``) — a dispatch that never
+  #   produced a byte retains nothing (LP-0MVKUKFSO008GI6O).
   # local_dispatch_prefill_observability_warn_seconds: Threshold (default 30s) at
   #   which a long initial first-byte wait logs a ``prefill_wait_exceeds_threshold``
   #   warning. While awaiting the SSE response headers, the proxy polls prefill

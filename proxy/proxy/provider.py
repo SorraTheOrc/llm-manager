@@ -5375,19 +5375,27 @@ the occupied gate ahead of it* against the budget, so it needs the number of
 
     - the generating concurrency from ``_local_concurrency_info`` (slots that
       will hold the gate while they decode), and
-    - the prefill-in-flight count (``_get_prefill_in_flight_count``), which is
+    - the prefill-in-flight count (``_get_live_prefill_in_flight_count``), which is
       the signal that remains when per-slot prefill progress is unobservable
       (``prefill_progress_unobservable``, ``alive=False``). An in-flight
       prefill must never be read as "free soon".
+
+    LP-0MVKUKFSO008GI6O AC3: only in-flight entries *backed by a live
+    dispatch record* are counted — an orphaned marker (record released by the
+    prefill-deadline release, a non-explicit cleanup, an orphan sweep or a
+    session eviction) must not raise ``busy_slots`` for the rest of the pool.
+    The 2026-10-23 incident shows a single stuck marker reporting
+    ``busy_slots=1 in_flight_prefills=1; available_slots=0`` for every other
+    session.
 
     Never raises: a routing decision must not break on an observability gap.
     """
     in_flight = 0
     try:
         import proxy.server as _srv
-        from proxy.router_helpers import _get_prefill_in_flight_count
+        from proxy.router_helpers import _get_live_prefill_in_flight_count
 
-        in_flight = max(0, int(_get_prefill_in_flight_count(_srv) or 0))
+        in_flight = max(0, int(_get_live_prefill_in_flight_count(_srv) or 0))
     except Exception:
         in_flight = 0
     cur_local = 0

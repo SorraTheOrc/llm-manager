@@ -127,6 +127,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_per_model_query,
     _normalize_outgoing_headers,
     _record_prefill_thrash_cooldown,
+    _release_prefill_deadline_dispatch,
     _request_dedup_hash,
     _schedule_recv_token_increment,
     _schedule_token_increment,
@@ -1505,6 +1506,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # LP-0MVIQ0G2M0006QF6: when the (tighter) prefill
                         # deadline is what fired, log it as the safety detour
                         # so the automatics are attributable.
+                        _prefill_deadline_fired = False
                         if isinstance(_exc, asyncio.TimeoutError):
                             try:
                                 _prefill_deadline = _get_prefill_deadline_seconds(srv)
@@ -1512,6 +1514,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     _prefill_deadline > 0
                                     and _first_byte_ceiling <= _prefill_deadline
                                 ):
+                                    _prefill_deadline_fired = True
                                     srv.logger.warning(
                                         "prefill_deadline_exceeded session=%s "
                                         "deadline=%.0fs → cancelling local "
@@ -1551,6 +1554,18 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                         session_id if session_id else "unknown",
                                         _first_byte_ceiling,
                                     )
+                            except Exception:
+                                pass
+                        # LP-0MVKUKFSO008GI6O AC1: a local dispatch cancelled
+                        # by the prefill deadline never produced a first byte,
+                        # so its lease and in-flight marker must be released
+                        # now — not retained as an inactive record with a
+                        # future ``expires_at`` (the 2026-10-23 ~4 h wedge).
+                        if _prefill_deadline_fired:
+                            try:
+                                await _release_prefill_deadline_dispatch(
+                                    srv, session_id, endpoint=endpoint
+                                )
                             except Exception:
                                 pass
                         srv.backend_ready = False

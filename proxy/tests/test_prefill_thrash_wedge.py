@@ -18,11 +18,14 @@ Mechanics (mirrors the incident evidence):
 1. ``_try_acquire_local_dispatch`` grants the session a dispatch lease and
    marks ``local_prefill_in_flight[session]``.
 2. Prefill produces no first byte; each ``_extend_lease_during_prefill`` poll
-   refreshes ``expires_at``/``last_progress_ts`` from the *in-flight* marker
-   (``lease_extended_during_prefill progress=None alive=False in_flight=True``)
-   — the refresh that keeps the 180s no-progress watchdog from firing.
+   extends ``expires_at`` from the *in-flight* marker
+   (``lease_extended_during_prefill progress=None alive=False in_flight=True``).
+   Pre-fix that poll also refreshed ``last_progress_ts``, which is what kept
+   the 180s no-progress watchdog from ever firing; post-fix (C5 AC4) an open
+   request is not progress, so the clock stays stale and the watchdog remains
+   armed.
 3. The prefill deadline fires (``prefill_deadline_exceeded``, 90s): the
-   request detours and the router runs the dispatch cleanup
+   request detours. Pre-fix the router ran only the generic dispatch cleanup
    (``_cleanup_after_request`` → ``_decrement_local_active_queries`` for the
    explicit path, immediate record deletion for the non-explicit path).
 4. Pre-fix, that cleanup only marks the record inactive with a future
@@ -34,17 +37,21 @@ Mechanics (mirrors the incident evidence):
 5. The leases only cleared via ``lease_released reason=session_evicted``
    ~4 h later.
 
-RED-phase convention
---------------------
-The post-fix contract tests are marked ``pytest.mark.xfail(strict=True)`` so
-``dev`` stays green while the wedge exists (see
-``tests/test_events_first_frame_bound.py`` for the established pattern). With
-the markers in place, ``dev`` is green and the strict-XPASS failure output —
-record + ``local_prefill_in_flight`` retained, immediate re-dispatch — is the
-documented bug reproduction. C4 (post-deadline thrash cooldown) and C5
-(truthful lease and in-flight accounting) flip these to green and remove the
-markers as part of the fix; a regression afterwards re-opens the defect
-loudly.
+Post-fix contract
+-----------------
+C4 (post-deadline thrash cooldown, LP-0MVKUKFHH005UDWL) and C5 (truthful lease
+and in-flight accounting, LP-0MVKUKFSO008GI6O) landed, so the contract tests
+below are green and unmarked: the harness mirrors the *post-fix* router
+sequence and a regression re-opens the defect loudly.
+
+- C5: on ``prefill_deadline_exceeded`` the router now releases the dispatch
+  lease and pops the ``local_prefill_in_flight`` marker
+  (``lease_released reason=prefill_deadline``) before the detour cleanup —
+  ``_detour_cleanup`` below mirrors that order.
+- C4: the session's post-deadline cooldown suppresses re-dispatch
+  (``routing_skip_local reason=prefill_thrash_cooldown``) —
+  ``_prefill_attempt`` consults ``_prefill_thrash_cooldown_remaining`` the
+  same way provider.py does.
 
 Simulation model
 ----------------
@@ -197,7 +204,9 @@ def wedge_srv(monkeypatch, clock: _InjectedClock):
     monkeypatch.setattr(helpers, "_query_prefill_progress", stub)
     monkeypatch.setattr(helpers, "_query_slot_processing", _no_slot_processing)
     contention_queue.reset()
+    helpers._reset_prefill_thrash_cooldowns()
     yield server
+    helpers._reset_prefill_thrash_cooldowns()
     contention_queue.reset()
 
 
@@ -221,6 +230,12 @@ async def _prefill_attempt(
     prefill deadline this item hardens) and detour when it fires. Returns
     True when the dispatch was granted, False when admission refused it.
     """
+    # C4: while the session's post-deadline cooldown is armed, local routing
+    # skips the dispatch (``routing_skip_local reason=prefill_thrash_cooldown``)
+    # — provider.py consults the same helper.
+    if helpers._prefill_thrash_cooldown_remaining(session) > 0:
+        return False
+
     acquired, _owner, _active, _retry_after = await _try_acquire_local_dispatch(
         wedge_srv, max_local=1, session_key=session, backend=None
     )
@@ -254,7 +269,17 @@ async def _prefill_attempt(
 
 
 async def _detour_cleanup(wedge_srv, session: str, *, session_explicit: bool) -> None:
-    """Run the router's post-deadline cleanup (router.py:1524)."""
+    """Run the router's post-deadline detour path.
+
+    Mirrors ``proxy_to_local``'s deadline branch: C5 releases the lease and
+    pops the in-flight marker (``lease_released reason=prefill_deadline``)
+    and the C4 cooldown is armed *before* the generic cleanup runs.
+    """
+    await helpers._release_prefill_deadline_dispatch(wedge_srv, session)
+    if session:
+        helpers._record_prefill_thrash_cooldown(
+            session, wedge_srv.config
+        )
     await _cleanup_after_request(
         wedge_srv,
         session,
@@ -330,25 +355,11 @@ async def _simulate_wedge_window(
     return granted, snapshots
 
 
-_WEDGE_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVKUKEIQ003YOLA pre-fix wedge: a dispatched session whose prefill "
-        "never produces a first byte retains its dispatch record (lease_renewed) "
-        "and local_prefill_in_flight marker and re-dispatches immediately; the "
-        "lease/marker must be released within <=5 min simulated with no "
-        "pre-cooldown re-dispatch. Flip to green and remove this marker when "
-        "C4/C5 land."
-    ),
-)
-
-
 # ---------------------------------------------------------------------------
 # Explicit-session path (lease retention)
 # ---------------------------------------------------------------------------
 
 
-@_WEDGE_XFAIL
 @pytest.mark.asyncio
 async def test_explicit_wedge_released_lease_and_marker_within_five_minutes(
     wedge_srv, clock
@@ -371,7 +382,6 @@ async def test_explicit_wedge_released_lease_and_marker_within_five_minutes(
     assert granted == 1, report
 
 
-@_WEDGE_XFAIL
 @pytest.mark.asyncio
 async def test_explicit_detour_releases_lease_before_any_retry(wedge_srv, clock):
     """Parent AC2: a dispatch that never produced a first byte must not
@@ -397,7 +407,6 @@ async def test_explicit_detour_releases_lease_before_any_retry(wedge_srv, clock)
 # ---------------------------------------------------------------------------
 
 
-@_WEDGE_XFAIL
 @pytest.mark.asyncio
 async def test_anonymous_detour_releases_the_prefill_marker(wedge_srv, clock):
     """AC4 (non-explicit): a detoured anonymous dispatch releases its
@@ -417,7 +426,6 @@ async def test_anonymous_detour_releases_the_prefill_marker(wedge_srv, clock):
     assert helpers._get_prefill_in_flight_count(wedge_srv) == 0, report
 
 
-@_WEDGE_XFAIL
 @pytest.mark.asyncio
 async def test_anonymous_wedge_does_not_deny_the_next_session(wedge_srv, clock):
     """AC4 (non-explicit): after a wedged anonymous dispatch detours, a
@@ -461,6 +469,7 @@ async def test_simulation_determinism_two_runs_identical(wedge_srv, clock):
     assert granted_1 >= 1  # the dispatch gate admitted the first attempt
 
     # Fresh state, shifted epoch: run it again and compare the trace.
+    helpers._reset_prefill_thrash_cooldowns()
     wedge_srv.local_dispatch_records = {}
     wedge_srv.local_prefill_in_flight = {}
     wedge_srv.local_active_queries = 0

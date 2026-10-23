@@ -994,11 +994,21 @@ effective first-byte ceiling is the tighter of this and
 is the bound that fires. On expiry the pending upstream request is cancelled
 (the monitor cancels its `open_task`), the local dispatch aborts with the
 retryable 503 the first-byte ceiling already produces — so the chain detours
-to the next provider — and the dispatch lease/slot is released by the normal
-cleanup path (no orphan survives). The event logs
+to the next provider — and the dispatch lease/slot is released. The event logs
 `prefill_deadline_exceeded session=… deadline=…s` so the detour is
 attributable; `dispatch_first_byte_timeout` is logged when the (looser) wedge
 ceiling is what fired instead.
+
+A dispatch cancelled by the deadline never produced a first byte, so nothing
+was prefilled and nothing is retained: the router calls
+`_release_prefill_deadline_dispatch` in the same branch, which deletes the
+dispatch record and pops the session's `local_prefill_in_flight` marker
+(logged `lease_released session=… reason=prefill_deadline endpoint=…`). Only
+that session's lease/marker are touched. Before this release the cleanup path
+merely marked the record inactive with a *future* `expires_at`
+(`lease_renewed`) and left the marker behind — the mechanism by which one
+wedged session held the local pool for ~4 h on 2026-10-23
+(LP-0MVKUKFSO008GI6O AC1).
 
 The deadline sits **above** the admission budget
 (`contention_queue_max_wait_seconds`, 60 s) so a request legitimately admitted
@@ -1058,15 +1068,46 @@ reason=local_lease_active`).
 
 The module drives the real routing helpers (`_try_acquire_local_dispatch`,
 `_await_first_byte_with_prefill_monitor`, `_extend_lease_during_prefill`,
-`_cleanup_after_request`, `_cleanup_stale_local_dispatch`) with a stubbed
-stale-`/slots` llama-server and an injected monotonic clock, so the whole
-5-minute simulated window runs in well under a second. Its post-fix contract
-assertions — lease and in-flight marker released on the detour, at most one
-local dispatch inside the window — are carried as
-`pytest.mark.xfail(strict=True)` during the RED phase (the repo convention, cf.
-`tests/test_events_first_frame_bound.py`) and are flipped to green, markers
-removed, by LP-0MVKUKFHH005UDWL (post-deadline thrash cooldown) and
-LP-0MVKUKFSO008GI6O (truthful lease and in-flight accounting).
+`_release_prefill_deadline_dispatch`, `_cleanup_after_request`,
+`_cleanup_stale_local_dispatch`) with a stubbed stale-`/slots` llama-server
+and an injected monotonic clock, so the whole 5-minute simulated window runs
+in well under a second. The harness mirrors the post-fix router sequence
+(deadline release → cooldown → cleanup) and its contract assertions — lease
+and in-flight marker released on the detour, at most one local dispatch
+inside the window — are green: LP-0MVKUKFHH005UDWL added the post-deadline
+thrash cooldown and LP-0MVKUKFSO008GI6O added the truthful lease/marker
+accounting.
+
+#### Lease and in-flight truthfulness (LP-0MVKUKFSO008GI6O)
+
+Three accounting rules keep the local gate honest, so one wedged session
+cannot hold the pool:
+
+1. **An open request is not progress.** `_extend_lease_during_prefill` pushes
+   `expires_at` out on the in-flight signal but does **not** refresh
+   `last_progress_ts`. Only observed numeric progress or observed slot
+   liveness (`is_processing`, LP-0MUXQ5QL40027VZ4) advances the no-progress
+   clock, so a genuinely progress-less in-flight record is still released by
+   `local_dispatch_no_progress_timeout_seconds` (180 s) instead of surviving
+   to the 900 s ceiling. The incident's
+   `lease_extended_during_prefill progress=None alive=False in_flight=True`
+   loop refreshed the clock every 10 s and defeated the watchdog.
+2. **The in-flight signal is own-session only.** The trigger is accepted only
+   when `local_prefill_in_flight` holds an entry for the extending record's
+   own session, and the record is addressed by
+   `_dispatch_lease_key(endpoint, session_id)` — another session's open
+   request can never refresh this record's `expires_at`/`last_progress_ts`.
+3. **Occupancy counts only live leases.** The admission gate's
+   `in_flight_prefills` (and therefore `busy_slots`) uses
+   `_get_live_prefill_in_flight_count`, which counts an in-flight marker only
+   when a live (active/unexpired) dispatch record backs it. An orphan marker
+   left by a released/deleted record no longer reports
+   `busy_slots=1 … available_slots=0` for every other session (the incident's
+   52 admission-guard rejections in the hour).
+
+Coverage: `proxy/tests/test_lease_truthfulness.py` (release on deadline,
+two-session extension isolation, orphan-marker occupancy, watchdog firing for
+progress-less in-flight records).
 
 When a routed stream fails, the proxy follows a **recovery-first** strategy
 with an **informative-error fallback** (from the Aug 3 error analysis,

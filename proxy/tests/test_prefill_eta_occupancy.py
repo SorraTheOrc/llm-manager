@@ -331,7 +331,7 @@ async def test_in_flight_prefill_with_unobservable_progress_is_counted(caplog):
     with (
         # No generating occupancy at all: the only occupant is the prefill.
         patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
-        patch("proxy.router_helpers._get_prefill_in_flight_count", lambda _srv: 1),
+        patch("proxy.router_helpers._get_live_prefill_in_flight_count", lambda _srv: 1),
         patch("proxy.provider.request_priority", return_value="low"),
         _guard_patches(),
     ):
@@ -367,7 +367,7 @@ async def test_free_gate_with_no_in_flight_prefill_still_admits(caplog):
 
     with (
         patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
-        patch("proxy.router_helpers._get_prefill_in_flight_count", lambda _srv: 0),
+        patch("proxy.router_helpers._get_live_prefill_in_flight_count", lambda _srv: 0),
         patch("proxy.provider.request_priority", return_value="low"),
         _guard_patches(),
     ):

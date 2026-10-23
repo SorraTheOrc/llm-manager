@@ -1229,6 +1229,25 @@ async def _extend_lease_during_prefill(
       reports ``is_processing=False``. Relying on ``/slots`` alone left the
       extension a no-op in exactly the heavy-load case it targets. The hard
       ``local_dispatch_max_prefill_seconds`` ceiling remains the wedge bound.
+      The in-flight trigger is accepted **only for the caller's own
+      session** — ``local_prefill_in_flight`` is process-wide, so session A's
+      open request must never refresh session B's lease
+      (LP-0MVKUKFSO008GI6O AC2).
+
+    Extension is scoped to the caller's own record: the record is addressed by
+    ``_dispatch_lease_key(endpoint, session_key)``, which embeds the session,
+    and only that record is mutated.
+
+    An open request is **not** progress. The in-flight trigger pushes
+    ``expires_at`` out but does **not** refresh ``last_progress_ts``, so a
+    genuinely progress-less in-flight record is still released by the
+    ``local_dispatch_no_progress_timeout_seconds`` (180s) watchdog
+    (LP-0MVKUKFSO008GI6O AC4). Refreshing the no-progress clock on the
+    in-flight signal alone is what sustained the 2026-10-23 ~4 h wedge:
+    ``lease_extended_during_prefill progress=None alive=False in_flight=True``
+    repeated every 10s defeated the watchdog while no byte was ever produced.
+    Only observed numeric progress or observed slot liveness counts as
+    progress (LP-0MUXQ5QL40027VZ4 liveness behaviour is unchanged).
 
     Liveness cannot hold a lease indefinitely: the
     ``local_dispatch_max_prefill_seconds`` ceiling in
@@ -1271,7 +1290,18 @@ async def _extend_lease_during_prefill(
     # `/slots` blocks for the whole prompt-processing batch, so without this
     # the extension never fired under load and the watchdog killed every
     # prefill/queue wait at 180s. The max-prefill ceiling still bounds a wedge.
-    if not advancing and not alive and not prefill_in_flight:
+    # LP-0MVKUKFSO008GI6O AC2: the in-flight signal is only usable when the
+    # marker belongs to *this* session — ``local_prefill_in_flight`` is a
+    # process-wide map, so another session's open request must never keep this
+    # record's lease alive ("truthful lease and in-flight accounting").
+    in_flight_own = False
+    if prefill_in_flight:
+        try:
+            _markers = getattr(srv, "local_prefill_in_flight", None)
+            in_flight_own = bool(_markers) and session_key in _markers
+        except Exception:
+            in_flight_own = False
+    if not advancing and not alive and not in_flight_own:
         # Unobservable and not processing: no extension. Keeps the adaptive
         # estimate applied at acquisition (fallback).
         return last_progress, False
@@ -1284,14 +1314,29 @@ async def _extend_lease_during_prefill(
         lock = getattr(srv, "local_dispatch_records_lock", None)
         if lock is not None:
             async with lock:
-                record = srv.local_dispatch_records.get(
-                    _dispatch_lease_key(endpoint, session_key)
-                )
+                # LP-0MVKUKFSO008GI6O AC2: the extension is scoped to the
+                # caller's own session record (``_dispatch_lease_key`` embeds
+                # the session), so session A's dispatch can never refresh
+                # session B's lease — the two-session isolation is guaranteed
+                # by key construction, not by incidental absence of markers.
+                record_key = _dispatch_lease_key(endpoint, session_key)
+                record = srv.local_dispatch_records.get(record_key)
                 if record is not None and record.get("active"):
                     record["expires_at"] = time.monotonic() + buffer_seconds
                     if progress is not None:
                         record["last_progress"] = progress
-                    record["last_progress_ts"] = time.monotonic()
+                    # LP-0MVKUKFSO008GI6O AC4: an open request is not
+                    # progress. The in-flight signal (``prefill_in_flight``)
+                    # extends the lease but must NOT refresh the no-progress
+                    # clock, otherwise a wedged in-flight prefill defeats the
+                    # 180s watchdog and holds the pool for hours (2026-10-23
+                    # incident; ``last_progress_ts`` was refreshed every 10s
+                    # with ``progress=None alive=False in_flight=True``). The
+                    # clock advances only on observed numeric progress or
+                    # liveness — a genuinely progress-less in-flight record is
+                    # still released by ``_watchdog_no_progress``.
+                    if advancing or alive:
+                        record["last_progress_ts"] = time.monotonic()
                     extended = True
                     try:
                         srv.logger.info(
@@ -1300,7 +1345,7 @@ async def _extend_lease_during_prefill(
                             session_key if session_key else "unknown",
                             progress,
                             alive,
-                            prefill_in_flight,
+                            in_flight_own,
                             buffer_seconds,
                         )
                     except Exception:
@@ -1636,6 +1681,41 @@ def _get_prefill_in_flight_count(srv) -> int:
         if d is None:
             return 0
         return max(0, int(len(d)))
+    except Exception:
+        return 0
+
+
+def _get_live_prefill_in_flight_count(srv) -> int:
+    """Return the number of in-flight prefills backed by a live dispatch record.
+
+    LP-0MVKUKFSO008GI6O AC3: a prefill-in-flight marker alone is not
+    evidence that a prefill is genuinely in progress — it must be backed by a
+    *live* dispatch record in ``local_dispatch_records``, i.e. an ``active``
+    record (a dispatch that is still running: prefill or generation).
+
+    An orphaned marker (record deleted by the prefill-deadline release, a
+    non-explicit cleanup, an orphan sweep or a session eviction) and a marker
+    whose record was retained only as an inactive lease (the pre-fix
+    ``lease_renewed`` retention) must not inflate ``busy_slots`` /
+    ``in_flight_prefills`` for the rest of the pool: the 2026-10-23 incident
+    shows a single stuck marker raising ``available_slots=0`` for every other
+    session while the dispatch it represented was long gone.
+
+    Never raises: a routing decision must not break on an observability gap.
+    """
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if not markers:
+            return 0
+        records = getattr(srv, "local_dispatch_records", None) or {}
+        live_sessions: set[str] = set()
+        for key, record in list(records.items()):
+            if not isinstance(record, dict) or not record.get("active"):
+                continue
+            session_id = _dispatch_key_session_id(key)
+            if session_id is not None:
+                live_sessions.add(session_id)
+        return max(0, sum(1 for s in markers if s in live_sessions))
     except Exception:
         return 0
 
@@ -2082,6 +2162,82 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
         await wake(1)
     except Exception:
         pass
+    return removed
+
+
+async def _release_prefill_deadline_dispatch(
+    srv,
+    session_key: str | None,
+    endpoint: str | None = None,
+    request: Request | None = None,
+) -> bool:
+    """Release the dispatch lease + in-flight marker of a deadline-cancelled dispatch.
+
+    LP-0MVKUKFSO008GI6O AC1: when ``prefill_deadline_exceeded`` cancels a
+    local dispatch that never produced a first byte, the session's lease must
+    be released on the spot — the pre-fix cleanup only marked the record
+    inactive with a *future* ``expires_at`` (``lease_renewed``) and left the
+    ``local_prefill_in_flight`` marker in place, so a wedged session re-
+    acquired the lease for hours (2026-10-23 incident: ~4 h hold, 2,056
+    other-session denials, ``available_slots=0``).
+
+    Deletes the dispatch record (any key form — legacy string or per-endpoint
+    tuple) and pops the marker for *session_key* (and only that session),
+    emitting ``lease_released session=... reason=prefill_deadline``. Returns
+    True when a record was removed. Fail-soft: the deadline path is already
+    an exceptional path and must never raise. Wakes the cross-session
+    contention queue when a lease was freed.
+    """
+    if not session_key:
+        return False
+    removed = False
+    record_key = _dispatch_lease_key(endpoint, session_key)
+    try:
+        async with srv.local_dispatch_records_lock:
+            if record_key in srv.local_dispatch_records:
+                del srv.local_dispatch_records[record_key]
+                removed = True
+            elif endpoint and (endpoint, session_key) in srv.local_dispatch_records:
+                # Belt-and-braces: tuple-key form for callers that pass the
+                # endpoint directly (mirrors ``_release_local_dispatch``).
+                del srv.local_dispatch_records[(endpoint, session_key)]
+                removed = True
+            if removed:
+                try:
+                    srv.logger.info(
+                        "lease_released session=%s reason=prefill_deadline "
+                        "endpoint=%s",
+                        session_key if session_key else "unknown",
+                        endpoint or "default",
+                        extra=_client_identity_extra(request),
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Pop the per-session prefill marker (own session only). A cancelled
+    # prefill is no longer in flight and must not count toward the prefill
+    # cap / gate occupancy (LP-0MVKUKFSO008GI6O AC1 + AC3).
+    marker_popped = False
+    try:
+        _p = getattr(srv, "local_prefill_in_flight", None)
+        if _p is not None and session_key in _p:
+            _plock = getattr(srv, "local_prefill_in_flight_lock", None)
+            if _plock is not None:
+                async with _plock:
+                    _p.pop(session_key, None)
+            else:
+                _p.pop(session_key, None)
+            marker_popped = True
+    except Exception:
+        pass
+    if removed or marker_popped:
+        try:
+            from proxy.contention_queue import wake
+
+            await wake(1)
+        except Exception:
+            pass
     return removed
 
 
