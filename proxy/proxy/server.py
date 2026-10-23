@@ -586,6 +586,16 @@ def _startup_config_logging():
     # start-proxy.sh captures stderr into proxy-startup.log.
     _startup_acquire_instance_lock()
     logger = setup_logging(config)
+    # Record the held lock now that logging exists: the guard runs before
+    # logging is configured (see above), so its own log lines cannot reach
+    # proxy.log. This line is what lets an operator confirm from the log alone
+    # that the single-writer guard is active.
+    if _instance_lock is not None:
+        logger.info(
+            "Single-instance lock held: %s pid=%s",
+            _instance_lock.path,
+            _instance_lock.holder_pid,
+        )
     _startup_validate_local_routing_config(config)
     _startup_validate_compaction_config(config)
 

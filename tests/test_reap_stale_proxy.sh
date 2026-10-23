@@ -176,6 +176,8 @@ else
   fail "reaper output missing the listener interlock message: $LISTEN_OUT"
 fi
 kill -9 "$LISTENER_PID" "$SOCKET_PID" 2>/dev/null || true
+# Reap the jobs so bash does not print a "Killed" notice above the results.
+wait "$LISTENER_PID" "$SOCKET_PID" 2>/dev/null || true
 
 # --- 6. a clean port is a no-op -------------------------------------------
 CLEAN_OUT="$(bash "$REAPER" --port "$PORT_CLEAN" 2>&1)"

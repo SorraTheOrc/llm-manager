@@ -246,3 +246,29 @@ def test_rejected_second_instance_leaves_the_live_log_in_place(
     assert sorted(p.name for p in log_dir.glob("proxy.log.*")) == [], (
         "a rejected instance must not create an archive of the live log"
     )
+
+
+def test_startup_records_the_held_lock_in_the_proxy_log(tmp_path: Path, monkeypatch):
+    """The guard runs before logging exists, so the lock is re-recorded after.
+
+    Without this line an operator cannot tell from proxy.log alone whether the
+    single-writer guard is active (the guard's own messages precede logging
+    configuration, and only WARNING+ reaches stderr via logging's last resort).
+    """
+    from proxy import server as srv_mod
+
+    log_dir = tmp_path / "logs"
+    config = {"logging": {"directory": str(log_dir), "level": "INFO"}}
+    monkeypatch.setattr(srv_mod, "load_config", lambda: config)
+    # Keep the test focused on the lock ordering: validation needs a full config
+    # and is covered by its own tests.
+    monkeypatch.setattr(srv_mod, "_startup_validate_local_routing_config", lambda cfg: None)
+    monkeypatch.setattr(srv_mod, "_startup_validate_compaction_config", lambda cfg: None)
+
+    srv_mod._startup_config_logging()
+
+    log_text = (log_dir / "proxy.log").read_text(encoding="utf-8")
+    assert "Single-instance lock held:" in log_text
+    assert str(os.getpid()) in log_text
+    assert (log_dir / "proxy.lock").is_file()
+    srv_mod._startup_release_instance_lock()
