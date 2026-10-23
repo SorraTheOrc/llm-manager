@@ -181,9 +181,25 @@ async def test_dispatch_line_carries_priority_and_prompt_size(caplog):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_line_reports_the_requested_priority_tier(caplog):
-    """A high-priority request is logged at the high tier, not the default."""
+async def test_dispatch_line_reports_the_requested_priority_tier(caplog, monkeypatch):
+    """A high-priority request is logged at the high tier, not the default.
+
+    The effective tier is capped to ``low`` while the configured cheap window
+    (``proxy/config.yaml``, 01:00-10:00 local) is active, so an unpinned clock
+    made this assertion depend on the wall-clock time the suite happened to run
+    at: green by day, red between 01:00 and 10:00 (LP-0MVK7WR8X006TUX9). Pin the
+    clock outside the window so the requested tier is what is observed.
+    """
     import logging
+
+    from proxy import priority as priority_mod
+
+    class _MiddayDatetime(priority_mod.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 1, 1, 12, 0)
+
+    monkeypatch.setattr(priority_mod, "datetime", _MiddayDatetime)
 
     caplog.set_level(logging.INFO)
     await _drive_local_stream(
