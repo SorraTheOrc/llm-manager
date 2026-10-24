@@ -1367,6 +1367,8 @@ async def _await_first_byte_with_prefill_monitor(
     llama_port: int = 8080,
     model_name: str | None = None,
     slot_id: int | None = None,
+    request: Request | None = None,
+    dispatch_session_id: str | None = None,
 ) -> tuple:
     """Await the initial upstream response while monitoring prefill progress.
 
@@ -1398,9 +1400,28 @@ async def _await_first_byte_with_prefill_monitor(
     *poll_seconds* and *timeout* are non-positive, preserving the previous
     behaviour for disabled configurations.
 
+    LP-0MVLFVY6K003VYEL: when *request* is given, each poll tick also checks
+    ``request.is_disconnected()``. A prefill emits no chunks, so the
+    post-first-byte disconnect checks never run while the dispatch awaits its
+    first byte — a client that died mid-prefill previously left its dispatch
+    record and ``local_prefill_in_flight`` marker behind until the
+    ``idle_timeout`` sweep (~5.5-6 min), refusing other sessions with
+    ``reason=local_lease_active``. On a *confirmed* disconnect
+    (``is_disconnected()`` returning True — never inferred from elapsed time)
+    the dispatch is released via ``_release_client_disconnect_dispatch``
+    (reason ``client_disconnect``) and ``ClientDisconnectedDuringPrefillError`` is
+    raised. The check rides the existing poll cadence, so no extra task is
+    created; with polling disabled (``poll_seconds <= 0``) the disconnect
+    reaper's cancellation + verdict covers the same case.
+
+    *dispatch_session_id* is the session key used for the release above and
+    defaults to *session_id*; the router passes the real session id there even
+    for non-explicit sessions, whose dispatch records are keyed by it.
+
     The pending *open_coro* task is cancelled if this helper is cancelled or
     raises, so a timed-out first-byte wait never leaks an upstream stream.
     """
+    _release_key = dispatch_session_id or session_id
     open_task = asyncio.ensure_future(open_coro)
     waited = 0.0
     warned = False
@@ -1424,6 +1445,36 @@ async def _await_first_byte_with_prefill_monitor(
                 return open_task.result()
 
             waited += step
+
+            # Client-dead prefill release (LP-0MVLFVY6K003VYEL). A local
+            # prefill emits no chunks, so the in-loop disconnect check in
+            # ``stream_generator`` cannot see a client that disappeared while
+            # the dispatch awaited its first byte. Poll on the same cadence as
+            # the lease extension (no new background task) and release the
+            # dispatch on a *confirmed* disconnect. Only an explicit
+            # ``is_disconnected()`` True releases — never elapsed time — so a
+            # live but slow prefill (>180 s) is never cut short here.
+            if request is not None and poll_seconds > 0:
+                _client_gone = False
+                try:
+                    _client_gone = await request.is_disconnected()
+                except Exception:
+                    _client_gone = False
+                if isinstance(_client_gone, bool) and _client_gone:
+                    try:
+                        srv.logger.info(
+                            "client_disconnect_during_prefill session=%s "
+                            "waited=%.0fs slot=%s",
+                            _release_key or "unknown",
+                            waited,
+                            slot_id,
+                        )
+                    except Exception:
+                        pass
+                    _release_client_disconnect_dispatch(
+                        srv, _release_key, endpoint=endpoint, request=request
+                    )
+                    raise ClientDisconnectedDuringPrefillError(_release_key)
 
             # Poll prefill progress and extend the lease. The request is
             # still awaiting its first byte (open_task is pending), so it is
@@ -2239,6 +2290,205 @@ async def _release_prefill_deadline_dispatch(
         except Exception:
             pass
     return removed
+
+
+class ClientDisconnectedDuringPrefillError(Exception):
+    """The client that dispatched a local request is gone before first byte.
+
+    Raised by ``_await_first_byte_with_prefill_monitor`` when it observes a
+    confirmed ``request.is_disconnected()`` inside the prefill/first-byte
+    wait (LP-0MVLFVY6K003VYEL). The dispatch record, the
+    ``local_prefill_in_flight`` marker and the session's slot assignment have
+    already been released when this is raised, and the pending upstream
+    first-byte wait is cancelled by the monitor, so the caller only has to
+    finish its own accounting (counters, client close) and stop serving a
+    client that is not there any more.
+    """
+
+    def __init__(self, session_id: str | None = None) -> None:
+        self.session_id = session_id
+        super().__init__(
+            f"client disconnected during prefill (session={session_id or 'unknown'})"
+        )
+
+
+_detached_release_tasks: set[asyncio.Task] = set()
+"""Strong references to fire-and-forget release tasks.
+
+``_release_client_disconnect_dispatch`` must not await anything (a second
+cancellation would skip an awaiting release — LP-0MVLFVY6K003VYEL AC3), so
+its upstream-stream close and contention-queue wake are scheduled as
+detached tasks. Holding a reference keeps the event loop from garbage
+collecting them mid-flight; each task discards itself on completion.
+"""
+
+
+def _reap_detached_release(task: asyncio.Task) -> None:
+    """Drop a completed detached release task, retrieving its exception."""
+    _detached_release_tasks.discard(task)
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+def _spawn_detached_release(coro) -> None:
+    """Schedule *coro* as a detached task (never awaited by the caller).
+
+    Used by the client-disconnect release so it can complete synchronously
+    (no ``await`` = no cancellation point). Fail-soft: without a running
+    loop the coroutine is closed instead of leaking an "never awaited"
+    warning.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return
+    try:
+        task = loop.create_task(coro)
+    except Exception:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return
+    _detached_release_tasks.add(task)
+    task.add_done_callback(_reap_detached_release)
+
+
+async def _close_stream_cm(stream_cm) -> None:
+    """Close a captured upstream stream context manager (best effort)."""
+    try:
+        await stream_cm.__aexit__(None, None, None)
+    except BaseException:
+        pass
+
+
+def _release_client_disconnect_dispatch(
+    srv,
+    session_key: str | None,
+    *,
+    endpoint: str | None = None,
+    request: Request | None = None,
+) -> bool:
+    """Release a local dispatch whose client died before the first byte.
+
+    LP-0MVLFVY6K003VYEL: a client that disappears mid-prefill (agent killed,
+    CLI CTRL-C, network drop) produces no chunks, so none of the
+    post-first-byte disconnect checks can see it. The dispatch record then
+    survived as an inactive lease with a fresh ``expires_at`` plus its
+    ``local_prefill_in_flight`` marker, and other sessions were refused with
+    ``local_dispatch_denied ... reason=local_lease_active`` until the cleanup
+    loop's ``idle_timeout`` sweep fired ~5.5-6 minutes later (observation
+    2026-10-23 20:58-21:04). This helper releases the dispatch on the spot:
+
+    - deletes the dispatch record (legacy string **and** per-endpoint tuple
+      key forms), so the slot is no longer occupied;
+    - pops this session's ``local_prefill_in_flight`` marker (own session
+      only) so the prefill cap / admission guard stop counting it;
+    - frees the session's slot assignment so the slot registry can be
+      reused;
+    - cancels the captured upstream stream (``stream_cm``) so llama-server
+      is not left prefilling for a client that cannot consume the tokens —
+      the same behaviour as the prefill-deadline and watchdog releases;
+    - wakes the cross-session contention queue so a queued session is
+      admitted immediately;
+    - logs ``lease_released session=... reason=client_disconnect`` — distinct
+      from ``disconnect`` (stream-end path), ``prefill_deadline``,
+      ``idle_timeout`` and ``no_progress_watchdog``, so the recovery path is
+      attributable.
+
+    **Synchronous by design** (AC3): the release contains no ``await``, so a
+    second ``CancelledError`` delivered to the reaper-cancelled request task
+    can never interrupt it half-way (the pre-fix ``finally`` cleanup awaited
+    the records lock and ``stream_cm.__aexit__`` and could be skipped
+    entirely). The two awaiting steps — closing the upstream stream and
+    waking the contention queue — are scheduled as detached tasks. Dict
+    mutations without an ``await`` cannot interleave with the lock-holding
+    readers on a single-threaded event loop, so skipping
+    ``local_dispatch_records_lock`` here is safe and is what makes the
+    release cancellation-proof.
+
+    Idempotent: a missing record/marker is a no-op and logs nothing, so the
+    disconnect release racing the deadline release, the watchdog or the
+    orphan sweep logs at most once. Returns True when a record or marker was
+    released.
+
+    The per-request counters (``active_queries``, ``local_active_queries``,
+    the per-model counter) are deliberately **not** touched here: the caller
+    pairs this release with ``_cleanup_after_request(..., decrement_local=
+    True)``, which is the single owner of those decrements. Decrementing in
+    both places would release another session's capacity
+    (``local_active_queries`` is a pool-wide counter).
+    """
+    if not session_key:
+        return False
+
+    removed = False
+    stream_cm = None
+    records = getattr(srv, "local_dispatch_records", None)
+    if records is not None:
+        try:
+            keys = [_dispatch_lease_key(endpoint, session_key)]
+            if endpoint:
+                # Belt-and-braces tuple-key form (mirrors
+                # ``_release_prefill_deadline_dispatch``).
+                keys.append((endpoint, session_key))
+            for key in keys:
+                record = records.pop(key, None)
+                if isinstance(record, dict):
+                    stream_cm = record.get("stream_cm")
+                    removed = True
+                    break
+        except Exception:
+            removed = False
+
+    if removed:
+        try:
+            srv.logger.info(
+                "lease_released session=%s reason=client_disconnect endpoint=%s",
+                session_key,
+                endpoint or "default",
+                extra=_client_identity_extra(request),
+            )
+        except Exception:
+            pass
+
+    marker_popped = False
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if markers is not None and session_key in markers:
+            markers.pop(session_key, None)
+            marker_popped = True
+    except Exception:
+        marker_popped = False
+
+    if removed or marker_popped:
+        try:
+            from proxy.session import _free_slot_assignment
+
+            _free_slot_assignment(session_key, endpoint=endpoint)
+        except Exception:
+            pass
+
+    if stream_cm is not None:
+        _spawn_detached_release(_close_stream_cm(stream_cm))
+
+    if removed or marker_popped:
+        try:
+            from proxy.contention_queue import wake
+
+            _spawn_detached_release(wake(1))
+        except Exception:
+            pass
+
+    return removed or marker_popped
 
 
 async def _query_slot_processing(srv, session_id: str, model_name: str | None, endpoint: str | None = None) -> bool:

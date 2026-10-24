@@ -455,3 +455,73 @@ post-fix window, and cooldown-throttled retries instead of the incident's 41
 local POSTs. Evidence, reproduction commands, and the outstanding 24 h sample:
 [docs/dev/prefill-recovery-verification.md](dev/prefill-recovery-verification.md);
 measurement tool: `scripts/prefill_recovery_verification.py`.
+
+## Client-dead mid-prefill recovery (LP-0MVLFVY6K003VYEL)
+
+A client that disappears while its local dispatch is still prefilling (agent
+killed, CLI CTRL-C, network drop) no longer holds the local pool. The prefill
+phase emits no stream chunks, so the in-loop `request.is_disconnected()` check
+(which runs every 10 chunks) and the stream generator's `GeneratorExit` /
+`CancelledError` handlers never run; pre-fix the dispatch survived as an
+inactive record with a fresh `expires_at` plus its `local_prefill_in_flight`
+marker, and other sessions were refused with
+`local_dispatch_denied ... reason=local_lease_active` until the cleanup loop's
+`idle_timeout` sweep fired ~5.5-6 minutes after the dispatch
+(observed 2026-10-23 20:58-21:04).
+
+Two detections now feed one release path:
+
+1. **Poll while awaiting the first byte.**
+   `_await_first_byte_with_prefill_monitor` takes the request and probes
+   `request.is_disconnected()` on the existing prefill poll cadence
+   (`local_dispatch_lease_prefill_poll_seconds`, default 10 s — no new
+   background task). A *confirmed* disconnect (an explicit `True`; never
+   inferred from elapsed time, so a live but slow >180 s prefill is not
+   touched) releases the dispatch and raises
+   `ClientDisconnectedDuringPrefillError`; the router finishes its counter
+   accounting and returns 499.
+2. **Reaper cancellation verdict.** `DisconnectReaper` polls every 5 s and
+   cancels the in-flight request task. It records its confirmed verdict on the
+   request's ASGI scope (`llama_proxy.client_disconnected`) before cancelling,
+   because a cancelled task cannot re-probe the connection. The router's
+   `CancelledError` path on the first-byte wait reads the verdict and releases
+   synchronously, then schedules the counter cleanup as a detached task.
+
+`_release_client_disconnect_dispatch` performs the release in one step:
+
+- deletes the dispatch record (legacy and per-endpoint key forms),
+- pops this session's `local_prefill_in_flight` marker,
+- frees the session's slot assignment,
+- cancels the captured upstream stream (`stream_cm`) so llama-server is not
+  left prefilling for a client that cannot consume the tokens,
+- wakes the cross-session contention queue,
+- logs `lease_released session=… reason=client_disconnect endpoint=…` —
+  distinct from `disconnect` (stream-end path), `prefill_deadline`,
+  `idle_timeout` and `no_progress_watchdog`, so the recovery reason is
+  attributable.
+
+The release deliberately contains **no `await`** (AC3): a second
+`CancelledError` on the reaper-cancelled task can no longer interrupt it
+half-way (the former `finally` cleanup awaited the records lock and
+`stream_cm.__aexit__` and could be skipped entirely). The two awaiting steps —
+closing the upstream stream and waking the contention queue — run as detached
+tasks. Record/marker mutations are single dict operations, so skipping the
+records lock here cannot interleave with a lock holder on the single-threaded
+event loop. The release is idempotent: a missing record or marker is a no-op
+that logs nothing, so racing the deadline release, the 180 s no-progress
+watchdog or the orphan sweep logs at most once.
+
+The existing safety nets are unchanged and still bound every dispatch: the
+90 s prefill deadline, the 180 s no-progress watchdog and the
+`local_dispatch_max_prefill_seconds` (900 s) ceiling. The client-dead path
+only tightens the recovery bound (expected: seconds — one poll interval plus
+the release — against the AC's 300 s limit). Per-request counters
+(`active_queries`, `local_active_queries`, the per-model counter) are
+decremented exactly once by `_cleanup_after_request`, the single owner of
+those decrements.
+
+Regression coverage: `proxy/tests/test_lease_truthfulness.py`
+(client-dead release unit + end-to-end router tests: another session is
+admitted immediately afterwards, and a reaper cancellation releases the
+dispatch), `proxy/tests/test_disconnect_detection.py` (reaper verdict, poll
+during prefill, 499 with no spurious backend cooldown / 5xx metric).

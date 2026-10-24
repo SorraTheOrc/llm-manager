@@ -97,6 +97,39 @@ skipped, the sweep verifies liveness before freeing a lease:
   `local_prefill_in_flight` are updated on the same paths as the lease, so
   admission and serialisation never see a slot the backend is still using.
 
+#### Client-dead mid-prefill release (LP-0MVLFVY6K003VYEL)
+
+A client that vanishes *during prefill* is released immediately instead of
+waiting for the `idle_timeout` sweep. Pre-fix the dispatch was retained as an
+inactive record with a fresh `expires_at` plus its `local_prefill_in_flight`
+marker, so every other session was refused with
+`local_dispatch_denied … reason=local_lease_active` for ~5.5-6 minutes
+(observed 2026-10-23 20:58-21:04). The prefill phase emits no chunks, so the
+in-loop `is_disconnected()` check and the generator's `GeneratorExit` /
+`CancelledError` handlers cannot see it. Two detections now feed one release:
+
+- `_await_first_byte_with_prefill_monitor` polls
+  `request.is_disconnected()` on the existing prefill poll cadence
+  (`local_dispatch_lease_prefill_poll_seconds`, default 10 s; no new task) and,
+  on a *confirmed* disconnect, releases and raises
+  `ClientDisconnectedDuringPrefillError` → the router accounts the counters and
+  answers 499 (no backend cooldown, no 5xx metric).
+- `DisconnectReaper` (5 s) records its confirmed verdict on the ASGI scope
+  (`llama_proxy.client_disconnected`) before cancelling the request task, so
+  the router's `CancelledError` path can release synchronously without
+  re-probing a connection it can no longer read.
+
+`_release_client_disconnect_dispatch` deletes the record, pops the marker,
+frees the slot assignment, cancels the captured upstream stream, wakes the
+contention queue and logs
+`lease_released session=… reason=client_disconnect endpoint=…` (distinct from
+`disconnect`, `prefill_deadline`, `idle_timeout`, `no_progress_watchdog`). It
+contains **no `await`** so a second cancellation cannot skip it; the two
+awaiting steps run as detached tasks. Only an explicit `is_disconnected()`
+`True` (or the reaper's recorded verdict) releases — never elapsed time — so
+a live but slow prefill is untouched, and the 90 s deadline / 180 s watchdog /
+900 s ceiling all still apply.
+
 ### 5. Remote Model Handling
 
 For remote models (`proxy_to_remote()`):

@@ -682,3 +682,157 @@ async def test_non_streaming_disconnect_before_request(mock_server):
         result = await proxy_to_local(mock_req, "v1/chat/completions")
 
         assert result is not None
+
+
+# ===================================================================
+# Pre-first-byte (prefill) disconnect detection (LP-0MVLFVY6K003VYEL)
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_reaper_records_confirmed_disconnect_verdict():
+    """The reaper records its confirmed verdict on the request's ASGI scope
+    before cancelling, so the prefill release path can act on it
+    synchronously (a cancelled task cannot re-probe the connection)."""
+    from proxy.disconnect_reaper import (
+        DisconnectReaper,
+        client_disconnect_observed,
+        reaper_registry,
+    )
+
+    reaper_registry.clear()
+
+    gone = MagicMock()
+    gone.scope = {"type": "http"}
+    gone.is_disconnected = AsyncMock(return_value=True)
+    alive = MagicMock()
+    alive.scope = {"type": "http"}
+    alive.is_disconnected = AsyncMock(return_value=False)
+
+    async def _long_running():
+        await asyncio.sleep(60)
+
+    gone_task = asyncio.create_task(_long_running())
+    alive_task = asyncio.create_task(_long_running())
+    reaper_registry[gone_task] = gone
+    reaper_registry[alive_task] = alive
+
+    try:
+        await DisconnectReaper().reap_once()
+
+        assert client_disconnect_observed(gone) is True, (
+            "a reaped request must carry the confirmed disconnect verdict"
+        )
+        assert client_disconnect_observed(alive) is False, (
+            "a connected request must never be marked disconnected"
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await gone_task
+        assert not alive_task.cancelled()
+    finally:
+        for task in (gone_task, alive_task):
+            if not task.done():
+                task.cancel()
+        reaper_registry.clear()
+
+
+def test_client_disconnect_observed_is_fail_closed():
+    """A missing/inconclusive verdict must read as 'connected' — a live but
+    slow prefill must never be released on an inference."""
+    from proxy.disconnect_reaper import (
+        CLIENT_DISCONNECTED_SCOPE_KEY,
+        client_disconnect_observed,
+        mark_client_disconnected,
+    )
+
+    assert client_disconnect_observed(None) is False
+    assert client_disconnect_observed(object()) is False
+
+    no_scope = MagicMock(spec=["headers"])
+    assert client_disconnect_observed(no_scope) is False
+
+    inconclusive = MagicMock()
+    inconclusive.scope = {CLIENT_DISCONNECTED_SCOPE_KEY: "yes"}
+    assert client_disconnect_observed(inconclusive) is False, (
+        "only an explicit True is a confirmed disconnect"
+    )
+
+    confirmed = MagicMock()
+    confirmed.scope = {}
+    mark_client_disconnected(confirmed)
+    assert client_disconnect_observed(confirmed) is True
+
+
+@pytest.mark.asyncio
+async def test_router_prefill_disconnect_returns_499_without_backend_error(
+    mock_server,
+):
+    """A client that disappears while the dispatch awaits its first byte must
+    not be treated as a backend fault: the request ends with a 499 (no client
+    left), the local backend stays ready, and no 5xx metric is recorded."""
+    from proxy.router import proxy_to_local
+
+    mock_server.config["server"]["local_dispatch_lease_prefill_poll_seconds"] = 0.05
+    mock_server.config["server"]["local_prefill_deadline_seconds"] = 0
+    mock_server.config["server"]["local_dispatch_first_byte_timeout_seconds"] = 30
+
+    mock_req = _make_mock_request(is_disconnected=True)
+
+    async def _never_returns(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    with (
+        patch("proxy.router._srv", return_value=mock_server),
+        patch("proxy.router._is_self_healing_active", return_value=False),
+        patch("proxy.router._check_slot_availability", return_value=None),
+        patch("proxy.router._increment_active_queries"),
+        patch("proxy.router._decrement_active_queries"),
+        patch("proxy.router._handle_session") as mock_session,
+        patch("proxy.router._build_slot_context", return_value=(None, None, 3.0)),
+        patch("proxy.router._call_with_backend_retries", _never_returns),
+        patch("proxy.router.httpx.AsyncClient") as mock_client_cls,
+        patch("proxy.router._schedule_token_increment"),
+        patch("proxy.router._schedule_recv_token_increment"),
+        patch("proxy.router.count_text_tokens", return_value=5),
+        patch("proxy.router._extract_delta_text_from_sse_chunk", return_value=""),
+        patch("proxy.router.log_request"),
+        patch("proxy.router.log_response_chunk"),
+        patch("proxy.router.record_http_error") as mock_record_http_error,
+    ):
+        mock_session.return_value = {
+            "session_id": "prefill-dead-session",
+            "session_created": False,
+            "is_delta_request": False,
+            "session_fallback_reason": None,
+            "delta_messages": None,
+            "body_override": None,
+            "body_json": {"messages": [], "model": "test-model", "stream": True},
+            "original_message_count": 0,
+        }
+
+        mock_client = MagicMock()
+        mock_client.aclose = AsyncMock()
+        mock_client_cls.return_value = mock_client
+
+        mock_req.body = AsyncMock(
+            return_value=json.dumps(
+                {"messages": [], "model": "test-model", "stream": True}
+            ).encode()
+        )
+
+        result = await proxy_to_local(mock_req, "v1/chat/completions")
+
+        assert getattr(result, "status_code", None) == 499, (
+            f"expected a 499 for a client that vanished during prefill, "
+            f"got {getattr(result, 'status_code', result)!r}"
+        )
+        assert mock_req.is_disconnected.called, (
+            "the prefill wait must probe the client connection"
+        )
+        assert mock_server.backend_ready is True, (
+            "a client disconnect is not a backend fault — the local backend "
+            "must not be cooled down"
+        )
+        assert not mock_record_http_error.called, (
+            "a client disconnect must not be recorded as a 5xx backend error"
+        )

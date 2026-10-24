@@ -56,6 +56,7 @@ def _log_local_stream_client_disconnect(srv, session_id, model_name):
 # Imports from sibling extracted modules
 import proxy.metrics as metrics  # noqa: E402
 from proxy import cold_start  # noqa: E402
+from proxy.disconnect_reaper import client_disconnect_observed  # noqa: E402
 from proxy.lifecycle import (  # noqa: E402
     _compute_adaptive_timeout,
     _is_self_healing_active,
@@ -99,6 +100,7 @@ from proxy.utils import (  # noqa: E402
 
 # Imports from sibling router helpers
 from .router_helpers import (  # noqa: E402  # noqa: E402, F401
+    ClientDisconnectedDuringPrefillError,
     _apply_queue_wait_to_timeout,
     _await_first_byte_with_prefill_monitor,
     _build_backend_error_response,
@@ -127,11 +129,13 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_per_model_query,
     _normalize_outgoing_headers,
     _record_prefill_thrash_cooldown,
+    _release_client_disconnect_dispatch,
     _release_prefill_deadline_dispatch,
     _request_dedup_hash,
     _schedule_recv_token_increment,
     _schedule_token_increment,
     _schedule_traffic_recording,
+    _spawn_detached_release,
     _try_acquire_local_dispatch,
     log_request,
     log_response,
@@ -750,7 +754,11 @@ async def _cleanup_after_request(
             except Exception:
                 pass
 
-    # On client disconnect, immediately remove the dispatch lease record
+    # On client disconnect, immediately remove the dispatch lease record.
+    # The ``disconnect`` reason is the stream-end path (a client that vanished
+    # *after* the first byte, LP-0MQTHP828000JYM6); a client that vanished
+    # during prefill is released earlier with ``reason=client_disconnect``
+    # (LP-0MVLFVY6K003VYEL). Both are idempotent, so either may run first.
     if disconnected and session_id:
         try:
             lock = getattr(srv, "local_dispatch_records_lock", None)
@@ -768,6 +776,21 @@ async def _cleanup_after_request(
                             )
                         except Exception:
                             pass
+        except Exception:
+            pass
+        # A disconnect also drops the prefill hold (if the client vanished
+        # while prefilling and the marker somehow survived the release):
+        # an orphan marker counts against the prefill cap for the whole pool.
+        try:
+            markers = getattr(srv, "local_prefill_in_flight", None)
+            if markers is not None and session_id in markers:
+                markers.pop(session_id, None)
+                try:
+                    from proxy.contention_queue import wake
+
+                    await wake(1)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1471,6 +1494,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             llama_port=llama_port,
                             model_name=model_name,
                             slot_id=slot_id,
+                            # LP-0MVLFVY6K003VYEL: pre-first-byte disconnect
+                            # detection + release (the in-loop check only runs
+                            # once chunks flow, which a prefill never emits).
+                            request=request,
+                            dispatch_session_id=session_id,
                         )
                         # LP-0MVKUKFHH005UDWL AC3: a successful local first
                         # byte clears the session's post-deadline cooldown —
@@ -1500,6 +1528,67 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     session_id
                                 )
                             )
+                    except ClientDisconnectedDuringPrefillError:
+                        # LP-0MVLFVY6K003VYEL: the client died while the
+                        # dispatch was prefilling. The monitor already logged
+                        # ``client_disconnect_during_prefill``, released the
+                        # dispatch record, the ``local_prefill_in_flight``
+                        # marker, the slot assignment and the upstream
+                        # first-byte wait (``lease_released ...
+                        # reason=client_disconnect``); finish the per-request
+                        # accounting and stop — there is no client left to
+                        # read a response, and the backend itself is healthy
+                        # (do NOT mark it not ready, which would cool the
+                        # local provider down).
+                        try:
+                            await _cleanup_after_request(
+                                srv, session_id,
+                                disconnected=True,
+                                # Counters are decremented here (the only
+                                # owner of the per-request decrements); the
+                                # disconnect release removed the record and
+                                # marker already, so this is a no-op for them.
+                                decrement_local=True,
+                                session_explicit=session_explicit,
+                                model_name=model_name,
+                                request=request,
+                                backend=endpoint,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await client.aclose()
+                        except Exception:
+                            pass
+                        return Response(status_code=499, content=b"")
+                    except asyncio.CancelledError:
+                        # LP-0MVLFVY6K003VYEL: the disconnect reaper cancels
+                        # the in-flight request task when the client drops
+                        # the connection. Pre-fix that cancellation skipped
+                        # the whole cleanup (no chunk loop had started), so
+                        # the dispatch record and marker outlived the client.
+                        # The reaper recorded its confirmed verdict on the
+                        # ASGI scope before cancelling; release synchronously
+                        # (no ``await`` that a second cancel could skip) and
+                        # schedule the counter cleanup as a detached task,
+                        # then let the cancellation propagate.
+                        if client_disconnect_observed(request):
+                            _release_client_disconnect_dispatch(
+                                srv, session_id, endpoint=endpoint,
+                                request=request,
+                            )
+                            _spawn_detached_release(
+                                _cleanup_after_request(
+                                    srv, session_id,
+                                    disconnected=True,
+                                    decrement_local=True,
+                                    session_explicit=session_explicit,
+                                    model_name=model_name,
+                                    request=request,
+                                    backend=endpoint,
+                                )
+                            )
+                        raise
                     except Exception as _exc:
                         # LP-0MUCEFB8E003YVFF: distinct, observable log line
                         # when the first-byte ceiling aborts a stuck prefill.
