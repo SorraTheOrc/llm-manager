@@ -10,8 +10,9 @@ per-session CSV record (split into fast / cheap buckets — from the mode
 timeline when the logs carry it, otherwise from the configured
 `server.priority_window`, otherwise the slot schedule) and an operator-facing
 Markdown report with highlighted, data-backed recommendations — including an
-**error taxonomy** and a deterministic **root-cause breakdown** for any proxy
-errors observed in the window.
+**error taxonomy**, a deterministic **root-cause breakdown** for any proxy
+errors observed in the window, and a **provider context-skips** breakdown for
+the per-provider context-ceiling skips (`routing_skip_provider_context`).
 
 The pipeline is fully deterministic: every report section is produced by
 rule-based Python, not an LLM. The skill is a thin, CLI-focused wrapper
@@ -67,7 +68,11 @@ Written to `--output-dir` (default `~/proxy-usage-reports`): `report.md`
 (primary deliverable), `fast_sessions.csv`, `cheap_sessions.csv`,
 `errors.csv`, and `errors.json`. On every non-`--quiet` run the CLI summary
 prints the complete absolute path to each artifact, starting with the
-report.
+report. `report.md` also carries the **Provider context skips** section
+(count, share of all skip events, standard/low split, provider breakdown and
+the `limit` ceiling each provider hit) whenever the window contains
+`routing_skip_provider_context` lines; the `--json` summary exposes the same
+figures as `provider_context_skips`.
 
 See [REFERENCE.md](REFERENCE.md#outputs) for the full schema of each
 artifact and the archival behaviour.

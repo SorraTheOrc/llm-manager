@@ -10,8 +10,10 @@ work item's decisions:
 - the initial model assignment is the provider/model of the session's first
   ``Stream started`` line;
 - the move to a remote model is attributed from the session's own
-  ``routing_skip_local`` or ``Fallback triggered`` line (both carry the session
-  and the reason since LP-0MVMBMSWR0036RES), falling back to the nearest
+  ``routing_skip_local`` or ``routing_skip_provider_context`` line (both carry
+  the session and the reason; the provider-context skip also names the
+  provider and the ceiling that blocked that attempt), or its own
+  session-bearing ``Fallback triggered`` line, falling back to the nearest
   session-less ``Fallback triggered`` line within 60s before the first remote
   stream (rotated logs predating the session stamp only), then to a local-lease
   refusal, and finally to the first remote stream time itself. Another
@@ -74,6 +76,12 @@ LEASE_ACTIVE_REASON = "local_lease_active"
 # - ``own_fallback`` — the session's own ``Fallback triggered`` line;
 # - ``own_skip`` — the session's own ``routing_skip_local`` line (unchanged
 #   precedence over the fallback line, which normally carries the same reason);
+# - ``own_provider_skip`` — the session's own ``routing_skip_provider_context``
+#   line (LP-0MVMBM1Y3001TPRT): a per-provider context-ceiling skip. It outranks
+#   the session's own fallback line because it names the provider and the
+#   ``limit`` that blocked that chain step, while ``own_skip`` still outranks it
+#   (a local-side skip explains why local was not used at all, and the digest
+#   of provider-context skips is reported separately);
 # - ``legacy_nearest`` — a session-less fallback line within
 #   :data:`FALLBACK_ATTRIBUTION_WINDOW_SECONDS` (pre-change rotated logs only);
 # - ``lease_denied`` — no fallback line, but the session was refused the local
@@ -85,6 +93,9 @@ LEASE_ACTIVE_REASON = "local_lease_active"
 #   fallback occurred.
 FALLBACK_ATTRIBUTION_OWN_FALLBACK = "own_fallback"
 FALLBACK_ATTRIBUTION_OWN_SKIP = "own_skip"
+# Provider context-ceiling skip (LP-0MVMBM1Y3001TPRT): own session-bearing
+# evidence that outranks the own-fallback state, see the comment block above.
+FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP = "own_provider_skip"
 FALLBACK_ATTRIBUTION_LEGACY_NEAREST = "legacy_nearest"
 FALLBACK_ATTRIBUTION_LEASE_DENIED = "lease_denied"
 FALLBACK_ATTRIBUTION_UNATTRIBUTED = "unattributed"
@@ -94,6 +105,7 @@ FALLBACK_ATTRIBUTION_NO_REMOTE = "no_remote_fallback"
 FALLBACK_ATTRIBUTION_ORDER = (
     FALLBACK_ATTRIBUTION_OWN_FALLBACK,
     FALLBACK_ATTRIBUTION_OWN_SKIP,
+    FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP,
     FALLBACK_ATTRIBUTION_LEASE_DENIED,
     FALLBACK_ATTRIBUTION_UNATTRIBUTED,
     FALLBACK_ATTRIBUTION_LEGACY_NEAREST,
@@ -323,6 +335,12 @@ class AnalysisResult:
     # ``routing_skip_reason_counts``) and surfaced here separately so a stuck
     # hold is distinguishable from a client retry storm.
     hold_cycle_routing_skip_events: list[LogEvent] = field(default_factory=list)
+    # Provider context-ceiling skips (LP-0MVMBM1Y3001TPRT): one event per
+    # provider whose ``max_context_tokens`` ceiling the estimated prompt
+    # exceeded. These are per-request size mismatches recorded by the proxy
+    # *before* a remote attempt, so they explain fallback chains that no
+    # session-less ``Fallback triggered`` line can attribute.
+    provider_context_skip_events: list[LogEvent] = field(default_factory=list)
     # Restart events (``restart`` kind, LP-0MUQO82LJ008F1FS) observed inside
     # the window, carrying the attribution markers (source/actor/reason,
     # LP-0MVC0S6U5003SEDJ) parsed from the log lines so the report can render
@@ -372,6 +390,23 @@ class AnalysisResult:
     @property
     def routing_skip_reason_counts(self) -> Counter:
         return Counter(e.reason for e in self.routing_skip_events if e.reason)
+
+    @property
+    def provider_context_skip_provider_counts(self) -> Counter:
+        """Provider context-ceiling skips grouped by provider (LP-0MVMBM1Y3001TPRT)."""
+        return Counter(
+            e.provider or "(unknown)" for e in self.provider_context_skip_events
+        )
+
+    @property
+    def provider_context_skip_limit_counts(self) -> Counter:
+        """Provider context-ceiling skips grouped by the ``limit`` they hit.
+
+        An event whose line carried no ``limit`` (older rotated logs, AC8) is
+        keyed as ``None`` so the caller can report it as unattributed rather
+        than silently dropping it.
+        """
+        return Counter(e.limit for e in self.provider_context_skip_events)
 
     @property
     def error_counts(self) -> Counter:
@@ -774,6 +809,7 @@ def _attribute_fallback(
     routing_skips: dict[str, list[LogEvent]],
     fallback_events: list[LogEvent],
     dispatch_denied: int = 0,
+    provider_context_skips: dict[str, list[LogEvent]] | None = None,
 ) -> tuple[datetime | None, str | None, str]:
     """Find (move_time, reason, attribution) for a session that reached remote.
 
@@ -782,17 +818,27 @@ def _attribute_fallback(
 
     1. The session's own ``routing_skip_local`` line at/before the first remote
        stream (unchanged precedence; it names why local was skipped).
-    2. The session's own session-bearing ``Fallback triggered`` line at/before
+    2. The session's own ``routing_skip_provider_context`` line at/before the
+       first remote stream (LP-0MVMBM1Y3001TPRT): also session-bearing, and it
+       names the provider + ``limit`` whose context ceiling blocked that
+       attempt, so it outranks the generic fallback line.
+    3. The session's own session-bearing ``Fallback triggered`` line at/before
        the first remote stream (the actual decision line).
-    3. The nearest **session-less** ``Fallback triggered`` line within
+    4. The nearest **session-less** ``Fallback triggered`` line within
        ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` before the first remote stream —
        only rotated logs predating the session stamp can reach this branch; a
        session-bearing line belongs to the session it names.
-    4. ``lease_denied`` when the session was refused local dispatch by another
+    5. ``lease_denied`` when the session was refused local dispatch by another
        session's lease (``local_dispatch_denied`` evidence) — the cause is
        concurrency/lease contention, reported as such instead of inheriting a
        neighbouring fallback's reason.
-    5. ``unattributed`` when there is no evidence at all.
+    6. ``unattributed`` when there is no evidence at all.
+
+    A ``routing_skip_local`` line wins over a provider-context skip because it
+    explains why local was not used at all, while provider-context skips are
+    downstream per-provider ceiling hits recorded while walking the chain;
+    both reasons are reported separately (per-session reason and the
+    provider-context breakdown), so nothing is lost by this precedence.
 
     Returns ``(None, None, attribution)`` when there is no timestamped
     evidence.
@@ -801,6 +847,15 @@ def _attribute_fallback(
     if skips:
         e = max(skips, key=lambda x: x.ts)
         return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
+    if provider_context_skips:
+        ctx_skips = [
+            e
+            for e in provider_context_skips.get(session_id, [])
+            if e.ts <= first_remote_ts
+        ]
+        if ctx_skips:
+            e = max(ctx_skips, key=lambda x: x.ts)
+            return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
     own = [
         e
         for e in fallback_events
@@ -832,6 +887,7 @@ def _build_session(
     fallback_events: list[LogEvent],
     schedule: bucketing.SlotSchedule,
     mode_map: bucketing.ModeScheduleMap | None = None,
+    provider_context_skips: dict[str, list[LogEvent]] | None = None,
 ) -> SessionStats:
     started = sorted(builder.started, key=lambda e: e.ts)
     finished = sorted(builder.finished, key=lambda e: e.ts)
@@ -856,6 +912,7 @@ def _build_session(
             routing_skips,
             fallback_events,
             dispatch_denied=builder.dispatch_denied,
+            provider_context_skips=provider_context_skips,
         )
         if move_ts is None:
             move_ts = first_remote.ts if has_local else None
@@ -1523,7 +1580,11 @@ def aggregate(
     """
     builders: dict[str, _SessionBuilder] = {}
     routing_skips: dict[str, list[LogEvent]] = {}
+    # Provider context-ceiling skips indexed by session (LP-0MVMBM1Y3001TPRT):
+    # per-session attribution input, see ``_attribute_fallback``.
+    provider_context_skips: dict[str, list[LogEvent]] = {}
     fallback_events: list[LogEvent] = []
+    provider_context_skip_events: list[LogEvent] = []
     routing_skip_events: list[LogEvent] = []
     dispatch_denied_events: list[LogEvent] = []
     error_events: list[LogEvent] = []
@@ -1671,6 +1732,17 @@ def aggregate(
                     routing_skips.setdefault(ev.session, []).append(ev)
                     builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
             continue
+        if ev.kind == "provider_context_skip":
+            # Provider context-ceiling skip (LP-0MVMBM1Y3001TPRT): a skip, not a
+            # stream/fallback event — it never contributes to request, token or
+            # fallback-event counts. It is collected globally for the report's
+            # provider-context breakdown and indexed by session so
+            # ``_attribute_fallback`` can prefer this session's own line.
+            provider_context_skip_events.append(ev)
+            if ev.session:
+                provider_context_skips.setdefault(ev.session, []).append(ev)
+                builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
+            continue
         if ev.kind == "contention_dispatch":
             contention_dispatch_events.append(ev)
             continue
@@ -1713,7 +1785,14 @@ def aggregate(
         # already been window-filtered above).
         if not builder.started:
             continue
-        sessions[sid] = _build_session(builder, routing_skips, fallback_events, schedule, mode_map)
+        sessions[sid] = _build_session(
+            builder,
+            routing_skips,
+            fallback_events,
+            schedule,
+            mode_map,
+            provider_context_skips,
+        )
 
     busy = compute_busy_stats(
         local_stream_events,
@@ -1745,5 +1824,6 @@ def aggregate(
         hourly_activity=hourly_activity,
         ttft_events=ttft_events,
         hold_cycle_routing_skip_events=hold_cycle_routing_skip_events,
+        provider_context_skip_events=provider_context_skip_events,
         restart_events=restart_events,
     )

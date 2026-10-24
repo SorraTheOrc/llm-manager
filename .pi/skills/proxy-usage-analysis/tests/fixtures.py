@@ -249,6 +249,33 @@ ROUTING_SKIP_CHAIN_HOLD_CYCLE_2 = (
     "provider session=019fc27d-3a46-7e5c-871e-57ab32f875f3 chain_hold_cycle=2"
 )
 
+# --- routing_skip_provider_context (per-provider context ceiling) -----------
+# (LP-0MVMBM1Y3001TPRT) Verbatim from /var/log/llama-proxy (2026-10-21 window):
+# the estimated prompt exceeds the entry's ``max_context_tokens``, so that
+# provider is skipped for this request only (no cooldown, no failure-domain
+# exclusion). Shared verbatim with LP-0MVK1Q99B0035OOE's parser pin.
+ROUTING_SKIP_PROVIDER_CONTEXT = (
+    "2026-10-21 04:11:29,318 - INFO - routing_skip_provider_context provider=munitoai-free "
+    "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+    "reason=provider_context_exceeded session=herdr-1792524101-1636143-211"
+)
+
+# A second provider/limit pair, so provider and ceiling breakdowns have more
+# than one row.
+ROUTING_SKIP_PROVIDER_CONTEXT_SECOND = (
+    "2026-10-21 04:12:05,004 - INFO - routing_skip_provider_context provider=opencode-go "
+    "type=remote status=provider_context_exceeded estimated_tokens=195787 limit=196608 "
+    "reason=provider_context_exceeded session=herdr-1792524101-1636143-211"
+)
+
+# Older rotated logs may predate the ``limit`` field: the event must still
+# parse (limit None) so historical windows stay analysable (AC8).
+ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT = (
+    "2026-10-21 04:13:11,900 - INFO - routing_skip_provider_context provider=munitoai-free "
+    "type=remote status=provider_context_exceeded estimated_tokens=160001 "
+    "reason=provider_context_exceeded session=herdr-1792524101-1636143-212"
+)
+
 # --- local_dispatch_denied --------------------------------------------------
 
 DISPATCH_DENIED = (

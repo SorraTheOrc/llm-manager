@@ -20,6 +20,10 @@ Two log families, one timestamped, one not:
      ``ratio``)
    - ``routing_skip_local reason=context_too_large|large_context_bypass``:
      hard-cap skips (fallback storms)
+   - ``routing_skip_provider_context``: per-provider context-ceiling skips for
+     this session (the estimated prompt exceeded that remote entry's
+     ``max_context_tokens``, LP-0MVMBM1Y3001TPRT) — the provider-side
+     counterpart of the local hard-cap skip, counted per session
    - ``local_dispatch_denied``: queue/slot contention denials
    - ``upstream error status=5xx``: backend 5xx responses
    These give the hour-by-hour timeline.
@@ -101,6 +105,14 @@ PRESSURE_LINE_RE = re.compile(
 SKIP_LINE_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?routing_skip_local .*?reason=(\w+)"
 )
+# Per-provider context-ceiling skip (LP-0MVMBM1Y3001TPRT): the estimated prompt
+# exceeded that remote entry's ``max_context_tokens``, so the chain walked on.
+# It carries the session UUID, so an oversized session's provider-side skips are
+# attributable even though ``Fallback triggered`` lines are not.
+PROVIDER_SKIP_LINE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?routing_skip_provider_context "
+    r".*?session=([A-Za-z0-9_.-]+)"
+)
 DENIED_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?local_dispatch_denied"
 )
@@ -158,6 +170,7 @@ class SessionCorrelation:
     wasted_work: int = 0         # prefill work on checks with ratio > 1.0
     ratio_gt_one: int = 0        # number of checks where est > per_slot (can't fit)
     skip_count: int = 0          # routing_skip_local lines for this session
+    provider_skip_count: int = 0  # routing_skip_provider_context lines
     pressure_count: int = 0      # context_pressure warnings for this session
 
 
@@ -173,6 +186,7 @@ class DayCorrelation:
     total_wasted_work: int = 0
     total_prefill_work: int = 0
     total_skips: int = 0
+    total_provider_skips: int = 0
     total_pressure: int = 0
 
 
@@ -252,11 +266,13 @@ def analyze_day(
     events = {
         "pressure": HourlyEvent("context_pressure"),
         "skips": HourlyEvent("routing_skip_local"),
+        "provider_skips": HourlyEvent("routing_skip_provider_context"),
         "denied": HourlyEvent("local_dispatch_denied"),
         "upstream5xx": HourlyEvent("upstream 5xx"),
     }
     pressure_of_session: dict[str, int] = defaultdict(int)
     skip_of_session: dict[str, int] = defaultdict(int)
+    provider_skip_of_session: dict[str, int] = defaultdict(int)
 
     for path in discover_log_files(log_dir):
         for line in iter_log_lines(path):
@@ -281,6 +297,12 @@ def analyze_day(
                     sess = line.split("session=", 1)[1].split()[0].rstrip(",")
                     if sess and sess != "unknown" and sess[0].isalnum():
                         skip_of_session[sess] += 1
+                continue
+            if "routing_skip_provider_context" in line:
+                m = PROVIDER_SKIP_LINE_RE.search(line)
+                if m:
+                    events["provider_skips"].add(ts)
+                    provider_skip_of_session[m.group(2)] += 1
                 continue
             if "local_dispatch_denied" in line:
                 events["denied"].add(ts)
@@ -316,9 +338,13 @@ def analyze_day(
     for s, n in skip_of_session.items():
         if s in res.sessions:
             res.sessions[s].skip_count = n
+    for s, n in provider_skip_of_session.items():
+        if s in res.sessions:
+            res.sessions[s].provider_skip_count = n
 
     res.total_pressure = events["pressure"].total
     res.total_skips = events["skips"].total
+    res.total_provider_skips = events["provider_skips"].total
     res.total_prefill_work = sum(s.prefill_work for s in res.sessions.values())
     res.total_wasted_work = sum(s.wasted_work for s in res.sessions.values())
 
@@ -383,6 +409,7 @@ def build_report(
             else 0.0,
             "context_pressure_warnings": res.total_pressure,
             "routing_skips": res.total_skips,
+            "provider_context_skips": res.total_provider_skips,
             "sessions": len(res.sessions),
         },
         "hourly_timeline": [
@@ -406,6 +433,7 @@ def build_report(
                 "wasted_work_tokens": s.wasted_work,
                 "checks_ratio_gt_1": s.ratio_gt_one,
                 "skips": s.skip_count,
+                "provider_context_skips": s.provider_skip_count,
                 "pressure_warnings": s.pressure_count,
             }
             for s in top_sessions
@@ -434,7 +462,8 @@ def render_markdown(report: dict) -> str:
     )
     lines.append(
         f"- context_pressure warnings: **{t['context_pressure_warnings']}** | "
-        f"routing_skip_local: **{t['routing_skips']}**"
+        f"routing_skip_local: **{t['routing_skips']}** | "
+        f"routing_skip_provider_context: **{t['provider_context_skips']}**"
     )
     lines.append(
         f"- Estimated prefill work: **{t['prefill_work_tokens']:,} tokens**"
@@ -460,15 +489,15 @@ def render_markdown(report: dict) -> str:
     lines.append("")
     lines.append(
         "| Session | Mode | Checks | Peak est. ctx | Prefill (tokens) | "
-        "Wasted (tokens) | Checks ratio>1 | Skips | Pressure |"
+        "Wasted (tokens) | Checks ratio>1 | Skips | Provider skips | Pressure |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
     for s in report["top_sessions"]:
         lines.append(
             f"| `{s['session'][:32]}` | {s['mode']} | {s['checks']} | "
             f"{s['peak_estimated_tokens']:,} | {s['prefill_work_tokens']:,} | "
             f"{s['wasted_work_tokens']:,} | {s['checks_ratio_gt_1']} | "
-            f"{s['skips']} | {s['pressure_warnings']} |"
+            f"{s['skips']} | {s['provider_context_skips']} | {s['pressure_warnings']} |"
         )
     lines.append("")
     d = report["llama_server_decode"]

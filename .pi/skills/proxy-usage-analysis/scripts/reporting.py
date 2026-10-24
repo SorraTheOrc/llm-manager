@@ -351,6 +351,7 @@ def build_report(
         summary.routing_skip_events,
         summary.dispatch_denied_events,
         mode_map,
+        summary.provider_context_skip_events,
     )
 
     lines: list[str] = []
@@ -365,6 +366,8 @@ def build_report(
        f"({fallback_rate * 100:.1f}% of requests) | dispatch denied: {summary.dispatch_denied_count}")
     ap(f"- Local-skip events: **{len(summary.routing_skip_events)}** | "
        f"hold-cycle re-emissions (excluded from demand): **{summary.hold_cycle_reemission_count}**")
+    ap(f"- Provider context-ceiling skips: **{len(summary.provider_context_skip_events)}** "
+       "(per-provider skip counted, not a provider failure)")
     ap(f"- Unattributed stream events (no session UUID): {summary.unattributed_events}")
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
     _ap_fallback_attribution(ap, summary)
@@ -457,6 +460,11 @@ def build_report(
             n = profile["cheap"]["routing_skip_reasons"].get(reason, 0)
             ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% | "
                f"{d} ({_pct(d, fast_skips):.1f}%) | {n} ({_pct(n, cheap_skips):.1f}%) |")
+
+    # Provider context-ceiling skips (LP-0MVMBM1Y3001TPRT): their own
+    # breakdown, immediately after the local-skip table so all skip evidence
+    # reads together and its `% of skips` column is comparable.
+    _append_provider_context_skip_section(ap, summary, schedule, mode_map)
 
     # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3): surfaced
     # separately so a stuck hold is not read as repeated client retries.
@@ -989,6 +997,94 @@ def _append_compaction_section(
     if all_dry and (would_have_avoided or avoided or would_still_fallback):
         ap("")
         ap("_Impact estimates in this window are hypothetical: no live dispatch change; " "the session history was not mutated._")
+
+
+def _append_provider_context_skip_section(
+    ap,
+    summary: AnalysisResult,
+    schedule: bucketing.SlotSchedule,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+) -> None:
+    """Append the ``## Provider context skips`` section to the report.
+
+    ``routing_skip_provider_context`` lines (LP-0MVMBM1Y3001TPRT) are
+    per-provider context-ceiling skips: the estimated prompt exceeded that
+    remote entry's ``max_context_tokens``, so the entry was skipped for this
+    request only (no cooldown, no failure-domain exclusion). They are the
+    session-bearing explanation for chains that the session-less
+    ``Fallback triggered`` lines cannot attribute, so they get their own
+    breakdown instead of being folded into the local-skip table.
+
+    Rendered only when the window carries such events. ``% of skips`` uses
+    **all skip events** as its denominator (``routing_skip_local`` +
+    provider-context skips), so the two tables stay comparable; the
+    Standard/Low cells are category-relative like the other reason tables.
+    """
+    events = summary.provider_context_skip_events
+    if not events:
+        return
+    local_skips = len(summary.routing_skip_events)
+    total_skips = local_skips + len(events)
+    by_provider: Counter = Counter()
+    providers_by_bucket: dict[str, Counter] = {"fast": Counter(), "cheap": Counter()}
+    limits_by_provider: dict[str, Counter] = {}
+    types_by_provider: dict[str, Counter] = {}
+    estimates: list[int] = []
+    for ev in events:
+        provider = ev.provider or UNKNOWN_LABEL
+        by_provider[provider] += 1
+        label = bucketing.bucket_label(ev.ts, schedule, mode_map)
+        providers_by_bucket["cheap" if label == "cheap" else "fast"][provider] += 1
+        if ev.limit is not None:
+            limits_by_provider.setdefault(provider, Counter())[ev.limit] += 1
+        types_by_provider.setdefault(provider, Counter())[
+            ev.provider_type or UNKNOWN_LABEL
+        ] += 1
+        if ev.estimated_tokens is not None:
+            estimates.append(ev.estimated_tokens)
+
+    fast_total = sum(providers_by_bucket["fast"].values())
+    cheap_total = sum(providers_by_bucket["cheap"].values())
+
+    ap("")
+    ap("## Provider context skips")
+    ap("")
+    ap("`routing_skip_provider_context` events: per-request **size** mismatches "
+       "where the estimated prompt exceeded that remote entry's "
+       "`max_context_tokens`. They are not provider failures (no cooldown, no "
+       "failure-domain exclusion) and the entry stays eligible for smaller "
+       "requests. Percentages are shares of **all skip events** "
+       "(`routing_skip_local` + provider-context skips).")
+    ap("")
+    ap(f"- Provider context skips: **{len(events)}** "
+       f"({_pct(len(events), total_skips):.1f}% of {total_skips} skip events: "
+       f"{local_skips} `routing_skip_local` + {len(events)} provider-context)")
+    if estimates:
+        estimates.sort()
+        ap(f"- Estimated prompt tokens that hit a ceiling: median "
+           f"**{int(_percentile(estimates, 50))}**, p90 "
+           f"**{int(_percentile(estimates, 90))}**, max **{estimates[-1]}** "
+           f"({len(estimates)} of {len(events)} events carried an estimate)")
+    no_limit = sum(1 for ev in events if ev.limit is None)
+    if no_limit:
+        ap(f"- **{no_limit}** event(s) carried no `limit=` field (older rotated "
+           "logs): their ceiling is reported as `not logged`.")
+    ap("")
+    ap("| Provider | Type | Total | % of skips | Standard | Low | Ceiling (limit) |")
+    ap("|---|---|---|---|---|---|---|")
+    for provider, count in by_provider.most_common():
+        fast = providers_by_bucket["fast"].get(provider, 0)
+        cheap = providers_by_bucket["cheap"].get(provider, 0)
+        types = ", ".join(
+            t for t, _ in types_by_provider.get(provider, Counter()).most_common()
+        ) or UNKNOWN_LABEL
+        limits = limits_by_provider.get(provider, Counter())
+        ceiling = ", ".join(f"{limit} ({n})" for limit, n in limits.most_common())
+        if not ceiling:
+            ceiling = "not logged"
+        ap(f"| {provider} | {types} | {count} | {_pct(count, total_skips):.1f}% | "
+           f"{fast} ({_pct(fast, fast_total):.1f}%) | "
+           f"{cheap} ({_pct(cheap, cheap_total):.1f}%) | {ceiling} |")
 
 
 def _append_hold_cycle_section(ap, summary: AnalysisResult) -> None:
@@ -1850,14 +1946,16 @@ def _bucket_profile(
     routing_skip_events: list[log_parser.LogEvent],
     dispatch_denied_events: list[log_parser.LogEvent],
     mode_map: bucketing.ModeScheduleMap | None = None,
+    provider_context_skip_events: list[log_parser.LogEvent] | None = None,
 ) -> dict:
     """Per-bucket (fast/cheap) totals for the report's summary tables.
 
     Covers sessions, requests, local/remote split, classification counts,
     context sizes, dispatch denials, and per-reason counters. Events without a
-    session (fallbacks, routing skips, dispatch denials) are bucketed by their
-    own timestamp using :func:`bucketing.bucket_label` (mode timeline, else the
-    configured priority window, else the slot schedule; LP-0MVKSXXIR006OBI2).
+    session (fallbacks, routing skips, provider context skips, dispatch
+    denials) are bucketed by their own timestamp using
+    :func:`bucketing.bucket_label` (mode timeline, else the configured
+    priority window, else the slot schedule; LP-0MVKSXXIR006OBI2).
     """
     def _label_at(ts: datetime) -> str:
         return bucketing.bucket_label(ts, schedule, mode_map)
@@ -1868,12 +1966,14 @@ def _bucket_profile(
             "local_only": 0, "fell_back": 0, "remote_only": 0,
             "dispatch_denied": 0, "ctx": [],
             "fallback_reasons": Counter(), "routing_skip_reasons": Counter(),
+            "provider_context_skips": Counter(),
         },
         "cheap": {
             "sessions": 0, "requests": 0, "local": 0, "remote": 0,
             "local_only": 0, "fell_back": 0, "remote_only": 0,
             "dispatch_denied": 0, "ctx": [],
             "fallback_reasons": Counter(), "routing_skip_reasons": Counter(),
+            "provider_context_skips": Counter(),
         },
     }
     for s in sessions:
@@ -1903,6 +2003,11 @@ def _bucket_profile(
     for ev in dispatch_denied_events:
         label = _label_at(ev.ts)
         buckets[_bucket_key(label)]["dispatch_denied"] += 1
+    for ev in provider_context_skip_events or ():
+        label = _label_at(ev.ts)
+        buckets[_bucket_key(label)]["provider_context_skips"][
+            ev.provider or UNKNOWN_LABEL
+        ] += 1
     return buckets
 
 
@@ -1987,6 +2092,42 @@ def run_analysis(
     return AnalysisRun(summary=summary, files=files, archived_to=archived_to, mode_map=mode_map)
 
 
+def provider_context_skips_json(
+    summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None = None
+) -> dict:
+    """Provider context-ceiling skip summary for the ``--json`` output.
+
+    LP-0MVMBM1Y3001TPRT: ``routing_skip_provider_context`` events are
+    per-request size mismatches against a remote entry's ``max_context_tokens``
+    (not provider failures). ``share_of_skips`` uses all skip events
+    (``routing_skip_local`` + provider-context) as its denominator, matching
+    the report's ``% of skips`` column. An event whose line carried no
+    ``limit`` is keyed as ``"(unknown)"`` so the absence is visible instead of
+    silently dropped (AC8).
+    """
+    events = summary.provider_context_skip_events
+    schedule = bucketing.schedule_from_config(None, None)
+    standard = low = 0
+    by_provider: Counter = Counter()
+    by_limit: Counter = Counter()
+    for ev in events:
+        by_provider[ev.provider or UNKNOWN_LABEL] += 1
+        by_limit[str(ev.limit) if ev.limit is not None else UNKNOWN_LABEL] += 1
+        if bucketing.bucket_label(ev.ts, schedule, mode_map) == "cheap":
+            low += 1
+        else:
+            standard += 1
+    total_skips = len(summary.routing_skip_events) + len(events)
+    return {
+        "total": len(events),
+        "share_of_skips": round(len(events) / total_skips, 4) if total_skips else 0.0,
+        "standard": standard,
+        "low": low,
+        "by_provider": dict(by_provider.most_common()),
+        "by_limit": dict(by_limit.most_common()),
+    }
+
+
 def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None = None) -> dict:
     """Machine-readable summary of the analysis (one dict; JSON-serialisable)."""
     sessions = list(summary.sessions.values())
@@ -2043,6 +2184,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "dispatch_denied": summary.dispatch_denied_count,
         "unattributed_events": summary.unattributed_events,
         "hold_cycle_routing_skip_events": summary.hold_cycle_reemission_count,
+        "provider_context_skips": provider_context_skips_json(summary, mode_map),
         "standard_sessions": sum(1 for s in sessions if s.bucket != "cheap"),
         "low_priority_sessions": sum(1 for s in sessions if s.bucket == "cheap"),
         "errors": len(summary.error_events),

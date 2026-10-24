@@ -13,6 +13,10 @@ operator's domain knowledge:
 - ``context_too_large`` (legacy ``warm_cache_bypass`` in rotated logs)
   indicates the prompt context exceeded the per-slot hard cap → raise
   local ctx-size / routing thresholds.
+- Provider context-ceiling skips (``routing_skip_provider_context``,
+  ``provider_context_exceeded``) indicate a remote entry's
+  ``max_context_tokens`` was exceeded → raise that entry's limit, reorder the
+  chain, or reduce prompt size.
 - Context pressure: sessions whose max context approaches the per-slot
   context limit (``local_model_ctx_size / slots``) → raise ctx-size.
 - Fast vs cheap fallback-rate imbalance → adjust ``slot_schedule`` entries.
@@ -69,6 +73,11 @@ REMOTE_ERROR_REASONS = (
 
 MIN_EVENTS = 1
 REASON_SHARE = 0.20
+# Provider context-ceiling skips (LP-0MVMBM1Y3001TPRT) are a distinct, directly
+# actionable size signal (a named provider entry could not take the prompt), so
+# they earn advice at a lower share of fallbacks than the routing-preference
+# reasons above.
+PROVIDER_CONTEXT_SHARE = 0.10
 FALLBACK_RATE_LOW = 0.10
 FALLBACK_RATE_HIGH = 0.30
 CONTEXT_PRESSURE_RATIO = 0.80
@@ -322,7 +331,61 @@ def generate_recommendations(
             )
         )
 
-    # --- 4. Context pressure ------------------------------------------------
+    # --- 4. Provider context-ceiling skips ----------------------------------
+    # ``routing_skip_provider_context`` (LP-0MVMBM1Y3001TPRT): the estimated
+    # prompt exceeded a remote entry's ``max_context_tokens``, so that entry was
+    # skipped for this request. Unlike the reason-count rules above this is
+    # driven by the events themselves (they carry provider, estimate and
+    # ceiling), which makes the advice name the actual limit that was hit
+    # instead of inferring it from a reason string.
+    ctx_skips = list(result.provider_context_skip_events)
+    # Share of fallbacks: a provider-context skip is not itself a ``Fallback
+    # triggered`` event, so a window where every request was served after a
+    # chain skip has no fallback denominator — the skips then are the whole
+    # signal and count as 100%.
+    share_denominator = total_fallbacks or len(ctx_skips)
+    if ctx_skips and _pct(len(ctx_skips), share_denominator) >= PROVIDER_CONTEXT_SHARE * 100:
+        provider_counts = result.provider_context_skip_provider_counts
+        limit_counts = result.provider_context_skip_limit_counts
+        bucket_split = {"fast": 0, "cheap": 0}
+        for ev in ctx_skips:
+            label = bucketing.bucket_label(ev.ts, schedule, mode_map)
+            bucket_split["cheap" if label == "cheap" else "fast"] += 1
+        providers_str = ", ".join(
+            f"{provider}: {count}" for provider, count in provider_counts.most_common()
+        )
+        if limit_counts:
+            limits_str = ", ".join(
+                f"{limit}" if limit is not None else "not logged"
+                for limit, _ in limit_counts.most_common()
+            )
+        else:
+            limits_str = "not logged"
+        recs.append(
+            Recommendation(
+                severity="medium",
+                title="Provider entries skip prompts above their context ceiling",
+                detail=(
+                    "The routing chain skipped one or more remote entries because the "
+                    "estimated prompt exceeded that entry's `max_context_tokens` "
+                    "(`provider_context_exceeded`). The request is still served by the "
+                    "next eligible provider, so this is a chain-cost/latency signal, not "
+                    "an outage: each skip walks the chain further. Consider raising the "
+                    "entry's `max_context_tokens` where the provider allows it, placing a "
+                    "larger-context entry earlier in the chain, or reducing prompt size "
+                    "(compaction) so oversized sessions stop exhausting the chain."
+                ),
+                evidence=(
+                    f"{len(ctx_skips)} provider context-ceiling skip(s) "
+                    f"({_pct(len(ctx_skips), share_denominator):.1f}% of {share_denominator} "
+                    f"fallback events). By provider: {providers_str}. "
+                    f"{_dn(len(ctx_skips), bucket_split['fast'], bucket_split['cheap'])}. "
+                    f"Ceiling(s) hit (`limit`): {limits_str}."
+                ),
+            )
+        )
+
+    # --- 5. Context pressure ------------------------------------------------
     if cfg_ctx is not None or mode_map is not None:
         pressured = []
         for s in sessions:
@@ -367,7 +430,7 @@ def generate_recommendations(
                 )
             )
 
-    # --- 5. Fast/cheap imbalance -------------------------------------------
+    # --- 6. Fast/cheap imbalance -------------------------------------------
     buckets = [b for b in bucket_stats.values() if b["sessions"] >= IMBALANCE_MIN_SESSIONS]
     if len(buckets) == 2:
         low, high = sorted(buckets, key=lambda b: b["fallback_rate"])
@@ -396,7 +459,7 @@ def generate_recommendations(
                 )
             )
 
-    # --- 6. Remote provider errors (informational) ---------------------------
+    # --- 7. Remote provider errors (informational) ---------------------------
     remote_errors = [
         r for r in reason_counts if r and any(tok in r.lower() for tok in REMOTE_ERROR_REASONS)
     ]
@@ -421,7 +484,7 @@ def generate_recommendations(
             )
         )
 
-    # --- 7. No change needed --------------------------------------------------
+    # --- 8. No change needed --------------------------------------------------
     if not recs and fallback_rate < FALLBACK_RATE_LOW:
         fast_fb_total = sum(bucket_reasons["fast"].values())
         cheap_fb_total = sum(bucket_reasons["cheap"].values())

@@ -6,10 +6,11 @@ The proxy logs lines of the form::
 
 Only a small set of structured message prefixes carry the signal this skill
 needs (``Stream started``, ``Stream finished``, ``Fallback triggered``,
-``routing_skip_local``, ``local_dispatch_denied``). Everything else is
-ignored. Parsing is tolerant: missing fields default to ``None`` and a line
-that cannot be parsed is skipped (never fatal), so truncated request payloads
-and log-format drift do not break the analysis.
+``routing_skip_local``, ``routing_skip_provider_context``,
+``local_dispatch_denied``). Everything else is ignored. Parsing is tolerant:
+missing fields default to ``None`` and a line that cannot be parsed is skipped
+(never fatal), so truncated request payloads and log-format drift do not break
+the analysis.
 
 Attribution markers (LP-0MVAPNC2900145RH) are appended to restart and
 mode-switch log lines, carrying ``source=<value>``, ``actor=<value>``, and
@@ -88,6 +89,16 @@ RE_FALLBACK_BUDGET_REMAINING = re.compile(r"\bremaining=(\d+)")
 RE_FALLBACK_BUDGET_WAITED = re.compile(r"\bwaited=([\d.]+)")
 # routing_skip_local reason sits between "reason=" and the "→" arrow.
 RE_ROUTING_SKIP_REASON = re.compile(r"\breason=([\w_]+)\s*→")
+# Provider context-ceiling skip fields (LP-0MVMBM1Y3001TPRT):
+#   routing_skip_provider_context provider=<p> type=remote
+#     status=provider_context_exceeded estimated_tokens=<n> limit=<n>
+#     reason=provider_context_exceeded session=<uuid>
+# ``estimated_tokens`` is the proxy's routing-time prompt estimate and
+# ``limit`` the per-entry ``max_context_tokens`` ceiling it exceeded. Both are
+# optional downstream (older rotated logs may omit ``limit``).
+RE_SKIP_ESTIMATED_TOKENS = re.compile(r"\bestimated_tokens=(\d+)")
+RE_SKIP_LIMIT = re.compile(r"\blimit=(\d+)")
+RE_PROVIDER_TYPE = re.compile(r"\btype=([A-Za-z0-9_.-]+)")
 # Chain-hold cycle stamp (LP-0MU5AIAAY003KVM0): the proxy tags
 # ``routing_skip_local`` lines with ``chain_hold_cycle=<N>`` (cycle 0 = first
 # pre-hold cycle, incremented on every hold restart). Tolerant: absent on
@@ -186,6 +197,12 @@ STREAM_STARTED = "Stream started"
 STREAM_FINISHED = "Stream finished"
 FALLBACK = "Fallback triggered"
 ROUTING_SKIP = "routing_skip_local"
+# Per-provider context-ceiling skip (LP-0MVMBM1Y3001TPRT): the estimated prompt
+# exceeds the remote entry's ``max_context_tokens``, so that entry is skipped
+# for this request only. It is *not* a provider failure (no cooldown, no
+# failure-domain exclusion) — it is a per-request size mismatch, and the line
+# carries the session UUID, the provider, the estimate and the ceiling.
+ROUTING_SKIP_PROVIDER_CONTEXT = "routing_skip_provider_context"
 DISPATCH_DENIED = "local_dispatch_denied"
 # Local dispatch attempt marker (LP-0MVKUKG3F0035I85): the proxy logs one
 # ``[local] POST http://<backend>/... `` line for **every** attempt it makes at
@@ -349,9 +366,10 @@ class LogEvent:
     """One parsed structured log line.
 
     ``kind`` is one of ``stream_started``, ``stream_finished``, ``fallback``,
-    ``routing_skip``, ``dispatch_denied``, ``local_dispatch``,
-    ``contention_dispatch``, ``contention_fallback_after_queue``,
-    ``idle_admit``, ``mode_switch``, ``restart``,
+    ``routing_skip``, ``provider_context_skip``, ``dispatch_denied``,
+    ``local_dispatch``, ``contention_dispatch``,
+    ``contention_fallback_after_queue``, ``idle_admit``, ``mode_switch``,
+    ``restart``,
     ``compaction_event``, ``compaction_backstop``, ``compaction_churn``, or an
     error kind (``stream_error``, ``stream_finish_error``, ``slot_save_error``,
     ``backend_retry``, ``upstream_http_error``). Only the fields relevant to
@@ -417,7 +435,18 @@ class LogEvent:
     budget_waited: float | None = None
     signal: str | None = None
     src_file: str | None = None
+    # 1-based line number inside ``src_file`` (set by ``iter_events``); with
+    # ``src_file`` it is the evidence pointer for a parsed line.
+    line_no: int | None = None
     raw: str | None = None
+    # Provider context-ceiling skip fields (``provider_context_skip`` kind,
+    # LP-0MVMBM1Y3001TPRT): the routing-time prompt estimate that exceeded the
+    # entry's ceiling, that ceiling (``limit``), and the entry's ``type=``
+    # (``remote`` / ``local``). Each is ``None`` when the line omits it, so
+    # older rotated logs keep parsing (AC8).
+    estimated_tokens: int | None = None
+    limit: int | None = None
+    provider_type: str | None = None
     # Operating-mode field (mode_switch kind only): "fast" | "cheap".
     mode: str | None = None
     # Restart-marker field (restart kind only): "spawned" | "complete"
@@ -682,6 +711,25 @@ def parse_log_line(line: str) -> LogEvent | None:
             budget_limit=_int(RE_FALLBACK_BUDGET_LIMIT, msg),
             budget_remaining=_int(RE_FALLBACK_BUDGET_REMAINING, msg),
             budget_waited=_float(RE_FALLBACK_BUDGET_WAITED, msg),
+        )
+    if msg.startswith(ROUTING_SKIP_PROVIDER_CONTEXT):
+        # "routing_skip_provider_context provider=munitoai-free type=remote
+        #  status=provider_context_exceeded estimated_tokens=195787 limit=150000
+        #  reason=provider_context_exceeded session=<uuid>"
+        # A per-provider context-ceiling skip: session-bearing, so it is
+        # attributable evidence of *why* a remote attempt was not made. The
+        # ``status=`` value duplicates ``reason=`` (both
+        # ``provider_context_exceeded``) and is therefore not stored twice.
+        return LogEvent(
+            "provider_context_skip",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            provider_type=_first(RE_PROVIDER_TYPE, msg),
+            session=_session_from(msg),
+            reason=_first(RE_REASON_KV, msg),
+            estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
+            limit=_int(RE_SKIP_LIMIT, msg),
+            raw=line,
         )
     if msg.startswith(ROUTING_SKIP):
         cycle_m = RE_CHAIN_HOLD_CYCLE.search(msg)
@@ -1029,7 +1077,7 @@ def iter_events(
     lo = window_start - margin
     hi = window_end + margin
     with open_log_text(path) as fh:
-        for line in fh:
+        for line_no, line in enumerate(fh, start=1):
             if len(line) < 24 or not line[:4].isdigit():
                 continue
             ev = parse_log_line(line)
@@ -1037,6 +1085,7 @@ def iter_events(
                 continue
             if lo <= ev.ts <= hi:
                 ev.src_file = path.name
+                ev.line_no = line_no
                 yield ev
 
 

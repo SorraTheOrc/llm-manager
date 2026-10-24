@@ -78,12 +78,22 @@ Outputs written to:
   hold-cycle routing-skip re-emissions (`chain_hold_cycle>0`) in the
   window, excluded from every demand/local-skip counter
   (LP-0MUIEO6IP0030CT3): `jq .hold_cycle_routing_skip_events`.
+- `--json` summary field `provider_context_skips` — provider context-ceiling
+  skips (LP-0MVMBM1Y3001TPRT): `{"total": N, "share_of_skips": f,
+  "standard": N, "low": N, "by_provider": {provider: count},
+  "by_limit": {limit: count}}`. `share_of_skips` uses **all** skip events
+  (`routing_skip_local` + provider-context) as its denominator; an event whose
+  line carried no `limit` is keyed `(unknown)` rather than dropped.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
   columns), a **Total tokens** section (Input / Output / Total counts and
   % share, with fast/cheap and by-model breakdowns; see [Total tokens](#total-tokens)
-  below), fallback-reason and routing-skip breakdowns, per-model
+  below), fallback-reason and routing-skip breakdowns, a **Provider context
+  skips** section (`routing_skip_provider_context` events rendered only when
+  the window has them: count, % of all skip events, Standard/Low split,
+  provider/type breakdown and the `limit` ceiling each provider hit, plus the
+  median/p90/max estimated prompt that was blocked), per-model
   breakdown, **Error analysis** (when the window has error events) with a
   taxonomy table that includes a **Status** column (upstream HTTP errors are
   split into one row per status code), a **Provider/model breakdown** table
@@ -219,7 +229,12 @@ entry is a local runtime edit, not a committed artifact.
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
-   `routing_skip_local`, `local_dispatch_denied`, `[local] POST` (every
+   `routing_skip_local`, `routing_skip_provider_context` (a per-provider
+   context-ceiling skip rendered as its own **Provider context skips**
+   breakdown in the report; parsed into `provider_context_skip`
+   events carrying `provider`, `type`, `reason`, `estimated_tokens`,
+   `limit`, `session`, and the source file/line as evidence,
+   LP-0MVMBM1Y3001TPRT), `local_dispatch_denied`, `[local] POST` (every
    dispatch attempt at the local llama-server — including attempts that
    never yield a first byte, LP-0MVKUKG3F0035I85), the server-side
    compaction events (`compaction_event`, `compaction_backstop`,
@@ -527,6 +542,19 @@ entry is a local runtime edit, not a committed artifact.
     `local_large_context_warm_cache_threshold`.
   - `HTTP 4xx/5xx`, `empty_response`, timeouts → remote provider issues
     (credentials, rate limits) — not slot-related.
+- **Provider context skips** (`routing_skip_provider_context`): a remote
+  entry's `max_context_tokens` ceiling was exceeded by the estimated prompt,
+  so that provider was skipped **for this request only** (no cooldown, no
+  failure-domain exclusion, no usage-limit reset). Read the dedicated section
+  as a chain-cost signal, not an outage: the request was still served, but each
+  skip walked the chain further. The `limit` column names the ceiling that was
+  hit, so a provider whose limit explains most skips is the one to raise (or
+  reorder behind a larger-context entry); a ceiling that is low relative to the
+  sessions' peak context overlaps the `context_too_large` /
+  `large_context_bypass` advice above (same size problem, remote side). A
+  session whose own provider-context skip precedes its first remote stream is
+  attributed that skip (`fallback_reason=provider_context_exceeded`) unless it
+  also logged a `routing_skip_local` line, which takes precedence.
 - **Context pressure**: sessions whose max context approaches
   `local_model_ctx_size / slots` can force `large_context_bypass`.
 - **Decode speed / Prompt eval speed**: when these sections are empty, read
@@ -708,20 +736,30 @@ entry is a local runtime edit, not a committed artifact.
   `Fallback triggered` carries `session=`, a session's fallback reason is taken
   from its **own** evidence and never inherited from a neighbouring line. The
   precedence is (1) the session's own `routing_skip_local` line at/before its
-  first remote stream, (2) the session's own `Fallback triggered` line at/before
-  its first remote stream, (3) the nearest **session-less** fallback line within
-  60s before the first remote stream — reachable only for rotated logs predating
-  the session stamp — and (4) no own evidence at all. The provenance is exposed
-  as the `fallback_attribution` column (`own_skip`, `own_fallback`,
-  `legacy_nearest`, `lease_denied`, `unattributed`) plus the `no_remote_fallback`
-  state for sessions that never used a remote provider; the report's
-  `Session fallback attribution` line and the JSON summary's
-  `fallback_attribution` map count every state. A session with no fallback line
-  but `local_dispatch_denied` evidence is labelled `lease_denied`
-  (`reason=local_lease_active`) — a lease/concurrency refusal, not an inherited
-  spill. Before this change a session with no fallback line of its own inherited
-  an unrelated neighbour's `rate_limited` within the 60s window (11 of 26 clean
-  local-using sessions in the 2026-10-23/24 window were mislabelled that way).
+  first remote stream, (2) the session's own `routing_skip_provider_context`
+  line at/before its first remote stream (LP-0MVMBM1Y3001TPRT — it names the
+  provider and the `limit` that blocked that chain step, so it outranks the
+  generic fallback line), (3) the session's own `Fallback triggered` line
+  at/before its first remote stream, (4) the nearest **session-less** fallback
+  line within 60s before the first remote stream — reachable only for rotated
+  logs predating the session stamp — and (5) no own evidence at all. The
+  provenance is exposed as the `fallback_attribution` column (`own_skip`,
+  `own_provider_skip`, `own_fallback`, `legacy_nearest`, `lease_denied`,
+  `unattributed`) plus the `no_remote_fallback` state for sessions that never
+  used a remote provider; the report's `Session fallback attribution` line and
+  the JSON summary's `fallback_attribution` map count every state. A session
+  with no fallback line but `local_dispatch_denied` evidence is labelled
+  `lease_denied` (`reason=local_lease_active`) — a lease/concurrency refusal,
+  not an inherited spill. Before this change a session with no fallback line of
+  its own inherited an unrelated neighbour's `rate_limited` within the 60s
+  window (11 of 26 clean local-using sessions in the 2026-10-23/24 window were
+  mislabelled that way).
+- Provider context-ceiling skips (`routing_skip_provider_context`) are counted
+  per event, not per provider chain: one request that exceeds several entries'
+  ceilings logs one line per entry, so the count is *entry* attempts skipped.
+  The line records no cooldown and the entry stays eligible for smaller
+  requests. Older rotated lines may omit `limit=`; those events still parse and
+  their ceiling is reported as `not logged` rather than zero.
 - Sessions spanning a slot-schedule transition may observe a brief restart
   interruption (llama-server is restarted immediately at the transition time);
   since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.

@@ -238,6 +238,72 @@ class TestLogLineParsing:
         assert ev.reason == "context_too_large"
         assert ev.chain_hold_cycle is None
 
+    def test_routing_skip_provider_context_parsed(self):
+        # LP-0MVMBM1Y3001TPRT AC1: the per-provider context-ceiling skip is its
+        # own event kind carrying session, provider, type, reason, estimate and
+        # the ceiling that was exceeded.
+        ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_PROVIDER_CONTEXT)
+        assert ev is not None
+        assert ev.kind == "provider_context_skip"
+        assert ev.session == "herdr-1792524101-1636143-211"
+        assert ev.provider == "munitoai-free"
+        assert ev.provider_type == "remote"
+        assert ev.reason == "provider_context_exceeded"
+        assert ev.estimated_tokens == 153917
+        assert ev.limit == 150000
+        # A skip is not a fallback and not a local skip: it must not leak into
+        # the other kinds' fields.
+        assert ev.src is None and ev.dst is None
+        assert ev.chain_hold_cycle is None
+
+    def test_routing_skip_provider_context_without_limit_degrades(self):
+        # AC8: historical lines may predate ``limit=``. The event still parses
+        # with everything else intact and ``limit`` None (never fatal).
+        ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT)
+        assert ev is not None
+        assert ev.kind == "provider_context_skip"
+        assert ev.limit is None
+        assert ev.estimated_tokens == 160001
+        assert ev.provider == "munitoai-free"
+        assert ev.session == "herdr-1792524101-1636143-212"
+
+    def test_routing_skip_provider_context_is_not_a_local_skip(self):
+        # Both prefixes start with ``routing_skip``; the provider-context line
+        # must never be parsed as a ``routing_skip_local`` event (and vice
+        # versa), otherwise per-session attribution precedence inverts.
+        ctx = log_parser.parse_log_line(fixtures.ROUTING_SKIP_PROVIDER_CONTEXT)
+        local = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CONTEXT_TOO_LARGE)
+        assert ctx.kind == "provider_context_skip"
+        assert local.kind == "routing_skip"
+
+    def test_routing_skip_provider_context_unknown_session_is_unattributed(self):
+        line = fixtures.ROUTING_SKIP_PROVIDER_CONTEXT.replace(
+            "session=herdr-1792524101-1636143-211", "session=unknown"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev.kind == "provider_context_skip"
+        assert ev.session is None
+
+    def test_iter_events_attaches_file_and_line_evidence(self, tmp_path):
+        # AC1: an event carries the source file/line for evidence, not just the
+        # raw text. Two noise lines precede the skip so the number is non-trivial.
+        log = tmp_path / "proxy.log"
+        log.write_text(
+            "2026-10-21 04:11:00,000 - INFO - Stream started: provider=local model=Qwen3 "
+            "session=herdr-1792524101-1636143-211 request=[]\n"
+            "not a log line\n" + fixtures.ROUTING_SKIP_PROVIDER_CONTEXT + "\n",
+            encoding="utf-8",
+        )
+        events = list(
+            log_parser.iter_events(
+                log, datetime(2026, 10, 21, 4, 0), datetime(2026, 10, 21, 5, 0)
+            )
+        )
+        skip = next(e for e in events if e.kind == "provider_context_skip")
+        assert skip.src_file == "proxy.log"
+        assert skip.line_no == 3
+        assert skip.raw.strip() == fixtures.ROUTING_SKIP_PROVIDER_CONTEXT
+
     def test_dispatch_denied(self):
         ev = log_parser.parse_log_line(fixtures.DISPATCH_DENIED)
         assert ev.kind == "dispatch_denied"
@@ -1173,6 +1239,89 @@ class TestSessionAggregation:
         assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 50)
         assert s.fallback_reason == "HTTP 400"
 
+    def test_fallback_attributed_via_provider_context_skip(self):
+        # AC2: the session's own routing_skip_provider_context line is
+        # session-bearing evidence, so it attributes the move (and its reason)
+        # without relying on a nearest-line Fallback triggered guess.
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s7 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s7 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+            "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+            "reason=provider_context_exceeded session=s7",
+            "2026-08-02 14:00:21,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s7 request=[]",
+            "2026-08-02 14:00:25,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session=s7 provider=opencode-go model=deepseek-v4-flash request=[]",
+        ]
+        res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        s = res.sessions["s7"]
+        assert s.fallback_reason == "provider_context_exceeded"
+        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 20)
+
+    def test_own_provider_context_skip_beats_nearest_fallback_guess(self):
+        # The own line wins over a closer session-less Fallback triggered line,
+        # even when that guess is also inside the attribution window.
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s8 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s8 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+            "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+            "reason=provider_context_exceeded session=s8",
+            "2026-08-02 14:00:55,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 400",
+            "2026-08-02 14:00:58,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s8 request=[]",
+        ]
+        res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        s = res.sessions["s8"]
+        assert s.fallback_reason == "provider_context_exceeded"
+        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 40)
+
+    def test_routing_skip_local_beats_provider_context_skip(self):
+        # Documented precedence (AC2): the local-side skip explains why local was
+        # not used at all, so it outranks the downstream per-provider ceiling
+        # hits recorded while walking the chain.
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s9 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s9 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:10,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+            "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+            "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+            "provider session=s9",
+            "2026-08-02 14:00:12,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+            "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+            "reason=provider_context_exceeded session=s9",
+            "2026-08-02 14:00:14,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s9 request=[]",
+        ]
+        res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        s = res.sessions["s9"]
+        assert s.fallback_reason == "context_too_large"
+        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 10)
+
+    def test_provider_context_skips_collected_without_inflating_demand(self):
+        # Provider-context skips are collected for the report's own breakdown
+        # but never counted as fallback events, local skips, or requests.
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s10 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s10 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+            "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+            "reason=provider_context_exceeded session=s10",
+            "2026-08-02 14:00:21,000 - INFO - routing_skip_provider_context provider=opencode-go "
+            "type=remote status=provider_context_exceeded estimated_tokens=195787 limit=196608 "
+            "reason=provider_context_exceeded session=s10",
+        ]
+        res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert len(res.provider_context_skip_events) == 2
+        assert res.fallback_events == []
+        assert res.routing_skip_events == []
+        assert res.total_requests == 1
+        assert res.sessions["s10"].routing_skips == 0
+        assert res.sessions["s10"].messages == 1
+        assert dict(res.provider_context_skip_provider_counts) == {
+            "munitoai-free": 1,
+            "opencode-go": 1,
+        }
+        assert dict(res.provider_context_skip_limit_counts) == {150000: 1, 196608: 1}
+
     def test_remote_only_session(self):
         lines = [
             # Legacy reason value in a rotated log: still classified correctly
@@ -2102,6 +2251,67 @@ class TestRecommendations:
         )
         recs = recommendations.generate_recommendations(res, config=None)
         assert any(r.severity == "info" and "remote" in r.title.lower() for r in recs)
+
+    def test_provider_context_skips_trigger_ceiling_advice(self):
+        # AC4: provider-context skip events drive their own advice naming count,
+        # share of fallbacks, standard/low split and the ``limit`` that was hit.
+        res = _result_with_sessions(
+            [_session("a")],
+            fallback_events=[
+                log_parser.LogEvent("fallback", WINDOW_START, reason="context_too_large"),
+                log_parser.LogEvent("fallback", WINDOW_START, reason="context_too_large"),
+            ],
+        )
+        res.provider_context_skip_events = [
+            log_parser.LogEvent(
+                "provider_context_skip",
+                WINDOW_START,
+                provider="munitoai-free",
+                provider_type="remote",
+                reason="provider_context_exceeded",
+                estimated_tokens=153917,
+                limit=150000,
+            ),
+            log_parser.LogEvent(
+                "provider_context_skip",
+                WINDOW_START,
+                provider="opencode-go",
+                reason="provider_context_exceeded",
+                estimated_tokens=195787,
+                limit=196608,
+            ),
+        ]
+        recs = recommendations.generate_recommendations(res, config=None)
+        ceiling = [r for r in recs if "ceiling" in r.title.lower()]
+        assert ceiling, "expected provider-ceiling advice, got: " + " | ".join(r.title for r in recs)
+        evidence = ceiling[0].evidence
+        assert "2 provider context-ceiling skip(s)" in evidence
+        assert "(100.0%" in evidence  # no fallback events -> skips are the whole signal
+        assert "150000" in evidence and "196608" in evidence
+        assert "Fast 2 (100.0%)" in evidence
+
+    def test_provider_context_skips_below_share_do_not_advise(self):
+        # AC4 threshold: a handful of ceiling skips inside a large fallback
+        # volume stays below PROVIDER_CONTEXT_SHARE and does not fire advice.
+        res = _result_with_sessions(
+            [_session("a")],
+            fallback_events=[
+                log_parser.LogEvent("fallback", WINDOW_START, reason="other_reason")
+                for _ in range(20)
+            ],
+        )
+        res.provider_context_skip_events = [
+            log_parser.LogEvent(
+                "provider_context_skip",
+                WINDOW_START,
+                provider="munitoai-free",
+                reason="provider_context_exceeded",
+                limit=150000,
+            )
+        ]
+        recs = recommendations.generate_recommendations(res, config=None)
+        titles = " | ".join(r.title for r in recs)
+        assert "ceiling" not in titles.lower()
 
 
 class TestErrorRecommendations:
@@ -4845,6 +5055,87 @@ class TestReportRestructure:
         section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
         assert "| Provider | Model | Sessions | Standard | Low | Requests | Fell back |" in section
         assert "| local | Qwen3 | 2 | 2 (100.0%) | 0 (0.0%) |" in section
+
+
+class TestProviderContextSkipReport:
+    """``## Provider context skips`` section and JSON (LP-0MVMBM1Y3001TPRT
+    AC3/AC6): dedicated breakdown with count, % of skips, standard/low split,
+    provider breakdown and the ceiling that was hit."""
+
+    def _aggregate(self, lines):
+        return aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+
+    def test_dedicated_section_renders_breakdown(self):
+        res = self._aggregate(
+            [
+                "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+                "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+                "reason=provider_context_exceeded session=s1",
+                "2026-08-02 14:00:21,000 - INFO - routing_skip_provider_context provider=opencode-go "
+                "type=remote status=provider_context_exceeded estimated_tokens=195787 limit=196608 "
+                "reason=provider_context_exceeded session=s1",
+                "2026-08-02 14:00:22,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+                "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+                "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+                "provider session=s1",
+            ]
+        )
+        md = reporting.build_report(res, config=None)
+        section = md.split("## Provider context skips", 1)[1].split("## ", 1)[0]
+        # Header bullet: count + share of all skip events (2 of 3).
+        assert "**2**" in section and "66.7% of 3 skip events" in section
+        # Provider rows with category-relative Standard/Low and the ceiling.
+        assert "| munitoai-free | remote | 1 | 33.3% | 1 (50.0%) | 0 (0.0%) | 150000 (1) |" in section
+        assert "| opencode-go | remote | 1 | 33.3% | 1 (50.0%) | 0 (0.0%) | 196608 (1) |" in section
+        # Skips and local skips have separate tables (never conflated).
+        assert "## routing_skip_local reasons" in md
+
+    def test_section_omitted_without_events(self):
+        res = self._aggregate(
+            [
+                "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 "
+                "session=plain request=[]",
+                "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 "
+                "session=plain provider=local model=Qwen3 request=[]",
+            ]
+        )
+        md = reporting.build_report(res, config=None)
+        assert "## Provider context skips" not in md
+
+    def test_absent_limit_degrades_to_not_logged(self):
+        # AC8: an event without ``limit`` renders as ``not logged`` instead of
+        # zero or a crash, and the note names how many lacked the field.
+        res = self._aggregate(
+            [
+                "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+                "type=remote status=provider_context_exceeded estimated_tokens=160001 "
+                "reason=provider_context_exceeded session=s2",
+            ]
+        )
+        md = reporting.build_report(res, config=None)
+        section = md.split("## Provider context skips", 1)[1].split("## ", 1)[0]
+        assert "carried no `limit=` field" in section
+        assert "| not logged |" in section
+
+    def test_json_summary_exposes_provider_context_skips(self):
+        res = self._aggregate(
+            [
+                "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+                "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+                "reason=provider_context_exceeded session=s1",
+                "2026-08-02 14:00:22,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+                "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+                "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+                "provider session=s1",
+            ]
+        )
+        j = reporting.summary_to_json(res)
+        obj = j["provider_context_skips"]
+        assert obj["total"] == 1
+        assert obj["share_of_skips"] == pytest.approx(0.5)  # 1 of 2 skip events
+        assert obj["by_provider"] == {"munitoai-free": 1}
+        assert obj["by_limit"] == {"150000": 1}
+        assert obj["standard"] == 1 and obj["low"] == 0
 
 
 class TestCategoryRelativePercentages:
