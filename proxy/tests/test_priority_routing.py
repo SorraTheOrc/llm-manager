@@ -6,8 +6,9 @@ replaces the fast/cheap operating mode:
 - AC1: header parsing (``X-Priority: low|medium|high``, absent/invalid →
   medium) and effective-priority computation incl. cheap-window low-capping
   (header unmodified, no 503/Retry-After deferral, no restart).
-- AC2: per-model ``priority_routes`` chain selection per priority;
-  backward-compatible default when absent.
+- AC2: per-provider ``priorities`` labels select the chain per priority;
+  backward-compatible default when no provider is labelled
+  (LP-0MVGPZWY0001JD1D).
 - AC3: priority gates the routing knobs (queue entry, economic bypass,
   local-vs-remote preference).
 - AC4: mode machinery removed (module gone, overlays gone, slot pool fixed
@@ -149,7 +150,7 @@ class TestEffectivePriority:
 
 
 # ---------------------------------------------------------------------------
-# AC2 — priority_routes chain selection
+# AC2 — per-provider priority labels select the chain
 # ---------------------------------------------------------------------------
 
 
@@ -157,42 +158,48 @@ def _model(providers):
     return {"providers": providers}
 
 
-def _prov(name, ptype="remote"):
-    return {"name": name, "type": ptype}
+def _prov(name, priorities=None, ptype="remote"):
+    entry = {"name": name, "type": ptype}
+    if priorities is not None:
+        entry["priorities"] = priorities
+    return entry
 
 
 class TestProviderChains:
     def test_backward_compatible_default_returns_full_chain(self):
+        # No provider declares ``priorities`` → every provider serves every
+        # priority (the documented legacy default for ``embed``/``github``/
+        # ``private``).
         cfg = _model([_prov("a"), _prov("b")])
         assert provider_chain_for_priority(cfg, "high") == cfg["providers"]
         assert provider_chain_for_priority(cfg, "low") == cfg["providers"]
         # Medium = today's semantics (full chain).
         assert provider_chain_for_priority(cfg, "medium") == cfg["providers"]
 
-    def test_low_names_resolved_against_providers(self):
-        cfg = _model([_prov("local", "local"), _prov("free"), _prov("paid")])
-        cfg["priority_routes"] = {"low": ["local", "free"]}
-        names = [p["name"] for p in provider_chain_for_priority(cfg, "low")]
-        assert names == ["local", "free"]
+    def test_labels_filter_the_provider_list(self):
+        cfg = _model(
+            [
+                _prov("local", ["low", "medium", "high"], "local"),
+                _prov("free", ["low", "medium", "high"]),
+                _prov("paid", ["medium", "high"]),
+            ]
+        )
+        for priority in ("low", "medium", "high"):
+            names = [p["name"] for p in provider_chain_for_priority(cfg, priority)]
+            expected = ["local", "free"] if priority == "low" else ["local", "free", "paid"]
+            assert names == expected, priority
 
-    def test_missing_route_falls_back_to_providers(self):
-        cfg = _model([_prov("a"), _prov("b")])
-        cfg["priority_routes"] = {"low": ["a"]}
-        # No medium entry: falls back to the full chain (medium semantics).
-        names = [p["name"] for p in provider_chain_for_priority(cfg, "medium")]
-        assert names == ["a", "b"]
+    def test_chain_entries_are_the_provider_dicts(self):
+        cfg = _model([_prov("local", ["low"], "local"), _prov("paid", ["high"])])
+        assert provider_chain_for_priority(cfg, "low") == [cfg["providers"][0]]
+        assert provider_chain_for_priority(cfg, "high") == [cfg["providers"][1]]
 
-    def test_dict_entries_passed_through(self):
-        cfg = _model([_prov("local", "local"), _prov("paid")])
-        entry = {"name": "direct", "type": "remote", "endpoint": "http://x"}
-        cfg["priority_routes"] = {"high": [entry]}
-        assert provider_chain_for_priority(cfg, "high") == [entry]
-
-    def test_unknown_name_skipped_without_crash(self):
-        cfg = _model([_prov("local", "local")])
-        cfg["priority_routes"] = {"low": ["local", "does-not-exist"]}
-        names = [p["name"] for p in provider_chain_for_priority(cfg, "low")]
-        assert names == ["local"]
+    def test_absent_priority_is_not_widened(self):
+        # Labelled model with no provider for the priority: an empty chain
+        # (the config validator rejects that shape at load; routing must never
+        # fall back to the full provider list).
+        cfg = _model([_prov("a", ["low"]), _prov("b", ["low"])])
+        assert provider_chain_for_priority(cfg, "high") == []
 
 
 # ---------------------------------------------------------------------------
@@ -379,14 +386,17 @@ class TestModeRemoval:
         assert window["start"] == "01:00"
         assert window["end"] == "10:00"
 
-    def test_models_declare_priority_routes(self):
+    def test_models_declare_priorities_on_every_provider(self):
         from proxy.utils import load_config
 
         cfg = load_config()
         for name in ("plan", "author", "code", "compact"):
-            routes = cfg["models"][name].get("priority_routes")
-            assert isinstance(routes, dict), name
-            assert "low" in routes, name
+            providers = cfg["models"][name]["providers"]
+            assert providers, name
+            for entry in providers:
+                assert isinstance(entry.get("priorities"), list), (
+                    f"{name}/{entry.get('name')} must declare priorities"
+                )
 
     def test_no_restart_on_policy_change_endpoint_gone(self):
         # AC4: POST /admin/set-mode / GET /admin/mode are removed from the

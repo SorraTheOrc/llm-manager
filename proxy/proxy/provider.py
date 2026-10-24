@@ -45,6 +45,7 @@ from proxy.observability import _record_backend_signal
 from proxy.priority import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
+    VALID_PRIORITIES,
     effective_chain_for_request,
     priority_routing_profile,
     request_priority,
@@ -4431,6 +4432,114 @@ def _get_chain_hold_total_seconds(config: dict) -> float:
         return _CHAIN_HOLD_TOTAL_DEFAULT
 
 
+def validate_priority_config(config: dict) -> list[str]:
+    """Validate the per-provider priority labels (LP-0MVGPZWY0001JD1D AC5).
+
+    Priority-chain membership lives on each provider entry as a ``priorities``
+    list (``[low, medium, high]``, ``[medium, high]``, …); the model's priority
+    chain is a filter over its own ``providers`` list. This validator enforces
+    the shapes that keep that filter honest:
+
+    - ``priority_routes`` is **removed** — a model that still declares it is
+      rejected with a migration message naming ``priorities`` (a stale overlay
+      must fail loudly instead of silently losing its routing).
+    - ``priorities`` must be a non-empty **list** of known priority names
+      (``low``/``medium``/``high``), with no duplicates. A scalar, a mapping or
+      an empty list is ambiguous about membership and is rejected.
+    - **Model-level opt-in (fail closed):** if any provider of a model declares
+      ``priorities``, every provider of that model must declare it. A silent
+      default for an unlabelled entry is exactly the leak this design removes.
+    - Every priority must be served by at least one provider of a labelled
+      model (Q6 option (a): reject at load rather than silently widening to the
+      full ``providers`` list — the paid tiers — inside the cheap window).
+
+    Models that declare no ``priorities`` anywhere stay unlabelled: every
+    provider remains eligible for every priority (the documented legacy
+    default used by ``embed`` / ``github`` / ``private``).
+
+    Returns a list of human-readable problem descriptions (empty when the
+    priority configuration is consistent).
+    """
+    problems: list[str] = []
+    if not isinstance(config, dict):
+        return problems
+    models = config.get("models")
+    if not isinstance(models, dict):
+        return problems
+
+    for model_name, model_cfg in models.items():
+        if not isinstance(model_cfg, dict):
+            continue
+        if "priority_routes" in model_cfg:
+            problems.append(
+                f"model {str(model_name)!r}: 'priority_routes' was removed; "
+                "declare 'priorities' on each provider entry instead "
+                "(e.g. priorities: [low, medium, high])"
+            )
+        providers = model_cfg.get("providers")
+        if not isinstance(providers, list):
+            continue
+        entries = [p for p in providers if isinstance(p, dict)]
+        labelled = [p for p in entries if "priorities" in p]
+        if not labelled:
+            continue
+
+        for entry in entries:
+            name = entry.get("name", "<unnamed>")
+            where = f"model {str(model_name)!r} provider {str(name)!r}"
+            if "priorities" not in entry:
+                problems.append(
+                    f"{where}: declares no 'priorities' but other providers of "
+                    "the model do — a labelled model must label every provider "
+                    "(no implicit default)"
+                )
+                continue
+            raw = entry.get("priorities")
+            if not isinstance(raw, list):
+                problems.append(
+                    f"{where}: 'priorities' must be a list of "
+                    f"{'/'.join(VALID_PRIORITIES)} (got {type(raw).__name__} "
+                    f"{raw!r})"
+                )
+                continue
+            if not raw:
+                problems.append(
+                    f"{where}: 'priorities' is empty — a provider must serve at "
+                    "least one priority, otherwise it can never be routed to"
+                )
+                continue
+            seen: list[str] = []
+            for value in raw:
+                label = str(value).strip().lower() if isinstance(value, str) else None
+                if label not in VALID_PRIORITIES:
+                    problems.append(
+                        f"{where}: unknown priority {value!r} in 'priorities' "
+                        f"(valid: {'/'.join(VALID_PRIORITIES)})"
+                    )
+                    continue
+                if label in seen:
+                    problems.append(
+                        f"{where}: duplicate priority {label!r} in 'priorities'"
+                    )
+                    continue
+                seen.append(label)
+
+        for priority in VALID_PRIORITIES:
+            served = any(
+                isinstance(p.get("priorities"), list)
+                and priority in [str(v).strip().lower() for v in p["priorities"]]
+                for p in labelled
+            )
+            if not served:
+                problems.append(
+                    f"model {str(model_name)!r}: no provider serves priority "
+                    f"{priority!r} — a labelled model must cover every priority "
+                    "(an empty chain is never widened to the full provider list)"
+                )
+
+    return problems
+
+
 def validate_chain_hold_config(config: dict) -> list[str]:
     """Validate the chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5).
 
@@ -8184,7 +8293,8 @@ async def _proxy_with_remote_fallback_cycle(
         pass
 
     # Effective priority (AC1/AC2): cheap-window capped header value, stamped
-    # on the request; the remote-only chain is selected by it (priority_routes)
+    # on the request; the remote-only chain is selected by it (per-provider
+    # ``priorities`` labels, LP-0MVGPZWY0001JD1D)
     # just like the local+remote cycle, so a ``low`` request on a remote-only
     # model uses its low chain (e.g. free-tier-first).
     server_cfg = config.get("server", config) if isinstance(config, dict) else {}
@@ -8825,7 +8935,8 @@ async def _proxy_with_fallback_cycle(
         pass
 
     # Effective priority (AC1/AC2): cheap-window capped header value, stamped
-    # on the request; the provider chain is selected by it (priority_routes).
+    # on the request; the provider chain is selected by it (per-provider
+    # ``priorities`` labels, LP-0MVGPZWY0001JD1D).
     # Rebound local ``model_config`` so the whole cycle (including the
     # lease-active fallback below) iterates the priority-selected chain.
     server_cfg = config.get("server", config) if isinstance(config, dict) else {}

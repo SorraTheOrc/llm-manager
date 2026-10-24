@@ -31,6 +31,9 @@ MUNITOAI_FREE_ENTRY = {
     "type": "remote",
     "provider": "MunitoAI",
     "display_name": "MunitoAI Free",
+    # Priority-chain membership (LP-0MVGPZWY0001JD1D): the free tier serves
+    # every priority, so it leads the ``low`` chain after local.
+    "priorities": ["low", "medium", "high"],
     "endpoint": "https://api.munito.ai/inference",
     "api_key_env": "MUNITOAI_FREE_API_KEY",
     "forward_session_headers": False,
@@ -54,6 +57,9 @@ MUNITOAI_ENTRY = {
     "name": "munitoai",
     "type": "remote",
     "provider": "MunitoAI",
+    # Priority-chain membership (LP-0MVGPZWY0001JD1D): the paid tier never
+    # serves ``low`` — exactly ``[medium, high]`` (LP-0MVF17VP70053JXX AC6).
+    "priorities": ["medium", "high"],
     "endpoint": "https://api.munito.ai/inference",
     "api_key_env": "MUNITOAI_API_KEY",
     "forward_session_headers": False,

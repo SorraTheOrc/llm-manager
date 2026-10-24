@@ -655,6 +655,23 @@ def _validate_config(cfg: dict) -> None:
     _validate_chain_hold_config(cfg)
     # Validate compaction configuration (LP-0MTG6RW3L003X122)
     _validate_compaction_config(cfg)
+    # Validate per-provider priority labels (LP-0MVGPZWY0001JD1D AC5)
+    _validate_priority_config(cfg)
+
+
+def _validate_priority_config(cfg: dict) -> None:
+    """Validate the per-provider priority labels (LP-0MVGPZWY0001JD1D AC5).
+
+    Raises ValueError on first invalid config (mirrors
+    ``_validate_chain_hold_config``).
+    """
+    from proxy.provider import validate_priority_config as _vpc_prio
+
+    problems = _vpc_prio(cfg)
+    if problems:
+        raise ValueError(
+            "Priority config validation failed: " + "; ".join(problems)
+        )
 
 
 def _validate_chain_hold_config(cfg: dict) -> None:

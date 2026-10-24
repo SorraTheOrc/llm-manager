@@ -261,13 +261,22 @@ proxy restart.
 
 `low` priority prefers local and queues over paid remote fallback, then uses the
 free tier (`munitoai-free`, `rate_limit_rpm: 3`). Because that free tier is the
-last entry of the chain, exhausted local slots plus an exhausted free budget
-used to leave the request nowhere to go but an upstream 429. `plan`, `author`
-and `code` therefore extend their `low` chain with the three `opencode-go`
-entries:
+last *free* entry of the chain, exhausted local slots plus an exhausted free
+budget used to leave the request nowhere to go but an upstream 429. `plan`,
+`author` and `code` therefore label the three `opencode-go` entries for `low`
+as well as `medium`/`high`:
 
 ```text
-low: [local-qwen3, munitoai-free, opencode-go-3, opencode-go-2, opencode-go]
+priorities: [low, medium, high]   # local-qwen3, munitoai-free,
+                                 # opencode-go-3, opencode-go-2, opencode-go
+priorities: [medium, high]        # munitoai, deepseek-flash
+```
+
+The resulting `low` chain is the model's own provider order filtered by the
+label (LP-0MVGPZWY0001JD1D), so it reads directly off the `providers` list:
+
+```text
+chain(low) = [local-qwen3, munitoai-free, opencode-go-3, opencode-go-2, opencode-go]
 ```
 
 Those entries keep the off-peak `available_times` windows added by
@@ -285,8 +294,48 @@ Capacity vs resilience — the three entries are **not** interchangeable:
 | HTTP 429 / usage limit | `_usage_limit_account_key` = `api_key_env@endpoint` | Independent per API key: a 429 on `opencode-go-3` leaves `opencode-go-2` and `opencode-go` eligible → 3× rate-limit capacity (LP-0MSMBWB23009XYPW, LP-0MVCX0E2V001VB5N). |
 | 5xx / stall / terminal error | `_failure_domain_key` = `endpoint:model` | Shared domain: one failure skips all three for the rest of the request → **no** 3× outage resilience (LP-0MSG45I8Q0020N1F). |
 
-The fully paid `munitoai` and `deepseek-flash` entries never join a `low` chain:
-they carry no window discipline that would confine spend to off-peak hours.
+The fully paid `munitoai` and `deepseek-flash` entries declare exactly
+`priorities: [medium, high]`, so they never join a `low` chain: they carry no
+window discipline that would confine spend to off-peak hours.
+
+### Priority-chain membership (`priorities`, LP-0MVGPZWY0001JD1D)
+
+Priority routing is declared **once**, on the provider definition the operator
+is already editing. Each provider entry may carry a `priorities` list of
+`low|medium|high`, and the chain for a request is the model's own ordered
+`providers` list filtered by the effective priority:
+
+```text
+chain(P) = [p for p in providers if P in p["priorities"]]   # order = providers order
+```
+
+Rules (all enforced at load by `validate_priority_config` → `ValueError`):
+
+- **No tier implication.** A provider labelled `medium` is *not* thereby
+  eligible for `low`; membership is exactly the list written.
+- **Model-level opt-in, fail-closed.** If any provider of a model declares
+  `priorities`, every provider of that model must declare it, and together
+  they must cover `low`, `medium` and `high`. A partially labelled model is a
+  load-time error, so adding a provider can never silently join or leave a
+  chain.
+- **Malformed labels rejected.** A non-list value, an empty list, an unknown
+  priority name and a duplicate entry each fail the load.
+- **No silent widening.** For a labelled model the filtered chain is used
+  as-is; an empty result never falls back to the full `providers` list (which
+  would leak the paid tiers during the nine cheap-window hours).
+- **Unlabelled models** (no `priorities` anywhere — `embed`, `github`,
+  `private`) keep the legacy behaviour: every provider is eligible for every
+  priority.
+- **Per-priority ordering is not supported.** Chain order is always the
+  `providers` order, so an entry that must come first for one priority and
+  later for another needs a separate entry (or a separate model). This is a
+  deliberate limitation of replacing the name-indexed route map.
+
+The former per-model `priority_routes` map (priority → ordered provider
+**names**) is **removed** — there is no shim or deprecation window. A config
+that still declares it fails at load with a migration message naming the
+replacement key; see the README section
+[Migrating from `priority_routes`](README.md#migrating-from-priority_routes).
 
 ### Per-entry context limits (`max_context_tokens`, LP-0MVF9N31A0006VH5)
 
