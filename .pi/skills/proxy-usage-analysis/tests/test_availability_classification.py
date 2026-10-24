@@ -81,6 +81,15 @@ FALLBACK_LEASE = (
     "from=local-qwen3, to=opencode-go-2, reason=local_lease_active"
 )
 
+# Session-bearing variant (LP-0MVMBMSWR0036RES): the proxy now stamps the
+# fallback line with ``session=``/``attempt=``; the hourly evidence counters
+# must treat it exactly like the session-less shape.
+FALLBACK_LEASE_SESSION_BEARING = (
+    "2026-10-23 02:01:05,112 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=local-qwen3, to=opencode-go-2, reason=local_lease_active "
+    "session=herdr-1792711827-616329-14270 attempt=2"
+)
+
 # Remote traffic in the same hour (requests were attempted and served — by
 # remote providers, never by the local model).
 REMOTE_STREAM_STARTED = (
@@ -264,6 +273,24 @@ def test_lease_blocked_recognised_from_denials_and_lease_active_reasons():
     summary = aggregation.aggregate(events, WINDOW_START, WINDOW_END, _schedule())
     counts = summary.hourly_activity[HOUR_KEY]
     assert counts["lease_active_fallbacks"] == 2
+    assert set(aggregation.hour_availability(HOUR_KEY, counts).states) == {
+        aggregation.AVAILABILITY_LEASE_BLOCKED
+    }
+
+
+def test_session_bearing_lease_fallback_counts_as_lease_active():
+    """LP-0MVMBMSWR0036RES: a ``Fallback triggered`` line that carries
+    ``session=``/``attempt=`` still feeds the lease-active refusal evidence —
+    the hourly availability verdict is unchanged by the new fields."""
+    events = _events([FALLBACK_LEASE_SESSION_BEARING])
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.kind == "fallback"
+    assert ev.session == "herdr-1792711827-616329-14270"
+    assert ev.attempt_index == 2
+    summary = aggregation.aggregate(events, WINDOW_START, WINDOW_END, _schedule())
+    counts = summary.hourly_activity[HOUR_KEY]
+    assert counts["lease_active_fallbacks"] == 1
     assert set(aggregation.hour_availability(HOUR_KEY, counts).states) == {
         aggregation.AVAILABILITY_LEASE_BLOCKED
     }

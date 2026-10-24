@@ -702,5 +702,9 @@ async def test_direct_dispatch_logs_one_labelled_guard_line(mixed_model_config, 
         "Fallback triggered" in r.getMessage()
         and "to=remote-fallback" in r.getMessage()
         and "reason=local_admission_guard" in r.getMessage()
+        # LP-0MVMBMSWR0036RES: the line now carries session/attempt evidence
+        # after ``reason=`` so the fallback is attributable to a session.
+        and "session=" in r.getMessage()
+        and "attempt=" in r.getMessage()
         for r in caplog.records
     ), "the chosen fallback provider must be logged"

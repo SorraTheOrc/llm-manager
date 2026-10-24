@@ -668,8 +668,10 @@ def test_model_audit_plan_routing() -> None:
 
         if not routing_events:
             # Broader search: look for ALL routing-related lines by
-            # matching session_id or prompt text (since Fallback triggered
-            # lines lack session IDs but are temporally correlated).
+            # matching session_id or prompt text. Since LP-0MVMBMSWR0036RES
+            # ``Fallback triggered`` lines carry ``session=``/``attempt=``, so
+            # most of them match the session filter directly; the temporal
+            # fallback below still covers pre-change lines.
             _log("  Broader search for routing events...")
             all_log_lines = _read_proxy_log_since("")
             all_routing_events = _find_routing_lines(all_log_lines)
@@ -684,6 +686,9 @@ def test_model_audit_plan_routing() -> None:
         else:
             # We already have events; also try to find Fallback triggered
             # lines that are temporally close (within 20s after dispatch).
+            # Session-bearing lines (LP-0MVMBMSWR0036RES) are also matched by
+            # the session filter above, so this only adds pre-change lines
+            # that carried no session id.
             all_fb = _find_routing_lines(_read_proxy_log_since(""))
             all_fb = [ev for ev in all_fb if ev["kind"] == "fallback"]
             import datetime as _dt

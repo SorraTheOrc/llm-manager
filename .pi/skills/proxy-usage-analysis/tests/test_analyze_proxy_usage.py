@@ -142,6 +142,50 @@ class TestLogLineParsing:
         assert ev.reason == "local_concurrency_limit"
         assert ev.session is None
 
+    def test_fallback_session_bearing_line_parses_evidence(self):
+        """Fallback lines since LP-0MVMBMSWR0036RES carry ``session=``/``attempt=``
+        (and budget evidence for budget-driven reasons); all fields parse."""
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_SESSION)
+        assert ev.kind == "fallback"
+        assert ev.session == "herdr-1792767061-1282111-17770"
+        assert ev.attempt_index == 3
+        assert ev.budget_limit is None  # reason not budget-driven
+
+    def test_fallback_rate_limited_line_parses_budget_snapshot(self):
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_RATE_LIMITED_BUDGET)
+        assert ev.kind == "fallback"
+        assert ev.session == "herdr-1792767061-1282111-17770"
+        assert ev.attempt_index == 4
+        assert ev.reason == "rate_limited"
+        assert ev.budget_limit == 60
+        assert ev.budget_remaining == 0
+        assert ev.budget_waited == pytest.approx(12.5)
+
+    def test_fallback_session_token_unknown_maps_to_none(self):
+        """The proxy emits ``session=unknown`` when the request has no UUID;
+        the parser degrades it to ``None`` (missing field) so legacy
+        attribution logic treats it as a session-less line."""
+        line = (
+            "2026-10-23 09:20:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 500 session=unknown attempt=1"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev.kind == "fallback"
+        assert ev.session is None
+        assert ev.attempt_index == 1
+        assert ev.reason == "HTTP 500"
+
+    def test_fallback_legacy_line_evidence_fields_none(self):
+        """Pre-change rotated logs parse with every evidence field None."""
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_HTTP_400)
+        assert ev.kind == "fallback"
+        assert ev.reason == "HTTP 400"
+        assert ev.session is None
+        assert ev.attempt_index is None
+        assert ev.budget_limit is None
+        assert ev.budget_remaining is None
+        assert ev.budget_waited is None
+
     def test_routing_skip_local(self):
         ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CONTEXT_TOO_LARGE)
         assert ev.kind == "routing_skip"
@@ -1261,6 +1305,211 @@ class TestSessionAggregation:
         assert res.sessions["fast1"].slots == 6
         assert res.sessions["cheap1"].bucket == "cheap"
         assert res.sessions["cheap1"].slots == 8
+
+
+class TestFallbackAttribution:
+    """Per-session fallback attribution (LP-0MVMBMSWR0036RES AC5).
+
+    A session's reason comes from its **own** evidence — its ``Fallback
+    triggered`` or ``routing_skip_local`` line. Another session's session-bearing
+    fallback line is never inherited; only session-less lines from rotated logs
+    predating the session stamp still use the nearest-line-within-60s heuristic.
+    """
+
+    WINDOW = (datetime(2026, 10, 23, 8, 0, 0), datetime(2026, 10, 23, 11, 0, 0))
+
+    def _local_then_remote(self, session: str, start: str, remote: str) -> list[str]:
+        return [
+            f"2026-10-23 {start}:00,000 - INFO - Stream started: provider=local "
+            f"model=Qwen3 session={session} request=[]",
+            f"2026-10-23 {start}:05,000 - INFO - Stream finished: reason=stop "
+            f"tokens=900/40/940 session={session} provider=local model=Qwen3 request=[]",
+            f"2026-10-23 {remote}:30,000 - INFO - Stream started: provider=opencode-go "
+            f"model=deepseek-v4-flash session={session} request=[]",
+            f"2026-10-23 {remote}:35,000 - INFO - Stream finished: reason=stop "
+            f"tokens=950/200/1150 session={session} provider=opencode-go "
+            f"model=deepseek-v4-flash request=[]",
+        ]
+
+    def _summarise(self, lines: list[str], schedule=None):
+        return aggregation.aggregate(
+            _events(lines), *self.WINDOW, schedule or _schedule()
+        )
+
+    def test_own_fallback_line_is_used(self):
+        """A session with its own ``Fallback triggered`` line (no skip line) is
+        attributed from that line."""
+        lines = [
+            # The session's own session-bearing fallback line, before its first
+            # remote stream (fixture time 09:12:44, remote at 09:13:00).
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["herdr-1792767061-1282111-17770"]
+        assert s.fallback_reason == "local_lease_active"
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK
+        assert s.remote_move_time == datetime(2026, 10, 23, 9, 12, 44, 517000)
+
+    def test_own_skip_line_still_wins(self):
+        """An own ``routing_skip_local`` line keeps precedence over the fallback
+        line (unchanged behaviour), and is labelled ``own_skip``."""
+        lines = [
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+            "2026-10-23 09:12:50,000 - INFO - routing_skip_local provider=local-qwen3 "
+            "model=Qwen3 estimated_tokens=5000 cold_threshold=39594 warm_threshold=39594 "
+            "new_tokens=50 cached_ratio=0.50 reason=context_too_large → skipping local, "
+            "routing to next remote provider session=herdr-1792767061-1282111-17770",
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["herdr-1792767061-1282111-17770"]
+        assert s.fallback_reason == "context_too_large"
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_SKIP
+
+    def test_session_does_not_inherit_another_sessions_reason(self):
+        """The regression this change fixes: session B reached remote seconds
+        after session A's spill, but B has no fallback line of its own — it must
+        stay unattributed instead of inheriting A's ``rate_limited``."""
+        lines = [
+            # A's session-bearing spill, just before B's remote move.
+            "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
+            *self._local_then_remote("session-b", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["session-b"]
+        assert s.fallback_reason is None
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+        # The move itself is still recorded (it used local, then remote).
+        assert s.remote_move_time == datetime(2026, 10, 23, 9, 6, 30)
+
+    def test_session_less_legacy_line_still_attributes_by_proximity(self):
+        """Rotated logs without ``session=`` keep the legacy nearest-line
+        heuristic, labelled ``legacy_nearest`` so it is distinguishable."""
+        lines = [
+            "2026-10-23 09:06:28,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 500",
+            *self._local_then_remote("legacy-session", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["legacy-session"]
+        assert s.fallback_reason == "HTTP 500"
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_LEGACY_NEAREST
+
+    def test_lease_denied_session_is_labelled_explicitly(self):
+        """No own fallback line, but ``local_dispatch_denied`` evidence: the
+        move is lease/concurrency contention, reported as such."""
+        lines = [
+            "2026-10-23 09:06:20,000 - INFO - local_dispatch_denied "
+            "session=leased-session owner=other-session active=1",
+            *self._local_then_remote("leased-session", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["leased-session"]
+        assert s.fallback_reason == aggregation.LEASE_ACTIVE_REASON
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_LEASE_DENIED
+
+    def test_local_only_session_is_no_remote_fallback(self):
+        lines = [
+            "2026-10-23 09:10:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=stays-local request=[]",
+            "2026-10-23 09:10:05,000 - INFO - Stream finished: reason=stop "
+            "tokens=900/40/940 session=stays-local provider=local model=Qwen3 request=[]",
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["stays-local"]
+        assert s.fallback_reason is None
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_NO_REMOTE
+
+    def test_attribution_counts_cover_every_session(self):
+        lines = [
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+            "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
+            *self._local_then_remote("session-b", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        counts = res.fallback_attribution_counts
+        assert sum(counts.values()) == len(res.sessions)
+        assert counts[aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK] == 1
+        assert counts[aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED] == 1
+
+    def test_report_exposes_attribution_states(self):
+        lines = [
+            "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
+            *self._local_then_remote("session-b", "09:06", "09:06"),
+            "2026-10-23 09:10:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=stays-local request=[]",
+        ]
+        res = self._summarise(lines)
+        md = reporting.build_report(res, None)
+        assert "Session fallback attribution:" in md
+        assert "unattributed **1**" in md
+        assert "no_remote_fallback **1**" in md
+
+    def test_json_summary_exposes_attribution_counts(self):
+        lines = [
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+        ]
+        res = self._summarise(lines)
+        data = reporting.summary_to_json(res)
+        assert data["fallback_attribution"] == {
+            aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK: 1
+        }
+
+    def test_csv_row_carries_attribution(self, tmp_path):
+        lines = [
+            "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
+            *self._local_then_remote("session-b", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        standard_path, low_path = reporting.write_csvs(res, tmp_path)
+        rows: list[dict] = []
+        for path in (standard_path, low_path):
+            with path.open(newline="", encoding="utf-8") as fh:
+                rows.extend(csv.DictReader(fh))
+        row = next(r for r in rows if r["session_id"] == "session-b")
+        assert row["fallback_attribution"] == aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+        assert row["fallback_reason"] == ""
+
+    def test_recommendations_note_attribution_coverage(self):
+        """Reason-count evidence names sessions without own evidence so the
+        counts are not read as complete."""
+        lines = [
+            "2026-10-23 09:05:20,000 - INFO - local_dispatch_denied "
+            "session=leased-session owner=other-session active=1",
+            *self._local_then_remote("leased-session", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        recs = recommendations.generate_recommendations(res, None)
+        contention = [r for r in recs if "slot pool contention" in r.title]
+        assert contention, "expected a slot-contention recommendation"
+        assert "lease/concurrency denied" in contention[0].evidence
+
+    def test_recommendations_omit_coverage_note_when_fully_attributed(self):
+        lines = [
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+        ]
+        res = self._summarise(lines)
+        recs = recommendations.generate_recommendations(res, None)
+        contention = [r for r in recs if "slot pool contention" in r.title]
+        assert contention, "expected a slot-contention recommendation"
+        assert "Session attribution coverage" not in contention[0].evidence
 
 
 class TestErrorAggregation:

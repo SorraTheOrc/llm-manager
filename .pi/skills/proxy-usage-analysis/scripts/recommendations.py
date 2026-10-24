@@ -27,6 +27,8 @@ from dataclasses import dataclass
 
 import bucketing
 from aggregation import (
+    FALLBACK_ATTRIBUTION_LEASE_DENIED,
+    FALLBACK_ATTRIBUTION_UNATTRIBUTED,
     ROOT_CAUSE_OTHER,
     ROOT_CAUSE_REMOTE,
     ROOT_CAUSE_RESTART,
@@ -125,6 +127,14 @@ def _combined_reason_counts(result: AnalysisResult) -> Counter:
     Per-session reasons are often (but not always) the same event as a global
     fallback line; the heuristic deliberately counts both so a single clear
     signal is never missed. Shares are computed against the combined total.
+
+    Since LP-0MVMBMSWR0036RES a session's reason is sourced from its own
+    evidence only (see :func:`aggregation._attribute_fallback`): a session with
+    no ``Fallback triggered`` line of its own never inherits a neighbour's
+    reason. Sessions labelled ``lease_denied`` do contribute a reason
+    (``local_lease_active``) because the local-dispatch refusal is real
+    evidence; ``unattributed`` and ``no_remote_fallback`` sessions contribute
+    nothing.
     """
     counts: Counter = Counter()
     for s in result.sessions.values():
@@ -134,6 +144,26 @@ def _combined_reason_counts(result: AnalysisResult) -> Counter:
         if ev.reason:
             counts[ev.reason] += 1
     return counts
+
+
+def _attribution_coverage(result: AnalysisResult) -> str:
+    """One-sentence coverage note for reason-count evidence.
+
+    Returns an empty string when every session that moved to remote had own
+    evidence, so a report over a clean window is unchanged; otherwise it names
+    how many sessions were lease-denied or unattributed so the cited counts are
+    not read as complete (LP-0MVMBMSWR0036RES AC5).
+    """
+    counts = result.fallback_attribution_counts
+    lease = counts.get(FALLBACK_ATTRIBUTION_LEASE_DENIED, 0)
+    unattributed = counts.get(FALLBACK_ATTRIBUTION_UNATTRIBUTED, 0)
+    if not lease and not unattributed:
+        return ""
+    return (
+        f" Session attribution coverage: {lease} session(s) lease/concurrency "
+        f"denied (`local_lease_active`) and {unattributed} unattributed (no own "
+        f"fallback evidence)."
+    )
 
 
 def _slot_counts(
@@ -193,6 +223,9 @@ def generate_recommendations(
 
     slot_counts_str = _slot_counts_str(fast_slots, cheap_slots)
     cfg_ctx = (config or {}).get("local_model_ctx_size")
+    # Session-attribution coverage for the evidence strings below: empty when
+    # every session that moved to remote had own evidence (LP-0MVMBMSWR0036RES).
+    attribution_note = _attribution_coverage(result)
 
     recs.extend(_error_recommendations(result))
 
@@ -218,7 +251,7 @@ def generate_recommendations(
                     f"{contention} of {total_fallbacks} fallback events ({_pct(contention, total_fallbacks):.1f}%) "
                     f"were slot-contention related ({breakdown}). "
                     f"{_dn(contention, contention_fast, contention_cheap)}. "
-                    f"Current slot counts: {slot_counts_str}."
+                    f"Current slot counts: {slot_counts_str}.{attribution_note}"
                 ),
             )
         )

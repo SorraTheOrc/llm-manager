@@ -148,7 +148,13 @@ STREAM_ERROR_ABORTED_LOCAL = (
     "provider=local model=Qwen3 error=ReadTimeout"
 )
 
-# --- Fallback triggered (never carries a session UUID) ----------------------
+# --- Fallback triggered ----------------------------------------------------
+#
+# Lines from before LP-0MVMBMSWR0036RES carry no session UUID; lines emitted
+# since carry ``session=<uuid|unknown> attempt=<n>`` after ``reason=`` (plus
+# ``limit=``/``remaining=``/``waited=`` for budget-driven ``rate_limited*``
+# reasons). Both shapes must parse: the session-less ones keep the legacy
+# nearest-line attribution, the session-bearing ones are attributed directly.
 
 FALLBACK_CONCURRENCY = (
     "2026-08-02 13:58:04,301 - INFO - Fallback triggered for model=v1/chat/completions, "
@@ -171,6 +177,30 @@ FALLBACK_CONTEXT_TOO_LARGE = (
 FALLBACK_HTTP_400 = (
     "2026-08-02 14:02:13,126 - INFO - Fallback triggered for model=v1/chat/completions, "
     "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 400"
+)
+
+# --- Fallback triggered with session + attempt evidence (LP-0MVMBMSWR0036RES)
+
+FALLBACK_SESSION = (
+    "2026-10-23 09:12:44,517 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=local-qwen3, to=opencode-go-deepseek, reason=local_lease_active "
+    "session=herdr-1792767061-1282111-17770 attempt=3"
+)
+
+# Budget-driven fallback: carries the budget snapshot the gate computed.
+FALLBACK_RATE_LIMITED_BUDGET = (
+    "2026-10-23 09:14:02,884 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=munitoai-free, to=opencode-go, reason=rate_limited "
+    "session=herdr-1792767061-1282111-17770 attempt=4 limit=60 remaining=0 waited=12.500"
+)
+
+# A *different* session's fallback, used to prove no session inherits another
+# session's reason (LP-0MVMBMSWR0036RES): session B moves to remote right after
+# session A spilled, but B has no fallback line of its own.
+FALLBACK_OTHER_SESSION = (
+    "2026-10-23 09:16:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=munitoai-free, to=opencode-go, reason=rate_limited "
+    "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000"
 )
 
 # --- routing_skip_local (session + reason, arrow before the explanation) ----

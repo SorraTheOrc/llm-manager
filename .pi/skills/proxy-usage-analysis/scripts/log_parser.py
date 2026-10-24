@@ -74,8 +74,18 @@ RE_TOKENS = re.compile(r"\btokens=(\d+)/(\d+)/(\d+)")
 RE_ENTRY = re.compile(r"\bentry=(\S+)")
 RE_ERROR_DETAIL = re.compile(r"\berror=([^\s,}]+)")
 RE_FALLBACK = re.compile(
-    r"Fallback triggered for model=(\S+?), from=(\S+?), to=(\S+?), reason=([\w ]+)$"
+    r"Fallback triggered for model=(\S+?), from=(\S+?), to=(\S+?), "
+    r"reason=([^=]*?)(?=\s+\w+=|\s*$)"
 )
+# Fallback evidence appended after ``reason=`` (LP-0MVMBMSWR0036RES):
+# ``session=<uuid|unknown> attempt=<n>``, plus ``limit=``/``remaining=``/
+# ``waited=`` when the reason is budget-driven (``rate_limited*``). Absent on
+# pre-change rotated logs, in which case every field degrades to ``None`` and
+# the legacy nearest-line attribution heuristic still applies.
+RE_FALLBACK_ATTEMPT = re.compile(r"\battempt=(\d+)")
+RE_FALLBACK_BUDGET_LIMIT = re.compile(r"\blimit=(\d+)")
+RE_FALLBACK_BUDGET_REMAINING = re.compile(r"\bremaining=(\d+)")
+RE_FALLBACK_BUDGET_WAITED = re.compile(r"\bwaited=([\d.]+)")
 # routing_skip_local reason sits between "reason=" and the "→" arrow.
 RE_ROUTING_SKIP_REASON = re.compile(r"\breason=([\w_]+)\s*→")
 # Chain-hold cycle stamp (LP-0MU5AIAAY003KVM0): the proxy tags
@@ -396,6 +406,15 @@ class LogEvent:
     entry: str | None = None
     status: int | None = None
     attempt: str | None = None
+    # Fallback evidence (LP-0MVMBMSWR0036RES, ``fallback`` kind only):
+    # ``attempt_index`` is the per-session fallback ordinal parsed from
+    # ``attempt=``; ``budget_limit``/``budget_remaining``/``budget_waited``
+    # carry the budget snapshot emitted with a ``rate_limited*`` reason.
+    # All ``None`` on pre-change lines (and on every other kind).
+    attempt_index: int | None = None
+    budget_limit: int | None = None
+    budget_remaining: int | None = None
+    budget_waited: float | None = None
     signal: str | None = None
     src_file: str | None = None
     raw: str | None = None
@@ -470,6 +489,17 @@ def _float(pattern: re.Pattern, text: str) -> float | None:
         return None
     try:
         return float(token)
+    except ValueError:
+        return None
+
+
+def _int(pattern: re.Pattern, text: str) -> int | None:
+    """Tolerant int extraction for a key=value field (``None`` if absent)."""
+    token = _first(pattern, text)
+    if token is None:
+        return None
+    try:
+        return int(token)
     except ValueError:
         return None
 
@@ -640,7 +670,18 @@ def parse_log_line(line: str) -> LogEvent | None:
             return None
         fmodel, src, dst, reason = m2.groups()
         return LogEvent(
-            "fallback", ts, reason=_normalize_reason(reason), src=src, dst=dst
+            "fallback",
+            ts,
+            reason=_normalize_reason(reason.strip() or None),
+            src=src,
+            dst=dst,
+            # Session-bearing since LP-0MVMBMSWR0036RES; pre-change rotated
+            # logs have no ``session=`` and parse to ``None``.
+            session=_session_from(msg),
+            attempt_index=_int(RE_FALLBACK_ATTEMPT, msg),
+            budget_limit=_int(RE_FALLBACK_BUDGET_LIMIT, msg),
+            budget_remaining=_int(RE_FALLBACK_BUDGET_REMAINING, msg),
+            budget_waited=_float(RE_FALLBACK_BUDGET_WAITED, msg),
         )
     if msg.startswith(ROUTING_SKIP):
         cycle_m = RE_CHAIN_HOLD_CYCLE.search(msg)

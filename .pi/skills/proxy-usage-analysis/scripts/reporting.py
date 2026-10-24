@@ -47,6 +47,7 @@ CSV_COLUMNS = [
     "initial_model",
     "remote_move_time",
     "fallback_reason",
+    "fallback_attribution",
     "bucket",
     "slots",
     "ctx_size",
@@ -89,6 +90,7 @@ def _session_row(s: SessionStats) -> dict:
         "initial_model": s.initial_model or "",
         "remote_move_time": _fmt_ts(s.remote_move_time),
         "fallback_reason": s.fallback_reason or "",
+        "fallback_attribution": s.fallback_attribution or "",
         "bucket": s.bucket or "",
         "slots": str(s.slots) if s.slots else "",
         "ctx_size": str(s.ctx_size) if s.ctx_size else "",
@@ -294,6 +296,26 @@ def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _ap_fallback_attribution(ap, summary: AnalysisResult) -> None:
+    """Render the per-session fallback-attribution states (LP-0MVMBMSWR0036RES).
+
+    States are mutually exclusive and cover every session: own evidence
+    (``own_fallback``/``own_skip``), the legacy nearest-line heuristic that only
+    session-less rotated logs can reach (``legacy_nearest``), a lease/concurrency
+    refusal (``lease_denied``), no own evidence at all (``unattributed``), and
+    sessions that never left local (``no_remote_fallback``).
+    """
+    counts = summary.fallback_attribution_counts
+    if not counts:
+        return
+    parts = [
+        f"{state} **{counts.get(state, 0)}**"
+        for state in aggregation.FALLBACK_ATTRIBUTION_ORDER
+        if counts.get(state, 0)
+    ]
+    ap("- Session fallback attribution: " + " | ".join(parts))
+
+
 def build_report(
     summary: AnalysisResult,
     config: dict | None,
@@ -345,6 +367,7 @@ def build_report(
        f"hold-cycle re-emissions (excluded from demand): **{summary.hold_cycle_reemission_count}**")
     ap(f"- Unattributed stream events (no session UUID): {summary.unattributed_events}")
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
+    _ap_fallback_attribution(ap, summary)
 
     _append_summary_by_hour(ap, summary)
 
@@ -505,8 +528,15 @@ def build_report(
         "those are expected and not treated as errors."
     )
     ap(
-        "- `Fallback triggered` lines carry no session UUID; per-session attribution prefers the "
-        "session's own `routing_skip_local` line and otherwise the nearest fallback event within 60s."
+        "- `Fallback triggered` lines carry `session=`/`attempt=` plus budget evidence "
+        "(`limit=`/`remaining=`/`waited=`) when the reason is `rate_limited*`. A session's "
+        "reason therefore comes from its own evidence (its `Fallback triggered` or "
+        "`routing_skip_local` line); the nearest-line-within-60s heuristic applies only to "
+        "session-less lines from rotated logs predating the session stamp, so a session never "
+        "inherits another session's reason. Sessions with no fallback line but a local-dispatch "
+        "lease refusal are labelled `lease_denied` (`local_lease_active`); any other session "
+        "without own evidence is `unattributed`, and a session that never used remote is "
+        "`no_remote_fallback` (see the `fallback_attribution` CSV column)."
     )
     ap(
         "- Related context: work item LP-0MSAOQTJS000FFVM (evaluate increasing local ctx-size) can "
@@ -1978,6 +2008,8 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "remote_requests": summary.remote_requests,
         "fallback_events": len(summary.fallback_events),
         "fallback_rate": round((len(summary.fallback_events) / total) if total else 0.0, 4),
+        # Per-session fallback-attribution states (LP-0MVMBMSWR0036RES AC5).
+        "fallback_attribution": dict(summary.fallback_attribution_counts.most_common()),
         "contention_dispatch": len(summary.contention_dispatch_events),
         "contention_fallback_after_queue": len(summary.contention_fallback_events),
         # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ AC2): verdicts taken

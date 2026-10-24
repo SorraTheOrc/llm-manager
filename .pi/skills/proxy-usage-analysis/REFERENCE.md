@@ -253,6 +253,28 @@ entry is a local runtime edit, not a committed artifact.
    without a TTFT line pair with `ttft=None` — unknown prefill, reported
    rather than dropped.
    Unparseable lines are counted and skipped, never fatal.
+
+   **`Fallback triggered` log contract (LP-0MVMBMSWR0036RES).** The proxy
+   emits one line per fallback, with the request's resolved session and a
+   per-session fallback ordinal trailing the reason:
+
+   ```text
+   Fallback triggered for model=<path>, from=<provider>, to=<provider>, reason=<reason>[ limit=<n> remaining=<n> waited=<seconds>] session=<uuid|unknown> attempt=<n>
+   ```
+
+   - `session=` is the request's resolved session UUID, or `unknown` when the
+     request carried none (the parser degrades `unknown` to "no session").
+   - `attempt=` is the session's 1-based fallback ordinal. It keeps increasing
+     across requests, so two fallbacks from the same session in the same
+     second are distinguishable.
+   - `limit=` / `remaining=` / `waited=` are the budget snapshot
+     (`provider_budget.BudgetDecision`: `limit_rpm`, `remaining`,
+     `waited_seconds`) and are emitted **only** when the reason is
+     budget-driven (`rate_limited*`). The decision itself is unchanged.
+   - All evidence fields trail `reason=`, so pre-change rotated logs (no
+     evidence fields) still parse: every evidence field degrades to `None`.
+     Consumers that anchored `reason=` to end-of-line were updated in the same
+     change.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the
    authoritative `tokens=prompt/completion/total` from `Stream finished`
@@ -682,9 +704,24 @@ entry is a local runtime edit, not a committed artifact.
   field. Local-skip totals for windows containing held requests therefore
   fall versus pre-change reports — this is the intended accuracy fix, not
   lost data.
-- `Fallback triggered` lines carry no session UUID; per-session attribution
-  prefers the session's own `routing_skip_local` line and otherwise the
-  nearest fallback event within 60s of the first remote stream.
+- **Per-session fallback attribution (LP-0MVMBMSWR0036RES).** Since
+  `Fallback triggered` carries `session=`, a session's fallback reason is taken
+  from its **own** evidence and never inherited from a neighbouring line. The
+  precedence is (1) the session's own `routing_skip_local` line at/before its
+  first remote stream, (2) the session's own `Fallback triggered` line at/before
+  its first remote stream, (3) the nearest **session-less** fallback line within
+  60s before the first remote stream — reachable only for rotated logs predating
+  the session stamp — and (4) no own evidence at all. The provenance is exposed
+  as the `fallback_attribution` column (`own_skip`, `own_fallback`,
+  `legacy_nearest`, `lease_denied`, `unattributed`) plus the `no_remote_fallback`
+  state for sessions that never used a remote provider; the report's
+  `Session fallback attribution` line and the JSON summary's
+  `fallback_attribution` map count every state. A session with no fallback line
+  but `local_dispatch_denied` evidence is labelled `lease_denied`
+  (`reason=local_lease_active`) — a lease/concurrency refusal, not an inherited
+  spill. Before this change a session with no fallback line of its own inherited
+  an unrelated neighbour's `rate_limited` within the 60s window (11 of 26 clean
+  local-using sessions in the 2026-10-23/24 window were mislabelled that way).
 - Sessions spanning a slot-schedule transition may observe a brief restart
   interruption (llama-server is restarted immediately at the transition time);
   since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.

@@ -9,10 +9,14 @@ work item's decisions:
   ``tokens=prompt/completion/total`` on ``Stream finished`` lines;
 - the initial model assignment is the provider/model of the session's first
   ``Stream started`` line;
-- the move to a remote model is attributed from the session's first
-  ``routing_skip_local`` line (carries session + reason), falling back to the
-  nearest ``Fallback triggered`` line within 60s before the first remote
-  stream, and finally to the first remote stream time itself;
+- the move to a remote model is attributed from the session's own
+  ``routing_skip_local`` or ``Fallback triggered`` line (both carry the session
+  and the reason since LP-0MVMBMSWR0036RES), falling back to the nearest
+  session-less ``Fallback triggered`` line within 60s before the first remote
+  stream (rotated logs predating the session stamp only), then to a local-lease
+  refusal, and finally to the first remote stream time itself. Another
+  session's reason is never inherited — the provenance is recorded in
+  ``SessionStats.fallback_attribution``;
 - fast/cheap bucket and slot count come from the slot schedule, keyed by
   session start time.
 
@@ -60,6 +64,41 @@ AVAILABILITY_ORDER = (
 )
 # Proxy ``reason=`` value that marks a local-lease refusal.
 LEASE_ACTIVE_REASON = "local_lease_active"
+
+# Per-session fallback-attribution states (LP-0MVMBMSWR0036RES AC5). Since the
+# proxy stamps every ``Fallback triggered`` line with ``session=``, a session's
+# reason is taken **only from its own evidence**; the legacy nearest-line
+# heuristic survives for rotated logs predating the change (their lines carry
+# no ``session=``), so historical windows keep working.
+#
+# - ``own_fallback`` — the session's own ``Fallback triggered`` line;
+# - ``own_skip`` — the session's own ``routing_skip_local`` line (unchanged
+#   precedence over the fallback line, which normally carries the same reason);
+# - ``legacy_nearest`` — a session-less fallback line within
+#   :data:`FALLBACK_ATTRIBUTION_WINDOW_SECONDS` (pre-change rotated logs only);
+# - ``lease_denied`` — no fallback line, but the session was refused the local
+#   dispatch by another session's lease (``local_dispatch_denied``); the cause
+#   is lease/concurrency contention, not an inherited reason;
+# - ``unattributed`` — reached remote with no own evidence at all (never
+#   inherits another session's reason);
+# - ``no_remote_fallback`` — the session never used a remote provider, so no
+#   fallback occurred.
+FALLBACK_ATTRIBUTION_OWN_FALLBACK = "own_fallback"
+FALLBACK_ATTRIBUTION_OWN_SKIP = "own_skip"
+FALLBACK_ATTRIBUTION_LEGACY_NEAREST = "legacy_nearest"
+FALLBACK_ATTRIBUTION_LEASE_DENIED = "lease_denied"
+FALLBACK_ATTRIBUTION_UNATTRIBUTED = "unattributed"
+FALLBACK_ATTRIBUTION_NO_REMOTE = "no_remote_fallback"
+
+# Canonical display order for the report's attribution summary.
+FALLBACK_ATTRIBUTION_ORDER = (
+    FALLBACK_ATTRIBUTION_OWN_FALLBACK,
+    FALLBACK_ATTRIBUTION_OWN_SKIP,
+    FALLBACK_ATTRIBUTION_LEASE_DENIED,
+    FALLBACK_ATTRIBUTION_UNATTRIBUTED,
+    FALLBACK_ATTRIBUTION_LEGACY_NEAREST,
+    FALLBACK_ATTRIBUTION_NO_REMOTE,
+)
 
 # Extra per-hour counters feeding the availability classification, layered on
 # the LP-0MTYAZFGN003BYQS counters: ``local_dispatch_attempts`` (every
@@ -206,6 +245,10 @@ class SessionStats:
     slots: int | None
     dispatch_denied: int
     routing_skips: int
+    # Provenance of ``fallback_reason`` (LP-0MVMBMSWR0036RES AC5): one of the
+    # ``FALLBACK_ATTRIBUTION_*`` states, so a consumer can tell own evidence
+    # from the legacy nearest-line heuristic and from a session with none.
+    fallback_attribution: str | None = None
     # Per-period context window of the profile active for this session (from
     # the mode profile's slot_schedule ctx_size, or its global
     # local_model_ctx_size when the entry did not pin one); None when not
@@ -316,6 +359,15 @@ class AnalysisResult:
     @property
     def fallback_reason_counts(self) -> Counter:
         return Counter(e.reason for e in self.fallback_events if e.reason)
+
+    @property
+    def fallback_attribution_counts(self) -> Counter:
+        """Session count per fallback-attribution state (LP-0MVMBMSWR0036RES)."""
+        return Counter(
+            s.fallback_attribution
+            for s in self.sessions.values()
+            if s.fallback_attribution
+        )
 
     @property
     def routing_skip_reason_counts(self) -> Counter:
@@ -721,26 +773,57 @@ def _attribute_fallback(
     first_remote_ts: datetime,
     routing_skips: dict[str, list[LogEvent]],
     fallback_events: list[LogEvent],
-) -> tuple[datetime | None, str | None]:
-    """Find (move_time, reason) for a session that reached a remote provider.
+    dispatch_denied: int = 0,
+) -> tuple[datetime | None, str | None, str]:
+    """Find (move_time, reason, attribution) for a session that reached remote.
 
-    Priority:
-    1. The session's own ``routing_skip_local`` line at/before the first
-       remote stream (authoritative: carries the session UUID and reason).
-    2. The nearest session-less ``Fallback triggered`` line within
-       ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` before the first remote stream.
-    Returns ``(None, None)`` when there is no evidence.
+    Priority — a session's own evidence always wins, and another session's
+    reason is never inherited (LP-0MVMBMSWR0036RES):
+
+    1. The session's own ``routing_skip_local`` line at/before the first remote
+       stream (unchanged precedence; it names why local was skipped).
+    2. The session's own session-bearing ``Fallback triggered`` line at/before
+       the first remote stream (the actual decision line).
+    3. The nearest **session-less** ``Fallback triggered`` line within
+       ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` before the first remote stream —
+       only rotated logs predating the session stamp can reach this branch; a
+       session-bearing line belongs to the session it names.
+    4. ``lease_denied`` when the session was refused local dispatch by another
+       session's lease (``local_dispatch_denied`` evidence) — the cause is
+       concurrency/lease contention, reported as such instead of inheriting a
+       neighbouring fallback's reason.
+    5. ``unattributed`` when there is no evidence at all.
+
+    Returns ``(None, None, attribution)`` when there is no timestamped
+    evidence.
     """
     skips = [e for e in routing_skips.get(session_id, []) if e.ts <= first_remote_ts]
     if skips:
         e = max(skips, key=lambda x: x.ts)
-        return e.ts, e.reason
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
+    own = [
+        e
+        for e in fallback_events
+        if e.session == session_id and e.ts <= first_remote_ts
+    ]
+    if own:
+        e = max(own, key=lambda x: x.ts)
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
     earliest = first_remote_ts - timedelta(seconds=FALLBACK_ATTRIBUTION_WINDOW_SECONDS)
-    candidates = [e for e in fallback_events if earliest <= e.ts <= first_remote_ts]
+    candidates = [
+        e
+        for e in fallback_events
+        if not e.session and earliest <= e.ts <= first_remote_ts
+    ]
     if candidates:
         e = max(candidates, key=lambda x: x.ts)
-        return e.ts, e.reason
-    return None, None
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_LEGACY_NEAREST
+    if dispatch_denied > 0:
+        # The proxy logged ``local_dispatch_denied session=<this session>
+        # owner=<other session>``: local was refused by a lease held
+        # elsewhere, so the move is lease/concurrency contention.
+        return None, LEASE_ACTIVE_REASON, FALLBACK_ATTRIBUTION_LEASE_DENIED
+    return None, None, FALLBACK_ATTRIBUTION_UNATTRIBUTED
 
 
 def _build_session(
@@ -767,13 +850,17 @@ def _build_session(
     has_local = any(e.provider == LOCAL_PROVIDER for e in started)
 
     if first_remote is not None:
-        move_ts, reason = _attribute_fallback(
-            builder.session_id, first_remote.ts, routing_skips, fallback_events
+        move_ts, reason, attribution = _attribute_fallback(
+            builder.session_id,
+            first_remote.ts,
+            routing_skips,
+            fallback_events,
+            dispatch_denied=builder.dispatch_denied,
         )
         if move_ts is None:
             move_ts = first_remote.ts if has_local else None
     else:
-        move_ts, reason = None, None
+        move_ts, reason, attribution = None, None, FALLBACK_ATTRIBUTION_NO_REMOTE
 
     # Bucket by the operating mode active at the session's first in-window
     # stream (LP-0MSPZUD4G007IYGH): when the logs show mode transitions, the
@@ -820,6 +907,7 @@ def _build_session(
         remote_model=first_remote.model if first_remote else None,
         remote_move_time=move_ts,
         fallback_reason=reason,
+        fallback_attribution=attribution,
         bucket=period.label if period else None,
         slots=period.slots if period else None,
         ctx_size=period.ctx_size if period else None,

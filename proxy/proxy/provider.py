@@ -596,6 +596,82 @@ def note_routing_hop(
     return hops
 
 
+# ---------------------------------------------------------------------------
+# Per-session fallback-attempt counter (LP-0MVMBMSWR0036RES AC2)
+# ---------------------------------------------------------------------------
+# Every ``Fallback triggered`` line carries ``session=<uuid|unknown> attempt=N``
+# so two fallbacks from the same session in the same second are distinguishable
+# (the log timestamp only has millisecond resolution and two cycles can emit in
+# the same millisecond). ``N`` is the session's 1-based fallback ordinal: it
+# keeps increasing across requests, so it is unique per session.
+#
+# ``_fallback_attempts``: session key -> number of fallback lines emitted.
+_fallback_attempts: dict[str, int] = {}
+_MAX_FALLBACK_ATTEMPT_ENTRIES = 1000
+
+
+def _next_fallback_attempt(session_id: str | None) -> int:
+    """Return the next fallback ordinal for *session_id* (1-based).
+
+    Sessions without a resolvable UUID share the ``"unknown"`` key, so even
+    session-less fallbacks stay individually numbered.
+    """
+    key = session_id or "unknown"
+    attempt = _fallback_attempts.get(key, 0) + 1
+    if key not in _fallback_attempts and len(_fallback_attempts) >= _MAX_FALLBACK_ATTEMPT_ENTRIES:
+        try:
+            _fallback_attempts.pop(next(iter(_fallback_attempts)), None)
+        except StopIteration:  # pragma: no cover - defensive
+            pass
+    _fallback_attempts[key] = attempt
+    return attempt
+
+
+def _fallback_budget_evidence(budget: Any) -> dict[str, Any] | None:
+    """Snapshot the budget evidence of a refused/waiting budget decision.
+
+    ``provider_budget.BudgetDecision`` already carries the numbers the budget
+    gate used (``limit_rpm``/``remaining``/``waited_seconds``); the fallback
+    line re-emits them so a ``rate_limited`` fallback is auditable without
+    replaying the gate (LP-0MVMBMSWR0036RES AC3).
+    """
+    if budget is None:
+        return None
+    try:
+        return {
+            "limit": int(getattr(budget, "limit_rpm", 0) or 0),
+            "remaining": int(getattr(budget, "remaining", 0) or 0),
+            "waited": round(float(getattr(budget, "waited_seconds", 0.0) or 0.0), 3),
+        }
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def _fallback_evidence(
+    session_id: str | None,
+    reason: str | None,
+    budget: dict[str, Any] | None = None,
+) -> str:
+    """Build the trailing ``key=value`` evidence for a ``Fallback triggered`` line.
+
+    Always carries ``session=`` (``unknown`` when the request had no session
+    UUID) and ``attempt=``. When *reason* is budget-driven (``rate_limited*``)
+    and *budget* holds the snapshot, it also carries the budget evidence
+    (``limit=``/``remaining=``/``waited=``). Appended **after** ``reason=``,
+    which is why every end-anchored consumer regex was updated in the same
+    change (LP-0MVMBMSWR0036RES AC4).
+    """
+    parts = [
+        f"session={session_id or 'unknown'}",
+        f"attempt={_next_fallback_attempt(session_id)}",
+    ]
+    if budget and (reason or "").startswith("rate_limited"):
+        parts.append(f"limit={budget.get('limit', 0)}")
+        parts.append(f"remaining={budget.get('remaining', 0)}")
+        parts.append(f"waited={float(budget.get('waited', 0.0)):.3f}")
+    return " " + " ".join(parts)
+
+
 # Per-(model, session) cached-tokens ratio: (model_name, session_id) -> ratio.
 # The ratio is cached_tokens / prompt_tokens from the last local response.
 # A ratio of 1.0 means ALL tokens were cached (fully warm).
@@ -842,6 +918,9 @@ def clear_cached_ratio_for_session(session_id: str | None) -> None:
     # A discarded session starts a fresh hop count (LP-0MVI2VRT2000V1AP).
     for key in [k for k in _last_routing_hop if k[1] == session_id]:
         _last_routing_hop.pop(key, None)
+    # A discarded session starts a fresh fallback ordinal too
+    # (LP-0MVMBMSWR0036RES AC2).
+    _fallback_attempts.pop(session_id, None)
 
 
 def _extract_cached_tokens_from_usage(usage: dict | None) -> int:
@@ -7154,10 +7233,16 @@ def _handle_streaming_success(
     prev_provider: str | None,
     fallback_reason: str | None,
     path: str,
+    session_id: str | None = None,
+    budget_evidence: dict[str, Any] | None = None,
 ) -> Response | None:
     """If *response* is a 2xx StreamingResponse, record the attempt, add
     the ``X-Provider`` header, log the fallback (if one occurred), and
     return the augmented response.
+
+    The ``Fallback triggered`` line carries ``session=``/``attempt=`` (and the
+    budget evidence for ``rate_limited*`` reasons) so per-session attribution
+    never has to guess (LP-0MVMBMSWR0036RES AC1-AC3).
 
     Returns ``None`` if *response* is **not** a streaming success (caller
     should continue normal processing).
@@ -7177,8 +7262,9 @@ def _handle_streaming_success(
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(
-                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s%s",
                 path, prev_provider, provider_name, fallback_reason or "streaming",
+                _fallback_evidence(session_id, fallback_reason or "streaming", budget_evidence),
             )
         return result
     return None
@@ -7220,12 +7306,16 @@ def _build_fallback_success_response(
     path: str,
     body_text: str = "",
     status_override: str = "success",
+    session_id: str | None = None,
+    budget_evidence: dict[str, Any] | None = None,
 ) -> Response:
     """Record a successful provider attempt, add the ``X-Provider`` header,
     log the fallback (if one occurred), and return the augmented response.
 
     This is the normal (non-streaming) success path used by both fallback
-    entrypoints when a provider returns a successful response.
+    entrypoints when a provider returns a successful response. The
+    ``Fallback triggered`` line carries ``session=``/``attempt=`` plus the
+    budget evidence for ``rate_limited*`` reasons (LP-0MVMBMSWR0036RES).
     """
     _record_attempt(
         attempts,
@@ -7242,11 +7332,12 @@ def _build_fallback_success_response(
     result = _add_provider_header(response, provider_name)
     if prev_provider:
         logger.info(
-            "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+            "Fallback triggered for model=%s, from=%s, to=%s, reason=%s%s",
             path,
             prev_provider,
             provider_name,
             fallback_reason or "unknown",
+            _fallback_evidence(session_id, fallback_reason or "unknown", budget_evidence),
         )
     return result
 
@@ -7635,11 +7726,16 @@ def _resolve_reasoning_content_promotion(
     fallback_reason: str | None,
     path: str,
     body_text: str,
+    session_id: str | None = None,
+    budget_evidence: dict[str, Any] | None = None,
 ) -> Response | None:
     """If the response body contains ``reasoning_content``, treat this
     empty-but-meaningful response as a success (promote it).  Records the
     attempt, adds the provider header, logs the fallback, and returns the
     augmented response.
+
+    The ``Fallback triggered`` line carries ``session=``/``attempt=`` plus the
+    budget evidence for ``rate_limited*`` reasons (LP-0MVMBMSWR0036RES).
 
     Returns ``None`` if the body does **not** contain ``reasoning_content``
     (caller should continue with empty-response cooldown logic).
@@ -7669,11 +7765,14 @@ def _resolve_reasoning_content_promotion(
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(
-                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s%s",
                 path,
                 prev_provider,
                 provider_name,
                 fallback_reason or "promoted_reasoning",
+                _fallback_evidence(
+                    session_id, fallback_reason or "promoted_reasoning", budget_evidence,
+                ),
             )
         return result
     return None
@@ -8255,6 +8354,9 @@ async def _proxy_with_remote_fallback_cycle(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
+    # Budget snapshot behind a ``rate_limited`` fallback, re-emitted on the
+    # ``Fallback triggered`` line (LP-0MVMBMSWR0036RES AC3).
+    _budget_evidence: dict[str, Any] | None = None
     # SSE comment emitted on the next successful streaming response after a
     # mid-stream re-route (LP-0MSF1PUM90099ZSW). ``{to}`` is filled in once
     # the next provider is resolved.
@@ -8401,6 +8503,7 @@ async def _proxy_with_remote_fallback_cycle(
                     **_budget_diagnostics(_budget),
                 )
                 fallback_reason = "rate_limited"
+                _budget_evidence = _fallback_budget_evidence(_budget)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
                 continue
@@ -8503,6 +8606,7 @@ async def _proxy_with_remote_fallback_cycle(
             stream_result = _handle_streaming_success(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path,
+                session_id=_budget_session_id, budget_evidence=_budget_evidence,
             )
             if stream_result is not None:
                 if _pending_reroute:
@@ -8625,6 +8729,7 @@ async def _proxy_with_remote_fallback_cycle(
                     promoted = _resolve_reasoning_content_promotion(
                         response, provider_name, provider_type, attempts,
                         prev_provider, fallback_reason, path, body_text,
+                        session_id=_budget_session_id, budget_evidence=_budget_evidence,
                     )
                     if promoted is not None:
                         # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
@@ -8662,6 +8767,7 @@ async def _proxy_with_remote_fallback_cycle(
             result = _build_fallback_success_response(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
+                session_id=_budget_session_id, budget_evidence=_budget_evidence,
             )
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
             _add_resolved_model_header(result, provider_cfg)
@@ -8899,6 +9005,9 @@ async def _proxy_with_fallback_cycle(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
+    # Budget snapshot behind a ``rate_limited`` fallback, re-emitted on the
+    # ``Fallback triggered`` line (LP-0MVMBMSWR0036RES AC3).
+    _budget_evidence: dict[str, Any] | None = None
     # SSE comment emitted on the next successful streaming response after a
     # mid-stream re-route (LP-0MSF1PUM90099ZSW). ``{to}`` is filled in once
     # the next provider is resolved.
@@ -9827,6 +9936,7 @@ async def _proxy_with_fallback_cycle(
                         **_budget_diagnostics(_budget),
                     )
                     fallback_reason = "rate_limited"
+                    _budget_evidence = _fallback_budget_evidence(_budget)
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     continue
@@ -9929,6 +10039,7 @@ async def _proxy_with_fallback_cycle(
             stream_result = _handle_streaming_success(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path,
+                session_id=_session_id, budget_evidence=_budget_evidence,
             )
             if stream_result is not None:
                 # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
@@ -10409,6 +10520,7 @@ async def _proxy_with_fallback_cycle(
                     promoted = _resolve_reasoning_content_promotion(
                         response, provider_name, provider_type, attempts,
                         prev_provider, fallback_reason, path, body_text,
+                        session_id=_session_id, budget_evidence=_budget_evidence,
                     )
                     if promoted is not None:
                         # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
@@ -10449,6 +10561,7 @@ async def _proxy_with_fallback_cycle(
                             promoted2 = _resolve_reasoning_content_promotion(
                                 response, provider_name, provider_type, attempts,
                                 prev_provider, fallback_reason, path, body_text,
+                                session_id=_session_id, budget_evidence=_budget_evidence,
                             )
                             if promoted2 is not None:
                                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model
@@ -10501,6 +10614,7 @@ async def _proxy_with_fallback_cycle(
             result = _build_fallback_success_response(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
+                session_id=_session_id, budget_evidence=_budget_evidence,
             )
             # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
             # local-400 streak (only unbroken same-session 400 runs escalate).
@@ -10574,6 +10688,8 @@ async def _proxy_with_fallback_cycle(
                                 response, provider_name, provider_type, attempts,
                                 prev_provider, fallback_reason, path, body_text,
                                 status_override="success_after_http_exception_retry",
+                                session_id=_session_id,
+                                budget_evidence=_budget_evidence,
                             )
                             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model
                             _add_resolved_model_header(result, provider_cfg)

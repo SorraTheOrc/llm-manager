@@ -139,7 +139,10 @@ _KV_ERROR = re.compile(r"\berror=([A-Za-z0-9_.]+)")
 _DISPATCH_FB = re.compile(r"\bdispatch_first_byte_ms=([\d.]+)")
 _DISPATCH_SERVICE = re.compile(r"\bdispatch_to_first_byte_ms=([\d.]+)")
 _DISPATCH_QWAIT = re.compile(r"\bqueue_wait_ms=([\d.]+)")
-_FALLBACK_REASON = re.compile(r"\breason=([A-Za-z0-9_]+)\s*$")
+# ``reason=`` is followed by the fallback evidence fields the proxy appends
+# since LP-0MVMBMSWR0036RES (``session=``/``attempt=``/budget), so it is bounded
+# by the next key=value pair rather than by end-of-line.
+_FALLBACK_REASON = re.compile(r"\breason=([A-Za-z0-9_ ]+?)(?=\s+[a-z_]+=|\s*$)")
 _SKIP_REASON = re.compile(r"\breason=([A-Za-z0-9_]+)")
 _CEILING = re.compile(r"\bceiling=([\d.]+)s")
 
@@ -608,11 +611,12 @@ def summarise_window(
         "timeouts_unrelated": unrelated,
         "correlation_window_seconds": correlation_window_s,
         "attribution_limit": (
-            "Timeout lines that carry no session id (e.g. 'Fallback triggered "
-            "... reason=empty_response' and 'slot_save failed ... error="
-            "ReadTimeout') cannot be attributed per request; they are reported "
-            "as coincident only when they fall inside the correlation window of "
-            "an idle-admitted request."
+            "Timeout lines that carry no session id (e.g. 'slot_save failed "
+            "... error=ReadTimeout', or a 'Fallback triggered' line from a "
+            "rotated log predating LP-0MVMBMSWR0036RES's session= field) cannot "
+            "be attributed per request; they are reported as coincident only "
+            "when they fall inside the correlation window of an idle-admitted "
+            "request. Session-bearing fallback lines are matched exactly."
         ),
     }
 
