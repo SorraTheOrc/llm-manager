@@ -148,8 +148,16 @@ class TestLastKnownFallbackBehaviour:
                 server.llama_process = MagicMock(poll=lambda: None)
                 server._http_client = None
                 server.config = {"server": {"llama_server_port": 8080, "session_slot_pool_size": 3}}
-                async def fake_query_slots(client, port, timeout=2.0, model=None):
-                    # Handlers path resolves child port before calling _query_slots
+                async def fake_query_slots(
+                    client, port, timeout=2.0, model=None, status_out=None
+                ):
+                    # Handlers path resolves child port before calling _query_slots.
+                    # The handler asks for the fresh query's outcome so a
+                    # definitive model-absent answer is not served from the
+                    # cache (LP-0MVKSXR4P001V0CM AC3); a transient 500 keeps
+                    # the graceful-degradation path exercised here.
+                    if isinstance(status_out, dict):
+                        status_out.update({"status": 500, "reason": "http_500"})
                     return (0, 0)
                 async def fake_query_detail(port, timeout=2.0, model=None, _client=None):
                     return []
@@ -175,7 +183,11 @@ class TestLastKnownFallbackBehaviour:
                 server.llama_process = MagicMock(poll=lambda: None)
                 server._http_client = None
                 server.config = {"server": {"llama_server_port": 8080, "session_slot_pool_size": 3}}
-                async def fake_query_slots(client, port, timeout=2.0, model=None):
+                async def fake_query_slots(
+                    client, port, timeout=2.0, model=None, status_out=None
+                ):
+                    if isinstance(status_out, dict):
+                        status_out.update({"status": 200, "reason": None})
                     return (1, 3)
                 async def fake_query_detail(port, timeout=2.0, model=None, _client=None):
                     return [{"slot_id": 0, "is_processing": False, "n_decoded": 10}]
