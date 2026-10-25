@@ -323,3 +323,58 @@ The 7-day post-fix window (2026-08-08 → 2026-08-14, fix released v0.1.11 on
 - **Verdict: parent AC2 satisfied via the bounded/residual-failures branch**
   of the exit criteria (explicit rationale + load context, vs the ~1.8%
   baseline). AC3 verification evidence posted as a work-item comment.
+
+---
+
+# 2026-10-24 window replay: residency-aware admission (executable evidence)
+
+**Work item:** LP-0MVN1IQTF0037WTG (child LP-0MVN4LB5W005WJ71, AC7 integration
+half). Driver: `proxy/scripts/replay_prefill_occupancy.py` (new
+`--residency-replay` / `--window-fixture` modes); tests:
+`proxy/tests/test_prefill_thrash_replay_2026_10_24.py`.
+
+The replay feeds every captured attempt through the **production** ladder
+(`provider._should_skip_local` + `proxy.residency.ResidencyView`), not a copy of
+its logic, so these numbers cannot drift from the shipped decision.
+
+## 1. The divergence case, measured both ways
+
+`proxy/tests/fixtures/slot_thrash_2026-10-24/tasks_92383_92422.log` (sanitised
+extract of `/var/log/llama-proxy/llama-server.log-2026-10-25`, pid 41395):
+
+| task | slot | prompt tokens | `n_past` (measured reuse) | reuse ratio | ladder verdict |
+|---|---|---|---|---|---|
+| 92383 | 0 | 49,103 | 738 | 1.5 % | **`resident_prefix_insufficient`** |
+| 92422 | 1 | 49,103 | 49,103 | 100 % | **admit** |
+
+The same prompt, seconds apart, measured cold then fully resident: slot churn,
+not GPU incapacity. Predicted-ratio pricing (sidecar 0.99) admitted the first
+attempt and burned its whole prefill deadline; the residency gate refuses it and
+keeps the retry.
+
+## 2. The pinned window, replayed end to end
+
+`proxy/tests/fixtures/prefill_thrash_2026_10_24.jsonl` (2026-10-24
+18:38–23:47 UTC, 1,978 local admission attempts):
+
+```
+attempts replayed:                1978
+  over the cold budget:           1960
+  admitted:                         51
+  idle-exempt (reported apart):     33
+  resident_prefix_insufficient:   1927
+over-budget cold admissions:         0 (must be 0)
+```
+
+Zero over-budget cold admissions without a resident prefix. The 33 idle-exempt
+admissions (`route=idle_bypass`) are reported separately: an idle GPU spends
+capacity that would otherwise be wasted, so they are not violations — but they
+must stay visible, hence the separate bucket. The 18 remaining admits are
+prompts below the 25,000-token budget, which route local as before.
+
+Modelling note: the capture has no per-slot prefill progress
+(`prefill_tokens_computed: null` — the `/slots` unobservability documented in
+`LP-0MUXTW4MD003TVIC`), so each attempt is replayed as what it measured: a
+session owning no slot, i.e. a measured zero prefix. That is the conservative
+assumption for an AC whose claim is "cold prompts above the budget from
+non-resident sessions are never admitted".

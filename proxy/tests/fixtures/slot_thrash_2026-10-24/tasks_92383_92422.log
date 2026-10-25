@@ -1,0 +1,44 @@
+# Sanitised 2026-10-24 slot-thrash extract: tasks 92383 (cold first attempt)
+# and 92422 (immediate same-prompt retry, fully resident).
+#
+# Provenance: /var/log/llama-proxy/llama-server.log-2026-10-25, pid 41395.
+# Pinned window (UTC): 2026-10-24T00:00:00Z .. 2026-10-24T23:59:59Z (the live proxy
+# day whose 18:38-23:47 segment LP-0MVN3KMGI009BZ0D captured as
+# proxy/tests/fixtures/prefill_thrash_2026_10_24.jsonl).
+#
+# What the extract proves (LP-0MVN1IQTF0037WTG AC7 / AC1): the SAME 49,103-token
+# prompt measured n_past=738 (1.5 % reusable) on its first attempt in slot 0 and
+# n_past=49103 (100 % reusable) on the immediate retry in slot 1. The prefix was
+# resident; the first attempt simply did not own it. Cold admission of that first
+# attempt is the thrash this work item exists to stop, and the retry is the
+# resident case the gate must keep admitting.
+#
+# Sanitisation: only llama-server scheduling lines for these two tasks are kept;
+# prompt-processing progress/checkpoint chatter is dropped as noise. No prompt
+# bodies, model output or credentials appear in these lines.
+#
+# Format note: these are llama-server log lines (no timestamps in the source
+# file), parsed by proxy/scripts/replay_prefill_occupancy.py --residency-replay.
+[41395] slot launch_slot_: id  0 | task 92383 | processing task, is_child = 0
+[41395] slot update_slots: id  0 | task 92383 | new prompt, n_ctx_slot = 131072, n_keep = 0, task.n_tokens = 49103
+[41395] slot update_slots: id  0 | task 92383 | n_past = 738, slot.prompt.tokens.size() = 84034, seq_id = 0, pos_min = 84033, n_swa = 0
+[41395] slot update_slots: id  0 | task 92383 | forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+[41395] slot update_slots: id  0 | task 92383 | n_tokens = 0, memory_seq_rm [0, end)
+[41395] slot update_slots: id  0 | task 92383 | n_tokens = 8192, memory_seq_rm [8192, end)
+[41395] slot update_slots: id  0 | task 92383 | n_tokens = 16384, memory_seq_rm [16384, end)
+[41395] slot update_slots: id  0 | task 92383 | n_tokens = 24576, memory_seq_rm [24576, end)
+[41395] slot update_slots: id  0 | task 92383 | n_tokens = 32768, memory_seq_rm [32768, end)
+[41395] slot update_slots: id  0 | task 92383 | n_tokens = 40960, memory_seq_rm [40960, end)
+[41395] slot update_slots: id  0 | task 92383 | n_tokens = 48075, memory_seq_rm [48075, end)
+[41395] slot update_slots: id  0 | task 92383 | n_tokens = 49099, memory_seq_rm [49099, end)
+[41395] slot init_sampler: id  0 | task 92383 | init sampler, took 4.35 ms, tokens: text = 49103, total = 49103
+[41395] slot update_slots: id  0 | task 92383 | prompt processing done, n_tokens = 49103, batch.n_tokens = 5
+[41395] slot launch_slot_: id  1 | task 92422 | processing task, is_child = 0
+[41395] slot      release: id  0 | task 92383 | stop processing: n_tokens = 49104, truncated = 0
+[41395] slot update_slots: id  1 | task 92422 | new prompt, n_ctx_slot = 131072, n_keep = 0, task.n_tokens = 49103
+[41395] slot update_slots: id  1 | task 92422 | n_past = 49103, slot.prompt.tokens.size() = 49105, seq_id = 1, pos_min = 49104, n_swa = 0
+[41395] slot update_slots: id  1 | task 92422 | restored context checkpoint (pos_min = 49098, pos_max = 49098, n_tokens = 49099, n_past = 49099, size = 62.813 MiB)
+[41395] slot update_slots: id  1 | task 92422 | n_tokens = 49099, memory_seq_rm [49099, end)
+[41395] slot init_sampler: id  1 | task 92422 | init sampler, took 4.37 ms, tokens: text = 49103, total = 49103
+[41395] slot update_slots: id  1 | task 92422 | prompt processing done, n_tokens = 49103, batch.n_tokens = 4
+[41395] slot      release: id  1 | task 92422 | stop processing: n_tokens = 49105, truncated = 0
