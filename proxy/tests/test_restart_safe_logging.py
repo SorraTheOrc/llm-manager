@@ -185,8 +185,14 @@ def test_archive_never_overwrites_an_existing_rotated_file(
     log_dir.mkdir()
     live = log_dir / "proxy.log"
     live.write_text(PRE_RESTART_LINE + "\n", encoding="utf-8")
-    # Pin the mtime so the derived archive name is deterministic.
-    pinned = dt.datetime(2026, 10, 23, 18, 29, 12).timestamp()
+    # Pin the mtime so the derived archive name is deterministic, but derive
+    # it from ``now`` rather than a fixed calendar date: a fixed date becomes
+    # a wall-clock time bomb once it ages past ``compress_after_days`` and
+    # ``prune_logs`` renames the archive to ``.gz`` before the assertions
+    # below (LP-0MVN5PIEG001MJKV).
+    pinned = dt.datetime.now().replace(
+        minute=0, second=0, microsecond=0
+    ).timestamp()
     os.utime(live, (pinned, pinned))
     existing = log_dir / (
         "proxy.log." + dt.datetime.fromtimestamp(pinned).strftime(ARCHIVE_TS_FORMAT)
