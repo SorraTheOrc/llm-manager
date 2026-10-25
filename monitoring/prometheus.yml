@@ -12,12 +12,15 @@ global:
   evaluation_interval: 15s      # How frequently to evaluate alerting rules
 
 # Alerting rules
+# Paths are resolved relative to THIS config file, so they must not repeat the
+# `monitoring/` prefix (they did, which made `promtool check config` fail with
+# "monitoring/monitoring/..." and blocked startup).
 rule_files:
-  - "monitoring/llama_memory_alerts.yaml"
-  - "monitoring/proxy_5xx_alerts.yaml"
-  - "monitoring/gpu_vram_alerts.yaml"
-  - "monitoring/slots_query_alerts.yaml"
-  - "monitoring/remote_stream_alerts.yaml"
+  - "llama_memory_alerts.yaml"
+  - "proxy_5xx_alerts.yaml"
+  - "gpu_vram_alerts.yaml"
+  - "slots_query_alerts.yaml"
+  - "remote_stream_alerts.yaml"
 
 # Scrape configurations
 scrape_configs:
@@ -27,8 +30,21 @@ scrape_configs:
       - targets: ["localhost:8000"]
     metrics_path: /metrics
 
-  # Scrape the AMD ROCm exporter for GPU VRAM metrics
-  - job_name: "rocm-exporter"
+  # Host + GPU metrics from node_exporter. The GPU series (gpu_busy_percent,
+  # gpu_gtt_used_bytes, gpu_vram_*_bytes) are produced by
+  # ~/.local/bin/gpu-metrics-textfile.sh (gpu-metrics.service) into the
+  # node_exporter textfile directory, because node_exporter has no amdgpu
+  # collector and amd/rocm-exporter publishes no release artifacts.
+  - job_name: "node-exporter"
     static_configs:
-      - targets: ["localhost:5000"]
+      - targets: ["localhost:9100"]
     metrics_path: /metrics
+
+  # Scrape the AMD ROCm exporter for GPU VRAM metrics
+  # DISABLED: amd/rocm-exporter has no published releases (GitHub releases API
+  # returns none), so nothing listens on :5000 and the target was permanently
+  # DOWN. GPU VRAM/GTT series now come from node-exporter above.
+  # - job_name: "rocm-exporter"
+  #   static_configs:
+  #     - targets: ["localhost:5000"]
+  #   metrics_path: /metrics
