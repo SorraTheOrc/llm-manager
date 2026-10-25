@@ -13,13 +13,20 @@ limitations. The skill itself is a thin, CLI-focused wrapper — see
   net (`proxy.log-YYYY-MM-DD_HH`, dash) — and either may be gzipped (`.gz`).
   The script discovers all of them and decompresses `.gz` transparently; the
   log directory should contain both types.
+- llama-server log source (read-only): `/var/log/llama-proxy/llama-server.log`
+  plus its rotations — numbered in-process rotations
+  (`llama-server.N.log`) and logrotate daily archives
+  (`llama-server.log-YYYY-MM-DD[.gz]`) — used for the Decode speed /
+  Prompt eval speed sections (see [How it works](#how-it-works) step 9).
 - Config (reference only, for slot schedule + thresholds):
   `proxy/config.yaml` in the llm project (auto-discovered by walking up from
-  the current directory, or pass `--config`). When the persisted operating
-  mode axis was removed (LP-0MVDT94F0003VHUA AC4), so the single unified
-  `proxy/config.yaml` is read, and the priority window
-  (`server.priority_window`) drives the standard/low session bucketing
-  and recommendations match the config the running proxy actually uses.
+  the current directory, or pass `--config`). The persisted operating-mode
+  axis was removed (LP-0MVDT94F0003VHUA AC4), so the single unified
+  `proxy/config.yaml` is read, and its `server.priority_window`
+  (`enabled` / `start` / `end`, local time) is the fast/cheap schedule when a
+  window's logs carry no mode-schedule evidence, so the standard/low session
+  bucketing and recommendations match the config the running proxy actually
+  uses (LP-0MVKSXXIR006OBI2).
 
 ## Outputs
 
@@ -71,12 +78,47 @@ Outputs written to:
   hold-cycle routing-skip re-emissions (`chain_hold_cycle>0`) in the
   window, excluded from every demand/local-skip counter
   (LP-0MUIEO6IP0030CT3): `jq .hold_cycle_routing_skip_events`.
+- `--json` summary field `provider_context_skips` — provider context-ceiling
+  skips (LP-0MVMBM1Y3001TPRT): `{"total": N, "share_of_skips": f,
+  "standard": N, "low": N, "by_provider": {provider: count},
+  "by_limit": {limit: count}}`. `share_of_skips` uses **all** skip events
+  (`routing_skip_local` + provider-context) as its denominator; an event whose
+  line carried no `limit` is keyed `(unknown)` rather than dropped.
+- **Prefill-regression keys** (LP-0MVOAQDB4002D56G, certifying the cold-prefill
+  admission budget of LP-0MVN3KMGI009BZ0D). Five additive keys, so the 24 h
+  AC4 certification no longer needs a hand-written log scan; the report renders
+  them in a **Prefill admission regression** section whenever any is non-zero.
+  - `prefill_deadline_events` — `prefill_deadline_exceeded` WARNING lines
+    (an admitted local prefill cancelled at the deadline).
+  - `prefill_deadline_events_by_class` — `{"user": N, "audit": M}`. A
+    session id beginning `audit-` is agent **audit** traffic (gate sweeps,
+    herdr child sessions); every other session — including an unattributed
+    one — is **user** traffic. Audit runs are real inference but are not the
+    workload the budget is priced for, so the deadline-rate criterion is gated
+    on `user`.
+  - `prefill_budget_refusals` — `local_admission_guard` events with
+    `decision=reject reason=prefill_budget_exceeded` (over-budget prompts
+    refused before any dispatch; other reject reasons are not counted here and
+    remain visible in `local_admission_reject`).
+  - `wasted_prefill_tokens` — sum of `new_tokens` over
+    `local_eviction_after_acceptance` events whose `reason` is
+    `prefill_deadline`: tokens the GPU computed for a dispatch then abandoned
+    before its first byte. Other eviction reasons are excluded.
+  - `provider_exhausted_errors` — `All providers exhausted` lines
+    (client-visible chain failures); `upstream_status_503_errors` —
+    `upstream_http_error` events with `status == 503` (provider-side 5xx).
+    The two are separate on purpose: a provider can return 503 while another
+    still serves the request.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
   columns), a **Total tokens** section (Input / Output / Total counts and
   % share, with fast/cheap and by-model breakdowns; see [Total tokens](#total-tokens)
-  below), fallback-reason and routing-skip breakdowns, per-model
+  below), fallback-reason and routing-skip breakdowns, a **Provider context
+  skips** section (`routing_skip_provider_context` events rendered only when
+  the window has them: count, % of all skip events, Standard/Low split,
+  provider/type breakdown and the `limit` ceiling each provider hit, plus the
+  median/p90/max estimated prompt that was blocked), per-model
   breakdown, **Error analysis** (when the window has error events) with a
   taxonomy table that includes a **Status** column (upstream HTTP errors are
   split into one row per status code), a **Provider/model breakdown** table
@@ -120,12 +162,23 @@ Outputs written to:
   (the previous hour-of-day keying could collide them and emit impossible
   >100% rows, LP-0MTYAZFGN003BYQS); the `--json` summary exposes the same
   per-hour activity as `hourly_activity`, plus `hourly_busy` and
-  `hourly_session_classification`, all keyed by absolute hour, **Local model
+  `hourly_session_classification`, all keyed by absolute hour. Each
+  `hourly_activity` entry (LP-0MVKUKG3F0035I85) carries `state` (the
+  `+`-joined availability label), `states` (the ordered tuple), and the raw
+  evidence counters `local_dispatch_attempts`, `local_denials`,
+  `lease_active_fallbacks` alongside `local_served`, so a machine consumer
+  can audit the availability verdict instead of trusting it, **Local model
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
-  fast/cheap split — when the window has local traffic), **Time to first
+  fast/cheap split — when the window has local traffic) followed by
+  **Prefill vs decode** (phase slot-time split: prefill dispatch → first byte
+  vs decode first byte → finish, each as slot-seconds and % of combined phase
+  slot time summing to 100%, with p10/p50/p90/max per phase and unknown-stream
+  counts; the `--json` summary exposes it as `local_busy.prefill_vs_decode`),
+  **Time to first
   token** (p10 / median / p90 of dispatch → first-token latency, split into
-  **Total / Fast / Cheap** rows using the same mode-aware session bucketing as
+  **Total / Fast / Cheap** rows using the same three-tier fast/cheap bucketing
+  (mode timeline → `server.priority_window` → slot schedule) as
   the other breakdowns, from local `dispatch_first_byte_ms=` and remote
   `ttft_seconds=` log lines; the `--json` summary exposes the same split under
   `ttft` with `total` / `fast` / `cheap` sub-objects), **Decode speed** and
@@ -201,7 +254,14 @@ entry is a local runtime edit, not a committed artifact.
 2. **Streaming parse** — files are read line by line (never loaded into
    memory; the live log can exceed 700 MB). Only structured prefixes are
    parsed: `Stream started`, `Stream finished`, `Fallback triggered`,
-   `routing_skip_local`, `local_dispatch_denied`, the server-side
+   `routing_skip_local`, `routing_skip_provider_context` (a per-provider
+   context-ceiling skip rendered as its own **Provider context skips**
+   breakdown in the report; parsed into `provider_context_skip`
+   events carrying `provider`, `type`, `reason`, `estimated_tokens`,
+   `limit`, `session`, and the source file/line as evidence,
+   LP-0MVMBM1Y3001TPRT), `local_dispatch_denied`, `[local] POST` (every
+   dispatch attempt at the local llama-server — including attempts that
+   never yield a first byte, LP-0MVKUKG3F0035I85), the server-side
    compaction events (`compaction_event`, `compaction_backstop`,
    `compaction_churn` — parsed tamerly with missing fields defaulting to
    None, LP-0MTHCTLAF00147IT), plus the operating-mode lines (`Mode
@@ -223,7 +283,38 @@ entry is a local runtime edit, not a committed artifact.
    into the event's `chain_hold_cycle` field (LP-0MU5AIAAY003KVM0); lines
    without the token (pre-chain-hold rotated logs) parse with
    `chain_hold_cycle=None`, which aggregates as cycle 0 (genuine demand).
+   Local `dispatch_first_byte_ms=` lines (LP-0MTSSM5SO003PKU0) parse into
+   `ttft` events carrying the prefill breakdown: `ttft_ms` (dispatch → first
+   byte total), `dispatch_to_first_byte_ms` (total minus queued wait),
+   `queue_wait_ms`, `cache_state` and `cached_ratio`, plus `session` and
+   `model` (LP-0MVJN025B001I8AL). `log_parser.pair_ttft_to_streams()` pairs
+   them FIFO per session (Nth TTFT ↔ Nth `stream_started`, the same
+   convention the busy-time calculation uses for start/finish pairs); streams
+   without a TTFT line pair with `ttft=None` — unknown prefill, reported
+   rather than dropped.
    Unparseable lines are counted and skipped, never fatal.
+
+   **`Fallback triggered` log contract (LP-0MVMBMSWR0036RES).** The proxy
+   emits one line per fallback, with the request's resolved session and a
+   per-session fallback ordinal trailing the reason:
+
+   ```text
+   Fallback triggered for model=<path>, from=<provider>, to=<provider>, reason=<reason>[ limit=<n> remaining=<n> waited=<seconds>] session=<uuid|unknown> attempt=<n>
+   ```
+
+   - `session=` is the request's resolved session UUID, or `unknown` when the
+     request carried none (the parser degrades `unknown` to "no session").
+   - `attempt=` is the session's 1-based fallback ordinal. It keeps increasing
+     across requests, so two fallbacks from the same session in the same
+     second are distinguishable.
+   - `limit=` / `remaining=` / `waited=` are the budget snapshot
+     (`provider_budget.BudgetDecision`: `limit_rpm`, `remaining`,
+     `waited_seconds`) and are emitted **only** when the reason is
+     budget-driven (`rate_limited*`). The decision itself is unchanged.
+   - All evidence fields trail `reason=`, so pre-change rotated logs (no
+     evidence fields) still parse: every evidence field degrades to `None`.
+     Consumers that anchored `reason=` to end-of-line were updated in the same
+     change.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the
    authoritative `tokens=prompt/completion/total` from `Stream finished`
@@ -232,22 +323,49 @@ entry is a local runtime edit, not a committed artifact.
    `Stream finished` events are collected across the analysis's effective
    margin beyond the window (48h, shared with the mode timeline in step 5;
    see `MODE_TIMELINE_MARGIN`), paired per session (FIFO), clipped back to
-   the window, and merged. Busy time is the union of active intervals (at
-   least one slot generating), total compute is the sum of clipped stream
-   durations (slot-seconds), and peak concurrency comes from a sweep over
-   interval endpoints. Busy seconds are attributed to **absolute** hours and
+   the window, and merged. **Busy is the union of dispatch → finish
+   intervals** (LP-0MVJN9H2I00116FP): each paired stream's interval starts at
+   its back-calculated dispatch time (`ttft.ts - ttft_ms/1000`, i.e. the
+   prefill line's first-byte timestamp minus its measured duration) and ends
+   at its `Stream finished` line, so the prefill (prompt-processing) phase is
+   counted alongside decode. A stream with no first-byte line falls back to
+   its decode interval (`Stream started` → `Stream finished`) and is
+   attributed to the lower bound — busy is never overstated by a fabricated
+   prefill. The decode-only union is retained as
+   `BusyStats.decode_busy_seconds`, the labelled **lower bound** of the busy
+   figure; `busy_seconds` is the labelled **upper bound**
+   (`BUSY_DEFINITION = "dispatch_to_finish"`,
+   `BUSY_UPPER_BOUND_LABEL`/`BUSY_LOWER_BOUND_LABEL`). All derived figures work
+   on the new intervals: total compute is the sum of clipped stream durations
+   (slot-seconds), peak concurrency comes from a sweep over interval
+   endpoints, and the fast/cheap and hourly splits are attributed from the
+   dispatch → finish union (`fast_busy_seconds`, `cheap_busy_seconds`,
+   `hourly_busy`); `prefill_busy_seconds` is the wall-clock prefill span
+   (upper − lower). The `--json` summary exposes the same fields under
+   `local_busy` — the definition marker `"definition": "dispatch_to_finish"`,
+   `decode_busy_seconds` (retained decode-only union, the lower bound),
+   `prefill_busy_seconds` (prefill span, derivable from the two unions),
+   `prefill_extended_streams` (how many streams carried a measured prefill)
+   and the human labels `upper_bound_label` / `lower_bound_label` — so a
+   machine consumer never has to infer the busy semantics
+   (LP-0MVJNW6SN008AKH3). Every pre-change key is retained unchanged, and the
+   phase split stays at `local_busy.prefill_vs_decode`. Busy seconds are attributed to **absolute** hours and
    to fast/cheap periods (slot schedule) by splitting at hour and period
    boundaries. The top-of-report **Summary by hour** table
    (LP-0MTFO210Q0044TTF, reworked by LP-0MTYAZFGN003BYQS) then renders one
    row per **absolute wall-clock hour** of the report window — the first/last
    rows truncated to the window edges and every hour listed even when idle —
    with a busy-% column (busy seconds ÷ window-bounded bucket duration,
-   clamped to 100%) plus five per-hour activity columns counted by each
-   event's own timestamp in the bucket: `Requests started` (all
-   `Stream started`), `Local attempts` (local `Stream started`), `Local
-   served` (local `Stream finished`), `Fallbacks` (`Fallback triggered`), and
-   `Local-skip` (`routing_skip_local`); a final totals row gives the window
-   busy totals plus the sum of each activity column. Counting by event
+   clamped to 100%), a **State** column carrying the hour's local-availability
+   classification (LP-0MVKUKG3F0035I85, see below), plus seven per-hour
+   activity columns counted by each event's own timestamp in the bucket:
+   `Requests started` (all `Stream started`), `Local attempts` (local `Stream
+   started`), `Local served` (local `Stream finished`), `Local dispatch`
+   (every `[local] POST` dispatch attempt, including attempts that never
+   stream), `Lease denials` (`local_dispatch_denied` refusals), `Fallbacks`
+   (`Fallback triggered`), and `Local-skip` (`routing_skip_local`); a final
+   totals row gives the window-level state plus the window busy totals and
+   the sum of each activity column. Counting by event
    timestamp means long-running sessions contribute to every hour they touch,
    not just their first-request hour. It renders regardless of local traffic
    (busy columns read `0s` / `0.0%` when the window has no local streams;
@@ -260,25 +378,92 @@ entry is a local runtime edit, not a committed artifact.
    pre-window leftovers from earlier windows, tracked separately in
    `pre_window_unfinished`, and streams started after the window end belong
    to the next window (LP-0MSVRRO3L0056N6C).
-5. **Fast/cheap bucketing** — each session is bucketed by the **operating
-   mode** active at its first in-window stream, reconstructed from the
-   `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
-   plus the manual-switch marker `Grandfathering: enabled; other-mode
-   config ... (current=<mode>)` (a `POST /admin/set-mode` manual switch
-   restarts the proxy and logs the actually-active mode this way, without
-   an applied-scheduled-mode line; LP-0MT1EE315007AKXG) — so a window
-   crossing the 01:00/10:00 mode transitions, or containing a manual
-   switch, splits fast vs cheap correctly even when the analysis itself
-   runs in fast mode. The mode timeline is built with a 48h margin beyond
-   the window (a single streaming pass also serves the busy-time pairing),
-   so the nearest prior transition is always available. The bucket label is
-   the mode name, and the slots / per-period ctx come from that mode's
-   config profile (`config-fast.yaml`: 3 slots @ 131072; `config-cheap.yaml`:
-   2 slots @ 262144) — the CSV `slots`/`ctx_size` columns and the report's
-   per-slot context figures reflect the profile that was actually active.
-   Windows with no mode transition observed (single-mode windows) keep the
-   legacy behavior: bucketing from the slot schedule of the analysis-time
-   config profile; nothing is hardcoded.
+   **Prefill statistics** (LP-0MVJN45LF009CO2V) are computed in the same pass
+   from the local `dispatch_first_byte_ms=` events: `aggregate()` hands the
+   margin-widened local TTFT events to `compute_busy_stats(ttft_events=...)`,
+   which pairs them FIFO per session to the local streams and reports
+   `BusyStats.prefill_stats` (`PrefillStats`). Each stream's prefill interval
+   is `[ttft.ts − ttft_ms/1000, ttft.ts]`; the duration comes from
+   `dispatch_first_byte_ms`, falling back to the logged
+   `dispatch_to_first_byte_ms + queue_wait_ms` split and then to pairing the
+   dispatch and first-byte timestamps (a non-positive pairing is not
+   evidence). `PrefillStats` exposes one `PrefillSample` per stream (session,
+   first-byte timestamp, seconds) plus `p10`/`p50`/`p90`/`max_seconds` and
+   `total_seconds`. **Every prefill figure is slot-seconds, not wall-clock**
+   (`unit`): `total_seconds` sums the per-stream durations (total prefill
+   work), so it is deliberately *not* comparable with the wall-clock union in
+   `BusyStats.busy_seconds`. Streams with no first-byte line are unknown
+   prefill — excluded from the percentiles but retained in
+   `stream_count`, so an aborted request is visible instead of silently
+   dropped. A stream is attributed to the window containing its first-byte
+   timestamp, and its interval is not clipped: a dispatch before
+   `window_start` keeps its full duration and a first byte after
+   `window_end` belongs to the next window (no double counting).
+   `prefill_stats` is `None` only when the caller supplied no TTFT events.
+   The `--json` summary exposes the same statistics as a top-level
+   `local_prefill` object — `unit` (`slot-seconds`), `slot_seconds` (window
+   total), `count` (measurable samples), `streams` (all local streams
+   considered), `unknown_prefill` (streams with no observable prefill) and
+   `p10` / `p50` / `p90` / `max_seconds` — with `0`/`null` values (never a
+   missing key) when there is local traffic but no measurable prefill, and
+   `null` when the window has no local traffic at all (matching `local_busy`)
+   (LP-0MVJNW6SN008AKH3).
+   **Decode statistics** (LP-0MVJNDOUU0059MMO) are computed in the same pass
+   on the same paired local streams, without needing TTFT events:
+   `BusyStats.decode_stats` (`DecodeStats`) holds one `DecodeSample` per
+   stream whose `Stream started` (first byte) falls in the window, with the
+   duration `Stream finished` − `Stream started`. Like prefill it is
+   **slot-seconds, not wall-clock** (`unit`), attributed by first-byte
+   timestamp and not clipped; a stream with no logged finish is unknown
+   decode (excluded from the percentiles, retained in `stream_count`).
+   `PrefillStats` and `DecodeStats` share the `SlotSecondsStats` base
+   (samples, percentiles, `total_seconds`, `unknown_count`), so the two
+   phases are directly additive: the `## Prefill vs decode` section
+   (LP-0MVJNDOUU0059MMO) splits local phase slot time into prefill and decode
+   as absolute slot-seconds and as a percentage of combined phase slot-time
+   that always sums to 100%, with p10/p50/p90/max per phase and an explicit
+   slot-seconds-not-wall-clock statement. A window with no prefill samples
+   prints a named reason and points at the `## Decode speed` /
+   `## Prompt eval speed` eval-timing diagnostic rather than leaving an
+   unattributed blank (a window with no local traffic prints a named "no
+   local traffic" reason). The same split is in the JSON summary at
+   `local_busy.prefill_vs_decode`.
+5. **Fast/cheap bucketing** — a session is bucketed by the **profile active
+   at its first in-window stream**, from three sources in precedence order
+   (LP-0MVKSXXIR006OBI2):
+   1. **Mode timeline** (historical windows) — reconstructed from the
+      `Mode scheduler: applied scheduled mode <mode>` lines parsed in step 2
+      plus the manual-switch marker `Grandfathering: enabled; other-mode
+      config ... (current=<mode>)` (a `POST /admin/set-mode` manual switch
+      restarts the proxy and logs the actually-active mode this way, without
+      an applied-scheduled-mode line; LP-0MT1EE315007AKXG) — so a window
+      crossing the 01:00/10:00 mode transitions, or containing a manual
+      switch, splits fast vs cheap correctly even when the analysis itself
+      runs in fast mode. The mode timeline is built with a 48h margin beyond
+      the window (a single streaming pass also serves the busy-time pairing),
+      so the nearest prior transition is always available. The bucket label is
+      the mode name, and the slots / per-period ctx come from that mode's
+      config profile (`config-fast.yaml`: 3 slots @ 131072; `config-cheap.yaml`:
+      2 slots @ 262144) — the CSV `slots`/`ctx_size` columns and the report's
+      per-slot context figures reflect the profile that was actually active.
+      This source **wins** whenever the logs carry the evidence, so archived
+      windows keep their historical attribution.
+   2. **Priority window** (the current deployment) — the fast/cheap mode
+      schedule was retired (LP-0MVDT94F0003VHUA); cheap semantics now come
+      from `server.priority_window`, which caps every request to `low`
+      priority inside its local-time window. When no mode transitions exist,
+      that window is the fast/cheap schedule: traffic inside it is **cheap**,
+      traffic outside **fast**. `start`/`end` are inclusive/exclusive local
+      times and `start > end` wraps past midnight (e.g. `22:00`–`06:00`,
+      split into two cheap segments); `enabled: false` attributes no cheap
+      time at all. The profile's slots/ctx still come from the unified
+      config, so only the time axis is re-labelled.
+   3. **Slot schedule** (legacy fallback) — bucketing from the analysis-time
+      config's `slot_schedule` entries by slot count; nothing is hardcoded.
+   The report's `## Priority window timeline & restarts` section names which
+   source applied, so the attribution is auditable (a retired mode schedule
+   with a `server.priority_window` source shows the window bounds; a window
+   with mode evidence states that the priority window was not applied).
 6. **Total tokens** — a `## Total tokens` section rendered **immediately before**
    `## Fallback reasons` in every run, including zero-traffic windows (shows
    `0` counts with a `_No tokens in window._` note for the by-model table).
@@ -286,8 +471,9 @@ entry is a local runtime edit, not a committed artifact.
    authoritative `tokens=prompt/completion/total` on `Stream finished` lines
    (never payload truncation), with a top row for Input / Output / Total
    (absolute + % of grand total), a fast vs cheap sub-table (absolute +
-   % of total per bucket; bucketing follows the existing mode-aware fast/cheap
-   logic, unattributed streams excluded or documented), and a by-model
+   % of total per bucket; bucketing follows the same three-tier fast/cheap
+   logic (mode timeline → `server.priority_window` → slot schedule),
+   unattributed streams excluded or documented), and a by-model
    sub-table (one row per `provider/model`, absolute + %, sorted by Total desc;
    unknown provider/model renders as the `(unknown)` placeholder).
 7. **Recommendations** — rule-based heuristics, each citing the data that
@@ -334,13 +520,31 @@ entry is a local runtime edit, not a committed artifact.
    (`eval time = <ms> ms / <n> tokens (<x> tok/s)` and `prompt eval time =`)
    are streamed from `llama-server.log*`, filtered to the Qwen3 child port
    (discovered per file from the `name=Qwen3 on port <port>` spawn line;
-   the port changes on every restart). Samples are bucketed Total / Fast /
-   Cheap via the slot schedule and summarised as median / p90 / p10 tok/s.
-   Because llama-server.log lines carry no timestamps, each sample is
-   bucketed by its log file's last-write time (approximate; documented in
-   the report). The per-session CSV `decode_tok_s` column is derived from
-   proxy.log instead (local completion tokens ÷ local active span) and stays
-   empty when not derivable.
+   the port changes on every restart). Rotation is recognised in both
+   schemes: numbered in-process rotations (`llama-server.N.log`) and the
+   logrotate daily archives (`llama-server.log-YYYY-MM-DD`), decompressing
+   `.gz` transparently. When rotation splits the Qwen3 spawn line away from a
+   child log, the port is **inferred** from the single, otherwise-unannounced
+   port carried by that file's eval lines (ports announced for other models,
+   e.g. `name=mxbai-embed on port N`, are excluded); a file whose port stays
+   ambiguous is skipped with a named reason. Samples are bucketed Total /
+   Fast / Cheap with the same three-tier fast/cheap attribution as the
+   session tables (mode timeline → `server.priority_window` → slot schedule)
+   and summarised as median / p90 / p10 tok/s. Because llama-server.log lines
+   carry no timestamps, each sample is bucketed by its log file's last-write
+   time (approximate; documented in the report). An empty window is
+   **self-diagnosing**: the section prints
+   the log directory scanned, the files scanned, the eval lines matched and
+   a named cause — `verbosity/build` (no `eval time` lines in the files at
+   all), `rotation` (files outside the window), or `attribution failure`
+   (Qwen3 port undeterminable) — instead of an unattributed blank
+   (LP-0MVJNIZRO008S031). The same context is in the `--json` summary under
+   `decode_speed` / `prompt_eval_speed` (`log_dir`, `files_discovered`,
+   `files_outside_window`, `files_unrecognised`, `qwen3_ports`,
+   `eval_lines_total`, `eval_lines_matched`, `file_diagnostics`, and
+   `empty_window_reasons` when the window is empty). The per-session CSV
+   `decode_tok_s` column is derived from proxy.log instead (local completion
+   tokens ÷ local active span) and stays empty when not derivable.
 
 ## Interpreting the report
 
@@ -363,10 +567,41 @@ entry is a local runtime edit, not a committed artifact.
     `local_large_context_warm_cache_threshold`.
   - `HTTP 4xx/5xx`, `empty_response`, timeouts → remote provider issues
     (credentials, rate limits) — not slot-related.
+- **Provider context skips** (`routing_skip_provider_context`): a remote
+  entry's `max_context_tokens` ceiling was exceeded by the estimated prompt,
+  so that provider was skipped **for this request only** (no cooldown, no
+  failure-domain exclusion, no usage-limit reset). Read the dedicated section
+  as a chain-cost signal, not an outage: the request was still served, but each
+  skip walked the chain further. The `limit` column names the ceiling that was
+  hit, so a provider whose limit explains most skips is the one to raise (or
+  reorder behind a larger-context entry); a ceiling that is low relative to the
+  sessions' peak context overlaps the `context_too_large` /
+  `large_context_bypass` advice above (same size problem, remote side). A
+  session whose own provider-context skip precedes its first remote stream is
+  attributed that skip (`fallback_reason=provider_context_exceeded`) unless it
+  also logged a `routing_skip_local` line, which takes precedence.
 - **Context pressure**: sessions whose max context approaches
   `local_model_ctx_size / slots` can force `large_context_bypass`.
+- **Decode speed / Prompt eval speed**: when these sections are empty, read
+  the **Why no eval-timing samples** block rather than assuming a data
+  problem: `verbosity/build` means the files were read but carry no
+  `eval time` lines (llama-server log verbosity or build flags), `rotation`
+  means every `llama-server*` file falls outside the window (retention/-
+  rotation too aggressive for the window), and `attribution failure` means
+  the eval lines exist but no Qwen3 child port could be determined (an
+  ambiguous or non-Qwen3 port). The block always names the log directory,
+  the files scanned and the eval lines matched.
 - **Local model utilization**: busy time is the share of the window with at
-  least one local slot generating. A low busy % with high fallback volume
+  least one local slot occupied **from dispatch to finish** (prefill +
+  decode, LP-0MVJN9H2I00116FP); the retained decode-only figure is its
+  labelled lower bound, and a stream with no first-byte line never inflates
+  it. The **Prefill vs decode** section then splits the *phase* slot time
+  into prefill (dispatch → first byte) and decode (first byte → finish) as
+  slot-seconds and as a share of combined phase slot time (always 100%
+  together, LP-0MVJNDOUU0059MMO) — read it for where slot time goes (prefill
+  rarely dominates at 46% local occupancy, but it does on large cold
+  prompts), not for window occupancy: phase slot-seconds sum per-stream
+  durations and are not comparable with the wall-clock busy %. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
   fallback reasons), not that local is underprovisioned. The **Summary by
   hour** table at the top of the report shows per-hour busy % and per-hour
@@ -374,7 +609,7 @@ entry is a local runtime edit, not a committed artifact.
   glance at the hourly pattern correlates demand with provider usage and
   shows when local was saturated vs idle; the totals row gives the
   window-wide busy % and the summed activity counts. `context_too_large`
-  is the largest lever: despite the legacy name (`warm_cache_bypass`) it
+  is the largest lever: despite the legacy name (`warm_cache_bypass`), it
   fires when the *estimated context* exceeds the effective warm-cache
   threshold (the per-slot clamp,
   `local_model_ctx_size // slots - headroom`, inflated by
@@ -383,6 +618,35 @@ entry is a local runtime edit, not a committed artifact.
   `local_concurrency_limit` / `local_lease_active` fallbacks. Note the
   slots-vs-context trade-off: more slots shrink per-slot context and *raise*
   bypass volume, so do not add slots without a matching ctx-size increase.
+- **Hour state (local availability)**: the **State** column of **Summary by
+  hour** answers "was the local model *idle*, or *unable to serve*?" — a
+  question busy-% cannot answer, because busy is computed only from paired
+  `Stream started`/`Stream finished` events, so an hour where work never
+  yields a first byte renders as `0s / 0.0%`. The four states are derived
+  only from the logs, and a short footnote after the table repeats their
+  definitions in every report:
+
+  | State | Meaning | Evidence |
+  |---|---|---|
+  | `serving` | decode happened | ≥1 local `Stream finished` |
+  | `prefill-only-no-decode` | prompts were prefilled, nothing was decoded | ≥1 `[local] POST` and **no** local `Stream finished` |
+  | `lease-blocked` | local demand was refused because another session held the dispatch lease | ≥1 `local_dispatch_denied` or `reason=local_lease_active` fallback |
+  | `idle` | no local demand at all | no dispatch attempt, no refusal, no local completion |
+
+  The states are **not exclusive** and are `+`-joined in the cell, in the
+  fixed order `serving`, `prefill-only-no-decode`, `lease-blocked`; `idle`
+  only ever appears alone. The 2026-10-23 02:00-03:00 incident is the canonical
+  example: a wedged prefill lease held the gate while the GPU prefilled ~2M
+  prompt tokens and decoded nothing, so the hour renders
+  `prefill-only-no-decode+lease-blocked | 0s | 0.0%` with `Local dispatch`
+  173, `Local served` 0 and `Lease denials` 141 — an outage, not idle. The
+  totals row carries the classification of the summed window evidence (the
+  window-level verdict, so a single wedged hour is still visible in a 24h
+  report). A high `lease-blocked` hour with a low busy % means the gate was
+  held (see the `local_lease_active` fallback guidance above);
+  `prefill-only-no-decode` without denials means dispatch happened but never
+  completed, i.e. cancelled/aborted prefill (check
+  `local_prefill_deadline_seconds` versus projected prefill ETA).
 - **Total tokens**: Input + Output + Total (prompt + completion summed from
   `tokens=prompt/completion/total` on `Stream finished` lines; streams without
   `tokens=` contribute `0`). Check the per-bucket and per-model tables in the
@@ -390,7 +654,10 @@ entry is a local runtime edit, not a committed artifact.
   fast% + cheap% = 100% and model %s sum to 100%. A large Input / Output
   disparity can reveal long-prompt sessions driving capacity pressure.
 - **Fast vs cheap**: a large fallback-rate gap between buckets suggests the
-  slot schedule under-serves one period.
+  profile under-serves one period. Read the `## Priority window timeline &
+  restarts` note first: it states whether the split came from the mode
+  timeline (historical logs), the configured `server.priority_window` (the
+  current cheap window), or the legacy slot schedule.
 - **Error analysis** (see the **Error analysis** section and `errors.csv`):
   the taxonomy table counts each error type; the **Provider/model breakdown**
   table splits each type by provider and model (e.g. a spike of
@@ -490,9 +757,34 @@ entry is a local runtime edit, not a committed artifact.
   field. Local-skip totals for windows containing held requests therefore
   fall versus pre-change reports — this is the intended accuracy fix, not
   lost data.
-- `Fallback triggered` lines carry no session UUID; per-session attribution
-  prefers the session's own `routing_skip_local` line and otherwise the
-  nearest fallback event within 60s of the first remote stream.
+- **Per-session fallback attribution (LP-0MVMBMSWR0036RES).** Since
+  `Fallback triggered` carries `session=`, a session's fallback reason is taken
+  from its **own** evidence and never inherited from a neighbouring line. The
+  precedence is (1) the session's own `routing_skip_local` line at/before its
+  first remote stream, (2) the session's own `routing_skip_provider_context`
+  line at/before its first remote stream (LP-0MVMBM1Y3001TPRT — it names the
+  provider and the `limit` that blocked that chain step, so it outranks the
+  generic fallback line), (3) the session's own `Fallback triggered` line
+  at/before its first remote stream, (4) the nearest **session-less** fallback
+  line within 60s before the first remote stream — reachable only for rotated
+  logs predating the session stamp — and (5) no own evidence at all. The
+  provenance is exposed as the `fallback_attribution` column (`own_skip`,
+  `own_provider_skip`, `own_fallback`, `legacy_nearest`, `lease_denied`,
+  `unattributed`) plus the `no_remote_fallback` state for sessions that never
+  used a remote provider; the report's `Session fallback attribution` line and
+  the JSON summary's `fallback_attribution` map count every state. A session
+  with no fallback line but `local_dispatch_denied` evidence is labelled
+  `lease_denied` (`reason=local_lease_active`) — a lease/concurrency refusal,
+  not an inherited spill. Before this change a session with no fallback line of
+  its own inherited an unrelated neighbour's `rate_limited` within the 60s
+  window (11 of 26 clean local-using sessions in the 2026-10-23/24 window were
+  mislabelled that way).
+- Provider context-ceiling skips (`routing_skip_provider_context`) are counted
+  per event, not per provider chain: one request that exceeds several entries'
+  ceilings logs one line per entry, so the count is *entry* attempts skipped.
+  The line records no cooldown and the entry stays eligible for smaller
+  requests. Older rotated lines may omit `limit=`; those events still parse and
+  their ceiling is reported as `not logged` rather than zero.
 - Sessions spanning a slot-schedule transition may observe a brief restart
   interruption (llama-server is restarted immediately at the transition time);
   since LP-0MSF9RUSQ007M346 there is no drain window and no 503 rejection period.
@@ -503,8 +795,12 @@ entry is a local runtime edit, not a committed artifact.
   marker (manual switches, LP-0MT1EE315007AKXG) within a 48h margin of the
   window; sessions starting before the earliest observed transition in the
   available logs fall back to the analysis-time mode (documented in
-  LP-0MSPZUD4G007IYGH). A window entirely inside one mode (no transition
-  observed) keeps the legacy slot-schedule bucketing.
+  LP-0MSPZUD4G007IYGH). A window with no mode evidence buckets from the
+  configured `server.priority_window` (local time, wrap-aware, `enabled:
+  false` disables it; LP-0MVKSXXIR006OBI2) — the retired mode schedule's
+  replacement — and only a window with neither signal keeps the legacy
+  slot-schedule bucketing. The report's `## Priority window timeline &
+  restarts` section states which of the three sources was used.
 - Busy-time pairing reads local `Stream started`/`Stream finished` events
   across the analysis's effective margin (48h, see `MODE_TIMELINE_MARGIN`)
   and clips streams to the window; a stream that started more than
@@ -532,6 +828,20 @@ entry is a local runtime edit, not a committed artifact.
   section's window filtering and fast/cheap split are approximate: each
   sample is bucketed by its log file's last-write time. Files whose Qwen3
   child port cannot be discovered are counted and skipped (never fatal).
+- **The hour availability state uses proxy-log evidence only**
+  (LP-0MVKUKG3F0035I85). llama-server writes its prefill/decode evidence
+  (`prompt processing progress`, `slot update_slots`, `eval time`) with **no
+  per-line timestamp**, so those lines cannot be attributed to an hour
+  deterministically — for the 6-hourly rotation a wedge window's GPU evidence
+  can only be placed in wall-clock time by an analyst reconstructing a time
+  base externally. The proxy's own `[local] POST` dispatch-attempt marker is
+  therefore the per-hour "prefill started" signal: it is emitted for every
+  attempt (including ones that never produce a first byte) with an exact
+  timestamp, and its lack of a following local `Stream finished` is exactly
+  the "no decode" half of `prefill-only-no-decode`. Prompt-token volume and
+  `eval time` counts remain available at window level in the **Prefill vs
+  decode** and **Decode speed** sections; they do not feed the per-hour
+  state.
 - The per-session CSV `decode_tok_s` is a session-level average over the
   local active span (first→last local stream event); it includes
   inter-request gaps, so it is a conservative lower bound of the true decode

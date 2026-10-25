@@ -25,6 +25,7 @@ import os
 import re
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -841,13 +842,171 @@ def _get_first_byte_timeout_seconds(srv) -> float:
     ceiling=900s``, LP-0MU1S617L002Q9PR AC1). The lifetime wedge bound
     (``local_dispatch_max_prefill_seconds``) is unchanged. Returns 0 to
     disable the first-byte ceiling entirely.
+
+    The effective ceiling is the tighter of this value and
+    :func:`_get_prefill_deadline_seconds` — the prefill deadline
+    (LP-0MVIQ0G2M0006QF6) is a *safety detour* deliberately set well below
+    the wedge bound so a stalled local prefill becomes a fast remote answer
+    instead of a multi-minute hang.
     """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_dispatch_first_byte_timeout_seconds", 840)
+        ceiling = float(raw) if raw is not None else 840.0
+    except Exception:
+        ceiling = 840.0
+    deadline = _get_prefill_deadline_seconds(srv)
+    if deadline > 0:
+        # Tighten toward the deadline; a zero wedge bound means "no ceiling".
+        return deadline if ceiling <= 0 else min(ceiling, deadline)
+    return ceiling
+
+
+def _get_prefill_deadline_seconds(srv) -> float:
+    """Return the prefill deadline in seconds (default 90; 0 disables).
+
+    A hard backstop *independent of ETA-estimator quality*
+    (LP-0MVIQ0G2M0006QF6 AC3): if a local dispatch has produced no first byte
+    by this deadline, the pending upstream request is cancelled and the local
+    dispatch aborts with the existing retryable 503, so the chain falls
+    through to the next provider instead of leaving the client on a silent
+    socket for minutes (baseline: 48 local dispatches >120 s, max 592 s).
+
+    It is deliberately set well ABOVE the admission budget
+    (``contention_queue_max_wait_seconds``, 60 s) so a request legitimately
+    admitted inside its budget is never cut off, and strictly BELOW
+    ``local_dispatch_first_byte_timeout_seconds`` (840 s) so it is the bound
+    that actually fires. Precedence: the prefill deadline wins over the wedge
+    bound; both are bounded by ``local_dispatch_max_prefill_seconds``.
+    """
+    try:
+        server_cfg = srv.config.get("server", {})
+        raw = server_cfg.get("local_prefill_deadline_seconds", 90)
+        return float(raw) if raw is not None else 90.0
+    except Exception:
+        return 90.0
     try:
         server_cfg = srv.config.get("server", {})
         raw = server_cfg.get("local_dispatch_first_byte_timeout_seconds", 840)
         return float(raw) if raw is not None else 840.0
     except Exception:
         return 840.0
+
+
+# ===================================================================
+# Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL)
+# ===================================================================
+#
+# Root cause 3 of 3 of the 2026-10-23 wedged prefill incident
+# (LP-0MVKN9IRP003XJH6): after ``prefill_deadline_exceeded`` cancels a local
+# dispatch, the client re-dispatched the *identical* prompt and burned the
+# whole prefill again — 41 local POSTs in the incident hour (35 inside
+# 02:00-03:00) re-prefilling near-duplicates of the same 28k-124k-token
+# prompts (93,038 x2, 93,006 x3, …) with zero tokens delivered.
+#
+# The cooldown is a per-session, in-process window armed by router.py when
+# the prefill deadline fires. While it is armed, provider.py skips local for
+# that session (``routing_skip_local reason=prefill_thrash_cooldown``) so the
+# request reaches the next provider immediately instead of re-prefilling.
+# Other sessions are untouched. The window is cleared on expiry (lazy prune)
+# and on a successful local first byte, and ``0`` disables it (documented
+# rollback).
+
+DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS = 600.0
+"""Default post-deadline cooldown for a thrashing session (10 minutes)."""
+
+#: Session id → monotonic deadline. In-process by design: a proxy restart
+#: resets the routing state, exactly like the dispatch leases it guards.
+_prefill_thrash_cooldowns: dict[str, float] = {}
+
+
+def _prefill_thrash_config_section(config) -> Mapping:
+    """Return the ``server`` config section of *config* (flat configs too)."""
+    if not isinstance(config, Mapping):
+        return {}
+    server = config.get("server")
+    if isinstance(server, Mapping):
+        return server
+    return config
+
+
+def _get_prefill_thrash_cooldown_seconds(config) -> float:
+    """Return the post-deadline cooldown in seconds (default 600; 0 disables).
+
+    ``server.local_prefill_thrash_cooldown_seconds`` is the rollback knob: 0
+    disables the cooldown entirely (both the arming on a deadline event and
+    the routing skip). A missing or malformed value falls back to the default
+    so a config typo cannot silently switch the protection off.
+    """
+    section = _prefill_thrash_config_section(config)
+    raw = section.get(
+        "local_prefill_thrash_cooldown_seconds",
+        DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS,
+    )
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS
+    return max(0.0, seconds)
+
+
+def _record_prefill_thrash_cooldown(session_id, config, now=None) -> float:
+    """Arm (or re-arm) *session_id*'s cooldown; return its deadline.
+
+    Called by router.py when ``prefill_deadline_exceeded`` cancels a local
+    dispatch. Returns the monotonic deadline, or 0 when the cooldown is
+    disabled or no session id is known (a cooldown needs a session to scope
+    to — an anonymous one-shot request has nothing to suppress).
+    """
+    if not session_id:
+        return 0.0
+    seconds = _get_prefill_thrash_cooldown_seconds(config)
+    if seconds <= 0:
+        _prefill_thrash_cooldowns.pop(session_id, None)
+        return 0.0
+    _now = time.monotonic() if now is None else now
+    deadline = _now + seconds
+    _prefill_thrash_cooldowns[session_id] = deadline
+    return deadline
+
+
+def _prefill_thrash_cooldown_remaining(session_id, config=None, now=None) -> float:
+    """Return the seconds left in *session_id*'s cooldown (0 when clear).
+
+    Expired windows are pruned here, so expiry needs no timer. A live config
+    flip to 0 also clears the window (documented rollback).
+    """
+    if not session_id:
+        return 0.0
+    deadline = _prefill_thrash_cooldowns.get(session_id)
+    if deadline is None:
+        return 0.0
+    if config is not None and _get_prefill_thrash_cooldown_seconds(config) <= 0:
+        _prefill_thrash_cooldowns.pop(session_id, None)
+        return 0.0
+    _now = time.monotonic() if now is None else now
+    remaining = deadline - _now
+    if remaining <= 0:
+        _prefill_thrash_cooldowns.pop(session_id, None)
+        return 0.0
+    return remaining
+
+
+def _clear_prefill_thrash_cooldown(session_id) -> bool:
+    """Clear *session_id*'s cooldown; return True when one was armed.
+
+    Called by router.py on a successful local first byte: a healthy dispatch
+    proves prefill works for this session again, so holding it off local would
+    only cost the local answer.
+    """
+    if not session_id:
+        return False
+    return _prefill_thrash_cooldowns.pop(session_id, None) is not None
+
+
+def _reset_prefill_thrash_cooldowns() -> None:
+    """Clear every cooldown window (test isolation / explicit reset)."""
+    _prefill_thrash_cooldowns.clear()
 
 
 #: Cached-token ratio at or above which a local dispatch counts as a
@@ -1071,6 +1230,25 @@ async def _extend_lease_during_prefill(
       reports ``is_processing=False``. Relying on ``/slots`` alone left the
       extension a no-op in exactly the heavy-load case it targets. The hard
       ``local_dispatch_max_prefill_seconds`` ceiling remains the wedge bound.
+      The in-flight trigger is accepted **only for the caller's own
+      session** — ``local_prefill_in_flight`` is process-wide, so session A's
+      open request must never refresh session B's lease
+      (LP-0MVKUKFSO008GI6O AC2).
+
+    Extension is scoped to the caller's own record: the record is addressed by
+    ``_dispatch_lease_key(endpoint, session_key)``, which embeds the session,
+    and only that record is mutated.
+
+    An open request is **not** progress. The in-flight trigger pushes
+    ``expires_at`` out but does **not** refresh ``last_progress_ts``, so a
+    genuinely progress-less in-flight record is still released by the
+    ``local_dispatch_no_progress_timeout_seconds`` (180s) watchdog
+    (LP-0MVKUKFSO008GI6O AC4). Refreshing the no-progress clock on the
+    in-flight signal alone is what sustained the 2026-10-23 ~4 h wedge:
+    ``lease_extended_during_prefill progress=None alive=False in_flight=True``
+    repeated every 10s defeated the watchdog while no byte was ever produced.
+    Only observed numeric progress or observed slot liveness counts as
+    progress (LP-0MUXQ5QL40027VZ4 liveness behaviour is unchanged).
 
     Liveness cannot hold a lease indefinitely: the
     ``local_dispatch_max_prefill_seconds`` ceiling in
@@ -1113,7 +1291,18 @@ async def _extend_lease_during_prefill(
     # `/slots` blocks for the whole prompt-processing batch, so without this
     # the extension never fired under load and the watchdog killed every
     # prefill/queue wait at 180s. The max-prefill ceiling still bounds a wedge.
-    if not advancing and not alive and not prefill_in_flight:
+    # LP-0MVKUKFSO008GI6O AC2: the in-flight signal is only usable when the
+    # marker belongs to *this* session — ``local_prefill_in_flight`` is a
+    # process-wide map, so another session's open request must never keep this
+    # record's lease alive ("truthful lease and in-flight accounting").
+    in_flight_own = False
+    if prefill_in_flight:
+        try:
+            _markers = getattr(srv, "local_prefill_in_flight", None)
+            in_flight_own = bool(_markers) and session_key in _markers
+        except Exception:
+            in_flight_own = False
+    if not advancing and not alive and not in_flight_own:
         # Unobservable and not processing: no extension. Keeps the adaptive
         # estimate applied at acquisition (fallback).
         return last_progress, False
@@ -1126,14 +1315,29 @@ async def _extend_lease_during_prefill(
         lock = getattr(srv, "local_dispatch_records_lock", None)
         if lock is not None:
             async with lock:
-                record = srv.local_dispatch_records.get(
-                    _dispatch_lease_key(endpoint, session_key)
-                )
+                # LP-0MVKUKFSO008GI6O AC2: the extension is scoped to the
+                # caller's own session record (``_dispatch_lease_key`` embeds
+                # the session), so session A's dispatch can never refresh
+                # session B's lease — the two-session isolation is guaranteed
+                # by key construction, not by incidental absence of markers.
+                record_key = _dispatch_lease_key(endpoint, session_key)
+                record = srv.local_dispatch_records.get(record_key)
                 if record is not None and record.get("active"):
                     record["expires_at"] = time.monotonic() + buffer_seconds
                     if progress is not None:
                         record["last_progress"] = progress
-                    record["last_progress_ts"] = time.monotonic()
+                    # LP-0MVKUKFSO008GI6O AC4: an open request is not
+                    # progress. The in-flight signal (``prefill_in_flight``)
+                    # extends the lease but must NOT refresh the no-progress
+                    # clock, otherwise a wedged in-flight prefill defeats the
+                    # 180s watchdog and holds the pool for hours (2026-10-23
+                    # incident; ``last_progress_ts`` was refreshed every 10s
+                    # with ``progress=None alive=False in_flight=True``). The
+                    # clock advances only on observed numeric progress or
+                    # liveness — a genuinely progress-less in-flight record is
+                    # still released by ``_watchdog_no_progress``.
+                    if advancing or alive:
+                        record["last_progress_ts"] = time.monotonic()
                     extended = True
                     try:
                         srv.logger.info(
@@ -1142,7 +1346,7 @@ async def _extend_lease_during_prefill(
                             session_key if session_key else "unknown",
                             progress,
                             alive,
-                            prefill_in_flight,
+                            in_flight_own,
                             buffer_seconds,
                         )
                     except Exception:
@@ -1164,6 +1368,8 @@ async def _await_first_byte_with_prefill_monitor(
     llama_port: int = 8080,
     model_name: str | None = None,
     slot_id: int | None = None,
+    request: Request | None = None,
+    dispatch_session_id: str | None = None,
 ) -> tuple:
     """Await the initial upstream response while monitoring prefill progress.
 
@@ -1195,9 +1401,28 @@ async def _await_first_byte_with_prefill_monitor(
     *poll_seconds* and *timeout* are non-positive, preserving the previous
     behaviour for disabled configurations.
 
+    LP-0MVLFVY6K003VYEL: when *request* is given, each poll tick also checks
+    ``request.is_disconnected()``. A prefill emits no chunks, so the
+    post-first-byte disconnect checks never run while the dispatch awaits its
+    first byte — a client that died mid-prefill previously left its dispatch
+    record and ``local_prefill_in_flight`` marker behind until the
+    ``idle_timeout`` sweep (~5.5-6 min), refusing other sessions with
+    ``reason=local_lease_active``. On a *confirmed* disconnect
+    (``is_disconnected()`` returning True — never inferred from elapsed time)
+    the dispatch is released via ``_release_client_disconnect_dispatch``
+    (reason ``client_disconnect``) and ``ClientDisconnectedDuringPrefillError`` is
+    raised. The check rides the existing poll cadence, so no extra task is
+    created; with polling disabled (``poll_seconds <= 0``) the disconnect
+    reaper's cancellation + verdict covers the same case.
+
+    *dispatch_session_id* is the session key used for the release above and
+    defaults to *session_id*; the router passes the real session id there even
+    for non-explicit sessions, whose dispatch records are keyed by it.
+
     The pending *open_coro* task is cancelled if this helper is cancelled or
     raises, so a timed-out first-byte wait never leaks an upstream stream.
     """
+    _release_key = dispatch_session_id or session_id
     open_task = asyncio.ensure_future(open_coro)
     waited = 0.0
     warned = False
@@ -1221,6 +1446,36 @@ async def _await_first_byte_with_prefill_monitor(
                 return open_task.result()
 
             waited += step
+
+            # Client-dead prefill release (LP-0MVLFVY6K003VYEL). A local
+            # prefill emits no chunks, so the in-loop disconnect check in
+            # ``stream_generator`` cannot see a client that disappeared while
+            # the dispatch awaited its first byte. Poll on the same cadence as
+            # the lease extension (no new background task) and release the
+            # dispatch on a *confirmed* disconnect. Only an explicit
+            # ``is_disconnected()`` True releases — never elapsed time — so a
+            # live but slow prefill (>180 s) is never cut short here.
+            if request is not None and poll_seconds > 0:
+                _client_gone = False
+                try:
+                    _client_gone = await request.is_disconnected()
+                except Exception:
+                    _client_gone = False
+                if isinstance(_client_gone, bool) and _client_gone:
+                    try:
+                        srv.logger.info(
+                            "client_disconnect_during_prefill session=%s "
+                            "waited=%.0fs slot=%s",
+                            _release_key or "unknown",
+                            waited,
+                            slot_id,
+                        )
+                    except Exception:
+                        pass
+                    _release_client_disconnect_dispatch(
+                        srv, _release_key, endpoint=endpoint, request=request
+                    )
+                    raise ClientDisconnectedDuringPrefillError(_release_key)
 
             # Poll prefill progress and extend the lease. The request is
             # still awaiting its first byte (open_task is pending), so it is
@@ -1389,12 +1644,16 @@ async def _increment_local_active_queries(
                         "active": True,
                         "expires_at": time.monotonic() + lease_timeout,
                         "model_name": model_name,
+                        "endpoint": backend,
                         # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
                         # A record that never makes progress is bounded by
                         # ``local_dispatch_no_progress_timeout_seconds`` from
                         # creation (no waiting on an unobservable signal).
                         "last_progress": 0,
                         "last_progress_ts": time.monotonic(),
+                        # LP-0MVN4LCED00661MX AC2: the admission evidence the
+                        # post-acceptance eviction ERROR reports.
+                        **_dispatch_evidence(body_json, model_name, session_key),
                     }
         except Exception:
             pass
@@ -1478,6 +1737,41 @@ def _get_prefill_in_flight_count(srv) -> int:
         if d is None:
             return 0
         return max(0, int(len(d)))
+    except Exception:
+        return 0
+
+
+def _get_live_prefill_in_flight_count(srv) -> int:
+    """Return the number of in-flight prefills backed by a live dispatch record.
+
+    LP-0MVKUKFSO008GI6O AC3: a prefill-in-flight marker alone is not
+    evidence that a prefill is genuinely in progress — it must be backed by a
+    *live* dispatch record in ``local_dispatch_records``, i.e. an ``active``
+    record (a dispatch that is still running: prefill or generation).
+
+    An orphaned marker (record deleted by the prefill-deadline release, a
+    non-explicit cleanup, an orphan sweep or a session eviction) and a marker
+    whose record was retained only as an inactive lease (the pre-fix
+    ``lease_renewed`` retention) must not inflate ``busy_slots`` /
+    ``in_flight_prefills`` for the rest of the pool: the 2026-10-23 incident
+    shows a single stuck marker raising ``available_slots=0`` for every other
+    session while the dispatch it represented was long gone.
+
+    Never raises: a routing decision must not break on an observability gap.
+    """
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if not markers:
+            return 0
+        records = getattr(srv, "local_dispatch_records", None) or {}
+        live_sessions: set[str] = set()
+        for key, record in list(records.items()):
+            if not isinstance(record, dict) or not record.get("active"):
+                continue
+            session_id = _dispatch_key_session_id(key)
+            if session_id is not None:
+                live_sessions.add(session_id)
+        return max(0, sum(1 for s in markers if s in live_sessions))
     except Exception:
         return 0
 
@@ -1609,6 +1903,371 @@ async def _decrement_generating_only_slot(srv, session_key: str | None = None) -
         await wake(1)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Session tenancy bound (LP-0MVN1IQTF0037WTG AC2)
+#
+# Per-request dispatch leases bound *in-flight* requests but not *which*
+# sessions occupy the pool over time: 27 distinct sessions cycled through 2
+# slots in 5.4 h on 2026-10-24, each newcomer evicting the resident session's
+# KV prefix. Tenancy bounds the number of distinct sessions that may hold a
+# local reservation at once, so a further session's large prompt follows the
+# normal chain instead of evicting a resident.
+#
+# A tenancy is a *lease*, not a lock: it is derived from the existing dispatch
+# records (no new lifecycle), it is always re-acquirable by the session that
+# already holds it (a session's own next turn is never blocked), and it
+# idle-lapses so a genuinely idle resident cannot gate the pool forever.
+# ---------------------------------------------------------------------------
+
+#: Skip reason emitted when the tenancy bound refuses a new session.
+TENANCY_SKIP_REASON: str = "tenant_limit"
+
+#: Default idle-lapse for a tenancy (seconds). Derived from the adaptive
+#: dispatch lease (``local_dispatch_lease_timeout_seconds``, 30 s base) so a
+#: tenancy is bounded by the same lifecycle that already governs slot
+#: ownership; in every case it stays well inside the 180 s no-progress
+#: watchdog and the 900 s lifetime ceiling (AC6).
+DEFAULT_TENANCY_IDLE_SECONDS: float = 30.0
+
+
+@dataclass(frozen=True)
+class TenancyDecision:
+    """Outcome of the tenancy check for one session's large prompt."""
+
+    admitted: bool
+    reason: str | None
+    occupants: tuple[str, ...] = ()
+    tenant_limit: int = 0
+
+
+def resolve_session_tenants(config: dict | None, max_local: int | None = None) -> int:
+    """Resolve ``server.local_session_tenants`` (default: the slot count).
+
+    ``0`` disables the bound (unlimited tenants), matching the
+    "0 disables" convention of the other admission knobs. Malformed values
+    fall back to the slot count so a typo can never widen the bound silently.
+    """
+    server_cfg = (config or {}).get("server") or {}
+    raw = server_cfg.get("local_session_tenants")
+    if raw is None:
+        return _default_tenants(server_cfg, max_local)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        # Malformed: fall back to the slot count, never to "unlimited".
+        return _default_tenants(server_cfg, max_local)
+    return max(0, value)
+
+
+def _default_tenants(server_cfg: dict, max_local: int | None) -> int:
+    """Slot count used as the tenancy default ("N tenants, N slots")."""
+    slots = max_local
+    if slots is None:
+        try:
+            slots = int(server_cfg.get("session_slot_pool_size", 1) or 1)
+        except (TypeError, ValueError):
+            slots = 1
+    return max(1, int(slots))
+
+
+def resolve_tenancy_idle_seconds(config: dict | None) -> float:
+    """Resolve ``server.local_session_tenancy_idle_seconds``.
+
+    Defaults to the adaptive dispatch-lease base
+    (``server.local_dispatch_lease_timeout_seconds``, itself defaulting to
+    :data:`DEFAULT_TENANCY_IDLE_SECONDS`) so tenancy lapses on the same clock
+    as the lease that holds the slot. A non-positive/malformed value falls back
+    to the default (a zero would otherwise make tenancy lapse instantly and
+    silently disable the bound).
+    """
+    server_cfg = (config or {}).get("server") or {}
+    raw = server_cfg.get("local_session_tenancy_idle_seconds")
+    if raw is None:
+        raw = server_cfg.get("local_dispatch_lease_timeout_seconds")
+    if raw is None:
+        return DEFAULT_TENANCY_IDLE_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_TENANCY_IDLE_SECONDS
+    if value <= 0.0:
+        return DEFAULT_TENANCY_IDLE_SECONDS
+    return value
+
+
+def evaluate_session_tenancy(
+    srv,
+    session_key: str | None,
+    *,
+    endpoint: str | None = None,
+    tenants: int | None = None,
+    idle_seconds: float | None = None,
+    now: float | None = None,
+    view=None,
+) -> TenancyDecision:
+    """Decide whether *session_key* may hold a local tenancy right now.
+
+    Occupants are the distinct sessions that provably hold the pool:
+
+    - sessions with a **live dispatch record** in the same endpoint scope
+      (``active`` or an unexpired no-preemption lease), and
+    - sessions whose slot is ``is_processing`` in the residency view (they are
+      actively prefill/decode-ing, so their prefix is resident).
+
+    A session already among the occupants is always admitted (same-session
+    re-entry: a session's own next turn is never blocked behind itself). An
+    occupant is dropped once its tenancy idle-lapses (``now - last activity >=``
+    *idle_seconds*), so an abandoned resident cannot gate the pool.
+
+    Fail-open: any unexpected error admits (admission must never break because
+    a registry read went wrong), and ``tenants <= 0`` disables the bound.
+
+    Returns:
+        A :class:`TenancyDecision`. ``admitted`` False only when a *new*
+        session would exceed the bound; ``reason`` is then
+        :data:`TENANCY_SKIP_REASON`.
+    """
+    if tenants is None:
+        tenants = resolve_session_tenants(None)
+    if idle_seconds is None:
+        idle_seconds = DEFAULT_TENANCY_IDLE_SECONDS
+    if tenants <= 0 or not session_key:
+        return TenancyDecision(True, None, (), tenants)
+
+    current = time.monotonic() if now is None else float(now)
+    ep_scope = endpoint or ""
+    occupants: list[str] = []
+
+    try:
+        records = dict(getattr(srv, "local_dispatch_records", None) or {})
+    except Exception:
+        return TenancyDecision(True, None, (), tenants)
+
+    # Snapshot the record dicts so a concurrent lease refresh cannot mutate a
+    # record mid-decision.
+    for key, record in records.items():
+        if not isinstance(record, dict):
+            continue
+        key_endpoint = key[0] if isinstance(key, tuple) and key else ""
+        if key_endpoint != ep_scope:
+            continue
+        owner = _dispatch_key_session_id(key)
+        if not owner or owner in occupants:
+            continue
+        live = bool(record.get("active")) or float(
+            record.get("expires_at") or 0.0
+        ) > current
+        if not live:
+            continue
+        last_activity = record.get("last_progress_ts") or record.get("started_at")
+        try:
+            lapsed = (
+                last_activity is not None
+                and (current - float(last_activity)) >= float(idle_seconds)
+            )
+        except (TypeError, ValueError):
+            lapsed = False
+        if lapsed:
+            continue
+        occupants.append(owner)
+
+    if view is not None and getattr(view, "known", False):
+        try:
+            processing = view.processing_sessions(endpoint=endpoint)
+        except Exception:
+            processing = ()
+        for owner in processing:
+            if owner and owner not in occupants:
+                occupants.append(owner)
+
+    if session_key in occupants:
+        return TenancyDecision(True, None, tuple(occupants), tenants)
+    if len(occupants) >= tenants:
+        return TenancyDecision(False, TENANCY_SKIP_REASON, tuple(occupants), tenants)
+    return TenancyDecision(True, None, tuple(occupants), tenants)
+
+
+async def _save_evicted_snapshot(
+    srv,
+    session_key: str | None,
+    *,
+    endpoint: str | None,
+    plan,
+    reason: str,
+) -> None:
+    """Detached: persist an evicted session's KV snapshot (AC6).
+
+    Runs as a detached task so a reclaim path never blocks the cleanup cycle
+    on a multi-second KV save (and never holds the dispatch-records lock while
+    doing it). Fail-soft: a gated or failed save is reported by
+    :func:`proxy.session.save_evicted_session_snapshot`, never raised.
+    """
+    try:
+        from proxy import session as session_mod
+
+        await session_mod.save_evicted_session_snapshot(
+            session_key,
+            _server_config_of(srv),
+            endpoint=endpoint,
+            reason=reason,
+            plan=plan,
+        )
+    except Exception:
+        pass
+
+
+def _record_local_eviction(
+    srv,
+    session_key: str | None,
+    *,
+    endpoint: str | None = None,
+    reason: str,
+    slot_id: int | None = None,
+    slot_owner_session: str | None = None,
+) -> bool:
+    """Emit the shared eviction event and schedule the snapshot save (AC6).
+
+    One chokepoint for every tenancy/lease reclaim, so the ERROR-level
+    ``local_eviction`` record (the convention owned by
+    ``LP-0MVN3KMGI009BZ0D`` AC7, see :mod:`proxy.admission_events`) and the
+    "save the evicted prefix so the client restores warm" step can never
+    drift apart.
+
+    Returns whether a snapshot save was planned (i.e. not gated off).
+    """
+    plan = None
+    try:
+        from proxy import session as session_mod
+
+        plan = session_mod.plan_eviction_snapshot(
+            session_key, _server_config_of(srv), endpoint=endpoint
+        )
+    except Exception:
+        plan = None
+
+    slot_owner = slot_owner_session or session_key
+    try:
+        from proxy.admission_events import log_local_eviction
+
+        log_local_eviction(
+            srv,
+            session_key,
+            reason,
+            endpoint=endpoint,
+            slot_id=slot_id if slot_id is not None else (plan[0] if plan else None),
+            slot_owner_session=slot_owner,
+            snapshot_planned=plan is not None,
+        )
+    except Exception:
+        pass
+
+    if plan is not None:
+        _spawn_detached_release(
+            _save_evicted_snapshot(
+                srv, session_key, endpoint=endpoint, plan=plan, reason=reason
+            )
+        )
+    return plan is not None
+
+
+def _dispatch_evidence(
+    body_json: dict | None,
+    model_name: str | None,
+    session_key: str | None,
+) -> dict:
+    """Accepted-dispatch evidence for the post-acceptance eviction event.
+
+    LP-0MVN4LCED00661MX AC2: the eviction ERROR must carry the numbers the
+    admission model used, so a defect is diagnosable without log archaeology.
+    Captured ONCE at record creation (cheap, best-effort) and never recomputed
+    on release — the values must describe the decision that admitted the
+    dispatch, not the state at eviction.
+    """
+    evidence: dict = {
+        "estimated_tokens": 0,
+        "cached_ratio": 0.0,
+        "new_tokens": 0,
+        "eta_prefill_s": None,
+        "slot_id": None,
+        "llama_task_id": None,
+        "first_byte_seen": False,
+    }
+    try:
+        if isinstance(body_json, dict) and body_json:
+            from proxy.lifecycle import _estimate_prompt_tokens
+
+            estimated = int(_estimate_prompt_tokens(body_json) or 0)
+            evidence["estimated_tokens"] = max(0, estimated)
+            ratio = 0.0
+            try:
+                from proxy.provider import _get_cached_ratio
+
+                ratio = float(_get_cached_ratio(model_name, session_key) or 0.0)
+            except Exception:
+                ratio = 0.0
+            ratio = min(1.0, max(0.0, ratio))
+            evidence["cached_ratio"] = ratio
+            evidence["new_tokens"] = max(0, int(round(estimated * (1.0 - ratio))))
+            try:
+                from proxy import prefill_eta
+
+                eta, _ = prefill_eta.estimate_prefill_seconds(
+                    model_name, estimated, ratio
+                )
+                evidence["eta_prefill_s"] = float(eta)
+            except Exception:
+                evidence["eta_prefill_s"] = None
+    except Exception:
+        pass
+    return evidence
+
+
+def mark_local_first_byte(srv, session_key: str | None, endpoint: str | None = None) -> None:
+    """Flag the session's dispatch record as having served a first byte (AC3).
+
+    After this the dispatch is no longer "accepted and unserved", so a later
+    release is normal churn and must NOT be reported as an eviction error.
+    Best-effort: a missing record or lock is a no-op.
+    """
+    try:
+        key = _dispatch_lease_key(endpoint, session_key)
+        records = getattr(srv, "local_dispatch_records", None)
+        if records is None:
+            return
+        record = records.get(key)
+        if record is None:
+            # Legacy string-key form (pre per-endpoint keys).
+            record = records.get(session_key) if session_key else None
+        if record is not None:
+            record["first_byte_seen"] = True
+    except Exception:
+        pass
+
+
+def _emit_eviction_after_acceptance(
+    srv,
+    session_key: str | None,
+    reason: str,
+    record: dict | None,
+    *,
+    endpoint: str | None = None,
+) -> bool:
+    """Report an accepted-and-unserved dispatch release (AC1/AC7).
+
+    Thin wrapper over :func:`proxy.admission_events.record_eviction_after_acceptance`
+    so the six release paths share one call shape. Never raises: an eviction
+    path is already an exceptional path.
+    """
+    try:
+        from proxy.admission_events import record_eviction_after_acceptance
+
+        return record_eviction_after_acceptance(
+            srv, session_key, reason, record, endpoint=endpoint
+        )
+    except Exception:
+        return False
 
 
 async def _try_acquire_local_dispatch(
@@ -1807,9 +2466,12 @@ async def _try_acquire_local_dispatch(
                     "active": True,
                     "expires_at": now + lease_timeout,
                     "model_name": model_name,
+                    "endpoint": backend,
                     # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
                     "last_progress": 0,
                     "last_progress_ts": now,
+                    # LP-0MVN4LCED00661MX AC2: admitted-dispatch evidence.
+                    **_dispatch_evidence(body_json, model_name, session_key),
                 }
                 # Register prefill hold for the prefill-aware guard.
                 try:
@@ -1927,6 +2589,326 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     return removed
 
 
+async def _release_prefill_deadline_dispatch(
+    srv,
+    session_key: str | None,
+    endpoint: str | None = None,
+    request: Request | None = None,
+) -> bool:
+    """Release the dispatch lease + in-flight marker of a deadline-cancelled dispatch.
+
+    LP-0MVKUKFSO008GI6O AC1: when ``prefill_deadline_exceeded`` cancels a
+    local dispatch that never produced a first byte, the session's lease must
+    be released on the spot — the pre-fix cleanup only marked the record
+    inactive with a *future* ``expires_at`` (``lease_renewed``) and left the
+    ``local_prefill_in_flight`` marker in place, so a wedged session re-
+    acquired the lease for hours (2026-10-23 incident: ~4 h hold, 2,056
+    other-session denials, ``available_slots=0``).
+
+    Deletes the dispatch record (any key form — legacy string or per-endpoint
+    tuple) and pops the marker for *session_key* (and only that session),
+    emitting ``lease_released session=... reason=prefill_deadline``. Returns
+    True when a record was removed. Fail-soft: the deadline path is already
+    an exceptional path and must never raise. Wakes the cross-session
+    contention queue when a lease was freed.
+    """
+    if not session_key:
+        return False
+    removed = False
+    released_record = None
+    record_key = _dispatch_lease_key(endpoint, session_key)
+    try:
+        async with srv.local_dispatch_records_lock:
+            if record_key in srv.local_dispatch_records:
+                released_record = srv.local_dispatch_records.pop(record_key)
+                removed = True
+            elif endpoint and (endpoint, session_key) in srv.local_dispatch_records:
+                # Belt-and-braces: tuple-key form for callers that pass the
+                # endpoint directly (mirrors ``_release_local_dispatch``).
+                released_record = srv.local_dispatch_records.pop(
+                    (endpoint, session_key)
+                )
+                removed = True
+            if removed:
+                try:
+                    srv.logger.info(
+                        "lease_released session=%s reason=prefill_deadline "
+                        "endpoint=%s",
+                        session_key if session_key else "unknown",
+                        endpoint or "default",
+                        extra=_client_identity_extra(request),
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Pop the per-session prefill marker (own session only). A cancelled
+    # prefill is no longer in flight and must not count toward the prefill
+    # cap / gate occupancy (LP-0MVKUKFSO008GI6O AC1 + AC3).
+    marker_popped = False
+    try:
+        _p = getattr(srv, "local_prefill_in_flight", None)
+        if _p is not None and session_key in _p:
+            _plock = getattr(srv, "local_prefill_in_flight_lock", None)
+            if _plock is not None:
+                async with _plock:
+                    _p.pop(session_key, None)
+            else:
+                _p.pop(session_key, None)
+            marker_popped = True
+    except Exception:
+        pass
+    if removed or marker_popped:
+        # LP-0MVN1IQTF0037WTG AC6: a deadline-cancelled dispatch evicts the
+        # session's lease. Record it through the shared eviction event and
+        # plan the KV snapshot *before* the slot assignment is freed below, so
+        # the session that retries restores its resident prefix warm.
+        _record_local_eviction(
+            srv,
+            session_key,
+            endpoint=endpoint,
+            reason="lease_evicted",
+        )
+        # LP-0MVN4LCED00661MX AC1: an ACCEPTED dispatch cancelled by the
+        # deadline before its first byte is the defect signal the whole
+        # budget/pricing model exists to prevent — reported at ERROR.
+        _emit_eviction_after_acceptance(
+            srv,
+            session_key,
+            "prefill_deadline",
+            released_record,
+            endpoint=endpoint,
+        )
+        try:
+            from proxy.contention_queue import wake
+
+            await wake(1)
+        except Exception:
+            pass
+    return removed
+
+
+class ClientDisconnectedDuringPrefillError(Exception):
+    """The client that dispatched a local request is gone before first byte.
+
+    Raised by ``_await_first_byte_with_prefill_monitor`` when it observes a
+    confirmed ``request.is_disconnected()`` inside the prefill/first-byte
+    wait (LP-0MVLFVY6K003VYEL). The dispatch record, the
+    ``local_prefill_in_flight`` marker and the session's slot assignment have
+    already been released when this is raised, and the pending upstream
+    first-byte wait is cancelled by the monitor, so the caller only has to
+    finish its own accounting (counters, client close) and stop serving a
+    client that is not there any more.
+    """
+
+    def __init__(self, session_id: str | None = None) -> None:
+        self.session_id = session_id
+        super().__init__(
+            f"client disconnected during prefill (session={session_id or 'unknown'})"
+        )
+
+
+_detached_release_tasks: set[asyncio.Task] = set()
+"""Strong references to fire-and-forget release tasks.
+
+``_release_client_disconnect_dispatch`` must not await anything (a second
+cancellation would skip an awaiting release — LP-0MVLFVY6K003VYEL AC3), so
+its upstream-stream close and contention-queue wake are scheduled as
+detached tasks. Holding a reference keeps the event loop from garbage
+collecting them mid-flight; each task discards itself on completion.
+"""
+
+
+def _reap_detached_release(task: asyncio.Task) -> None:
+    """Drop a completed detached release task, retrieving its exception."""
+    _detached_release_tasks.discard(task)
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+def _spawn_detached_release(coro) -> None:
+    """Schedule *coro* as a detached task (never awaited by the caller).
+
+    Used by the client-disconnect release so it can complete synchronously
+    (no ``await`` = no cancellation point). Fail-soft: without a running
+    loop the coroutine is closed instead of leaking an "never awaited"
+    warning.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return
+    try:
+        task = loop.create_task(coro)
+    except Exception:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return
+    _detached_release_tasks.add(task)
+    task.add_done_callback(_reap_detached_release)
+
+
+async def _close_stream_cm(stream_cm) -> None:
+    """Close a captured upstream stream context manager (best effort)."""
+    try:
+        await stream_cm.__aexit__(None, None, None)
+    except BaseException:
+        pass
+
+
+def _release_client_disconnect_dispatch(
+    srv,
+    session_key: str | None,
+    *,
+    endpoint: str | None = None,
+    request: Request | None = None,
+) -> bool:
+    """Release a local dispatch whose client died before the first byte.
+
+    LP-0MVLFVY6K003VYEL: a client that disappears mid-prefill (agent killed,
+    CLI CTRL-C, network drop) produces no chunks, so none of the
+    post-first-byte disconnect checks can see it. The dispatch record then
+    survived as an inactive lease with a fresh ``expires_at`` plus its
+    ``local_prefill_in_flight`` marker, and other sessions were refused with
+    ``local_dispatch_denied ... reason=local_lease_active`` until the cleanup
+    loop's ``idle_timeout`` sweep fired ~5.5-6 minutes later (observation
+    2026-10-23 20:58-21:04). This helper releases the dispatch on the spot:
+
+    - deletes the dispatch record (legacy string **and** per-endpoint tuple
+      key forms), so the slot is no longer occupied;
+    - pops this session's ``local_prefill_in_flight`` marker (own session
+      only) so the prefill cap / admission guard stop counting it;
+    - frees the session's slot assignment so the slot registry can be
+      reused;
+    - cancels the captured upstream stream (``stream_cm``) so llama-server
+      is not left prefilling for a client that cannot consume the tokens —
+      the same behaviour as the prefill-deadline and watchdog releases;
+    - wakes the cross-session contention queue so a queued session is
+      admitted immediately;
+    - logs ``lease_released session=... reason=client_disconnect`` — distinct
+      from ``disconnect`` (stream-end path), ``prefill_deadline``,
+      ``idle_timeout`` and ``no_progress_watchdog``, so the recovery path is
+      attributable.
+
+    **Synchronous by design** (AC3): the release contains no ``await``, so a
+    second ``CancelledError`` delivered to the reaper-cancelled request task
+    can never interrupt it half-way (the pre-fix ``finally`` cleanup awaited
+    the records lock and ``stream_cm.__aexit__`` and could be skipped
+    entirely). The two awaiting steps — closing the upstream stream and
+    waking the contention queue — are scheduled as detached tasks. Dict
+    mutations without an ``await`` cannot interleave with the lock-holding
+    readers on a single-threaded event loop, so skipping
+    ``local_dispatch_records_lock`` here is safe and is what makes the
+    release cancellation-proof.
+
+    Idempotent: a missing record/marker is a no-op and logs nothing, so the
+    disconnect release racing the deadline release, the watchdog or the
+    orphan sweep logs at most once. Returns True when a record or marker was
+    released.
+
+    The per-request counters (``active_queries``, ``local_active_queries``,
+    the per-model counter) are deliberately **not** touched here: the caller
+    pairs this release with ``_cleanup_after_request(..., decrement_local=
+    True)``, which is the single owner of those decrements. Decrementing in
+    both places would release another session's capacity
+    (``local_active_queries`` is a pool-wide counter).
+    """
+    if not session_key:
+        return False
+
+    removed = False
+    stream_cm = None
+    released_record = None
+    records = getattr(srv, "local_dispatch_records", None)
+    if records is not None:
+        try:
+            keys = [_dispatch_lease_key(endpoint, session_key)]
+            if endpoint:
+                # Belt-and-braces tuple-key form (mirrors
+                # ``_release_prefill_deadline_dispatch``).
+                keys.append((endpoint, session_key))
+            for key in keys:
+                record = records.pop(key, None)
+                if isinstance(record, dict):
+                    released_record = record
+                    stream_cm = record.get("stream_cm")
+                    removed = True
+                    break
+        except Exception:
+            removed = False
+
+    if removed:
+        try:
+            srv.logger.info(
+                "lease_released session=%s reason=client_disconnect endpoint=%s",
+                session_key,
+                endpoint or "default",
+                extra=_client_identity_extra(request),
+            )
+        except Exception:
+            pass
+
+    marker_popped = False
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if markers is not None and session_key in markers:
+            markers.pop(session_key, None)
+            marker_popped = True
+    except Exception:
+        marker_popped = False
+
+    if removed or marker_popped:
+        # LP-0MVN1IQTF0037WTG AC6: an observed client disconnect releases the
+        # reservation immediately (one cleanup cycle, no waiting). Record the
+        # eviction through the shared event and plan the KV snapshot *before*
+        # the slot assignment is freed below, so a client that reconnects
+        # restores its resident prefix warm.
+        _record_local_eviction(
+            srv,
+            session_key,
+            endpoint=endpoint,
+            reason="lease_evicted",
+        )
+        # LP-0MVN4LCED00661MX AC1 (``lease_evicted``): an accepted dispatch
+        # whose lease was reclaimed before the first byte.
+        _emit_eviction_after_acceptance(
+            srv,
+            session_key,
+            "lease_evicted",
+            released_record,
+            endpoint=endpoint,
+        )
+        try:
+            from proxy.session import _free_slot_assignment
+
+            _free_slot_assignment(session_key, endpoint=endpoint)
+        except Exception:
+            pass
+
+    if stream_cm is not None:
+        _spawn_detached_release(_close_stream_cm(stream_cm))
+
+    if removed or marker_popped:
+        try:
+            from proxy.contention_queue import wake
+
+            _spawn_detached_release(wake(1))
+        except Exception:
+            pass
+
+    return removed or marker_popped
+
+
 async def _query_slot_processing(srv, session_id: str, model_name: str | None, endpoint: str | None = None) -> bool:
     """Check whether the session's llama-server slot is still processing.
 
@@ -1941,10 +2923,11 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None, e
     query targets that llama-server instance so per-endpoint dispatch
     records are verified against the correct server (LP-0MRPILSMW004T4H8).
 
-    Returns False (do not treat as alive) when the session has no slot
-    assignment, no *model_name* is known (the router requires a model
-    param), or the query fails/times out — the caller then proceeds with
-    normal orphan cleanup.
+    Returns False (probe inconclusive) when the session has no slot
+    assignment, no *model_name* is known, or the query fails/times out.
+    The caller must apply fail-closed semantics (LP-0MVIQ0FJC000YLX0):
+    if the record has recent ``last_progress_ts``, treat it as alive
+    rather than orphaning on an inconclusive probe.
     """
     if not session_id or not model_name:
         return False
@@ -2059,9 +3042,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
        still processing, the lease is extended by the chunk-refresh buffer
        instead (``lease_verified_active ... stream_abandoned=False``), so a
        long silent generation cannot lose its lease mid-flight
-       (LP-0MSUO6XRP001MCB2). Genuinely idle slots are orphan-cleaned as
+       (LP-0MSUO6XRP001MCB2). LP-0MVIQ0FJC000YLX0: also extended when the
+       /slots probe is inconclusive (fail-closed) but the record has recent
+       ``last_progress_ts``. Genuinely idle slots are orphan-cleaned as
        before, logged at WARNING level with ``reason=orphan_cleanup`` plus
-       an INFO-level ``lease_released reason=orphan_cleanup`` for parity
+       an INFO-level ``lease_released reason=orphan_cleanup`` for parity.
+       On genuine orphan cleanup, the upstream HTTP stream is cancelled
+       (``stream_cm.__aexit__``) so the llama-server slot is actually freed.
        with existing log consumers.
 
     Active records whose *expires_at* is still in the future are preserved
@@ -2102,6 +3089,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     stream_cm = record.pop("stream_cm", None)
                     del srv.local_dispatch_records[sid]
                     removed += 1
+                    # LP-0MVN4LCED00661MX AC1: the record is captured before
+                    # deletion so the eviction event carries its evidence.
+                    released_record = dict(record)
                     # Decrement counter while still under the lock for
                     # atomicity (LP-0MUCEFB8E003YVFF).
                     try:
@@ -2121,7 +3111,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         pass
                     # Deferred: free slot assignment and preflight tracking
                     # after the lock, and close the upstream stream.
-                    deferred_watchdog.append((sid, session_key, endpoint_from_record, stream_cm))
+                    deferred_watchdog.append(
+                        (
+                            sid,
+                            session_key,
+                            endpoint_from_record,
+                            stream_cm,
+                            released_record,
+                        )
+                    )
                     continue
 
                 expires_at = record.get("expires_at", 0)
@@ -2130,8 +3128,18 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 
                 if not active:
                     # Normal idle timeout for inactive records
+                    idle_record = dict(record)
                     del srv.local_dispatch_records[sid]
                     removed += 1
+                    # LP-0MVN1IQTF0037WTG AC6: record the eviction and plan
+                    # the KV snapshot BEFORE the slot assignment is released
+                    # (the plan needs it); the slot is then freed for reuse.
+                    _record_local_eviction(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        endpoint=_endpoint_from_record(record),
+                        reason="slot_assignment_freed",
+                    )
                     # Free the slot registry entry so the slot can be
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
                     try:
@@ -2149,6 +3157,17 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 
                     except Exception:
                         pass
+                    # LP-0MVN4LCED00661MX AC1 (``idle_timeout``): classified by
+                    # the record's ``first_byte_seen`` flag, NOT by this path —
+                    # an inactive record that already served its response is
+                    # normal churn and is suppressed by the emitter (AC3).
+                    _emit_eviction_after_acceptance(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        "idle_timeout",
+                        idle_record,
+                        endpoint=_endpoint_from_record(record),
+                    )
                     try:
                         srv.logger.info(
                             "lease_released session=%s reason=idle_timeout endpoint=%s",
@@ -2164,10 +3183,11 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
         pass
 
     # Phase 2 (outside the lock): verify which candidates still have a
-    # processing slot on llama-server. A failed / unverifiable query means
-    # "not verified alive" — the record is orphan-cleaned below (fail-open,
-    # matching pre-existing behaviour). The no-progress watchdog already ran
-    # in phase 1, so records reaching here have shown recent progress.
+    # processing slot on llama-server. A failed/unverifiable query means
+    # the record is not in ``alive`` — Phase 3 applies fail-closed semantics
+    # (LP-0MVIQ0FJC000YLX0): if the record has recent ``last_progress_ts``,
+    # extend the lease rather than orphaning. The no-progress watchdog already
+    # ran in phase 1, so records reaching here have shown recent progress.
     alive: set[str] = set()
     for sid, record in verify_candidates:
         try:
@@ -2213,7 +3233,35 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         except Exception:
                             pass
                         continue
+                    # LP-0MVIQ0FJC000YLX0: fail-closed on unverifiable liveness.
+                    # If the /slots probe failed or timed out (session not in
+                    # ``alive``) but the record has recent progress, treat it
+                    # as alive and extend the lease rather than orphaning. This
+                    # prevents orphaning streams that are still generating but
+                    # whose /slots query timed out under heavy prefill load.
+                    no_progress_timeout = _get_no_progress_timeout_seconds(srv)
+                    last_progress_ts = current.get("last_progress_ts")
+                    if last_progress_ts is not None and no_progress_timeout > 0:
+                        now = time.monotonic()
+                        if now - last_progress_ts <= no_progress_timeout:
+                            # Recent progress detected — extend the lease.
+                            current["expires_at"] = (
+                                time.monotonic()
+                                + _get_chunk_refresh_buffer_seconds(srv)
+                            )
+                            try:
+                                srv.logger.info(
+                                    "lease_verified_active session=%s "
+                                    "reason=recent_progress stream_abandoned=False",
+                                    _dispatch_key_session_id(sid) if _dispatch_key_session_id(sid) else "unknown",
+                                )
+                            except Exception:
+                                pass
+                            continue
                     # Genuinely orphaned active record past its expires_at
+                    # Capture stream_cm before deleting so we can cancel
+                    # the upstream request and actually free the llama-server slot.
+                    stream_cm = current.pop("stream_cm", None)
                     del srv.local_dispatch_records[sid]
                     try:
                         _p = getattr(srv, "local_prefill_in_flight", None)
@@ -2222,6 +3270,32 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     except Exception:
                         pass
                     removed += 1
+                    # LP-0MVIQ0FJC000YLX0: cancel the upstream stream so the
+                    # llama-server slot is actually freed. Without this the
+                    # slot stays occupied on the backend while the proxy
+                    # thinks it is free (LP-0MUGQHPJ50046LV8).
+                    if stream_cm is not None:
+                        try:
+                            await stream_cm.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                    # LP-0MVN1IQTF0037WTG AC6: emit the shared eviction event
+                    # and plan the KV snapshot before the assignment is freed.
+                    _record_local_eviction(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        endpoint=_endpoint_from_record(record),
+                        reason="lease_evicted",
+                    )
+                    # LP-0MVN4LCED00661MX AC1 (``orphan_cleanup``): the orphan
+                    # sweep released an accepted dispatch with no live slot.
+                    _emit_eviction_after_acceptance(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        "orphan_cleanup",
+                        record,
+                        endpoint=_endpoint_from_record(record),
+                    )
                     # Free the slot registry entry so the slot can be
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
                     try:
@@ -2261,7 +3335,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     # LP-0MUGQHPJ50046LV8: close upstream streams for watchdog-released
     # records and free their slot assignments (deferred past the lock).
     if deferred_watchdog:
-        for sid, session_key, endpoint_from_record, stream_cm in deferred_watchdog:
+        for (
+            sid,
+            session_key,
+            endpoint_from_record,
+            stream_cm,
+            released_record,
+        ) in deferred_watchdog:
             try:
                 # Close the upstream httpx stream to cancel the in-flight
                 # request so the llama-server slot is actually freed.
@@ -2274,6 +3354,25 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
             except Exception:
                 pass
             # Free the slot registry entry (LP-0MSB0RP7F000U0WJ).
+            # LP-0MVN1IQTF0037WTG AC6: a watchdog-released lease is a
+            # tenancy that expired without observed activity — record it and
+            # plan the KV snapshot before the assignment is freed, so a client
+            # that comes back restores warm instead of pre-filling cold.
+            _record_local_eviction(
+                srv,
+                session_key,
+                endpoint=endpoint_from_record,
+                reason="tenancy_lease_expired",
+            )
+            # LP-0MVN4LCED00661MX AC1 (``no_progress_watchdog``): the watchdog
+            # released an accepted dispatch that never produced a first byte.
+            _emit_eviction_after_acceptance(
+                srv,
+                session_key,
+                "no_progress_watchdog",
+                released_record,
+                endpoint=endpoint_from_record,
+            )
             try:
                 from proxy.session import _free_slot_assignment
                 _free_slot_assignment(
@@ -2441,16 +3540,17 @@ async def _recover_stuck_generating_queries(srv) -> None:
 
 
 async def _recover_stuck_local_active_queries(srv) -> None:
-    """Detect and reset a stuck ``local_active_queries`` counter.
+    """Detect and repair a stuck ``local_active_queries`` counter.
 
-    If ``local_active_queries > 0`` and **no** active dispatch records
-    exist, the counter is likely stuck (e.g., from a swallowed exception
-    in ``_decrement_local_active_queries``). Resets to 0 and logs a
-    WARNING-level message.
-
-    Designed to be called from ``_dispatch_cleanup_loop`` (server.py)
-    after ``_cleanup_stale_local_dispatch``, providing a periodic
-    self-recovery mechanism that runs every 10 seconds.
+    The counter can only be as large as the number of truly in-flight local
+    requests (LP-0MVKSXR4P001V0CM AC2). A leak that outlives the request —
+    e.g. a swallowed exception in ``_decrement_local_active_queries`` — is
+    repaired by clamping the counter to the number of **active** dispatch
+    records at every tick, rather than only resetting to 0 when *no* active
+    records exist. Without the clamp, a leak that coexists with any in-flight
+    request (``has_active`` true) survived indefinitely and made
+    ``/llama/local/status`` report busy while the GPU was idle (2026-10-22
+    night: 66 consecutive ``freeSlots: 0`` refusals).
 
     In legacy mode (no ``local_dispatch_records`` attribute), the counter
     is reset whenever it is > 0, since there is no dispatch-record-based
@@ -2464,18 +3564,19 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                     # Read the records snapshot (not holding records_lock).
                     # This is a self-correcting check that runs every 10s,
                     # so a slightly stale snapshot is acceptable.
-                    has_active = any(
-                        r.get("active", False) for r in records.values()
-                    )
-                    if not has_active:
+                    active_count = _count_active_local_dispatch_records(srv)
+                    active_count = active_count if active_count is not None else 0
+                    if srv.local_active_queries > active_count:
                         prev = srv.local_active_queries
-                        srv.local_active_queries = 0
+                        srv.local_active_queries = active_count
                         try:
                             srv.logger.warning(
                                 "local_active_queries counter recovered: "
-                                "reset from %d to 0 (no active dispatch "
+                                "reset from %d to %d (%d active dispatch "
                                 "records)",
                                 prev,
+                                active_count,
+                                active_count,
                             )
                         except Exception:
                             pass
@@ -2508,6 +3609,27 @@ async def _recover_stuck_local_active_queries(srv) -> None:
                         pass
     except Exception:
         pass
+
+
+def _count_active_local_dispatch_records(srv) -> int | None:
+    """Count dispatch records still marked ``active`` (in-flight local work).
+
+    Returns ``None`` when the server has no dispatch-record registry (legacy
+    mode) so callers can distinguish "no records system" from "zero
+    in-flight". Best-effort snapshot without a lock, matching the periodic
+    recovery loop's tolerance for a slightly stale view.
+    """
+    records = getattr(srv, "local_dispatch_records", None)
+    if records is None:
+        return None
+    try:
+        return sum(
+            1
+            for r in records.values()
+            if isinstance(r, dict) and r.get("active")
+        )
+    except Exception:
+        return None
 
 
 async def _recover_stuck_global_active_queries(srv) -> None:

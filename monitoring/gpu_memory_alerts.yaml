@@ -1,0 +1,48 @@
+# GPU memory (GTT) pressure alerts
+#
+# Replaces the previous gpu_vram_alerts.yaml, which could never fire: it
+# selected rocm_vram_used_bytes / rocm_vram_total_bytes from the AMD
+# rocm-exporter, but amd/rocm-exporter publishes no release artifacts, so
+# nothing ever served :5000 and those series never existed.
+#
+# WHY GTT AND NOT VRAM
+# --------------------
+# This host is a Strix Halo APU (Radeon 8060S iGPU, gfx1151). The iGPU sees only
+# a small BIOS carve-out as "VRAM" (1 GiB here, of which ~0.3 GiB is in use),
+# while models actually live in GTT - system RAM mapped for the GPU, currently
+# ~36.6 GB of a 128 GiB GTT pool. Alerting on the carve-out would say nothing
+# about real memory pressure; alerting on GTT does.
+#
+# Series source: node_exporter textfile collector, fed by the 10 s sysfs sampler
+# (gpu-metrics.service) which publishes gpu_gtt_used_bytes / gpu_vram_used_bytes
+# / gpu_vram_total_bytes from /sys/class/drm/card0/device/mem_info_*.
+#
+# THRESHOLDS
+# ----------
+# Fractions of the GTT pool (mem_info_gtt_total = 137438953472 bytes = 128 GiB on
+# this host). GTT is capped by the driver/BIOS, not by physical RAM, so the
+# constant is the pool size, not installed memory. Update it if the BIOS
+# carve-out/GTT setting changes.
+#
+# LP-0MVO8DOHP008FL48 (GPU utilisation must come from power, dead alert groups).
+
+groups:
+  - name: gpu-memory.rules
+    rules:
+      - alert: GpuGttHighWarning
+        expr: gpu_gtt_used_bytes > 0.75 * 128 * 1024 * 1024 * 1024
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU GTT memory usage > 75% of the 128 GiB pool"
+          description: "GTT (system RAM mapped for the GPU) on {{ $labels.instance }} is above 75% of the 128 GiB pool ({{ $value | humanize1024 }}B in use). Loaded models are consuming most of the GPU-visible memory; check loaded models and consider unloading an idle model before the next load fails."
+
+      - alert: GpuGttHighCritical
+        expr: gpu_gtt_used_bytes > 0.90 * 128 * 1024 * 1024 * 1024
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GPU GTT memory usage > 90% of the 128 GiB pool (critical)"
+          description: "GTT on {{ $labels.instance }} is above 90% of the 128 GiB pool ({{ $value | humanize1024 }}B in use). A further model load, or a large-context session, is likely to fail. Unload an idle model or reduce local context immediately."

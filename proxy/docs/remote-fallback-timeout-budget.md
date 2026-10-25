@@ -195,6 +195,12 @@ the derived value, so clients back off correctly. Regression tests:
 - **AC4 — regression test:** `proxy/tests/test_remote_failover_budget.py`
   asserts bounded failover for a stalling-then-empty upstream (attempt
   count, elapsed time, terminal `retry_budget_exhausted` event).
+  Attempt-count assertions use jitter-tolerant bounds (`<= 2`) rather than
+  exact counts (LP-0MVK8BMGW0059W5S): at these tiny test budgets the exact
+  number of attempts depends on wall-clock jitter around the deadline, so a
+  single stalled first attempt can exhaust the budget under load. The
+  deterministic proofs are the terminal `retry_budget_exhausted` event and
+  the budget value in the failover warning log.
 - **AC5 — full suite green.**
 
 ## Related items

@@ -106,6 +106,50 @@ Models can define an ordered list of `providers` for automatic failover. The `pr
 | `budget` | dict | optional | Per-**entry** behaviour override for the free-tier budget knobs (`reserve_ratio`, `wait_max_seconds`, `max_waiters`, `affinity_ttl_seconds`) — precedence: entry > model > server > default (LP-0MVDVK5TM004TQQV; see [Per-model and per-entry budget knobs](#per-model-and-per-entry-budget-knobs-budget)). |
 | `max_context_tokens` | int | optional | Maximum **estimated prompt context** the entry may serve (LP-0MVF9N2QL001CDA7). A request whose routing estimate exceeds this ceiling SKIPS the entry and falls through to the next eligible provider — a size mismatch, not a failure (no cooldown/affinity/usage-limit/queue side effects). Absent, `0` or non-positive disables the gate (byte-for-byte previous behaviour). Shipped `config.yaml` values are sourced (upstream context window / provider per-minute token allowance) and recorded in a config comment; see [Per-entry context limits](#per-entry-context-limits-max_context_tokens). Applies to local entries too: composes as an additional hard cap (`min(existing local thresholds, max_context_tokens)`). |
 | `display_name` | string | optional | Human-readable tier label for the X-Resolved-Model header (e.g. `MunitoAI Free`, `OpenCode Go 3`). Overrides the `provider` brand in the display string only — failure-domain, cooldown and usage-limit keying still use `provider`. Use it to distinguish same-brand tiers/accounts (LP-0MVCQ36QV009QX8K, LP-0MVDUW7OB006UT62). |
+| `priorities` | list | optional | The `low`/`medium`/`high` priorities this entry may serve (LP-0MVGPZWY0001JD1D). The model's priority chain is its ordered `providers` list filtered by the request's effective priority, so membership is declared here and nowhere else. Absent on **every** provider of a model = unlabelled model (all priorities served by all providers). Validated at load; see [Priority-chain membership](#priority-chain-membership-priorities). |
+
+#### Priority-chain membership (`priorities`)
+
+Priority routing is declared once, on the provider definition itself. The
+chain for a request is the model's own ordered `providers` list filtered by
+the request's effective priority (`X-Priority`, capped to `low` inside the
+cheap window):
+
+```text
+chain(P) = [p for p in providers if P in p["priorities"]]   # providers order
+```
+
+```yaml
+providers:
+  - name: local-qwen3
+    priorities: [low, medium, high]   # served for every priority
+    type: local
+    llama_model: Qwen3
+  - name: munitoai
+    priorities: [medium, high]        # never in the ``low`` chain
+    type: remote
+```
+
+Rules (each one is a load-time `ValueError` from `validate_priority_config`, so
+nothing fails silently at 02:00 instead of at startup):
+
+- **No tier implication:** `[medium, high]` does not include `low`. Membership
+  is exactly the list written.
+- **Model-level opt-in, fail-closed:** if any provider of a model declares
+  `priorities`, every provider of that model must, and together they must
+  cover `low`, `medium` and `high`.
+- **Shape checks:** the value must be a non-empty list of known priority names
+  with no duplicates.
+- **No silent widening:** a labelled model's filtered chain is used as-is; an
+  empty result never expands to the full `providers` list.
+- **Per-priority ordering is not supported:** chain order is always the
+  `providers` order. A provider that must lead one priority and trail another
+  needs two entries (or two models), so this is a price worth understanding
+  before adding a paid tier to a `low` chain.
+
+The former per-model `priority_routes` name map is **removed**. A config that
+still declares it fails at load; see the README section
+[Migrating from `priority_routes`](README.md#migrating-from-priority_routes).
 
 #### Per-entry context limits (`max_context_tokens`)
 

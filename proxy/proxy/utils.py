@@ -655,6 +655,23 @@ def _validate_config(cfg: dict) -> None:
     _validate_chain_hold_config(cfg)
     # Validate compaction configuration (LP-0MTG6RW3L003X122)
     _validate_compaction_config(cfg)
+    # Validate per-provider priority labels (LP-0MVGPZWY0001JD1D AC5)
+    _validate_priority_config(cfg)
+
+
+def _validate_priority_config(cfg: dict) -> None:
+    """Validate the per-provider priority labels (LP-0MVGPZWY0001JD1D AC5).
+
+    Raises ValueError on first invalid config (mirrors
+    ``_validate_chain_hold_config``).
+    """
+    from proxy.provider import validate_priority_config as _vpc_prio
+
+    problems = _vpc_prio(cfg)
+    if problems:
+        raise ValueError(
+            "Priority config validation failed: " + "; ".join(problems)
+        )
 
 
 def _validate_chain_hold_config(cfg: dict) -> None:
@@ -765,6 +782,109 @@ def _compress_file(path: Path) -> bool:
         return False
 
 
+#: Timestamp suffixes understood on rotated ``proxy.log`` files. The in-process
+#: handler names a rotation after the interval it closes (``%Y-%m-%d_%H``); a
+#: startup archive of the live log is named after the *last write* in it
+#: (``%Y-%m-%d_%H%M%S``) so a restart collision can never overwrite a window
+#: (LP-0MVLHMAWV008EKTI).
+_ROTATED_LOG_TS_FORMATS = ("%Y-%m-%d_%H", "%Y-%m-%d_%H%M%S")
+
+
+def _parse_rotated_log_time(filename: str) -> datetime | None:
+    """Parse the timestamp encoded in a ``proxy.log.<ts>[.<n>][.gz]`` name."""
+    name = filename
+    if name.endswith(".gz"):
+        name = name[:-3]
+    if not name.startswith("proxy.log."):
+        return None
+    date_str = name[len("proxy.log."):]
+    # Drop a uniqueness suffix (``.1``, ``.2``, ...) added on a name collision.
+    if "." in date_str:
+        date_str = date_str.split(".", 1)[0]
+    for fmt in _ROTATED_LOG_TS_FORMATS:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _archive_log_name(base: Path, stamp: datetime) -> Path:
+    """Return a not-yet-existing archive path for *base* (never overwrites)."""
+    suffix = stamp.strftime("%Y-%m-%d_%H%M%S")
+    candidate = base.with_name(f"{base.name}.{suffix}")
+    if not candidate.exists():
+        return candidate
+    for index in range(1, 1000):
+        candidate = base.with_name(f"{base.name}.{suffix}.{index}")
+        if not candidate.exists():
+            return candidate
+    # Extremely unlikely: fall back to a pid-qualified name.
+    return base.with_name(f"{base.name}.{suffix}.pid{os.getpid()}")
+
+
+def archive_live_log(
+    log_file: Path, logger: logging.Logger | None = None
+) -> Path | None:
+    """Move a non-empty *log_file* aside so a restart cannot lose its window.
+
+    ``TimedRotatingFileHandler`` opens the live file in append mode, so a
+    restart normally keeps the existing content. The 2026-10-23 incident shows
+    append mode alone is not a guarantee: a restart (or a second writer's
+    rotation/truncate of the same path) left ``proxy.log`` starting at the new
+    process's startup line, with the whole pre-restart interval missing from
+    every retained file. Renaming the live file aside at startup makes that
+    window an explicit archived file:
+
+    * the archive is named after the file's last write
+      (``proxy.log.YYYY-MM-DD_HHMMSS``), so it is discovered by the same
+      prefix rules as every other rotated log and its coverage is unambiguous;
+    * the new process always starts a fresh ``proxy.log``;
+    * an existing rotated file is never overwritten — a name collision gets a
+      ``.<n>`` suffix, so no window can be deleted by a rotation rename
+      (``TimedRotatingFileHandler.doRollover`` would otherwise ``os.remove`` a
+      same-named file);
+    * a previous writer that is still alive (a wedged twin) keeps writing to
+      the *archived inode* instead of interleaving with the new process.
+
+    An empty (or missing) live file is left alone and no archive is created, so
+    restarts without traffic leave no empty files behind.
+
+    Returns the archive path, or ``None`` when nothing was archived.
+    """
+    log_file = Path(log_file)
+    try:
+        if not log_file.is_file() or log_file.stat().st_size == 0:
+            return None
+    except OSError:
+        return None
+
+    try:
+        stamp = datetime.fromtimestamp(log_file.stat().st_mtime)
+    except OSError:
+        return None
+
+    archive = _archive_log_name(log_file, stamp)
+    try:
+        os.replace(log_file, archive)
+    except OSError as exc:
+        if logger is not None:
+            logger.warning(
+                "Could not archive the previous proxy log %s (%s); the existing "
+                "file is kept and will be appended to",
+                log_file,
+                exc,
+            )
+        return None
+
+    if logger is not None:
+        logger.info(
+            "Rotated previous proxy log aside: %s (pre-restart window preserved)",
+            archive.name,
+        )
+    return archive
+
+
 def prune_logs(
     log_dir: Path,
     retention_days: int,
@@ -773,10 +893,15 @@ def prune_logs(
 ) -> int:
     """Prune and compress rotated log files in *log_dir*.
 
-    Scans for ``proxy.log.YYYY-MM-DD_HH`` files (and ``.gz``-compressed
-    variants).  Files older than *retention_days* are deleted; files within
-    retention but older than *compress_after_days* are gzip-compressed. This
-    satisfies AC2 (compression) alongside AC1 (retention pruning).
+    Scans for rotated proxy logs and their ``.gz``-compressed variants. Two
+    naming schemes are understood: the in-process handler's
+    ``proxy.log.YYYY-MM-DD_HH`` (named after the interval it closes) and the
+    restart archive's ``proxy.log.YYYY-MM-DD_HHMMSS`` (named after the file's
+    last write, optionally with a ``.<n>`` collision suffix) — see
+    :func:`archive_live_log`. Files older than *retention_days* are deleted;
+    files within retention but older than *compress_after_days* are
+    gzip-compressed. This satisfies AC2 (compression) alongside AC1 (retention
+    pruning).
 
     Args:
         log_dir: Directory containing the rotated log files.
@@ -791,9 +916,9 @@ def prune_logs(
     if not log_dir.is_dir():
         return 0
 
-    # Filenames carry hour precision (proxy.log.YYYY-MM-DD_HH), so truncate
-    # the cutoffs to the hour to avoid a file stamped N days ago at the same
-    # hour appearing older than the exact datetime cutoffs.
+    # Filenames carry hour or second precision, so truncate the cutoffs
+    # to the hour to avoid a file stamped N days ago at the same hour
+    # appearing older than the exact datetime cutoffs.
     cutoff = (datetime.now() - timedelta(days=retention_days)).replace(minute=0, second=0, microsecond=0)
     compress_cutoff = (datetime.now() - timedelta(days=compress_after_days)).replace(minute=0, second=0, microsecond=0)
     deleted = 0
@@ -802,15 +927,9 @@ def prune_logs(
         if not log_file.is_file():
             continue
 
-        # Try to parse the date from the filename: proxy.log.YYYY-MM-DD_HH
-        name = log_file.name
-        is_gz = name.endswith(".gz")
-        try:
-            if is_gz:
-                name = name[:-3]
-            date_str = name[len("proxy.log."):]
-            file_date = datetime.strptime(date_str, "%Y-%m-%d_%H")
-        except ValueError:
+        is_gz = log_file.name.endswith(".gz")
+        file_date = _parse_rotated_log_time(log_file.name)
+        if file_date is None:
             continue
 
         if file_date < cutoff:
@@ -837,6 +956,38 @@ def prune_logs(
     return deleted
 
 
+def resolve_log_dir(config: dict) -> Path:
+    """Return the log directory for *config*, creating it when possible.
+
+    Extracted from :func:`setup_logging` so the single-instance guard can
+    compute the same directory **before** logging is configured: the lock must
+    be taken before :func:`archive_live_log` runs, otherwise a rejected second
+    instance would rename the live log out from under the process that owns it
+    (LP-0MVLHMAWV008EKTI AC1/AC2).
+
+    Dev mode (``LLAMA_PROXY_DEV=1``) uses the XDG state directory; otherwise
+    the configured ``logging.directory`` is used, falling back to the package's
+    local ``logs/`` directory when the configured one is not writable.
+    """
+    if os.environ.get("LLAMA_PROXY_DEV") == "1":
+        xdg_state = os.environ.get(
+            "XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state")
+        )
+        dir_path = Path(xdg_state) / "llama-proxy-dev" / "logs"
+        dir_path.mkdir(parents=True, exist_ok=True)
+        return dir_path
+
+    log_config = config.get("logging", {})
+    dir_path = Path(log_config.get("directory", "/var/log/llama-proxy"))
+    try:
+        dir_path.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        dir_path = Path(__file__).parent.parent / "logs"
+        dir_path.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Using local log directory: {dir_path}")
+    return dir_path
+
+
 def setup_logging(config: dict) -> logging.Logger:
     """Setup logging with time-based rotation.
 
@@ -849,6 +1000,11 @@ def setup_logging(config: dict) -> logging.Logger:
     the expected disk footprint.  The in-process rotation is the primary
     mechanism; a ``logrotate`` drop-in (see HOST_INSTALL.md) provides
     a safety net for compression and pruning across restarts.
+
+    A non-empty ``proxy.log`` found at startup is first **renamed aside** (see
+    :func:`archive_live_log`), so a restart archives the pre-restart window
+    instead of risking its loss, and the new process always starts a fresh
+    file (LP-0MVLHMAWV008EKTI AC1).
     """
     srv = _srv()
 
@@ -871,21 +1027,14 @@ def setup_logging(config: dict) -> logging.Logger:
     srv.verbose_chunks = verbose_chunks
 
     if is_dev:
-        # Dev mode: use XDG-based dev log directory with DEBUG level
-        xdg_state = os.environ.get("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local", "state"))
-        dir_path = Path(xdg_state) / "llama-proxy-dev" / "logs"
-        dir_path.mkdir(parents=True, exist_ok=True)
+        # Dev mode: XDG-based dev log directory with DEBUG level.
         log_level = "DEBUG"
+        dir_path = resolve_log_dir(config)
         print(f"[INFO] Dev mode: using log directory {dir_path} at level {log_level}")
     else:
-        dir_path = Path(log_config.get("directory", "/var/log/llama-proxy"))
-        # Try to create log directory, fall back to local logs directory if permission denied
-        try:
-            dir_path.mkdir(parents=True, exist_ok=True)
-        except PermissionError:
-            dir_path = Path(__file__).parent.parent / "logs"
-            dir_path.mkdir(parents=True, exist_ok=True)
-            print(f"[INFO] Using local log directory: {dir_path}")
+        # Configured directory, falling back to the local logs directory when
+        # it is not writable.
+        dir_path = resolve_log_dir(config)
 
     # Assign log_dir to the server module for use by other modules
     srv.log_dir = dir_path
@@ -899,6 +1048,14 @@ def setup_logging(config: dict) -> logging.Logger:
 
     # File handler with rotation
     log_file = dir_path / "proxy.log"
+
+    # Restart-safe archive (LP-0MVLHMAWV008EKTI AC1): move a non-empty live log
+    # aside BEFORE the handler opens it, so the pre-restart window survives as
+    # its own file and this process starts a fresh proxy.log. Renaming also
+    # detaches any lingering previous writer (a wedged twin) onto the archived
+    # inode instead of letting two writers interleave on one path.
+    archived_live_log = archive_live_log(log_file)
+
     file_handler = TimedRotatingFileHandler(
         log_file,
         when="H",  # Hourly rotation
@@ -918,6 +1075,15 @@ def setup_logging(config: dict) -> logging.Logger:
     ))
     logger.addHandler(console_handler)
 
+    # Record the archive move in the NEW log so the restart is attributable
+    # (the archive itself carried the move's cause; this line places it in
+    # time). Logged only after the handler is attached so it reaches the file.
+    if archived_live_log is not None:
+        logger.info(
+            "Rotated previous proxy log aside: %s (pre-restart window preserved)",
+            archived_live_log.name,
+        )
+
     # Prune old rotated files on startup (AC4: 9.3 GB backlog cleaned).
     # Compresses retained-but-old files for space savings (AC2).
     # Runs before the logger is returned so the prune/compress events are logged.
@@ -936,8 +1102,9 @@ def setup_logging(config: dict) -> logging.Logger:
         logger.exception("Failed to prune old log files (non-fatal)")
 
     logger.info(
-        "Logging initialised at %s",
+        "Logging initialised at %s pid=%s",
         log_file,
+        os.getpid(),
     )
 
     return logger

@@ -450,6 +450,70 @@ def test_start_proxy_skill_documents_stale_key_refusal():
     assert "unset OPENCODE_API_KEY" in skill
 
 
+def test_start_proxy_skill_documents_detached_launch_and_foreground_ban():
+    """LP-0MVGT0E6W000Q8CY AC4/AC5: the skill states the never-foreground
+    rule under an agent tool call, the exact detached command, the
+    --foreground/--log-file escape hatches, and the tool-timeout diagnostic
+    signature with its recovery."""
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / ".pi"
+        / "skills"
+        / "start-proxy"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert (
+        "NEVER start the proxy in the foreground under an agent tool call"
+        in skill
+    ), "skill must state the foreground ban"
+    assert "bash scripts/start-proxy.sh --restart" in skill, (
+        "skill must show the exact detached command"
+    )
+    assert "--foreground" in skill and "--log-file" in skill
+    assert "Shutting down" in skill, "signature must reference the missing shutdown line"
+    assert "Command timed out after" in skill, "signature must reference the tool result"
+    assert "curl -sf http://127.0.0.1:8080/health" in skill, (
+        "recovery must check the sibling services"
+    )
+
+
+def test_start_proxy_readme_documents_detached_launch_and_diagnostic_signature():
+    """LP-0MVGT0E6W000Q8CY AC4/AC5: the README start section documents the
+    detached launch (handoff line, setsid, log file, /health polling), bans
+    foreground starts under agent tool calls, and records the tool-timeout
+    diagnostic signature with its recovery."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "**Via `start-proxy.sh` (detached by default" in readme
+    assert "its **own session/process group**" in readme
+    assert "Proxy launched detached: child pid" in readme
+    assert "--log-file" in readme
+    assert (
+        "NEVER start the proxy in the foreground under an agent tool call"
+        in readme
+    ), "README must state the foreground ban"
+    assert "Diagnosing a proxy killed by a tool-call timeout" in readme
+    assert readme.count("Shutting down") >= 1
+    assert "Command timed out after" in readme
+    assert "bash scripts/start-proxy.sh --restart" in readme
+
+
+def test_start_proxy_header_documents_detach_health_polling_contract():
+    """LP-0MVGT0E6W000Q8CY AC1/AC2: the script's usage header states the
+    detached handoff contract (failures after the handoff are log-only; poll
+    /health) and the never-foreground rule."""
+    header_text = _script_path().read_text(encoding="utf-8").split(
+        "Automatically resolves required API keys from:", 1
+    )[0]
+    # Normalise the comment block so assertions are independent of wrapping.
+    header = " ".join(header_text.replace("#", " ").split())
+    assert "Detached launch contract" in header
+    assert "MUST poll /health" in header
+    assert "Never run in the foreground under an agent tool call" in header
+    assert "`--foreground` only for an interactive terminal session" in header
+
+
 def test_start_proxy_reason_resolution_precedence():
     """The restart-reason resolution is FLAG > ENV > default (LP-0MVAPNC2900145RH).
 

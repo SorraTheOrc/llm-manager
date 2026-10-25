@@ -36,11 +36,11 @@ from fastapi import Response
 
 from proxy import admission_reserve, contention_queue, prefill_eta
 
-#: Tokens whose calibrated own-ETA (~93.6 s) fits the 120 s budget while the
-#: projected wait with one occupant (~187.2 s) does not (same fixture as the
+#: Tokens whose calibrated own-ETA (~56.2 s) fits the 60 s budget while the
+#: projected wait with one occupant (~112.4 s) does not (same fixture as the
 #: occupancy test).
-_TOKENS = 20_000
-_BUDGET = 120.0
+_TOKENS = 12_000
+_BUDGET = 60.0
 
 
 class _DummyRequest:
@@ -79,7 +79,7 @@ def _cfg(**server_overrides) -> dict:
     server = {
         "session_slot_pool_size": 1,
         "contention_queue_policy": "queue",
-        "contention_queue_max_wait_seconds": 120,
+        "contention_queue_max_wait_seconds": 60,
         "contention_queue_max_depth": 4,
     }
     server.update(server_overrides)
@@ -142,9 +142,9 @@ async def test_follow_up_with_ticket_dispatches_local_without_queueing(caplog):
     """AC1 end-to-end: the ticket bypasses admission re-check and the queue."""
     caplog.set_level(logging.INFO, logger="llama-proxy")
     _seed_calibration()
-    # Gate is occupied (busy=1 ⇒ projected 187 s > budget), so without the
+    # Gate is occupied (busy=1 ⇒ projected 112 s > budget), so without the
     # ticket this request would be refused. The ticket was reserved for an
-    # idle gate (busy=0 ⇒ own ETA 93.6 s < budget) and is honoured now.
+    # idle gate (busy=0 ⇒ own ETA 56.2 s < budget) and is honoured now.
     status, payload = admission_reserve.reserve(
         {"estimated_tokens": _TOKENS, "session_id": "s-1"},
         _cfg(),
@@ -191,7 +191,7 @@ def test_reserve_refuses_with_full_payload_when_wait_exceeds_budget():
         {"estimated_tokens": _TOKENS, "session_id": "s-1"},
         _cfg(),
         model="Qwen3",
-        busy_slots=1,  # occupied gate ⇒ projected ~187 s > 120 s budget
+        busy_slots=1,  # occupied gate ⇒ projected ~112 s > 60 s budget
     )
 
     assert status == 429
@@ -243,6 +243,43 @@ def test_expired_ticket_is_not_honoured(monkeypatch):
     monkeypatch.setattr(ar_mod.time, "monotonic", lambda: 3.0)
     assert ar_mod.peek("t-expired") is None, "expired ticket must not be honoured"
     assert ar_mod.claim("t-expired") is None, "expired claim falls back (AC3)"
+
+
+def test_claim_of_expired_ticket_counts_expiry_without_raising(monkeypatch):
+    """LP-0MVJXC9MK003UET8: the expired-claim branch must not raise F823.
+
+    ``claim()`` incremented the module-global ``_expired`` without declaring
+    it ``global``, so the branch made ``_expired`` a local read-before-
+    assignment (``UnboundLocalError``). The race is real: a ticket can expire
+    between ``_prune_expired()`` and the ``is_expired()`` check, because both
+    sample ``time.monotonic()``. Drive that exact interleaving by having the
+    first monotonic read (inside ``_prune_expired``) land inside the TTL and
+    the second (inside ``claim``) land past it.
+    """
+    import proxy.admission_reserve as ar_mod
+
+    admission_reserve._reservations["t-race"] = admission_reserve.Reservation(
+        ticket_id="t-race",
+        estimated_tokens=_TOKENS,
+        cached_ratio=0.0,
+        priority=None,
+        provider="Qwen3",
+        session_id=None,
+        created_at=0.0,
+        ttl_seconds=2.0,
+    )
+    before = admission_reserve.stats()["reserved_expired"]
+    # monotonic() is called by _prune_expired (t=1.0, inside the 2 s TTL) and
+    # then by Reservation.is_expired() inside claim (t=3.0, past it).
+    readings = iter([1.0, 3.0])
+    monkeypatch.setattr(ar_mod.time, "monotonic", lambda: next(readings, 3.0))
+
+    assert admission_reserve.claim("t-race") is None, (
+        "an expired claim must fall back to the ordinary path"
+    )
+    assert admission_reserve.stats()["reserved_expired"] == before + 1, (
+        "the expiry must be counted in the reserved_expired stat"
+    )
 
 
 def test_cancelled_ticket_is_not_honoured_and_releases_the_gate():

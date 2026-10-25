@@ -142,6 +142,50 @@ class TestLogLineParsing:
         assert ev.reason == "local_concurrency_limit"
         assert ev.session is None
 
+    def test_fallback_session_bearing_line_parses_evidence(self):
+        """Fallback lines since LP-0MVMBMSWR0036RES carry ``session=``/``attempt=``
+        (and budget evidence for budget-driven reasons); all fields parse."""
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_SESSION)
+        assert ev.kind == "fallback"
+        assert ev.session == "herdr-1792767061-1282111-17770"
+        assert ev.attempt_index == 3
+        assert ev.budget_limit is None  # reason not budget-driven
+
+    def test_fallback_rate_limited_line_parses_budget_snapshot(self):
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_RATE_LIMITED_BUDGET)
+        assert ev.kind == "fallback"
+        assert ev.session == "herdr-1792767061-1282111-17770"
+        assert ev.attempt_index == 4
+        assert ev.reason == "rate_limited"
+        assert ev.budget_limit == 60
+        assert ev.budget_remaining == 0
+        assert ev.budget_waited == pytest.approx(12.5)
+
+    def test_fallback_session_token_unknown_maps_to_none(self):
+        """The proxy emits ``session=unknown`` when the request has no UUID;
+        the parser degrades it to ``None`` (missing field) so legacy
+        attribution logic treats it as a session-less line."""
+        line = (
+            "2026-10-23 09:20:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 500 session=unknown attempt=1"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev.kind == "fallback"
+        assert ev.session is None
+        assert ev.attempt_index == 1
+        assert ev.reason == "HTTP 500"
+
+    def test_fallback_legacy_line_evidence_fields_none(self):
+        """Pre-change rotated logs parse with every evidence field None."""
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_HTTP_400)
+        assert ev.kind == "fallback"
+        assert ev.reason == "HTTP 400"
+        assert ev.session is None
+        assert ev.attempt_index is None
+        assert ev.budget_limit is None
+        assert ev.budget_remaining is None
+        assert ev.budget_waited is None
+
     def test_routing_skip_local(self):
         ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CONTEXT_TOO_LARGE)
         assert ev.kind == "routing_skip"
@@ -193,6 +237,72 @@ class TestLogLineParsing:
         assert ev.kind == "routing_skip"
         assert ev.reason == "context_too_large"
         assert ev.chain_hold_cycle is None
+
+    def test_routing_skip_provider_context_parsed(self):
+        # LP-0MVMBM1Y3001TPRT AC1: the per-provider context-ceiling skip is its
+        # own event kind carrying session, provider, type, reason, estimate and
+        # the ceiling that was exceeded.
+        ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_PROVIDER_CONTEXT)
+        assert ev is not None
+        assert ev.kind == "provider_context_skip"
+        assert ev.session == "herdr-1792524101-1636143-211"
+        assert ev.provider == "munitoai-free"
+        assert ev.provider_type == "remote"
+        assert ev.reason == "provider_context_exceeded"
+        assert ev.estimated_tokens == 153917
+        assert ev.limit == 150000
+        # A skip is not a fallback and not a local skip: it must not leak into
+        # the other kinds' fields.
+        assert ev.src is None and ev.dst is None
+        assert ev.chain_hold_cycle is None
+
+    def test_routing_skip_provider_context_without_limit_degrades(self):
+        # AC8: historical lines may predate ``limit=``. The event still parses
+        # with everything else intact and ``limit`` None (never fatal).
+        ev = log_parser.parse_log_line(fixtures.ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT)
+        assert ev is not None
+        assert ev.kind == "provider_context_skip"
+        assert ev.limit is None
+        assert ev.estimated_tokens == 160001
+        assert ev.provider == "munitoai-free"
+        assert ev.session == "herdr-1792524101-1636143-212"
+
+    def test_routing_skip_provider_context_is_not_a_local_skip(self):
+        # Both prefixes start with ``routing_skip``; the provider-context line
+        # must never be parsed as a ``routing_skip_local`` event (and vice
+        # versa), otherwise per-session attribution precedence inverts.
+        ctx = log_parser.parse_log_line(fixtures.ROUTING_SKIP_PROVIDER_CONTEXT)
+        local = log_parser.parse_log_line(fixtures.ROUTING_SKIP_CONTEXT_TOO_LARGE)
+        assert ctx.kind == "provider_context_skip"
+        assert local.kind == "routing_skip"
+
+    def test_routing_skip_provider_context_unknown_session_is_unattributed(self):
+        line = fixtures.ROUTING_SKIP_PROVIDER_CONTEXT.replace(
+            "session=herdr-1792524101-1636143-211", "session=unknown"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev.kind == "provider_context_skip"
+        assert ev.session is None
+
+    def test_iter_events_attaches_file_and_line_evidence(self, tmp_path):
+        # AC1: an event carries the source file/line for evidence, not just the
+        # raw text. Two noise lines precede the skip so the number is non-trivial.
+        log = tmp_path / "proxy.log"
+        log.write_text(
+            "2026-10-21 04:11:00,000 - INFO - Stream started: provider=local model=Qwen3 "
+            "session=herdr-1792524101-1636143-211 request=[]\n"
+            "not a log line\n" + fixtures.ROUTING_SKIP_PROVIDER_CONTEXT + "\n",
+            encoding="utf-8",
+        )
+        events = list(
+            log_parser.iter_events(
+                log, datetime(2026, 10, 21, 4, 0), datetime(2026, 10, 21, 5, 0)
+            )
+        )
+        skip = next(e for e in events if e.kind == "provider_context_skip")
+        assert skip.src_file == "proxy.log"
+        assert skip.line_no == 3
+        assert skip.raw.strip() == fixtures.ROUTING_SKIP_PROVIDER_CONTEXT
 
     def test_dispatch_denied(self):
         ev = log_parser.parse_log_line(fixtures.DISPATCH_DENIED)
@@ -374,6 +484,196 @@ class TestTtftParsing:
         ev = log_parser.parse_log_line(line)
         assert ev.kind == "ttft"
         assert ev.kind != "stream_started"
+
+    def test_dispatch_first_byte_real_warm_line(self):
+        """A real warm-cache line from /var/log/llama-proxy parses field-exact.
+
+        AC2: ``parse_log_line()`` yields ``kind=ttft`` with ``ttft_ms`` plus
+        ``dispatch_to_first_byte_ms``, ``queue_wait_ms``, ``cache_state``,
+        ``cached_ratio``, ``session`` and ``model``, matching the real-line
+        format exactly.
+        """
+        ev = log_parser.parse_log_line(fixtures.DISPATCH_FIRST_BYTE_WARM)
+        assert ev is not None
+        assert ev.kind == "ttft"
+        assert ev.ttft_ms == pytest.approx(29546.0)
+        assert ev.dispatch_to_first_byte_ms == pytest.approx(29545.3)
+        assert ev.queue_wait_ms == pytest.approx(0.6)
+        assert ev.cache_state == "warm"
+        assert ev.cached_ratio == pytest.approx(0.992)
+        assert ev.session == fixtures.PREFILL_SESSION
+        assert ev.model == "Qwen3"
+        assert ev.ts == datetime(2026, 10, 22, 21, 15, 42, 7000)
+
+    def test_dispatch_first_byte_real_cold_line(self):
+        """A real cold-cache line (zero cached ratio) parses field-exact."""
+        ev = log_parser.parse_log_line(fixtures.DISPATCH_FIRST_BYTE_COLD)
+        assert ev is not None
+        assert ev.kind == "ttft"
+        assert ev.ttft_ms == pytest.approx(55656.5)
+        assert ev.dispatch_to_first_byte_ms == pytest.approx(55655.9)
+        assert ev.cache_state == "cold"
+        assert ev.cached_ratio == pytest.approx(0.0)
+        assert ev.session == fixtures.PREFILL_SESSION
+
+    def test_dispatch_first_byte_queue_wait_split(self):
+        """The service-time split is consistent: total − queue wait = service.
+
+        Real line: 26.6 s dispatch → first byte, of which 16.2 s was spent
+        queued for the single slot, leaving 10.4 s of service time.
+        """
+        ev = log_parser.parse_log_line(fixtures.DISPATCH_FIRST_BYTE_QUEUE_WAIT)
+        assert ev is not None
+        assert ev.queue_wait_ms == pytest.approx(16169.9)
+        assert ev.dispatch_to_first_byte_ms == pytest.approx(10403.1)
+        assert ev.ttft_ms - ev.queue_wait_ms == pytest.approx(ev.dispatch_to_first_byte_ms)
+
+    def test_remote_ttft_line_has_no_prefill_fields(self):
+        """Remote ``ttft_seconds=`` lines carry none of the local prefill fields."""
+        line = (
+            "2026-08-02 14:35:00,200 - INFO - "
+            "ttft_seconds=0.823 session=def456 provider=opencode-go "
+            "model=deepseek-v4-flash"
+        )
+        ev = log_parser.parse_log_line(line)
+        assert ev is not None
+        assert ev.kind == "ttft"
+        assert ev.dispatch_to_first_byte_ms is None
+        assert ev.queue_wait_ms is None
+        assert ev.cache_state is None
+        assert ev.cached_ratio is None
+
+
+class TestPrefillPairing:
+    """FIFO pairing of ``dispatch_first_byte_ms`` events to local streams.
+
+    For each session the Nth TTFT event pairs with the Nth ``stream_started``
+    event by timestamp (AC3); streams with no TTFT event surface as
+    ``PrefillMatch`` with ``ttft=None`` — unknown prefill — instead of being
+    silently dropped (AC4).
+    """
+
+    @staticmethod
+    def _parse(lines: list[str]) -> list[log_parser.LogEvent]:
+        return [e for e in (log_parser.parse_log_line(ln) for ln in lines) if e is not None]
+
+    def test_fifo_pairs_nth_ttft_with_nth_stream_real_session(self):
+        """Three real TTFT lines pair FIFO with the three starts of the same
+        session, in timestamp order."""
+        events = self._parse(
+            [
+                fixtures.STREAM_STARTED_PREFILL_COLD,
+                fixtures.DISPATCH_FIRST_BYTE_COLD,
+                fixtures.STREAM_STARTED_PREFILL_COLD_FAST,
+                fixtures.DISPATCH_FIRST_BYTE_COLD_FAST,
+                fixtures.STREAM_STARTED_PREFILL_WARM,
+                fixtures.DISPATCH_FIRST_BYTE_WARM,
+            ]
+        )
+        starts = [e for e in events if e.kind == "stream_started"]
+        ttfts = [e for e in events if e.kind == "ttft"]
+        matches = log_parser.pair_ttft_to_streams(ttfts, starts)
+
+        assert len(matches) == 3
+        # FIFO by timestamp: the 55.7 s cold prefill pairs with the first
+        # stream, the 1.1 s cold with the second, the 29.5 s warm with the
+        # third.
+        assert [m.prefill_seconds for m in matches] == pytest.approx(
+            [55.6565, 1.1005, 29.546]
+        )
+        for m in matches:
+            assert m.known_prefill
+            assert m.stream.session == fixtures.PREFILL_SESSION
+            assert m.ttft.session == fixtures.PREFILL_SESSION
+            # dispatch time is back-calculated: ts − prefill duration.
+            assert m.dispatch_ts == m.ttft.ts - timedelta(milliseconds=m.ttft.ttft_ms)
+        # Matches are ordered by stream start time.
+        assert [m.stream.ts for m in matches] == sorted(m.stream.ts for m in matches)
+
+    def test_single_request_session_pairs_its_ttft(self):
+        events = self._parse(
+            [fixtures.STREAM_STARTED_PREFILL_COLD, fixtures.DISPATCH_FIRST_BYTE_COLD]
+        )
+        matches = log_parser.pair_ttft_to_streams(
+            [e for e in events if e.kind == "ttft"],
+            [e for e in events if e.kind == "stream_started"],
+        )
+        assert len(matches) == 1
+        assert matches[0].prefill_seconds == pytest.approx(55.6565)
+
+    def test_multi_session_pairing_by_timestamp(self):
+        """Sessions pair independently; interleaved starts keep their order."""
+        starts = [
+            log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 10), session="s1"),
+            log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 20), session="s2"),
+            log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 30), session="s1"),
+        ]
+        ttfts = [
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 12), session="s1", ttft_ms=500.0),
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 22), session="s2", ttft_ms=200.0),
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 32), session="s1", ttft_ms=700.0),
+        ]
+        matches = log_parser.pair_ttft_to_streams(ttfts, starts)
+        assert [(m.stream.session, m.prefill_seconds) for m in matches] == [
+            ("s1", 0.5),
+            ("s2", 0.2),
+            ("s1", 0.7),
+        ]
+
+    def test_aborted_stream_reported_as_unknown_prefill(self):
+        """A stream that dies before first byte has no TTFT line: it is kept
+        in the pairing as unknown prefill rather than silently dropped."""
+        events = self._parse(
+            [
+                fixtures.STREAM_STARTED_ABORTED_LOCAL,
+                fixtures.STREAM_ERROR_ABORTED_LOCAL,
+                fixtures.STREAM_STARTED_PREFILL_COLD,
+                fixtures.DISPATCH_FIRST_BYTE_COLD,
+            ]
+        )
+        matches = log_parser.pair_ttft_to_streams(
+            [e for e in events if e.kind == "ttft"],
+            [e for e in events if e.kind == "stream_started"],
+        )
+        assert len(matches) == 2
+        aborted = next(m for m in matches if m.stream.session == "audit-WL-0MVFRRMX3003UPP3-phase2_child_6-11d812e7")
+        assert not aborted.known_prefill
+        assert aborted.ttft is None
+        assert aborted.prefill_seconds is None
+        assert aborted.dispatch_ts is None
+        # The completed stream still pairs normally.
+        completed = next(m for m in matches if m.stream.session == fixtures.PREFILL_SESSION)
+        assert completed.known_prefill
+        assert completed.prefill_seconds == pytest.approx(55.6565)
+
+    def test_extra_ttft_events_without_a_stream_are_ignored(self):
+        """More TTFT events than streams: the surplus has no stream to
+        attribute to and is ignored (not fabricated)."""
+        starts = [log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 10), session="s1")]
+        ttfts = [
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 12), session="s1", ttft_ms=500.0),
+            log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 22), session="s1", ttft_ms=999.0),
+        ]
+        matches = log_parser.pair_ttft_to_streams(ttfts, starts)
+        assert len(matches) == 1
+        assert matches[0].prefill_seconds == pytest.approx(0.5)
+
+    def test_session_less_events_are_not_paired(self):
+        """Session-less TTFT/start events cannot be paired and are skipped."""
+        starts = [log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 14, 0, 10), session=None)]
+        ttfts = [log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 12), session=None, ttft_ms=500.0)]
+        assert log_parser.pair_ttft_to_streams(ttfts, starts) == []
+
+    def test_dispatch_interval_before_window_still_reconstructs(self):
+        """A dispatch that starts before the window still reconstructs its
+        interval (boundary-crossing input for the union-interval busy
+        calculation): the pairing is window-agnostic."""
+        ttft = log_parser.LogEvent("ttft", datetime(2026, 8, 2, 14, 0, 5), session="s1", ttft_ms=60000.0)
+        start = log_parser.LogEvent("stream_started", datetime(2026, 8, 2, 13, 59, 0), session="s1")
+        match = log_parser.pair_ttft_to_streams([ttft], [start])[0]
+        assert match.dispatch_ts == datetime(2026, 8, 2, 13, 59, 5)  # 60 s before first byte
+        assert match.ttft.ts > WINDOW_START
+        assert match.dispatch_ts < WINDOW_START  # pre-window dispatch
 
 
 class TestErrorLineParsing:
@@ -939,6 +1239,89 @@ class TestSessionAggregation:
         assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 50)
         assert s.fallback_reason == "HTTP 400"
 
+    def test_fallback_attributed_via_provider_context_skip(self):
+        # AC2: the session's own routing_skip_provider_context line is
+        # session-bearing evidence, so it attributes the move (and its reason)
+        # without relying on a nearest-line Fallback triggered guess.
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s7 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s7 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+            "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+            "reason=provider_context_exceeded session=s7",
+            "2026-08-02 14:00:21,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s7 request=[]",
+            "2026-08-02 14:00:25,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session=s7 provider=opencode-go model=deepseek-v4-flash request=[]",
+        ]
+        res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        s = res.sessions["s7"]
+        assert s.fallback_reason == "provider_context_exceeded"
+        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 20)
+
+    def test_own_provider_context_skip_beats_nearest_fallback_guess(self):
+        # The own line wins over a closer session-less Fallback triggered line,
+        # even when that guess is also inside the attribution window.
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s8 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s8 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+            "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+            "reason=provider_context_exceeded session=s8",
+            "2026-08-02 14:00:55,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 400",
+            "2026-08-02 14:00:58,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s8 request=[]",
+        ]
+        res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        s = res.sessions["s8"]
+        assert s.fallback_reason == "provider_context_exceeded"
+        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 40)
+
+    def test_routing_skip_local_beats_provider_context_skip(self):
+        # Documented precedence (AC2): the local-side skip explains why local was
+        # not used at all, so it outranks the downstream per-provider ceiling
+        # hits recorded while walking the chain.
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s9 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s9 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:10,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+            "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+            "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+            "provider session=s9",
+            "2026-08-02 14:00:12,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+            "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+            "reason=provider_context_exceeded session=s9",
+            "2026-08-02 14:00:14,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s9 request=[]",
+        ]
+        res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        s = res.sessions["s9"]
+        assert s.fallback_reason == "context_too_large"
+        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 10)
+
+    def test_provider_context_skips_collected_without_inflating_demand(self):
+        # Provider-context skips are collected for the report's own breakdown
+        # but never counted as fallback events, local skips, or requests.
+        lines = [
+            "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s10 request=[]",
+            "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s10 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+            "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+            "reason=provider_context_exceeded session=s10",
+            "2026-08-02 14:00:21,000 - INFO - routing_skip_provider_context provider=opencode-go "
+            "type=remote status=provider_context_exceeded estimated_tokens=195787 limit=196608 "
+            "reason=provider_context_exceeded session=s10",
+        ]
+        res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert len(res.provider_context_skip_events) == 2
+        assert res.fallback_events == []
+        assert res.routing_skip_events == []
+        assert res.total_requests == 1
+        assert res.sessions["s10"].routing_skips == 0
+        assert res.sessions["s10"].messages == 1
+        assert dict(res.provider_context_skip_provider_counts) == {
+            "munitoai-free": 1,
+            "opencode-go": 1,
+        }
+        assert dict(res.provider_context_skip_limit_counts) == {150000: 1, 196608: 1}
+
     def test_remote_only_session(self):
         lines = [
             # Legacy reason value in a rotated log: still classified correctly
@@ -1071,6 +1454,211 @@ class TestSessionAggregation:
         assert res.sessions["fast1"].slots == 6
         assert res.sessions["cheap1"].bucket == "cheap"
         assert res.sessions["cheap1"].slots == 8
+
+
+class TestFallbackAttribution:
+    """Per-session fallback attribution (LP-0MVMBMSWR0036RES AC5).
+
+    A session's reason comes from its **own** evidence — its ``Fallback
+    triggered`` or ``routing_skip_local`` line. Another session's session-bearing
+    fallback line is never inherited; only session-less lines from rotated logs
+    predating the session stamp still use the nearest-line-within-60s heuristic.
+    """
+
+    WINDOW = (datetime(2026, 10, 23, 8, 0, 0), datetime(2026, 10, 23, 11, 0, 0))
+
+    def _local_then_remote(self, session: str, start: str, remote: str) -> list[str]:
+        return [
+            f"2026-10-23 {start}:00,000 - INFO - Stream started: provider=local "
+            f"model=Qwen3 session={session} request=[]",
+            f"2026-10-23 {start}:05,000 - INFO - Stream finished: reason=stop "
+            f"tokens=900/40/940 session={session} provider=local model=Qwen3 request=[]",
+            f"2026-10-23 {remote}:30,000 - INFO - Stream started: provider=opencode-go "
+            f"model=deepseek-v4-flash session={session} request=[]",
+            f"2026-10-23 {remote}:35,000 - INFO - Stream finished: reason=stop "
+            f"tokens=950/200/1150 session={session} provider=opencode-go "
+            f"model=deepseek-v4-flash request=[]",
+        ]
+
+    def _summarise(self, lines: list[str], schedule=None):
+        return aggregation.aggregate(
+            _events(lines), *self.WINDOW, schedule or _schedule()
+        )
+
+    def test_own_fallback_line_is_used(self):
+        """A session with its own ``Fallback triggered`` line (no skip line) is
+        attributed from that line."""
+        lines = [
+            # The session's own session-bearing fallback line, before its first
+            # remote stream (fixture time 09:12:44, remote at 09:13:00).
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["herdr-1792767061-1282111-17770"]
+        assert s.fallback_reason == "local_lease_active"
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK
+        assert s.remote_move_time == datetime(2026, 10, 23, 9, 12, 44, 517000)
+
+    def test_own_skip_line_still_wins(self):
+        """An own ``routing_skip_local`` line keeps precedence over the fallback
+        line (unchanged behaviour), and is labelled ``own_skip``."""
+        lines = [
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+            "2026-10-23 09:12:50,000 - INFO - routing_skip_local provider=local-qwen3 "
+            "model=Qwen3 estimated_tokens=5000 cold_threshold=39594 warm_threshold=39594 "
+            "new_tokens=50 cached_ratio=0.50 reason=context_too_large → skipping local, "
+            "routing to next remote provider session=herdr-1792767061-1282111-17770",
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["herdr-1792767061-1282111-17770"]
+        assert s.fallback_reason == "context_too_large"
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_OWN_SKIP
+
+    def test_session_does_not_inherit_another_sessions_reason(self):
+        """The regression this change fixes: session B reached remote seconds
+        after session A's spill, but B has no fallback line of its own — it must
+        stay unattributed instead of inheriting A's ``rate_limited``."""
+        lines = [
+            # A's session-bearing spill, just before B's remote move.
+            "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
+            *self._local_then_remote("session-b", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["session-b"]
+        assert s.fallback_reason is None
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+        # The move itself is still recorded (it used local, then remote).
+        assert s.remote_move_time == datetime(2026, 10, 23, 9, 6, 30)
+
+    def test_session_less_legacy_line_still_attributes_by_proximity(self):
+        """Rotated logs without ``session=`` keep the legacy nearest-line
+        heuristic, labelled ``legacy_nearest`` so it is distinguishable."""
+        lines = [
+            "2026-10-23 09:06:28,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 500",
+            *self._local_then_remote("legacy-session", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["legacy-session"]
+        assert s.fallback_reason == "HTTP 500"
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_LEGACY_NEAREST
+
+    def test_lease_denied_session_is_labelled_explicitly(self):
+        """No own fallback line, but ``local_dispatch_denied`` evidence: the
+        move is lease/concurrency contention, reported as such."""
+        lines = [
+            "2026-10-23 09:06:20,000 - INFO - local_dispatch_denied "
+            "session=leased-session owner=other-session active=1",
+            *self._local_then_remote("leased-session", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["leased-session"]
+        assert s.fallback_reason == aggregation.LEASE_ACTIVE_REASON
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_LEASE_DENIED
+
+    def test_local_only_session_is_no_remote_fallback(self):
+        lines = [
+            "2026-10-23 09:10:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=stays-local request=[]",
+            "2026-10-23 09:10:05,000 - INFO - Stream finished: reason=stop "
+            "tokens=900/40/940 session=stays-local provider=local model=Qwen3 request=[]",
+        ]
+        res = self._summarise(lines)
+        s = res.sessions["stays-local"]
+        assert s.fallback_reason is None
+        assert s.fallback_attribution == aggregation.FALLBACK_ATTRIBUTION_NO_REMOTE
+
+    def test_attribution_counts_cover_every_session(self):
+        lines = [
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+            "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
+            *self._local_then_remote("session-b", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        counts = res.fallback_attribution_counts
+        assert sum(counts.values()) == len(res.sessions)
+        assert counts[aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK] == 1
+        assert counts[aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED] == 1
+
+    def test_report_exposes_attribution_states(self):
+        lines = [
+            "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
+            *self._local_then_remote("session-b", "09:06", "09:06"),
+            "2026-10-23 09:10:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=stays-local request=[]",
+        ]
+        res = self._summarise(lines)
+        md = reporting.build_report(res, None)
+        assert "Session fallback attribution:" in md
+        assert "unattributed **1**" in md
+        assert "no_remote_fallback **1**" in md
+
+    def test_json_summary_exposes_attribution_counts(self):
+        lines = [
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+        ]
+        res = self._summarise(lines)
+        data = reporting.summary_to_json(res)
+        assert data["fallback_attribution"] == {
+            aggregation.FALLBACK_ATTRIBUTION_OWN_FALLBACK: 1
+        }
+
+    def test_csv_row_carries_attribution(self, tmp_path):
+        lines = [
+            "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
+            *self._local_then_remote("session-b", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        standard_path, low_path = reporting.write_csvs(res, tmp_path)
+        rows: list[dict] = []
+        for path in (standard_path, low_path):
+            with path.open(newline="", encoding="utf-8") as fh:
+                rows.extend(csv.DictReader(fh))
+        row = next(r for r in rows if r["session_id"] == "session-b")
+        assert row["fallback_attribution"] == aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+        assert row["fallback_reason"] == ""
+
+    def test_recommendations_note_attribution_coverage(self):
+        """Reason-count evidence names sessions without own evidence so the
+        counts are not read as complete."""
+        lines = [
+            "2026-10-23 09:05:20,000 - INFO - local_dispatch_denied "
+            "session=leased-session owner=other-session active=1",
+            *self._local_then_remote("leased-session", "09:06", "09:06"),
+        ]
+        res = self._summarise(lines)
+        recs = recommendations.generate_recommendations(res, None)
+        contention = [r for r in recs if "slot pool contention" in r.title]
+        assert contention, "expected a slot-contention recommendation"
+        assert "lease/concurrency denied" in contention[0].evidence
+
+    def test_recommendations_omit_coverage_note_when_fully_attributed(self):
+        lines = [
+            fixtures.FALLBACK_SESSION,
+            *self._local_then_remote("herdr-1792767061-1282111-17770",
+                                     "09:12", "09:13"),
+        ]
+        res = self._summarise(lines)
+        recs = recommendations.generate_recommendations(res, None)
+        contention = [r for r in recs if "slot pool contention" in r.title]
+        assert contention, "expected a slot-contention recommendation"
+        assert "Session attribution coverage" not in contention[0].evidence
 
 
 class TestErrorAggregation:
@@ -1664,6 +2252,67 @@ class TestRecommendations:
         recs = recommendations.generate_recommendations(res, config=None)
         assert any(r.severity == "info" and "remote" in r.title.lower() for r in recs)
 
+    def test_provider_context_skips_trigger_ceiling_advice(self):
+        # AC4: provider-context skip events drive their own advice naming count,
+        # share of fallbacks, standard/low split and the ``limit`` that was hit.
+        res = _result_with_sessions(
+            [_session("a")],
+            fallback_events=[
+                log_parser.LogEvent("fallback", WINDOW_START, reason="context_too_large"),
+                log_parser.LogEvent("fallback", WINDOW_START, reason="context_too_large"),
+            ],
+        )
+        res.provider_context_skip_events = [
+            log_parser.LogEvent(
+                "provider_context_skip",
+                WINDOW_START,
+                provider="munitoai-free",
+                provider_type="remote",
+                reason="provider_context_exceeded",
+                estimated_tokens=153917,
+                limit=150000,
+            ),
+            log_parser.LogEvent(
+                "provider_context_skip",
+                WINDOW_START,
+                provider="opencode-go",
+                reason="provider_context_exceeded",
+                estimated_tokens=195787,
+                limit=196608,
+            ),
+        ]
+        recs = recommendations.generate_recommendations(res, config=None)
+        ceiling = [r for r in recs if "ceiling" in r.title.lower()]
+        assert ceiling, "expected provider-ceiling advice, got: " + " | ".join(r.title for r in recs)
+        evidence = ceiling[0].evidence
+        assert "2 provider context-ceiling skip(s)" in evidence
+        assert "(100.0%" in evidence  # no fallback events -> skips are the whole signal
+        assert "150000" in evidence and "196608" in evidence
+        assert "Fast 2 (100.0%)" in evidence
+
+    def test_provider_context_skips_below_share_do_not_advise(self):
+        # AC4 threshold: a handful of ceiling skips inside a large fallback
+        # volume stays below PROVIDER_CONTEXT_SHARE and does not fire advice.
+        res = _result_with_sessions(
+            [_session("a")],
+            fallback_events=[
+                log_parser.LogEvent("fallback", WINDOW_START, reason="other_reason")
+                for _ in range(20)
+            ],
+        )
+        res.provider_context_skip_events = [
+            log_parser.LogEvent(
+                "provider_context_skip",
+                WINDOW_START,
+                provider="munitoai-free",
+                reason="provider_context_exceeded",
+                limit=150000,
+            )
+        ]
+        recs = recommendations.generate_recommendations(res, config=None)
+        titles = " | ".join(r.title for r in recs)
+        assert "ceiling" not in titles.lower()
+
 
 class TestErrorRecommendations:
     """Error-driven remediation recommendations are quantified from the
@@ -2205,6 +2854,20 @@ def _local_event(kind: str, ts: datetime, session: str = "s1") -> log_parser.Log
     )
 
 
+def _ttft_event(
+    ts: datetime,
+    session: str = "s1",
+    ttft_ms: float | None = 5000.0,
+    **kwargs: object,
+) -> log_parser.LogEvent:
+    """A local ``dispatch_first_byte_ms`` TTFT event.
+
+    Mirrors the real dispatch log line, which carries no ``provider=`` field
+    (so ``provider`` stays ``None``, the local marker used by the parser).
+    """
+    return log_parser.LogEvent("ttft", ts, session=session, ttft_ms=ttft_ms, **kwargs)
+
+
 class TestBusyStats:
     def test_sequential_streams_single_session(self):
         events = [
@@ -2445,13 +3108,13 @@ class TestBusyStats:
         assert md.index("## Summary by hour") < md.index("## Session summary")
         # AC2/AC1: window-bounded rows with a % column; idle middle hour
         # listed; activity columns replace the classification columns.
-        assert "| Hour | Busy | % | Requests started | Local attempts | Local served | Fallbacks | Local-skip |" in section
-        assert "| 09:30-10:00 | 30s | 1.7% | 1 | 1 | 1 | 0 | 0 |" in section
-        assert "| 10:00-11:00 | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 |" in section
-        assert "| 11:00-11:45 | 15s | 0.6% | 1 | 1 | 1 | 0 | 0 |" in section
+        assert "| Hour | State | Busy | % | Requests started | Local attempts | Local served | Local dispatch | Lease denials | Fallbacks | Local-skip |" in section
+        assert "| 09:30-10:00 | serving | 30s | 1.7% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | idle | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| 11:00-11:45 | serving | 15s | 0.6% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
         # AC3: totals row = total busy over the window and overall busy % plus
         # the sum of each activity column over the window.
-        assert "| Totals | 45s | 0.6% | 2 | 2 | 2 | 0 | 0 |" in section
+        assert "| Totals | serving | 45s | 0.6% | 2 | 2 | 2 | 0 | 0 | 0 | 0 |" in section
         # The Local model utilization section no longer hosts the hourly table.
         util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
         assert "| Hour | Busy |" not in util
@@ -2468,6 +3131,874 @@ class TestBusyStats:
         assert res.busy.streams == 2
         assert res.busy.busy_seconds == 20.0
         assert res.busy.peak_concurrency == 2
+
+    def test_prefill_interval_buckets_identically_to_stream_start(self):
+        """AC5: for a session whose dispatch and first byte fall in the same
+        fast/cheap period, the interval buckets identically whether it starts
+        at ``Stream started`` or at the back-calculated dispatch time.
+
+        The interval start handed to ``compute_busy_stats`` is the
+        ``stream_started`` timestamp; modelling the new interval is therefore
+        a start event at the dispatch time (09:30:00) rather than at first
+        byte (09:30:05).
+        """
+        start = datetime(2026, 8, 2, 9, 0, 0)
+        end = datetime(2026, 8, 2, 11, 0, 0)
+        finish = _local_event("stream_finished", datetime(2026, 8, 2, 9, 30, 15), "s1")
+        decode_only = aggregation.compute_busy_stats(
+            [_local_event("stream_started", datetime(2026, 8, 2, 9, 30, 5), "s1"), finish],
+            start,
+            end,
+            _schedule(),
+        )
+        with_prefill = aggregation.compute_busy_stats(
+            [_local_event("stream_started", datetime(2026, 8, 2, 9, 30, 0), "s1"), finish],
+            start,
+            end,
+            _schedule(),
+        )
+        assert decode_only is not None and with_prefill is not None
+        assert decode_only.cheap_busy_seconds == 10.0
+        assert with_prefill.cheap_busy_seconds == 15.0
+        # Both intervals lie wholly in the cheap period: the *split* (all
+        # cheap, no fast) is identical; only the duration grows by the 5 s of
+        # prefill.
+        assert decode_only.fast_busy_seconds == with_prefill.fast_busy_seconds == 0.0
+        assert with_prefill.cheap_busy_seconds - decode_only.cheap_busy_seconds == 5.0
+
+    def test_prefill_interval_crossing_period_boundary_splits_buckets(self):
+        """AC4/AC5: a prefill interval that straddles the fast/cheap boundary
+        attributes each side to its own bucket (5 s cheap + 20 s fast)."""
+        start = datetime(2026, 8, 2, 9, 0, 0)
+        end = datetime(2026, 8, 2, 11, 0, 0)
+        # Dispatch 09:59:55 (cheap), first byte 10:00:05, finish 10:00:20 (fast).
+        busy = aggregation.compute_busy_stats(
+            [
+                _local_event("stream_started", datetime(2026, 8, 2, 9, 59, 55), "s1"),
+                _local_event("stream_finished", datetime(2026, 8, 2, 10, 0, 20), "s1"),
+            ],
+            start,
+            end,
+            _schedule(),
+        )
+        assert busy is not None
+        assert busy.cheap_busy_seconds == 5.0
+        assert busy.fast_busy_seconds == 20.0
+        assert busy.busy_seconds == 25.0
+
+    def test_prefill_interval_starting_before_window_is_clipped(self):
+        """AC4: a dispatch before the window (boundary-crossing interval) is
+        clipped to the window start for the union busy calculation."""
+        start = datetime(2026, 8, 2, 9, 0, 0)
+        end = datetime(2026, 8, 2, 11, 0, 0)
+        busy = aggregation.compute_busy_stats(
+            [
+                _local_event("stream_started", datetime(2026, 8, 2, 8, 59, 50), "s1"),
+                _local_event("stream_finished", datetime(2026, 8, 2, 9, 0, 30), "s1"),
+            ],
+            start,
+            end,
+            _schedule(),
+        )
+        assert busy is not None
+        assert busy.busy_seconds == 30.0  # 20 s pre-window clipped away
+        assert busy.streams == 1
+
+
+class TestPrefillStats:
+    """Per-stream local prefill statistics (LP-0MVJN45LF009CO2V).
+
+    ``compute_busy_stats`` takes the local ``dispatch_first_byte_ms`` TTFT
+    events, pairs them FIFO to the local streams per session, and reports the
+    prefill interval ``[ttft.ts - ttft_ms/1000, ttft.ts]`` as slot-seconds
+    (the integral of concurrency), never as wall-clock.
+    """
+
+    @staticmethod
+    def _busy(
+        stream_events: list[log_parser.LogEvent],
+        ttft_events: list[log_parser.LogEvent],
+        start: datetime = WINDOW_START,
+        end: datetime = WINDOW_END,
+    ) -> aggregation.BusyStats | None:
+        return aggregation.compute_busy_stats(
+            stream_events, start, end, _schedule(), ttft_events=ttft_events
+        )
+
+    def test_per_stream_prefill_from_dispatch_first_byte_ms(self):
+        """AC1: prefill comes from ``dispatch_first_byte_ms`` per local
+        stream — 5 s for the first stream, 30 s for the second."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 30), "s2"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0),
+            _ttft_event(datetime(2026, 8, 2, 14, 5, 0), "s2", 30000.0),
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([5.0, 30.0])
+        assert stats.count == 2
+        assert stats.unknown_count == 0
+        assert stats.stream_count == 2
+        assert stats.total_seconds == pytest.approx(35.0)
+        assert stats.has_samples
+
+    def test_percentiles_use_linear_interpolation(self):
+        """AC3: p10/p50/p90/max over the per-stream samples.
+
+        4 samples of 10/20/30/40 s -> p10 13 s, p50 25 s, p90 37 s, max 40 s
+        (linear interpolation, matching the rest of the skill's percentiles).
+        """
+        streams: list[log_parser.LogEvent] = []
+        ttfts: list[log_parser.LogEvent] = []
+        for index, prefill_s in enumerate((10, 20, 30, 40)):
+            ts = datetime(2026, 8, 2, 14, index, 0)
+            session = f"s{index}"
+            streams.append(_local_event("stream_started", ts, session))
+            streams.append(_local_event("stream_finished", ts + timedelta(seconds=60), session))
+            ttfts.append(_ttft_event(ts, session, prefill_s * 1000.0))
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.p10 == pytest.approx(13.0)
+        assert stats.p50 == pytest.approx(25.0)
+        assert stats.p90 == pytest.approx(37.0)
+        assert stats.max_seconds == pytest.approx(40.0)
+        assert stats.total_seconds == pytest.approx(100.0)
+
+    def test_concurrent_prefill_is_slot_seconds_not_wall_clock(self):
+        """AC3/AC5: two concurrent 10 s prefills (13:59:50 -> 14:00:00) are
+        20 slot-seconds of prefill work but only 10 s of wall-clock, so the
+        window total must be the per-stream sum, not a union."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s2"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 0), "s1", 10000.0),
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 0), "s2", 10000.0),
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.total_seconds == pytest.approx(20.0)  # slot-seconds
+        assert stats.unit == "slot-seconds"
+        # The wall-clock union of the same prefills is only 10 s. The busy
+        # figure is the dispatch → finish union (LP-0MVJN9H2I00116FP), but
+        # here both dispatches (13:59:50) predate the 14:00:00 window start
+        # and are clipped away, so busy equals the 20 s decode-only union.
+        assert busy.busy_seconds == pytest.approx(20.0)
+        assert busy.decode_busy_seconds == pytest.approx(20.0)
+        assert busy.prefill_busy_seconds == pytest.approx(0.0)
+
+    def test_stream_without_ttft_is_unknown_prefill(self):
+        """AC4: a stream with no first-byte line is counted as unknown
+        prefill — excluded from the percentiles, retained in the count."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "aborted"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 2), "aborted"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.count == 1
+        assert stats.unknown_count == 1
+        assert stats.stream_count == 2
+        assert list(stats.samples) == pytest.approx([5.0])
+        assert stats.p50 == pytest.approx(5.0)  # unknown sample not averaged in
+        assert stats.total_seconds == pytest.approx(5.0)
+
+    def test_no_ttft_events_reports_every_stream_as_unknown(self):
+        """AC4: with no TTFT events at all, every local stream is unknown
+        prefill (empty percentiles, zero total) rather than a silent zero."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        busy = self._busy(streams, [])
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.count == 0
+        assert stats.unknown_count == 1
+        assert stats.stream_count == 1
+        assert stats.total_seconds == 0.0
+        assert not stats.has_samples
+        assert stats.p10 is None and stats.p50 is None and stats.p90 is None
+        assert stats.max_seconds is None
+
+    def test_fallback_pairs_dispatch_and_first_byte_timestamps(self):
+        """AC2: with ``dispatch_first_byte_ms`` absent, prefill falls back to
+        pairing the dispatch (``Stream started``) and first-byte timestamps:
+        14:00:02 -> 14:00:10 is 8 s."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 2), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", None)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([8.0])
+        assert stats.unknown_count == 0
+
+    def test_fallback_reconstructs_total_from_the_logged_split(self):
+        """AC2: when only the service/queue split survived, the prefill total
+        is reconstructed from ``dispatch_to_first_byte_ms + queue_wait_ms``
+        (real queue-contention fixture: 10.403 s service + 16.170 s queued)."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 48), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 1, 30), "s1"),
+        ]
+        ttfts = [
+            _ttft_event(
+                datetime(2026, 8, 2, 14, 0, 48),
+                "s1",
+                None,
+                dispatch_to_first_byte_ms=10403.1,
+                queue_wait_ms=16169.9,
+            )
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([26.573])
+
+    def test_fallback_rejects_non_positive_timestamp_pairing(self):
+        """AC2/AC4: the timestamp fallback needs positive evidence. The proxy
+        logs ``Stream started`` at first byte, so a zero difference is not a
+        measurement — the stream stays unknown prefill."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", None)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.count == 0
+        assert stats.unknown_count == 1
+
+    def test_fifo_pairing_attributes_prefill_to_the_right_stream(self):
+        """AC1: the Nth TTFT of a session pairs with that session's Nth
+        stream, independent of the order the events are supplied in."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 5), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 30), "s1"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 6), "s1", 55656.5),
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 21), "s1", 1100.5),
+        ]
+        ordered = self._busy(streams, ttfts)
+        reversed_order = self._busy(streams, list(reversed(ttfts)))
+        assert ordered is not None and reversed_order is not None
+        assert ordered.prefill_stats is not None
+        assert reversed_order.prefill_stats is not None
+        assert list(ordered.prefill_stats.samples) == pytest.approx([55.6565, 1.1005])
+        assert list(reversed_order.prefill_stats.samples) == list(
+            ordered.prefill_stats.samples
+        )
+
+    def test_dispatch_before_window_start_keeps_full_prefill(self):
+        """AC6 boundary: a first byte inside the window whose dispatch
+        predates it keeps its full prefill duration (60 s)."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 5), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 5), "s1", 60000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([60.0])  # dispatch 13:59:05
+        assert stats.total_seconds == pytest.approx(60.0)
+
+    def test_first_byte_after_window_end_is_not_a_window_sample(self):
+        """AC6 boundary: a TTFT after the window end belongs to the next
+        window — it is not counted (and never double-counted)."""
+        streams = [
+            # In-window stream so busy stats exist at all.
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 30), "s1"),
+            # Next-window stream: first byte after window_end.
+            _local_event("stream_started", datetime(2026, 8, 2, 15, 0, 10), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 15, 0, 30), "s2"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0),
+            _ttft_event(datetime(2026, 8, 2, 15, 0, 10), "s2", 9000.0),
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([5.0])
+        assert stats.stream_count == 1
+        assert stats.unknown_count == 0
+        assert stats.total_seconds == pytest.approx(5.0)
+
+    def test_stream_outside_window_without_ttft_is_not_unknown(self):
+        """AC6 boundary: a stream that started before the window and has no
+        first-byte line belongs to an earlier window, so it is not this
+        window's unknown prefill."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 13, 59, 50), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 5), "s1"),
+        ]
+        busy = self._busy(streams, [])
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        assert stats.unknown_count == 0
+        assert stats.stream_count == 0
+
+    def test_streams_expose_per_stream_attribution(self):
+        """AC1: the measurements stay attributable per local stream (session
+        + first-byte timestamp), so unknown prefill can be named."""
+        first_byte = datetime(2026, 8, 2, 14, 0, 10)
+        streams = [
+            _local_event("stream_started", first_byte, "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "aborted"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 2), "aborted"),
+        ]
+        ttfts = [_ttft_event(first_byte, "s1", 5000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        stats = busy.prefill_stats
+        assert stats is not None
+        known, unknown = stats.streams
+        assert (known.session, known.first_byte_ts, known.seconds) == ("s1", first_byte, 5.0)
+        assert known.known
+        assert (unknown.session, unknown.first_byte_ts, unknown.seconds) == (
+            "aborted",
+            None,
+            None,
+        )
+        assert not unknown.known
+
+    def test_prefill_stats_absent_when_ttft_events_not_supplied(self):
+        """Callers that do not pass TTFT events get no prefill statistics
+        rather than a fabricated empty measurement (backward compatible)."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None
+        assert busy.prefill_stats is None
+
+    def test_aggregate_populates_prefill_stats_from_real_dispatch_lines(self):
+        """AC1 end-to-end: ``aggregate()`` feeds the real TTFT events to the
+        busy computation, so a real session's three dispatch lines become
+        three prefill samples and the aborted stream stays unknown."""
+        start = datetime(2026, 10, 21, 22, 0, 0)
+        end = datetime(2026, 10, 22, 22, 0, 0)
+        lines = [
+            fixtures.STREAM_STARTED_PREFILL_COLD,
+            fixtures.DISPATCH_FIRST_BYTE_COLD,
+            fixtures.STREAM_STARTED_PREFILL_COLD_FAST,
+            fixtures.DISPATCH_FIRST_BYTE_COLD_FAST,
+            fixtures.STREAM_STARTED_PREFILL_WARM,
+            fixtures.DISPATCH_FIRST_BYTE_WARM,
+            fixtures.STREAM_STARTED_ABORTED_LOCAL,
+            fixtures.STREAM_ERROR_ABORTED_LOCAL,
+        ]
+        result = aggregation.aggregate(_events(lines), start, end, _schedule())
+        assert result.busy is not None
+        stats = result.busy.prefill_stats
+        assert stats is not None
+        assert list(stats.samples) == pytest.approx([55.6565, 1.1005, 29.546])
+        assert stats.count == 3
+        assert stats.unknown_count == 1
+        assert stats.stream_count == 4
+        assert stats.total_seconds == pytest.approx(86.3)
+        assert stats.unit == "slot-seconds"
+
+
+class TestDispatchToFinishBusy:
+    """Busy = union of **dispatch → finish** intervals (LP-0MVJN9H2I00116FP).
+
+    ``busy_seconds`` is the union of ``[ttft.ts - ttft_ms/1000, Stream
+    finished]`` intervals (prefill + decode), with the decode-only union
+    retained as ``decode_busy_seconds`` — the labelled lower bound. Total
+    compute, (peak/avg) concurrency, the fast/cheap split and the hourly split
+    are all recomputed on the new intervals. A stream with no first-byte line
+    falls back to its decode interval and is attributed to the lower bound, so
+    the busy figure is never overstated.
+    """
+
+    @staticmethod
+    def _busy(
+        stream_events: list[log_parser.LogEvent],
+        ttft_events: list[log_parser.LogEvent],
+        start: datetime = WINDOW_START,
+        end: datetime = WINDOW_END,
+    ) -> aggregation.BusyStats | None:
+        return aggregation.compute_busy_stats(
+            stream_events, start, end, _schedule(), ttft_events=ttft_events
+        )
+
+    def test_busy_union_spans_dispatch_to_finish(self):
+        """AC1: the busy interval starts at ``ttft.ts - ttft_ms/1000`` — a
+        30 s prefill extends the 10 s decode interval to 40 s of busy."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 30), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 30), "s1", 30000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.busy_seconds == 40.0  # dispatch 14:00:00 → finish 14:00:40
+        assert busy.busy_definition == "dispatch_to_finish"
+        assert busy.busy_upper_bound_seconds == 40.0
+        assert busy.prefill_extended_streams == 1
+        assert busy.total_compute_seconds == 40.0
+        assert busy.avg_stream_duration == pytest.approx(40.0)
+        # Retained decode-only figure (lower bound) and wall-clock prefill span.
+        assert busy.decode_busy_seconds == 10.0
+        assert busy.busy_lower_bound_seconds == 10.0
+        assert busy.prefill_busy_seconds == 30.0
+
+    def test_decode_only_figure_is_retained_and_feedless_stream_stays_low(self):
+        """AC2/AC5: the decode-only union is reported alongside; a stream
+        without a TTFT line contributes its decode interval to the lower bound
+        only, so the upper bound is not inflated by it."""
+        streams = [
+            # Measured prefill: busy 14:00:05 → 14:00:20 (15 s), decode 10 s.
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            # No first-byte line: contributes decode only (30 s).
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 30), "s2"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.decode_busy_seconds == 40.0  # 10 s + 30 s
+        assert busy.busy_seconds == 45.0  # 15 s (extended) + 30 s (feedless)
+        assert busy.prefill_busy_seconds == 5.0  # only the measured prefill
+        assert busy.prefill_extended_streams == 1
+        assert busy.prefill_stats is not None
+        assert busy.prefill_stats.unknown_count == 1  # s2 visible as unknown
+
+    def test_overlapping_prefill_and_decode_intervals_merge(self):
+        """AC6: one stream's prefill overlapping another's decode merges into
+        a single union interval — no double counting."""
+        start, end = datetime(2026, 8, 2, 13, 0, 0), datetime(2026, 8, 2, 15, 0, 0)
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 30), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s2"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 0), "s1", 10000.0)]
+        busy = self._busy(streams, ttfts, start, end)
+        assert busy is not None
+        # s1 dispatch 13:59:50 → 14:00:30; s2 14:00:10–20 inside it: union 40 s.
+        assert busy.busy_seconds == 40.0
+        assert busy.decode_busy_seconds == 30.0  # 14:00:00–30 (s2 inside s1)
+        assert busy.prefill_busy_seconds == 10.0
+        assert busy.total_compute_seconds == pytest.approx(50.0)  # 40 + 10
+        assert busy.peak_concurrency == 2  # s2's decode overlaps s1's prefill
+        assert busy.avg_concurrency == pytest.approx(50.0 / 40.0)
+
+    def test_unknown_prefill_stream_keeps_decode_interval(self):
+        """A stream paired with a TTFT whose duration is unknown stays at its
+        decode interval (a zero-delta timestamp pairing is not evidence): busy
+        equals decode and the stream is counted as unknown prefill."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", None)]  # no duration
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.busy_seconds == 10.0
+        assert busy.decode_busy_seconds == 10.0
+        assert busy.prefill_busy_seconds == 0.0
+        assert busy.prefill_extended_streams == 0
+        assert busy.prefill_stats is not None and busy.prefill_stats.unknown_count == 1
+
+    def test_unfinished_stream_with_dispatch_does_not_inflate_busy(self):
+        """AC6 boundary: a stream with a measured prefill but no logged finish
+        contributes nothing (its compute time is unknown), even though its
+        dispatch time is derivable."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 30), "aborted"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 5, 10), "s2"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 30), "aborted", 30000.0)]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.busy_seconds == 10.0  # s2 decode only, no invented prefill
+        assert busy.unfinished_streams == 1
+        assert busy.prefill_extended_streams == 0
+
+    def test_dispatch_before_window_start_is_clipped_for_busy(self):
+        """AC6 boundary: a dispatch before the window (boundary-crossing
+        interval) is clipped to the window start; the in-window part still
+        includes the prefill seconds that fall inside the window."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 5), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 40), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 14, 0, 5), "s1", 60000.0)]
+        busy = self._busy(streams, ttfts)  # dispatch 13:59:05, window starts 14:00:00
+        assert busy is not None
+        assert busy.busy_seconds == 40.0  # 35 s decode + 5 s in-window prefill
+        assert busy.decode_busy_seconds == 35.0
+        assert busy.prefill_busy_seconds == 5.0
+
+    def test_fast_cheap_split_on_dispatch_intervals(self):
+        """AC3: fast/cheap bucketing runs on the new intervals — a prefill
+        straddling the cheap→fast boundary attributes each side to its own
+        bucket (10 s cheap + 20 s fast), and the decode-only split is retained
+        separately."""
+        start, end = datetime(2026, 8, 2, 9, 0, 0), datetime(2026, 8, 2, 11, 0, 0)
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 10, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 10, 0, 20), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 10, 0, 10), "s1", 20000.0)]
+        busy = self._busy(streams, ttfts, start, end)
+        assert busy is not None
+        assert busy.cheap_busy_seconds == 10.0  # 09:59:50–10:00:00
+        assert busy.fast_busy_seconds == 20.0
+        assert busy.busy_seconds == 30.0
+        # Decode-only layer keeps the old all-fast behaviour.
+        assert busy.decode_cheap_busy_seconds == 0.0
+        assert busy.decode_fast_busy_seconds == 10.0
+
+    def test_hourly_busy_recomputed_on_dispatch_intervals(self):
+        """AC3: ``hourly_busy`` attributes the prefill to its dispatch hour
+        (09:59:50 → hour 9) and the rest to the first-byte hour."""
+        start, end = datetime(2026, 8, 2, 9, 0, 0), datetime(2026, 8, 2, 11, 0, 0)
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 10, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 10, 0, 20), "s1"),
+        ]
+        ttfts = [_ttft_event(datetime(2026, 8, 2, 10, 0, 10), "s1", 20000.0)]
+        busy = self._busy(streams, ttfts, start, end)
+        assert busy is not None
+        hourly = dict(busy.hourly_busy)
+        assert hourly[datetime(2026, 8, 2, 9, 0, 0)] == 10.0
+        assert hourly[datetime(2026, 8, 2, 10, 0, 0)] == 20.0
+
+    def test_no_ttft_events_keeps_disambiguation_compat(self):
+        """AC3 compat: without TTFT events every interval falls back to its
+        decode interval, so the busy figure stays the decode-only figure and
+        the bounds coincide."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 15), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 25), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(streams, WINDOW_START, WINDOW_END, _schedule())
+        assert busy is not None
+        assert busy.busy_seconds == 10.0
+        assert busy.decode_busy_seconds == 10.0
+        assert busy.prefill_busy_seconds == 0.0
+        assert busy.busy_lower_bound_seconds == busy.busy_upper_bound_seconds == 10.0
+        assert busy.prefill_extended_streams == 0
+
+    def test_aggregate_wires_dispatch_intervals_end_to_end(self):
+        """AC1 end-to-end through ``aggregate()``: a real dispatch line extends
+        the busy union back to its back-calculated dispatch time."""
+        start = datetime(2026, 10, 22, 20, 0, 0)
+        end = datetime(2026, 10, 22, 22, 0, 0)
+        lines = [
+            fixtures.STREAM_STARTED_PREFILL_COLD,  # 21:15:02,477 (= first byte)
+            fixtures.DISPATCH_FIRST_BYTE_COLD,  # ttft_ms=55656.5 -> dispatch 21:14:06.8
+            # Synthesised finish 10 s after the first byte.
+            "2026-10-22 21:15:12,477 - INFO - Stream finished: reason=stop "
+            f"tokens=1000/20/1020 session={fixtures.PREFILL_SESSION} provider=local "
+            "model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), start, end, _schedule())
+        assert summary.busy is not None
+        busy = summary.busy
+        assert busy.streams == 1
+        assert busy.decode_busy_seconds == 10.0
+        assert busy.busy_seconds == pytest.approx(65.7, abs=0.1)  # 55.6565 s prefill + 10 s
+        assert busy.prefill_busy_seconds == pytest.approx(55.7, abs=0.1)
+        assert busy.prefill_extended_streams == 1
+        assert busy.prefill_stats is not None
+        assert list(busy.prefill_stats.samples) == pytest.approx([55.6565])
+
+    def test_report_renders_definition_and_labelled_bounds(self):
+        """AC2/AC3: the ``## Local model utilization`` section states the
+        dispatch → finish definition, retains the decode-only row as the
+        labelled lower bound, and labels the busy figure as the upper bound."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert summary.busy is not None
+        md = reporting.build_report(summary, None)
+        section = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "from dispatch to finish" in section
+        assert "prefill + decode" in section
+        assert "upper bound (dispatch → finish)" in section
+        assert "Decode-only busy — lower bound" in section
+        assert "| Prefill busy (upper − lower) | 30s |" in section
+        assert "1 of 1 stream(s) contributed a measured prefill" in section
+        # Busy of 40 s over the 1h window.
+        assert "40s (1.1%)" in section
+
+
+class TestDecodeStats:
+    """Per-stream local decode (first byte → finish) slot-seconds
+    (LP-0MVJNDOUU0059MMO).
+
+    Decode is measured on the same paired streams as busy, but reported as
+    **slot-seconds** (the sum of the per-stream decode durations — the integral
+    of concurrency), never as wall-clock, so it can be added to the prefill
+    slot-seconds to split phase slot time.
+    """
+
+    def test_concurrent_decode_is_slot_seconds_not_wall_clock(self):
+        """Two concurrent 10 s decodes are 20 slot-seconds of decode work but
+        only 10 s of wall clock."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 10), "s2"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None and busy.decode_stats is not None
+        assert busy.decode_stats.total_seconds == pytest.approx(20.0)
+        assert busy.decode_stats.unit == "slot-seconds"
+        # The wall-clock union of the same decodes is only 10 s.
+        assert busy.decode_busy_seconds == pytest.approx(10.0)
+
+    def test_decode_percentiles_use_linear_interpolation(self):
+        """p10/p50/p90/max over the per-stream decode durations, matching the
+        prefill percentiles: 10/20/30/40 s -> 13/25/37/40 s."""
+        streams: list[log_parser.LogEvent] = []
+        for index, decode_s in enumerate((10, 20, 30, 40)):
+            ts = datetime(2026, 8, 2, 14, index, 0)
+            session = f"s{index}"
+            streams.append(_local_event("stream_started", ts, session))
+            streams.append(
+                _local_event("stream_finished", ts + timedelta(seconds=decode_s), session)
+            )
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None and busy.decode_stats is not None
+        stats = busy.decode_stats
+        assert stats.count == 4
+        assert stats.p10 == pytest.approx(13.0)
+        assert stats.p50 == pytest.approx(25.0)
+        assert stats.p90 == pytest.approx(37.0)
+        assert stats.max_seconds == pytest.approx(40.0)
+        assert stats.total_seconds == pytest.approx(100.0)
+
+    def test_unfinished_stream_is_unknown_decode(self):
+        """A stream with no logged finish has unknown decode time: excluded
+        from the percentiles, retained in the stream count."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 5, 0), "aborted"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None and busy.decode_stats is not None
+        assert busy.decode_stats.count == 1
+        assert busy.decode_stats.unknown_count == 1
+        assert busy.decode_stats.stream_count == 2
+        assert busy.decode_stats.total_seconds == pytest.approx(10.0)
+
+    def test_decode_stats_available_without_ttft_events(self):
+        """Decode does not depend on the first-byte lines: with no TTFT events
+        supplied the prefill stats are absent but decode is still reported."""
+        streams = [
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 25), "s1"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            streams, WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert busy is not None
+        assert busy.prefill_stats is None
+        assert busy.decode_stats is not None
+        assert busy.decode_stats.total_seconds == pytest.approx(15.0)
+
+
+class TestPrefillVsDecodeSection:
+    """``## Prefill vs decode`` report section (LP-0MVJNDOUU0059MMO).
+
+    The section splits local phase slot time into prefill (dispatch → first
+    byte) and decode (first byte → finish) as absolute slot-seconds and as a
+    percentage of combined phase slot-time that always sums to 100%, with
+    p10/p50/p90/max per phase, an explicit slot-seconds-not-wall-clock
+    statement, and a named reason plus an eval-timing pointer when no prefill
+    samples exist.
+    """
+
+    @staticmethod
+    def _summary(lines: list[str]) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events(lines), WINDOW_START, WINDOW_END, _schedule()
+        )
+
+    @staticmethod
+    def _section(md: str) -> str:
+        return md.split("## Prefill vs decode", 1)[1].split("\n## ", 1)[0]
+
+    @staticmethod
+    def _row(section: str, label: str) -> list[str]:
+        line = next(
+            ln for ln in section.splitlines() if ln.startswith(f"| {label}")
+        )
+        return [cell.strip() for cell in line.strip("|").split("|")]
+
+    def test_section_splits_phase_slot_seconds_and_sums_to_100_percent(self):
+        """A 30 s prefill + 10 s decode stream reports 30 / 10 slot-seconds
+        and 75.0% / 25.0% of combined phase slot-time."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        summary = self._summary(lines)
+        assert summary.busy is not None
+        section = self._section(reporting.build_report(summary, None))
+        prefill = self._row(section, "Prefill (dispatch → first byte)")
+        decode = self._row(section, "Decode (first byte → finish)")
+        assert prefill[1] == "30s"
+        assert decode[1] == "10s"
+        assert float(prefill[2].rstrip("%")) == pytest.approx(75.0)
+        assert float(decode[2].rstrip("%")) == pytest.approx(25.0)
+        assert float(prefill[2].rstrip("%")) + float(decode[2].rstrip("%")) == pytest.approx(100.0)
+        total = self._row(section, "Total")
+        assert total[1] == "40s"
+        assert total[2] == "100.0%"
+
+    def test_section_states_slot_seconds_not_wall_clock(self):
+        """The header must say the figures are slot-seconds (the integral of
+        concurrency), not wall-clock."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        section = self._section(reporting.build_report(self._summary(lines), None))
+        flattened = " ".join(section.split())
+        assert "slot-seconds" in flattened
+        assert "integral of concurrency" in flattened
+        assert "not wall-clock" in flattened
+
+    def test_section_reports_prefill_and_decode_percentiles(self):
+        """p10/p50/p90/max are reported per phase over the per-stream samples."""
+        lines: list[str] = []
+        for index, prefill_s in enumerate((10, 20, 30, 40)):
+            ts = f"2026-08-02 14:0{index}:00,000"
+            lines.append(
+                f"{ts} - INFO - Stream started: provider=local model=Qwen3 session=s{index} request=[]"
+            )
+            lines.append(
+                "2026-08-02 14:0" + str(index) + ":59,000 - INFO - Stream finished: "
+                f"reason=stop tokens=100/10/110 session=s{index} provider=local model=Qwen3 request=[]"
+            )
+            lines.append(
+                f"{ts} - INFO - dispatch_first_byte_ms={prefill_s * 1000.0} "
+                f"dispatch_to_first_byte_ms={prefill_s * 1000.0} cache_state=warm "
+                f"cached_ratio=0.900 queue_wait_ms=0.0 session=s{index} model=Qwen3"
+            )
+        section = self._section(reporting.build_report(self._summary(lines), None))
+        prefill = self._row(section, "Prefill (dispatch → first byte)")
+        decode = self._row(section, "Decode (first byte → finish)")
+        # p10, median, p90, max, samples
+        assert [float(v) for v in prefill[3:7]] == [13.0, 25.0, 37.0, 40.0]
+        assert prefill[7] == "4"
+        assert [float(v) for v in decode[3:7]] == [59.0, 59.0, 59.0, 59.0]
+        assert decode[7] == "4"
+
+    def test_section_without_prefill_samples_names_reason_and_eval_timing_pointer(self):
+        """With no first-byte lines the section prints a named reason and
+        points at the llama-server eval-timing diagnostic instead of leaving an
+        unattributed blank; decode is still attributed."""
+        lines = [
+            "2026-08-02 14:00:10,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:20,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        section = self._section(reporting.build_report(self._summary(lines), None))
+        assert "No prefill samples" in section
+        assert "unknown prefill" in section
+        assert "`## Decode speed` / `## Prompt eval speed`" in section
+        assert "eval-timing" in section
+        prefill = self._row(section, "Prefill (dispatch → first byte)")
+        decode = self._row(section, "Decode (first byte → finish)")
+        assert prefill[1] == "-" and prefill[2] == "-"
+        assert decode[1] == "10s" and decode[2] == "100.0%"
+
+    def test_section_with_no_local_traffic_renders_named_reason(self):
+        """An empty window prints a named reason rather than an empty table."""
+        section = self._section(
+            reporting.build_report(self._summary([]), None)
+        )
+        assert "No local traffic" in section
+        assert section.count("|") == 0
+
+    def test_json_summary_exposes_phase_split(self):
+        """The machine-readable summary carries the same phase split."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        data = reporting.summary_to_json(self._summary(lines))
+        phase = data["local_busy"]["prefill_vs_decode"]
+        assert phase["unit"] == "slot-seconds"
+        assert phase["prefill"]["slot_seconds"] == pytest.approx(30.0)
+        assert phase["prefill"]["pct"] == pytest.approx(75.0)
+        assert phase["decode"]["slot_seconds"] == pytest.approx(10.0)
+        assert phase["decode"]["pct"] == pytest.approx(25.0)
+        assert phase["prefill"]["samples"] == 1
+        assert phase["decode"]["samples"] == 1
+        json.dumps(data)
 
 
 class TestSummaryByHourActivity:
@@ -2539,11 +4070,11 @@ class TestSummaryByHourActivity:
         # window-bounded bucket duration.
         md = reporting.build_report(self._summary(), None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| Hour | Busy | % | Requests started | Local attempts | Local served | Fallbacks | Local-skip |" in section
-        assert "| 09:00-10:00 | 30s | 0.8% | 1 | 1 | 1 | 0 | 0 |" in section
-        assert "| 10:00-11:00 | 5s | 0.1% | 2 | 1 | 1 | 1 | 1 |" in section
-        assert "| 11:00-12:00 | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 |" in section
-        assert "| Totals | 35s | 0.3% | 4 | 2 | 2 | 1 | 1 |" in section
+        assert "| Hour | State | Busy | % | Requests started | Local attempts | Local served | Local dispatch | Lease denials | Fallbacks | Local-skip |" in section
+        assert "| 09:00-10:00 | serving | 30s | 0.8% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | serving | 5s | 0.1% | 2 | 1 | 1 | 0 | 0 | 1 | 1 |" in section
+        assert "| 11:00-12:00 | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| Totals | serving | 35s | 0.3% | 4 | 2 | 2 | 0 | 0 | 1 | 1 |" in section
 
     def test_long_running_session_contributes_to_each_hour(self):
         # A single session whose requests start in different hours: the second
@@ -2561,8 +4092,8 @@ class TestSummaryByHourActivity:
         assert summary.hourly_activity[datetime(2026, 8, 2, 10, 0, 0)]["requests_started"] == 1
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 09:00-10:00 | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 |" in section
-        assert "| 10:00-11:00 | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 |" in section
+        assert "| 09:00-10:00 | serving | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | serving | 10s | 0.3% | 1 | 1 | 1 | 0 | 0 | 0 | 0 |" in section
 
     def test_multiple_requests_same_hour_sum_activity(self):
         # Two local requests in hour 10 (s2 + s4): activity columns sum the
@@ -2574,8 +4105,8 @@ class TestSummaryByHourActivity:
         summary = aggregation.aggregate(_events(lines), self.WINDOW_START, self.WINDOW_END, _schedule())
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 10:00-11:00 | 15s | 0.4% | 3 | 2 | 2 | 1 | 1 |" in section
-        assert "| Totals | 45s | 0.4% | 5 | 3 | 3 | 1 | 1 |" in section
+        assert "| 10:00-11:00 | serving | 15s | 0.4% | 3 | 2 | 2 | 0 | 0 | 1 | 1 |" in section
+        assert "| Totals | serving | 45s | 0.4% | 5 | 3 | 3 | 0 | 0 | 1 | 1 |" in section
 
     def test_renders_without_local_traffic(self):
         # No local streams (busy is None): the table still renders at the top
@@ -2591,8 +4122,8 @@ class TestSummaryByHourActivity:
         md = reporting.build_report(summary, None)
         assert md.index("## Summary by hour") < md.index("## Session summary")
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| 10:00-11:00 | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 |" in section
-        assert "| Totals | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 |" in section
+        assert "| 10:00-11:00 | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| Totals | idle | 0s | 0.0% | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
         assert "## Local model utilization" not in md
 
     def test_no_sessions_renders_no_data_note(self):
@@ -2601,8 +4132,8 @@ class TestSummaryByHourActivity:
         summary = aggregation.aggregate([], self.WINDOW_START, self.WINDOW_END, _schedule())
         md = reporting.build_report(summary, None)
         section = md.split("## Summary by hour", 1)[1].split("## ", 1)[0]
-        assert "| _No session data in window._ | - | - | - | - | - | - | - |" in section
-        assert "| Totals | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 |" in section
+        assert "| _No session data in window._ | - | - | - | - | - | - | - | - | - | - |" in section
+        assert "| Totals | idle | 0s | 0.0% | 0 | 0 | 0 | 0 | 0 | 0 | 0 |" in section
 
     def test_json_summary_exposes_hourly_activity_and_classification(self):
         # The machine-readable summary exposes per-hour activity (matching the
@@ -2610,12 +4141,18 @@ class TestSummaryByHourActivity:
         # absolute hour and self-describing.
         data = reporting.summary_to_json(self._summary())
         assert data["hourly_activity"] == [
-            {"hour": "2026-08-02 09:00:00", "requests_started": 1, "local_attempts": 1,
-             "local_served": 1, "fallbacks": 0, "local_skip": 0},
-            {"hour": "2026-08-02 10:00:00", "requests_started": 2, "local_attempts": 1,
-             "local_served": 1, "fallbacks": 1, "local_skip": 1},
-            {"hour": "2026-08-02 11:00:00", "requests_started": 1, "local_attempts": 0,
-             "local_served": 0, "fallbacks": 0, "local_skip": 0},
+            {"hour": "2026-08-02 09:00:00", "state": "serving", "states": ["serving"],
+             "requests_started": 1, "local_attempts": 1,
+             "local_served": 1, "local_dispatch_attempts": 0, "local_denials": 0,
+             "lease_active_fallbacks": 0, "fallbacks": 0, "local_skip": 0},
+            {"hour": "2026-08-02 10:00:00", "state": "serving", "states": ["serving"],
+             "requests_started": 2, "local_attempts": 1,
+             "local_served": 1, "local_dispatch_attempts": 0, "local_denials": 0,
+             "lease_active_fallbacks": 0, "fallbacks": 1, "local_skip": 1},
+            {"hour": "2026-08-02 11:00:00", "state": "idle", "states": ["idle"],
+             "requests_started": 1, "local_attempts": 0,
+             "local_served": 0, "local_dispatch_attempts": 0, "local_denials": 0,
+             "lease_active_fallbacks": 0, "fallbacks": 0, "local_skip": 0},
         ]
         assert data["hourly_session_classification"] == [
             {"hour": "2026-08-02 09:00:00", "local_only": 1, "fell_back": 0, "remote_only": 0},
@@ -2787,10 +4324,11 @@ class TestHourlyRollingWindow:
         }
         for hour, busy in expected_busy.items():
             assert hour in rows, f"missing row {hour}"
-            assert rows[hour][1] == busy, f"{hour} busy {rows[hour][1]} != {busy}"
-            # Requests started | Local attempts | Local served | Fallbacks | Local-skip
-            assert rows[hour][3:8] == ["1", "1", "1", "0", "0"], hour
-        afternoon_started = sum(int(rows[h][3]) for h in expected_busy)
+            assert rows[hour][2] == busy, f"{hour} busy {rows[hour][2]} != {busy}"
+            # Hour | State | Busy | % | Requests started | Local attempts | Local served |
+            # Local dispatch | Lease denials | Fallbacks | Local-skip
+            assert rows[hour][4:11] == ["1", "1", "1", "0", "0", "0", "0"], hour
+        afternoon_started = sum(int(rows[h][4]) for h in expected_busy)
         assert afternoon_started == 7
 
     def test_no_row_exceeds_100_percent_and_no_duplicate_busy_duration(self):
@@ -2798,13 +4336,13 @@ class TestHourlyRollingWindow:
         # partials do not share a busy duration (7s vs 3m 00s), proving
         # absolute-hour keying rather than hour-of-day collision.
         rows = self._rows()
-        assert rows["11:04-12:00"][1] == "7s"
-        assert rows["11:04-12:00"][2] == "0.2%"
-        assert rows["11:00-11:04"][1] == "3m 00s"
-        assert rows["11:00-11:04"][2] == "75.0%"
-        pcts = [float(cell.rstrip("%")) for cell in (r[2] for r in rows.values())]
+        assert rows["11:04-12:00"][2] == "7s"
+        assert rows["11:04-12:00"][3] == "0.2%"
+        assert rows["11:00-11:04"][2] == "3m 00s"
+        assert rows["11:00-11:04"][3] == "75.0%"
+        pcts = [float(cell.rstrip("%")) for cell in (r[3] for r in rows.values())]
         assert pcts and all(p <= 100.0 for p in pcts)
-        busy_cells = [r[1] for label, r in rows.items() if label != "Totals"]
+        busy_cells = [r[2] for label, r in rows.items() if label != "Totals"]
         non_zero = [b for b in busy_cells if b != "0s"]
         assert len(non_zero) == len(set(non_zero))
 
@@ -3517,6 +5055,87 @@ class TestReportRestructure:
         section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
         assert "| Provider | Model | Sessions | Standard | Low | Requests | Fell back |" in section
         assert "| local | Qwen3 | 2 | 2 (100.0%) | 0 (0.0%) |" in section
+
+
+class TestProviderContextSkipReport:
+    """``## Provider context skips`` section and JSON (LP-0MVMBM1Y3001TPRT
+    AC3/AC6): dedicated breakdown with count, % of skips, standard/low split,
+    provider breakdown and the ceiling that was hit."""
+
+    def _aggregate(self, lines):
+        return aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+
+    def test_dedicated_section_renders_breakdown(self):
+        res = self._aggregate(
+            [
+                "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+                "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+                "reason=provider_context_exceeded session=s1",
+                "2026-08-02 14:00:21,000 - INFO - routing_skip_provider_context provider=opencode-go "
+                "type=remote status=provider_context_exceeded estimated_tokens=195787 limit=196608 "
+                "reason=provider_context_exceeded session=s1",
+                "2026-08-02 14:00:22,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+                "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+                "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+                "provider session=s1",
+            ]
+        )
+        md = reporting.build_report(res, config=None)
+        section = md.split("## Provider context skips", 1)[1].split("## ", 1)[0]
+        # Header bullet: count + share of all skip events (2 of 3).
+        assert "**2**" in section and "66.7% of 3 skip events" in section
+        # Provider rows with category-relative Standard/Low and the ceiling.
+        assert "| munitoai-free | remote | 1 | 33.3% | 1 (50.0%) | 0 (0.0%) | 150000 (1) |" in section
+        assert "| opencode-go | remote | 1 | 33.3% | 1 (50.0%) | 0 (0.0%) | 196608 (1) |" in section
+        # Skips and local skips have separate tables (never conflated).
+        assert "## routing_skip_local reasons" in md
+
+    def test_section_omitted_without_events(self):
+        res = self._aggregate(
+            [
+                "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 "
+                "session=plain request=[]",
+                "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 "
+                "session=plain provider=local model=Qwen3 request=[]",
+            ]
+        )
+        md = reporting.build_report(res, config=None)
+        assert "## Provider context skips" not in md
+
+    def test_absent_limit_degrades_to_not_logged(self):
+        # AC8: an event without ``limit`` renders as ``not logged`` instead of
+        # zero or a crash, and the note names how many lacked the field.
+        res = self._aggregate(
+            [
+                "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+                "type=remote status=provider_context_exceeded estimated_tokens=160001 "
+                "reason=provider_context_exceeded session=s2",
+            ]
+        )
+        md = reporting.build_report(res, config=None)
+        section = md.split("## Provider context skips", 1)[1].split("## ", 1)[0]
+        assert "carried no `limit=` field" in section
+        assert "| not logged |" in section
+
+    def test_json_summary_exposes_provider_context_skips(self):
+        res = self._aggregate(
+            [
+                "2026-08-02 14:00:20,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+                "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+                "reason=provider_context_exceeded session=s1",
+                "2026-08-02 14:00:22,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+                "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+                "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+                "provider session=s1",
+            ]
+        )
+        j = reporting.summary_to_json(res)
+        obj = j["provider_context_skips"]
+        assert obj["total"] == 1
+        assert obj["share_of_skips"] == pytest.approx(0.5)  # 1 of 2 skip events
+        assert obj["by_provider"] == {"munitoai-free": 1}
+        assert obj["by_limit"] == {"150000": 1}
+        assert obj["standard"] == 1 and obj["low"] == 0
 
 
 class TestCategoryRelativePercentages:
@@ -5157,3 +6776,1019 @@ class TestIdleAdmitCounter:
         data = reporting.summary_to_json(result.summary)
         assert data["local_idle_admit"] == 2
         json.dumps(data)
+
+
+class TestMachineReadablePrefillAndBusyJson:
+    """Machine-readable prefill and redefined-busy JSON surface
+    (LP-0MVJNW6SN008AKH3).
+
+    ``summary_to_json`` gains a top-level ``local_prefill`` object (prefill
+    slot-seconds total, count, p10/p50/p90/max, unknown-prefill count and the
+    slot-seconds unit) and ``local_busy`` gains the dispatch → finish
+    definition marker, the retained decode-only union, the wall-clock prefill
+    span and the labelled lower/upper bounds — while every legacy key stays in
+    place so existing consumers keep working.
+    """
+
+    @staticmethod
+    def _summary(lines: list[str]) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events(lines), WINDOW_START, WINDOW_END, _schedule()
+        )
+
+    @staticmethod
+    def _prefill_lines(prefill_seconds: list[float]) -> list[str]:
+        """One local stream per prefill duration, each with a first-byte line."""
+        lines: list[str] = []
+        for index, seconds in enumerate(prefill_seconds):
+            ts = f"2026-08-02 14:0{index}:30,000"
+            lines.append(
+                f"{ts} - INFO - Stream started: provider=local model=Qwen3 "
+                f"session=s{index} request=[]"
+            )
+            lines.append(
+                "2026-08-02 14:0" + str(index) + ":40,000 - INFO - Stream finished: "
+                f"reason=stop tokens=100/10/110 session=s{index} provider=local "
+                "model=Qwen3 request=[]"
+            )
+            lines.append(
+                f"{ts} - INFO - dispatch_first_byte_ms={seconds * 1000.0} "
+                f"dispatch_to_first_byte_ms={seconds * 1000.0} cache_state=warm "
+                f"cached_ratio=0.900 queue_wait_ms=0.0 session=s{index} model=Qwen3"
+            )
+        return lines
+
+    def test_local_prefill_reports_slot_seconds_count_and_percentiles(self):
+        """A window with prefill samples exposes the total, count and
+        p10/p50/p90/max in slot-seconds."""
+        data = reporting.summary_to_json(
+            self._summary(self._prefill_lines([10, 20, 30, 40]))
+        )
+        prefill = data["local_prefill"]
+        assert prefill["unit"] == "slot-seconds"
+        assert prefill["slot_seconds"] == pytest.approx(100.0)
+        assert prefill["count"] == 4
+        assert prefill["streams"] == 4
+        assert prefill["unknown_prefill"] == 0
+        assert prefill["p10"] == pytest.approx(13.0)
+        assert prefill["p50"] == pytest.approx(25.0)
+        assert prefill["p90"] == pytest.approx(37.0)
+        assert prefill["max_seconds"] == pytest.approx(40.0)
+        json.dumps(data)  # round-trips
+
+    def test_local_prefill_without_samples_keeps_structure(self):
+        """Local traffic with no first-byte line keeps every key: zero total,
+        null percentiles and the stream counted as unknown prefill."""
+        lines = [
+            "2026-08-02 14:00:10,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:20,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        data = reporting.summary_to_json(self._summary(lines))
+        prefill = data["local_prefill"]
+        assert prefill["unit"] == "slot-seconds"
+        assert prefill["slot_seconds"] == 0.0
+        assert prefill["count"] == 0
+        assert prefill["streams"] == 1
+        assert prefill["unknown_prefill"] == 1
+        for key in ("p10", "p50", "p90", "max_seconds"):
+            assert prefill[key] is None
+        json.dumps(data)
+
+    def test_local_prefill_is_null_without_local_traffic(self):
+        """No local traffic means no busy or prefill object at all (matching
+        ``local_busy``'s None convention)."""
+        data = reporting.summary_to_json(self._summary([]))
+        assert data["local_busy"] is None
+        assert data["local_prefill"] is None
+        json.dumps(data)
+
+    def test_local_busy_exposes_definition_prefill_span_and_bounds(self):
+        """A 30 s prefill + 10 s decode stream reports the dispatch → finish
+        union as busy, the decode-only union as the lower bound, the prefill
+        wall-clock span as their difference, and the labelled bounds."""
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        busy = reporting.summary_to_json(self._summary(lines))["local_busy"]
+        assert busy["definition"] == "dispatch_to_finish"
+        assert busy["busy_seconds"] == pytest.approx(40.0)
+        assert busy["decode_busy_seconds"] == pytest.approx(10.0)
+        assert busy["prefill_busy_seconds"] == pytest.approx(30.0)
+        assert busy["upper_bound_label"] == aggregation.BUSY_UPPER_BOUND_LABEL
+        assert busy["lower_bound_label"] == aggregation.BUSY_LOWER_BOUND_LABEL
+        assert busy["prefill_extended_streams"] == 1
+
+    def test_local_busy_keeps_every_legacy_key(self):
+        """Legacy consumers keep working: the pre-change ``local_busy`` keys
+        are all still present, and the phase split still carries both totals."""
+        busy = reporting.summary_to_json(
+            self._summary(self._prefill_lines([30]))
+        )["local_busy"]
+        legacy = {
+            "window_seconds",
+            "busy_seconds",
+            "busy_pct",
+            "idle_seconds",
+            "idle_pct",
+            "total_compute_seconds",
+            "streams",
+            "avg_stream_duration_seconds",
+            "peak_concurrency",
+            "avg_concurrency",
+            "unfinished_streams",
+            "pre_window_unfinished",
+            "fast_busy_seconds",
+            "cheap_busy_seconds",
+            "fast_window_seconds",
+            "cheap_window_seconds",
+            "hourly_busy",
+            "prefill_vs_decode",
+        }
+        assert legacy <= set(busy)
+
+    def test_local_busy_has_unique_keys(self):
+        """No dictionary key is duplicated — a regression guard for F601.
+
+        Duplicate key literals silently overwrite; this test catches any
+        accidental re-addition (LP-0MVKE63D2007WD0E)."""
+        busy = reporting.summary_to_json(
+            self._summary(self._prefill_lines([30]))
+        )["local_busy"]
+        keys = list(busy.keys())
+        assert len(keys) == len(set(keys)), (
+            f"Duplicate keys detected: {[k for k in keys if keys.count(k) > 1]}"
+        )
+        phase = busy["prefill_vs_decode"]
+        assert phase["prefill"]["slot_seconds"] == pytest.approx(30.0)
+        assert phase["decode"]["slot_seconds"] == pytest.approx(10.0)
+        assert phase["prefill"]["pct"] + phase["decode"]["pct"] == pytest.approx(100.0)
+
+    def test_cli_json_summary_includes_new_keys(self, tmp_path, capsys):
+        """The ``--json`` CLI summary carries the new keys end to end."""
+        import analyze_proxy_usage as cli
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        rc = cli.main(
+            [
+                "--log-dir", str(log_dir),
+                "--start", "2026-08-02 14:00:00",
+                "--end", "2026-08-02 15:00:00",
+                "--output-dir", str(tmp_path / "out"),
+                "--json",
+            ]
+        )
+        assert rc == 0
+        data = json.loads(capsys.readouterr().out)
+        prefill = data["local_prefill"]
+        assert prefill["unit"] == "slot-seconds"
+        assert prefill["count"] == 0
+        # Both in-window local streams carry no first-byte line: unknown prefill.
+        assert prefill["unknown_prefill"] == 2
+        busy = data["local_busy"]
+        assert busy["definition"] == "dispatch_to_finish"
+        assert busy["decode_busy_seconds"] == pytest.approx(busy["busy_seconds"])
+        assert busy["prefill_busy_seconds"] == pytest.approx(0.0)
+        assert busy["upper_bound_label"] == aggregation.BUSY_UPPER_BOUND_LABEL
+        assert busy["lower_bound_label"] == aggregation.BUSY_LOWER_BOUND_LABEL
+
+    def test_cli_text_summary_references_the_corrected_busy_figure(self, tmp_path, capsys):
+        """The stdout summary names the dispatch → finish definition and keeps
+        the decode-only lower bound visible next to it."""
+        import analyze_proxy_usage as cli
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        rc = cli.main(
+            [
+                "--log-dir", str(log_dir),
+                "--start", "2026-08-02 14:00:00",
+                "--end", "2026-08-02 15:00:00",
+                "--output-dir", str(tmp_path / "out"),
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "local model busy (dispatch → finish)" in out
+        assert "decode-only busy (lower bound)" in out
+
+
+# ---------------------------------------------------------------------------
+# Regenerated report end-to-end verification (LP-0MVJO4382002FJF2)
+# ---------------------------------------------------------------------------
+
+
+class TestRegeneratedReportExpectedOrder:
+    """End-to-end verification of a regenerated report.
+
+    The fixture mirrors the intake brief's measured shape
+    (LP-0MVGCQ421005IXGC): per-stream prefill (dispatch → first byte)
+    dominates decode (first byte → finish) at a 180 s / 100 s ratio (the
+    brief's ≈14.3 h prefill vs ≈7.8 h decode), and the six streams are spaced
+    so their dispatch → finish intervals never overlap. That reproduces the
+    brief's expected order — ≈16 % decode-only busy becoming ≈46 % busy
+    (dispatch → finish union) — so the regenerated report must show the
+    corrected figure and the new ``## Prefill vs decode`` breakdown
+    (LP-0MVJO4382002FJF2 AC1/AC2/AC3/AC5).
+    """
+
+    PREFILL_S = 180.0
+    DECODE_S = 100.0
+    STREAMS = 6
+
+    @classmethod
+    def _stream_events(cls, index: int) -> list[str]:
+        """One local stream: dispatch at 14:0X:00, first byte after the
+        180 s prefill, finish after a further 100 s decode. The
+        ``dispatch_first_byte_ms`` line is stamped at first-byte time (real
+        proxy format) and carries the prefill duration."""
+        first_byte = datetime(2026, 8, 2, 14, 0, 0) + timedelta(
+            minutes=2 + index * 10, seconds=cls.PREFILL_S
+        )
+        finish = first_byte + timedelta(seconds=cls.DECODE_S)
+        session = f"verify-s{index}"
+        ts = first_byte.strftime("%Y-%m-%d %H:%M:%S")
+        return [
+            f"{ts},000 - INFO - Stream started: provider=local model=Qwen3 session={session} request=[]",
+            f"{finish.strftime('%Y-%m-%d %H:%M:%S')},000 - INFO - Stream finished: "
+            f"reason=stop tokens=1000/100/1100 session={session} provider=local model=Qwen3 request=[]",
+            f"{ts},000 - INFO - dispatch_first_byte_ms={cls.PREFILL_S * 1000.0:.1f} "
+            f"dispatch_to_first_byte_ms={cls.PREFILL_S * 1000.0 - 1.0:.1f} "
+            f"cache_state=warm cached_ratio=0.900 queue_wait_ms=0.0 "
+            f"session={session} model=Qwen3",
+        ]
+
+    @classmethod
+    def _write_logs(cls, tmp_path: Path, with_llama_log: bool = True) -> Path:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True)
+        lines = [
+            line
+            for index in range(cls.STREAMS)
+            for line in cls._stream_events(index)
+        ]
+        (log_dir / "proxy.log").write_text("\n".join(lines) + "\n")
+        if with_llama_log:
+            (log_dir / "llama-server.log").write_text(
+                fixtures.QWEN3_SPAWN_LINE
+                + "\n" + fixtures.PROMPT_EVAL_REAL
+                + "\n" + fixtures.DECODE_EVAL_REAL
+                + "\n" + fixtures.PROMPT_EVAL_REAL2
+                + "\n" + fixtures.DECODE_EVAL_REAL2
+                + "\n"
+            )
+        return log_dir
+
+    @staticmethod
+    def _row(section: str, label: str) -> list[str]:
+        line = next(
+            ln for ln in section.splitlines() if ln.startswith(f"| {label}")
+        )
+        return [cell.strip() for cell in line.strip("|").split("|")]
+
+    def test_regenerated_report_shows_corrected_busy_and_phase_split(self, tmp_path):
+        """AC1/AC3/AC5: the regenerated report over a brief-shaped window
+        shows the dispatch → finish busy figure as the upper bound with the
+        decode-only figure retained as the labelled lower bound plus the
+        definition-change note, and the busy % is materially higher than the
+        pre-change decode-only busy % (≈16 % → ≈46 % expected order)."""
+        log_dir = self._write_logs(tmp_path)
+        out_dir = tmp_path / "out"
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=out_dir,
+            config=None,
+        )
+        md = (out_dir / "report.md").read_text()
+
+        # -- Local model utilization: both figures + definition-change note --
+        util = md.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "Busy = at least one local slot active **from dispatch to finish**" in util
+        assert "previously counted decode only" in util
+        # 6 × 280 s dispatch→finish = 1680 s = 46.7% of the 1 h window.
+        assert "| Busy time — upper bound (dispatch → finish) | 28m 00s (46.7%)" in util
+        # Retained decode-only lower bound: 6 × 100 s = 600 s = 16.7%.
+        assert "| Decode-only busy — lower bound (`Stream started` → finish) | 10m 00s (16.7%)" in util
+        # Prefill busy = upper − lower = 1080 s.
+        assert "| Prefill busy (upper − lower) | 18m 00s |" in util
+
+        # -- Prefill vs decode split: prefill dominant, totals to 100% --
+        section = md.split("## Prefill vs decode", 1)[1].split("\n## ", 1)[0]
+        assert "slot-seconds" in section and "not wall-clock" in section
+        prefill = self._row(section, "Prefill (dispatch → first byte)")
+        decode = self._row(section, "Decode (first byte → finish)")
+        assert prefill[1] == "18m 00s"
+        assert decode[1] == "10m 00s"
+        assert float(prefill[2].rstrip("%")) == pytest.approx(64.3, abs=0.1)
+        assert float(decode[2].rstrip("%")) == pytest.approx(35.7, abs=0.1)
+        assert float(prefill[2].rstrip("%")) + float(decode[2].rstrip("%")) == pytest.approx(100.0)
+        total = self._row(section, "Total")
+        assert total[1] == "28m 00s" and total[2] == "100.0%"
+
+        # -- Busy % materially higher than the decode-only busy % (AC5) --
+        busy = result.summary.busy
+        assert busy is not None
+        decode_pct = busy.decode_busy_seconds / busy.window_seconds * 100
+        assert 15.0 <= decode_pct <= 17.5  # brief's ≈16 %
+        assert 44.0 <= busy.busy_pct <= 49.0  # brief's ≈46 %
+        assert busy.busy_pct >= 2.5 * decode_pct  # materially higher, same order
+
+    def test_speed_sections_are_never_an_unattributed_blank(self, tmp_path):
+        """AC4: ``## Decode speed`` / ``## Prompt eval speed`` render real
+        samples when llama-server eval timing exists, or a named,
+        self-diagnosing reason (log dir + scanned files, never a bare blank)
+        when it does not."""
+        for with_llama_log in (True, False):
+            log_dir = self._write_logs(
+                tmp_path / f"logs_{with_llama_log}", with_llama_log=with_llama_log
+            )
+            out_dir = tmp_path / f"out_{with_llama_log}"
+            reporting.run_analysis(
+                log_dir=log_dir,
+                window_start=WINDOW_START,
+                window_end=WINDOW_END,
+                output_dir=out_dir,
+                config=None,
+            )
+            md = (out_dir / "report.md").read_text()
+            for title in ("## Decode speed", "## Prompt eval speed"):
+                section = md.split(title, 1)[1].split("\n## ", 1)[0]
+                assert "| Model | Bucket | Samples |" in section or (
+                    "No llama-server eval timing samples" in section
+                    and "**Why no eval-timing samples**" in section
+                    and "Log directory scanned: `" in section
+                ), f"{title} in run with_llama_log={with_llama_log} is an unattributed blank"
+
+    def test_json_summary_matches_report_phase_split(self, tmp_path):
+        """AC2/AC5 cross-check: the machine-readable summary carries the same
+        corrected busy figure and phase split as the report, and the busy
+        union decomposes into decode lower bound + prefill span."""
+        log_dir = self._write_logs(tmp_path)
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out_json",
+            config=None,
+        )
+        data = reporting.summary_to_json(result.summary)
+        busy = data["local_busy"]
+        assert busy["definition"] == "dispatch_to_finish"
+        assert busy["busy_seconds"] == pytest.approx(1680.0)
+        assert busy["decode_busy_seconds"] == pytest.approx(600.0)
+        assert busy["prefill_busy_seconds"] == pytest.approx(1080.0)
+        assert busy["busy_pct"] == pytest.approx(1680.0 / 3600 * 100, abs=0.05)
+        assert busy["prefill_busy_seconds"] == pytest.approx(
+            busy["busy_seconds"] - busy["decode_busy_seconds"]
+        )
+        phase = busy["prefill_vs_decode"]
+        assert phase["unit"] == aggregation.SLOT_SECONDS_UNIT
+        assert phase["prefill"]["slot_seconds"] == pytest.approx(1080.0)
+        assert phase["decode"]["slot_seconds"] == pytest.approx(600.0)
+        assert phase["prefill"]["pct"] + phase["decode"]["pct"] == pytest.approx(100.0)
+        # The brief's expected-order sanity check: prefill ≈ 14.3 h / decode
+        # ≈ 7.8 h → prefill ≈ 65 % of combined phase slot-time.
+        assert 60.0 <= phase["prefill"]["pct"] <= 70.0
+        prefill = data["local_prefill"]
+        assert prefill["slot_seconds"] == pytest.approx(1080.0)
+        assert prefill["count"] == 6
+        json.dumps(data)  # round-trips
+
+
+# =========================================================================
+# Priority-window bucketing (LP-0MVKSXXIR006OBI2)
+#
+# The fast/cheap mode schedule is retired: ``server.priority_window`` (local
+# time, midnight-wrapping capable) is now the only cheap-mode signal for
+# windows whose logs carry no ``Mode scheduler`` evidence. Historical windows
+# that do carry mode evidence keep their mode-timeline attribution (AC5).
+# =========================================================================
+
+PRIORITY_CONFIG = {
+    "local_model_ctx_size": 262144,
+    "session_slot_pool_size": 2,
+    "priority_window": {
+        "enabled": True,
+        "start": "01:00",
+        "end": "10:00",
+        "start_minutes": 60,
+        "end_minutes": 600,
+    },
+}
+
+
+def _priority_mode_map(
+    start_minutes: float = 60,
+    end_minutes: float = 600,
+    wrap: bool = False,
+) -> bucketing.ModeScheduleMap:
+    """A mode map whose only fast/cheap source is the priority window."""
+    return bucketing.ModeScheduleMap.from_profiles(
+        {"default": {"session_slot_pool_size": 2, "local_model_ctx_size": 262144}},
+        None,
+        2,
+        priority_window=bucketing.PriorityWindow(
+            start_minutes=start_minutes, end_minutes=end_minutes
+        ),
+    )
+
+
+def _no_slot_schedule() -> bucketing.SlotSchedule:
+    """The unified config has no ``slot_schedule``: one flat fast period."""
+    return bucketing.schedule_from_config({}, 2)
+
+
+class TestPriorityWindowParsing:
+    """Window parsing: enabled/disabled, custom bounds, midnight wrap (AC4/AC6)."""
+
+    def test_normalize_parses_bounds_to_minutes(self):
+        window = config_loader.normalize_priority_window(
+            {"enabled": True, "start": "01:00", "end": "10:00"}
+        )
+        assert window == {
+            "enabled": True,
+            "start": "01:00",
+            "end": "10:00",
+            "start_minutes": 60,
+            "end_minutes": 600,
+        }
+
+    def test_normalize_custom_bounds(self):
+        window = config_loader.normalize_priority_window(
+            {"enabled": True, "start": "22:00", "end": "06:30"}
+        )
+        assert window["start_minutes"] == 22 * 60
+        assert window["end_minutes"] == 6 * 60 + 30
+
+    def test_normalize_disabled_flag(self):
+        window = config_loader.normalize_priority_window(
+            {"enabled": False, "start": "01:00", "end": "10:00"}
+        )
+        assert window["enabled"] is False
+
+    def test_normalize_invalid_bounds_fall_back_to_shipped_defaults(self):
+        window = config_loader.normalize_priority_window(
+            {"enabled": True, "start": "not-a-time", "end": "99:99"}
+        )
+        assert (window["start_minutes"], window["end_minutes"]) == (60, 600)
+
+    def test_normalize_absent_window(self):
+        assert config_loader.normalize_priority_window(None) is None
+        assert config_loader.priority_window_bounds({}) is None
+
+    def test_parse_config_text_reads_priority_window(self):
+        cfg = config_loader.parse_config_text(
+            "server:\n"
+            "  priority_window:\n"
+            "    enabled: true\n"
+            '    start: "22:00"\n'
+            '    end: "06:00"\n'
+        )
+        assert cfg["priority_window"]["start_minutes"] == 22 * 60
+        assert cfg["priority_window"]["end_minutes"] == 6 * 60
+        assert cfg["priority_window"]["enabled"] is True
+
+    def test_regex_fallback_parser_reads_priority_window(self):
+        cfg = config_loader._parse_config_text_regex(
+            "server:\n"
+            "  priority_window:\n"
+            "    enabled: false\n"
+            '    start: "02:30"\n'
+            '    end: "05:45"\n'
+        )
+        window = config_loader.normalize_priority_window(cfg["priority_window"])
+        assert window["enabled"] is False
+        assert (window["start_minutes"], window["end_minutes"]) == (150, 345)
+
+    def test_discover_configs_exposes_window_bounds(self, tmp_path):
+        (tmp_path / "proxy").mkdir()
+        (tmp_path / "proxy" / "config.yaml").write_text(
+            "server:\n"
+            "  local_model_ctx_size: 131072\n"
+            "  priority_window:\n"
+            "    enabled: true\n"
+            '    start: "01:00"\n'
+            '    end: "10:00"\n'
+        )
+        configs = config_loader.discover_configs(start=tmp_path)
+        bounds = configs["priority_window_bounds"]
+        assert bounds["enabled"] is True
+        assert (bounds["start_minutes"], bounds["end_minutes"]) == (60, 600)
+
+
+class TestPriorityWindowSchedule:
+    """``PriorityWindow``/``ModeScheduleMap`` window semantics (AC1/AC4)."""
+
+    def test_segments_split_at_the_bounds(self):
+        window = bucketing.PriorityWindow(start_minutes=60, end_minutes=600)
+        assert window.segments() == [
+            (0.0, 60, "fast"),
+            (60, 600, "cheap"),
+            (600, float(bucketing.MINUTES_PER_DAY), "fast"),
+        ]
+
+    def test_midnight_wrap_is_split_across_midnight(self):
+        window = bucketing.PriorityWindow(
+            start_minutes=22 * 60, end_minutes=6 * 60
+        )
+        assert window.wraps is True
+        assert window.segments() == [
+            (0.0, 360, "cheap"),
+            (360, 1320, "fast"),
+            (1320, float(bucketing.MINUTES_PER_DAY), "cheap"),
+        ]
+        assert window.contains(23 * 60) is True
+        assert window.contains(3 * 60) is True
+        assert window.contains(12 * 60) is False
+
+    def test_disabled_window_yields_no_schedule(self):
+        assert bucketing.PriorityWindow.from_config(
+            {"priority_window": {"enabled": False, "start": "01:00", "end": "10:00"}}
+        ) is None
+        assert bucketing.PriorityWindow.from_config({}) is None
+        assert bucketing.PriorityWindow.from_config(None) is None
+
+    def test_from_config_accepts_raw_and_normalised_blocks(self):
+        raw = bucketing.PriorityWindow.from_config(
+            {"priority_window": {"enabled": True, "start": "02:00", "end": "04:00"}}
+        )
+        assert raw == bucketing.PriorityWindow(120.0, 240.0)
+        normalised = bucketing.PriorityWindow.from_config(PRIORITY_CONFIG)
+        assert normalised == bucketing.PriorityWindow(60.0, 600.0)
+
+    def test_profile_source_reports_priority_window(self):
+        assert _priority_mode_map().profile_source == "server.priority_window"
+
+    def test_profile_source_is_none_without_window_or_timeline(self):
+        mm = bucketing.ModeScheduleMap.from_profiles({"default": None}, None, 2)
+        assert mm.profile_source is None
+
+    def test_bucket_label_uses_window(self):
+        mm = _priority_mode_map()
+        schedule = _no_slot_schedule()
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 3, 0), schedule, mm) == "cheap"
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 12, 0), schedule, mm) == "fast"
+        # Bounds are inclusive-start / exclusive-end (local time).
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 1, 0), schedule, mm) == "cheap"
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 10, 0), schedule, mm) == "fast"
+
+    def test_bucket_label_falls_back_to_slot_schedule_without_window(self):
+        schedule = bucketing.schedule_from_entries([("23:59", 8), ("10:00", 6)])
+        mm = bucketing.ModeScheduleMap.from_profiles({"default": None}, None, 8)
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 3, 0), schedule, mm) == "cheap"
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 11, 0), schedule, mm) == "fast"
+        # And with no mode map at all (legacy call sites).
+        assert bucketing.bucket_label(datetime(2026, 10, 22, 11, 0), schedule, None) == "fast"
+
+
+class TestPriorityWindowBucketing:
+    """Overnight bucketing with no mode-schedule evidence (AC1/AC2/AC5)."""
+
+    OVERNIGHT_START = datetime(2026, 10, 22, 0, 0, 0)
+    OVERNIGHT_END = datetime(2026, 10, 22, 12, 0, 0)
+
+    def test_overnight_window_attributes_cheap_seconds(self):
+        """cheap_window_seconds matches 01:00-10:00 with no ``Mode scheduler``
+        lines — the regression the nightly report showed (AC2)."""
+        events = [
+            _local_event("stream_started", datetime(2026, 10, 22, 3, 0, 0), "night"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 3, 0, 10), "night"),
+            _local_event("stream_started", datetime(2026, 10, 22, 11, 0, 0), "day"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 11, 0, 20), "day"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            events,
+            self.OVERNIGHT_START,
+            self.OVERNIGHT_END,
+            _no_slot_schedule(),
+            _priority_mode_map(),
+        )
+        assert busy is not None
+        assert busy.cheap_window_seconds == pytest.approx(9 * 3600.0)
+        assert busy.fast_window_seconds == pytest.approx(3 * 3600.0)
+        assert busy.cheap_busy_seconds == pytest.approx(10.0)
+        assert busy.fast_busy_seconds == pytest.approx(20.0)
+
+    def test_sessions_bucketed_cheap_inside_the_window(self):
+        lines = [
+            "2026-10-22 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=night request=[]",
+            "2026-10-22 03:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=night provider=local model=Qwen3 request=[]",
+            "2026-10-22 11:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=day request=[]",
+            "2026-10-22 11:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=day provider=local model=Qwen3 request=[]",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            self.OVERNIGHT_START,
+            self.OVERNIGHT_END,
+            _no_slot_schedule(),
+            _priority_mode_map(),
+        )
+        assert res.sessions["night"].bucket == "cheap"
+        assert res.sessions["day"].bucket == "fast"
+
+    def test_event_level_bucketing_follows_the_window(self):
+        """Session-less events (fallback/routing-skip reasons) are bucketed by
+        their own timestamp, so they land in the low-priority tables too."""
+        lines = [
+            "2026-10-22 03:30:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=context_too_large",
+            "2026-10-22 11:30:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+            "from=local-qwen3, to=opencode-go-deepseek, reason=provider_error",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            self.OVERNIGHT_START,
+            self.OVERNIGHT_END,
+            _no_slot_schedule(),
+            _priority_mode_map(),
+        )
+        buckets = reporting._bucket_profile(
+            [], _no_slot_schedule(), res.fallback_events, [], [], _priority_mode_map()
+        )
+        assert buckets["cheap"]["fallback_reasons"]["context_too_large"] == 1
+        assert buckets["fast"]["fallback_reasons"]["provider_error"] == 1
+
+    def test_midnight_wrapping_window_is_honoured(self):
+        """A 22:00-06:00 window contributes cheap time on both sides of
+        midnight inside a single analysis window (AC4)."""
+        events = [
+            _local_event("stream_started", datetime(2026, 10, 22, 2, 0, 0), "s1"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 2, 0, 5), "s1"),
+            _local_event("stream_started", datetime(2026, 10, 22, 23, 0, 0), "s2"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 23, 0, 5), "s2"),
+        ]
+        start = datetime(2026, 10, 22, 0, 0, 0)
+        end = datetime(2026, 10, 23, 0, 0, 0)
+        busy = aggregation.compute_busy_stats(
+            events, start, end, _no_slot_schedule(), _priority_mode_map(22 * 60, 6 * 60)
+        )
+        assert busy is not None
+        assert busy.cheap_window_seconds == pytest.approx(8 * 3600.0)
+        assert busy.fast_window_seconds == pytest.approx(16 * 3600.0)
+        assert busy.cheap_busy_seconds == pytest.approx(10.0)
+        assert busy.fast_busy_seconds == 0.0
+
+    def test_disabled_window_attributes_no_cheap_time(self):
+        events = [
+            _local_event("stream_started", datetime(2026, 10, 22, 3, 0, 0), "night"),
+            _local_event("stream_finished", datetime(2026, 10, 22, 3, 0, 10), "night"),
+        ]
+        busy = aggregation.compute_busy_stats(
+            events,
+            self.OVERNIGHT_START,
+            self.OVERNIGHT_END,
+            _no_slot_schedule(),
+            _priority_mode_map_with_window(enabled=False),
+        )
+        assert busy is not None
+        assert busy.cheap_window_seconds == 0.0
+        assert busy.cheap_busy_seconds == 0.0
+
+    def test_mode_timeline_evidence_wins_over_priority_window(self):
+        """AC5: a window whose logs still carry ``Mode scheduler`` evidence
+        keeps mode-timeline attribution; the priority window layers beneath."""
+        mm = _priority_mode_map(0, 6 * 60)  # would make 03:00 cheap
+        lines = [
+            "2026-08-14 10:00:02,000 - INFO - Mode scheduler: applied scheduled mode fast",
+            "2026-08-15 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=cheap-hours request=[]",
+            "2026-08-15 03:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=cheap-hours provider=local model=Qwen3 request=[]",
+        ]
+        res = aggregation.aggregate(
+            _events(lines),
+            TestModeTimelineBucketing.MODE_WINDOW_START,
+            TestModeTimelineBucketing.MODE_WINDOW_END,
+            bucketing.schedule_from_config(fixtures.MODE_FAST_CONFIG, 3),
+            mm,
+        )
+        assert mm.profile_source == "mode_schedule"
+        # The mode timeline says fast at 03:00, so the priority window's cheap
+        # attribution must not override it.
+        assert res.sessions["cheap-hours"].bucket == "fast"
+
+
+def _priority_mode_map_with_window(enabled: bool) -> bucketing.ModeScheduleMap:
+    """A mode map over an explicitly disabled priority window."""
+    return bucketing.ModeScheduleMap.from_profiles(
+        {"default": {"session_slot_pool_size": 2}},
+        None,
+        2,
+        priority_window=bucketing.PriorityWindow.from_config(
+            {"priority_window": {"enabled": enabled, "start": "01:00", "end": "10:00"}}
+        ),
+    )
+
+
+class TestPriorityWindowReportNote:
+    """AC3: the timeline section names the attribution source."""
+
+    WINDOW_START = datetime(2026, 10, 22, 0, 0, 0)
+    WINDOW_END = datetime(2026, 10, 22, 12, 0, 0)
+
+    def _report(self, mode_map: bucketing.ModeScheduleMap, lines: list[str]) -> str:
+        res = aggregation.aggregate(
+            _events(lines), self.WINDOW_START, self.WINDOW_END, _no_slot_schedule(), mode_map
+        )
+        return reporting.build_report(res, PRIORITY_CONFIG, mode_map=mode_map)
+
+    def test_note_names_priority_window_when_mode_timeline_is_retired(self):
+        lines = [
+            "2026-10-22 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=night request=[]",
+            "2026-10-22 03:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=night provider=local model=Qwen3 request=[]",
+        ]
+        report = self._report(_priority_mode_map(), lines)
+        assert "## Priority window timeline & restarts" in report
+        section = report.split("## Priority window timeline & restarts", 1)[1].split("\n## ", 1)[0]
+        assert "server.priority_window" in section
+        assert "01:00–10:00" in section
+        assert "retired" in section
+
+    def test_note_marks_wrapping_window(self):
+        lines = [
+            "2026-10-22 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=night request=[]",
+        ]
+        report = self._report(_priority_mode_map(22 * 60, 6 * 60), lines)
+        section = report.split("## Priority window timeline & restarts", 1)[1].split("\n## ", 1)[0]
+        assert "22:00–06:00" in section
+        assert "wraps past midnight" in section
+
+    def test_note_says_mode_schedule_won_when_evidence_present(self):
+        mm = _priority_mode_map()
+        lines = ["2026-10-22 10:00:02,000 - INFO - Mode scheduler: applied scheduled mode fast"]
+        report = self._report(mm, lines)
+        section = report.split("## Priority window timeline & restarts", 1)[1].split("\n## ", 1)[0]
+        assert "active for this window" in section
+        assert "not applied" in section
+
+    def test_notes_and_limitations_mentions_priority_window(self):
+        report = self._report(_priority_mode_map(), [])
+        assert "`server.priority_window`" in report
+        assert "retired mode schedule" in report
+
+    def test_section_omitted_when_no_window_and_no_events(self):
+        mm = bucketing.ModeScheduleMap.from_profiles({"default": None}, None, 2)
+        report = self._report(mm, [])
+        assert "## Priority window timeline & restarts" not in report
+
+
+class TestPriorityWindowEndToEnd:
+    """Overnight run through ``run_analysis``: cheap CSV + JSON + report (AC1-AC3)."""
+
+    WINDOW_START = datetime(2026, 10, 22, 0, 0, 0)
+    WINDOW_END = datetime(2026, 10, 22, 12, 0, 0)
+
+    LINES = [
+        "2026-10-22 03:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=night request=[]",
+        "2026-10-22 03:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=night provider=local model=Qwen3 request=[]",
+        "2026-10-22 11:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=day request=[]",
+        "2026-10-22 11:00:10,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=day provider=local model=Qwen3 request=[]",
+    ]
+
+    def _run(self, tmp_path: Path, config: dict | None = None):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(self.LINES) + "\n")
+        return reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=self.WINDOW_START,
+            window_end=self.WINDOW_END,
+            output_dir=tmp_path / "out",
+            config=config if config is not None else PRIORITY_CONFIG,
+        )
+
+    def test_overnight_run_splits_low_priority_sessions(self, tmp_path):
+        run = self._run(tmp_path)
+        out_dir = tmp_path / "out"
+        assert run.summary.sessions["night"].bucket == "cheap"
+        assert run.summary.sessions["day"].bucket == "fast"
+
+        import csv
+
+        with (out_dir / "low_priority_sessions.csv").open() as f:
+            cheap_rows = list(csv.DictReader(f))
+        with (out_dir / "standard_sessions.csv").open() as f:
+            fast_rows = list(csv.DictReader(f))
+        assert {r["session_id"] for r in cheap_rows} == {"night"}
+        assert {r["session_id"] for r in fast_rows} == {"day"}
+
+        data = reporting.summary_to_json(run.summary, run.mode_map)
+        busy = data["local_busy"]
+        assert busy["cheap_window_seconds"] == pytest.approx(9 * 3600.0)
+        assert busy["fast_window_seconds"] == pytest.approx(3 * 3600.0)
+        assert busy["cheap_busy_seconds"] == pytest.approx(10.0)
+        assert busy["fast_busy_seconds"] == pytest.approx(10.0)
+        assert data["low_priority_sessions"] == 1
+        assert data["standard_sessions"] == 1
+
+        report_md = (out_dir / "report.md").read_text()
+        assert "server.priority_window" in report_md
+        assert "01:00–10:00" in report_md
+
+    def test_disabled_window_via_run_analysis_attributes_no_cheap_time(self, tmp_path):
+        disabled = {
+            "local_model_ctx_size": 262144,
+            "session_slot_pool_size": 2,
+            "priority_window": {
+                "enabled": False,
+                "start": "01:00",
+                "end": "10:00",
+                "start_minutes": 60,
+                "end_minutes": 600,
+            },
+        }
+        run = self._run(tmp_path, config=disabled)
+        assert run.summary.sessions["night"].bucket == "fast"
+        assert run.summary.busy is not None
+        assert run.summary.busy.cheap_window_seconds == 0.0
+        assert run.summary.busy.cheap_busy_seconds == 0.0
+
+
+class TestResidencyAdmission:
+    """Residency-aware admission evidence (LP-0MVN1IQTF0037WTG AC5).
+
+    ``routing_resident_prefix`` carries the *measured* reusable prefix next to
+    the request estimate, so the report can split resident from evicted reuse
+    and show which session owned the slot at each decision — the two facts the
+    predicted ``cached_ratio`` could not provide under contention.
+    """
+
+    RESIDENT = (
+        "2026-08-02 14:00:00,000 - INFO - routing_resident_prefix "
+        "provider=local model=Qwen3 decision=admit n_past_actual=49103 "
+        "estimated_tokens=49103 reuse_ratio=1.0000 "
+        "slot_owner_session=sess-a residency_source=measured min_ratio=0.50 "
+        "tenants=2 occupants=1 session=sess-a"
+    )
+    EVICTED = (
+        "2026-08-02 14:05:00,000 - INFO - routing_resident_prefix "
+        "provider=local model=Qwen3 decision=resident_prefix_insufficient "
+        "n_past_actual=738 estimated_tokens=49103 reuse_ratio=0.0150 "
+        "slot_owner_session=sess-b residency_source=measured min_ratio=0.50 "
+        "tenants=2 occupants=2 session=sess-a"
+    )
+    NO_SLOT = (
+        "2026-08-02 14:06:00,000 - INFO - routing_resident_prefix "
+        "provider=local model=Qwen3 decision=resident_prefix_insufficient "
+        "n_past_actual=none estimated_tokens=49103 reuse_ratio=none "
+        "slot_owner_session=sess-b residency_source=non_resident min_ratio=0.50 "
+        "tenants=2 occupants=2 session=sess-c"
+    )
+    TENANT = (
+        "2026-08-02 14:07:00,000 - INFO - routing_resident_prefix "
+        "provider=local model=Qwen3 decision=tenant_limit "
+        "n_past_actual=none estimated_tokens=49103 reuse_ratio=none "
+        "slot_owner_session=sess-b residency_source=non_resident min_ratio=0.50 "
+        "tenants=2 occupants=2 session=sess-d"
+    )
+    EVICTION = (
+        "2026-08-02 14:08:00,000 - ERROR - local_eviction session=sess-a "
+        "reason=tenancy_lease_expired endpoint=default slot=1 "
+        "slot_owner_session=sess-a tenants=2 snapshot_planned=true"
+    )
+
+    def _summary(self) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events(
+                [
+                    fixtures.STREAM_STARTED_LOCAL,
+                    self.RESIDENT,
+                    self.EVICTED,
+                    self.NO_SLOT,
+                    self.TENANT,
+                    self.EVICTION,
+                    fixtures.STREAM_FINISHED_LOCAL,
+                ]
+            ),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+
+    @staticmethod
+    def _section(md: str) -> str:
+        return md.split("## Residency-aware admission", 1)[1].split("\n## ", 1)[0]
+
+    def test_parser_reads_measured_prefix_and_owner(self):
+        ev = log_parser.parse_log_line(self.RESIDENT)
+        assert ev.kind == "residency_decision"
+        assert ev.decision == "admit"
+        assert ev.n_past_actual == 49103
+        assert ev.estimated_tokens == 49103
+        assert ev.reuse_ratio == pytest.approx(1.0)
+        assert ev.slot_owner_session == "sess-a"
+        assert ev.residency_source == "measured"
+        assert ev.session == "sess-a"
+
+    def test_parser_treats_none_as_unknown_not_zero(self):
+        ev = log_parser.parse_log_line(self.NO_SLOT)
+        assert ev.n_past_actual is None
+        assert ev.reuse_ratio is None
+        assert ev.residency_source == "non_resident"
+        assert ev.decision == "resident_prefix_insufficient"
+
+    def test_tenant_limit_fields_parsed(self):
+        ev = log_parser.parse_log_line(self.TENANT)
+        assert ev.decision == "tenant_limit"
+        assert ev.tenant_limit == 2
+        assert ev.tenant_occupants == 2
+
+    def test_eviction_event_parsed(self):
+        ev = log_parser.parse_log_line(self.EVICTION)
+        assert ev.kind == "local_eviction"
+        assert ev.reason == "tenancy_lease_expired"
+        assert ev.slot_id == 1
+        assert ev.snapshot_planned is True
+        assert ev.session == "sess-a"
+
+    def test_aggregation_collects_residency_and_evictions(self):
+        res = self._summary()
+        assert len(res.residency_events) == 4
+        assert len(res.eviction_events) == 1
+
+    def test_report_splits_resident_and_evicted_reuse(self):
+        md = reporting.build_report(self._summary(), None)
+        section = self._section(md)
+
+        assert "Resident (admitted)" in section
+        assert "Evicted (denied)" in section
+        resident_row = next(
+            ln for ln in section.splitlines() if ln.startswith("| Resident")
+        )
+        evicted_row = next(
+            ln for ln in section.splitlines() if ln.startswith("| Evicted")
+        )
+        # One resident decision at 100 % reuse, one *measured* eviction at
+        # 1.5 % (the no-slot denial carries no ratio and is reported on its own
+        # bullet line instead of being priced as a 0 % measurement).
+        assert "| 1 |" in resident_row
+        assert "100.0%" in resident_row
+        assert "| 1 |" in evicted_row
+        assert "1.5%" in evicted_row
+        assert "**1** with no slot at all" in section
+
+    def test_report_reports_slot_owner_churn(self):
+        md = reporting.build_report(self._summary(), None)
+        section = self._section(md)
+
+        assert "slot churn" in section
+        # sess-a's slot owner changed between decisions (sess-a → sess-b).
+        churn_rows = [ln for ln in section.splitlines() if ln.startswith("| sess-")]
+        assert any("sess-a" in row or "sess" in row for row in churn_rows)
+        assert any("sess-b" in row for row in churn_rows)
+
+    def test_report_lists_evictions_by_reason(self):
+        md = reporting.build_report(self._summary(), None)
+        section = self._section(md)
+
+        assert "tenancy_lease_expired" in section
+        assert "Snapshot saved" in section
+
+    def test_non_measurements_are_not_counted_as_measured(self):
+        """Decisions with no measurement never enter the measured/ratio split.
+
+        LP-0MVNPZY22008B536: a non-resident denial carries no measurement, so
+        the report must report it under "no measurement" and keep it out of the
+        measured denominator and the resident/evicted ratio rows (otherwise a
+        fabricated 0 % drags the evicted median down).
+        """
+        summary = aggregation.aggregate(
+            _events(
+                [
+                    fixtures.STREAM_STARTED_LOCAL,
+                    self.NO_SLOT,
+                    self.EVICTION,
+                    fixtures.STREAM_FINISHED_LOCAL,
+                ]
+            ),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+        section = self._section(reporting.build_report(summary, None))
+
+        assert "(measured ratio: 0, no measurement: 1)" in section
+        assert "**1** with no slot at all" in section
+        # No ratio row can be rendered: nothing was measured.
+        assert "| Resident (admitted) |" not in section
+        assert "| Evicted (denied) |" not in section
+
+    def test_section_absent_without_residency_events(self):
+        summary = aggregation.aggregate(
+            _events([fixtures.STREAM_STARTED_LOCAL, fixtures.STREAM_FINISHED_LOCAL]),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+        md = reporting.build_report(summary, None)
+        assert "## Residency-aware admission" not in md

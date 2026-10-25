@@ -344,74 +344,111 @@ async def index(request: Request):
 
 
 
+# Budget for assembling the initial ``/events`` payload
+# (LP-0MVK1YDW900757Q9).
+#
+# The initial payload awaits ``query_llama_status()`` (which fans out to
+# llama-server and is otherwise unbounded), ``router_list_models()``,
+# ``_get_per_model_queries()`` and the 5 s ``_query_slots_detail()``. All of it
+# used to run *before* the keepalive loop, so a stalled backend produced a
+# stream that yielded zero bytes forever: the TCP connection stayed up, the
+# browser ``EventSource`` never reconnected and the UI looked frozen
+# (LP-0MVJML600003CQ6Y, AC4).
+#
+# Bounding the whole assembly caps the first frame at roughly the existing 5 s
+# ``/slots`` detail timeout — comfortably below the 30 s keepalive interval in
+# the loop below — so a client always sees a frame (payload or ``: keepalive``)
+# within this bound.
+_INITIAL_STATUS_TIMEOUT = 5.0
+
+
 async def status_events():
     """Server-Sent Events endpoint for real-time status updates."""
     srv = _srv()
     queue: asyncio.Queue = asyncio.Queue(maxsize=10)
     srv.sse_clients.add(queue)
 
+    async def _initial_payload() -> str:
+        """Build the first ``status`` payload.
+
+        Bounded by the caller (``_INITIAL_STATUS_TIMEOUT``) so a slow or
+        degraded backend can never leave the stream silent.
+        """
+        llama_status = await srv.query_llama_status()
+        total_sent = srv.token_counts.get("total_sent", 0)
+        total_recv = srv.token_counts.get("total_recv", 0)
+
+        loaded_models = None
+        if llama_status.get("router_mode"):
+            router_models = await srv.router_list_models()
+            loaded_models = _extract_router_model_ids(router_models)
+
+        per_model_queries = await _get_per_model_queries(srv)
+
+        # --- Per-slot data query (best-effort) ---
+        slot_details = []
+        if llama_status.get("llama_server_running"):
+            try:
+                server_cfg = srv.config.get("server", {})
+                llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+                model_name = srv.current_model or None
+                # 5s timeout: llama-server may be slow to respond
+                # to /slots when busy generating tokens.
+                slot_details = await _query_slots_detail(
+                    llama_port, timeout=5.0, model=model_name,
+                )
+            except Exception:
+                pass
+        # Preserve last known slot data when query fails or llama-server
+        # is too busy to respond (ReadTimeout during token generation).
+        # Use the shared module-level cache from _periodic_broadcast_loop()
+        # so that a page-reload during a busy generation still shows real data.
+        # Read llama-server log for supplemental progress data so the
+        # initial SSE payload shows real token counts even when /slots
+        # endpoint is unresponsive during busy generation.
+        from proxy.observability import (
+            _enrich_slot_details_with_progress,
+            _resolve_slot_details_for_enrichment,
+            _update_slot_progress_from_log,
+        )
+        _update_slot_progress_from_log()
+        # Enrich a detached copy so the shared fallback cache keeps the
+        # pristine /slots values (LP-0MVECWYWK000U3E1, AC2).
+        slot_details = _resolve_slot_details_for_enrichment(slot_details)
+        _enrich_slot_details_with_progress(slot_details, srv=srv)
+
+        return json.dumps({
+            "type": "status",
+            "current_model": srv.current_model,
+            "loaded_models": loaded_models,
+            "llama_server_running": llama_status["llama_server_running"],
+            "n_ctx": llama_status["n_ctx"],
+            "kv_cache_tokens": llama_status["kv_cache_tokens"],
+            "total_sent": total_sent,
+            "total_recv": total_recv,
+            "per_model_queries": per_model_queries,
+            "slots": slot_details,
+            # Derived per-account quota state (LP-0MVF7KQED005TG9Z):
+            # null when the feature is disabled or nothing has been
+            # polled yet, so the payload degrades cleanly (AC2b).
+            "quota": _quota_status_payload(srv.config),
+        })
+
     async def event_generator():
         try:
-            llama_status = await srv.query_llama_status()
-            total_sent = srv.token_counts.get("total_sent", 0)
-            total_recv = srv.token_counts.get("total_recv", 0)
-
-            loaded_models = None
-            if llama_status.get("router_mode"):
-                router_models = await srv.router_list_models()
-                loaded_models = _extract_router_model_ids(router_models)
-
-            per_model_queries = await _get_per_model_queries(srv)
-
-            # --- Per-slot data query (best-effort) ---
-            slot_details = []
-            if llama_status.get("llama_server_running"):
-                try:
-                    server_cfg = srv.config.get("server", {})
-                    llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
-                    model_name = srv.current_model or None
-                    # 5s timeout: llama-server may be slow to respond
-                    # to /slots when busy generating tokens.
-                    slot_details = await _query_slots_detail(
-                        llama_port, timeout=5.0, model=model_name,
-                    )
-                except Exception:
-                    pass
-            # Preserve last known slot data when query fails or llama-server
-            # is too busy to respond (ReadTimeout during token generation).
-            # Use the shared module-level cache from _periodic_broadcast_loop()
-            # so that a page-reload during a busy generation still shows real data.
-            # Read llama-server log for supplemental progress data so the
-            # initial SSE payload shows real token counts even when /slots
-            # endpoint is unresponsive during busy generation.
-            from proxy.observability import (
-                _enrich_slot_details_with_progress,
-                _resolve_slot_details_for_enrichment,
-                _update_slot_progress_from_log,
-            )
-            _update_slot_progress_from_log()
-            # Enrich a detached copy so the shared fallback cache keeps the
-            # pristine /slots values (LP-0MVECWYWK000U3E1, AC2).
-            slot_details = _resolve_slot_details_for_enrichment(slot_details)
-            _enrich_slot_details_with_progress(slot_details, srv=srv)
-
-            initial_status = json.dumps({
-                "type": "status",
-                "current_model": srv.current_model,
-                "loaded_models": loaded_models,
-                "llama_server_running": llama_status["llama_server_running"],
-                "n_ctx": llama_status["n_ctx"],
-                "kv_cache_tokens": llama_status["kv_cache_tokens"],
-                "total_sent": total_sent,
-                "total_recv": total_recv,
-                "per_model_queries": per_model_queries,
-                "slots": slot_details,
-                # Derived per-account quota state (LP-0MVF7KQED005TG9Z):
-                # null when the feature is disabled or nothing has been
-                # polled yet, so the payload degrades cleanly (AC2b).
-                "quota": _quota_status_payload(srv.config),
-            })
-            yield f"data: {initial_status}\n\n"
+            try:
+                initial_status = await asyncio.wait_for(
+                    _initial_payload(), timeout=_INITIAL_STATUS_TIMEOUT,
+                )
+                yield f"data: {initial_status}\n\n"
+            except TimeoutError:
+                # Degraded backend: never leave the stream silent. A keepalive
+                # comment keeps the browser ``EventSource`` connected (comments
+                # carry no payload, so the UI keeps its current view) and the
+                # generator then enters the loop below, where
+                # ``_periodic_broadcast_loop()`` pushes the full status payload
+                # as soon as the backend answers again (LP-0MVK1YDW900757Q9 AC1).
+                yield ": keepalive\n\n"
 
             while True:
                 try:

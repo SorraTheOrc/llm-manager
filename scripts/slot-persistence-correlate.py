@@ -76,9 +76,13 @@ _STREAM_RE = re.compile(
     r"provider=local.*?session=(?P<session2>\S+))"
 )
 # 2026-08-06 01:55:13,618 - INFO - Fallback triggered ... reason=local_concurrency_limit
+# Trailing evidence fields (``session=``/``attempt=``, plus ``limit=``/
+# ``remaining=``/``waited=`` for ``rate_limited*``) were appended after
+# ``reason=`` by LP-0MVMBMSWR0036RES, so the reason is bounded by the next
+# ``key=`` token instead of running to end-of-line.
 _FALLBACK_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3} - \w+ - "
-    r"Fallback triggered .*reason=(?P<reason>\S+)$"
+    r"Fallback triggered .*reason=(?P<reason>.+?)(?:\s+[a-z_]+=\S+)*$"
 )
 # llama-server: [36051] srv   prompt_save:  - saving prompt with length 26234, total state size = 335.517 MiB
 _LLAMA_SAVE_RE = re.compile(r"prompt_save:")

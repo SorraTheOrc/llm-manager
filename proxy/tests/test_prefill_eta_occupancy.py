@@ -74,19 +74,19 @@ def _cfg(**server_overrides) -> dict:
     server = {
         "session_slot_pool_size": 1,
         "contention_queue_policy": "queue",
-        "contention_queue_max_wait_seconds": 120,
+        "contention_queue_max_wait_seconds": 60,
         "contention_queue_max_depth": 4,
     }
     server.update(server_overrides)
     return {"provider_cooldown_seconds": 60, "server": server}
 
 
-#: Tokens whose calibrated own-ETA (~93.6 s) fits the 120 s budget while the
-#: projected wait with one occupant (~187.2 s) does not. This is exactly the
+#: Tokens whose calibrated own-ETA (~56.2 s) fits the 60 s budget while the
+#: projected wait with one occupant (~112.4 s) does not. This is exactly the
 #: shape the old guard got wrong.
-_TOKENS = 20_000
+_TOKENS = 12_000
 _MS_PER_TOKEN = 3.9
-_BUDGET = 120.0
+_BUDGET = 60.0
 
 
 @pytest.fixture(autouse=True)
@@ -128,11 +128,11 @@ def test_projected_wait_is_own_prefill_times_occupancy():
     projected = prefill_eta.projected_wait_seconds("Qwen3", _TOKENS, 0.0, 2, _cfg())
 
     assert projected.busy_slots == 2
-    assert projected.own_prefill_seconds == pytest.approx(93.6, abs=0.1)
+    assert projected.own_prefill_seconds == pytest.approx(56.2, abs=0.1)
     assert projected.occupancy_seconds == pytest.approx(
         projected.own_prefill_seconds * 2, abs=0.1
     )
-    assert projected.projected_seconds == pytest.approx(280.8, abs=0.2)
+    assert projected.projected_seconds == pytest.approx(168.5, abs=0.2)
 
 
 def test_projected_wait_negative_or_missing_occupancy_is_zero():
@@ -331,7 +331,7 @@ async def test_in_flight_prefill_with_unobservable_progress_is_counted(caplog):
     with (
         # No generating occupancy at all: the only occupant is the prefill.
         patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
-        patch("proxy.router_helpers._get_prefill_in_flight_count", lambda _srv: 1),
+        patch("proxy.router_helpers._get_live_prefill_in_flight_count", lambda _srv: 1),
         patch("proxy.provider.request_priority", return_value="low"),
         _guard_patches(),
     ):
@@ -367,7 +367,7 @@ async def test_free_gate_with_no_in_flight_prefill_still_admits(caplog):
 
     with (
         patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
-        patch("proxy.router_helpers._get_prefill_in_flight_count", lambda _srv: 0),
+        patch("proxy.router_helpers._get_live_prefill_in_flight_count", lambda _srv: 0),
         patch("proxy.provider.request_priority", return_value="low"),
         _guard_patches(),
     ):

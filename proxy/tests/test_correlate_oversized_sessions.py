@@ -65,6 +65,13 @@ DENIED_LINE = (
     "2026-08-26 22:04:00,000 - INFO - local_dispatch_denied "
     "session=herdr-1787669217-851654-15207 owner=herdr-1787669217-851654-15207 active=2"
 )
+# Per-provider context-ceiling skip (LP-0MVMBM1Y3001TPRT), verbatim shape from
+# the real log line.
+PROVIDER_SKIP_LINE = (
+    "2026-08-26 22:02:30,000 - INFO - routing_skip_provider_context provider=munitoai-free "
+    "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+    "reason=provider_context_exceeded session=herdr-1787669217-851654-15207"
+)
 UPSTREAM_503 = (
     "2026-08-26 22:05:00,000 - WARNING - [remote] upstream error status=503 "
     "url=https://opencode.ai/zen/go elapsed=12.3"
@@ -122,6 +129,15 @@ class TestRegexes:
         assert analyzer.UPSTREAM_5XX_RE.search(UPSTREAM_503).group(2) == "503"
         assert analyzer.UPSTREAM_5XX_RE.search(UPSTREAM_402) is None
 
+    def test_provider_skip_regex(self):
+        # LP-0MVMBM1Y3001TPRT: the provider-context skip is attributable to its
+        # session (unlike a session-less Fallback triggered line).
+        m = analyzer.PROVIDER_SKIP_LINE_RE.search(PROVIDER_SKIP_LINE)
+        assert m is not None
+        assert m.group(2) == "herdr-1787669217-851654-15207"
+        # The local-skip pattern must not swallow the provider-context line.
+        assert analyzer.SKIP_LINE_RE.search(PROVIDER_SKIP_LINE) is None
+
     def test_llama_regexes_split_families(self):
         d = analyzer.LLAMA_EVAL_RE.search(LLAMA_EVAL_SLOW)
         assert d is not None
@@ -171,6 +187,24 @@ class TestAnalyzeDay:
 
         assert res.total_prefill_work == 149912 + 70000
         assert res.total_wasted_work == 100000 + 70000
+
+    def test_provider_context_skips_counted_per_session(self, tmp_path):
+        # AC7 (LP-0MVMBM1Y3001TPRT): the oversized-session correlation accounts
+        # for routing_skip_provider_context, per day and per session, without
+        # touching the local-skip tally.
+        _write_log(tmp_path, [ROUTING_FAST_OVER, PROVIDER_SKIP_LINE, SKIP_TOO_LARGE])
+        res = analyzer.analyze_day(tmp_path, DAY, CAPS)
+        assert res.total_provider_skips == 1
+        agg = res.sessions["herdr-1787669217-851654-15207"]
+        assert agg.provider_skip_count == 1
+        assert agg.skip_count == 1
+        report = analyzer.build_report(tmp_path, DAY, CAPS)
+        assert report["totals"]["provider_context_skips"] == 1
+        top = report["top_sessions"][0]
+        assert top["provider_context_skips"] == 1
+        txt = analyzer.render_markdown(report)
+        assert "routing_skip_provider_context: **1**" in txt
+        assert "Provider skips" in txt
 
     def test_hourly_timeline_buckets(self, tmp_path):
         _write_log(
@@ -289,6 +323,7 @@ class TestReportAndArtifacts:
                 "wasted_pct_of_prefill": 0.0,
                 "context_pressure_warnings": 0,
                 "routing_skips": 0,
+                "provider_context_skips": 0,
                 "sessions": 0,
             },
             "hourly_timeline": [],

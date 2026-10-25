@@ -21,6 +21,8 @@ These tests cover the sidecar that closes the gap:
 from __future__ import annotations
 
 import json
+import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -610,3 +612,186 @@ class TestSidecarWriterOnSave:
         )
 
         assert read_slot_ratio_sidecar(filename) is None
+
+
+class TestSeedOutcomeInstrumentation:
+    """LP-0MVJYZWWW005XGW7 — every seed decision is observable at INFO.
+
+    The restored-prefix feature made zero contact in 54.4 h and the only
+    diagnostic was DEBUG, so the failure mode was unmeasurable. Each branch of
+    ``seed_cached_ratio()`` now reports one ``slot_ratio_seed outcome=…`` line
+    (or stays silent when the session owns no snapshot at all).
+    """
+
+    LOGGER = "llama-proxy.provider"
+
+    @staticmethod
+    def _seed_lines(caplog) -> list[str]:
+        return [m for m in caplog.messages if m.startswith("slot_ratio_seed ")]
+
+    def test_found_emits_one_info_line_and_keeps_the_credit(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        messages = _messages(3)
+        config = _write_snapshot(
+            tmp_path,
+            messages=messages,
+            cached_tokens=50_000,
+            server_overrides={"session_slot_ratio_safety_margin": 1.0},
+        )
+
+        source = seed_cached_ratio(
+            config["server"], {"messages": _messages(5)}, MODEL, SESSION, 100_000
+        )
+
+        lines = self._seed_lines(caplog)
+        assert source == "restored"
+        assert len(lines) == 1
+        assert "outcome=found" in lines[0]
+        assert f"session={SESSION[:8]}" in lines[0]
+        assert f"model={MODEL}" in lines[0]
+        assert "stored_messages=3" in lines[0]
+        assert "incoming_messages=5" in lines[0]
+        assert "age_s=0" in lines[0]
+        assert "cached_ratio=0.50" in lines[0]
+        # Behaviour-neutral: the credited ratio is unchanged.
+        assert _get_cached_ratio(MODEL, SESSION) == pytest.approx(0.5)
+        assert _get_cached_ratio_source(MODEL, SESSION) == "restored"
+
+    def test_missing_snapshot_is_reported(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        config = _write_snapshot(tmp_path, messages=_messages(3))
+        filename = _slot_filename_for_session(
+            SESSION, config["server"]["session_slot_save_path"]
+        )
+        Path(filename).unlink()
+
+        source = seed_cached_ratio(
+            config["server"], {"messages": _messages()}, MODEL, SESSION, 100_000
+        )
+
+        lines = self._seed_lines(caplog)
+        assert source is None
+        assert len(lines) == 1
+        assert "outcome=missing_snapshot" in lines[0]
+        assert "stored_messages=3" in lines[0]
+        assert "incoming_messages=3" in lines[0]
+        assert "cached_ratio=0.00" in lines[0]
+        assert _get_cached_ratio(MODEL, SESSION) == 0.0
+
+    def test_missing_sidecar_is_reported(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        config = _write_snapshot(tmp_path, with_sidecar=False)
+
+        source = seed_cached_ratio(
+            config["server"], {"messages": _messages()}, MODEL, SESSION, 100_000
+        )
+
+        lines = self._seed_lines(caplog)
+        assert source is None
+        assert len(lines) == 1
+        assert "outcome=missing_sidecar" in lines[0]
+        assert "stored_messages=0" in lines[0]
+        assert "incoming_messages=3" in lines[0]
+        assert _get_cached_ratio(MODEL, SESSION) == 0.0
+
+    def test_expired_sidecar_is_reported_with_its_age(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        now = datetime.now(UTC)
+        config = _write_snapshot(
+            tmp_path, messages=_messages(3), saved_at=now - timedelta(days=3)
+        )
+
+        source = seed_cached_ratio(
+            config["server"],
+            {"messages": _messages()},
+            MODEL,
+            SESSION,
+            100_000,
+            now=now,
+        )
+
+        lines = self._seed_lines(caplog)
+        assert source is None
+        assert len(lines) == 1
+        assert "outcome=expired" in lines[0]
+        assert f"age_s={3 * 86400}" in lines[0]
+        assert "stored_messages=3" in lines[0]
+        assert _get_cached_ratio(MODEL, SESSION) == 0.0
+
+    def test_model_mismatch_is_reported(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        config = _write_snapshot(tmp_path, model="SomeOtherModel")
+
+        source = seed_cached_ratio(
+            config["server"], {"messages": _messages()}, MODEL, SESSION, 100_000
+        )
+
+        lines = self._seed_lines(caplog)
+        assert source is None
+        assert len(lines) == 1
+        assert "outcome=model_mismatch" in lines[0]
+        assert f"model={MODEL}" in lines[0]
+        assert _get_cached_ratio(MODEL, SESSION) == 0.0
+
+    def test_prefix_mismatch_is_reported_and_supersedes_the_debug_line(
+        self, tmp_path, caplog
+    ):
+        caplog.set_level(logging.DEBUG, logger=self.LOGGER)
+        config = _write_snapshot(
+            tmp_path, messages=_messages(3, system="original system prompt")
+        )
+
+        source = seed_cached_ratio(
+            config["server"],
+            {"messages": _messages(3, system="a completely different system prompt")},
+            MODEL,
+            SESSION,
+            100_000,
+        )
+
+        lines = self._seed_lines(caplog)
+        assert source is None
+        assert len(lines) == 1
+        assert "outcome=prefix_mismatch" in lines[0]
+        assert "stored_messages=3" in lines[0]
+        assert _get_cached_ratio(MODEL, SESSION) == 0.0
+        # No duplicated DEBUG/INFO pair for the same event.
+        assert not [m for m in caplog.messages if "slot_ratio_sidecar skipped" in m]
+
+    def test_empty_ratio_is_reported(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        config = _write_snapshot(tmp_path, messages=_messages(3), cached_tokens=0)
+
+        source = seed_cached_ratio(
+            config["server"], {"messages": _messages()}, MODEL, SESSION, 100_000
+        )
+
+        lines = self._seed_lines(caplog)
+        assert source is None
+        assert len(lines) == 1
+        assert "outcome=empty_ratio" in lines[0]
+        assert "cached_ratio=0.00" in lines[0]
+        assert _get_cached_ratio(MODEL, SESSION) == 0.0
+
+    def test_session_without_snapshot_stays_silent(self, tmp_path, caplog):
+        """The common case must not flood the log (AC3)."""
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        config = _write_snapshot(tmp_path, session_id="another-session")
+
+        source = seed_cached_ratio(
+            config["server"], {"messages": _messages()}, MODEL, SESSION, 100_000
+        )
+
+        assert source is None
+        assert self._seed_lines(caplog) == []
+        assert _get_cached_ratio(MODEL, SESSION) == 0.0
+
+    def test_no_slot_persistence_configured_stays_silent(self, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+
+        assert (
+            seed_cached_ratio({}, {"messages": _messages()}, MODEL, SESSION, 100_000)
+            is None
+        )
+        assert self._seed_lines(caplog) == []
+

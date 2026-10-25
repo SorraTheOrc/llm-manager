@@ -30,6 +30,7 @@ import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -45,6 +46,7 @@ from proxy.observability import _record_backend_signal
 from proxy.priority import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
+    VALID_PRIORITIES,
     effective_chain_for_request,
     priority_routing_profile,
     request_priority,
@@ -595,6 +597,82 @@ def note_routing_hop(
     return hops
 
 
+# ---------------------------------------------------------------------------
+# Per-session fallback-attempt counter (LP-0MVMBMSWR0036RES AC2)
+# ---------------------------------------------------------------------------
+# Every ``Fallback triggered`` line carries ``session=<uuid|unknown> attempt=N``
+# so two fallbacks from the same session in the same second are distinguishable
+# (the log timestamp only has millisecond resolution and two cycles can emit in
+# the same millisecond). ``N`` is the session's 1-based fallback ordinal: it
+# keeps increasing across requests, so it is unique per session.
+#
+# ``_fallback_attempts``: session key -> number of fallback lines emitted.
+_fallback_attempts: dict[str, int] = {}
+_MAX_FALLBACK_ATTEMPT_ENTRIES = 1000
+
+
+def _next_fallback_attempt(session_id: str | None) -> int:
+    """Return the next fallback ordinal for *session_id* (1-based).
+
+    Sessions without a resolvable UUID share the ``"unknown"`` key, so even
+    session-less fallbacks stay individually numbered.
+    """
+    key = session_id or "unknown"
+    attempt = _fallback_attempts.get(key, 0) + 1
+    if key not in _fallback_attempts and len(_fallback_attempts) >= _MAX_FALLBACK_ATTEMPT_ENTRIES:
+        try:
+            _fallback_attempts.pop(next(iter(_fallback_attempts)), None)
+        except StopIteration:  # pragma: no cover - defensive
+            pass
+    _fallback_attempts[key] = attempt
+    return attempt
+
+
+def _fallback_budget_evidence(budget: Any) -> dict[str, Any] | None:
+    """Snapshot the budget evidence of a refused/waiting budget decision.
+
+    ``provider_budget.BudgetDecision`` already carries the numbers the budget
+    gate used (``limit_rpm``/``remaining``/``waited_seconds``); the fallback
+    line re-emits them so a ``rate_limited`` fallback is auditable without
+    replaying the gate (LP-0MVMBMSWR0036RES AC3).
+    """
+    if budget is None:
+        return None
+    try:
+        return {
+            "limit": int(getattr(budget, "limit_rpm", 0) or 0),
+            "remaining": int(getattr(budget, "remaining", 0) or 0),
+            "waited": round(float(getattr(budget, "waited_seconds", 0.0) or 0.0), 3),
+        }
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def _fallback_evidence(
+    session_id: str | None,
+    reason: str | None,
+    budget: dict[str, Any] | None = None,
+) -> str:
+    """Build the trailing ``key=value`` evidence for a ``Fallback triggered`` line.
+
+    Always carries ``session=`` (``unknown`` when the request had no session
+    UUID) and ``attempt=``. When *reason* is budget-driven (``rate_limited*``)
+    and *budget* holds the snapshot, it also carries the budget evidence
+    (``limit=``/``remaining=``/``waited=``). Appended **after** ``reason=``,
+    which is why every end-anchored consumer regex was updated in the same
+    change (LP-0MVMBMSWR0036RES AC4).
+    """
+    parts = [
+        f"session={session_id or 'unknown'}",
+        f"attempt={_next_fallback_attempt(session_id)}",
+    ]
+    if budget and (reason or "").startswith("rate_limited"):
+        parts.append(f"limit={budget.get('limit', 0)}")
+        parts.append(f"remaining={budget.get('remaining', 0)}")
+        parts.append(f"waited={float(budget.get('waited', 0.0)):.3f}")
+    return " " + " ".join(parts)
+
+
 # Per-(model, session) cached-tokens ratio: (model_name, session_id) -> ratio.
 # The ratio is cached_tokens / prompt_tokens from the last local response.
 # A ratio of 1.0 means ALL tokens were cached (fully warm).
@@ -841,6 +919,9 @@ def clear_cached_ratio_for_session(session_id: str | None) -> None:
     # A discarded session starts a fresh hop count (LP-0MVI2VRT2000V1AP).
     for key in [k for k in _last_routing_hop if k[1] == session_id]:
         _last_routing_hop.pop(key, None)
+    # A discarded session starts a fresh fallback ordinal too
+    # (LP-0MVMBMSWR0036RES AC2).
+    _fallback_attempts.pop(session_id, None)
 
 
 def _extract_cached_tokens_from_usage(usage: dict | None) -> int:
@@ -2263,6 +2344,315 @@ class _RoutingEstimateCache:
         return self._value
 
 
+# ---------------------------------------------------------------------------
+# Residency-aware admission (LP-0MVN1IQTF0037WTG AC1/AC3)
+#
+# Local admission used to be priced purely from a *prediction*
+# (`expected_cached_ratio` / the `slot_cache_ratio` sidecar). Under contention
+# that prediction is structurally wrong: 27 sessions cycled through 2 slots in
+# 5.4 h on 2026-10-24, aggregate prefix reuse was 26.1 % (median 15.6 % for
+# prompts >20k), and the same 49,103-token prompt scored `n_past=738` on one
+# attempt and 100 % reuse on the immediate retry. The router therefore prices
+# and gates on the *measured* resident prefix read from the cached `/slots`
+# snapshot (see `proxy.residency`), falling back one rung at a time when the
+# measurement is unavailable.
+# ---------------------------------------------------------------------------
+
+#: Default threshold for `server.local_resident_prefix_min_ratio`: a large
+#: prompt is admitted locally only when at least this fraction of it is already
+#: resident in the session's slot. ``0`` disables the gate entirely.
+RESIDENT_PREFIX_MIN_RATIO_DEFAULT: float = 0.5
+
+#: Skip reason emitted when a large prompt's measured reusable prefix is below
+#: `local_resident_prefix_min_ratio`.
+SKIP_REASON_RESIDENT_PREFIX: str = "resident_prefix_insufficient"
+
+#: Admission-decision values logged on the fail-open path, where the residency
+#: view could not measure anything (no fresh snapshot, no ownership) and the
+#: ladder degrades to the predicted sidecar ratio. Logging them keeps
+#: residency-blind admissions visible instead of silently unlogged
+#: (LP-0MVN4LANP0069QQM AC5).
+DECISION_ADMIT_PREDICTED: str = "admit_predicted"
+DECISION_SKIP_PREDICTED: str = "skip_predicted"
+
+#: Skip reasons an idle local backend may override (LP-0MVGD9Z8Z0055Y5J). The
+#: idle-exempt override is the LAST rung of the admission ladder, so the new
+#: residency gate must not silently disable it: an idle GPU still serves cold
+#: work. The physical `context_too_large` cap is never overridable.
+IDLE_OVERRIDABLE_SKIP_REASONS: tuple[str, ...] = (
+    "large_context_bypass",
+    SKIP_REASON_RESIDENT_PREFIX,
+)
+
+#: Provenance of a residency measurement, reported in the admission log line.
+RESIDENCY_SOURCE_MEASURED = "measured"       # live context_tokens from /slots
+RESIDENCY_SOURCE_SESSION_SLOT = "session_slot"  # owns the slot, size unknown
+RESIDENCY_SOURCE_NON_RESIDENT = "non_resident"  # owns no slot (view is fresh)
+RESIDENCY_SOURCE_UNKNOWN = "unknown"            # no fresh view and no ownership
+
+
+@dataclass(frozen=True)
+class ResidentPrefixFacts:
+    """What the live slot state says about one session's reusable prefix."""
+
+    n_past_actual: int | None
+    reuse_ratio: float
+    slot_owner_session: str | None
+    source: str
+    view_known: bool = False
+
+    @property
+    def resident(self) -> bool:
+        """True when the session owns a slot (measured or restore path)."""
+        return self.source in (
+            RESIDENCY_SOURCE_MEASURED,
+            RESIDENCY_SOURCE_SESSION_SLOT,
+        )
+
+
+def _effective_resident_prefix_min_ratio(config: dict | None) -> float:
+    """Resolve `server.local_resident_prefix_min_ratio` (default 0.5).
+
+    ``0`` (or a non-positive / malformed value) disables the residency gate,
+    restoring the predicted-ratio decision this change replaces.
+    """
+    raw = None
+    if isinstance(config, dict):
+        raw = (config.get("server") or {}).get("local_resident_prefix_min_ratio")
+    if raw is None:
+        return RESIDENT_PREFIX_MIN_RATIO_DEFAULT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return RESIDENT_PREFIX_MIN_RATIO_DEFAULT
+    if value <= 0.0:
+        return 0.0
+    return min(1.0, value)
+
+
+def _session_owns_slot(session_id: str | None, endpoint: str | None = None) -> int | None:
+    """Return the slot id *session_id* currently owns, if any.
+
+    Reads the in-process ownership registry (``session._slot_owners``), which
+    is authoritative even when the `/slots` snapshot is stale or missing — the
+    restore path of the AC1 fallback ladder. Fail-open: any error reads as "no
+    ownership".
+    """
+    if not session_id:
+        return None
+    try:
+        from proxy.session import _assigned_slot_for_session
+    except Exception:
+        return None
+    # Prefer the request's endpoint scope, then fall back to any endpoint: the
+    # registry may key ownership with the empty endpoint (legacy single-server
+    # mode) while the router resolves a concrete URL, and vice versa.
+    for scope in ((endpoint,) if endpoint else ()) + (None,):
+        try:
+            slot_id = _assigned_slot_for_session(session_id, endpoint=scope)
+        except Exception:
+            slot_id = None
+        if slot_id is not None:
+            return slot_id
+    return None
+
+
+def resolve_resident_prefix(
+    session_id: str | None,
+    estimated_tokens: int,
+    *,
+    view=None,
+    endpoint: str | None = None,
+) -> ResidentPrefixFacts:
+    """Measure the session's reusable prefix and classify its residency.
+
+    The fallback ladder (never a hard local outage):
+
+    1. ``context_tokens`` known ⇒ measured ratio
+       ``min(context_tokens, estimated_tokens) / estimated_tokens``;
+    2. ``context_tokens`` unknown but the session owns the slot ⇒ treat as
+       resident (the restore path: the slot holds this session's prefix but
+       the build does not report its size — llama.cpp b8782 dropped `n_past`);
+    3. neither ⇒ non-resident (the caller then falls back to today's
+       predicted-ratio decision).
+
+    Only the two documented sources are consulted — the cached `/slots`
+    snapshot and the in-process ownership registry. There is deliberately no
+    synchronous `/slots` call here: llama-server holds `/slots` for >15 s while
+    processing a prompt batch (LP-0MUXTW4MD003TVIC).
+
+    Args:
+        session_id: Session whose prefix is being priced.
+        estimated_tokens: The request's estimated prompt size (tokens).
+        view: Pre-built :class:`proxy.residency.ResidencyView`; built on demand
+            when omitted (fail-open: an unknown view is not an error).
+        endpoint: Local llama-server endpoint scope when several are in play.
+    """
+    if view is None:
+        try:
+            from proxy.residency import get_residency_view
+
+            view = get_residency_view(endpoint=endpoint)
+        except Exception:
+            view = None
+
+    known = bool(getattr(view, "known", False))
+    slot = None
+    if view is not None and known:
+        try:
+            slot = view.slot_for_session(session_id, endpoint=endpoint)
+        except Exception:
+            slot = None
+
+    context_tokens = getattr(slot, "context_tokens", None) if slot is not None else None
+    owner = getattr(slot, "owner_session", None) if slot is not None else None
+    if slot is not None and owner is None:
+        owner = _session_owns_slot(session_id, endpoint)
+
+    if context_tokens is not None and estimated_tokens > 0:
+        reusable = min(int(context_tokens), int(estimated_tokens))
+        return ResidentPrefixFacts(
+            n_past_actual=int(context_tokens),
+            reuse_ratio=min(1.0, max(0.0, reusable / float(estimated_tokens))),
+            slot_owner_session=owner or session_id,
+            source=RESIDENCY_SOURCE_MEASURED,
+            view_known=known,
+        )
+
+    # Unknown size: ownership is the authoritative signal (restore path).
+    owned_slot = _session_owns_slot(session_id, endpoint)
+    if owned_slot is not None:
+        return ResidentPrefixFacts(
+            n_past_actual=None,
+            reuse_ratio=1.0,
+            slot_owner_session=owner or session_id,
+            source=RESIDENCY_SOURCE_SESSION_SLOT,
+            view_known=known,
+        )
+
+    # No ownership. With a *fresh* view that is a measured fact (the pool holds
+    # another session's prefix, so this session's reusable prefix is zero);
+    # with no fresh view the state is genuinely unknown and admission must
+    # fail open to the predicted-ratio decision rather than denying local on
+    # absent data.
+    if owner is None and view is not None and known:
+        # Name the session whose prefix is occupying the pool, so the denial is
+        # attributable in the admission log (AC5 ``slot_owner_session``).
+        try:
+            occupants = view.processing_sessions(endpoint=endpoint) or (
+                view.occupied_sessions(endpoint=endpoint)
+            )
+        except Exception:
+            occupants = ()
+        owner = occupants[0] if occupants else None
+    return ResidentPrefixFacts(
+        n_past_actual=None,
+        reuse_ratio=0.0,
+        slot_owner_session=owner,
+        source=RESIDENCY_SOURCE_NON_RESIDENT if known else RESIDENCY_SOURCE_UNKNOWN,
+        view_known=known,
+    )
+
+
+#: Skip reason emitted when the tenancy bound refuses a new session (AC2).
+#: Mirrors ``proxy.router_helpers.TENANCY_SKIP_REASON``; kept local so the
+#: ladder does not need a module-level import of ``router_helpers`` (which
+#: imports the server lazily to avoid a cycle).
+SKIP_REASON_TENANT_LIMIT: str = "tenant_limit"
+
+
+def _evaluate_local_tenancy(
+    session_id: str | None,
+    *,
+    endpoint: str | None = None,
+    tenants: int,
+    idle_seconds: float | None = None,
+):
+    """Run the AC2 tenancy rung against the live dispatch registry.
+
+    Fail-open by construction: a session that is empty, a missing/unreadable
+    registry, or any unexpected error returns ``None`` ("no verdict"), which
+    the ladder reads as "tenancy permits" — the bound must never become a hard
+    local outage.
+    """
+    if not session_id:
+        return None
+    try:
+        from proxy import router_helpers
+    except Exception:
+        return None
+    try:
+        import proxy.server as server_module
+
+        return router_helpers.evaluate_session_tenancy(
+            server_module,
+            session_id,
+            endpoint=endpoint,
+            tenants=tenants,
+            idle_seconds=idle_seconds,
+        )
+    except Exception:
+        return None
+
+
+def _log_residency_decision(
+    *,
+    session_id: str | None,
+    estimated_tokens: int,
+    decision: str,
+    model_name: str | None = None,
+    facts=None,
+    min_ratio: float | None = None,
+    tenancy=None,
+) -> None:
+    """Emit the residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5).
+
+    One structured ``routing_resident_prefix`` line per admission decision, at
+    the same INFO level as ``routing_skip_local`` / ``routing_hop`` so the
+    operator can see, per decision, the *measured* reusable prefix and which
+    session owned the slot — residency regressions become visible without
+    forensics. Consumed by ``proxy-usage-analysis`` (resident-vs-evicted reuse
+    split and per-session slot-owner churn).
+
+    Never raises: logging must not become an admission failure mode.
+    """
+    try:
+        n_past = getattr(facts, "n_past_actual", None)
+        reuse = getattr(facts, "reuse_ratio", None)
+        owner = getattr(facts, "slot_owner_session", None)
+        source = getattr(facts, "source", "none")
+        occupants = len(getattr(tenancy, "occupants", ()) or ())
+        tenant_limit = getattr(tenancy, "tenant_limit", None)
+        # ``reuse_ratio`` is a *measurement*, so it must be reported as
+        # unknown when there is no measurement. ``ResidentPrefixFacts`` keeps
+        # 0.0 as an internal sentinel for the gate comparison, but logging that
+        # sentinel would fabricate a 0 % measurement for a session that owns no
+        # slot (``n_past_actual=none``) and make ``proxy-usage-analysis`` count
+        # a non-measurement in its "measured ratio" denominator and in the
+        # resident/evicted ratio rows (LP-0MVNPZY22008B536). A genuine
+        # measured 0 (a slot reporting ``context_tokens=0``) still logs 0.0000.
+        measured_ratio = n_past is not None and isinstance(reuse, (int, float))
+        logger.info(
+            "routing_resident_prefix provider=local model=%s decision=%s "
+            "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
+            "slot_owner_session=%s residency_source=%s min_ratio=%s "
+            "tenants=%s occupants=%d session=%s",
+            model_name or "unknown",
+            decision,
+            n_past if n_past is not None else "none",
+            int(estimated_tokens),
+            f"{reuse:.4f}" if measured_ratio else "none",
+            owner or "none",
+            source or "none",
+            f"{min_ratio:.2f}" if isinstance(min_ratio, (int, float)) else "none",
+            tenant_limit if tenant_limit is not None else "none",
+            occupants,
+            session_id or "unknown",
+        )
+    except Exception:
+        pass
+
+
 def _should_skip_local(
     model_name: str,
     session_id: str | None,
@@ -2271,6 +2661,11 @@ def _should_skip_local(
     estimated_tokens: int | None = None,
     warm_cache_threshold: int = 0,
     economic_bypass_serves_local: bool = False,
+    resident_prefix_min_ratio: float = 0.0,
+    residency_view=None,
+    endpoint: str | None = None,
+    session_tenants: int | None = None,
+    tenancy_idle_seconds: float | None = None,
 ) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -2313,6 +2708,20 @@ def _should_skip_local(
 
     A threshold of 0 disables the bypass entirely.
 
+    Residency-aware ladder (LP-0MVN1IQTF0037WTG AC1/AC3), applied when
+    *resident_prefix_min_ratio* > 0 for a prompt above *cold_cache_threshold*:
+
+    1. the hard ``context_too_large`` cap above (unchanged, still first);
+    2. **resident-prefix gate** — admit only when the session's *measured*
+       reusable prefix is at least ``resident_prefix_min_ratio`` of the
+       prompt, else skip with ``resident_prefix_insufficient``;
+    3. **live-prefix pricing** — price ``new_tokens`` from that same live
+       measurement (never the predicted sidecar ratio), so the cold cap is
+       evaluated against real prefill work;
+    4. the idle-exempt override is applied by the *caller* after this
+       function returns (``IDLE_OVERRIDABLE_SKIP_REASONS``), so an idle GPU
+       still serves cold work.
+
     Args:
         model_name: The llama_model name of the local provider.
         session_id: The session ID (for per-session ratio tracking).
@@ -2322,6 +2731,12 @@ def _should_skip_local(
         warm_cache_threshold: Hard cap on total context. 0 = disabled.
         economic_bypass_serves_local: Config-driven flag (from the active
             mode profile) enabling cheap-mode economic-bypass recovery.
+        resident_prefix_min_ratio: Threshold for the resident-prefix gate
+            (``server.local_resident_prefix_min_ratio``). ``0`` disables the
+            residency ladder and restores the predicted-ratio decision.
+        residency_view: Pre-built residency view (``proxy.residency``); built
+            on demand when omitted.
+        endpoint: Local llama-server endpoint scope.
 
     Returns:
         A tuple ``(skip, reason)`` where:
@@ -2329,12 +2744,12 @@ def _should_skip_local(
         - ``skip`` is True if local should be skipped, False for normal
           local routing.
         - ``reason`` is the skip reason when ``skip`` is True
-          (``"context_too_large"`` or ``"large_context_bypass"``), or None
-          when ``skip`` is False.  When ``economic_bypass_serves_local`` is
-          True and the economic check would normally trigger but physical
-          capacity is available, ``(False, None)`` is returned so the
-          request proceeds to local (with contention-queue wait if slots
-          are busy).
+          (``"context_too_large"``, ``"large_context_bypass"`` or
+          ``"resident_prefix_insufficient"``), or None when ``skip`` is
+          False.  When ``economic_bypass_serves_local`` is True and the
+          economic check would normally trigger but physical capacity is
+          available, ``(False, None)`` is returned so the request proceeds to
+          local (with contention-queue wait if slots are busy).
     """
     if cold_cache_threshold <= 0:
         return (False, None)
@@ -2349,7 +2764,116 @@ def _should_skip_local(
     if estimated_tokens <= cold_cache_threshold:
         return (False, None)
 
-    # Check 2: Dynamic new-token calculation
+    # Check 2: Residency-aware ladder (AC1 gate + AC2 tenancy + AC3 pricing).
+    # ``facts`` is None when the residency gate is disabled (ratio 0) — the
+    # tenancy rung then still applies with its own knob, since tenancy is an
+    # independent bound on how many distinct sessions may hold the pool.
+    facts = None
+    # Set when the residency view could not measure anything (no fresh
+    # snapshot and no ownership). The ladder then fails open to the predicted
+    # ratio, but the *decision* must still be logged with an explicit
+    # ``n_past_actual=none`` so residency-blind admissions are visible in the
+    # usage report instead of vanishing (AC5 — LP-0MVN4LANP0069QQM).
+    unmeasured_facts = None
+    if resident_prefix_min_ratio > 0.0:
+        facts = resolve_resident_prefix(
+            session_id,
+            estimated_tokens,
+            view=residency_view,
+            endpoint=endpoint,
+        )
+        if facts.source == RESIDENCY_SOURCE_UNKNOWN:
+            # Fail-open: no fresh measurement and no ownership — degrade to
+            # today's predicted-ratio decision instead of denying local.
+            unmeasured_facts = facts
+            facts = None
+        elif not facts.resident:
+            # Fresh view, no slot of its own: the resident prefix is measured
+            # at zero, so no prediction can make this prompt cheap.
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=SKIP_REASON_RESIDENT_PREFIX,
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
+            return (True, SKIP_REASON_RESIDENT_PREFIX)
+        elif facts.reuse_ratio < resident_prefix_min_ratio:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=SKIP_REASON_RESIDENT_PREFIX,
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
+            return (True, SKIP_REASON_RESIDENT_PREFIX)
+
+    # Check 3: session tenancy bound (AC2). At most ``session_tenants``
+    # distinct sessions hold a local reservation at once, so a further
+    # session's large prompt falls through the normal chain instead of
+    # evicting a resident's prefix. Same-session re-entry and idle-lapsed
+    # tenancies are always admitted (see evaluate_session_tenancy).
+    if session_id and session_tenants is not None and session_tenants > 0:
+        tenancy = _evaluate_local_tenancy(
+            session_id,
+            endpoint=endpoint,
+            tenants=session_tenants,
+            idle_seconds=tenancy_idle_seconds,
+        )
+        if tenancy is not None and not tenancy.admitted:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=SKIP_REASON_TENANT_LIMIT,
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio or None,
+                tenancy=tenancy,
+            )
+            return (True, SKIP_REASON_TENANT_LIMIT)
+
+    # Check 4: live-prefix pricing (AC3) when a residency measurement exists.
+    if facts is not None and facts.resident:
+        reusable = (
+            min(facts.n_past_actual, estimated_tokens)
+            if facts.n_past_actual is not None
+            else estimated_tokens
+        )
+        if max(0, estimated_tokens - reusable) <= cold_cache_threshold:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision="admit",
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
+            return (False, None)
+        if economic_bypass_serves_local:
+            # Cheap mode still recovers the *economic* miss locally; the
+            # contention queue (if enabled) waits for a slot.
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision="admit",
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
+            return (False, None)
+        _log_residency_decision(
+            session_id=session_id,
+            estimated_tokens=estimated_tokens,
+            decision="large_context_bypass",
+            model_name=model_name,
+            facts=facts,
+            min_ratio=resident_prefix_min_ratio,
+        )
+        return (True, "large_context_bypass")
+
+    # Check 5: Dynamic new-token calculation (predicted ratio).
     ratio = expected_cached_ratio(
         model_name,
         session_id,
@@ -2358,6 +2882,15 @@ def _should_skip_local(
     )
     new_tokens = int(estimated_tokens * (1 - ratio))
     if new_tokens <= cold_cache_threshold:
+        if unmeasured_facts is not None:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=DECISION_ADMIT_PREDICTED,
+                model_name=model_name,
+                facts=unmeasured_facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
         return (False, None)
 
     # Economic cold-cache bypass (large_context_bypass)
@@ -2365,8 +2898,26 @@ def _should_skip_local(
         # Active mode profile recovers economic bypasses locally. The
         # contention queue (if enabled) will wait for a slot when all are
         # busy.
+        if unmeasured_facts is not None:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=DECISION_ADMIT_PREDICTED,
+                model_name=model_name,
+                facts=unmeasured_facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
         return (False, None)
 
+    if unmeasured_facts is not None:
+        _log_residency_decision(
+            session_id=session_id,
+            estimated_tokens=estimated_tokens,
+            decision=DECISION_SKIP_PREDICTED,
+            model_name=model_name,
+            facts=unmeasured_facts,
+            min_ratio=resident_prefix_min_ratio,
+        )
     return (True, "large_context_bypass")
 
 
@@ -2485,6 +3036,7 @@ def _evaluate_idle_admission_override(
     config: dict,
     provider_cfg: dict,
     estimated_tokens: int,
+    cached_ratio: float = 0.0,
 ) -> dict | None:
     """Decide whether idle local capacity should serve a bypassed request.
 
@@ -2495,9 +3047,18 @@ def _evaluate_idle_admission_override(
     blocker, a decision dict is returned; otherwise ``None`` (today's
     behaviour, byte-for-byte).
 
+    An idle GPU is NOT permission to start a doomed prefill
+    (LP-0MVN4LBZ500281Z7 AC3c): the shared
+    :func:`proxy.prefill_eta.evaluate_admission` cold-prefill budget is
+    consulted through this one implementation (never a second copy of the
+    budget maths). When it refuses, the returned dict carries
+    ``admitted: False`` plus the refusal ``reason`` so the caller can keep
+    skipping local and log the refusal as attributable — silent routing as if
+    idle capacity were blocked would hide the budget doing its job.
+
     Returns:
-        ``{"reason", "idle_seconds", "threshold_seconds"}`` when the request
-        should be admitted locally, else ``None``.
+        ``{"admitted", "reason", "idle_seconds", "threshold_seconds",
+        "guard_reason"}`` when idle capacity applies, else ``None``.
     """
     try:
         server_config = config.get("server", config) if isinstance(config, dict) else {}
@@ -2519,13 +3080,72 @@ def _evaluate_idle_admission_override(
         idle_seconds = local_idle_seconds()
         if idle_seconds < threshold:
             return None
+        admission = _idle_admission_budget_verdict(
+            config, provider_cfg, estimated_tokens, cached_ratio
+        )
         return {
+            "admitted": admission is None or bool(admission.admit),
             "reason": IDLE_ADMIT_REASON,
             "idle_seconds": idle_seconds,
             "threshold_seconds": threshold,
+            "guard_reason": admission.reason if admission is not None else None,
+            "guard_decision": admission,
         }
     except Exception:
         logger.debug("idle admission evaluation failed", exc_info=True)
+        return None
+
+
+def _idle_admission_budget_verdict(
+    config: dict,
+    provider_cfg: dict,
+    estimated_tokens: int,
+    cached_ratio: float,
+):
+    """Run the shared cold-prefill admission guard for the idle bypass path.
+
+    Returns the :class:`proxy.prefill_eta.AdmissionDecision` when the guard
+    actually refused (so the caller can log it and keep skipping local), else
+    ``None`` — an inert guard or an admitted verdict leaves the idle bypass
+    behaviour byte-for-byte unchanged (LP-0MVN4LBZ500281Z7 AC3c/AC8).
+    """
+    try:
+        from proxy import prefill_eta
+
+        if estimated_tokens <= 0:
+            return None
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        guard_cfg = prefill_eta.resolve_config(server_cfg)
+        if guard_cfg.policy == prefill_eta.POLICY_OFF:
+            return None
+        # Only the cold-prefill budget and its deadline-relative sibling are
+        # consulted here: the idle bypass exists precisely because the
+        # occupancy/queue bounds do not apply to an idle GPU.
+        if (
+            guard_cfg.cold_prefill_budget_tokens <= 0
+            and guard_cfg.budget_safety_fraction <= 0.0
+        ):
+            return None
+        model_name = provider_cfg.get("llama_model", "") if isinstance(
+            provider_cfg, dict
+        ) else ""
+        decision = prefill_eta.evaluate_admission(
+            config, model_name, estimated_tokens, cached_ratio, "medium"
+        )
+        if decision.admit or not decision.active:
+            return None
+        prefill_eta.record_guard_decision(
+            decision,
+            provider=(
+                provider_cfg.get("name") if isinstance(provider_cfg, dict) else None
+            ),
+            model=model_name,
+            priority="medium",
+            free_slot=False,
+        )
+        return decision
+    except Exception:
+        logger.debug("idle admission budget verdict failed", exc_info=True)
         return None
 
 
@@ -4431,6 +5051,114 @@ def _get_chain_hold_total_seconds(config: dict) -> float:
         return _CHAIN_HOLD_TOTAL_DEFAULT
 
 
+def validate_priority_config(config: dict) -> list[str]:
+    """Validate the per-provider priority labels (LP-0MVGPZWY0001JD1D AC5).
+
+    Priority-chain membership lives on each provider entry as a ``priorities``
+    list (``[low, medium, high]``, ``[medium, high]``, …); the model's priority
+    chain is a filter over its own ``providers`` list. This validator enforces
+    the shapes that keep that filter honest:
+
+    - ``priority_routes`` is **removed** — a model that still declares it is
+      rejected with a migration message naming ``priorities`` (a stale overlay
+      must fail loudly instead of silently losing its routing).
+    - ``priorities`` must be a non-empty **list** of known priority names
+      (``low``/``medium``/``high``), with no duplicates. A scalar, a mapping or
+      an empty list is ambiguous about membership and is rejected.
+    - **Model-level opt-in (fail closed):** if any provider of a model declares
+      ``priorities``, every provider of that model must declare it. A silent
+      default for an unlabelled entry is exactly the leak this design removes.
+    - Every priority must be served by at least one provider of a labelled
+      model (Q6 option (a): reject at load rather than silently widening to the
+      full ``providers`` list — the paid tiers — inside the cheap window).
+
+    Models that declare no ``priorities`` anywhere stay unlabelled: every
+    provider remains eligible for every priority (the documented legacy
+    default used by ``embed`` / ``github`` / ``private``).
+
+    Returns a list of human-readable problem descriptions (empty when the
+    priority configuration is consistent).
+    """
+    problems: list[str] = []
+    if not isinstance(config, dict):
+        return problems
+    models = config.get("models")
+    if not isinstance(models, dict):
+        return problems
+
+    for model_name, model_cfg in models.items():
+        if not isinstance(model_cfg, dict):
+            continue
+        if "priority_routes" in model_cfg:
+            problems.append(
+                f"model {str(model_name)!r}: 'priority_routes' was removed; "
+                "declare 'priorities' on each provider entry instead "
+                "(e.g. priorities: [low, medium, high])"
+            )
+        providers = model_cfg.get("providers")
+        if not isinstance(providers, list):
+            continue
+        entries = [p for p in providers if isinstance(p, dict)]
+        labelled = [p for p in entries if "priorities" in p]
+        if not labelled:
+            continue
+
+        for entry in entries:
+            name = entry.get("name", "<unnamed>")
+            where = f"model {str(model_name)!r} provider {str(name)!r}"
+            if "priorities" not in entry:
+                problems.append(
+                    f"{where}: declares no 'priorities' but other providers of "
+                    "the model do — a labelled model must label every provider "
+                    "(no implicit default)"
+                )
+                continue
+            raw = entry.get("priorities")
+            if not isinstance(raw, list):
+                problems.append(
+                    f"{where}: 'priorities' must be a list of "
+                    f"{'/'.join(VALID_PRIORITIES)} (got {type(raw).__name__} "
+                    f"{raw!r})"
+                )
+                continue
+            if not raw:
+                problems.append(
+                    f"{where}: 'priorities' is empty — a provider must serve at "
+                    "least one priority, otherwise it can never be routed to"
+                )
+                continue
+            seen: list[str] = []
+            for value in raw:
+                label = str(value).strip().lower() if isinstance(value, str) else None
+                if label not in VALID_PRIORITIES:
+                    problems.append(
+                        f"{where}: unknown priority {value!r} in 'priorities' "
+                        f"(valid: {'/'.join(VALID_PRIORITIES)})"
+                    )
+                    continue
+                if label in seen:
+                    problems.append(
+                        f"{where}: duplicate priority {label!r} in 'priorities'"
+                    )
+                    continue
+                seen.append(label)
+
+        for priority in VALID_PRIORITIES:
+            served = any(
+                isinstance(p.get("priorities"), list)
+                and priority in [str(v).strip().lower() for v in p["priorities"]]
+                for p in labelled
+            )
+            if not served:
+                problems.append(
+                    f"model {str(model_name)!r}: no provider serves priority "
+                    f"{priority!r} — a labelled model must cover every priority "
+                    "(an empty chain is never widened to the full provider list)"
+                )
+
+    return problems
+
+
 def validate_chain_hold_config(config: dict) -> list[str]:
     """Validate the chain-hold configuration (LP-0MSH94Z7K007VKC9 AC5).
 
@@ -5317,6 +6045,7 @@ async def _queue_context_bypass(
     session_id: str | None,
     priority: str | None = None,
     estimated_tokens: int | None = None,
+    endpoint: str | None = None,
 ) -> tuple[bool, str | None]:
     """Mirror of the smart-routing large-context skip decision.
 
@@ -5358,8 +6087,32 @@ async def _queue_context_bypass(
         estimated_tokens=_estimated_tokens,
         warm_cache_threshold=_warm_threshold,
         economic_bypass_serves_local=_recover_economic,
+        resident_prefix_min_ratio=_effective_resident_prefix_min_ratio(config),
+        endpoint=endpoint,
+        session_tenants=_resolve_tenants(config),
+        tenancy_idle_seconds=_resolve_tenancy_idle(config),
     )
     return _skip_local, _skip_reason
+
+
+def _resolve_tenants(config: dict | None) -> int:
+    """Resolve the AC2 tenancy bound (``server.local_session_tenants``)."""
+    try:
+        from proxy.router_helpers import resolve_session_tenants
+
+        return resolve_session_tenants(config)
+    except Exception:
+        return 0
+
+
+def _resolve_tenancy_idle(config: dict | None) -> float | None:
+    """Resolve the AC2 tenancy idle-lapse (``local_session_tenancy_idle_seconds``)."""
+    try:
+        from proxy.router_helpers import resolve_tenancy_idle_seconds
+
+        return resolve_tenancy_idle_seconds(config)
+    except Exception:
+        return None
 
 
 def _local_gate_occupancy(
@@ -5375,19 +6128,27 @@ the occupied gate ahead of it* against the budget, so it needs the number of
 
     - the generating concurrency from ``_local_concurrency_info`` (slots that
       will hold the gate while they decode), and
-    - the prefill-in-flight count (``_get_prefill_in_flight_count``), which is
+    - the prefill-in-flight count (``_get_live_prefill_in_flight_count``), which is
       the signal that remains when per-slot prefill progress is unobservable
       (``prefill_progress_unobservable``, ``alive=False``). An in-flight
       prefill must never be read as "free soon".
+
+    LP-0MVKUKFSO008GI6O AC3: only in-flight entries *backed by a live
+    dispatch record* are counted — an orphaned marker (record released by the
+    prefill-deadline release, a non-explicit cleanup, an orphan sweep or a
+    session eviction) must not raise ``busy_slots`` for the rest of the pool.
+    The 2026-10-23 incident shows a single stuck marker reporting
+    ``busy_slots=1 in_flight_prefills=1; available_slots=0`` for every other
+    session.
 
     Never raises: a routing decision must not break on an observability gap.
     """
     in_flight = 0
     try:
         import proxy.server as _srv
-        from proxy.router_helpers import _get_prefill_in_flight_count
+        from proxy.router_helpers import _get_live_prefill_in_flight_count
 
-        in_flight = max(0, int(_get_prefill_in_flight_count(_srv) or 0))
+        in_flight = max(0, int(_get_live_prefill_in_flight_count(_srv) or 0))
     except Exception:
         in_flight = 0
     cur_local = 0
@@ -5540,6 +6301,8 @@ async def _prefill_admission_guard(
     messages: list | None = None,
     max_local: int = 1,
     endpoint: str | None = None,
+    reason_label: str | None = None,
+    free_slot: bool = False,
 ):
     """Evaluate (and log) the prefill-ETA admission guard.
 
@@ -5555,6 +6318,11 @@ async def _prefill_admission_guard(
     *endpoint* let it read the occupied gate ahead of this request, so the
     projected wait it compares against the budget includes the in-flight
     prefill rather than the own-prefill term alone.
+
+    *reason_label* / *free_slot* let the direct (free-slot) dispatch guard
+    (LP-0MVIQ0F8T002FS42) reuse this one implementation and one budget source
+    while logging the decision as ``eta_exceeds_budget_direct`` — the log line
+    is emitted exactly once, by this helper.
     """
     try:
         from proxy import prefill_eta
@@ -5565,9 +6333,11 @@ async def _prefill_admission_guard(
         guard_cfg = prefill_eta.resolve_config(server_cfg)
         if guard_cfg.policy == prefill_eta.POLICY_OFF:
             return None
-        if prefill_eta.wait_budget_seconds(config, priority) <= 0:
-            # ``high`` priority never queues, so there is no budget to guard.
-            return None
+        # NOTE (LP-0MVN4LBZ500281Z7): no early return on a zero wait budget.
+        # ``high`` priority has no queue budget, but the cold-prefill budget
+        # prices GPU COMPUTE and must still bind; ``evaluate_admission``
+        # returns ``no_budget`` (inert) for the wait bound on its own, so the
+        # pre-existing never-queue semantics are preserved.
         model_name = (
             provider_cfg.get("llama_model", "")
             if isinstance(provider_cfg, dict)
@@ -5599,12 +6369,29 @@ async def _prefill_admission_guard(
         )
         if not decision.active:
             return None
+        # For the deadline refusal keep the decision's own reason so the
+        # log reason is ``prefill_eta_exceeds_deadline`` on both paths
+        # (LP-0MVKUKEU80022C3U AC1).  The budget refusal still gets the
+        # queue/direct suffix.  The cold-prefill budget and its
+        # deadline-relative sibling keep their own reasons too
+        # (LP-0MVN4LBZ500281Z7 AC7).
+        log_label = reason_label
+        if reason_label and str(decision.reason).startswith(
+            (
+                "prefill_eta_exceeds_deadline",
+                "prefill_eta_exceeds_safety_budget",
+                "prefill_budget_exceeded",
+            )
+        ):
+            log_label = decision.reason
         prefill_eta.record_guard_decision(
             decision,
             provider=(provider_cfg.get("name") if isinstance(provider_cfg, dict) else None),
             session_id=session_id,
             model=model_name,
             priority=priority,
+            reason_label=log_label,
+            free_slot=free_slot,
         )
         return decision
     except Exception:
@@ -5738,6 +6525,7 @@ async def _maybe_queue_for_local_slot(
     skip_local, skip_reason = await _queue_context_bypass(
         config, model_config, provider_cfg, request, body_json, session_id,
         priority=priority, estimated_tokens=_estimated_tokens,
+        endpoint=endpoint,
     )
     if skip_local:
         return ("context_bypass", skip_reason, None)
@@ -5822,6 +6610,16 @@ async def _maybe_queue_for_local_slot(
         ),
         session_id=session_id,
         retained=_retained,
+        # ETA-aware ordering (LP-0MVIQ0G2M0006QF6 AC1): the admission guard
+        # already costed this request's prefill, so the queue can admit the
+        # shortest projected prefill first within its retention class.
+        eta_seconds=(
+            float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0)
+            if _admission is not None
+            else None
+        ),
+        eta_ordering=bool(cq.get("eta_ordering", False)),
+        promote_after_seconds=float(cq.get("eta_promotion_seconds", 0) or 0),
     )
     if elapsed is None:
         # Caps exceeded — the caller falls back. Surface the measured wait so
@@ -7009,10 +7807,16 @@ def _handle_streaming_success(
     prev_provider: str | None,
     fallback_reason: str | None,
     path: str,
+    session_id: str | None = None,
+    budget_evidence: dict[str, Any] | None = None,
 ) -> Response | None:
     """If *response* is a 2xx StreamingResponse, record the attempt, add
     the ``X-Provider`` header, log the fallback (if one occurred), and
     return the augmented response.
+
+    The ``Fallback triggered`` line carries ``session=``/``attempt=`` (and the
+    budget evidence for ``rate_limited*`` reasons) so per-session attribution
+    never has to guess (LP-0MVMBMSWR0036RES AC1-AC3).
 
     Returns ``None`` if *response* is **not** a streaming success (caller
     should continue normal processing).
@@ -7032,8 +7836,9 @@ def _handle_streaming_success(
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(
-                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s%s",
                 path, prev_provider, provider_name, fallback_reason or "streaming",
+                _fallback_evidence(session_id, fallback_reason or "streaming", budget_evidence),
             )
         return result
     return None
@@ -7075,12 +7880,16 @@ def _build_fallback_success_response(
     path: str,
     body_text: str = "",
     status_override: str = "success",
+    session_id: str | None = None,
+    budget_evidence: dict[str, Any] | None = None,
 ) -> Response:
     """Record a successful provider attempt, add the ``X-Provider`` header,
     log the fallback (if one occurred), and return the augmented response.
 
     This is the normal (non-streaming) success path used by both fallback
-    entrypoints when a provider returns a successful response.
+    entrypoints when a provider returns a successful response. The
+    ``Fallback triggered`` line carries ``session=``/``attempt=`` plus the
+    budget evidence for ``rate_limited*`` reasons (LP-0MVMBMSWR0036RES).
     """
     _record_attempt(
         attempts,
@@ -7097,11 +7906,12 @@ def _build_fallback_success_response(
     result = _add_provider_header(response, provider_name)
     if prev_provider:
         logger.info(
-            "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+            "Fallback triggered for model=%s, from=%s, to=%s, reason=%s%s",
             path,
             prev_provider,
             provider_name,
             fallback_reason or "unknown",
+            _fallback_evidence(session_id, fallback_reason or "unknown", budget_evidence),
         )
     return result
 
@@ -7490,11 +8300,16 @@ def _resolve_reasoning_content_promotion(
     fallback_reason: str | None,
     path: str,
     body_text: str,
+    session_id: str | None = None,
+    budget_evidence: dict[str, Any] | None = None,
 ) -> Response | None:
     """If the response body contains ``reasoning_content``, treat this
     empty-but-meaningful response as a success (promote it).  Records the
     attempt, adds the provider header, logs the fallback, and returns the
     augmented response.
+
+    The ``Fallback triggered`` line carries ``session=``/``attempt=`` plus the
+    budget evidence for ``rate_limited*`` reasons (LP-0MVMBMSWR0036RES).
 
     Returns ``None`` if the body does **not** contain ``reasoning_content``
     (caller should continue with empty-response cooldown logic).
@@ -7524,11 +8339,14 @@ def _resolve_reasoning_content_promotion(
         result = _add_provider_header(response, provider_name)
         if prev_provider:
             logger.info(
-                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s",
+                "Fallback triggered for model=%s, from=%s, to=%s, reason=%s%s",
                 path,
                 prev_provider,
                 provider_name,
                 fallback_reason or "promoted_reasoning",
+                _fallback_evidence(
+                    session_id, fallback_reason or "promoted_reasoning", budget_evidence,
+                ),
             )
         return result
     return None
@@ -8110,6 +8928,9 @@ async def _proxy_with_remote_fallback_cycle(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
+    # Budget snapshot behind a ``rate_limited`` fallback, re-emitted on the
+    # ``Fallback triggered`` line (LP-0MVMBMSWR0036RES AC3).
+    _budget_evidence: dict[str, Any] | None = None
     # SSE comment emitted on the next successful streaming response after a
     # mid-stream re-route (LP-0MSF1PUM90099ZSW). ``{to}`` is filled in once
     # the next provider is resolved.
@@ -8148,7 +8969,8 @@ async def _proxy_with_remote_fallback_cycle(
         pass
 
     # Effective priority (AC1/AC2): cheap-window capped header value, stamped
-    # on the request; the remote-only chain is selected by it (priority_routes)
+    # on the request; the remote-only chain is selected by it (per-provider
+    # ``priorities`` labels, LP-0MVGPZWY0001JD1D)
     # just like the local+remote cycle, so a ``low`` request on a remote-only
     # model uses its low chain (e.g. free-tier-first).
     server_cfg = config.get("server", config) if isinstance(config, dict) else {}
@@ -8255,6 +9077,7 @@ async def _proxy_with_remote_fallback_cycle(
                     **_budget_diagnostics(_budget),
                 )
                 fallback_reason = "rate_limited"
+                _budget_evidence = _fallback_budget_evidence(_budget)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
                 continue
@@ -8357,6 +9180,7 @@ async def _proxy_with_remote_fallback_cycle(
             stream_result = _handle_streaming_success(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path,
+                session_id=_budget_session_id, budget_evidence=_budget_evidence,
             )
             if stream_result is not None:
                 if _pending_reroute:
@@ -8479,6 +9303,7 @@ async def _proxy_with_remote_fallback_cycle(
                     promoted = _resolve_reasoning_content_promotion(
                         response, provider_name, provider_type, attempts,
                         prev_provider, fallback_reason, path, body_text,
+                        session_id=_budget_session_id, budget_evidence=_budget_evidence,
                     )
                     if promoted is not None:
                         # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
@@ -8516,6 +9341,7 @@ async def _proxy_with_remote_fallback_cycle(
             result = _build_fallback_success_response(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
+                session_id=_budget_session_id, budget_evidence=_budget_evidence,
             )
             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
             _add_resolved_model_header(result, provider_cfg)
@@ -8753,6 +9579,9 @@ async def _proxy_with_fallback_cycle(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
+    # Budget snapshot behind a ``rate_limited`` fallback, re-emitted on the
+    # ``Fallback triggered`` line (LP-0MVMBMSWR0036RES AC3).
+    _budget_evidence: dict[str, Any] | None = None
     # SSE comment emitted on the next successful streaming response after a
     # mid-stream re-route (LP-0MSF1PUM90099ZSW). ``{to}`` is filled in once
     # the next provider is resolved.
@@ -8789,7 +9618,8 @@ async def _proxy_with_fallback_cycle(
         pass
 
     # Effective priority (AC1/AC2): cheap-window capped header value, stamped
-    # on the request; the provider chain is selected by it (priority_routes).
+    # on the request; the provider chain is selected by it (per-provider
+    # ``priorities`` labels, LP-0MVGPZWY0001JD1D).
     # Rebound local ``model_config`` so the whole cycle (including the
     # lease-active fallback below) iterates the priority-selected chain.
     server_cfg = config.get("server", config) if isinstance(config, dict) else {}
@@ -8872,6 +9702,62 @@ async def _proxy_with_fallback_cycle(
                 # explicit ``endpoint`` the legacy default is used, keeping
                 # single-server deployments working without changes.
                 local_endpoint = _get_local_provider_endpoint(provider_cfg, config)
+                # LP-0MVKUKFHH005UDWL: post-deadline prefill-thrash cooldown.
+                # A session whose last local dispatch was cancelled by the
+                # prefill deadline must not immediately re-dispatch the
+                # identical prompt and burn the whole prefill again (the
+                # 2026-10-23 incident: 41 local POSTs, 35 inside 02:00-03:00,
+                # re-prefilling near-duplicates of the same prompt). While the
+                # session cools down, local is skipped here — BEFORE the
+                # concurrency / queue / smart-routing gates, so the request
+                # never queues for a slot it would then be forbidden to use —
+                # and the chain reaches the next provider (AC1/AC4). The
+                # window is armed by router.py on the deadline event, cleared
+                # on expiry or a successful local first byte, and per-session
+                # (AC2 cross-session isolation).
+                _thrash_cooldown_remaining = 0.0
+                try:
+                    from proxy.router_helpers import (
+                        _prefill_thrash_cooldown_remaining,
+                    )
+
+                    _thrash_cooldown_remaining = (
+                        _prefill_thrash_cooldown_remaining(
+                            _session_id,
+                            config,
+                        )
+                        or 0.0
+                    )
+                except Exception:
+                    _thrash_cooldown_remaining = 0.0
+                if _thrash_cooldown_remaining > 0:
+                    logger.info(
+                        "routing_skip_local provider=%s model=%s "
+                        "session=%s cooldown_remaining=%.0fs "
+                        "reason=prefill_thrash_cooldown → skipping local, "
+                        "routing to next remote provider",
+                        provider_name,
+                        provider_cfg.get("llama_model") or "unknown",
+                        _session_id or "unknown",
+                        _thrash_cooldown_remaining,
+                    )
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="cached_tokens_skip",
+                        reason="prefill_thrash_cooldown",
+                        cooldown_remaining_seconds=round(
+                            _thrash_cooldown_remaining, 1
+                        ),
+                    )
+                    fallback_reason = "prefill_thrash_cooldown"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _note_local_fallback_reason(
+                        request, "prefill_thrash_cooldown"
+                    )
+                    continue
                 # Local concurrency limit check (LP-0MR5MAJNM005R905):
                 # if local concurrency limit (session_slot_pool_size) is exceeded, skip to next
                 # provider without marking local as unavailable. The check is
@@ -9152,6 +10038,9 @@ async def _proxy_with_fallback_cycle(
                 # bypasses locally (cheap semantics); high routes remote;
                 # medium uses the merged base config flag (absent — false).
                 _recover_economic = _economic_bypass_serves_local(config, _priority)
+                _resident_min_ratio = _effective_resident_prefix_min_ratio(config)
+                _session_tenants = _resolve_tenants(config)
+                _tenancy_idle = _resolve_tenancy_idle(config)
                 _skip_local, _skip_reason = _should_skip_local(
                     _llama_model,
                     _session_id,
@@ -9160,16 +10049,63 @@ async def _proxy_with_fallback_cycle(
                     estimated_tokens=_estimated_tokens,
                     warm_cache_threshold=_warm_threshold,
                     economic_bypass_serves_local=_recover_economic,
+                    resident_prefix_min_ratio=_resident_min_ratio,
+                    endpoint=local_endpoint,
+                    session_tenants=_session_tenants,
+                    tenancy_idle_seconds=_tenancy_idle,
                 )
                 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): spend
                 # obviously idle GPU capacity instead of paying for a remote
-                # call. Only the ECONOMIC bypass is overridable — the physical
+                # call. Only the ECONOMIC misses are overridable — the physical
                 # ``context_too_large`` cap still applies (the request cannot
-                # fit the KV slot).
-                if _skip_local and _skip_reason == "large_context_bypass":
+                # fit the KV slot), while a residency-gate denial is overridable
+                # because an idle GPU has nothing to evict
+                # (``IDLE_OVERRIDABLE_SKIP_REASONS``).
+                if _skip_local and _skip_reason in IDLE_OVERRIDABLE_SKIP_REASONS:
                     _idle_admit = _evaluate_idle_admission_override(
-                        config, provider_cfg, _estimated_tokens
+                        config,
+                        provider_cfg,
+                        _estimated_tokens,
+                        _routing_cached_ratio,
                     )
+                    if _idle_admit is not None and not _idle_admit.get(
+                        "admitted", True
+                    ):
+                        # Idle capacity is available but the shared cold-prefill
+                        # budget refused the dispatch (LP-0MVN4LBZ500281Z7
+                        # AC3c/AC7): keep skipping local and log the refusal so
+                        # it is attributable, not silently mistaken for an idle
+                        # block.
+                        logger.info(
+                            "routing_idle_admit_refused provider=%s model=%s "
+                            "reason=%s idle_seconds=%.1f "
+                            "threshold_seconds=%.1f estimated_tokens=%d "
+                            "new_tokens=%d cached_ratio=%.2f cache_state=%s "
+                            "session=%s",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _idle_admit.get("guard_reason")
+                            or "prefill_budget_exceeded",
+                            _idle_admit["idle_seconds"],
+                            _idle_admit["threshold_seconds"],
+                            _estimated_tokens,
+                            _routing_new_tokens,
+                            _routing_cached_ratio,
+                            _routing_cache_state,
+                            _session_id or "unknown",
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="idle_admit_refused",
+                            reason=_idle_admit.get("guard_reason")
+                            or "prefill_budget_exceeded",
+                            estimated_tokens=_estimated_tokens,
+                            idle_seconds=round(_idle_admit["idle_seconds"], 1),
+                            threshold_seconds=_idle_admit["threshold_seconds"],
+                        )
+                        _idle_admit = None
                     if _idle_admit is not None:
                         logger.info(
                             "routing_idle_admit provider=%s model=%s "
@@ -9318,6 +10254,10 @@ async def _proxy_with_fallback_cycle(
                             estimated_tokens=_compacted_tokens,
                             warm_cache_threshold=_warm_threshold,
                             economic_bypass_serves_local=_recover_economic,
+                            resident_prefix_min_ratio=_resident_min_ratio,
+                            endpoint=local_endpoint,
+                            session_tenants=_session_tenants,
+                            tenancy_idle_seconds=_tenancy_idle,
                         )
                         if _skip_after:
                             logger.info(
@@ -9459,6 +10399,108 @@ async def _proxy_with_fallback_cycle(
                 except Exception:
                     pass
 
+                # Prefill-ETA guard on the DIRECT (free-slot) dispatch path
+                # (LP-0MVIQ0F8T002FS42). The queue-entry guard only runs when
+                # every local slot is busy; without this a request that finds a
+                # free slot starts a 40-80k-token prefill that cannot finish
+                # inside the caller's wait budget and is abandoned (baseline: 48
+                # of 606 local dispatches had a first byte after >120 s). Same
+                # estimator, same single budget source
+                # (``contention_queue_max_wait_seconds``) — this is the same
+                # decision applied one step earlier. Inert (``None``) when the
+                # bucket is uncalibrated, so cold start behaves exactly as
+                # today.
+                _direct_admission = await _prefill_admission_guard(
+                    config,
+                    provider_cfg,
+                    _estimated_tokens,
+                    _session_id,
+                    priority=_priority,
+                    messages=(
+                        body_json.get("messages")
+                        if isinstance(body_json, dict)
+                        else None
+                    ),
+                    max_local=max_local,
+                    endpoint=local_endpoint,
+                    reason_label="eta_exceeds_budget_direct",
+                    free_slot=True,
+                )
+                if _direct_admission is not None and not _direct_admission.admit:
+                    # Deadline refusal (LP-0MVKUKEU80022C3U) keeps its own
+                    # reason so the diagnostic says *why* local was refused.
+                    if str(_direct_admission.reason).startswith(
+                        "prefill_eta_exceeds_deadline"
+                    ):
+                        _direct_reason = "prefill_eta_exceeds_deadline"
+                    else:
+                        _direct_reason = "eta_exceeds_budget_direct"
+                    try:
+                        setattr(request, "_local_admission_decision", _direct_admission)
+                    except Exception:
+                        pass
+                    # The guard helper already emitted the single
+                    # ``local_admission_guard ... reason=eta_exceeds_budget_direct``
+                    # line (ETA, budget, free_slot=true). Record the attempt so
+                    # the fallback provider and the diagnostics carry it too
+                    # (AC4).
+                    _record_attempt(
+                        attempts,
+                        provider=provider_name,
+                        type=provider_type,
+                        status="local_admission_reject",
+                        reason=_direct_reason,
+                        eta_prefill_seconds=round(
+                            float(
+                                getattr(
+                                    _direct_admission,
+                                    "eta_prefill_seconds",
+                                    0.0,
+                                )
+                                or 0.0
+                            ),
+                            1,
+                        ),
+                        budget_seconds=round(
+                            float(
+                                getattr(_direct_admission, "budget_seconds", 0.0)
+                                or 0.0
+                            ),
+                            1,
+                        ),
+                    )
+                    try:
+                        logger.info(
+                            "local_admission_guard_direct_fallback "
+                            "provider=%s model=%s session=%s "
+                            "reason=%s free_slot=true → routing to next provider",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _session_id or "unknown",
+                            _direct_reason,
+                        )
+                    except Exception:
+                        pass
+                    # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): a
+                    # local-only client must never be moved remote — the
+                    # caller turns the decision into the retryable 429.
+                    if _preference == _PREF_LOCAL_ONLY:
+                        fallback_reason = "local_admission_guard"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
+                        return _build_exhausted_response(
+                            all_local_slot_exhaustion=False,
+                            unavailable_providers={},
+                            diagnostics=attempts,
+                            config=config,
+                        )
+                    fallback_reason = "local_admission_guard"
+                    prev_provider = provider_name
+                    all_slot_exhaustion = False
+                    _note_local_fallback_reason(request, fallback_reason)
+                    continue
+
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 
                 # LP-0MTBOX45O005LD1S AC2: the cheap-mode compaction gate
@@ -9522,6 +10564,7 @@ async def _proxy_with_fallback_cycle(
                         **_budget_diagnostics(_budget),
                     )
                     fallback_reason = "rate_limited"
+                    _budget_evidence = _fallback_budget_evidence(_budget)
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     continue
@@ -9624,6 +10667,7 @@ async def _proxy_with_fallback_cycle(
             stream_result = _handle_streaming_success(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path,
+                session_id=_session_id, budget_evidence=_budget_evidence,
             )
             if stream_result is not None:
                 # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
@@ -10104,6 +11148,7 @@ async def _proxy_with_fallback_cycle(
                     promoted = _resolve_reasoning_content_promotion(
                         response, provider_name, provider_type, attempts,
                         prev_provider, fallback_reason, path, body_text,
+                        session_id=_session_id, budget_evidence=_budget_evidence,
                     )
                     if promoted is not None:
                         # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model for Pi extension
@@ -10144,6 +11189,7 @@ async def _proxy_with_fallback_cycle(
                             promoted2 = _resolve_reasoning_content_promotion(
                                 response, provider_name, provider_type, attempts,
                                 prev_provider, fallback_reason, path, body_text,
+                                session_id=_session_id, budget_evidence=_budget_evidence,
                             )
                             if promoted2 is not None:
                                 # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model
@@ -10196,6 +11242,7 @@ async def _proxy_with_fallback_cycle(
             result = _build_fallback_success_response(
                 response, provider_name, provider_type, attempts,
                 prev_provider, fallback_reason, path, body_text,
+                session_id=_session_id, budget_evidence=_budget_evidence,
             )
             # LP-0MTXEBQ4E001BMI2: local success resets the deterministic
             # local-400 streak (only unbroken same-session 400 runs escalate).
@@ -10269,6 +11316,8 @@ async def _proxy_with_fallback_cycle(
                                 response, provider_name, provider_type, attempts,
                                 prev_provider, fallback_reason, path, body_text,
                                 status_override="success_after_http_exception_retry",
+                                session_id=_session_id,
+                                budget_evidence=_budget_evidence,
                             )
                             # LP-0MR4ZIGDT004A3E1: Surface resolved provider/model
                             _add_resolved_model_header(result, provider_cfg)

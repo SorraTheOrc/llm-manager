@@ -46,7 +46,7 @@ logger = logging.getLogger("llama-proxy")
 # Cross-session queue state (module-level = process-wide)
 # ---------------------------------------------------------------------------
 
-# Each waiter: (enqueued_at, asyncio.Event, session_id, retained).
+# Each waiter: (enqueued_at, asyncio.Event, session_id, retained, eta_seconds).
 _waiters: deque = deque()
 _condition: asyncio.Condition | None = None
 
@@ -189,24 +189,83 @@ async def wake_all() -> None:
 def _enqueue(
     entry: tuple,
     retained: bool,
+    *,
+    eta_ordering: bool = False,
+    promote_after_seconds: float = 0.0,
 ) -> int:
     """Insert *entry* into ``_waiters``, retained waiters ahead of newcomers.
 
-    Returns the number of non-retained waiters the entry jumped ahead of
-    (0 when appended FIFO). Retained entries are appended after any existing
-    retained ones, so ordering within a class stays FIFO.
+    Returns the number of waiters the entry jumped ahead of (0 when appended
+    FIFO). Retained entries are appended after any existing retained ones, so
+    ordering within a class stays FIFO unless ETA ordering is enabled.
+
+    ETA-aware ordering (LP-0MVIQ0G2M0006QF6 AC1): when *eta_ordering* is on,
+    the entry is placed inside its retention class by ascending projected
+    prefill ETA, so a queued short turn is not parked behind a multi-minute
+    prefill (``local_max_concurrent_prefills: 1`` makes head-of-line blocking
+    the dominant tail). Retention still wins over size: ordering only applies
+    *within* a retention class.
+
+    Age-based promotion bounds starvation: an existing waiter whose age
+    exceeds *promote_after_seconds* is treated as ETA 0 (front of its class),
+    so a long prefill that keeps losing still gets the slot once it has
+    waited long enough.
     """
+    def _eta_of(waiter: tuple) -> float | None:
+        return waiter[4] if len(waiter) > 4 else None
+
+    def _key(waiter: tuple, now: float) -> float:
+        if promote_after_seconds > 0:
+            try:
+                age = now - float(waiter[0])
+            except (TypeError, ValueError):
+                age = 0.0
+            if age >= promote_after_seconds:
+                return 0.0  # promoted: front of its class
+        eta = _eta_of(waiter)
+        return float(eta) if eta is not None else float("inf")
+
     if not retained:
-        _waiters.append(entry)
-        return 0
+        if not eta_ordering:
+            _waiters.append(entry)
+            return 0
+        segment_start = 0
+        while segment_start < len(_waiters) and _waiters[segment_start][3]:
+            segment_start += 1
+        return _insert_sorted(entry, segment_start, len(_waiters), _key)
     insert_at = 0
     for index, existing in enumerate(_waiters):
         if existing[3] if len(existing) > 3 else False:
             insert_at = index + 1
         else:
             break
-    _waiters.insert(insert_at, entry)
-    return len(_waiters) - insert_at - 1
+    if not eta_ordering:
+        _waiters.insert(insert_at, entry)
+        return len(_waiters) - insert_at - 1
+    return _insert_sorted(entry, 0, insert_at, _key)
+
+
+def _insert_sorted(
+    entry: tuple,
+    start: int,
+    end: int,
+    key,
+) -> int:
+    """Insert *entry* into ``_waiters[start:end]`` keeping *key* ascending.
+
+    Ties keep FIFO order (the new entry is placed after existing equal keys).
+    Returns how many waiters in the segment the entry jumped ahead of.
+    """
+    now = time.monotonic()
+    entry_key = key(entry, now)
+    position = end
+    for index in range(start, end):
+        if key(_waiters[index], now) > entry_key:
+            position = index
+            break
+    _waiters.insert(position, entry)
+    # Waiters previously at [position, end) now sit behind the new entry.
+    return max(0, end - position)
 
 
 async def wait_for_local_slot(
@@ -215,6 +274,9 @@ async def wait_for_local_slot(
     slot_free_check: Callable[[], bool],
     session_id: str | None = None,
     retained: bool = False,
+    eta_seconds: float | None = None,
+    eta_ordering: bool = False,
+    promote_after_seconds: float = 0.0,
 ) -> float | None:
     """Wait (bounded, cross-session) for a local slot to free.
 
@@ -228,6 +290,11 @@ async def wait_for_local_slot(
     *retained* marks a returning session (see the module docstring): its
     waiter is placed ahead of non-retained waiters and the reorder is logged
     naming both sessions and the reason (LP-0MVI2VRT2000V1AP AC1).
+
+    *eta_seconds* / *eta_ordering* enable shortest-ETA-first ordering within a
+    retention class (LP-0MVIQ0G2M0006QF6 AC1): *eta_seconds* is this
+    request's projected prefill, and *promote_after_seconds* bounds long-ETA
+    starvation by treating a waiter older than that as highest priority.
     """
     cond = _get_condition()
     started = time.monotonic()
@@ -239,7 +306,12 @@ async def wait_for_local_slot(
             # Slot already free (race between the decision point and here).
             return 0.0
         ev = asyncio.Event()
-        ahead_of = _enqueue((started, ev, session_id, retained), retained)
+        ahead_of = _enqueue(
+            (started, ev, session_id, retained, eta_seconds),
+            retained,
+            eta_ordering=eta_ordering,
+            promote_after_seconds=promote_after_seconds,
+        )
         if retained and ahead_of > 0:
             try:
                 overtaken = next(
@@ -251,6 +323,29 @@ async def wait_for_local_slot(
                     "reason=lease_owner_retention depth=%d",
                     session_id or "unknown",
                     overtaken or "unknown",
+                    len(_waiters),
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
+        elif eta_ordering and ahead_of > 0:
+            # Shortest-ETA-first reorder (AC1): name the waiters it passed so
+            # the scheduling decision is auditable.
+            try:
+                overtaken = next(
+                    (
+                        w[2]
+                        for w in _waiters
+                        if w[1] is not ev and (w[3] if len(w) > 3 else False) == retained
+                    ),
+                    "unknown",
+                )
+                logger.info(
+                    "contention_queue_eta_order session=%s ahead_of=%s "
+                    "eta_s=%s reason=shortest_eta_first retained=%s depth=%d",
+                    session_id or "unknown",
+                    overtaken or "unknown",
+                    "unknown" if eta_seconds is None else f"{float(eta_seconds):.1f}",
+                    retained,
                     len(_waiters),
                 )
             except Exception:  # pragma: no cover - defensive

@@ -10,6 +10,9 @@ Validates that:
 - Alert rule files (monitoring/*.yaml) are valid Prometheus rule files.
 """
 
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -28,16 +31,31 @@ REQUIRED_CONFIG_SECTIONS = {
 }
 
 REQUIRED_SCRAPE_JOBS = {
-    "prometheus.yml": ["llama-proxy", "rocm-exporter"],
+    "prometheus.yml": ["llama-proxy", "node-exporter"],
 }
 
 REQUIRED_RULE_FILES = {
     "prometheus.yml": [
-        "monitoring/llama_memory_alerts.yaml",
-        "monitoring/proxy_5xx_alerts.yaml",
-        "monitoring/gpu_vram_alerts.yaml",
+        "gpu_compute_rules.yaml",
+        "gpu_memory_alerts.yaml",
+        "proxy_5xx_alerts.yaml",
+        "slots_query_alerts.yaml",
+        "remote_stream_alerts.yaml",
     ],
 }
+
+# Series that must never appear in a rule expression:
+# - rocm_vram_*: the AMD rocm-exporter publishes no release artifacts, so no
+#   exporter ever served these series and rules using them could never fire.
+# - gpu_busy_percent: pinned at 100% regardless of GPU state on this Strix Halo
+#   APU (LP-0MS9GA6QL007XTBP), so it is not a utilisation signal.
+# - llama_process_rss_bytes: published as 0 by the proxy (llama-server runs in a
+#   podman container, so there is no host process handle to read RSS from).
+FORBIDDEN_RULE_SERIES = [
+    "rocm_vram_",
+    "gpu_busy_percent",
+    "llama_process_rss_bytes",
+]
 
 EXPECTED_ROCM_EXPORTER_METRICS = [
     "rocm_vram_total_bytes",
@@ -104,10 +122,61 @@ def prometheus_alert_rules() -> list[Path]:
     rule_files = config.get("rule_files", [])
     paths = []
     for rf in rule_files:
-        # Rule file paths are relative to the prometheus.yml location
-        p = MONITORING_DIR / rf.replace("monitoring/", "")
-        paths.append(p)
+        # Rule file paths are relative to the prometheus.yml location, so they
+        # must not repeat the `monitoring/` prefix (they did once, and a config
+        # with unresolvable rule files is rejected by Prometheus outright).
+        assert not rf.startswith("monitoring/"), (
+            f"rule_files entry {rf!r} must be relative to monitoring/ and must not "
+            f"repeat the 'monitoring/' prefix"
+        )
+        paths.append(MONITORING_DIR / rf)
     return paths
+
+
+def _rule_expressions(path: Path) -> list[str]:
+    """Return every expr string in a Prometheus rule file (recording + alerting)."""
+    data = assert_valid_yaml(path)
+    exprs = []
+    for group in data.get("groups", []):
+        for rule in group.get("rules", []):
+            expr = rule.get("expr")
+            if expr:
+                exprs.append(expr)
+    return exprs
+
+
+def _find_key(node, key: str):
+    """Recursively find *key* in a nested config mapping (config.yaml blocks)."""
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for v in node.values():
+            found = _find_key(v, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for v in node:
+            found = _find_key(v, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _threshold_fraction(expr: str) -> float | None:
+    """Parse the `> 0.75 * ...` fraction out of an alert expression."""
+    m = re.search(r"[<>]=?\s*(\d+(?:\.\d+)?)\s*\*", expr)
+    return float(m.group(1)) if m else None
+
+
+def _promtool() -> str | None:
+    """Locate promtool, or None when it is not installed on this host."""
+    for candidate in (
+        shutil.which("promtool"),
+        str(Path.home() / "bin" / "prometheus" / "promtool"),
+    ):
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -158,23 +227,32 @@ class TestPrometheusConfig:
                 return
         pytest.fail("llama-proxy scrape job not found")
 
-    def test_rocm_exporter_scrape_job_exists(self, prometheus_config):
-        """AC 2: Prometheus has a scrape job for rocm-exporter."""
+    def test_node_exporter_scrape_job_exists(self, prometheus_config):
+        """GPU/host metrics come from node_exporter (rocm-exporter has no releases)."""
         jobs = {j.get("job_name") for j in prometheus_config.get("scrape_configs", [])}
-        assert "rocm-exporter" in jobs, (
-            "Missing scrape job 'rocm-exporter' in prometheus.yml"
+        assert "node-exporter" in jobs, (
+            "Missing scrape job 'node-exporter' in prometheus.yml - GPU power "
+            "and GTT series are sourced from it"
         )
 
-    def test_rocm_exporter_scrape_target(self, prometheus_config):
-        """AC 2: The rocm-exporter scrape job targets localhost:5000."""
+    def test_node_exporter_scrape_target(self, prometheus_config):
+        """The node-exporter scrape job targets localhost:9100."""
         for job in prometheus_config.get("scrape_configs", []):
-            if job.get("job_name") == "rocm-exporter":
+            if job.get("job_name") == "node-exporter":
                 targets = job.get("static_configs", [{}])[0].get("targets", [])
-                assert len(targets) >= 1, (
-                    "rocm-exporter scrape job must have at least one target"
+                assert "localhost:9100" in targets, (
+                    "node-exporter scrape job must target localhost:9100"
                 )
                 return
-        pytest.fail("rocm-exporter scrape job not found")
+        pytest.fail("node-exporter scrape job not found")
+
+    def test_no_scrape_job_for_unpublished_exporter(self, prometheus_config):
+        """No active job scrapes an exporter that publishes no release artifacts."""
+        jobs = {j.get("job_name") for j in prometheus_config.get("scrape_configs", [])}
+        assert "rocm-exporter" not in jobs, (
+            "rocm-exporter has no release artifacts, so this job can only ever be "
+            "a permanently DOWN target"
+        )
 
     def test_alert_rule_files_configured(self, prometheus_config):
         """AC 6: Prometheus is configured to load alert rule files."""
@@ -185,8 +263,8 @@ class TestPrometheusConfig:
         """AC 6: Each referenced rule file exists on disk."""
         rule_files = prometheus_config.get("rule_files", [])
         for rf in rule_files:
-            relative = rf.replace("monitoring/", "")
-            path = MONITORING_DIR / relative
+            # Paths are resolved relative to prometheus.yml's own directory.
+            path = MONITORING_DIR / rf
             assert path.exists(), (
                 f"Referenced rule file {rf} not found at {path}"
             )
@@ -289,15 +367,15 @@ class TestGrafanaDashboardConfig:
 class TestAlertRuleFiles:
     """Validation that alert rule YAML files are structurally valid."""
 
-    def test_llama_memory_alerts_exists(self):
-        """Llama memory alert rules file exists."""
-        path = MONITORING_DIR / "llama_memory_alerts.yaml"
+    def test_gpu_compute_rules_exists(self):
+        """GPU compute rules file exists."""
+        path = MONITORING_DIR / "gpu_compute_rules.yaml"
         assert path.exists()
 
-    def test_llama_memory_alerts_valid_yaml(self):
-        """Llama memory alert rules is valid YAML with groups/rules."""
-        data = assert_valid_yaml(MONITORING_DIR / "llama_memory_alerts.yaml")
-        assert "groups" in data, "llama_memory_alerts.yaml missing 'groups' key"
+    def test_gpu_memory_alerts_valid_yaml(self):
+        """GPU memory alert rules is valid YAML with groups/rules."""
+        data = assert_valid_yaml(MONITORING_DIR / "gpu_memory_alerts.yaml")
+        assert "groups" in data, "gpu_memory_alerts.yaml missing 'groups' key"
         assert len(data["groups"]) >= 1
         assert len(data["groups"][0].get("rules", [])) >= 1
 
@@ -314,18 +392,44 @@ class TestAlertRuleFiles:
         assert len(data["groups"][0].get("rules", [])) >= 1
 
     def test_alert_rule_file_names_in_prometheus_config(self):
-        """AC 6: The prometheus.yml references the alert rule files."""
+        """The prometheus.yml references the GPU and proxy alert rule files."""
         config = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
         rule_files = config.get("rule_files", [])
-        assert (
-            "monitoring/llama_memory_alerts.yaml" in rule_files
-        ), "prometheus.yml must reference monitoring/llama_memory_alerts.yaml"
-        assert (
-            "monitoring/proxy_5xx_alerts.yaml" in rule_files
-        ), "prometheus.yml must reference monitoring/proxy_5xx_alerts.yaml"
-        assert (
-            "monitoring/gpu_vram_alerts.yaml" in rule_files
-        ), "prometheus.yml must reference monitoring/gpu_vram_alerts.yaml"
+        for expected in (
+            "gpu_compute_rules.yaml",
+            "gpu_memory_alerts.yaml",
+            "proxy_5xx_alerts.yaml",
+        ):
+            assert expected in rule_files, (
+                f"prometheus.yml must reference {expected} (relative to monitoring/)"
+            )
+
+    def test_removed_dead_rule_files_are_not_referenced(self):
+        """Dead rule files must not come back: they could never fire."""
+        config = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
+        rule_files = config.get("rule_files", [])
+        for dead in ("gpu_vram_alerts.yaml", "llama_memory_alerts.yaml"):
+            assert dead not in rule_files, (
+                f"{dead} was removed because its expressions can never be "
+                f"satisfied on this host; do not re-add it"
+            )
+            assert not (MONITORING_DIR / dead).exists(), (
+                f"{dead} should have been deleted"
+            )
+
+    def test_no_rule_uses_a_dead_or_pinned_series(self, prometheus_alert_rules):
+        """No rule may select a series that is unpublished or pinned."""
+        offenders = []
+        for rule_file in prometheus_alert_rules:
+            for expr in _rule_expressions(rule_file):
+                for forbidden in FORBIDDEN_RULE_SERIES:
+                    if forbidden in expr:
+                        offenders.append(f"{rule_file.name}: {expr.strip()}")
+        assert not offenders, (
+            "Rules reference series that are unpublished or meaningless on this "
+            "host (rocm_vram_* has no exporter, gpu_busy_percent is pinned at "
+            "100%, llama_process_rss_bytes is always 0):\n" + "\n".join(offenders)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -390,60 +494,147 @@ class TestGrafanaSystemdUnit:
 # ---------------------------------------------------------------------------
 
 
-class TestGpuVramAlerts:
-    """Validation of monitoring/gpu_vram_alerts.yaml."""
+class TestGpuComputeRules:
+    """GPU utilisation rules derive from power draw, not the pinned busy counter."""
 
-    def test_gpu_vram_alerts_exists(self):
-        """AC 4: GPU VRAM alert rules file exists."""
-        path = MONITORING_DIR / "gpu_vram_alerts.yaml"
-        assert path.exists()
+    def _rules(self) -> list[dict]:
+        data = assert_valid_yaml(MONITORING_DIR / "gpu_compute_rules.yaml")
+        return [r for g in data["groups"] for r in g.get("rules", [])]
 
-    def test_gpu_vram_alerts_valid_yaml(self):
-        """AC 4: GPU VRAM alert rules is valid YAML with groups/rules."""
-        data = assert_valid_yaml(MONITORING_DIR / "gpu_vram_alerts.yaml")
-        assert "groups" in data, "gpu_vram_alerts.yaml missing 'groups' key"
-        assert len(data["groups"]) >= 1
-        assert len(data["groups"][0].get("rules", [])) >= 2
+    def _recording_rule(self, name: str) -> dict:
+        for r in self._rules():
+            if r.get("record") == name:
+                return r
+        pytest.fail(f"Recording rule {name} not found in gpu_compute_rules.yaml")
 
-    def test_gpu_vram_alert_names(self):
-        """AC 4: GPU VRAM alerts have expected warning and critical rules."""
-        data = assert_valid_yaml(MONITORING_DIR / "gpu_vram_alerts.yaml")
-        rules = data["groups"][0]["rules"]
-        alert_names = [r.get("alert") for r in rules]
-        assert "GpuVramHighWarning" in alert_names, (
-            "Expected alert 'GpuVramHighWarning' in gpu_vram_alerts.yaml"
+    def test_gpu_compute_rules_exists(self):
+        assert (MONITORING_DIR / "gpu_compute_rules.yaml").exists()
+
+    def test_recording_rules_present(self):
+        """The recording rules the docs/queries promise must exist."""
+        records = {r.get("record") for r in self._rules()}
+        for expected in ("gpu:power_watts:amdgpu", "gpu:computing:bool"):
+            assert expected in records, (
+                f"Missing recording rule {expected}; got {sorted(records)}"
+            )
+
+    def test_power_series_is_restricted_to_the_amdgpu_chip(self):
+        """The power series must select the GPU hwmon device, not CPU/other."""
+        expr = self._recording_rule("gpu:power_watts:amdgpu")["expr"]
+        assert "node_hwmon_power_average_watt" in expr
+        assert 'chip_name="amdgpu"' in expr, (
+            "Power series must join node_hwmon_chip_names on chip_name=\"amdgpu\" "
+            "so a CPU/other hwmon power sensor cannot be mistaken for GPU power"
         )
-        assert "GpuVramHighCritical" in alert_names, (
-            "Expected alert 'GpuVramHighCritical' in gpu_vram_alerts.yaml"
+
+    def test_computing_bool_uses_a_boolean_comparison(self):
+        """Without `bool` the comparison filters series instead of yielding 0/1."""
+        expr = self._recording_rule("gpu:computing:bool")["expr"]
+        assert ">= bool" in expr, (
+            "gpu:computing:bool must use a `bool` comparison so idle samples are "
+            "recorded as 0; otherwise averaging over a window drops idle samples "
+            "and overstates utilisation"
         )
 
-    def test_gpu_vram_warning_threshold(self):
-        """AC 4: Warning alert fires at 75% VRAM utilization."""
-        data = assert_valid_yaml(MONITORING_DIR / "gpu_vram_alerts.yaml")
-        rules = data["groups"][0]["rules"]
-        for r in rules:
-            if r.get("alert") == "GpuVramHighWarning":
-                expr = r["expr"]
-                assert "0.75" in expr, (
-                    f"Warning threshold should be 0.75, got expr: {expr}"
-                )
-                assert r["labels"]["severity"] == "warning"
-                return
-        pytest.fail("GpuVramHighWarning alert not found")
+    def test_threshold_matches_the_proxy_wedge_power_threshold(self):
+        """The rule threshold must not drift from the proxy's configured value."""
+        cfg = assert_valid_yaml(PROJECT_ROOT / "proxy" / "config.yaml")
+        # llama_gpu_wedge_power_low_threshold_watts lives in the server block.
+        threshold = _find_key(
+            cfg, "llama_gpu_wedge_power_low_threshold_watts"
+        )
+        assert threshold is not None, (
+            "proxy/config.yaml no longer defines "
+            "llama_gpu_wedge_power_low_threshold_watts"
+        )
+        expr = self._recording_rule("gpu:computing:bool")["expr"]
+        assert f">= bool {threshold}" in expr, (
+            f"gpu:computing:bool must use the proxy's configured compute "
+            f"threshold ({threshold} W) so the two layers agree; got: {expr}"
+        )
 
-    def test_gpu_vram_critical_threshold(self):
-        """AC 4: Critical alert fires at 90% VRAM utilization."""
-        data = assert_valid_yaml(MONITORING_DIR / "gpu_vram_alerts.yaml")
-        rules = data["groups"][0]["rules"]
-        for r in rules:
-            if r.get("alert") == "GpuVramHighCritical":
-                expr = r["expr"]
-                assert "0.9" in expr, (
-                    f"Critical threshold should be 0.9, got expr: {expr}"
-                )
-                assert r["labels"]["severity"] == "critical"
-                return
-        pytest.fail("GpuVramHighCritical alert not found")
+    def test_sustained_compute_alert_fires_on_the_power_series(self):
+        """A sustained-compute alert must exist and use the power-derived series."""
+        alerts = [r for r in self._rules() if r.get("alert")]
+        assert alerts, "gpu_compute_rules.yaml defines no alerting rule"
+        alert = alerts[0]
+        assert "gpu:computing:bool" in alert["expr"], (
+            "The sustained-compute alert must be driven by the power-derived "
+            f"recording rule, not an ad-hoc expression: {alert['expr']}"
+        )
+        assert alert.get("for"), "A sustained-compute alert must set a `for` duration"
+
+
+class TestGpuMemoryAlerts:
+    """GPU memory pressure is measured on GTT, the pool models actually use."""
+
+    def _rules(self) -> list[dict]:
+        data = assert_valid_yaml(MONITORING_DIR / "gpu_memory_alerts.yaml")
+        return [r for g in data["groups"] for r in g.get("rules", [])]
+
+    def test_alerts_target_the_published_gtt_series(self):
+        """Every GPU memory alert must key off gpu_gtt_used_bytes."""
+        for rule in self._rules():
+            assert "gpu_gtt_used_bytes" in rule["expr"], (
+                f"Alert {rule.get('alert')} must use gpu_gtt_used_bytes "
+                f"(published by the node_exporter textfile sampler); got: "
+                f"{rule['expr']}"
+            )
+
+    def test_warning_and_critical_severities_present(self):
+        severities = {r["labels"]["severity"] for r in self._rules()}
+        assert severities == {"warning", "critical"}, (
+            f"Expected one warning and one critical GPU memory alert, got {severities}"
+        )
+
+    def test_critical_threshold_is_higher_than_warning(self):
+        """Warning must fire before critical, or the pair is useless."""
+        by_sev = {r["labels"]["severity"]: r["expr"] for r in self._rules()}
+        warn = _threshold_fraction(by_sev["warning"])
+        crit = _threshold_fraction(by_sev["critical"])
+        assert warn is not None and crit is not None, (
+            f"Could not parse thresholds from {by_sev}"
+        )
+        assert warn < crit, (
+            f"Warning threshold {warn} must be below critical threshold {crit}"
+        )
+
+
+class TestPrometheusRuleValidation:
+    """promtool is the authority on rule syntax and behaviour; use it directly."""
+
+    def test_config_and_rules_validate(self):
+        promtool = _promtool()
+        if promtool is None:
+            pytest.skip("promtool not installed")
+        result = subprocess.run(
+            [promtool, "check", "config", str(MONITORING_DIR / "prometheus.yml")],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            "promtool check config failed:\n"
+            f"{result.stdout}\n{result.stderr}\n"
+            "Note: rule_files paths are resolved relative to prometheus.yml's own "
+            "directory, so they must not repeat the 'monitoring/' prefix."
+        )
+
+    def test_rule_unit_tests_pass(self):
+        """Behavioural tests: threshold semantics, alert firing, duration."""
+        promtool = _promtool()
+        if promtool is None:
+            pytest.skip("promtool not installed")
+        test_file = MONITORING_DIR / "tests" / "gpu_rules_test.yml"
+        assert test_file.exists(), f"Missing {test_file}"
+        result = subprocess.run(
+            [promtool, "test", "rules", str(test_file)],
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+        )
+        assert result.returncode == 0, (
+            "promtool test rules failed:\n" f"{result.stdout}\n{result.stderr}"
+        )
 
 
 class TestRocmExporterSystemdUnit:

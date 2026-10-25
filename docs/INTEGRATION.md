@@ -42,7 +42,10 @@ a separate file to prevent accidental collection during normal test runs:
 ```bash
 # Ensure llama-server and proxy are running
 ./scripts/start-llama.sh router
+# start-proxy.sh detaches the server by default (prints a handoff line and
+# exits 0) — never run it with --foreground under an agent tool call.
 ./proxy/scripts/start-proxy.sh
+curl -sf http://127.0.0.1:8000/health   # poll: a post-handoff failure is log-only
 
 # Run live host-flow tests
 RUN_LIVE_HOST_FLOW=1 python3 -m pytest proxy/tests/test_host_flow_live_e2e.py -v

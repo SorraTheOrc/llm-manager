@@ -71,7 +71,90 @@ STREAM_FINISHED_LOCAL = (
     "provider=local model=Qwen3 request=[{'type': 'text', 'text': '/plan SA-0MSAS108O009DYKT'}]"
 )
 
-# --- Fallback triggered (never carries a session UUID) ----------------------
+# --- Prefill TTFT lines (real /var/log/llama-proxy/proxy.log lines) --------
+#
+# Local requests log ``dispatch_first_byte_ms`` (dispatch → first byte, the
+# total including any single-slot queue wait), its service-time split
+# ``dispatch_to_first_byte_ms`` (= total − ``queue_wait_ms``) and the
+# prompt-cache outcome (``cache_state``/``cached_ratio``). The line's
+# timestamp is the **first-byte** time, so dispatch time is back-calculated as
+# ``ts - dispatch_first_byte_ms``. The three dispatch lines plus their three
+# ``Stream started`` lines below all belong to one real multi-request session,
+# so they double as the FIFO pairing fixture.
+
+PREFILL_SESSION = "audit-TTS-0MVJN64VK0095ZOP-false-positive-screen-b53084c3"
+
+STREAM_STARTED_PREFILL_COLD = (
+    "2026-10-22 21:15:02,477 - INFO - Stream started: provider=local model=Qwen3 "
+    f"session={PREFILL_SESSION} request=[{{'type': 'text', 'text': "
+    "'[READ-ONLY AUDIT] You are performing a read-only audi..."
+)
+
+STREAM_STARTED_PREFILL_COLD_FAST = (
+    "2026-10-22 21:15:09,614 - INFO - Stream started: provider=local model=Qwen3 "
+    f"session={PREFILL_SESSION} request=[{{'type': 'text', 'text': "
+    "'[READ-ONLY AUDIT] You are performing a read-only audi..."
+)
+
+STREAM_STARTED_PREFILL_WARM = (
+    "2026-10-22 21:15:42,006 - INFO - Stream started: provider=local model=Qwen3 "
+    f"session={PREFILL_SESSION} request=[{{'type': 'text', 'text': "
+    "'[READ-ONLY AUDIT] You are performing a read-only audi..."
+)
+
+# Cold prompt cache: 55.7 s dispatch → first byte (the bulk of it prefill).
+DISPATCH_FIRST_BYTE_COLD = (
+    "2026-10-22 21:15:02,477 - INFO - dispatch_first_byte_ms=55656.5 "
+    "dispatch_to_first_byte_ms=55655.9 cache_state=cold cached_ratio=0.000 "
+    f"queue_wait_ms=0.6 session={PREFILL_SESSION} model=Qwen3"
+)
+
+# Second request in the same session, cold but fast (short prompt).
+DISPATCH_FIRST_BYTE_COLD_FAST = (
+    "2026-10-22 21:15:09,615 - INFO - dispatch_first_byte_ms=1100.5 "
+    "dispatch_to_first_byte_ms=1100.1 cache_state=cold cached_ratio=0.000 "
+    f"queue_wait_ms=0.4 session={PREFILL_SESSION} model=Qwen3"
+)
+
+# Warm prompt cache: 29.5 s dispatch → first byte at a 0.992 cached ratio.
+DISPATCH_FIRST_BYTE_WARM = (
+    "2026-10-22 21:15:42,007 - INFO - dispatch_first_byte_ms=29546.0 "
+    "dispatch_to_first_byte_ms=29545.3 cache_state=warm cached_ratio=0.992 "
+    f"queue_wait_ms=0.6 session={PREFILL_SESSION} model=Qwen3"
+)
+
+# Queue contention: 16.2 s of the 26.6 s dispatch → first byte was spent
+# waiting for the single slot, so service time is only 10.4 s (real line).
+DISPATCH_FIRST_BYTE_QUEUE_WAIT = (
+    "2026-10-22 15:04:48,715 - INFO - dispatch_first_byte_ms=26573.0 "
+    "dispatch_to_first_byte_ms=10403.1 cache_state=warm cached_ratio=0.994 "
+    "queue_wait_ms=16169.9 session=herdr-1792667491-1086302-15476 model=Qwen3"
+)
+
+# Aborted local stream: a stream that dies before first byte emits **no**
+# ``dispatch_first_byte_ms=`` line (the 2 aborted streams in the intake
+# window have rotated out of retention). The start/error line formats are
+# copied verbatim from real /var/log/llama-proxy lines; the shared session
+# matches a real abort chronology.
+STREAM_STARTED_ABORTED_LOCAL = (
+    "2026-10-21 23:28:35,414 - INFO - Stream started: provider=local model=Qwen3 "
+    "session=audit-WL-0MVFRRMX3003UPP3-phase2_child_6-11d812e7 "
+    "request=[{'type': 'text', 'text': '[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — CHI..."
+)
+
+STREAM_ERROR_ABORTED_LOCAL = (
+    "2026-10-21 23:28:36,512 - WARNING - Stream error: "
+    "session=audit-WL-0MVFRRMX3003UPP3-phase2_child_6-11d812e7 "
+    "provider=local model=Qwen3 error=ReadTimeout"
+)
+
+# --- Fallback triggered ----------------------------------------------------
+#
+# Lines from before LP-0MVMBMSWR0036RES carry no session UUID; lines emitted
+# since carry ``session=<uuid|unknown> attempt=<n>`` after ``reason=`` (plus
+# ``limit=``/``remaining=``/``waited=`` for budget-driven ``rate_limited*``
+# reasons). Both shapes must parse: the session-less ones keep the legacy
+# nearest-line attribution, the session-bearing ones are attributed directly.
 
 FALLBACK_CONCURRENCY = (
     "2026-08-02 13:58:04,301 - INFO - Fallback triggered for model=v1/chat/completions, "
@@ -94,6 +177,30 @@ FALLBACK_CONTEXT_TOO_LARGE = (
 FALLBACK_HTTP_400 = (
     "2026-08-02 14:02:13,126 - INFO - Fallback triggered for model=v1/chat/completions, "
     "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 400"
+)
+
+# --- Fallback triggered with session + attempt evidence (LP-0MVMBMSWR0036RES)
+
+FALLBACK_SESSION = (
+    "2026-10-23 09:12:44,517 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=local-qwen3, to=opencode-go-deepseek, reason=local_lease_active "
+    "session=herdr-1792767061-1282111-17770 attempt=3"
+)
+
+# Budget-driven fallback: carries the budget snapshot the gate computed.
+FALLBACK_RATE_LIMITED_BUDGET = (
+    "2026-10-23 09:14:02,884 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=munitoai-free, to=opencode-go, reason=rate_limited "
+    "session=herdr-1792767061-1282111-17770 attempt=4 limit=60 remaining=0 waited=12.500"
+)
+
+# A *different* session's fallback, used to prove no session inherits another
+# session's reason (LP-0MVMBMSWR0036RES): session B moves to remote right after
+# session A spilled, but B has no fallback line of its own.
+FALLBACK_OTHER_SESSION = (
+    "2026-10-23 09:16:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=munitoai-free, to=opencode-go, reason=rate_limited "
+    "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000"
 )
 
 # --- routing_skip_local (session + reason, arrow before the explanation) ----
@@ -140,6 +247,33 @@ ROUTING_SKIP_CHAIN_HOLD_CYCLE_2 = (
     "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
     "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
     "provider session=019fc27d-3a46-7e5c-871e-57ab32f875f3 chain_hold_cycle=2"
+)
+
+# --- routing_skip_provider_context (per-provider context ceiling) -----------
+# (LP-0MVMBM1Y3001TPRT) Verbatim from /var/log/llama-proxy (2026-10-21 window):
+# the estimated prompt exceeds the entry's ``max_context_tokens``, so that
+# provider is skipped for this request only (no cooldown, no failure-domain
+# exclusion). Shared verbatim with LP-0MVK1Q99B0035OOE's parser pin.
+ROUTING_SKIP_PROVIDER_CONTEXT = (
+    "2026-10-21 04:11:29,318 - INFO - routing_skip_provider_context provider=munitoai-free "
+    "type=remote status=provider_context_exceeded estimated_tokens=153917 limit=150000 "
+    "reason=provider_context_exceeded session=herdr-1792524101-1636143-211"
+)
+
+# A second provider/limit pair, so provider and ceiling breakdowns have more
+# than one row.
+ROUTING_SKIP_PROVIDER_CONTEXT_SECOND = (
+    "2026-10-21 04:12:05,004 - INFO - routing_skip_provider_context provider=opencode-go "
+    "type=remote status=provider_context_exceeded estimated_tokens=195787 limit=196608 "
+    "reason=provider_context_exceeded session=herdr-1792524101-1636143-211"
+)
+
+# Older rotated logs may predate the ``limit`` field: the event must still
+# parse (limit None) so historical windows stay analysable (AC8).
+ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT = (
+    "2026-10-21 04:13:11,900 - INFO - routing_skip_provider_context provider=munitoai-free "
+    "type=remote status=provider_context_exceeded estimated_tokens=160001 "
+    "reason=provider_context_exceeded session=herdr-1792524101-1636143-212"
 )
 
 # --- local_dispatch_denied --------------------------------------------------
@@ -390,6 +524,35 @@ SLOT_RELEASE_IGNORED = (
 )
 SRV_LOAD_IGNORED = "srv          load: spawning server instance with name=mxbai-embed on port 51973"
 MALFORMED_EVAL_LINE = "[32999] eval time = not-a-number ms / many tokens"
+
+# --- Empty eval-timing diagnostic fixtures ---------------------------------
+#
+# The two ways an analysis window can contain no eval-timing samples: the log
+# carries no eval lines at all (llama-server verbosity/build), or the Qwen3
+# child port cannot be discovered so its eval lines cannot be attributed
+# (real observable case: only a non-Qwen3 child spawn line is present).
+
+# Spawn line present, but the file holds no ``eval time`` lines whatsoever.
+LLAMA_LOG_NO_EVAL_LINES = "\n".join(
+    [
+        QWEN3_SPAWN_LINE,
+        SLOT_PRINT_TIMING_IGNORED,
+        SLOT_RELEASE_IGNORED,
+        "srv  log_server_r: done request: GET /slots 127.0.0.1 200",
+    ]
+)
+
+# Eval lines present, but the Qwen3 port cannot be discovered (the only
+# spawn line announces a different child instance), so nothing is attributed.
+LLAMA_LOG_UNDISCOVERABLE_QWEN3_PORT = "\n".join(
+    [
+        SRV_LOAD_IGNORED,
+        "[51973] prompt eval time =   29504.01 ms / 11449 tokens "
+        "(    2.58 ms per token,   388.05 tokens per second)",
+        "[51973]        eval time =    3776.71 ms /   153 tokens "
+        "(   24.68 ms per token,    40.51 tokens per second)",
+    ]
+)
 
 
 # --- Config fixture (proxy/config.yaml fragment, real values) ---------------

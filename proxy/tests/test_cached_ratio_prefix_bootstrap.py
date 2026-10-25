@@ -187,7 +187,10 @@ class TestPrefillEtaGuard:
             "server": {
                 "local_admission_guard_policy": "reject",
                 "local_admission_guard_min_samples": 1,
-                "contention_queue_max_wait_seconds": 120,
+                "contention_queue_max_wait_seconds": 60,
+                # Isolate the BUDGET bound (the deadline bound is covered by
+                # tests/test_prefill_eta_deadline.py, LP-0MVKUKEU80022C3U).
+                "local_prefill_deadline_seconds": 0,
             }
         }
 
@@ -202,9 +205,9 @@ class TestPrefillEtaGuard:
         cold = prefill_eta.evaluate_admission(config, MODEL, 45028, 0.0, "medium")
 
         record_prompt_prefix(
-            MODEL, SESSION, 30000, _msgs("read the file", "tool result")
+            MODEL, SESSION, 41000, _msgs("read the file", "tool result")
         )
-        update_cached_ratio(MODEL, SESSION, cached_tokens=0, prompt_tokens=30000)
+        update_cached_ratio(MODEL, SESSION, cached_tokens=0, prompt_tokens=41000)
 
         # Wired path: turn 2 extends turn 1's message list, so the recorded
         # prefix earns credit and the ETA drops below the budget.

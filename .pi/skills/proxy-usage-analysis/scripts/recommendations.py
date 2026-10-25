@@ -13,6 +13,10 @@ operator's domain knowledge:
 - ``context_too_large`` (legacy ``warm_cache_bypass`` in rotated logs)
   indicates the prompt context exceeded the per-slot hard cap → raise
   local ctx-size / routing thresholds.
+- Provider context-ceiling skips (``routing_skip_provider_context``,
+  ``provider_context_exceeded``) indicate a remote entry's
+  ``max_context_tokens`` was exceeded → raise that entry's limit, reorder the
+  chain, or reduce prompt size.
 - Context pressure: sessions whose max context approaches the per-slot
   context limit (``local_model_ctx_size / slots``) → raise ctx-size.
 - Fast vs cheap fallback-rate imbalance → adjust ``slot_schedule`` entries.
@@ -27,6 +31,8 @@ from dataclasses import dataclass
 
 import bucketing
 from aggregation import (
+    FALLBACK_ATTRIBUTION_LEASE_DENIED,
+    FALLBACK_ATTRIBUTION_UNATTRIBUTED,
     ROOT_CAUSE_OTHER,
     ROOT_CAUSE_REMOTE,
     ROOT_CAUSE_RESTART,
@@ -67,6 +73,11 @@ REMOTE_ERROR_REASONS = (
 
 MIN_EVENTS = 1
 REASON_SHARE = 0.20
+# Provider context-ceiling skips (LP-0MVMBM1Y3001TPRT) are a distinct, directly
+# actionable size signal (a named provider entry could not take the prompt), so
+# they earn advice at a lower share of fallbacks than the routing-preference
+# reasons above.
+PROVIDER_CONTEXT_SHARE = 0.10
 FALLBACK_RATE_LOW = 0.10
 FALLBACK_RATE_HIGH = 0.30
 CONTEXT_PRESSURE_RATIO = 0.80
@@ -105,7 +116,8 @@ def _reason_counts_by_bucket(
 
     Mirrors ``_combined_reason_counts``: per-session reasons are bucketed by
     the session's bucket, global fallback events by their own timestamp
-    (mode-aware when the logs show mode transitions, LP-0MSPZUD4G007IYGH).
+    (:func:`bucketing.bucket_label` — mode timeline, else the configured
+    priority window, else the slot schedule).
     """
     buckets: dict[str, Counter] = {"fast": Counter(), "cheap": Counter()}
     for s in result.sessions.values():
@@ -113,12 +125,7 @@ def _reason_counts_by_bucket(
             buckets[_bucket_key(s.bucket)][s.fallback_reason] += 1
     for ev in result.fallback_events:
         if ev.reason:
-            if mode_map is not None and mode_map.transitions:
-                label = mode_map.period_for(ev.ts).label
-            elif schedule.periods:
-                label = schedule.period_for(ev.ts).label
-            else:
-                label = "fast"
+            label = bucketing.bucket_label(ev.ts, schedule, mode_map)
             buckets[_bucket_key(label)][ev.reason] += 1
     return buckets
 
@@ -129,6 +136,14 @@ def _combined_reason_counts(result: AnalysisResult) -> Counter:
     Per-session reasons are often (but not always) the same event as a global
     fallback line; the heuristic deliberately counts both so a single clear
     signal is never missed. Shares are computed against the combined total.
+
+    Since LP-0MVMBMSWR0036RES a session's reason is sourced from its own
+    evidence only (see :func:`aggregation._attribute_fallback`): a session with
+    no ``Fallback triggered`` line of its own never inherits a neighbour's
+    reason. Sessions labelled ``lease_denied`` do contribute a reason
+    (``local_lease_active``) because the local-dispatch refusal is real
+    evidence; ``unattributed`` and ``no_remote_fallback`` sessions contribute
+    nothing.
     """
     counts: Counter = Counter()
     for s in result.sessions.values():
@@ -138,6 +153,26 @@ def _combined_reason_counts(result: AnalysisResult) -> Counter:
         if ev.reason:
             counts[ev.reason] += 1
     return counts
+
+
+def _attribution_coverage(result: AnalysisResult) -> str:
+    """One-sentence coverage note for reason-count evidence.
+
+    Returns an empty string when every session that moved to remote had own
+    evidence, so a report over a clean window is unchanged; otherwise it names
+    how many sessions were lease-denied or unattributed so the cited counts are
+    not read as complete (LP-0MVMBMSWR0036RES AC5).
+    """
+    counts = result.fallback_attribution_counts
+    lease = counts.get(FALLBACK_ATTRIBUTION_LEASE_DENIED, 0)
+    unattributed = counts.get(FALLBACK_ATTRIBUTION_UNATTRIBUTED, 0)
+    if not lease and not unattributed:
+        return ""
+    return (
+        f" Session attribution coverage: {lease} session(s) lease/concurrency "
+        f"denied (`local_lease_active`) and {unattributed} unattributed (no own "
+        f"fallback evidence)."
+    )
 
 
 def _slot_counts(
@@ -197,6 +232,9 @@ def generate_recommendations(
 
     slot_counts_str = _slot_counts_str(fast_slots, cheap_slots)
     cfg_ctx = (config or {}).get("local_model_ctx_size")
+    # Session-attribution coverage for the evidence strings below: empty when
+    # every session that moved to remote had own evidence (LP-0MVMBMSWR0036RES).
+    attribution_note = _attribution_coverage(result)
 
     recs.extend(_error_recommendations(result))
 
@@ -222,7 +260,7 @@ def generate_recommendations(
                     f"{contention} of {total_fallbacks} fallback events ({_pct(contention, total_fallbacks):.1f}%) "
                     f"were slot-contention related ({breakdown}). "
                     f"{_dn(contention, contention_fast, contention_cheap)}. "
-                    f"Current slot counts: {slot_counts_str}."
+                    f"Current slot counts: {slot_counts_str}.{attribution_note}"
                 ),
             )
         )
@@ -293,7 +331,61 @@ def generate_recommendations(
             )
         )
 
-    # --- 4. Context pressure ------------------------------------------------
+    # --- 4. Provider context-ceiling skips ----------------------------------
+    # ``routing_skip_provider_context`` (LP-0MVMBM1Y3001TPRT): the estimated
+    # prompt exceeded a remote entry's ``max_context_tokens``, so that entry was
+    # skipped for this request. Unlike the reason-count rules above this is
+    # driven by the events themselves (they carry provider, estimate and
+    # ceiling), which makes the advice name the actual limit that was hit
+    # instead of inferring it from a reason string.
+    ctx_skips = list(result.provider_context_skip_events)
+    # Share of fallbacks: a provider-context skip is not itself a ``Fallback
+    # triggered`` event, so a window where every request was served after a
+    # chain skip has no fallback denominator — the skips then are the whole
+    # signal and count as 100%.
+    share_denominator = total_fallbacks or len(ctx_skips)
+    if ctx_skips and _pct(len(ctx_skips), share_denominator) >= PROVIDER_CONTEXT_SHARE * 100:
+        provider_counts = result.provider_context_skip_provider_counts
+        limit_counts = result.provider_context_skip_limit_counts
+        bucket_split = {"fast": 0, "cheap": 0}
+        for ev in ctx_skips:
+            label = bucketing.bucket_label(ev.ts, schedule, mode_map)
+            bucket_split["cheap" if label == "cheap" else "fast"] += 1
+        providers_str = ", ".join(
+            f"{provider}: {count}" for provider, count in provider_counts.most_common()
+        )
+        if limit_counts:
+            limits_str = ", ".join(
+                f"{limit}" if limit is not None else "not logged"
+                for limit, _ in limit_counts.most_common()
+            )
+        else:
+            limits_str = "not logged"
+        recs.append(
+            Recommendation(
+                severity="medium",
+                title="Provider entries skip prompts above their context ceiling",
+                detail=(
+                    "The routing chain skipped one or more remote entries because the "
+                    "estimated prompt exceeded that entry's `max_context_tokens` "
+                    "(`provider_context_exceeded`). The request is still served by the "
+                    "next eligible provider, so this is a chain-cost/latency signal, not "
+                    "an outage: each skip walks the chain further. Consider raising the "
+                    "entry's `max_context_tokens` where the provider allows it, placing a "
+                    "larger-context entry earlier in the chain, or reducing prompt size "
+                    "(compaction) so oversized sessions stop exhausting the chain."
+                ),
+                evidence=(
+                    f"{len(ctx_skips)} provider context-ceiling skip(s) "
+                    f"({_pct(len(ctx_skips), share_denominator):.1f}% of {share_denominator} "
+                    f"fallback events). By provider: {providers_str}. "
+                    f"{_dn(len(ctx_skips), bucket_split['fast'], bucket_split['cheap'])}. "
+                    f"Ceiling(s) hit (`limit`): {limits_str}."
+                ),
+            )
+        )
+
+    # --- 5. Context pressure ------------------------------------------------
     if cfg_ctx is not None or mode_map is not None:
         pressured = []
         for s in sessions:
@@ -338,7 +430,7 @@ def generate_recommendations(
                 )
             )
 
-    # --- 5. Fast/cheap imbalance -------------------------------------------
+    # --- 6. Fast/cheap imbalance -------------------------------------------
     buckets = [b for b in bucket_stats.values() if b["sessions"] >= IMBALANCE_MIN_SESSIONS]
     if len(buckets) == 2:
         low, high = sorted(buckets, key=lambda b: b["fallback_rate"])
@@ -367,7 +459,7 @@ def generate_recommendations(
                 )
             )
 
-    # --- 6. Remote provider errors (informational) ---------------------------
+    # --- 7. Remote provider errors (informational) ---------------------------
     remote_errors = [
         r for r in reason_counts if r and any(tok in r.lower() for tok in REMOTE_ERROR_REASONS)
     ]
@@ -392,7 +484,7 @@ def generate_recommendations(
             )
         )
 
-    # --- 7. No change needed --------------------------------------------------
+    # --- 8. No change needed --------------------------------------------------
     if not recs and fallback_rate < FALLBACK_RATE_LOW:
         fast_fb_total = sum(bucket_reasons["fast"].values())
         cheap_fb_total = sum(bucket_reasons["cheap"].values())

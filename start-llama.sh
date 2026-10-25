@@ -239,6 +239,10 @@ if [[ "$router_mode" -eq 1 ]]; then
   : "${LLAMA_PARALLEL:=1}"
   # Batch window defaults — override via LLAMA_BATCH_SIZE / LLAMA_UBATCH_SIZE.
   : "${LLAMA_BATCH_SIZE:=8192}"
+  # Prompt-processing micro-batch. LP-0MVIQ0FSX006HQOS tried 2048 and REVERTED
+  # it: the >=1.3x p90 gate failed on the 20k+ batches that drive the local
+  # tail (1.04x; the 1.62x win was confined to ~18k tokens). Keep this aligned
+  # with models.ini [Qwen3] ubatch-size; see docs/dev/ubatch-ab-2026-10-22.md.
   : "${LLAMA_UBATCH_SIZE:=1024}"
   LLAMA_CMD=(
     "$LLAMA_BIN"
@@ -305,6 +309,10 @@ case "$model" in
     QUANTIZATION=Q8_0
     CONTEXT=131072 # 128k context window (canonical size; max supported is 262144)
     BATCH_SIZE=8192
+    # Prompt-processing micro-batch: 2048 was tried and REVERTED by
+    # LP-0MVIQ0FSX006HQOS (>=1.3x p90 gate failed on 20k+ batches). Keep in
+    # step with models.ini [Qwen3] ubatch-size. See
+    # docs/dev/ubatch-ab-2026-10-22.md.
     UBATCH_SIZE=1024
     CHAT_TEMPLATE_KWARGS=""
     REASONING_FORMAT=deepseek

@@ -1,5 +1,16 @@
 # In-flight lease hold: accepted-but-never-progressed local requests
 
+> **Superseded (2026-10-23) by LP-0MVKUKFSO008GI6O.** The residual risk
+> characterised below no longer exists: the in-flight prefill signal extends a
+> lease's `expires_at` but no longer refreshes `last_progress_ts`, so an open
+> request is not treated as progress and the 180 s no-progress watchdog
+> releases a genuinely progress-less in-flight record. The effective bound is
+> therefore the **180 s no-progress timeout** (plus the 90 s prefill deadline
+> release in the router), not the 840 s first-byte ceiling. Sections below are
+> kept as the historical record of the pre-fix behaviour they measured; see
+> `proxy/docs/routing.md` § *Lease and in-flight truthfulness* and
+> `proxy/tests/test_lease_truthfulness.py` for the current contract.
+
 Characterisation and bounding of the residual risk introduced by the
 in-flight prefill-liveness signal (`9b7c505c`, LP-0MUXTW4MD003TVIC).
 Tracked by **LP-0MUXYXZQB002S391**.
@@ -149,16 +160,21 @@ that have delivered a first byte.
 
 ## Acceptance-criteria mapping
 
-1. **met** — `test_accepted_but_never_progressed_held_to_ceiling_then_released`
-   reproduces the shape (open in-flight request, no first byte, no `/slots`
-   state), shows the in-flight refresh defeats the 180s no-progress watchdog,
-   and shows release at `local_dispatch_max_prefill_seconds` with the
-   upstream `stream_cm` cancelled and counters/slot freed.
+1. **met (superseded)** — the original evidence was
+   `test_accepted_but_never_progressed_held_to_ceiling_then_released`, which
+   showed the in-flight refresh defeating the 180s no-progress watchdog and
+   release only at `local_dispatch_max_prefill_seconds`. LP-0MVKUKFSO008GI6O
+   AC4 replaced that behaviour: the same shape is now released at the 180 s
+   no-progress timeout and the test is
+   `test_accepted_but_never_progressed_released_by_no_progress_watchdog`.
 2. **met** — the starvation analysis above (occupancy model, `held / pool_size`
-   quantification, observed frequency) with hermetic evidence in
-   `test_in_flight_hold_starves_single_slot_local_pool`.
+   quantification, observed frequency). Its hermetic evidence is now
+   `test_in_flight_hold_does_not_starve_single_slot_local_pool`: the hold is
+   released at the 180 s no-progress timeout and the waiter is admitted.
 3. **met** — the 840s first-byte ceiling is identified as the tighter
-   effective bound and the trade-off against killing genuine long prefills is
-   stated; further tightening is not recommended.
-4. **met** — no production code change; the added tests live in the existing
-   hermetic suite.
+   effective bound *under the pre-fix refresh behaviour*; with AC4 the
+   180 s no-progress timeout is the effective bound and no ceiling tightening
+   is needed.
+4. **met** — no production code change in this item; the follow-up change is
+   tracked in LP-0MVKUKFSO008GI6O and pinned by
+   `proxy/tests/test_lease_truthfulness.py`.

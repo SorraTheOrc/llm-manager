@@ -132,13 +132,13 @@ def _live_entry(model_name: str, entry_name: str) -> dict:
 
 
 def _target_chain_entries(model_name: str) -> list[dict]:
-    """Resolve the target low chain against the live ``providers`` entries."""
-    model = _live_model(model_name)
-    shaped = {
-        **model,
-        "priority_routes": {"low": list(TARGET_LOW_CHAIN)},
-    }
-    return provider_chain_for_priority(shaped, PRIORITY_LOW)
+    """Resolve the target low chain from the live provider ``priorities`` labels.
+
+    Since LP-0MVGPZWY0001JD1D the chain is a plain filter over the model's own
+    ``providers`` list, so the live labels are the only source of truth: no
+    synthetic route table is injected here.
+    """
+    return provider_chain_for_priority(_live_model(model_name), PRIORITY_LOW)
 
 
 def _next_provider(chain: list[dict], named: set[str], domains: set[str]):
@@ -192,15 +192,23 @@ class TestLiveConfigInvariants:
 
     def test_fully_paid_tiers_never_enter_a_low_chain(self):
         # AC6: ``munitoai`` and ``deepseek-flash`` have no window discipline,
-        # so they must never be reachable from a ``low`` route.
+        # so they must never be reachable from a ``low`` route. Membership is
+        # declared by each entry's own ``priorities`` label
+        # (LP-0MVGPZWY0001JD1D).
         config = _live_config()
         banned = {"munitoai", "deepseek-flash"}
         for model_name, model in config["models"].items():
-            routes = (model or {}).get("priority_routes") or {}
-            low = routes.get("low") or []
+            low_labels = [
+                e.get("name")
+                for e in (model or {}).get("providers") or []
+                if PRIORITY_LOW in (e.get("priorities") or [])
+            ]
             resolved = provider_chain_for_priority(model, PRIORITY_LOW)
             leaked = banned & {e.get("name", "") for e in resolved}
-            assert not leaked, f"model {model_name!r} low chain {low!r} leaks paid tiers {sorted(leaked)}"
+            assert not leaked, (
+                f"model {model_name!r} low chain {low_labels!r} "
+                f"leaks paid tiers {sorted(leaked)}"
+            )
 
     @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
     def test_opencode_entries_keep_their_off_peak_windows(self, model_name):

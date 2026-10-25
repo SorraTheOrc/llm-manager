@@ -416,6 +416,11 @@ async def get_llama_local_status(request: Request):
     ``true`` whenever the served slot data came from that cache rather than
     a fresh query — counts or per-slot detail — so a future silent failure
     (worker alive but zero dispatches across an idle window) is observable.
+    The two sources are also published separately:
+    ``slot_counts_stale`` and ``slots_detail_stale``. Only the detail matters
+    for capacity: a cached ``is_processing``/``phase`` is a fossil of a past
+    request, so a hint derived from it is reconciled with live proxy state
+    (see ``capacity_hint`` below, LP-0MVKSXR4P001V0CM AC3).
 
     ``slots`` carries the per-slot details (``slot_id``, ``is_processing``,
     ``n_decoded``) from llama-server's ``/slots`` endpoint so consumers such
@@ -429,7 +434,7 @@ async def get_llama_local_status(request: Request):
     httpx timeout bounded by the ``STATUS_QUERY_TIMEOUT`` window so a slow
     /slots response cannot blow the endpoint's response budget.
 
-    Per-slot capacity (LP-0MVGDUVGE0024YAI, ``status_schema_version: 2``):
+    Per-slot capacity (LP-0MVGDUVGE0024YAI, ``status_schema_version: 3``):
     each slot also carries ``owner_session_id`` and ``lease_state``
     (``generating`` | ``idle_leased`` | ``free``) so a dispatcher can tell a
     slot that is actually working from one that is merely reserved-but-idle
@@ -448,13 +453,24 @@ async def get_llama_local_status(request: Request):
     and at least one slot is prefilling; ``saturated`` when nothing is free
     and every occupied slot is decoding. All new fields are additive — a
     client that ignores them behaves exactly as before (AC1), and the ETA
-    fields are ``null`` (never stale numbers) when ``slots_stale`` is true
+    fields are ``null`` (never stale numbers) when the slot detail is stale
     (AC7).
 
-    ``local_active_query`` mirrors ``active_query`` but is derived from the
-    local-only counter (``local_active_queries``), so remote provider
-    streams (e.g. opencode-go → deepseek-v4-flash) do not make it true.
-    Local activity is a subset of all activity, so
+    When the served slot detail is stale, ``capacity_hint`` is reconciled
+    with live state (LP-0MVKSXR4P001V0CM AC1/AC3) so a fossil snapshot can
+    never starve a dispatcher: with no in-flight local request (counted from
+    active dispatch records in ``local_in_flight_requests``) every verdict
+    degrades to ``idle`` and ``available_slots`` is reconciled upward;
+    in-flight work with fresh chunk activity within
+    ``STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS`` keeps ``saturated``; any other
+    in-flight work is reported ``prefill_bound``, never ``saturated``.
+
+    ``local_active_query`` reports whether local model work is genuinely in
+    flight, derived from active dispatch records rather than the
+    ``local_active_queries`` counter, so retained post-stream leases and a
+    leaked counter do not make it true (LP-0MVKSXR4P001V0CM AC1). Remote
+    provider streams (e.g. opencode-go → deepseek-v4-flash) never make it
+    true. Local activity is a subset of all activity, so
     ``local_active_query=true`` implies ``active_query=true``
     (LP-0MSL2ZLLS009RVKR).
 
@@ -521,24 +537,43 @@ async def get_llama_local_status(request: Request):
     # The global counter above also counts remote provider streams, so herdr
     # dispatch needs a local-only signal. local_active_query=true implies
     # active_query=true (local activity is a subset of all activity).
+    #
+    # LP-0MVKSXR4P001V0CM AC1: derive the answer from the live dispatch
+    # records (a request is in flight only while its record is ``active``),
+    # not from ``local_active_queries``, whose retained post-stream leases no
+    # longer correspond to work. The counter remains the legacy fallback when
+    # the server has no dispatch-record registry at all.
+    live_local_requests: int | None = None
     local_active_query = False
     try:
-        async with srv.local_active_queries_lock:
-            local_active_query = srv.local_active_queries > 0
+        from proxy.router_helpers import (
+            _count_active_local_dispatch_records as _count_active_records,
+        )
+
+        live_local_requests = _count_active_records(srv)
     except Exception:
-        local_active_query = False
+        live_local_requests = None
+    if live_local_requests is not None:
+        local_active_query = live_local_requests > 0
+    else:
+        try:
+            async with srv.local_active_queries_lock:
+                local_active_query = srv.local_active_queries > 0
+        except Exception:
+            local_active_query = False
 
     # -- slots query (lightweight, short timeout) -------------------------
     available_slots = 0
     total_slots = 0
     slots: list[dict] = []
-    # slots_stale: True when the served slot data (counts or per-slot
-    # detail) came from the last-known cache because the fresh /slots query
-    # failed (LP-0MSVP7XJ6008QPKX, LP-0MUFSVXID0039ZAQ). Set in the counts
-    # block below and by the per-slot detail fallback; logged and returned in
-    # the payload so a future silent failure (worker alive, zero dispatches
-    # across an idle window) is observable.
-    slots_stale = False
+    # ``counts_stale`` / ``detail_stale`` track the two independent /slots
+    # fallbacks separately: the counts cache (LP-0MSVP7XJ6008QPKX) and the
+    # per-slot detail cache (LP-0MUFSVXID0039ZAQ). Only ``detail_stale``
+    # matters for capacity: ``is_processing``/``phase`` from a cached
+    # snapshot are a fossil of a past request, so a hint derived from them
+    # must be reconciled with live proxy state (LP-0MVKSXR4P001V0CM AC3).
+    counts_stale = False
+    detail_stale = False
     if llama_running:
         try:
             server_cfg = srv.config.get("server", {}) if isinstance(srv.config, dict) else {}
@@ -565,18 +600,49 @@ async def get_llama_local_status(request: Request):
                     _query_slots,
                     _query_slots_detail,
                     last_known_slot_counts,
+                    slots_failure_is_definitive_model_absent,
                 )
-                available_slots, total_slots = await _query_slots(client, llama_port, timeout=2.0, model=cm)
+                # The outcome of the fresh counts query (status + reason) lets
+                # the handler tell a definitive "this model is not loaded"
+                # (HTTP 400/404 from llama-server's router) from a transient
+                # failure, so a fossil cache snapshot is never served as
+                # current capacity (LP-0MVKSXR4P001V0CM AC3).
+                counts_outcome: dict = {}
+                available_slots, total_slots = await _query_slots(
+                    client,
+                    llama_port,
+                    timeout=2.0,
+                    model=cm,
+                    status_out=counts_outcome,
+                )
+                model_absent = slots_failure_is_definitive_model_absent(
+                    counts_outcome
+                )
                 # Graceful degradation (LP-0MSVP7XJ6008QPKX): a /slots failure
                 # (e.g. HTTP 500 during a model reload after cheap-mode restart)
                 # previously surfaced as total_slots=0, fail-closing the herdr
                 # downtime worker. Serve the last known counts when fresh, and
                 # flag the degraded state so monitoring sees it.
                 if total_slots == 0:
-                    last_known = last_known_slot_counts()
-                    if last_known is not None:
-                        available_slots, total_slots = last_known
-                        slots_stale = True
+                    if model_absent:
+                        # Definitive: the idle model instance is not loaded
+                        # (llama-server's router unloads idle models). That is
+                        # a fresh, truthful "no slots yet", not staleness:
+                        # fail open on the configured pool — the first
+                        # dispatched job loads the model (LP-0MSI06HPB0043MV1)
+                        # — and do not resurrect cached occupancy.
+                        try:
+                            total_slots = int(
+                                server_cfg.get("session_slot_pool_size", 3) or 3
+                            )
+                        except (TypeError, ValueError):
+                            total_slots = 3
+                        available_slots = total_slots
+                    else:
+                        last_known = last_known_slot_counts()
+                        if last_known is not None:
+                            available_slots, total_slots = last_known
+                            counts_stale = True
                 # Per-slot details (LP-0MSORPUMX002LLIA): best-effort, empty
                 # list on any failure (helper catches HTTP/connect/timeout
                 # errors internally; the handler guard keeps the response
@@ -599,9 +665,9 @@ async def get_llama_local_status(request: Request):
                     # the counts fallback above; when the cache is empty the
                     # payload stays a well-formed empty array (AC3).
                     cached_detail = _last_slot_details_cache
-                    if cached_detail:
+                    if cached_detail and not model_absent:
                         slots = list(cached_detail)
-                        slots_stale = True
+                        detail_stale = True
             except Exception:
                 # slots query is best-effort; default to 0 on failure
                 pass
@@ -635,7 +701,7 @@ async def get_llama_local_status(request: Request):
             srv,
             cm,
             srv.config if isinstance(getattr(srv, "config", None), dict) else {},
-            stale=slots_stale,
+            stale=detail_stale,
         )
     except Exception:
         # Annotation is best-effort; the base slot fields remain valid.
@@ -691,19 +757,62 @@ async def get_llama_local_status(request: Request):
     # last-known cache, a poll-derived ETA is not a fresh number. Null it
     # rather than let a dispatcher act on a stale estimate. The budget is a
     # configuration constant (not poll-derived) and stays truthful.
-    if slots_stale:
+    if detail_stale:
         prefill_eta = dict(prefill_eta)
         prefill_eta["prefill_eta_seconds"] = None
         prefill_eta["queue_eta_seconds"] = None
+
+    # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): idle age of the local
+    # backend, the signal the routing override reads. Also feeds the stale
+    # capacity reconciliation below (recent chunk activity is the only fresh
+    # evidence that a cached ``decode`` phase is still true).
+    try:
+        from proxy.local_activity import activity_snapshot as _activity_snapshot
+
+        _idle_snapshot = _activity_snapshot()
+    except Exception:
+        _idle_snapshot = {}
 
     # AC4 (LP-0MVGDUVGE0024YAI): summarise whether the pool is genuinely
     # working — ``idle`` (a free slot, or only idle leases), ``prefill_bound``
     # (no free slot, at least one prefill) or ``saturated`` (no free slot, all
     # decode). Computed from the annotated slots by the pure decision table.
     try:
-        from proxy.observability import compute_capacity_hint as _capacity_hint
+        from proxy.observability import (
+            compute_capacity_hint as _capacity_hint,
+        )
+        from proxy.observability import (
+            downgrade_stale_capacity_hint as _downgrade_stale_hint,
+        )
 
         capacity_hint = _capacity_hint(slots)
+        # LP-0MVKSXR4P001V0CM AC3: a hint derived from cached ``/slots``
+        # detail must never claim the pool is saturated without fresh
+        # evidence. Reconcile it with the live dispatch/activity state so a
+        # fossil snapshot cannot starve a dispatcher through an idle window.
+        capacity_hint = _downgrade_stale_hint(
+            capacity_hint,
+            stale=detail_stale,
+            live_local_requests=live_local_requests or 0,
+            activity_source=_idle_snapshot.get("last_activity_source"),
+            idle_seconds=_idle_snapshot.get("idle_seconds"),
+        )
+        if detail_stale and capacity_hint == "idle":
+            # The proxy sees no in-flight local work, so the cached counts
+            # must not report a full pool either: reconcile
+            # ``available_slots`` with the same view (fail-open, mirroring the
+            # no-model-loaded branch LP-0MSI06HPB0043MV1). A dispatcher polls
+            # this pair together and acts on both.
+            if total_slots <= 0:
+                try:
+                    total_slots = int(
+                        server_cfg.get("session_slot_pool_size", 3) or 3
+                    )
+                except (TypeError, ValueError):
+                    total_slots = 3
+            available_slots = max(
+                available_slots, total_slots - (live_local_requests or 0)
+            )
     except Exception:
         capacity_hint = "idle"
 
@@ -714,7 +823,7 @@ async def get_llama_local_status(request: Request):
     try:
         from proxy.router_helpers import (
             _effective_prefill_cap,
-            _get_prefill_in_flight_count,
+            _get_live_prefill_in_flight_count,
         )
 
         _server_cfg_for_prefill = (
@@ -722,7 +831,11 @@ async def get_llama_local_status(request: Request):
             if isinstance(getattr(srv, "config", None), dict)
             else {}
         )
-        prefill_in_flight = _get_prefill_in_flight_count(srv)
+        # LP-0MVKUKFSO008GI6O AC3: publish only in-flight prefills backed by
+        # a live dispatch record. An orphaned marker (LP-0MVKSXR4P001V0CM
+        # evidence: ``local_prefills_in_flight: 1`` while the GPU was idle)
+        # must not make the pool look busy to a dispatcher.
+        prefill_in_flight = _get_live_prefill_in_flight_count(srv)
         prefill_cap = _effective_prefill_cap(
             _server_cfg_for_prefill, int(total_slots or 1)
         )
@@ -738,14 +851,11 @@ async def get_llama_local_status(request: Request):
 
     # -- structured log entry with latency --------------------------------
     _latency_ms = int((time.monotonic() - _start) * 1000)
-    # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): idle age of the local
-    # backend, the signal the routing override reads.
-    try:
-        from proxy.local_activity import activity_snapshot as _activity_snapshot
-
-        _idle_snapshot = _activity_snapshot()
-    except Exception:
-        _idle_snapshot = {}
+    # ``slots_stale`` keeps its documented meaning (counts OR detail served
+    # from cache) for existing consumers; the per-source flags are published
+    # alongside it so an operator can tell a count fallback from a capacity
+    # view built on cached slot detail.
+    slots_stale = counts_stale or detail_stale
     client_ip, client_ip_source = _resolve_client_ip(request)
     status_extra = {
         "client_ip": client_ip,
@@ -766,7 +876,9 @@ async def get_llama_local_status(request: Request):
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
         "capacity_hint": capacity_hint,
-        "status_schema_version": 2,
+        "local_in_flight_requests": live_local_requests,
+        "slots_detail_stale": detail_stale,
+        "status_schema_version": 3,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -788,6 +900,16 @@ async def get_llama_local_status(request: Request):
         # (LP-0MSVP7XJ6008QPKX, LP-0MUFSVXID0039ZAQ). Additive field;
         # consumers that ignore unknown fields are unaffected.
         "slots_stale": bool(slots_stale),
+        # Per-source freshness (LP-0MVKSXR4P001V0CM AC3): ``slots_stale`` is
+        # the union below; ``slots_detail_stale`` is the one that matters for
+        # ``capacity_hint`` (cached ``is_processing``/``phase`` are not live
+        # evidence) and ``slot_counts_stale`` only affects the counts.
+        "slots_detail_stale": bool(detail_stale),
+        "slot_counts_stale": bool(counts_stale),
+        # Truthful in-flight local request count, derived from live dispatch
+        # records (``None`` in legacy mode with no record registry).
+        # ``local_active_query`` mirrors ``> 0``; ``Null`` is never emitted.
+        "local_in_flight_requests": live_local_requests,
         # Per-slot details (LP-0MSORPUMX002LLIA): compact slot dicts from
         # llama-server's /slots endpoint, falling back to the last-known
         # detail cache on a transient failure (LP-0MUFSVXID0039ZAQ); empty
@@ -816,8 +938,10 @@ async def get_llama_local_status(request: Request):
         "capacity_hint": capacity_hint,
         # Additive payload version (AC1): bumped when per-slot/top-level
         # capacity fields change meaning. Consumers that ignore it behave
-        # exactly as before.
-        "status_schema_version": 2,
+        # exactly as before. v3 (LP-0MVKSXR4P001V0CM): ``capacity_hint`` is
+        # reconciled with live dispatch state when slot detail is stale, and
+        # ``slots_detail_stale`` / ``local_in_flight_requests`` are added.
+        "status_schema_version": 3,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local
@@ -1133,6 +1257,21 @@ async def prometheus_metrics():
 # /admin/metrics
 # ---------------------------------------------------------------------------
 
+def _local_eviction_metrics() -> dict:
+    """Post-acceptance eviction counters (LP-0MVN4LCED00661MX AC5).
+
+    ``total`` plus a per-reason breakdown. Monotonic; reset only on process
+    restart (matching the in-process Prometheus counter). Never raises: an
+    observability endpoint must not fail because a counter is unavailable.
+    """
+    try:
+        from proxy.admission_events import eviction_after_acceptance_counters
+
+        return eviction_after_acceptance_counters()
+    except Exception:
+        return {"total": 0, "by_reason": {}}
+
+
 @router.get("/admin/metrics")
 async def admin_metrics():
     """Return router/memory/metrics for observability."""
@@ -1198,6 +1337,11 @@ async def admin_metrics():
         "restore_fallback_total": dict(srv.session_restore_observability.get("restore_fallback_total", {})),
         "delta_payload_bytes_total": int(srv.session_restore_observability.get("delta_payload_bytes_total", 0)),
         "single_flight_metrics": dict(srv.session_single_flight_observability),
+        # LP-0MVN4LCED00661MX AC5: post-acceptance local evictions (an accepted
+        # dispatch released before its first byte) with a per-reason
+        # breakdown, beside the guardrail block. Alert on any non-zero count
+        # for a within-budget prompt — that is a pricing/budget defect.
+        "local_evictions_after_acceptance": _local_eviction_metrics(),
         "guardrail_metrics": {
             "guardrail_cutoff_total": int(srv.session_guardrail_observability.get("guardrail_cutoff_total", 0)),
             "guardrail_cutoff_reasons": dict(srv.session_guardrail_observability.get("guardrail_cutoff_reasons", {})),

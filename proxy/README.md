@@ -15,7 +15,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Request/Response Logging**: Comprehensive logging with time-based rotation. INFO-level request log lines now include the resolved session ID (`session_id=<value>`), assigned slot ID (`slot=<value>` or `slot=none`), and a body preview that excludes system-prompt content to prevent sensitive system-prompt data from leaking into logs. Console output for STREAM CHUNK messages now prints only the streamed text content (delta.content) to reduce noisy JSON envelopes in the terminal; rotating file logs continue to record the full JSON chunk records unchanged.
 - **Request + Token Counters**: In-memory counters with periodic JSON persistence
 - **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
-- **Priority-based routing**: every request carries an effective priority (`X-Priority: low|medium|high`, default `medium`; capped to `low` during the configured cheap window, `server.priority_window`, default 01:00–10:00 local). The effective priority selects the model's `priority_routes` provider chain and gates the routing knobs (contention-queue entry, economic-bypass recovery, local-vs-remote preference) — LP-0MVDT94F0003VHUA AC1–AC3. The slot pool is fixed at 2 (`session_slot_pool_size`); no routing-policy change ever restarts the proxy. The fast/cheap mode machinery (overlays, `proxy/.mode`, `mode_schedule.yaml`, `/admin/set-mode`) was removed (AC4).
+- **Priority-based routing**: every request carries an effective priority (`X-Priority: low|medium|high`, default `medium`; capped to `low` during the configured cheap window, `server.priority_window`, default 01:00–10:00 local). The effective priority selects the model's provider chain — each provider entry declares the priorities it serves as a `priorities` list, and the chain is that model's `providers` list filtered by the priority (LP-0MVGPZWY0001JD1D) — and gates the routing knobs (contention-queue entry, economic-bypass recovery, local-vs-remote preference) — LP-0MVDT94F0003VHUA AC1–AC3. The slot pool is fixed at 2 (`session_slot_pool_size`); no routing-policy change ever restarts the proxy. The fast/cheap mode machinery (overlays, `proxy/.mode`, `mode_schedule.yaml`, `/admin/set-mode`) was removed (AC4).
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
 - **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view. Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in). Each slot header badge shows the **full session ID** (untruncated, with the full ID also on hover) — slot session IDs are no longer shortened to 8 characters (LP-0MV6CZGN6003Z5QI).
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
@@ -1187,13 +1187,67 @@ Routing policy now lives **per request**, not per machine state:
   request; during the configured cheap window (`server.priority_window`,
   default local 01:00–10:00) every request routes as `low` — the header is
   never modified and no 503/Retry-After deferral is applied (AC1).
-- Each model may declare `priority_routes` (AC2) — a map from priority to an
-  ordered provider list (names resolve against the model's `providers`).
-  A config without `priority_routes` behaves exactly as today (`medium`
-  semantics), so the existing base config is 100% backward compatible.
+- Each provider entry may declare `priorities` (AC2; LP-0MVGPZWY0001JD1D) —
+  the list of `low|medium|high` priorities it may serve. The chain for a
+  request is the model's own `providers` list filtered by the request's
+  effective priority, in `providers` order:
+  `chain(P) = [p for p in providers if P in p["priorities"]]`.
+  Membership is declared once, on the provider definition itself. The former
+  per-model `priority_routes` name map is **removed** — see
+  [Migrating from `priority_routes`](#migrating-from-priority_routes).
+  A model that declares no `priorities` anywhere keeps every provider eligible
+  for every priority (today's `medium` semantics: `embed`, `github`,
+  `private`), so an unlabelled config stays 100% backward compatible.
+- **No tier implication** — `[medium, high]` never includes `low`; a provider
+  serves exactly the priorities listed. Model-level opt-in is fail-closed: if
+  any provider of a model declares `priorities`, every provider of that model
+  must, and together they must cover every priority (validated at load).
+- **Per-priority ordering is not supported**: the chain order is always the
+  model's `providers` order, so an entry cannot be positioned differently for
+  different priorities. Add a separate provider entry instead.
 - The routing knobs (contention-queue entry, economic-bypass recovery,
   local-vs-remote preference) are keyed to the effective priority (AC3) —
   see the README "Per-priority contention-queue tuning" section.
+
+### Migrating from `priority_routes`
+
+`priority_routes` (a per-model map from priority to an ordered list of
+provider **names**) was removed in LP-0MVGPZWY0001JD1D. There is no
+compatibility shim and no deprecation window: a config that still declares it
+fails at load with a message naming the replacement key. To migrate, delete
+the `priority_routes` block and label each provider entry with the priorities
+its entry appeared under:
+
+```yaml
+# Before
+models:
+  plan:
+    providers:
+      - name: local-qwen3
+        type: local
+        llama_model: Qwen3
+      - name: munitoai
+        type: remote
+        # …
+    priority_routes:
+      low: [local-qwen3]
+
+# After
+models:
+  plan:
+    providers:
+      - name: local-qwen3
+        priorities: [low, medium, high]
+        type: local
+        llama_model: Qwen3
+      - name: munitoai
+        priorities: [medium, high]
+        type: remote
+        # …
+```
+
+Chain order after migration is the `providers` order, which is why the old
+`priority_routes` lists always had to agree with it.
 
 Because `config.yaml` is the only config, the restart signature simply hashes
 the base config (still via the shared canonical helper
@@ -1773,6 +1827,46 @@ Systemd-specific instructions removed. If you run systemd units outside this rep
 
 ### Starting the Server
 
+**Via `start-proxy.sh` (detached by default — the normal way):**
+
+```bash
+cd proxy
+bash scripts/start-proxy.sh --restart    # add --keep-llama-server to preserve a warm llama-server
+```
+
+The script performs every synchronous check first (port free, provider API keys
+resolved, config readable, plus the `--restart` cleanup) and then launches
+uvicorn in its **own session/process group** (`setsid`, or `nohup` + `disown`
+when `setsid` is unavailable) with its stdout/stderr redirected to a log file.
+It prints one handoff line and exits 0:
+
+```
+Proxy launched detached: child pid 12345, output in /tmp/proxy-startup.log | health check: curl -sf http://127.0.0.1:8000/health
+```
+
+Because the server outlives the launcher, a failed startup after the handoff
+(bind error, model load failure, import error) can only be seen in the log —
+**poll `/health`** instead of trusting the exit code:
+
+```bash
+curl -sf http://127.0.0.1:8000/health || tail -30 /tmp/proxy-startup.log
+```
+
+| Flag | Effect |
+|------|--------|
+| `--foreground` | **Interactive debugging only** — blocking `exec` of uvicorn in the current process group. Unattended callers may set `START_PROXY_FOREGROUND=1` instead. |
+| `--log-file <path>` | Where the detached server's stdout/stderr go (default `/tmp/proxy-startup.log`). |
+| `--restart` | Kill any running proxy, llama-server and TTS processes first. |
+| `--keep-llama-server` | With `--restart`, preserve a warm llama-server (KV / prompt cache). |
+
+> **NEVER start the proxy in the foreground under an agent tool call.**
+> A tool-call timeout SIGKILLs the entire process group, so a foreground uvicorn
+dies mid-startup with no `Shutting down` line and leaves the proxy offline
+(LP-0MVGT0E6W000Q8CY). Run the detached command above, never `--foreground`,
+and never pipe the launcher into `| tail` (holding the caller's stdout open is
+the same failure by another route). `--foreground` exists only for an
+interactive terminal session.
+
 **Direct uvicorn:**
 ```bash
 source .venv/bin/activate
@@ -1782,6 +1876,30 @@ python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
 # Development (with auto-reload and DEBUG logging)
 LLAMA_PROXY_DEV=1 python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8001 --reload --log-level debug
 ```
+
+### Diagnosing a proxy killed by a tool-call timeout
+
+The proxy can be killed by the harness that launched it, not by a crash. The
+signature is unambiguous — check all four:
+
+1. The proxy log ends abruptly with **no `Shutting down` line** (SIGKILL, not a
+   clean shutdown).
+2. The triggering tool result read `Command timed out after <N> seconds`.
+3. The launcher was run in the foreground (a bare `start-proxy.sh` invocation
+   before the default was detach, or an explicit `--foreground`).
+4. Sibling services are still alive — `curl -sf http://127.0.0.1:8080/health`
+   (llama-server) and the TTS server on 8081 answer while the proxy on 8000
+   does not.
+
+Recovery is a plain restart; do not re-investigate the launch path:
+
+```bash
+cd proxy && bash scripts/start-proxy.sh --restart
+```
+
+llama-server is preserved by default when its recorded signature matches the
+effective config, so the restart keeps the warm KV / prompt cache and is fast.
+Then poll `/health` as described above.
 
 ### Verbose per-chunk SSE logging (`--verbose`)
 
@@ -1794,10 +1912,13 @@ Enable verbose chunk logging for debugging stream issues with any of:
 
 ```bash
 # start-proxy.sh flag (recommended; run from the repository root)
-proxy/scripts/start-proxy.sh --verbose
+# The script detaches by default, so this returns a handoff line immediately —
+# the STREAM CHUNK lines land in the detached log, not in this terminal.
+proxy/scripts/start-proxy.sh --verbose --restart --log-file /tmp/proxy-verbose.log
+# then: curl -sf http://127.0.0.1:8000/health ; tail -f /tmp/proxy-verbose.log
 
 # Environment variable (works with any launcher, including direct uvicorn)
-LLAMA_PROXY_VERBOSE=1 proxy/scripts/start-proxy.sh
+LLAMA_PROXY_VERBOSE=1 proxy/scripts/start-proxy.sh --restart
 
 # Config key in config.yaml
 #   logging:
@@ -1810,6 +1931,8 @@ at INFO level in all modes, and chunk content is always suppressed from the cons
 Note on start-proxy.sh hardening
 
 The bundled `proxy/scripts/start-proxy.sh` script now prefers the virtualenv Python interpreter (`.venv/bin/python3`) when available, falls back to the system `python3`, and will set `PYTHONPATH` to the repository root if it is not already set to avoid import errors when running from the repository checkout.
+
+The script also **detaches the server by default** (LP-0MVGT0E6W000Q8CY): after the checks below it launches uvicorn in its own session with stdout/stderr redirected to `/tmp/proxy-startup.log` (override with `--log-file`), prints one handoff line and exits 0. Startup failures after the handoff are visible only in that log, so poll `/health`. Use `--foreground` (`START_PROXY_FOREGROUND=1` when flags cannot be passed) only for interactive debugging — never under an agent tool call, whose timeout would SIGKILL the server's process group.
 
 Before launching the server the script also checks whether the selected port (default `8000`, or overridden with `--port`) is already in use on the local host. If the port is occupied the script exits with a helpful message indicating the port and suggesting running with a different `--port` value.
 
@@ -1917,12 +2040,18 @@ Response:
 | Field                     | Type          | Description                                                                 |
 |---------------------------|---------------|-----------------------------------------------------------------------------|
 | `active_query`            | `bool`        | `true` while a request is being processed (at least one in-flight request). |
-| `local_active_query`      | `bool`        | `true` only while LOCAL model work is in flight (remote provider streams are excluded — LP-0MSL2ZLLS009RVKR). |
+| `local_active_query`      | `bool`        | `true` only while LOCAL model work is in flight, derived from live dispatch records (a retained post-stream lease or a leaked counter does not count); remote provider streams are excluded (LP-0MSL2ZLLS009RVKR, LP-0MVKSXR4P001V0CM). |
+| `local_in_flight_requests`| `int|null`    | Number of active local dispatch records (`null` in legacy mode without the registry). |
 | `model_switch_in_progress`| `bool`        | `true` during a background model load or model switch.                     |
 | `current_model`           | `string|null` | Name of the currently loaded model, or `null` when no model is loaded.     |
 | `llama_server_running`    | `bool`        | `true` when the llama-server process is running and responsive.            |
-| `available_slots`         | `int`         | Number of model-serving slots that are currently idle (not processing).     |
+| `available_slots`         | `int`         | Number of model-serving slots that are currently idle (not processing). When the served slot detail is stale and the proxy has no in-flight local work, reconciled upward to the pool size so a stale snapshot cannot close the dispatch gate. |
 | `total_slots`             | `int`         | Total number of model-serving slots configured on the llama-server.         |
+| `capacity_hint`           | `string`      | `idle` \| `prefill_bound` \| `saturated`, from the per-slot decision table; reconciled with live dispatch/activity state when slot detail is stale (LP-0MVGDUVGE0024YAI, LP-0MVKSXR4P001V0CM). |
+| `slots_stale`             | `bool`        | The served slot counts **or** per-slot detail came from the last-known cache. |
+| `slots_detail_stale`      | `bool`        | The per-slot detail (and therefore `capacity_hint` input) is cached.       |
+| `slot_counts_stale`       | `bool`        | The `available_slots` / `total_slots` pair is cached.                      |
+| `status_schema_version`   | `int`         | Payload schema version (currently `3`).                                    |
 
 **Performance:**
 
@@ -2887,6 +3016,18 @@ Logs are written with time-based rotation:
 - **Rotation**: Every 6 hours
 - **Retention**: 7 days
 - **Format**: `TIMESTAMP - LEVEL - MESSAGE`
+
+**Restart-safe, single-writer logging (LP-0MVLHMAWV008EKTI).** On startup a
+non-empty `proxy.log` is renamed aside to `proxy.log.YYYY-MM-DD_HHMMSS`
+(named for its last write, never overwriting an existing rotated file), so a
+restart archives the pre-restart window instead of risking its loss and the
+new process always starts a fresh file. Only one proxy may own a log
+directory: an exclusive `flock` on `proxy.lock` makes a second instance fail
+fast with the holder's pid, and `start-proxy.sh` reaps a bound-less stale twin
+(`reap-stale-proxy.sh`) before launching. Measurement scripts that assert log
+coverage call `measure_log_coverage()` (`scripts/lib/proxy_logs.py`), which
+turns an unexplained gap between adjacent files into a verdict failure. See
+[docs/dev/proxy-log-lifecycle.md](../docs/dev/proxy-log-lifecycle.md).
 
 Log entries include:
 - Incoming requests (method, path, target, body preview)

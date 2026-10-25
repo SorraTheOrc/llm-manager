@@ -998,18 +998,20 @@ def test_contention_queue_config_logs_invalid_values(caplog):
 
 def test_cheap_config_declares_queue_policy():
     """The merged cheap profile declares queue policy + tuned caps (F2 AC1,
-    caps tuned 60→120 / 4→8 per LP-0MTF6EVLW007PEHN)."""
+    caps tuned 60→120 / 4→8 per LP-0MTF6EVLW007PEHN; halved 120→60 in
+    LP-0MVIQ0EXV00673HO)."""
     from config_test_utils import get_merged_config
 
     server = get_merged_config("cheap")["server"]
     assert server["contention_queue_policy"] == "queue"
-    assert server["contention_queue_max_wait_seconds"] == 120
+    assert server["contention_queue_max_wait_seconds"] == 60
     assert server["contention_queue_max_depth"] == 8
 
 
 def test_fast_config_declares_queue_policy():
     """The merged fast profile declares queue policy + the same tuned caps as
-    cheap (depth 8, wait 120s) since LP-0MV881O5C007PSL4.
+    cheap (depth 8, wait 60s). LP-0MV881O5C007PSL4 raised fast to cheap caps
+    (wait 120s); LP-0MVIQ0EXV00673HO halved the unified cap to 60s.
 
     Fast mode originally used a smaller queue (depth 3 vs 8, wait 45s vs 120s,
     LP-0MTQYIK4Z008XF2V) so burst traffic spilled to remotes sooner during
@@ -1021,7 +1023,7 @@ def test_fast_config_declares_queue_policy():
 
     server = get_merged_config("fast")["server"]
     assert server["contention_queue_policy"] == "queue"
-    assert server["contention_queue_max_wait_seconds"] == 120
+    assert server["contention_queue_max_wait_seconds"] == 60
     assert server["contention_queue_max_depth"] == 8
 
 
@@ -1249,7 +1251,7 @@ def test_lease_grace_default_is_not_clamped_and_logs_nothing(caplog):
     caplog.set_level(logging.WARNING, logger="llama-proxy")
     cfg = {
         "contention_queue_policy": "queue",
-        "contention_queue_max_wait_seconds": 120,
+        "contention_queue_max_wait_seconds": 60,
         "contention_queue_max_depth": 8,
     }
 
@@ -1274,7 +1276,7 @@ def test_lease_grace_clamps_to_the_runtime_ceiling(caplog):
     resolved = _get_contention_queue_config(
         {
             "contention_queue_policy": "queue",
-            "contention_queue_max_wait_seconds": 120,
+            "contention_queue_max_wait_seconds": 60,
             "contention_queue_lease_grace_seconds": 99999,
             "session_guardrail_max_runtime_seconds": 1800,
         }

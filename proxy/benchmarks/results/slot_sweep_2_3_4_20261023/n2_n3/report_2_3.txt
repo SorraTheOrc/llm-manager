@@ -1,0 +1,43 @@
+========================================================================
+  SLOT-COUNT BENCHMARK REPORT
+========================================================================
+  Target: 6,000 prompt tokens, ~600s response
+  Concurrency: 3  |  Requests per run: 6  |  Warmup: 0 (use --warmup to enable)
+  Date: 2026-10-23 21:04 UTC
+
+ Slots   Completed   Errors   Avg Dur   Min Dur   Max Dur   Avg TPS   Avg TTFT     GPU Mem
+--------------------------------------------------------------------------------
+     2     11/ 12        1       65s        5s      451s    147.3      0.03s       0.2GB
+     3     11/ 12        1      104s        4s      617s    161.0      0.16s       0.2GB
+--------------------------------------------------------------------------------
+
+  Throughput scaling (completed requests x avg_tps):
+    2 slots -> 11 req in 11.9min total, 32867 tokens generated
+    3 slots -> 11 req in 19.1min total, 24581 tokens generated
+--------------------------------------------------------------------------------
+
+  CONTENTION METRICS (per slot count)
+    Queue-timeout = contention_queue_fallback_after_queue count
+    Queue rate    = queue-timeouts / queue-path arrivals (dispatch+timeout)
+    Local share   = local stream share (local / observed resolved streams)
+    Quarantine    = local quarantine episodes (from /health snapshots)
+
+ Slots   Queue t/o  Queue rate   Local share   Local streams   Quarant. episodes
+--------------------------------------------------------------------------------
+     2           2       66.7%          0.0%            0/11                   1
+     3           0        0.0%          0.0%            0/11                   0
+--------------------------------------------------------------------------------
+
+  REPRODUCIBILITY + VIABILITY (per slot count)
+    slots=2:
+      command: /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/slot_benchmark.py --sweep --resume 2 --concurrency 3 --prompt-tokens 2000 --output-dir /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3
+      config: session_slot_pool_size 2 -> 2  |  model: plan -> local-qwen3/Qwen3
+      ctx: total=262144  per-slot(physical)=126976  observed slots=2
+      system MemAvailable: 84.5GB  llama_started: True
+      viability: no warnings
+    slots=3:
+      command: /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/slot_benchmark.py --sweep --resume 2 --concurrency 3 --prompt-tokens 2000 --output-dir /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3
+      config: session_slot_pool_size 2 -> 3  |  model: plan -> local-qwen3/Qwen3
+      ctx: total=262144  per-slot(physical)=83285  observed slots=3
+      system MemAvailable: 80.5GB  llama_started: True
+      viability: no warnings

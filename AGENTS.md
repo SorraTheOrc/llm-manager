@@ -42,3 +42,14 @@ and caches results per git state (2-hour TTL, git-state fingerprint) so a
 green run at an unchanged commit is reused instead of re-executed. Direct
 `pytest`/`npm test` invocations bypass the cache and are reserved for
 single-file or targeted runs.
+
+### Git hooks (dev-push full-suite gate)
+
+This clone's committed hooks must be activated once per clone:
+`scripts/install_git_hooks.sh` (idempotent; sets `core.hooksPath=.githooks`
+for the main checkout and all worktrees). Once active, `.githooks/pre-push`
+runs the **full suite** on every push to `dev`/`main` and refuses a red push;
+feature-branch pushes skip the suite. Verify with
+`scripts/install_git_hooks.sh --check`. Details, bypass knobs
+(`TEST_SCOPE_SKIP=1`) and a stdin based push simulation:
+[docs/dev/git-hooks.md](docs/dev/git-hooks.md).

@@ -1,0 +1,201 @@
+{
+  "config": {
+    "slot_count": 3,
+    "total_requests": 12,
+    "concurrency": 3,
+    "prompt_tokens_target": 2000,
+    "output_tokens_target": 18000,
+    "phase": "cold",
+    "proxy_restart_time": "2026-10-23T20:33:30.552962+00:00",
+    "llama_ready_time": "2026-10-23T20:33:41.606606+00:00"
+  },
+  "reproducibility": {
+    "command": "/home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/slot_benchmark.py --sweep --resume 2 --concurrency 3 --prompt-tokens 2000 --output-dir /home/rgardler/projects/llm/.worklog/worktrees/wl-LP-0MVK096GF0038FTH-execute-n-2-n-3-n-4-slot-sweep-in-a-quie/proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3",
+    "config_diff": {
+      "session_slot_pool_size": {
+        "before": 2,
+        "after": 3
+      }
+    },
+    "model": "plan -> local-qwen3/Qwen3",
+    "context_size": 262144,
+    "per_slot_ctx": 83285
+  },
+  "viability": {
+    "observed_slots": 3,
+    "system_memory_bytes": 86419771392,
+    "llama_started": true,
+    "warnings": []
+  },
+  "requests": [
+    {
+      "request_index": 1,
+      "status": "error",
+      "total_duration_seconds": 1200.015,
+      "time_to_first_token_seconds": null,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "tokens_per_second": 0.0,
+      "resolved_model": null,
+      "error": "Timeout after 1200s: "
+    },
+    {
+      "request_index": 2,
+      "status": "completed",
+      "total_duration_seconds": 616.554,
+      "time_to_first_token_seconds": 1.003,
+      "prompt_tokens": 402,
+      "completion_tokens": 922,
+      "tokens_per_second": 1.5,
+      "resolved_model": "MunitoAI Free/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 3,
+      "status": "completed",
+      "total_duration_seconds": 5.958,
+      "time_to_first_token_seconds": 0.008,
+      "prompt_tokens": 402,
+      "completion_tokens": 1059,
+      "tokens_per_second": 177.74,
+      "resolved_model": "MunitoAI Free/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 4,
+      "status": "completed",
+      "total_duration_seconds": 4.314,
+      "time_to_first_token_seconds": 0.007,
+      "prompt_tokens": 402,
+      "completion_tokens": 947,
+      "tokens_per_second": 219.52,
+      "resolved_model": "MunitoAI Free/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 5,
+      "status": "completed",
+      "total_duration_seconds": 26.374,
+      "time_to_first_token_seconds": 0.007,
+      "prompt_tokens": 1909,
+      "completion_tokens": 5843,
+      "tokens_per_second": 221.54,
+      "resolved_model": "MunitoAI Free/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 6,
+      "status": "completed",
+      "total_duration_seconds": 5.804,
+      "time_to_first_token_seconds": 0.007,
+      "prompt_tokens": 402,
+      "completion_tokens": 1172,
+      "tokens_per_second": 201.92,
+      "resolved_model": "MunitoAI Free/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 7,
+      "status": "completed",
+      "total_duration_seconds": 5.953,
+      "time_to_first_token_seconds": 0.007,
+      "prompt_tokens": 402,
+      "completion_tokens": 1226,
+      "tokens_per_second": 205.96,
+      "resolved_model": "MunitoAI Free/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 8,
+      "status": "completed",
+      "total_duration_seconds": 29.314,
+      "time_to_first_token_seconds": 0.018,
+      "prompt_tokens": 349,
+      "completion_tokens": 2398,
+      "tokens_per_second": 81.8,
+      "resolved_model": "OpenCode Go 3/deepseek-v4.1-flash",
+      "error": null
+    },
+    {
+      "request_index": 9,
+      "status": "completed",
+      "total_duration_seconds": 18.684,
+      "time_to_first_token_seconds": 0.007,
+      "prompt_tokens": 1856,
+      "completion_tokens": 3882,
+      "tokens_per_second": 207.78,
+      "resolved_model": "OpenCode Go 3/deepseek-v4.1-flash",
+      "error": null
+    },
+    {
+      "request_index": 10,
+      "status": "completed",
+      "total_duration_seconds": 407.397,
+      "time_to_first_token_seconds": 0.701,
+      "prompt_tokens": 402,
+      "completion_tokens": 872,
+      "tokens_per_second": 2.14,
+      "resolved_model": "MunitoAI Free/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 11,
+      "status": "completed",
+      "total_duration_seconds": 23.399,
+      "time_to_first_token_seconds": 0.007,
+      "prompt_tokens": 402,
+      "completion_tokens": 5337,
+      "tokens_per_second": 228.08,
+      "resolved_model": "MunitoAI Free/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    },
+    {
+      "request_index": 12,
+      "status": "completed",
+      "total_duration_seconds": 4.135,
+      "time_to_first_token_seconds": 0.007,
+      "prompt_tokens": 402,
+      "completion_tokens": 923,
+      "tokens_per_second": 223.2,
+      "resolved_model": "MunitoAI Free/deepseek-ai/deepseek-v4-flash",
+      "error": null
+    }
+  ],
+  "summary": {
+    "slot_count": 3,
+    "total_requests": 12,
+    "completed": 11,
+    "errors": 1,
+    "total_duration_seconds": 1147.8875835351646,
+    "avg_duration": 104.4,
+    "min_duration": 4.1,
+    "max_duration": 616.6,
+    "median_duration": 18.7,
+    "avg_ttft": 0.162,
+    "avg_tps": 161.0,
+    "total_prompt_tokens": 7330,
+    "total_completion_tokens": 24581,
+    "gpu_memory_bytes": 254312448,
+    "start_time": "2026-10-23T20:33:41.607022+00:00",
+    "end_time": "2026-10-23T21:04:08.463356+00:00",
+    "error": null,
+    "contention": {
+      "queue_timeout_count": 0,
+      "queue_timeout_rate": 0.0,
+      "local_stream_share": 0.0,
+      "local_stream_count": 0,
+      "observed_stream_count": 11,
+      "quarantine_episode_count": 0,
+      "unavailable": {}
+    }
+  },
+  "contention": {
+    "queue_timeout_count": 0,
+    "queue_timeout_rate": 0.0,
+    "local_stream_share": 0.0,
+    "local_stream_count": 0,
+    "observed_stream_count": 11,
+    "quarantine_episode_count": 0,
+    "unavailable": {}
+  }
+}

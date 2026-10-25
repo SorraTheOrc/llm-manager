@@ -45,6 +45,7 @@ See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
 
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -221,11 +222,43 @@ def last_known_slot_counts() -> tuple[int, int] | None:
 # TTL instead of by N. A failed fetch is cached for a longer backoff window
 # so an unavailable backend is not hammered, and callers fall back to the
 # last-known counts (with the stale flag) via ``last_known_slot_counts``.
+#
+# Invariant (LP-0MVJML600003CQ6Y, AC1-AC3, AC5):
+#
+#   1. The shared single-flight future is ALWAYS settled before its owner
+#      stops owning it: ``set_result``/``set_exception`` on a completed fetch,
+#      or ``cancel()`` when the leader itself is cancelled. A failure nobody is
+#      following is marked as retrieved by its owner (``_consume_slots_inflight_outcome``)
+#      so asyncio logs no "Future exception was never retrieved" at arbitrary
+#      GC times for the usual lone-failure case (LP-0MVK6QUAQ002KFHU). The second case is
+#      the 2026-10-22 Web UI freeze: ``asyncio.CancelledError`` derives from
+#      ``BaseException``, so a browser disconnect cancelling the SSE handler
+#      bypassed the old ``except Exception`` and left the future pending with
+#      no owner while ``finally`` removed the registry entry.
+#   2. A follower NEVER waits on that future unboundedly. It waits at most its
+#      own caller timeout using ``asyncio.wait`` — which, unlike
+#      ``asyncio.wait_for``/``asyncio.timeout``, does not cancel the awaited
+#      future, so one impatient follower cannot break the wait of the others.
+#      Only once that bound elapses does it promote itself: the abandoned
+#      future is cancelled (releasing any remaining follower of it) and a fresh
+#      one is installed under the lock, with this caller as the new leader.
+#   3. A registry entry is only removed by the caller that still owns it, so a
+#      promoted leader's future is never evicted by the task it replaced.
+#
+# Together these guarantee ``_periodic_broadcast_loop()`` — which reaches this
+# helper through ``query_llama_status()`` and ``_query_slots_detail()`` — can
+# never stall on an abandoned future, so one cancelled request can no longer
+# freeze status updates for every connected Web UI client.
 # ===================================================================
 
 _slots_poll_cache: dict[str, tuple[float, int, object]] = {}
 _slots_poll_inflight: dict[str, "asyncio.Future"] = {}
 _slots_poll_lock: "asyncio.Lock | None" = None
+
+# How many bounded waits a follower performs before it degrades instead of
+# retrying: one to notice the original owner is cancelled/stuck, one to notice
+# that the promotion race handed it a future that is itself stuck.
+_SLOTS_POLL_FOLLOWER_ATTEMPTS = 2
 
 
 def _get_slots_poll_lock() -> "asyncio.Lock":
@@ -256,6 +289,31 @@ def _slots_poll_failure_backoff_seconds() -> float:
         )
     except (TypeError, ValueError):
         return 5.0
+
+
+def _slots_poll_follower_timeout_seconds(caller_timeout) -> float:
+    """Upper bound (seconds) on a follower's wait for the shared future.
+
+    Defaults to the caller's own *timeout* — the budget it would have spent
+    fetching upstream itself — so a follower degrades no later than it would
+    have failed on its own. ``SLOTS_POLL_FOLLOWER_TIMEOUT_SECONDS`` may lower
+    that bound, never raise it. A follower that takes over leadership gets a
+    fresh caller-sized fetch budget, so its total work is bounded by two
+    caller timeouts (LP-0MVJML600003CQ6Y, AC2).
+    """
+    import os
+
+    try:
+        budget = max(0.0, float(caller_timeout))
+    except (TypeError, ValueError):
+        budget = 5.0
+    try:
+        configured = float(os.environ.get("SLOTS_POLL_FOLLOWER_TIMEOUT_SECONDS", ""))
+    except (TypeError, ValueError):
+        return budget
+    if configured <= 0:
+        return budget
+    return min(budget, configured)
 
 
 def reset_slots_poll_cache() -> None:
@@ -292,6 +350,109 @@ async def _do_slots_fetch(
     return status, None
 
 
+def _consume_slots_inflight_outcome(fut: "asyncio.Future") -> None:
+    """Retrieve a settled shared future's outcome so asyncio logs no late warning.
+
+    The single-flight future is a broadcast channel that is usually
+    *unobserved*: the common case is a lone poller whose ``/slots`` fetch fails
+    (e.g. ConnectionError while llama-server restarts) and no follower ever
+    calls ``fut.result()``. A settled exception nobody retrieves makes
+    ``Future.__del__`` log "Future exception was never retrieved" whenever the
+    cyclic GC later reclaims the traceback cycle -- production log noise whose
+    timestamp is pure GC timing, and a cross-test flake source in the suite
+    (LP-0MVK6QUAQ002KFHU). Calling ``exception()`` here marks the outcome as
+    observed without changing semantics: a follower that does call
+    ``fut.result()`` still re-raises the leader's failure.
+    """
+    if fut.cancelled():
+        return
+    with contextlib.suppress(BaseException):
+        fut.exception()
+
+
+def _new_slots_inflight_future() -> "asyncio.Future":
+    """Create the shared single-flight future on the running loop."""
+    fut = asyncio.get_running_loop().create_future()
+    fut.add_done_callback(_consume_slots_inflight_outcome)
+    return fut
+
+
+async def _release_slots_inflight(url: str, fut: "asyncio.Future") -> None:
+    """Drop *url*'s registry entry, but only when *fut* is still the entry.
+
+    A promoted leader may already have replaced the entry for *url*; popping it
+    blindly would let a third caller start a duplicate upstream fetch
+    (LP-0MVJML600003CQ6Y, invariant 3).
+    """
+    async with _get_slots_poll_lock():
+        if _slots_poll_inflight.get(url) is fut:
+            _slots_poll_inflight.pop(url, None)
+
+
+async def _promote_slots_follower(
+    url: str, stale: "asyncio.Future"
+) -> tuple["asyncio.Future", bool]:
+    """Promote a follower whose leader never resolved the shared future.
+
+    The abandoned *stale* future is cancelled (releasing any other follower of
+    it) and evicted, and a fresh future is installed under the lock. Returns
+    ``(future, is_leader)``; ``is_leader`` is ``False`` when another caller won
+    the promotion race and already installed a newer future, in which case that
+    future is returned for this caller to follow.
+    """
+    async with _get_slots_poll_lock():
+        current = _slots_poll_inflight.get(url)
+        if current is not None and current is not stale:
+            return current, False
+        if not stale.done():
+            stale.cancel()
+        fut = _new_slots_inflight_future()
+        _slots_poll_inflight[url] = fut
+        return fut, True
+
+
+async def _await_slots_inflight(fut: "asyncio.Future", wait_seconds: float) -> bool:
+    """Wait at most *wait_seconds* for *fut*; return whether it is done.
+
+    Uses ``asyncio.wait`` rather than ``asyncio.wait_for``/``asyncio.timeout``
+    because those cancel the awaited future on timeout, which would break the
+    wait for every *other* follower sharing it (LP-0MVJML600003CQ6Y, AC2).
+    """
+    if fut.done():
+        return True
+    if wait_seconds <= 0:
+        return fut.done()
+    await asyncio.wait({fut}, timeout=wait_seconds)
+    return fut.done()
+
+
+async def _run_slots_fetch_as_leader(
+    url: str, timeout: float, client, fut: "asyncio.Future"
+) -> tuple[int, object]:
+    """Fetch /slots and settle the shared future for every follower."""
+    try:
+        status, data = await _do_slots_fetch(url, timeout, client)
+        _slots_poll_cache[url] = (time.monotonic(), status, data)
+        if not fut.done():
+            fut.set_result((status, data))
+        return status, data
+    except BaseException as exc:
+        # ``CancelledError`` derives from ``BaseException``, so a leader
+        # cancelled by a client disconnect used to skip this path entirely and
+        # leave the future pending with no owner (LP-0MVJML600003CQ6Y, AC1).
+        # Always settle the future before re-raising. Cancelling — rather than
+        # setting an exception — also keeps asyncio's "Future exception was
+        # never retrieved" warning out of the logs when nobody is following.
+        if not fut.done():
+            if isinstance(exc, Exception):
+                fut.set_exception(exc)
+            else:
+                fut.cancel()
+        raise
+    finally:
+        await _release_slots_inflight(url, fut)
+
+
 async def _fetch_slots_payload(
     url: str, timeout: float, client=None
 ) -> tuple[int, object]:
@@ -302,6 +463,10 @@ async def _fetch_slots_payload(
     without touching the backend. A non-200 result is cached for
     ``SLOTS_POLL_FAILURE_BACKOFF_SECONDS`` so a failing backend is not
     hammered. Returns ``(status_code, parsed_data)``.
+
+    Cancellation safety (LP-0MVJML600003CQ6Y): the shared future is always
+    settled by its owner, and a follower waits for it only for a bounded time
+    before promoting itself to leader — see the invariant block above.
     """
     cached = _cached_slots_payload(url)
     if cached is not None:
@@ -317,32 +482,44 @@ async def _fetch_slots_payload(
         if inflight is not None:
             fut = inflight
         else:
-            fut = asyncio.get_event_loop().create_future()
+            fut = _new_slots_inflight_future()
             _slots_poll_inflight[url] = fut
             leader = True
 
-    if not leader:
-        return await fut
+    if leader:
+        return await _run_slots_fetch_as_leader(url, timeout, client, fut)
 
-    try:
-        status, data = await _do_slots_fetch(url, timeout, client)
-        _slots_poll_cache[url] = (time.monotonic(), status, data)
-        if not fut.done():
-            fut.set_result((status, data))
-        return status, data
-    except Exception as exc:
-        if not fut.done():
-            fut.set_exception(exc)
-        raise
-    finally:
-        async with lock:
-            _slots_poll_inflight.pop(url, None)
+    # Follower: bounded wait, then take over leadership (AC1/AC2).
+    wait_seconds = _slots_poll_follower_timeout_seconds(timeout)
+    for attempt in range(_SLOTS_POLL_FOLLOWER_ATTEMPTS):
+        if await _await_slots_inflight(fut, wait_seconds) and not fut.cancelled():
+            # Re-raises the leader's exception, preserving the old shared-await
+            # semantics for genuine upstream failures.
+            return fut.result()
+        # The leader was cancelled or never resolved: this caller makes its own
+        # progress rather than waiting forever.
+        fut, leader = await _promote_slots_follower(url, fut)
+        if leader:
+            return await _run_slots_fetch_as_leader(url, timeout, client, fut)
+        if attempt + 1 >= _SLOTS_POLL_FOLLOWER_ATTEMPTS:
+            break
+
+    # Every shared future this caller followed was abandoned: degrade to a
+    # still-fresh cached payload, else report the timeout to the caller (which
+    # records a /slots failure and falls back to last-known counts).
+    cached = _cached_slots_payload(url)
+    if cached is not None:
+        return cached
+    raise TimeoutError(
+        f"/slots single-flight follower waited {_SLOTS_POLL_FOLLOWER_ATTEMPTS} "
+        f"bounded attempts for {url} without a payload"
+    )
 
 
 async def _query_slots(
     client, llama_port: int, timeout: float = 2.0, model: str | None = None,
     base_url: str | None = None,
-
+    status_out: dict | None = None,
 ) -> tuple:
     """Query the llama-server ``/slots`` endpoint.
 
@@ -366,6 +543,14 @@ async def _query_slots(
     updated (graceful degradation, LP-0MSVP7XJ6008QPKX); on failure the
     ``llama_slots_query_failures_total`` metric is incremented so a
     sustained /slots outage surfaces as an alert.
+
+    ``status_out`` (optional, additive) is filled with the *outcome* of the
+    fresh query — ``{"status": int | None, "reason": str | None}`` — so a
+    caller can distinguish a definitive answer (e.g. HTTP 400 "model not
+    found": llama-server's router has unloaded the idle model) from a
+    transient failure (500/timeout/connection). Both collapse to ``(0, 0)``
+    here; only the caller can decide whether serving cached counts is
+    truthful (LP-0MVKSXR4P001V0CM AC3).
     """
     try:
         url = _build_llama_url(llama_port, "/slots", base_url=base_url)
@@ -384,19 +569,55 @@ async def _query_slots(
                 )
                 if total_slots > 0:
                     _record_last_slot_counts(available_slots, total_slots)
+                _set_slots_status_out(status_out, status=status)
                 return available_slots, total_slots
             _record_slots_query_failure("invalid_payload")
+            _set_slots_status_out(status_out, status=status, reason="invalid_payload")
             return 0, 0
         _record_slots_query_failure(f"http_{status}")
+        _set_slots_status_out(status_out, status=status, reason=f"http_{status}")
         return 0, 0
     except TimeoutError:
         _record_slots_query_failure("timeout")
+        _set_slots_status_out(status_out, reason="timeout")
     except Exception as exc:
         if isinstance(exc, (ConnectionError, OSError)):
             _record_slots_query_failure("connection_error")
+            _set_slots_status_out(status_out, reason="connection_error")
         else:
             _record_slots_query_failure("unknown")
+            _set_slots_status_out(status_out, reason="unknown")
     return 0, 0
+
+
+def _set_slots_status_out(
+    status_out: dict | None, *, status: int | None = None, reason: str | None = None
+) -> None:
+    """Fill the optional ``status_out`` dict from ``_query_slots``."""
+    if status_out is None:
+        return
+    try:
+        status_out["status"] = status
+        status_out["reason"] = reason
+    except Exception:
+        pass
+
+
+def slots_failure_is_definitive_model_absent(status_out: dict | None) -> bool:
+    """True when the fresh ``/slots`` failure is a definitive "no such model".
+
+    llama-server's router answers ``/slots?model=<name>`` with HTTP 400 (or
+    404) when no instance of *name* is loaded — its idle-model unload does
+    this, as does the window before a preload finishes. That is a fresh,
+    truthful "no slots right now", not a transient outage, so callers must
+    not substitute cached counts/detail (a fossil snapshot of the last
+    request) for it. Any other reason (500, timeout, connection error, bad
+    payload) is transient and keeps the graceful-degradation path
+    (LP-0MSVP7XJ6008QPKX, LP-0MVKSXR4P001V0CM AC3).
+    """
+    if not isinstance(status_out, dict):
+        return False
+    return status_out.get("reason") in ("http_400", "http_404")
 
 
 def _record_last_slot_counts(available_slots: int, total_slots: int) -> None:
@@ -606,6 +827,20 @@ Updated by ``_periodic_broadcast_loop()`` on each successful query.
 Read by ``status_events()`` in ``proxy.ui`` and by the
 ``/llama/local/status`` handler (``proxy.handlers``) as a fallback when
 the initial /slots query fails or times out (LP-0MUFSVXID0039ZAQ).
+
+Also the measurement source of the residency-aware admission view
+(``proxy.residency.get_residency_view()``, LP-0MVN1IQTF0037WTG AC1): local
+admission must never issue a synchronous ``/slots`` call, so it ages this
+cache instead. Its freshness stamp is ``_last_slot_details_at``.
+"""
+
+
+_last_slot_details_at: float = 0.0
+"""``time.monotonic()`` stamp of the last successful ``/slots`` snapshot.
+
+Set only when a fresh ``/slots`` query populated
+``_last_slot_details_cache`` (never when the last-known cache is reused), so
+``proxy.residency`` can age the measurement and fail open when it is stale.
 """
 
 
@@ -1346,6 +1581,17 @@ CAPACITY_IDLE = "idle"
 CAPACITY_PREFILL_BOUND = "prefill_bound"
 CAPACITY_SATURATED = "saturated"
 
+STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS = 15.0
+"""Maximum proxy-observed idle age that still counts as fresh decode evidence.
+
+When the served ``/slots`` detail is stale, a cached ``is_processing`` /
+``n_decoded`` snapshot cannot prove the pool is still saturated
+(LP-0MVKSXR4P001V0CM AC3). A decoding stream forwards SSE chunks continuously,
+so a local-activity idle age within this window (source ``chunk``) is live
+evidence that decode is happening now; anything older is a fossil snapshot and
+must not keep a dispatcher waiting.
+"""
+
 
 def slot_lease_state(is_processing: bool, owner_session_id: str | None) -> str:
     """Classify a slot's lease state (LP-0MVGDUVGE0024YAI AC2).
@@ -1439,6 +1685,51 @@ def compute_capacity_hint(slots: list[dict]) -> str:
     if any(str(s.get("lease_state")) == LEASE_STATE_GENERATING for s in occupied):
         return CAPACITY_SATURATED
     return CAPACITY_IDLE
+
+
+def downgrade_stale_capacity_hint(
+    hint: str,
+    *,
+    stale: bool,
+    live_local_requests: int,
+    activity_source: str | None = None,
+    idle_seconds: float | None = None,
+) -> str:
+    """Reconcile a capacity hint computed from possibly-stale slot detail.
+
+    ``compute_capacity_hint`` reads ``is_processing`` / ``phase``, which are
+    only as fresh as the served ``/slots`` snapshot. When that snapshot came
+    from the last-known cache (``stale``), the cached fields describe a past
+    request, so a ``saturated`` verdict can starve a dispatcher through an
+    entire idle window (LP-0MVKSXR4P001V0CM: 66 consecutive ``freeSlots: 0``
+    refusals overnight while the GPU was idle).
+
+    Reconciliation rules (AC1/AC3):
+
+    1. Fresh detail → return ``hint`` unchanged (the decision table is
+       authoritative).
+    2. Stale detail and **no** live in-flight local requests → ``idle``. The
+       cached occupancy is contradicted by the proxy's own dispatch state
+       (retained leases and a leaked ``local_active_queries`` counter are not
+       work, and an unloaded model reports no slots at all).
+    3. Stale detail with live in-flight work and fresh decode evidence
+       (``activity_source == "chunk"`` within
+       ``STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS``) → ``saturated``.
+    4. Stale detail with live in-flight work but no decode evidence →
+       ``prefill_bound`` (busy, but never claimed as saturated on stale data).
+    """
+    if not stale:
+        return hint
+    if live_local_requests <= 0:
+        return CAPACITY_IDLE
+    recent_decode = (
+        activity_source == "chunk"
+        and idle_seconds is not None
+        and idle_seconds <= STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS
+    )
+    if recent_decode:
+        return CAPACITY_SATURATED
+    return CAPACITY_PREFILL_BOUND
 
 
 def _build_status_slot_owners(srv) -> dict[int, dict]:
@@ -1602,9 +1893,16 @@ def _resolve_slot_details_for_enrichment(slot_details: list[dict] | None) -> lis
 
     The cache list object is preserved (slice assignment) so any module
     holding a reference to it keeps observing updates.
+
+    The snapshot's freshness stamp (``_last_slot_details_at``) is refreshed
+    only on a successful fresh query, so a stale cache keeps ageing and
+    ``proxy.residency`` can fail open instead of denying local on old data
+    (LP-0MVN1IQTF0037WTG AC1).
     """
     if slot_details:
+        global _last_slot_details_at
         _last_slot_details_cache[:] = [dict(s) for s in slot_details]
+        _last_slot_details_at = time.monotonic()
     return [dict(s) for s in _last_slot_details_cache]
 
 
@@ -1801,7 +2099,10 @@ async def _periodic_broadcast_loop():
                         except Exception:
                             pass
                         # 5s timeout: llama-server may be slow to respond
-                        # to /slots when busy generating tokens.
+                        # to /slots when busy generating tokens. The single-flight
+                        # helper bounds a follower's wait too, so a cancelled leader
+                        # can no longer stall this loop for every SSE client
+                        # (LP-0MVJML600003CQ6Y, AC5).
                         slot_details = await _query_slots_detail(
                             llama_port, timeout=5.0, model=model_name,
                         )

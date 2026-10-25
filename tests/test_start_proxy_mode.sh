@@ -242,9 +242,12 @@ JSON
 
 run_restart() {
     # Sandboxed --restart run; resets the fake-kill log first.
+    # --foreground keeps the intercepted final `exec uvicorn` in this captured
+    # stream; start-proxy.sh detaches by default (LP-0MVGT0E6W000Q8CY) and the
+    # restart assertions below read the script's own output.
     : > "$KILL_LOG"
     local out
-    out=$(cd "$PROXY_DIR" && PATH="$SANDBOX:$PATH" bash scripts/start-proxy.sh --restart --port "$TEST_PORT" 2>&1)
+    out=$(cd "$PROXY_DIR" && PATH="$SANDBOX:$PATH" bash scripts/start-proxy.sh --foreground --restart --port "$TEST_PORT" 2>&1)
     echo "$out"
 }
 
@@ -252,8 +255,11 @@ TEST_PORT=8457
 
 run_script() {
     # Usage: run_script  -> prints combined stdout+stderr of the sandboxed script
+    # --foreground is REQUIRED: the fake python shim intercepts the final
+    # `exec uvicorn` and reports the effective mode; detaching by default
+    # (LP-0MVGT0E6W000Q8CY) would route that output to the log file instead.
     local out
-    out=$(cd "$PROXY_DIR" && PATH="$SANDBOX:$PATH" bash scripts/start-proxy.sh --port "$TEST_PORT" 2>&1)
+    out=$(cd "$PROXY_DIR" && PATH="$SANDBOX:$PATH" bash scripts/start-proxy.sh --foreground --port "$TEST_PORT" 2>&1)
     echo "$out"
 }
 

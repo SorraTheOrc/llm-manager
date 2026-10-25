@@ -6,10 +6,11 @@ The proxy logs lines of the form::
 
 Only a small set of structured message prefixes carry the signal this skill
 needs (``Stream started``, ``Stream finished``, ``Fallback triggered``,
-``routing_skip_local``, ``local_dispatch_denied``). Everything else is
-ignored. Parsing is tolerant: missing fields default to ``None`` and a line
-that cannot be parsed is skipped (never fatal), so truncated request payloads
-and log-format drift do not break the analysis.
+``routing_skip_local``, ``routing_skip_provider_context``,
+``local_dispatch_denied``). Everything else is ignored. Parsing is tolerant:
+missing fields default to ``None`` and a line that cannot be parsed is skipped
+(never fatal), so truncated request payloads and log-format drift do not break
+the analysis.
 
 Attribution markers (LP-0MVAPNC2900145RH) are appended to restart and
 mode-switch log lines, carrying ``source=<value>``, ``actor=<value>``, and
@@ -26,7 +27,7 @@ from __future__ import annotations
 
 import gzip
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -59,6 +60,14 @@ RE_SESSION = re.compile(r"\bsession=([A-Za-z0-9_.-]+)")
 RE_DISPATCH_FIRST_BYTE = re.compile(
     r"dispatch_first_byte_ms=([\d.]+)"
 )
+# Service-time split of the same local dispatch line (LP-0MV6CFMU9005WU2E):
+# ``dispatch_to_first_byte_ms`` = total minus the single-slot queue wait, and
+# ``queue_wait_ms`` is that queued component. ``cache_state``/``cached_ratio``
+# describe the prompt-cache outcome of the request.
+RE_DISPATCH_TO_FIRST_BYTE = re.compile(r"dispatch_to_first_byte_ms=([\d.]+)")
+RE_QUEUE_WAIT_MS = re.compile(r"queue_wait_ms=([\d.]+)")
+RE_CACHE_STATE = re.compile(r"\bcache_state=(\w+)")
+RE_CACHED_RATIO = re.compile(r"\bcached_ratio=([\d.]+)")
 RE_TTFT_SECONDS = re.compile(
     r"ttft_seconds=([\d.]+)"
 )
@@ -66,16 +75,40 @@ RE_TOKENS = re.compile(r"\btokens=(\d+)/(\d+)/(\d+)")
 RE_ENTRY = re.compile(r"\bentry=(\S+)")
 RE_ERROR_DETAIL = re.compile(r"\berror=([^\s,}]+)")
 RE_FALLBACK = re.compile(
-    r"Fallback triggered for model=(\S+?), from=(\S+?), to=(\S+?), reason=([\w ]+)$"
+    r"Fallback triggered for model=(\S+?), from=(\S+?), to=(\S+?), "
+    r"reason=([^=]*?)(?=\s+\w+=|\s*$)"
 )
+# Fallback evidence appended after ``reason=`` (LP-0MVMBMSWR0036RES):
+# ``session=<uuid|unknown> attempt=<n>``, plus ``limit=``/``remaining=``/
+# ``waited=`` when the reason is budget-driven (``rate_limited*``). Absent on
+# pre-change rotated logs, in which case every field degrades to ``None`` and
+# the legacy nearest-line attribution heuristic still applies.
+RE_FALLBACK_ATTEMPT = re.compile(r"\battempt=(\d+)")
+RE_FALLBACK_BUDGET_LIMIT = re.compile(r"\blimit=(\d+)")
+RE_FALLBACK_BUDGET_REMAINING = re.compile(r"\bremaining=(\d+)")
+RE_FALLBACK_BUDGET_WAITED = re.compile(r"\bwaited=([\d.]+)")
 # routing_skip_local reason sits between "reason=" and the "→" arrow.
 RE_ROUTING_SKIP_REASON = re.compile(r"\breason=([\w_]+)\s*→")
+# Provider context-ceiling skip fields (LP-0MVMBM1Y3001TPRT):
+#   routing_skip_provider_context provider=<p> type=remote
+#     status=provider_context_exceeded estimated_tokens=<n> limit=<n>
+#     reason=provider_context_exceeded session=<uuid>
+# ``estimated_tokens`` is the proxy's routing-time prompt estimate and
+# ``limit`` the per-entry ``max_context_tokens`` ceiling it exceeded. Both are
+# optional downstream (older rotated logs may omit ``limit``).
+RE_SKIP_ESTIMATED_TOKENS = re.compile(r"\bestimated_tokens=(\d+)")
+RE_SKIP_LIMIT = re.compile(r"\blimit=(\d+)")
+RE_PROVIDER_TYPE = re.compile(r"\btype=([A-Za-z0-9_.-]+)")
 # Chain-hold cycle stamp (LP-0MU5AIAAY003KVM0): the proxy tags
 # ``routing_skip_local`` lines with ``chain_hold_cycle=<N>`` (cycle 0 = first
 # pre-hold cycle, incremented on every hold restart). Tolerant: absent on
 # pre-chain-hold rotated logs → None (treated as cycle 0 downstream).
 RE_CHAIN_HOLD_CYCLE = re.compile(r"\bchain_hold_cycle=(\d+)")
 RE_DISPATCH_DENIED = re.compile(r"session=([A-Za-z0-9_.-]+) owner=([A-Za-z0-9_.-]+) active=(\d+)")
+# Bare ``reason=<token>`` extractor for lines whose reason is not followed by
+# the routing-skip arrow (e.g. ``contention_queue_fallback_after_queue ...
+# reason=local_lease_active``).
+RE_REASON_KV = re.compile(r"\breason=([\w_]+)")
 
 # Compaction events (LP-0MTHCTLAF00147IT): the proxy emits ``compaction_event``
 # for every compaction decision (compact / remote_with_guidance / backstop_*)
@@ -131,6 +164,23 @@ RE_LOCAL_ADMISSION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
 RE_ROUTING_IDLE_SECONDS = re.compile(r"\bidle_seconds=([\d.]+)")
 RE_IDLE_ADMIT_THRESHOLD = re.compile(r"\bthreshold_seconds=([\d.]+)")
 
+# Residency-aware admission + eviction evidence (LP-0MVN1IQTF0037WTG AC5).
+# ``none`` is a *meaningful* value for ``n_past_actual`` / ``reuse_ratio`` /
+# ``slot_owner_session`` (measurement unavailable, or the session owns no
+# slot), so it parses to ``None`` and is never read as zero.
+RE_RESIDENCY_DECISION = re.compile(
+    r"\bdecision=([A-Za-z_]+)"
+)
+RE_N_PAST_ACTUAL = re.compile(r"\bn_past_actual=(\d+|none)\b")
+RE_REUSE_RATIO = re.compile(r"\breuse_ratio=([\d.]+|none)\b")
+RE_SLOT_OWNER_SESSION = re.compile(r"\bslot_owner_session=(\S+)")
+RE_RESIDENCY_SOURCE = re.compile(r"\bresidency_source=([A-Za-z_]+)")
+RE_TENANT_LIMIT = re.compile(r"\btenants=(\d+|none)\b")
+RE_TENANT_OCCUPANTS = re.compile(r"\boccupants=(\d+)")
+RE_EVICTION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
+RE_SLOT_ID = re.compile(r"\bslot=(\d+|none)\b")
+RE_SNAPSHOT_PLANNED = re.compile(r"\bsnapshot_planned=(true|false|unknown)\b")
+
 # Enriched error payload on ``Stream finished: reason=error`` (LP-0MT6322OT00900OX).
 # The proxy now logs ``error_type=<type> error_message=<msg> suggested_action=<act>``
 # before the trailing session/provider/model/entry fields. Messages/actions may
@@ -164,11 +214,77 @@ STREAM_STARTED = "Stream started"
 STREAM_FINISHED = "Stream finished"
 FALLBACK = "Fallback triggered"
 ROUTING_SKIP = "routing_skip_local"
+# Per-provider context-ceiling skip (LP-0MVMBM1Y3001TPRT): the estimated prompt
+# exceeds the remote entry's ``max_context_tokens``, so that entry is skipped
+# for this request only. It is *not* a provider failure (no cooldown, no
+# failure-domain exclusion) — it is a per-request size mismatch, and the line
+# carries the session UUID, the provider, the estimate and the ceiling.
+ROUTING_SKIP_PROVIDER_CONTEXT = "routing_skip_provider_context"
 DISPATCH_DENIED = "local_dispatch_denied"
+# Local dispatch attempt marker (LP-0MVKUKG3F0035I85): the proxy logs one
+# ``[local] POST http://<backend>/... `` line for **every** attempt it makes at
+# the local llama-server, including attempts that never yield a first byte (a
+# wedged prefill lease, a cancelled dispatch). ``Stream started: provider=local``
+# only appears once the request is admitted, so it cannot see work that was
+# attempted-but-never-served; this marker is the per-hour local-dispatch
+# attempt evidence the availability classification needs.
+LOCAL_POST = "[local] POST"
 CONTENTION_DISPATCH = "contention_queue_dispatch"
 CONTENTION_FALLBACK_AFTER_QUEUE = "contention_queue_fallback_after_queue"
 LOCAL_ADMISSION_GUARD = "local_admission_guard"
 ROUTING_IDLE_ADMIT = "routing_idle_admit"
+# Residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5): the proxy emits
+# ``routing_resident_prefix provider=local model=... decision=<verdict>
+# n_past_actual=<n|none> estimated_tokens=<n> reuse_ratio=<f|none>
+# slot_owner_session=<id|none> residency_source=<measured|session_slot|
+# non_resident|unknown> min_ratio=<f> tenants=<n> occupants=<n> session=<id>``
+# once per admission decision. ``decision`` is one of ``admit``,
+# ``resident_prefix_insufficient``, ``tenant_limit`` (plus
+# ``large_context_bypass`` for a live-priced cold miss). The fail-open path
+# (unmeasured view — no fresh snapshot, no ownership) logs
+# ``admit_predicted`` / ``skip_predicted`` with ``n_past_actual=none`` so
+# residency-blind decisions stay observable (LP-0MVN4LANP0069QQM AC5).
+ROUTING_RESIDENT_PREFIX = "routing_resident_prefix"
+# Shared post-acceptance eviction event (LP-0MVN1IQTF0037WTG AC6,
+# LP-0MVN3KMGI009BZ0D AC7): ``local_eviction session=... reason=<vocab>
+# endpoint=... slot=<n|none> slot_owner_session=... tenants=...
+# snapshot_planned=<bool>`` emitted at ERROR level whenever a resident
+# session's lease/slot is reclaimed.
+#: A committed `local_eviction` line as emitted by `_record_local_eviction`
+#: (used to distinguish it from the after-acceptance event below, which shares
+#: the prefix but is its OWN kind).
+LOCAL_EVICTION = "local_eviction"
+# Post-acceptance eviction (LP-0MVN4LCED00661MX, parent AC7): the proxy emits
+# ``local_eviction_after_acceptance session=<id> reason=<vocab>
+# estimated_tokens=<n> new_tokens=<n> eta_prefill_s=<f|unknown>
+# elapsed_s=<f> slot_id=<n|unknown> llama_task_id=<id|unknown> endpoint=<...>``
+# at ERROR level when an ACCEPTED local dispatch is released before producing a
+# first byte. It shares the `local_eviction` prefix, so it must be matched
+# explicitly and classified as its own kind — never folded into the
+# `local_eviction` tenancy event (different fields, different meaning).
+LOCAL_EVICTION_AFTER_ACCEPTANCE = "local_eviction_after_acceptance"
+RE_EVICTION_AA_ESTIMATED = re.compile(r"\bestimated_tokens=(\d+)")
+RE_EVICTION_AA_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
+RE_EVICTION_AA_ETA = re.compile(r"\beta_prefill_s=([\d.]+|unknown)")
+RE_EVICTION_AA_ELAPSED = re.compile(r"\belapsed_s=([\d.]+)")
+RE_EVICTION_AA_SLOT_ID = re.compile(r"\bslot_id=(\d+|unknown)")
+RE_EVICTION_AA_TASK_ID = re.compile(r"\bllama_task_id=(\S+)")
+# Prefill-deadline cancellation (LP-0MVOAQDB4002D56G, parent AC4): the proxy
+# logs ``prefill_deadline_exceeded session=<id> deadline=<n>s → cancelling
+# local dispatch and detouring to the next provider`` at WARNING level when an
+# admitted local prefill overruns the deadline. Its own kind so AC4's
+# deadline-rate check reads from the report instead of a raw log scan.
+PREFILL_DEADLINE_EXCEEDED = "prefill_deadline_exceeded"
+RE_PREFILL_DEADLINE_SECONDS = re.compile(r"\bdeadline=(\d+(?:\.\d+)?)s")
+# Provider-chain exhaustion: ``All providers exhausted for model=<route>;
+# unavailable={...}; usage_limit_reset=<...>`` — the client-visible failure
+# the AC4 "no increase in 503s / exhaustion" check counts. Distinct from the
+# upstream per-provider errors (``upstream_http_error``), which are counted by
+# status code.
+PROVIDER_EXHAUSTED = "All providers exhausted"
+RE_PROVIDER_EXHAUSTED_MODEL = re.compile(
+    r"All providers exhausted for model=(\S+?);"
+)
 COMPACTION_EVENT = "compaction_event"
 COMPACTION_BACKSTOP = "compaction_backstop"
 COMPACTION_CHURN = "compaction_churn"
@@ -319,7 +435,8 @@ class LogEvent:
     """One parsed structured log line.
 
     ``kind`` is one of ``stream_started``, ``stream_finished``, ``fallback``,
-    ``routing_skip``, ``dispatch_denied``, ``contention_dispatch``,
+    ``routing_skip``, ``provider_context_skip``, ``dispatch_denied``,
+    ``local_dispatch``, ``contention_dispatch``,
     ``contention_fallback_after_queue``, ``idle_admit``, ``mode_switch``,
     ``restart``,
     ``compaction_event``, ``compaction_backstop``, ``compaction_churn``, or an
@@ -376,9 +493,29 @@ class LogEvent:
     entry: str | None = None
     status: int | None = None
     attempt: str | None = None
+    # Fallback evidence (LP-0MVMBMSWR0036RES, ``fallback`` kind only):
+    # ``attempt_index`` is the per-session fallback ordinal parsed from
+    # ``attempt=``; ``budget_limit``/``budget_remaining``/``budget_waited``
+    # carry the budget snapshot emitted with a ``rate_limited*`` reason.
+    # All ``None`` on pre-change lines (and on every other kind).
+    attempt_index: int | None = None
+    budget_limit: int | None = None
+    budget_remaining: int | None = None
+    budget_waited: float | None = None
     signal: str | None = None
     src_file: str | None = None
+    # 1-based line number inside ``src_file`` (set by ``iter_events``); with
+    # ``src_file`` it is the evidence pointer for a parsed line.
+    line_no: int | None = None
     raw: str | None = None
+    # Provider context-ceiling skip fields (``provider_context_skip`` kind,
+    # LP-0MVMBM1Y3001TPRT): the routing-time prompt estimate that exceeded the
+    # entry's ceiling, that ceiling (``limit``), and the entry's ``type=``
+    # (``remote`` / ``local``). Each is ``None`` when the line omits it, so
+    # older rotated logs keep parsing (AC8).
+    estimated_tokens: int | None = None
+    limit: int | None = None
+    provider_type: str | None = None
     # Operating-mode field (mode_switch kind only): "fast" | "cheap".
     mode: str | None = None
     # Restart-marker field (restart kind only): "spawned" | "complete"
@@ -407,6 +544,16 @@ class LogEvent:
     # logging (LP-0MTSSM5SO003PKU0). Populated by dispatch_first_byte_ms=
     # (local) or ttft_seconds= (remote) log lines.
     ttft_ms: float | None = None
+    # Prefill breakdown carried by the local ``dispatch_first_byte_ms=`` line
+    # (LP-0MVJN025B001I8AL): ``ttft_ms`` is the dispatch→first-byte *total*,
+    # ``dispatch_to_first_byte_ms`` is the same interval minus the queued wait
+    # (``queue_wait_ms``), and ``cache_state``/``cached_ratio`` report the
+    # prompt-cache outcome. All four are ``None`` on remote ``ttft_seconds=``
+    # lines and on historical logs that predate the split.
+    dispatch_to_first_byte_ms: float | None = None
+    queue_wait_ms: float | None = None
+    cache_state: str | None = None
+    cached_ratio: float | None = None
     # Chain-hold cycle stamp (LP-0MU5AIAAY003KVM0): 0 = first (pre-hold)
     # cycle, incremented on every hold restart; ``None`` when the line does
     # not carry the token (pre-chain-hold logs). Populated on
@@ -426,6 +573,35 @@ class LogEvent:
     # ``idle_admit`` events only.
     idle_seconds: str | None = None
     threshold_seconds: str | None = None
+    # Residency-aware admission evidence (LP-0MVN1IQTF0037WTG AC5,
+    # ``residency_decision`` kind): the measured reusable prefix, the request
+    # estimate, the resulting reuse ratio and which session owned the slot at
+    # decision time (``residency_source`` records whether the ratio was
+    # measured, inferred from slot ownership, or absent). ``n_past_actual`` /
+    # ``reuse_ratio`` / ``slot_owner_session`` are ``None`` when the line
+    # reports ``none`` — never coerced to zero.
+    n_past_actual: int | None = None
+    reuse_ratio: float | None = None
+    slot_owner_session: str | None = None
+    residency_source: str | None = None
+    tenant_limit: int | None = None
+    tenant_occupants: int | None = None
+    # Eviction evidence (LP-0MVN1IQTF0037WTG AC6, ``local_eviction`` kind): the
+    # reclaimed slot, whether the evicted session's KV snapshot was planned,
+    # and the closed reason vocabulary in ``reason``.
+    slot_id: int | None = None
+    snapshot_planned: bool | None = None
+    # Post-acceptance eviction evidence (LP-0MVN4LCED00661MX, parent AC7).
+    # ``eta_prefill_seconds``/``elapsed_seconds`` are floats with a distinct
+    # name from the admission guard's string-valued ``eta_prefill_s`` so the
+    # two events can never be conflated.
+    new_tokens: int | None = None
+    eta_prefill_seconds: float | None = None
+    elapsed_seconds: float | None = None
+    llama_task_id: str | None = None
+    # Prefill-deadline overrun (``prefill_deadline_exceeded`` kind): the
+    # configured deadline that was exceeded, in seconds.
+    deadline_seconds: float | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -433,11 +609,106 @@ def _first(pattern: re.Pattern, text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _float(pattern: re.Pattern, text: str) -> float | None:
+    """Tolerant float extraction for a key=value field (``None`` if absent)."""
+    token = _first(pattern, text)
+    if token is None:
+        return None
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def _int(pattern: re.Pattern, text: str) -> int | None:
+    """Tolerant int extraction for a key=value field (``None`` if absent)."""
+    token = _first(pattern, text)
+    if token is None:
+        return None
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
 def _session_from(text: str) -> str | None:
     token = _first(RE_SESSION, text)
     if token is None or token == "unknown":
         return None
     return token
+
+
+@dataclass(frozen=True)
+class PrefillMatch:
+    """One local stream paired FIFO with its ``dispatch_first_byte_ms`` event.
+
+    ``ttft`` is ``None`` when the stream produced no first-byte line: an
+    aborted request (client disconnect, stream error) or a logging gap. Such
+    streams are **unknown prefill** — they must be reported as such rather
+    than silently dropped from the count (LP-0MVJN025B001I8AL AC4).
+    """
+
+    stream: LogEvent
+    ttft: LogEvent | None = None
+
+    @property
+    def known_prefill(self) -> bool:
+        """Whether this stream's prefill duration is observable."""
+        return self.ttft is not None and self.ttft.ttft_ms is not None
+
+    @property
+    def prefill_seconds(self) -> float | None:
+        """Dispatch→first-byte seconds, or ``None`` when unknown."""
+        if self.ttft is None or self.ttft.ttft_ms is None:
+            return None
+        return self.ttft.ttft_ms / 1000.0
+
+    @property
+    def dispatch_ts(self) -> datetime | None:
+        """Back-calculated dispatch time (``ttft.ts - ttft_ms``), or ``None``.
+
+        The dispatch line is written at first-byte time and carries only a
+        duration, so the prefill interval is
+        ``[dispatch_ts, ttft.ts]`` (LP-0MVJGCQ421005IXGC intake brief).
+        """
+        if self.ttft is None or self.ttft.ttft_ms is None:
+            return None
+        return self.ttft.ts - timedelta(milliseconds=self.ttft.ttft_ms)
+
+
+def pair_ttft_to_streams(
+    ttft_events: Iterable[LogEvent],
+    started_events: Iterable[LogEvent],
+) -> list[PrefillMatch]:
+    """Pair local streams with their TTFT events per session, FIFO by time.
+
+    TTFT lines carry ``session=``, so the Nth ``dispatch_first_byte_ms``
+    event of a session pairs with that session's Nth ``stream_started`` event
+    (the same FIFO convention ``aggregation.compute_busy_stats`` uses for
+    start/finish pairs). Streams are returned sorted by their start timestamp;
+    streams with no TTFT paired are included with ``ttft=None`` so callers can
+    count them as unknown prefill instead of losing them. TTFT events beyond a
+    session's stream count have no stream to attribute to and are ignored.
+    Session-less events cannot be paired and are skipped.
+    """
+    starts: dict[str, list[LogEvent]] = {}
+    for ev in started_events:
+        if ev.session is not None:
+            starts.setdefault(ev.session, []).append(ev)
+    ttfts: dict[str, list[LogEvent]] = {}
+    for ev in ttft_events:
+        if ev.session is not None:
+            ttfts.setdefault(ev.session, []).append(ev)
+
+    matches: list[PrefillMatch] = []
+    for session_id, session_starts in starts.items():
+        ordered_starts = sorted(session_starts, key=lambda e: e.ts)
+        ordered_ttfts = sorted(ttfts.get(session_id, []), key=lambda e: e.ts)
+        for index, stream in enumerate(ordered_starts):
+            ttft = ordered_ttfts[index] if index < len(ordered_ttfts) else None
+            matches.append(PrefillMatch(stream=stream, ttft=ttft))
+    matches.sort(key=lambda m: m.stream.ts)
+    return matches
 
 
 def _attribution_from(msg: str) -> tuple[str | None, str | None, str | None]:
@@ -526,7 +797,37 @@ def parse_log_line(line: str) -> LogEvent | None:
             return None
         fmodel, src, dst, reason = m2.groups()
         return LogEvent(
-            "fallback", ts, reason=_normalize_reason(reason), src=src, dst=dst
+            "fallback",
+            ts,
+            reason=_normalize_reason(reason.strip() or None),
+            src=src,
+            dst=dst,
+            # Session-bearing since LP-0MVMBMSWR0036RES; pre-change rotated
+            # logs have no ``session=`` and parse to ``None``.
+            session=_session_from(msg),
+            attempt_index=_int(RE_FALLBACK_ATTEMPT, msg),
+            budget_limit=_int(RE_FALLBACK_BUDGET_LIMIT, msg),
+            budget_remaining=_int(RE_FALLBACK_BUDGET_REMAINING, msg),
+            budget_waited=_float(RE_FALLBACK_BUDGET_WAITED, msg),
+        )
+    if msg.startswith(ROUTING_SKIP_PROVIDER_CONTEXT):
+        # "routing_skip_provider_context provider=munitoai-free type=remote
+        #  status=provider_context_exceeded estimated_tokens=195787 limit=150000
+        #  reason=provider_context_exceeded session=<uuid>"
+        # A per-provider context-ceiling skip: session-bearing, so it is
+        # attributable evidence of *why* a remote attempt was not made. The
+        # ``status=`` value duplicates ``reason=`` (both
+        # ``provider_context_exceeded``) and is therefore not stored twice.
+        return LogEvent(
+            "provider_context_skip",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            provider_type=_first(RE_PROVIDER_TYPE, msg),
+            session=_session_from(msg),
+            reason=_first(RE_REASON_KV, msg),
+            estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
+            limit=_int(RE_SKIP_LIMIT, msg),
+            raw=line,
         )
     if msg.startswith(ROUTING_SKIP):
         cycle_m = RE_CHAIN_HOLD_CYCLE.search(msg)
@@ -537,6 +838,12 @@ def parse_log_line(line: str) -> LogEvent | None:
             reason=_normalize_reason(_first(RE_ROUTING_SKIP_REASON, msg)),
             chain_hold_cycle=int(cycle_m.group(1)) if cycle_m else None,
         )
+    if msg.startswith(LOCAL_POST):
+        # ``[local] POST http://... body={...} session_id=<uuid> session={...}``.
+        # The request body is echoed (truncated) into the line and may itself
+        # contain ``session=``/``provider=`` text, so no field is extracted
+        # here: the event is a per-attempt marker, counted by hour only.
+        return LogEvent("local_dispatch", ts)
     if msg.startswith(DISPATCH_DENIED):
         m2 = RE_DISPATCH_DENIED.search(msg)
         if m2 is None:
@@ -558,12 +865,14 @@ def parse_log_line(line: str) -> LogEvent | None:
         )
     if msg.startswith(CONTENTION_FALLBACK_AFTER_QUEUE):
         # "contention_queue_fallback_after_queue provider=... session=... queued_duration=1.23s"
+        # (optionally suffixed with ``reason=<token>``, e.g. ``local_lease_active``)
         return LogEvent(
             "contention_fallback_after_queue",
             ts,
             provider=_first(RE_PROVIDER, msg),
             session=_session_from(msg),
             queued_duration=_first(RE_CONTENTION_DURATION, msg),
+            reason=_normalize_reason(_first(RE_REASON_KV, msg)),
         )
     if msg.startswith(ROUTING_IDLE_ADMIT):
         # "routing_idle_admit provider=local model=Qwen3
@@ -597,6 +906,129 @@ def parse_log_line(line: str) -> LogEvent | None:
             enforced=_first(RE_LOCAL_ADMISSION_ENFORCED, msg),
             eta_prefill_s=_first(RE_LOCAL_ADMISSION_ETA, msg),
             budget_s=_first(RE_LOCAL_ADMISSION_BUDGET, msg),
+        )
+    if msg.startswith(ROUTING_RESIDENT_PREFIX):
+        # "routing_resident_prefix provider=local model=Qwen3 decision=admit
+        #  n_past_actual=49103 estimated_tokens=49103 reuse_ratio=1.0000
+        #  slot_owner_session=<id> residency_source=measured min_ratio=0.50
+        #  tenants=2 occupants=1 session=<id>"
+        decision = _first(RE_RESIDENCY_DECISION, msg)
+        if decision is None:
+            return None
+        raw_n_past = _first(RE_N_PAST_ACTUAL, msg)
+        raw_ratio = _first(RE_REUSE_RATIO, msg)
+        owner = _first(RE_SLOT_OWNER_SESSION, msg)
+        return LogEvent(
+            "residency_decision",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            model=_first(RE_MODEL, msg),
+            session=_session_from(msg),
+            decision=decision,
+            estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
+            n_past_actual=(
+                int(raw_n_past) if raw_n_past and raw_n_past != "none" else None
+            ),
+            reuse_ratio=(
+                float(raw_ratio) if raw_ratio and raw_ratio != "none" else None
+            ),
+            slot_owner_session=None if not owner or owner == "none" else owner,
+            residency_source=_first(RE_RESIDENCY_SOURCE, msg),
+            tenant_limit=(
+                int(_first(RE_TENANT_LIMIT, msg))
+                if _first(RE_TENANT_LIMIT, msg)
+                and _first(RE_TENANT_LIMIT, msg) != "none"
+                else None
+            ),
+            tenant_occupants=(
+                int(_first(RE_TENANT_OCCUPANTS, msg))
+                if _first(RE_TENANT_OCCUPANTS, msg)
+                else None
+            ),
+        )
+    if msg.startswith(PREFILL_DEADLINE_EXCEEDED):
+        # "prefill_deadline_exceeded session=<id> deadline=120s → cancelling
+        #  local dispatch and detouring to the next provider"
+        # Session-less lines are still counted (the AC4 rate does not depend on
+        # attribution); only the deadline token is optional.
+        return LogEvent(
+            PREFILL_DEADLINE_EXCEEDED,
+            ts,
+            session=_session_from(msg),
+            deadline_seconds=_float(RE_PREFILL_DEADLINE_SECONDS, msg),
+        )
+    if msg.startswith(PROVIDER_EXHAUSTED):
+        # "All providers exhausted for model=v1/chat/completions;
+        #  unavailable={'local-qwen3': 59}; usage_limit_reset=None"
+        return LogEvent(
+            "provider_exhausted",
+            ts,
+            model=_first(RE_PROVIDER_EXHAUSTED_MODEL, msg),
+        )
+    if msg.startswith(LOCAL_EVICTION_AFTER_ACCEPTANCE):
+        # "local_eviction_after_acceptance session=<id> reason=prefill_deadline
+        #  estimated_tokens=40000 new_tokens=40000 eta_prefill_s=148.1
+        #  elapsed_s=92.4 slot_id=1 llama_task_id=unknown endpoint=default"
+        # A missing reason makes the line unparseable (the whole point of the
+        # event is its cause), so it is skipped rather than guessed.
+        reason = _first(RE_EVICTION_REASON, msg)
+        if reason is None:
+            return None
+        raw_eta = _first(RE_EVICTION_AA_ETA, msg)
+        raw_slot_id = _first(RE_EVICTION_AA_SLOT_ID, msg)
+        raw_task_id = _first(RE_EVICTION_AA_TASK_ID, msg)
+        raw_elapsed = _first(RE_EVICTION_AA_ELAPSED, msg)
+        return LogEvent(
+            LOCAL_EVICTION_AFTER_ACCEPTANCE,
+            ts,
+            session=_session_from(msg),
+            reason=reason,
+            slot_id=(
+                int(raw_slot_id)
+                if raw_slot_id and raw_slot_id != "unknown"
+                else None
+            ),
+            estimated_tokens=_int(RE_EVICTION_AA_ESTIMATED, msg),
+            new_tokens=_int(RE_EVICTION_AA_NEW_TOKENS, msg),
+            eta_prefill_seconds=(
+                float(raw_eta) if raw_eta and raw_eta != "unknown" else None
+            ),
+            elapsed_seconds=float(raw_elapsed) if raw_elapsed else None,
+            llama_task_id=(
+                None if not raw_task_id or raw_task_id == "unknown" else raw_task_id
+            ),
+        )
+    if msg.startswith(LOCAL_EVICTION):
+        # "local_eviction session=<id> reason=lease_evicted endpoint=default
+        #  slot=1 slot_owner_session=<id> tenants=2 snapshot_planned=true"
+        reason = _first(RE_EVICTION_REASON, msg)
+        if reason is None:
+            return None
+        raw_slot = _first(RE_SLOT_ID, msg)
+        raw_planned = _first(RE_SNAPSHOT_PLANNED, msg)
+        return LogEvent(
+            "local_eviction",
+            ts,
+            session=_session_from(msg),
+            reason=reason,
+            slot_id=int(raw_slot) if raw_slot and raw_slot != "none" else None,
+            slot_owner_session=(
+                None
+                if not _first(RE_SLOT_OWNER_SESSION, msg)
+                or _first(RE_SLOT_OWNER_SESSION, msg) == "none"
+                else _first(RE_SLOT_OWNER_SESSION, msg)
+            ),
+            tenant_limit=(
+                int(_first(RE_TENANT_LIMIT, msg))
+                if _first(RE_TENANT_LIMIT, msg)
+                and _first(RE_TENANT_LIMIT, msg) != "none"
+                else None
+            ),
+            snapshot_planned=(
+                None
+                if raw_planned in (None, "unknown")
+                else raw_planned == "true"
+            ),
         )
     if msg.startswith(MODE_SWITCH_PREFIX):
         # "Mode scheduler: applied scheduled mode cheap" — the mode that the
@@ -816,6 +1248,10 @@ def parse_log_line(line: str) -> LogEvent | None:
                 model=_first(RE_MODEL, msg),
                 session=_session_from(msg),
                 ttft_ms=ttft_ms_val,
+                dispatch_to_first_byte_ms=_float(RE_DISPATCH_TO_FIRST_BYTE, msg),
+                queue_wait_ms=_float(RE_QUEUE_WAIT_MS, msg),
+                cache_state=_first(RE_CACHE_STATE, msg),
+                cached_ratio=_float(RE_CACHED_RATIO, msg),
                 raw=line,
             )
 
@@ -862,7 +1298,7 @@ def iter_events(
     lo = window_start - margin
     hi = window_end + margin
     with open_log_text(path) as fh:
-        for line in fh:
+        for line_no, line in enumerate(fh, start=1):
             if len(line) < 24 or not line[:4].isdigit():
                 continue
             ev = parse_log_line(line)
@@ -870,6 +1306,7 @@ def iter_events(
                 continue
             if lo <= ev.ts <= hi:
                 ev.src_file = path.name
+                ev.line_no = line_no
                 yield ev
 
 

@@ -79,10 +79,21 @@
    ```bash
    sudo systemctl restart llama-proxy
    ```
-   Or restart the proxy process directly:
+   Or restart the proxy process directly (`--restart` kills the running proxy
+   and detaches the replacement by default — the launcher prints one handoff
+   line and exits 0, so poll `/health`; startup failures land in
+   `/tmp/proxy-startup.log`, use `--log-file <path>` to move it):
    ```bash
-   pkill -f 'uvicorn proxy.server' && sleep 2 && bash proxy/scripts/start-proxy.sh
+   bash proxy/scripts/start-proxy.sh --restart
+   curl -sf http://127.0.0.1:8000/health
    ```
+
+   > **If the proxy alone is dead while llama-server/TTS are alive, and the
+   > triggering command timed out (`Command timed out after <N> seconds`) after
+   > running `start-proxy.sh` in the foreground:** that is the tool-timeout
+   > failure mode of LP-0MVGT0E6W000Q8CY (log ends with no `Shutting down`
+   > line). Recover with `bash proxy/scripts/start-proxy.sh --restart`; a warm
+   > llama-server is preserved by default when its signature matches.
 
 2. **Restart llama-server** (if the backend is unresponsive or crashed):
    ```bash
@@ -132,3 +143,37 @@ If the issue cannot be resolved at the proxy layer:
   - `status`: `"5xx"` (HTTP status class)
   - `reason`: `"backend_error"`, `"backend_unavailable"`, `"self_healing"`, or `"slot_exhaustion"`
 - **Dashboard**: See `monitoring/grafana_llama_memory_dashboard.json` — "Proxy 5xx Errors (/v1/chat/completions)" panel.
+
+
+## Post-acceptance eviction (`local_eviction_after_acceptance`)
+
+An `ERROR` line `local_eviction_after_acceptance session=… reason=…` means an
+**accepted** local dispatch was released before its first byte (reasons:
+`prefill_deadline`, `no_progress_watchdog`, `idle_timeout`, `orphan_cleanup`,
+`lease_evicted`, `slot_assignment_freed`). It is a defect signal, not churn.
+
+1. Read the line's evidence: `estimated_tokens`, `new_tokens`,
+   `eta_prefill_s`, `elapsed_s`, `slot_id`.
+2. If `new_tokens` is within `server.local_cold_prefill_budget_tokens`, the
+   budget/pricing model is wrong for that prompt band — file a **critical
+   `test-failure`** work item via the triage path (see the
+   `proxy-usage-analysis` skill's triage rule).
+3. Cross-check the 24 h report: `local_evictions_after_acceptance_by_reason`
+   shows whether the events cluster in one reason (a path regression) or in one
+   prompt-size band (a calibration defect).
+4. Rollback if the events are volume-critical: `local_cold_prefill_budget_tokens: 0`,
+   `local_prefill_deadline_seconds: 90`,
+   `local_admission_guard_eta_percentile_min_tokens: 32768`,
+   `local_admission_guard_budget_safety_fraction: 0.0`.
+
+**Zero-evidence lines are not admissions.** `slot_assignment_freed` is emitted
+only for sessions that actually held a dispatch record, and it carries that
+record's admission evidence. A `slot_assignment_freed` line whose
+`estimated_tokens=0 new_tokens=0 eta_prefill_s=unknown elapsed_s=0.0` therefore
+describes a *missing* record, not an accepted dispatch that the GPU failed to
+serve — triage it as an instrumentation bug, not as a pricing/band defect.
+This was a real regression on 2026-10-25 (94 of 116 events came from the
+session-eviction path looking records up under the legacy string key while
+production records are keyed `(endpoint, session_id)`); it is fixed in
+`LP-0MVO7IDTP005S92D`, which also releases the per-endpoint lease on session
+eviction instead of leaking it until its timeout.

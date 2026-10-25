@@ -1,9 +1,9 @@
-# Slot-count re-evaluation: keep N=2 pending a quiet-window N=3 sweep (LP-0MVGCQ3QN009HRE8)
+# Slot-count re-evaluation: keep N=2 — the quiet-window sweep could not test the projection (LP-0MVGCQ3QN009HRE8)
 
 **Item:** Re-evaluate `session_slot_pool_size` against measured GPU busy-time and contention history (LP-0MVGCQ3QN009HRE8).
-**Decision:** **KEEP `session_slot_pool_size: 2`** (production unchanged) until the controlled N=3 sweep in LP-0MVGPEP3O000RKKD lands. The evidence below shows N=3 would absorb more concurrent demand, but the measured N=3 cost/benefit could not be established on the shared proxy; the mitigations N=2 depends on are enumerated in [Decision and mitigations](#decision-and-mitigations-ac4).
-**Date:** 2026-10-20
-**Method harness:** `scripts/slot_history_extract.py` (this item) + `proxy/benchmarks/slot_benchmark.py` (prior verdict).
+**Decision:** **KEEP `session_slot_pool_size: 2`** (production unchanged; no config-change item created). The controlled N=2/N=3 sweep **ran** on 2026-10-23 in a verified quiet window (LP-0MVGPEP3O000RKKD, results in [the committed sweep directory](../proxy/benchmarks/results/slot_sweep_2_3_4_20261023/RESULTS_NOTE.md)), but **both runs are INVALID for local metrics — local stream share 0.0 %** — because the harness cannot land requests on the local backend under its own concurrency (cold-start admission caps local dispatch at 1 until the first prefill completes). The concurrency projection is therefore **not testable** with this harness as configured; the reopening conditions are in [Measured N=3/N=4 sweep outcome](#measured-n3--n4-sweep-outcome-ac3-2026-10-23). The evidence for N=3 absorbing more concurrent demand stands, but its measured cost/benefit still does not; the mitigations N=2 depends on are enumerated in [Decision and mitigations](#decision-and-mitigations-ac4).
+**Date:** 2026-10-20 (measured-sweep outcome added 2026-10-23)
+**Method harness:** `scripts/slot_history_extract.py` (this item) + `proxy/benchmarks/slot_benchmark.py` (prior verdict) + `scripts/slot_sweep_preflight.py` (quiet-window gate, LP-0MVK0969J004MTG3).
 
 ---
 
@@ -13,7 +13,8 @@
 - **On the 2026-10-19 07:23 → 2026-10-20 07:23 window (single N=2 config)**, the log-derived concurrency distribution is: peak **9** concurrent sessions, mean **1.27**, p95 **4**; **16.5%** of minutes have more than two sessions in flight.
 - **Capacity model** (`denied = max(0, concurrent − N)`): N=2 denies **19.7%** of session-minutes; N=3 would deny **6.7%**; N=4 **2.2%**. So the *demand* case for a third slot is real.
 - **But N=3 does not add prefill capacity** (prefill is serialised at `local_max_concurrent_prefills: 1`) and it **shrinks per-slot context to 83,285** (warm threshold 79,121 vs 120,627 at N=2), pushing more large prompts into cold re-prefill — the dominant source of the 86% queue-abandonment rate already observed.
-- **Decision: keep N=2.** Its 126,976-token per-slot context protects the warm-cache band that a third slot would evict. Revisit when the quiet-window N=3 sweep (LP-0MVGPEP3O000RKKD) and the prefill-aware metrics item (LP-0MVGCQ421005IXGC) land.
+- **Decision: keep N=2.** Its 126,976-token per-slot context protects the warm-cache band that a third slot would evict. Revisit when a harness can measure local concurrency (LP-0MVLHNEDO008FTBH), the prefill-aware metrics item (LP-0MVGCQ421005IXGC) lands, or ≥30 days of N=2 production logs show `local_dispatch_denied` dominated by genuine concurrent demand rather than prefill hold.
+- **The 2026-10-23 quiet-window sweep (N=2, N=3) ran but is INVALID for local metrics**: local stream share **0.0 %** at both Ns (0/11 local streams each; every stream served by a remote deepseek-v4.x-flash provider). Cause is structural — immediately after each slot-count restart the proxy's cold-start window admits only **one** concurrent local dispatch, and the harness fires `--concurrency 3` at t=0 — not host load. The measured queue-timeout rates (66.7 % at N=2, 0 % at N=3, from 3 arrivals each) therefore **cannot confirm or refute** the 19.7 %/6.7 %/2.2 % denied-session-minute projection; the projection's status is **not testable as configured**.
 
 ---
 
@@ -192,11 +193,124 @@ Measured directly from the same window's logs (no new load):
 
 The prefill total matches the intake's independent estimate (14.3 h / 463 requests) within log-rotation noise. The queue-abandonment rate (86%) confirms that the 120 s `contention_queue_max_wait_seconds` is shorter than the median prefill-plus-queue hold, so most queued waits are guaranteed losses — the motivation for the prefill-ETA admission guard (already live).
 
-## Measured N=3 / N=4 sweep status (AC3, deferred)
+## Measured N=3 / N=4 sweep outcome (AC3, 2026-10-23)
 
-The controlled sweep was **attempted and aborted** on 2026-10-20: `slot_benchmark --slots 3 --concurrency 3 --prompt-tokens 2000` ran against the live proxy while it was serving 5 concurrent sessions (52 distinct sessions / 5 min; 2 audits + 4 herdr panes holding local leases). Under that contention every benchmark turn-1 request stalled at 600–760 s against the 1200 s timeout and llama-server stopped answering health probes. The harness restored the config (`sha256 6eec5656…`) and a controlled `start-proxy.sh --restart` returned the proxy to healthy (N=2, `--parallel 2`).
+### What ran
 
-A clean N=3/N=4 measurement needs a quiet window; it is tracked in **LP-0MVGPEP3O000RKKD** (same harness, exact commands recorded there). Until it runs, the N=3 cost/benefit is **projected**, not measured — which is why the decision is to hold N=2 rather than switch.
+The controlled sweep **ran** on 2026-10-23 in a **verified quiet window** — the gate
+`scripts/slot_sweep_preflight.py` (LP-0MVK0969J004MTG3) exited 0 with
+`local_idle_seconds=412.5`, `available_slots=2/2`, `local_owner_session_id=null`,
+`slots_stale=false`. Command set (validated in LP-0MVK0969J004MTG3, which also corrects
+`--sweep` to `--sweep --resume 2` so the out-of-scope N=1 is not re-run):
+
+```bash
+python3 scripts/slot_sweep_preflight.py --json --timeout 30      # must exit 0
+LLAMA_PROXY_BENCHMARK_ROOT=/home/rgardler/projects/llm \
+  python3 -m proxy.benchmarks.slot_benchmark \
+  --sweep --resume 2 --concurrency 3 --prompt-tokens 2000 \
+  --output-dir proxy/benchmarks/results/slot_sweep_2_3_4_20261023/n2_n3
+```
+
+Full evidence, validity flags and the reproduction log:
+[`proxy/benchmarks/results/slot_sweep_2_3_4_20261023/RESULTS_NOTE.md`](../proxy/benchmarks/results/slot_sweep_2_3_4_20261023/RESULTS_NOTE.md)
+(`slot_2.json`, `slot_3.json`, preserved `report_2_3.json`).
+
+### Measured results (both runs INVALID for local metrics)
+
+| Metric | N=2 | N=3 |
+|---|---|---|
+| Requested / observed llama-server `--parallel` | 2 / **2** ✅ | 3 / **3** ✅ |
+| Per-slot physical context (`per_slot_ctx`) | 126,976 | 83,285 |
+| Warm threshold implied (95 % of per-slot ctx) | 120,627 | 79,121 |
+| Completed / errors | 11 / 12 (1 error) | 11 / 12 (1 error) |
+| **Local stream share** | **0.0 % (0/11)** | **0.0 % (0/11)** |
+| Avg TTFT (remote, not prefill) | 0.033 s | 0.162 s |
+| Avg decode tok/s (remote) | 147.3 | 161.0 |
+| Queue-timeout count / rate | 2 / 66.7 % | 0 / 0.0 % |
+| Local quarantine episodes | 1 | 0 |
+| MemAvailable at run end | 90.68 GB | 86.42 GB |
+| `finish_reason=length` | not recorded (harness gap, LP-0MVLHNJ3W007T319) | not recorded |
+| Run wall time | 24.5 min | 19.1 min |
+
+`--parallel` agreed with `session_slot_pool_size` at both Ns, the per-slot context clamp
+matched the table below, no viability warnings were raised, and the harness restored the
+production config (`session_slot_pool_size: 2`, `--parallel 2`, sha256 identical). Memory
+did **not** bind at N=3 (86.42 GB free), so the N=4 memory gate passed; **N=4 was not run**
+because both runs are INVALID and N=4 would replicate the same invalid measurement (explicit
+quantified skip in `.../n4/SKIP.md`).
+
+### Reconciling the measured rates with the projection (AC2)
+
+**Verdict: the projection is NOT TESTABLE with this harness as configured — neither confirmed
+nor refuted.** The measured queue-timeout rates cannot be compared with the 19.7 % / 6.7 % /
+2.2 % denied-session-minute figures because the two quantities are produced by different
+workloads and different mechanisms:
+
+- **The projection's unit** is *session-minutes over a 24 h production window*: sessions that
+  arrive **staggered**, are mostly **warm** (44 %+ warm-cache share), and are typically
+  short-lived. Its driver is *demand concurrency* — `denied = max(0, concurrent − N)` on a
+  log-derived concurrency series (peak 9, mean 1.27, p95 4).
+- **The sweep's unit** is *three simultaneous cold, 4-turn requests of up to 18,000 output
+tokens each, launched the instant llama-server reports ready*. Its driver is the **cold-start
+admission cap**: each slot-count restart reloads the model, re-arming
+  `proxy/proxy/cold_start.py` (cap = **1** concurrent local dispatch until the first prefill
+  completes, LP-0MUCEFCAT005NFNN). Two of the three requests are refused at the local gate on
+  every cycle (`local_dispatch_denied … cold_start=True active=1`), the admitted one holds the
+  only slot for a whole agentic turn, and the rest exhaust the 60 s
+  `contention_queue_max_wait_seconds` budget or the 1,200 s client timeout and complete
+  remotely (`Fallback triggered … from=local-qwen3, to=munitoai-free, reason=HTTP 503`).
+- **Which assumption broke:** the sweep assumed "concurrency 3" would exercise three *local*
+  slots. It does not — it exercises the cold-start guard. The same mechanism explains the
+  0.0 % local share of the 2026-10-17 sweep, so this is a property of the harness, not of the
+  host load or the 2026-10-23 window.
+- **The one directional signal, stated at its true strength:** N=2 recorded 2 queue timeouts
+  (66.7 % of queue-path arrivals) and 1 quarantine episode; N=3 recorded 0 queue timeouts
+  (every queue dispatch completed inside the 60 s budget). That direction is consistent with
+  a third slot absorbing more concurrent arrivals, but it rests on **3 arrivals per
+  configuration**, contains **no local streams at all**, and is confounded by the remote
+  fallbacks that emptied the local path. It cannot carry the 19.7 % → 6.7 % claim, and it is
+  not comparable with the 2026-10-17/2026-10-20 numbers because the queue budget in force is
+  now **60 s**, not 120 s.
+
+**Validity caveats carried into this verdict (AC3):**
+
+1. **INVALID runs** — local stream share 0.0 % at both Ns: no local TTFT/decode conclusion is
+   drawn anywhere in this doc from the sweep.
+2. **Driver-session interference** — the sweep was launched from an agent session; that
+   session's own requests were *denied* local dispatch during N=3 (they ran remotely and did
+   not consume a local slot) but they are inside the measurement window.
+3. **Other host actors** — a second herdr agent session was alive and a status-probe loop
+   polled `/llama/local/status` every 10 s during the window (status lines only; probes fire
+   only when all slots are idle).
+4. **`contention_queue_max_wait_seconds = 60 s`** in force (not 120 s): queue-timeout rates
+   are only comparable with runs using 60 s.
+5. **Restart-induced cold window** on every slot count — the mechanism behind the 0 % local
+   share (see above); it also means the first measured requests of each N saw a cold cache.
+6. **`finish_reason` is not captured** by this harness version and the restore restart clears
+   `proxy.log`, so `finish_reason=length` cannot be recovered for this run.
+7. **Remote-provider variance** — the fallback streams used deepseek-v4.x-flash on two
+   providers with rate-limit fallback between them, so even the "remote baseline" TTFT/TPS is
+   not stable.
+
+### What would reopen this decision (AC4, verdict stays N=2)
+
+1. **A harness that can land requests locally under concurrency** (LP-0MVLHNEDO008FTBH):
+   staggered arrivals so the first prefill lifts the cold cap before the next request is
+   issued, a warm-start proof (`cold_start.is_cold() == False`) before the measured set, or
+   single-turn requests at production sizes. Evidence of success = `local_stream_share > 0`
+   with ≥2 concurrent local streams and per-request resolved models recorded.
+2. **A warmed N=2-vs-N=3 comparison whose decode-throughput gain exceeds the warm-cache loss**
+   from the 83,285 clamp (79,121 warm threshold vs 120,627 at N=2). Any move must re-decide the
+   warm-threshold target in the same pass.
+3. **Production-log evidence over ≥30 days at N=2** that `local_dispatch_denied` is dominated
+   by genuine concurrent demand rather than prefill hold (today's "99.7 % at `active=2`" figure
+   cannot distinguish them) — the prefill-aware busy metrics item LP-0MVGCQ421005IXGC.
+4. **Any change that lifts prefill concurrency** (`local_max_concurrent_prefills > 1`) changes
+   the premise: slots would then add prefill capacity too, and a fresh sweep is required.
+
+## Prior attempt (2026-10-20, aborted)
+
+The controlled sweep was first **attempted and aborted** on 2026-10-20: `slot_benchmark --slots 3 --concurrency 3 --prompt-tokens 2000` ran against the live proxy while it was serving 5 concurrent sessions (52 distinct sessions / 5 min; 2 audits + 4 herdr panes holding local leases). Under that contention every benchmark turn-1 request stalled at 600–760 s against the 1200 s timeout and llama-server stopped answering health probes. The harness restored the config (`sha256 6eec5656…`) and a controlled `start-proxy.sh --restart` returned the proxy to healthy (N=2, `--parallel 2`). The 2026-10-23 run above fixed the precondition (quiet gate) but hit the harness-side limit instead.
 
 **Per-slot context / warm-threshold interaction** (the item that must be decided together):
 
@@ -218,7 +332,7 @@ Rationale:
 1. N=2 preserves the 126,976-token per-slot context and therefore the warm-cache band; N=3 (83,285) and N=4 (61,440) would evict it.
 2. Prefill serialisation (`local_max_concurrent_prefills: 1`) means extra slots add decode concurrency, not prefill capacity — they cannot by themselves fix the 86% queue abandonment.
 3. The historical record shows abandonment rising with demand and context size, not falling when the slot count rose.
-4. The N=3 demand benefit (19.7% → 6.7% denied session-minutes) is real but **unmeasured on cost**; the quiet-window sweep is the gate.
+4. The N=3 demand benefit (19.7% → 6.7% denied session-minutes) is real but **still unmeasured on cost**: the 2026-10-23 sweep ran but was INVALID for local metrics (local stream share 0.0 %), so it neither confirms nor refutes the projection — see [Measured N=3 / N=4 sweep outcome](#measured-n3--n4-sweep-outcome-ac3-2026-10-23).
 
 **Expected effect if N were changed (for the follow-up):**
 
@@ -239,14 +353,16 @@ Rationale:
 4. **Capacity-based admission** (LP-0MVGDUVS6003T2IX) — keep default-off until warmth improves and the 24 h measurement is green.
 5. **Economic threshold discipline** — keep the 38k cold / ~126,976 warm routing clamp; do not widen it to compete for slots the GPU cannot prefill.
 6. **Queue-wait tuning only with the ETA guard** — a longer `contention_queue_max_wait_seconds` without the guard merely lengthens guaranteed-loss waits.
-7. **Re-decide slot count with LP-0MVGPEP3O000RKKD** (quiet-window sweep) and **LP-0MVGCQ421005IXGC** (prefill-aware busy metrics); decide the warm-threshold item in the same pass.
+7. **Re-decide slot count once a harness can measure local concurrency** (**LP-0MVLHNEDO008FTBH** — warm-start / staggered-arrival mode; the 2026-10-23 sweep was INVALID because the cold-start cap admits one local dispatch), and with the **prefill-aware busy metrics** item LP-0MVGCQ421005IXGC; decide the warm-threshold item in the same pass. `finish_reason=length` capture must land first too (LP-0MVLHNJ3W007T319).
 
 ---
 
 ## Scope and follow-ups (AC5)
 
-- **No production slot-count change was made.** The only production interaction was the aborted sweep, which restored config to `session_slot_pool_size: 2` and was verified healthy (`--parallel 2`, 2 slots).
-- **LP-0MVGPEP3O000RKKD** — controlled N=3/N=4 sweep in a quiet window (AC3 completion; `discovered-from` this item).
+- **No production slot-count change was made** and no config-change item was created: the verdict stays at N=2. The sweep's only production interaction was the temporary `session_slot_pool_size` 2 → 3 → 2 cycle, restored and verified (`--parallel 2`, 2 slots, `/health` ok, config sha256 identical to the pre-run value).
+- **LP-0MVGPEP3O000RKKD** — the quiet-window sweep epic; its three children are complete: preflight gate + validated commands (LP-0MVK0969J004MTG3), measured sweep (LP-0MVK096GF0038FTH, results committed under `proxy/benchmarks/results/slot_sweep_2_3_4_20261023/`), and this verdict.
+- **LP-0MVLHNEDO008FTBH** — the harness cannot exercise local concurrency (cold-start cap): add a warm-start / staggered-arrival mode. This is the precondition for reopening the slot-count decision.
+- **LP-0MVLHNJ3W007T319** — `slot_benchmark` must record `finish_reason` per request (the sweep cannot report `finish_reason=length` without it).
 - **LP-0MVGCQ421005IXGC** — prefill-aware busy metrics (the reported 29.9% busy understates real occupancy; this doc uses the 44% figure).
 - Warm-threshold = 95%-of-per-slot item — must be decided with any future slot-count change (N=3 target becomes 79,121).
 
@@ -256,3 +372,5 @@ Rationale:
 - Raw extracted data: `docs/slot-history-LP-0MVGCQ3QN009HRE8.json` (history + concurrency).
 - Prior verdict / method: `docs/slot-count-verdict-lp-0mv9ungeb009xuz5.md`.
 - Sweep harness: `proxy/benchmarks/slot_benchmark.py`.
+- Quiet-window gate: `scripts/slot_sweep_preflight.py`; tests `tests/test_slot_sweep_preflight.py` (LP-0MVK0969J004MTG3).
+- 2026-10-23 sweep evidence: `proxy/benchmarks/results/slot_sweep_2_3_4_20261023/RESULTS_NOTE.md`, `n2_n3/slot_2.json`, `n2_n3/slot_3.json`, `n2_n3/report_2_3.json`, `n4/SKIP.md`, `sweep_n2_n3.log`.
