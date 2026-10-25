@@ -1654,3 +1654,57 @@ def test_single_eviction_logging_convention():
     ]
     assert not stray, f"eviction emitters must come from admission_events only: {stray}"
     assert callable(admission_events.log_local_eviction)
+
+
+def test_tenancy_denial_leaves_the_contention_queue_budget_alone(monkeypatch):
+    """A tenancy denial is an ordinary skip: the queue budget is untouched.
+
+    AC2 requires the denial to follow the normal fall-through chain "not
+    evicting a resident" and to spend the ``contention_queue_*`` budget exactly
+    as the pre-existing bypass does — i.e. the ladder must not enter (or
+    consume) the queue at all when it denies on tenancy grounds.
+    """
+    from proxy import router as router_mod
+
+    config = {"server": {"contention_queue_max_wait_seconds": 60.0}}
+    before = dict(router_mod._get_contention_queue_config(config["server"]))
+
+    def _boom(*_a, **_k):  # pragma: no cover - must never run
+        raise AssertionError("the admission ladder must not consult the queue")
+
+    _install_tenancy(["sess-a", "sess-b"])
+    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
+    monkeypatch.setattr(provider, "evaluate_admission", _boom, raising=False)
+    monkeypatch.setattr("proxy.prefill_eta.evaluate_admission", _boom)
+
+    skip, reason = _gate_with_tenancy(
+        session_id="sess-c", view=view, monkeypatch=monkeypatch
+    )
+
+    assert skip is True
+    assert reason == SKIP_TENANT_LIMIT
+    after = router_mod._get_contention_queue_config(config["server"])
+    assert after == before, "a tenancy denial must not change the queue budget"
+
+
+def test_lifetime_ceiling_releases_a_lease_that_keeps_reporting_progress():
+    """The 900 s ceiling bounds a lease the no-progress watchdog cannot.
+
+    A wedged slot can keep reporting progress/is_processing forever, so the
+    lease TTL refresh is bounded from above by ``started_at`` + ceiling: the
+    900 s ceiling is never optional, even when every other bound is satisfied.
+    """
+    srv = _SrvStub()
+    now = time.monotonic()
+    record = {
+        "backend": "local",
+        "active": True,
+        "started_at": now - 901.0,
+        "last_progress_ts": now - 1.0,  # fresh: the no-progress watchdog is silent
+        "expires_at": now + 3600.0,
+    }
+    assert router_helpers._watchdog_no_progress(srv, "sess-a", record) is True
+
+    # Inside the ceiling the same well-refreshed lease stays live.
+    record["started_at"] = now - 899.0
+    assert router_helpers._watchdog_no_progress(srv, "sess-a", record) is False
