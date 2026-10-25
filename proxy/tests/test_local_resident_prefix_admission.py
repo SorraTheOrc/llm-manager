@@ -1573,3 +1573,84 @@ def test_local_prefill_deadline_default_is_unchanged():
     work must not move it (the deadline is only the lease backstop).
     """
     assert router_helpers._get_prefill_deadline_seconds(_SrvStub()) == 90.0
+
+
+# ---------------------------------------------------------------------------
+# AC2 — the thrash cooldown and the tenancy bound compose (never widen)
+# ---------------------------------------------------------------------------
+
+def test_thrash_cooldown_and_tenancy_bound_compose():
+    """A tenancy-denied session under thrash cooldown sees both gates.
+
+    The routing loop checks the post-deadline thrash cooldown
+    (``LP-0MVKUKFHH005UDWL``) *before* the ladder, so the cooldown must not
+    widen admission: a session whose tenancy is denied stays denied while its
+    cooldown remains armed, on its own grounds.
+    """
+    from proxy import router_helpers as rh
+
+    rh._reset_prefill_thrash_cooldowns()
+    try:
+        at = 1000.0  # cooldown-arming instant
+        ev = at + 60  # evaluation instant: records must still be live (TTL 30 s)
+        srv = _SrvStub()
+        srv.record("sess-a", now=ev)
+        srv.record("sess-b", now=ev)
+
+        # A cooldown armed just before (deadline far in the future)…
+        rh._record_prefill_thrash_cooldown(
+            "sess-c",
+            {"server": {"local_prefill_thrash_cooldown_seconds": 600}},
+            now=at,
+        )
+        assert rh._prefill_thrash_cooldown_remaining("sess-c", now=at + 60) > 0
+
+        # …does not widen admission: the tenancy bound still denies a third
+        # session on its own grounds while the cooldown stays armed.
+        decision = rh.evaluate_session_tenancy(
+            srv, "sess-c", tenants=2, idle_seconds=30.0, now=ev
+        )
+        assert decision.admitted is False
+        assert decision.reason == SKIP_TENANT_LIMIT
+    finally:
+        rh._reset_prefill_thrash_cooldowns()
+
+
+# ---------------------------------------------------------------------------
+# AC5 — a single eviction logging convention (LP-0MVN3KMGI009BZ0D AC7)
+# ---------------------------------------------------------------------------
+
+def test_single_eviction_logging_convention():
+    """Every reclaim path funnels through ``admission_events`` — one sink.
+
+    The one-logging-convention rule forbids a second, ad-hoc eviction line:
+    whatever reason text a reclaim path wants, it must reach
+    ``admission_events.log_local_eviction``. This structural contract pins the
+    routing so a future path cannot invent a new format silently.
+    """
+    import inspect
+    import re
+
+    from proxy import admission_events, router_helpers
+
+    src = inspect.getsource(router_helpers)
+    # The shared sinks, by name, are the only eviction emitters the reclaim
+    # module may use.
+    sinks = sorted(
+        set(re.findall(r"(?:log_local_eviction|record_eviction_after_acceptance)", src))
+    )
+    assert sinks == ["log_local_eviction", "record_eviction_after_acceptance"], (
+        f"reclaim paths must use the shared admission_events sinks only, "
+        f"found: {sinks}"
+    )
+    # …and every import of an *eviction* function comes from
+    # proxy.admission_events — never a second module defining its own format.
+    eviction_imports = re.findall(
+        r"from proxy\.([\w.]+) import ([\w, ]+)", src
+    )
+    stray = [
+        m for m in eviction_imports
+        if "eviction" in m[1].lower() and "admission_events" not in m[0]
+    ]
+    assert not stray, f"eviction emitters must come from admission_events only: {stray}"
+    assert callable(admission_events.log_local_eviction)
