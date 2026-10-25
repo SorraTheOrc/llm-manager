@@ -183,8 +183,6 @@ def test_aggregation_collects_after_acceptance_events_separately():
 
 def test_summary_json_exposes_total_and_per_reason(monkeypatch):
     """Both additive keys are present, with every reason addressable."""
-    events = _summary_with([_line(r) for r in REASONS])
-
     summary = _analyse([_line(r) for r in REASONS])
     counts = Counter(e.reason for e in summary.eviction_after_acceptance_events)
 
@@ -228,10 +226,6 @@ def test_aggregation_result_carries_the_after_acceptance_bucket():
 # ---------------------------------------------------------------------------
 
 def test_report_prints_the_counter_and_breakdown():
-    events = _summary_with(
-        [_line("prefill_deadline"), _line("prefill_deadline"), _line("idle_timeout")]
-    )
-
     summary = _analyse(
         [_line("prefill_deadline"), _line("prefill_deadline"), _line("idle_timeout")]
     )

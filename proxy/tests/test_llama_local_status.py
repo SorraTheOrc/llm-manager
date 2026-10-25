@@ -1487,7 +1487,8 @@ async def test_server_error_still_uses_graceful_degradation():
 async def test_query_slots_reports_outcome_for_definitive_absence():
     """``_query_slots(status_out=...)`` exposes the fresh query outcome so a
     caller can tell a definitive model-absent answer from a transient fault."""
-    from unittest.mock import AsyncMock, patch as _patch
+    from unittest.mock import AsyncMock
+    from unittest.mock import patch as _patch
 
     from proxy.observability import _query_slots
 
