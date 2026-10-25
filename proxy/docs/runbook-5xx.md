@@ -165,3 +165,15 @@ An `ERROR` line `local_eviction_after_acceptance session=… reason=…` means a
    `local_prefill_deadline_seconds: 90`,
    `local_admission_guard_eta_percentile_min_tokens: 32768`,
    `local_admission_guard_budget_safety_fraction: 0.0`.
+
+**Zero-evidence lines are not admissions.** `slot_assignment_freed` is emitted
+only for sessions that actually held a dispatch record, and it carries that
+record's admission evidence. A `slot_assignment_freed` line whose
+`estimated_tokens=0 new_tokens=0 eta_prefill_s=unknown elapsed_s=0.0` therefore
+describes a *missing* record, not an accepted dispatch that the GPU failed to
+serve — triage it as an instrumentation bug, not as a pricing/band defect.
+This was a real regression on 2026-10-25 (94 of 116 events came from the
+session-eviction path looking records up under the legacy string key while
+production records are keyed `(endpoint, session_id)`); it is fixed in
+`LP-0MVO7IDTP005S92D`, which also releases the per-endpoint lease on session
+eviction instead of leaking it until its timeout.

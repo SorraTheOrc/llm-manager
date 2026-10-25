@@ -177,8 +177,9 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
     try:
         import proxy.server as _srv
         from proxy.router_helpers import (
-            _dispatch_lease_key,
+            _dispatch_key_session_id,
             _emit_eviction_after_acceptance,
+            _endpoint_from_record,
             _release_local_dispatch,
         )
 
@@ -187,21 +188,49 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         # eviction can still be reported as a post-acceptance eviction when it
         # had not served a first byte (the emitter classifies by the record's
         # ``first_byte_seen`` flag, so normal churn stays quiet).
-        released_record = None
+        #
+        # LP-0MVO7IDTP005S92D: the lookup must cover EVERY key shape the
+        # session's records can live under — the legacy bare ``session_id``
+        # string AND per-endpoint ``(endpoint, session_id)`` tuples
+        # (LP-0MRPILSMW004T4H8). A string-only lookup always missed in
+        # production, which both leaked per-endpoint leases until their
+        # timeout and fed the post-acceptance emitter a ``None`` record, i.e.
+        # it fired an ERROR with zero evidence for sessions that may never
+        # have been dispatched at all.
+        released_records: list[tuple[str | None, dict]] = []
         try:
-            records = getattr(_srv, "local_dispatch_records", None)
-            if records is not None:
-                released_record = records.get(_dispatch_lease_key(None, session_id))
+            records = getattr(_srv, "local_dispatch_records", None) or {}
+            for record_key in list(records):
+                if _dispatch_key_session_id(record_key) != session_id:
+                    continue
+                record = records.get(record_key)
+                if isinstance(record, dict):
+                    released_records.append(
+                        (_endpoint_from_record(record), record)
+                    )
         except Exception:
-            released_record = None
+            released_records = []
+        # Release every record owned by the session: the legacy string key
+        # first, then each per-endpoint record (AC1). ``_release_local_dispatch``
+        # also frees the corresponding slot assignments and prefill markers.
         await _release_local_dispatch(_srv, session_id)
+        for record_endpoint in {ep for ep, _ in released_records if ep}:
+            await _release_local_dispatch(_srv, session_id, endpoint=record_endpoint)
         logger.info(
             "lease_released session=%s reason=session_evicted",
             session_id if session_id else "unknown",
         )
-        _emit_eviction_after_acceptance(
-            _srv, session_id, "slot_assignment_freed", released_record
-        )
+        # Report each accepted-but-unserved dispatch exactly once (AC3); a
+        # session with no dispatch record was never accepted, so it is normal
+        # churn — no ERROR, no counter increment (AC2).
+        for record_endpoint, record in released_records:
+            _emit_eviction_after_acceptance(
+                _srv,
+                session_id,
+                "slot_assignment_freed",
+                record,
+                endpoint=record_endpoint,
+            )
     except Exception:
         logger.exception(
             "Failed to release dispatch lease on session eviction for %s",
