@@ -2367,6 +2367,14 @@ RESIDENT_PREFIX_MIN_RATIO_DEFAULT: float = 0.5
 #: `local_resident_prefix_min_ratio`.
 SKIP_REASON_RESIDENT_PREFIX: str = "resident_prefix_insufficient"
 
+#: Admission-decision values logged on the fail-open path, where the residency
+#: view could not measure anything (no fresh snapshot, no ownership) and the
+#: ladder degrades to the predicted sidecar ratio. Logging them keeps
+#: residency-blind admissions visible instead of silently unlogged
+#: (LP-0MVN4LANP0069QQM AC5).
+DECISION_ADMIT_PREDICTED: str = "admit_predicted"
+DECISION_SKIP_PREDICTED: str = "skip_predicted"
+
 #: Skip reasons an idle local backend may override (LP-0MVGD9Z8Z0055Y5J). The
 #: idle-exempt override is the LAST rung of the admission ladder, so the new
 #: residency gate must not silently disable it: an idle GPU still serves cold
@@ -2761,6 +2769,12 @@ def _should_skip_local(
     # tenancy rung then still applies with its own knob, since tenancy is an
     # independent bound on how many distinct sessions may hold the pool.
     facts = None
+    # Set when the residency view could not measure anything (no fresh
+    # snapshot and no ownership). The ladder then fails open to the predicted
+    # ratio, but the *decision* must still be logged with an explicit
+    # ``n_past_actual=none`` so residency-blind admissions are visible in the
+    # usage report instead of vanishing (AC5 — LP-0MVN4LANP0069QQM).
+    unmeasured_facts = None
     if resident_prefix_min_ratio > 0.0:
         facts = resolve_resident_prefix(
             session_id,
@@ -2771,6 +2785,7 @@ def _should_skip_local(
         if facts.source == RESIDENCY_SOURCE_UNKNOWN:
             # Fail-open: no fresh measurement and no ownership — degrade to
             # today's predicted-ratio decision instead of denying local.
+            unmeasured_facts = facts
             facts = None
         elif not facts.resident:
             # Fresh view, no slot of its own: the resident prefix is measured
@@ -2867,6 +2882,15 @@ def _should_skip_local(
     )
     new_tokens = int(estimated_tokens * (1 - ratio))
     if new_tokens <= cold_cache_threshold:
+        if unmeasured_facts is not None:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=DECISION_ADMIT_PREDICTED,
+                model_name=model_name,
+                facts=unmeasured_facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
         return (False, None)
 
     # Economic cold-cache bypass (large_context_bypass)
@@ -2874,8 +2898,26 @@ def _should_skip_local(
         # Active mode profile recovers economic bypasses locally. The
         # contention queue (if enabled) will wait for a slot when all are
         # busy.
+        if unmeasured_facts is not None:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=DECISION_ADMIT_PREDICTED,
+                model_name=model_name,
+                facts=unmeasured_facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
         return (False, None)
 
+    if unmeasured_facts is not None:
+        _log_residency_decision(
+            session_id=session_id,
+            estimated_tokens=estimated_tokens,
+            decision=DECISION_SKIP_PREDICTED,
+            model_name=model_name,
+            facts=unmeasured_facts,
+            min_ratio=resident_prefix_min_ratio,
+        )
     return (True, "large_context_bypass")
 
 

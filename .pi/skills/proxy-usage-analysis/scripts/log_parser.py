@@ -240,7 +240,10 @@ ROUTING_IDLE_ADMIT = "routing_idle_admit"
 # non_resident|unknown> min_ratio=<f> tenants=<n> occupants=<n> session=<id>``
 # once per admission decision. ``decision`` is one of ``admit``,
 # ``resident_prefix_insufficient``, ``tenant_limit`` (plus
-# ``large_context_bypass`` for a live-priced cold miss).
+# ``large_context_bypass`` for a live-priced cold miss). The fail-open path
+# (unmeasured view — no fresh snapshot, no ownership) logs
+# ``admit_predicted`` / ``skip_predicted`` with ``n_past_actual=none`` so
+# residency-blind decisions stay observable (LP-0MVN4LANP0069QQM AC5).
 ROUTING_RESIDENT_PREFIX = "routing_resident_prefix"
 # Shared post-acceptance eviction event (LP-0MVN1IQTF0037WTG AC6,
 # LP-0MVN3KMGI009BZ0D AC7): ``local_eviction session=... reason=<vocab>

@@ -1312,31 +1312,109 @@ def test_non_resident_denial_logs_no_ratio(caplog, monkeypatch):
 def test_unknown_state_logs_no_ratio(caplog, monkeypatch):
     """Genuinely unknown state (stale view, no ownership) also logs ``none``.
 
-    The prediction-fallback path emits the decision line only once the
-    predicted-ratio ladder reaches its own verdict, so this asserts the shape
-    through ``_log_residency_decision`` directly (the ladder does not log an
-    ``unknown`` denial — there is no denial to report).
+    LP-0MVN4LANP0069QQM closed the gap this test used to document: the
+    fail-open path (no fresh snapshot, no ownership) *does* emit the decision
+    line — with ``n_past_actual=none`` and ``reuse_ratio=none`` — so a
+    residency-blind admission is visible in the usage report instead of
+    vanishing. Asserted through the ladder, not through a direct call.
     """
     import logging
 
-    with caplog.at_level(logging.INFO, logger="llama-proxy"):
-        provider._log_residency_decision(
-            session_id="sess-a",
-            estimated_tokens=EST_TOKENS,
-            decision="resident_prefix_insufficient",
-            model_name="Qwen3",
-            facts=provider.resolve_resident_prefix(
-                "sess-a",
-                EST_TOKENS,
-                view=_view(slots=[], owners={}, monkeypatch=monkeypatch),
-            ),
-            min_ratio=0.5,
-        )
+    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
 
+    view = _view(
+        slots=[_slot(0, None)],
+        owners={},
+        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, predicted_ratio=0.99, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
     event = _parse_logged_caught(caplog, "routing_resident_prefix")
     assert event.residency_source == "unknown"
+    assert event.decision == provider.DECISION_ADMIT_PREDICTED
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None, "a non-measurement must not be logged as 0.0"
+
+
+def test_unknown_state_denial_logs_the_predicted_decision(caplog, monkeypatch):
+    """A fail-open *denial* is logged too, at INFO with ``n_past_actual=none``.
+
+    AC5 requires every admission/denial decision to be observable; before
+    LP-0MVN4LANP0069QQM the residency-blind denial was invisible, so the
+    usage report could not distinguish "no residency measurement" from "no
+    large prompts at all".
+    """
+    import logging
+
+    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
+
+    view = _view(
+        slots=[_slot(0, None)],
+        owners={},
+        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, predicted_ratio=0.0, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == "large_context_bypass"
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == "unknown"
+    assert event.decision == provider.DECISION_SKIP_PREDICTED
     assert event.n_past_actual is None
     assert event.reuse_ratio is None
+
+
+def test_decision_line_is_logged_at_info(caplog, monkeypatch):
+    """The decision line rides INFO — the level the usage report parses.
+
+    Asserted on the fail-open path, which had emitted no line at all.
+    """
+    import logging
+
+    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
+
+    view = _view(
+        slots=[_slot(0, None)],
+        owners={},
+        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        _gate(view=view, predicted_ratio=0.0, monkeypatch=monkeypatch)
+
+    records = [
+        r for r in caplog.records if "routing_resident_prefix" in r.getMessage()
+    ]
+    assert records, "the fail-open decision must be logged"
+    assert all(r.levelno == logging.INFO for r in records)
+
+
+def test_measured_path_still_emits_one_line(caplog, monkeypatch):
+    """The fail-open logging never doubles up on the measured path."""
+    import logging
+
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    records = [
+        r for r in caplog.records if "routing_resident_prefix" in r.getMessage()
+    ]
+    assert len(records) == 1
+    assert "decision=admit" in records[0].getMessage()
 
 
 def test_measured_zero_ratio_is_still_logged_as_zero(caplog, monkeypatch):
@@ -1357,3 +1435,141 @@ def test_measured_zero_ratio_is_still_logged_as_zero(caplog, monkeypatch):
     assert event.n_past_actual == 0
     assert event.reuse_ratio == pytest.approx(0.0)
     assert event.reuse_ratio is not None
+
+
+# ---------------------------------------------------------------------------
+# AC2 — a tenancy denial never costs a resident its prefix
+# ---------------------------------------------------------------------------
+
+def test_tenancy_denial_does_not_evict_a_resident(monkeypatch, caplog):
+    """The (N+1)th session falls through; nobody's lease or slot is reclaimed.
+
+    AC2 requires the denials to follow the normal fall-through chain "not
+    evicting a resident" — so the bound must be enforced purely as a routing
+    decision. This asserts the residents' dispatch records survive untouched
+    and that the shared eviction event stays silent (an eviction here would be
+    exactly the 2026-10-24 thrash this work removes).
+    """
+    import logging
+
+    now = 1000.0
+    srv = _SrvStub()
+    srv.record("sess-a", now=now)
+    srv.record("sess-b", now=now)
+    before = {k: dict(v) for k, v in srv.local_dispatch_records.items()}
+
+    with caplog.at_level(logging.ERROR, logger="llama-proxy"):
+        decision = router_helpers.evaluate_session_tenancy(
+            srv, "sess-c", tenants=2, idle_seconds=30.0, now=now
+        )
+
+    assert decision.admitted is False
+    assert decision.reason == SKIP_TENANT_LIMIT
+    assert srv.local_dispatch_records == before, "a denial must not reclaim a lease"
+    assert all(rec["active"] for rec in srv.local_dispatch_records.values())
+    assert not [r for r in caplog.records if "local_eviction" in r.getMessage()]
+
+
+def test_live_resident_is_never_idle_lapsed(monkeypatch):
+    """A resident still processing in its slot keeps its tenancy.
+
+    Idle-lapse only frees a *silent* tenancy; a session whose slot is
+    ``is_processing`` in the live view is provably active, so it must stay an
+    occupant even when its dispatch record looks stale.
+    """
+    now = 1000.0
+    srv = _SrvStub()
+    srv.record("sess-a", now=now - 600.0)  # stale lease record
+    srv.record("sess-b", now=now)
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    decision = router_helpers.evaluate_session_tenancy(
+        srv, "sess-c", tenants=2, idle_seconds=30.0, now=now, view=view
+    )
+
+    assert decision.admitted is False
+    assert "sess-a" in decision.occupants, (
+        "a live (is_processing) resident must not be lapsed out"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC1 — the idle override still serves a residency-gate denial
+# ---------------------------------------------------------------------------
+
+def test_idle_backend_admits_cold_work_after_a_residency_denial(monkeypatch):
+    """End-to-end at the gate: a residency denial is idle-overridable.
+
+    ``local_idle_admit_*`` is the last rung of the ladder: the ladder refuses
+    cold work from a non-resident session, and an idle GPU then admits that
+    same request locally (composition, not merely reason-list membership).
+    """
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-other"},
+        monkeypatch=monkeypatch,
+    )
+
+    skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    assert reason in provider.IDLE_OVERRIDABLE_SKIP_REASONS
+
+    monkeypatch.setattr(
+        "proxy.local_activity.local_idle_seconds", lambda *a, **k: 600.0
+    )
+    monkeypatch.setattr(provider, "_local_idle_blocker", lambda *a, **k: None)
+    monkeypatch.setattr(
+        provider, "_idle_admission_budget_verdict", lambda *a, **k: None
+    )
+
+    decision = provider._evaluate_idle_admission_override(
+        {"server": {"local_idle_admit_enabled": True,
+                    "local_idle_admit_seconds": 60.0}},
+        {"llama_model": "Qwen3"},
+        EST_TOKENS,
+    )
+
+    assert decision is not None, "an idle backend must still admit cold work"
+    assert decision["admitted"] is True
+
+
+# ---------------------------------------------------------------------------
+# AC6 — the eviction snapshot obeys the existing persistence gates
+# ---------------------------------------------------------------------------
+
+def test_eviction_snapshot_respects_the_busy_gate(tmp_path, monkeypatch):
+    """Eviction saves go through ``session_slot_skip_when_busy`` like any save.
+
+    A save issued while another local stream is generating serialises behind
+    that work, so the busy gate must apply to the eviction path too — and an
+    idle eviction must still produce a plan.
+    """
+    from proxy import session as session_mod
+
+    srv = _eviction_srv(tmp_path)
+    srv.config["server"]["session_slot_skip_when_busy"] = True
+    monkeypatch.setattr(session_mod, "_srv", lambda: srv)
+
+    srv.record("sess-b", now=time.monotonic())  # another session streaming
+    assert session_mod.plan_eviction_snapshot(
+        "sess-a", srv.config["server"], endpoint=None
+    ) is None
+
+    srv.local_dispatch_records.clear()
+    srv.record("sess-a", now=time.monotonic())  # only the evicted session left
+    assert session_mod.plan_eviction_snapshot(
+        "sess-a", srv.config["server"], endpoint=None
+    ) is not None
+
+
+def test_local_prefill_deadline_default_is_unchanged():
+    """AC6: the prefill deadline stays the pre-existing 90 s default.
+
+    The 90→110 s change belongs to ``LP-0MVN3KMGI009BZ0D``; this item's tenancy
+    work must not move it (the deadline is only the lease backstop).
+    """
+    assert router_helpers._get_prefill_deadline_seconds(_SrvStub()) == 90.0
