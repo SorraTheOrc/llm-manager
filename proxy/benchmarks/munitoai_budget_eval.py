@@ -43,7 +43,13 @@ from pathlib import Path
 
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3}")
 POST_RE = re.compile(r"\[remote\] POST \S+ -> (https?://[^/ ]+)")
-FALLBACK_RE = re.compile(r"from=([a-z0-9-]+), to=([a-z0-9-]+), reason=([A-Za-z0-9_ ]+)$")
+# ``reason=`` is followed by the evidence fields the proxy appends since
+# LP-0MVMBMSWR0036RES (``session=``/``attempt=``/budget), so it is bounded by the
+# next key=value token rather than by end-of-line.
+FALLBACK_RE = re.compile(
+    r"from=([a-z0-9-]+), to=([a-z0-9-]+), reason=([A-Za-z0-9_ ]+?)"
+    r"(?=\s+[a-z_]+=|\s*$)"
+)
 TTFT_RE = re.compile(r"ttft_seconds=([\d.]+) .*provider=(M[\w ]+)")
 
 class LogReader:

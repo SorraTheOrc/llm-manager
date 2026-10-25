@@ -1,3 +1,4 @@
+
 """CSV and Markdown report generation, plus the end-to-end analysis runner.
 
 Outputs (per acceptance criteria):
@@ -46,6 +47,7 @@ CSV_COLUMNS = [
     "initial_model",
     "remote_move_time",
     "fallback_reason",
+    "fallback_attribution",
     "bucket",
     "slots",
     "ctx_size",
@@ -88,6 +90,7 @@ def _session_row(s: SessionStats) -> dict:
         "initial_model": s.initial_model or "",
         "remote_move_time": _fmt_ts(s.remote_move_time),
         "fallback_reason": s.fallback_reason or "",
+        "fallback_attribution": s.fallback_attribution or "",
         "bucket": s.bucket or "",
         "slots": str(s.slots) if s.slots else "",
         "ctx_size": str(s.ctx_size) if s.ctx_size else "",
@@ -293,6 +296,26 @@ def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _ap_fallback_attribution(ap, summary: AnalysisResult) -> None:
+    """Render the per-session fallback-attribution states (LP-0MVMBMSWR0036RES).
+
+    States are mutually exclusive and cover every session: own evidence
+    (``own_fallback``/``own_skip``), the legacy nearest-line heuristic that only
+    session-less rotated logs can reach (``legacy_nearest``), a lease/concurrency
+    refusal (``lease_denied``), no own evidence at all (``unattributed``), and
+    sessions that never left local (``no_remote_fallback``).
+    """
+    counts = summary.fallback_attribution_counts
+    if not counts:
+        return
+    parts = [
+        f"{state} **{counts.get(state, 0)}**"
+        for state in aggregation.FALLBACK_ATTRIBUTION_ORDER
+        if counts.get(state, 0)
+    ]
+    ap("- Session fallback attribution: " + " | ".join(parts))
+
+
 def build_report(
     summary: AnalysisResult,
     config: dict | None,
@@ -328,6 +351,7 @@ def build_report(
         summary.routing_skip_events,
         summary.dispatch_denied_events,
         mode_map,
+        summary.provider_context_skip_events,
     )
 
     lines: list[str] = []
@@ -342,8 +366,11 @@ def build_report(
        f"({fallback_rate * 100:.1f}% of requests) | dispatch denied: {summary.dispatch_denied_count}")
     ap(f"- Local-skip events: **{len(summary.routing_skip_events)}** | "
        f"hold-cycle re-emissions (excluded from demand): **{summary.hold_cycle_reemission_count}**")
+    ap(f"- Provider context-ceiling skips: **{len(summary.provider_context_skip_events)}** "
+       "(per-provider skip counted, not a provider failure)")
     ap(f"- Unattributed stream events (no session UUID): {summary.unattributed_events}")
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
+    _ap_fallback_attribution(ap, summary)
 
     _append_summary_by_hour(ap, summary)
 
@@ -434,6 +461,21 @@ def build_report(
             ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% | "
                f"{d} ({_pct(d, fast_skips):.1f}%) | {n} ({_pct(n, cheap_skips):.1f}%) |")
 
+    # Provider context-ceiling skips (LP-0MVMBM1Y3001TPRT): their own
+    # breakdown, immediately after the local-skip table so all skip evidence
+    # reads together and its `% of skips` column is comparable.
+    _append_provider_context_skip_section(ap, summary, schedule, mode_map)
+
+    # Residency-aware admission (LP-0MVN1IQTF0037WTG AC5): resident-vs-evicted
+    # reuse split and per-session slot-owner churn, immediately after the skip
+    # evidence they explain.
+    _append_residency_section(ap, summary)
+
+    # Prefill-regression checks (LP-0MVOAQDB4002D56G, parent AC4): the four
+    # admission-budget numbers the 24 h certification reads, split into user
+    # and agent-audit traffic.
+    _append_prefill_regression_section(ap, summary)
+
     # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3): surfaced
     # separately so a stuck hold is not read as repeated client retries.
     _append_hold_cycle_section(ap, summary)
@@ -463,6 +505,7 @@ def build_report(
     _append_speed_section(ap, "Prompt eval speed", "prompt_eval", speed)
 
     _append_busy_section(ap, summary, schedule)
+    _append_prefill_vs_decode_section(ap, summary)
 
     _append_mode_timeline_section(ap, summary, mode_map)
 
@@ -488,29 +531,48 @@ def build_report(
     )
     ap(
         "- A session is included when it has at least one `Stream started` inside the window; "
-        "fast/cheap bucketing uses the session start time and the operating-mode profile active at "
-        "that time (reconstructed from `Mode scheduler` lines for scheduled "
-        "transitions plus the `Grandfathering: enabled; ... (current=<mode>)` marker for "
-        "manual switches, LP-0MT1EE315007AKXG; windows without mode transitions use "
-        "the analysis-time config profile, LP-0MSPZUD4G007IYGH)."
+        "fast/cheap bucketing uses the timestamp of that first in-window `Stream started` and "
+        "the profile active at that time. The profile comes from the reconstructed operating-mode "
+        "timeline when the logs carry `Mode scheduler` lines for scheduled transitions plus the "
+        "`Grandfathering: enabled; ... (current=<mode>)` marker for manual switches "
+        "(LP-0MT1EE315007AKXG; windows without mode transitions fall through, LP-0MSPZUD4G007IYGH); "
+        "the retired mode schedule leaves the configured `server.priority_window` as the cheap-mode "
+        "signal, so a window with no mode evidence buckets traffic inside it as cheap/low and "
+        "everything else as fast (LP-0MVKSXXIR006OBI2). Windows with neither fall back to the "
+        "slot schedule of the analysis-time config."
     )
     ap(
         "- Sessions spanning a slot-schedule transition may observe 503s during the drain window; "
         "those are expected and not treated as errors."
     )
     ap(
-        "- `Fallback triggered` lines carry no session UUID; per-session attribution prefers the "
-        "session's own `routing_skip_local` line and otherwise the nearest fallback event within 60s."
+        "- `Fallback triggered` lines carry `session=`/`attempt=` plus budget evidence "
+        "(`limit=`/`remaining=`/`waited=`) when the reason is `rate_limited*`. A session's "
+        "reason therefore comes from its own evidence (its `Fallback triggered` or "
+        "`routing_skip_local` line); the nearest-line-within-60s heuristic applies only to "
+        "session-less lines from rotated logs predating the session stamp, so a session never "
+        "inherits another session's reason. Sessions with no fallback line but a local-dispatch "
+        "lease refusal are labelled `lease_denied` (`local_lease_active`); any other session "
+        "without own evidence is `unattributed`, and a session that never used remote is "
+        "`no_remote_fallback` (see the `fallback_attribution` CSV column)."
     )
     ap(
         "- Related context: work item LP-0MSAOQTJS000FFVM (evaluate increasing local ctx-size) can "
         "use this report's `large_context_bypass` data. See the skill's SKILL.md for interpretation."
     )
     ap(
-        "- Decode/prompt-eval speeds come from llama-server eval-timing lines, filtered to the Qwen3 "
-        "child port (discovered per log file). llama-server.log lines carry no timestamps, so the "
-        "fast/cheap split and window filtering are approximate: each sample is bucketed by its log "
-        "file's last-write time. Files whose Qwen3 port cannot be discovered are skipped."
+        "- Decode/prompt-eval speeds come from llama-server eval-timing lines, "
+        "filtered to the Qwen3 child port (discovered per log file from the "
+        "router's `name=Qwen3 on port` spawn line, or inferred when rotation "
+        "split the spawn line away and the file's eval lines carry a single "
+        "unambiguous port). llama-server.log lines carry no timestamps, so the "
+        "fast/cheap split and window filtering are approximate: each sample is "
+        "bucketed by its log file's last-write time. Rotated files follow both "
+        "the numbered (`llama-server.N.log`) and daily "
+        "(`llama-server.log-YYYY-MM-DD[.gz]`) naming schemes. Files whose Qwen3 "
+        "port cannot be determined are skipped, and a window with no samples "
+        "prints a named reason (log path, files scanned, lines matched) instead "
+        "of an unattributed blank (LP-0MVJNIZRO008S031)."
     )
     ap(
         "- Compaction events (LP-0MTHCTLAF00147IT): the proxy emits `compaction_event` lines for "
@@ -524,6 +586,20 @@ def build_report(
         "(LP-0MTNIJQ8U007AGVW)."
     )
     return "\n".join(lines) + "\n"
+
+
+def _fmt_window(priority_window: object) -> str:
+    """``HH:MM–HH:MM`` rendering of a priority window (with a wrap marker)."""
+    start = float(getattr(priority_window, "start_minutes", 0))
+    end = float(getattr(priority_window, "end_minutes", 0))
+    wraps = bool(getattr(priority_window, "wraps", False))
+
+    def _hhmm(minutes: float) -> str:
+        total = int(minutes) % (24 * 60)
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    suffix = " (wraps past midnight)" if wraps else ""
+    return f"{_hhmm(start)}–{_hhmm(end)}{suffix}"
 
 
 def _append_mode_timeline_section(
@@ -542,9 +618,15 @@ def _append_mode_timeline_section(
 
     Source values display consistently as the canonical ``scheduler`` /
     ``worker`` / ``api`` / ``manual`` labels (LP-0MVC144KS001PDR4).
+
+    When the window's fast/cheap profile came from the configured
+    ``server.priority_window`` rather than a reconstructed mode schedule (the
+    mode timeline is retired in the unified config), a note naming that source
+    is rendered so the attribution is auditable (LP-0MVKSXXIR006OBI2 AC3).
     """
     transitions = mode_map.transitions if mode_map else []
     restarts = summary.restart_events_sorted
+    priority_window = getattr(mode_map, "priority_window", None)
 
     # Merge mode transitions and restart events into a single timeline.
     # (timestamp, event_type, mode_or_kind, source, actor, reason)
@@ -563,12 +645,35 @@ def _append_mode_timeline_section(
         timeline.append((ev.ts, "restart", kind, ev.source, ev.actor, ev.reason))
 
     timeline.sort(key=lambda x: x[0])
-    if not timeline:
+    if not timeline and priority_window is None:
         return
 
     ap("")
     ap("## Priority window timeline & restarts")
     ap("")
+    if priority_window is not None and not transitions:
+        # AC3: name the attribution source explicitly.
+        ap(
+            "Mode schedule: **retired** — no `Mode scheduler` transition lines "
+            "were found in this window, so fast/cheap attribution is derived from "
+            f"the configured `{priority_window.source}` "
+            f"({_fmt_window(priority_window)}, local time): traffic inside the "
+            "window is bucketed **cheap** (low priority), traffic outside it "
+            "**fast**. The window is the only cheap-mode signal in the unified "
+            "config (LP-0MVDT94F0003VHUA)."
+        )
+        ap("")
+    elif priority_window is not None and transitions:
+        ap(
+            "Mode schedule: **active for this window** — the logs carry "
+            "`Mode scheduler` / `Grandfathering` evidence, so fast/cheap "
+            "attribution follows the reconstructed mode timeline and the "
+            f"configured `{priority_window.source}` "
+            f"({_fmt_window(priority_window)}) is not applied."
+        )
+        ap("")
+    if not timeline:
+        return
     ap(
         "Each line shows the timestamp, event type, and attribution "
         "(source / actor / reason) when available. Restart rows also show the "
@@ -904,6 +1009,313 @@ def _append_compaction_section(
         ap("_Impact estimates in this window are hypothetical: no live dispatch change; " "the session history was not mutated._")
 
 
+def _append_provider_context_skip_section(
+    ap,
+    summary: AnalysisResult,
+    schedule: bucketing.SlotSchedule,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+) -> None:
+    """Append the ``## Provider context skips`` section to the report.
+
+    ``routing_skip_provider_context`` lines (LP-0MVMBM1Y3001TPRT) are
+    per-provider context-ceiling skips: the estimated prompt exceeded that
+    remote entry's ``max_context_tokens``, so the entry was skipped for this
+    request only (no cooldown, no failure-domain exclusion). They are the
+    session-bearing explanation for chains that the session-less
+    ``Fallback triggered`` lines cannot attribute, so they get their own
+    breakdown instead of being folded into the local-skip table.
+
+    Rendered only when the window carries such events. ``% of skips`` uses
+    **all skip events** as its denominator (``routing_skip_local`` +
+    provider-context skips), so the two tables stay comparable; the
+    Standard/Low cells are category-relative like the other reason tables.
+    """
+    events = summary.provider_context_skip_events
+    if not events:
+        return
+    local_skips = len(summary.routing_skip_events)
+    total_skips = local_skips + len(events)
+    by_provider: Counter = Counter()
+    providers_by_bucket: dict[str, Counter] = {"fast": Counter(), "cheap": Counter()}
+    limits_by_provider: dict[str, Counter] = {}
+    types_by_provider: dict[str, Counter] = {}
+    estimates: list[int] = []
+    for ev in events:
+        provider = ev.provider or UNKNOWN_LABEL
+        by_provider[provider] += 1
+        label = bucketing.bucket_label(ev.ts, schedule, mode_map)
+        providers_by_bucket["cheap" if label == "cheap" else "fast"][provider] += 1
+        if ev.limit is not None:
+            limits_by_provider.setdefault(provider, Counter())[ev.limit] += 1
+        types_by_provider.setdefault(provider, Counter())[
+            ev.provider_type or UNKNOWN_LABEL
+        ] += 1
+        if ev.estimated_tokens is not None:
+            estimates.append(ev.estimated_tokens)
+
+    fast_total = sum(providers_by_bucket["fast"].values())
+    cheap_total = sum(providers_by_bucket["cheap"].values())
+
+    ap("")
+    ap("## Provider context skips")
+    ap("")
+    ap("`routing_skip_provider_context` events: per-request **size** mismatches "
+       "where the estimated prompt exceeded that remote entry's "
+       "`max_context_tokens`. They are not provider failures (no cooldown, no "
+       "failure-domain exclusion) and the entry stays eligible for smaller "
+       "requests. Percentages are shares of **all skip events** "
+       "(`routing_skip_local` + provider-context skips).")
+    ap("")
+    ap(f"- Provider context skips: **{len(events)}** "
+       f"({_pct(len(events), total_skips):.1f}% of {total_skips} skip events: "
+       f"{local_skips} `routing_skip_local` + {len(events)} provider-context)")
+    if estimates:
+        estimates.sort()
+        ap(f"- Estimated prompt tokens that hit a ceiling: median "
+           f"**{int(_percentile(estimates, 50))}**, p90 "
+           f"**{int(_percentile(estimates, 90))}**, max **{estimates[-1]}** "
+           f"({len(estimates)} of {len(events)} events carried an estimate)")
+    no_limit = sum(1 for ev in events if ev.limit is None)
+    if no_limit:
+        ap(f"- **{no_limit}** event(s) carried no `limit=` field (older rotated "
+           "logs): their ceiling is reported as `not logged`.")
+    ap("")
+    ap("| Provider | Type | Total | % of skips | Standard | Low | Ceiling (limit) |")
+    ap("|---|---|---|---|---|---|---|")
+    for provider, count in by_provider.most_common():
+        fast = providers_by_bucket["fast"].get(provider, 0)
+        cheap = providers_by_bucket["cheap"].get(provider, 0)
+        types = ", ".join(
+            t for t, _ in types_by_provider.get(provider, Counter()).most_common()
+        ) or UNKNOWN_LABEL
+        limits = limits_by_provider.get(provider, Counter())
+        ceiling = ", ".join(f"{limit} ({n})" for limit, n in limits.most_common())
+        if not ceiling:
+            ceiling = "not logged"
+        ap(f"| {provider} | {types} | {count} | {_pct(count, total_skips):.1f}% | "
+           f"{fast} ({_pct(fast, fast_total):.1f}%) | "
+           f"{cheap} ({_pct(cheap, cheap_total):.1f}%) | {ceiling} |")
+
+
+def _append_residency_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Residency-aware admission`` section to the report.
+
+    LP-0MVN1IQTF0037WTG AC5. Two questions the pre-change report could not
+    answer:
+
+    - **Resident vs evicted reuse.** `routing_resident_prefix` lines carry the
+      *measured* reusable prefix (`n_past_actual`) next to the request estimate
+      (`estimated_tokens`), so admission can be split into genuinely resident
+      work (ratio at/above the configured threshold) versus evicted work (the
+      session held no slot, or held one whose prefix had been replaced). The
+      2026-10-24 baseline — median reuse 15.6 % for prompts >20k tokens — is
+      exactly this split, and it is invisible in the predicted
+      `cached_ratio` figures.
+    - **Slot-owner churn.** Which sessions owned the slot at decision time.
+      A session whose `slot_owner_session` changes between decisions lost its
+      resident prefix to another tenant; counting distinct owners per session
+      per hour is the churn signal behind the 27-sessions-through-2-slots
+      observation.
+
+    Also lists post-acceptance evictions (`local_eviction`) by reason so a
+    regression in reclaim behaviour (dead sessions gating the pool) shows up
+    as data rather than as a client-visible stall.
+    """
+    residency_events = list(getattr(summary, "residency_events", []) or [])
+    eviction_events = list(getattr(summary, "eviction_events", []) or [])
+    after_acceptance = list(
+        getattr(summary, "eviction_after_acceptance_events", []) or []
+    )
+    if not residency_events and not eviction_events and not after_acceptance:
+        return
+
+    measured = [ev for ev in residency_events if ev.reuse_ratio is not None]
+    resident = [ev for ev in measured if ev.decision == "admit"]
+    evicted = [
+        ev
+        for ev in measured
+        if ev.decision == "resident_prefix_insufficient"
+    ]
+    no_slot = [
+        ev
+        for ev in residency_events
+        if ev.reuse_ratio is None
+        and ev.decision == "resident_prefix_insufficient"
+    ]
+    tenant_denials = [ev for ev in residency_events if ev.decision == "tenant_limit"]
+
+    ap("")
+    ap("## Residency-aware admission")
+    ap("")
+    ap("`routing_resident_prefix` decisions carry the **measured** reusable "
+       "prefix (`n_past_actual`) next to the request estimate, so resident and "
+       "evicted reuse are separable — the predicted `cached_ratio` cannot do "
+       "this under contention.")
+    ap("")
+    ap(f"- Residency decisions: **{len(residency_events)}** "
+       f"(measured ratio: {len(measured)}, no measurement: "
+       f"{len(residency_events) - len(measured)})")
+    ap(f"- Resident admissions (ratio at/above threshold): **{len(resident)}**")
+    ap(f"- Evicted denials (`resident_prefix_insufficient`): **{len(evicted)}** "
+       f"with a measured prefix, **{len(no_slot)}** with no slot at all")
+    ap(f"- Tenant-limit denials (`tenant_limit`): **{len(tenant_denials)}**")
+    if eviction_events:
+        ap(f"- Post-acceptance evictions (`local_eviction`): "
+           f"**{len(eviction_events)}**")
+
+    if measured:
+        def _ratio_stats(events) -> str:
+            ratios = sorted(ev.reuse_ratio for ev in events)
+            if not ratios:
+                return "none"
+            return (
+                f"median {_percentile(ratios, 50) * 100:.1f}%, "
+                f"p10 {_percentile(ratios, 10) * 100:.1f}%, "
+                f"max {ratios[-1] * 100:.1f}%"
+            )
+
+        ap("")
+        ap("| Class | Decisions | Reuse ratio | Est. prompt tokens | Median new tokens |")
+        ap("|---|---|---|---|---|")
+        for label, events in (("Resident (admitted)", resident), ("Evicted (denied)", evicted)):
+            if not events:
+                continue
+            estimates = [
+                ev.estimated_tokens for ev in events if ev.estimated_tokens
+            ]
+            new_tokens = sorted(max(0, ev.estimated_tokens - ev.n_past_actual)
+                                for ev in events
+                                if ev.estimated_tokens and ev.n_past_actual is not None)
+            ap(f"| {label} | {len(events)} | {_ratio_stats(events)} | "
+               f"{int(_percentile(estimates, 50)) if estimates else '-'} | "
+               f"{int(_percentile(new_tokens, 50)) if new_tokens else '-'} |")
+
+    # Slot-owner churn per session: distinct owners seen across decisions.
+    owners_by_session: dict[str, set] = {}
+    decisions_by_session: Counter = Counter()
+    for ev in residency_events:
+        if not ev.session:
+            continue
+        decisions_by_session[ev.session] += 1
+        if ev.slot_owner_session and ev.slot_owner_session != "none":
+            owners_by_session.setdefault(ev.session, set()).add(ev.slot_owner_session)
+    churned = {
+        session: owners
+        for session, owners in owners_by_session.items()
+        if len(owners) > 1
+    }
+    ap("")
+    ap(f"- Sessions whose slot owner changed between decisions "
+       f"(slot churn): **{len(churned)}** of "
+       f"{len(decisions_by_session)} session(s) making residency decisions")
+    if churned:
+        ap("")
+        ap("| Session | Decisions | Slot owners seen |")
+        ap("|---|---|---|")
+        for session, owners in sorted(
+            churned.items(), key=lambda kv: -len(kv[1])
+        )[:10]:
+            names = ", ".join(sorted(owners)[:5])
+            if len(owners) > 5:
+                names += f", … (+{len(owners) - 5})"
+            ap(f"| {session[:8]} | {decisions_by_session[session]} | {names} |")
+
+    if after_acceptance:
+        # LP-0MVN4LCQJ0034S5S AC3: the counter, its per-reason breakdown and
+        # the alert threshold, inline. This is a defect signal — any count for
+        # within-budget prompts is an alert, not a trend to watch.
+        by_reason = Counter(ev.reason or UNKNOWN_LABEL for ev in after_acceptance)
+        ap("")
+        ap(f"- **Post-acceptance evictions, ERROR "
+           f"(`local_eviction_after_acceptance`): "
+           f"{len(after_acceptance)}**")
+        ap("  | Reason | Count | Share |")
+        ap("  |---|---|---|")
+        for reason, count in by_reason.most_common():
+            ap(f"  | {reason} | {count} | "
+               f"{_pct(count, len(after_acceptance)):.1f}% |")
+        ap("")
+        ap("  **Alert threshold: >0.** An accepted local dispatch evicted before "
+           "its first byte is a defect in the budget/pricing model for that "
+           "prompt band — file a critical `test-failure` work item via the "
+           "triage path (see the skill's triage rule), do not treat it as "
+           "expected churn.")
+
+    if eviction_events:
+        reasons = Counter(ev.reason or UNKNOWN_LABEL for ev in eviction_events)
+        snapshots = sum(1 for ev in eviction_events if ev.snapshot_planned)
+        ap("")
+        ap("| Eviction reason | Count | Share | Snapshot saved |")
+        ap("|---|---|---|---|")
+        for reason, count in reasons.most_common():
+            ap(f"| {reason} | {count} | "
+               f"{_pct(count, len(eviction_events)):.1f}% | "
+               f"{snapshots} |")
+
+
+def _append_prefill_regression_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Prefill admission regression`` section (AC4 checks).
+
+    The cold-prefill admission budget (LP-0MVN3KMGI009BZ0D) is certified over
+    a 24 h window by four checks, which used to require hand-written log
+    scans. They are rendered together here, with the deadline count split into
+    ``user`` and agent ``audit`` traffic (LP-0MVOAQDB4002D56G) because audit
+    gate runs are real inference but not the workload the budget is priced
+    for. Omitted entirely when every check is zero, like the report's other
+    conditional sections.
+    """
+    deadline_events = len(getattr(summary, "prefill_deadline_events", []) or [])
+    by_class = _prefill_deadline_by_class(summary)
+    budget_refusals = sum(
+        1
+        for e in getattr(summary, "local_admission_events", []) or []
+        if getattr(e, "decision", None) == "reject"
+        and (getattr(e, "reason", None) or "") == "prefill_budget_exceeded"
+    )
+    wasted = _wasted_prefill_tokens(summary)
+    exhausted = len(getattr(summary, "provider_exhausted_events", []) or [])
+    upstream_503 = sum(
+        1
+        for e in getattr(summary, "error_events", []) or []
+        if getattr(e, "kind", None) == "upstream_http_error"
+        and getattr(e, "status", None) == 503
+    )
+    if not any((deadline_events, budget_refusals, wasted, exhausted, upstream_503)):
+        return
+
+    evictions = list(getattr(summary, "eviction_after_acceptance_events", []) or [])
+    ap("")
+    ap("## Prefill admission regression")
+    ap("")
+    ap("Cold-prefill admission budget checks (LP-0MVN3KMGI009BZ0D AC4). "
+       "`user` / `audit` splits the deadline count by session id: `audit-*` "
+       "sessions are agent audit runs, not user traffic.")
+    ap("")
+    ap("| Check | Value | Meaning |")
+    ap("|---|---|---|")
+    ap(f"| `prefill_deadline_exceeded` | {deadline_events} "
+       f"(user {by_class['user']} / audit {by_class['audit']}) | "
+       "admitted local prefills cancelled at the deadline |")
+    ap(f"| `prefill_budget_exceeded` refusals | {budget_refusals} | "
+       "over-budget prompts refused at admission (never dispatched) |")
+    ap(f"| Wasted prefill tokens | {wasted} | "
+       "tokens computed then discarded by deadline cancellations |")
+    ap(f"| Provider exhaustion | {exhausted} | "
+       "client-visible `All providers exhausted` failures |")
+    ap(f"| Upstream `status=503` | {upstream_503} | provider-side 5xx responses |")
+    if evictions:
+        ap("")
+        ap("Post-acceptance evictions in the window, by reason "
+           "(`local_evictions_after_acceptance`):")
+        ap("")
+        ap("| Reason | Count |")
+        ap("|---|---|")
+        for reason, count in Counter(
+            ev.reason or UNKNOWN_LABEL for ev in evictions
+        ).most_common():
+            ap(f"| {reason} | {count} |")
+
+
 def _append_hold_cycle_section(ap, summary: AnalysisResult) -> None:
     """Append the ``## Hold-cycle re-emissions`` section to the report.
 
@@ -1074,8 +1486,41 @@ ACTIVITY_COLUMNS = (
     ("requests_started", "Requests started"),
     ("local_attempts", "Local attempts"),
     ("local_served", "Local served"),
+    ("local_dispatch_attempts", "Local dispatch"),
+    ("local_denials", "Lease denials"),
     ("fallbacks", "Fallbacks"),
     ("local_skip", "Local-skip"),
+)
+
+# Footnote defining the ``State`` column's vocabulary
+# (LP-0MVKUKG3F0035I85). Rendered once, immediately after the table, so the
+# operator can decode ``lease-blocked``/``prefill-only-no-decode`` rows without
+# consulting REFERENCE.md.
+AVAILABILITY_FOOTNOTE = (
+    "_Hour state (derived only from the logs; states are not exclusive and are "
+    "`+`-joined when several apply):_"
+)
+AVAILABILITY_STATE_NOTES = (
+    (
+        aggregation.AVAILABILITY_SERVING,
+        "at least one local stream completed (a local `Stream finished`), so the "
+        "local model actually decoded tokens.",
+    ),
+    (
+        aggregation.AVAILABILITY_PREFILL_ONLY_NO_DECODE,
+        "local work was dispatched (`[local] POST` to llama-server) but no local "
+        "stream completed, so prompts were prefilled without any decode.",
+    ),
+    (
+        aggregation.AVAILABILITY_LEASE_BLOCKED,
+        "local demand was refused because another session held the local dispatch "
+        "lease (`local_dispatch_denied` / `reason=local_lease_active`).",
+    ),
+    (
+        aggregation.AVAILABILITY_IDLE,
+        "no local dispatch attempt, no refusal and no completed local stream: no "
+        "local demand at all (a wedged or refused hour is never reported idle).",
+    ),
 )
 
 
@@ -1125,19 +1570,28 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
     (window-bounded buckets, partial first/last hours truncated to the
     window edges, idle hours listed as ``0s``), with busy time / busy-%
     columns (busy seconds ÷ window-bounded bucket duration, defensively
-    clamped to 100%) and five per-hour **activity** columns counted by each
+    clamped to 100%) and seven per-hour **activity** columns counted by each
     event's own timestamp (LP-0MTYAZFGN003BYQS): ``Requests started`` (all
     ``Stream started`` events), ``Local attempts`` (``Stream started`` with
     ``provider=local``), ``Local served`` (``Stream finished`` with
     ``provider=local``), ``Fallbacks`` (``Fallback triggered`` events), and
     ``Local-skip`` (``routing_skip_local`` events) — replacing the previous
-    session-first-hour classification columns. Buckets are keyed by absolute
-    hour, so a rolling window that straddles an hour emits two distinct edge
-    partials rather than two rows sharing one hour-of-day bucket. Always
-    rendered — also when the window has no local traffic (busy columns then
-    read ``0s`` / ``0.0%``); with no events at all the body shows a
-    ``No data`` note. Ends with a Totals row: window busy totals plus the sum
-    of each activity column over the window.
+    session-first-hour classification columns. ``Local dispatch`` (every
+    ``[local] POST`` attempt to llama-server, LP-0MVKUKG3F0035I85) and
+    ``Lease denials`` (``local_dispatch_denied`` refusals) were added so the
+    ``State`` column's verdict is auditable from the row itself. A **State**
+    column (LP-0MVKUKG3F0035I85) sits next to ``Hour``, carrying the
+    availability classification (``serving`` / ``prefill-only-no-decode`` /
+    ``lease-blocked`` / ``idle``, ``+``-joined when several apply) so an hour
+    whose gate was wedged no longer reads as ``0s / 0.0%`` idle; the state
+    vocabulary is defined in the footnote printed after the table. Buckets are
+    keyed by absolute hour, so a rolling window that straddles an hour emits
+    two distinct edge partials rather than two rows sharing one hour-of-day
+    bucket. Always rendered — also when the window has no local traffic (busy
+    columns then read ``0s`` / ``0.0%``); with no events at all the body shows
+    a ``No data`` note. Ends with a Totals row: the window-level state (the
+    classification of the summed window evidence), window busy totals and the
+    sum of each activity column over the window.
     """
     sessions = list(summary.sessions.values())
     hourly = dict(summary.busy.hourly_busy) if summary.busy else {}
@@ -1147,11 +1601,17 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
     ap("")
     ap("## Summary by hour")
     ap("")
-    ap("| Hour | Busy | % | " + " | ".join(label for _, label in ACTIVITY_COLUMNS) + " |")
-    ap("|" + "---|" * (3 + len(ACTIVITY_COLUMNS)))
+    # State column (LP-0MVKUKG3F0035I85): per-hour availability classification
+    # derived only from the logs (serving / prefill-only-no-decode /
+    # lease-blocked / idle), so a wedged gate stops reading as ``0s / 0.0%``
+    # idle. Placed next to ``Hour`` so the operator sees the outage before the
+    # busy columns.
+    ap("| Hour | State | Busy | % | " + " | ".join(label for _, label in ACTIVITY_COLUMNS) + " |")
+    ap("|" + "---|" * (4 + len(ACTIVITY_COLUMNS)))
     activity_totals: Counter = Counter()
+    window_evidence = Counter()
     if not has_data:
-        ap("| _No session data in window._ |" + " - |" * (2 + len(ACTIVITY_COLUMNS)))
+        ap("| _No session data in window._ |" + " - |" * (3 + len(ACTIVITY_COLUMNS)))
     else:
         # Window-bounded hour buckets keyed by ABSOLUTE hour
         # (LP-0MTYAZFGN003BYQS): each bucket's key is the top of its hour, so
@@ -1170,13 +1630,16 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
             # impossible, but never emit one even if inputs drift.
             pct = min(100.0, (seconds / duration * 100.0)) if duration else 0.0
             counts = summary.hourly_activity.get(bucket_key, Counter())
+            state = aggregation.hour_availability(bucket_key, counts).label
+            for key in aggregation.AVAILABILITY_COUNTERS:
+                window_evidence[key] += counts.get(key, 0)
             cells = []
             for key, _label in ACTIVITY_COLUMNS:
                 value = counts.get(key, 0)
                 activity_totals[key] += value
                 cells.append(str(value))
             ap(
-                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {_fmt_duration(seconds)} | {pct:.1f}% | "
+                f"| {cursor:%H:%M}-{bucket_end:%H:%M} | {state} | {_fmt_duration(seconds)} | {pct:.1f}% | "
                 + " | ".join(cells)
                 + " |"
             )
@@ -1184,21 +1647,39 @@ def _append_summary_by_hour(ap, summary: AnalysisResult) -> None:
 
     busy_seconds = summary.busy.busy_seconds if summary.busy else 0.0
     busy_pct = summary.busy.busy_pct if summary.busy else 0.0
+    window_state = aggregation.classify_hour(
+        summary.window_start,
+        local_dispatch_attempts=window_evidence.get("local_dispatch_attempts", 0),
+        local_served=window_evidence.get("local_served", 0),
+        local_denials=window_evidence.get("local_denials", 0),
+        lease_active_fallbacks=window_evidence.get("lease_active_fallbacks", 0),
+    ).label
     ap(
-        f"| Totals | {_fmt_duration(busy_seconds)} | {busy_pct:.1f}% | "
+        f"| Totals | {window_state} | {_fmt_duration(busy_seconds)} | {busy_pct:.1f}% | "
         + " | ".join(str(activity_totals.get(key, 0)) for key, _label in ACTIVITY_COLUMNS)
         + " |"
     )
+    ap("")
+    ap(AVAILABILITY_FOOTNOTE)
+    for state_name, note in AVAILABILITY_STATE_NOTES:
+        ap(f"- `{state_name}` — {note}")
 
 
 def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSchedule) -> None:
     """Append the ``## Local model utilization`` section to the report.
 
-    Covers busy/idle time over the window (union of active local streams,
-    clipped to the window), total compute (slot-seconds), and concurrency.
-    The section is omitted when the window has no local traffic. (The
-    former hourly busy profile moved to the top of the report as the
-    ``## Summary by hour`` table, LP-0MTFO210Q0044TTF.)
+    Busy is the union of **dispatch → finish** intervals (prefill + decode,
+    LP-0MVJN9H2I00116FP): at least one local slot occupied from the stream's
+    back-calculated dispatch time until its ``Stream finished`` line. The
+    definition change is stated in the section header, the previous
+    decode-only figure is retained as the labelled **lower bound**, and the
+    dispatch → finish union is the labelled **upper bound** (a stream with no
+    first-byte line contributes its decode interval only, so the upper bound
+    is never overstated). All figures — busy/idle, total compute
+    (slot-seconds), concurrency, and the fast/cheap split — are computed on
+    the new intervals. The section is omitted when the window has no local
+    traffic. (The former hourly busy profile moved to the top of the report
+    as the ``## Summary by hour`` table, LP-0MTFO210Q0044TTF.)
     """
     if summary.busy is None:
         return
@@ -1206,15 +1687,23 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap("")
     ap("## Local model utilization")
     ap("")
-    ap("Busy = at least one local slot actively generating (local streams paired "
-       "per session, clipped to the window, overlapping streams merged).")
+    ap("Busy = at least one local slot active **from dispatch to finish** "
+       "(prefill + decode). This redefines busy: it previously counted decode only "
+       "(`Stream started` → `Stream finished`), which excluded prompt processing. "
+       "The decode-only figure is retained below as the lower bound.")
     ap("")
     ap("| Metric | Total | Standard | Low |")
     ap("|---|---|---|---|")
     fast_win = b.fast_window_seconds or 0.0
     cheap_win = b.cheap_window_seconds or 0.0
-    ap(f"| Busy time | {_busy_cell(b.busy_seconds, b.window_seconds)} | "
+    ap(f"| Busy time — upper bound (dispatch → finish) | "
+       f"{_busy_cell(b.busy_seconds, b.window_seconds)} | "
        f"{_busy_cell(b.fast_busy_seconds, fast_win)} | {_busy_cell(b.cheap_busy_seconds, cheap_win)} |")
+    ap(f"| Decode-only busy — lower bound (`Stream started` → finish) | "
+       f"{_busy_cell(b.decode_busy_seconds, b.window_seconds)} | "
+       f"{_busy_cell(b.decode_fast_busy_seconds, fast_win)} | "
+       f"{_busy_cell(b.decode_cheap_busy_seconds, cheap_win)} |")
+    ap(f"| Prefill busy (upper − lower) | {_fmt_duration(b.prefill_busy_seconds)} | - | - |")
     ap(f"| Idle time | {_busy_cell(b.idle_seconds, b.window_seconds)} | "
        f"{_busy_cell(fast_win - b.fast_busy_seconds, fast_win)} | "
        f"{_busy_cell(cheap_win - b.cheap_busy_seconds, cheap_win)} |")
@@ -1223,6 +1712,12 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap(f"| Total compute (slot-time) | {_fmt_duration(b.total_compute_seconds)} | - | - |")
     ap(f"| Avg concurrency (while busy) | {b.avg_concurrency:.2f} | - | - |")
     ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
+    ap("")
+    ap(f"_Bounds: lower = {aggregation.BUSY_LOWER_BOUND_LABEL}; upper = "
+       f"{aggregation.BUSY_UPPER_BOUND_LABEL}. {b.prefill_extended_streams} of "
+       f"{b.streams} stream(s) contributed a measured prefill (a first-byte line); "
+       "the rest fall back to their decode interval, so the upper bound is never "
+       "overstated._")
     if b.unfinished_streams or b.pre_window_unfinished:
         ap("")
         ap(f"_Note: {b.unfinished_streams} local stream(s) started inside the window "
@@ -1236,11 +1731,146 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap("")
     ap("Method: streams are paired per session (FIFO) across the margin-widened "
        f"event stream (48h collection margin, max({log_parser.BUSY_WINDOW_MARGIN} "
-       "busy-pairing, 48h mode timeline)), then clipped to the window so "
+       "busy-pairing, 48h mode timeline)), each pair extended back to its "
+       "back-calculated dispatch time (`ttft.ts - ttft_ms/1000`) when a "
+       "`dispatch_first_byte_ms` line exists, then clipped to the window so "
        "boundary-crossing streams are counted exactly; unfinished streams are those "
        "started inside the window or within its 1h busy-pairing margin with no "
        "logged finish (earlier starts are pre-window leftovers); fast/cheap split "
        "follows the slot schedule.")
+
+
+def _phase_cell(value: float | None) -> str:
+    """Format a slot-seconds percentile (``-`` when there are no samples)."""
+    return f"{value:.1f}" if value is not None else "-"
+
+
+def _phase_row(
+    label: str,
+    stats: aggregation.SlotSecondsStats | None,
+    pct: float,
+) -> str:
+    """One phase row of the ``## Prefill vs decode`` table."""
+    if stats is None or not stats.has_samples:
+        return f"| {label} | - | - | - | - | - | - | 0 |"
+    return (
+        f"| {label} | {_fmt_duration(stats.total_seconds)} | {pct:.1f}% | "
+        f"{_phase_cell(stats.p10)} | {_phase_cell(stats.p50)} | "
+        f"{_phase_cell(stats.p90)} | {_phase_cell(stats.max_seconds)} | "
+        f"{stats.count} |"
+    )
+
+
+def _phase_split(busy: aggregation.BusyStats) -> tuple[float, float, float, float]:
+    """``(prefill_total, decode_total, combined, prefill_pct)`` in slot-seconds.
+
+    ``combined`` is the measured phase slot-time (prefill + decode) and the
+    returned prefill percentage is its complement-base, so
+    ``prefill_pct + (100 - prefill_pct) == 100`` exactly.
+    """
+    prefill = busy.prefill_stats
+    decode = busy.decode_stats
+    prefill_total = prefill.total_seconds if prefill is not None else 0.0
+    decode_total = decode.total_seconds if decode is not None else 0.0
+    combined = round(prefill_total + decode_total, 1)
+    prefill_pct = round(prefill_total / combined * 100.0, 1) if combined else 0.0
+    return prefill_total, decode_total, combined, prefill_pct
+
+
+def _append_prefill_vs_decode_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Prefill vs decode`` section to the report.
+
+    Splits local phase **slot time** into prefill (dispatch → first byte) and
+    decode (first byte → finish), each as an absolute slot-seconds total and as
+    a percentage of the combined phase slot-time (always summing to 100%),
+    with p10/p50/p90/max per phase (LP-0MVJNDOUU0059MMO). Every figure is
+    slot-seconds — the integral of concurrency — never wall-clock, which the
+    header states explicitly. A window without prefill samples prints a named
+    reason and points at the llama-server eval-timing diagnostic instead of
+    leaving an unattributed blank; a window without local traffic prints a
+    named "no local traffic" reason.
+    """
+    ap("")
+    ap("## Prefill vs decode")
+    ap("")
+    busy = summary.busy
+    if busy is None:
+        ap(
+            "_No local traffic in window: no local slot time to attribute to "
+            "prefill or decode._"
+        )
+        return
+    ap(
+        "Where local slot time goes, by phase. Every figure here is "
+        "**slot-seconds** — the integral of concurrency (the sum of the "
+        "per-stream phase durations), **not wall-clock**: two concurrent 10 s "
+        "prefills are 20 slot-seconds but only 10 s of wall clock. The phase "
+        "totals are therefore not comparable with the wall-clock busy/idle "
+        "figures in `## Local model utilization`."
+    )
+    ap("")
+    ap(
+        "| Phase | Slot-seconds | % of phase slot-time | p10 (s) | Median (s) "
+        "| p90 (s) | Max (s) | Samples |"
+    )
+    ap("|---|---|---|---|---|---|---|---|")
+    prefill = busy.prefill_stats
+    decode = busy.decode_stats
+    _prefill_total, _decode_total, combined, prefill_pct = _phase_split(busy)
+    decode_pct = round(100.0 - prefill_pct, 1) if combined else 0.0
+    ap(_phase_row("Prefill (dispatch → first byte)", prefill, prefill_pct))
+    ap(_phase_row("Decode (first byte → finish)", decode, decode_pct))
+    known = (prefill.count if prefill is not None else 0) + (
+        decode.count if decode is not None else 0
+    )
+    total_pct = "100.0%" if combined else "-"
+    ap(f"| Total | {_fmt_duration(combined)} | {total_pct} | - | - | - | - | {known} |")
+    ap("")
+    ap(
+        "Percentages are of the combined measured phase slot-time (prefill + "
+        "decode) and always sum to 100.0%. A phase the logs cannot measure is "
+        "excluded from the percentiles and totals rather than counted as 0 s."
+    )
+    unknown_parts: list[str] = []
+    if prefill is not None and prefill.unknown_count:
+        unknown_parts.append(f"{prefill.unknown_count} unknown prefill")
+    if decode is not None and decode.unknown_count:
+        unknown_parts.append(
+            f"{decode.unknown_count} unknown decode (no `Stream finished`)"
+        )
+    if unknown_parts:
+        ap("")
+        ap(
+            "_Unknown phase durations (aborted or still-running streams): "
+            f"{', '.join(unknown_parts)}; they are excluded from the "
+            "percentiles and totals rather than counted as 0 s._"
+        )
+    if prefill is None or not prefill.has_samples:
+        if prefill is None:
+            reason = (
+                "no local TTFT events were supplied to the analysis, so no "
+                "`dispatch_first_byte_ms` first-byte line was available"
+            )
+        else:
+            reason = (
+                f"none of the {prefill.stream_count} local stream(s) carried "
+                "a `dispatch_first_byte_ms` first-byte line "
+                f"({prefill.unknown_count} unknown prefill)"
+            )
+        if combined:
+            tail = (
+                f"the decode figures above are {decode_pct:.1f}% of measured "
+                "phase slot-time only"
+            )
+        else:
+            tail = "no phase slot time could be measured"
+        ap("")
+        ap(
+            f"_No prefill samples in window — {reason}. Prefill slot-time is "
+            f"unattributed; {tail}. For the llama-server-side breakdown see "
+            "the `## Decode speed` / `## Prompt eval speed` eval-timing "
+            "diagnostic sections._"
+        )
 
 
 def _fmt_tokens(n: int) -> str:
@@ -1317,6 +1947,49 @@ def _append_total_tokens_section(ap, summary) -> None:
 
 def _pct(part: int, total: int) -> float:
     return (part / total * 100.0) if total else 0.0
+
+
+AUDIT_SESSION_PREFIX = "audit-"
+
+
+def _is_audit_session(session: str | None) -> bool:
+    """Whether *session* is agent audit traffic rather than user traffic.
+
+    Audit runs (``/skill:audit`` gate sweeps, ``herdr`` child sessions) use
+    session ids prefixed ``audit-``. They issue genuine local inference and
+    therefore genuinely consume prefill, but they are not the workload the
+    prefill budget is priced for (LP-0MVOAQDB4002D56G).
+    """
+    return bool(session) and str(session).startswith(AUDIT_SESSION_PREFIX)
+
+
+def _prefill_deadline_by_class(summary: AnalysisResult) -> dict[str, int]:
+    """``prefill_deadline_exceeded`` counts split user vs agent-audit traffic."""
+    counts = {"user": 0, "audit": 0}
+    for event in getattr(summary, "prefill_deadline_events", []) or []:
+        key = "audit" if _is_audit_session(getattr(event, "session", None)) else "user"
+        counts[key] += 1
+    return counts
+
+
+def _wasted_prefill_tokens(summary: AnalysisResult) -> int:
+    """Prefill tokens computed and discarded by deadline cancellations.
+
+    Sums ``new_tokens`` over ``local_eviction_after_acceptance`` events whose
+    ``reason`` is ``prefill_deadline``: those are the tokens the GPU had to
+    compute for a dispatch that was then abandoned before its first byte
+    (parent AC4's waste check). Other eviction reasons are excluded — their
+    ``new_tokens`` did not necessarily cost a fresh prefill.
+    """
+    total = 0
+    for event in getattr(summary, "eviction_after_acceptance_events", []) or []:
+        if (getattr(event, "reason", None) or "") != "prefill_deadline":
+            continue
+        try:
+            total += int(getattr(event, "new_tokens", None) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
 def _percentile(values: list[float], pct: float) -> float | None:
@@ -1437,6 +2110,52 @@ def _speed_cell(value: float | None) -> str:
     return f"{value:.1f}" if value is not None else "-"
 
 
+def _append_speed_diagnostic(ap, speed: llama_log_parser.SpeedStats) -> None:
+    """Render the named, self-diagnosing reason for an empty eval-timing
+    window (LP-0MVJNIZRO008S031): the log path scanned, the files found, the
+    eval-timing lines matched, and the distinguishing cause(s) — verbosity /
+    build, rotation, or attribution failure — instead of an unattributed
+    blank.
+    """
+    ap("")
+    ap("**Why no eval-timing samples**")
+    ap("")
+    ap(f"- Log directory scanned: `{speed.log_dir or '<unknown>'}`")
+    if speed.files_discovered:
+        ap(
+            f"- Files scanned ({len(speed.files_discovered)}): "
+            + llama_log_parser._summarise_names(
+                [f"`{n}`" for n in speed.files_discovered]
+            )
+        )
+    else:
+        ap("- Files scanned: **none**")
+    total_eval = sum(d.eval_lines for d in speed.file_diagnostics)
+    matched = sum(d.samples_in_window for d in speed.file_diagnostics)
+    ap(
+        f"- Files parsed: {speed.files_parsed} | skipped: "
+        f"{speed.files_skipped} | outside window (rotation): "
+        f"{len(speed.outside_window_files)} | unrecognised rotation names: "
+        f"{len(speed.ignored_logs)}"
+    )
+    ap(f"- Eval-timing lines found: {total_eval} | matched to Qwen3: {matched}")
+    ap("")
+    for reason in llama_log_parser.empty_window_reasons(speed):
+        ap(f"- {reason}")
+    if speed.file_diagnostics:
+        rows = [d for d in speed.file_diagnostics if d.status != llama_log_parser.STATUS_OUTSIDE_WINDOW]
+        if rows:
+            ap("")
+            ap("| File | Status | Qwen3 port (source) | Lines | Eval lines (matched/total) | Samples |")
+            ap("|---|---|---|---|---|---|")
+            for d in rows:
+                port = f"{d.port} ({d.port_source})" if d.port is not None else "-"
+                ap(
+                    f"| `{d.name}` | {d.status} | {port} | {d.lines_scanned} | "
+                    f"{d.eval_lines_matched}/{d.eval_lines} | {d.samples_in_window} |"
+                )
+
+
 def _append_speed_section(
     ap,
     title: str,
@@ -1445,6 +2164,12 @@ def _append_speed_section(
 ) -> None:
     """Append a speed section (``## Decode speed`` / ``## Prompt eval speed``)
     to the report, one row per (model, bucket) with samples / median / p90 / p10.
+
+    When the window has no samples the section renders a named,
+    self-diagnosing reason (log path, files scanned, lines matched and the
+    cause) instead of an unattributed blank (LP-0MVJNIZRO008S031); the
+    diagnostic is additive and the table layout is unchanged when samples do
+    exist.
     """
     ap("")
     ap(f"## {title}")
@@ -1456,6 +2181,7 @@ def _append_speed_section(
     total = buckets[TOTAL]
     if total.count == 0:
         ap("_No llama-server eval timing samples in window._")
+        _append_speed_diagnostic(ap, speed)
         return
     ap("| Model | Bucket | Samples | Median (tok/s) | p90 (tok/s) | p10 (tok/s) |")
     ap("|---|---|---|---|---|---|")
@@ -1471,7 +2197,7 @@ def _append_speed_section(
     if speed.files_skipped:
         ap("")
         ap(f"_Note: {speed.files_skipped} llama-server log file(s) skipped "
-           "(Qwen3 child port not found)._")
+           "(Qwen3 child port not found)._", )
 
 
 def _bucket_key(bucket: str | None) -> str:
@@ -1492,19 +2218,19 @@ def _bucket_profile(
     routing_skip_events: list[log_parser.LogEvent],
     dispatch_denied_events: list[log_parser.LogEvent],
     mode_map: bucketing.ModeScheduleMap | None = None,
+    provider_context_skip_events: list[log_parser.LogEvent] | None = None,
 ) -> dict:
     """Per-bucket (fast/cheap) totals for the report's summary tables.
 
     Covers sessions, requests, local/remote split, classification counts,
     context sizes, dispatch denials, and per-reason counters. Events without a
-    session (fallbacks, routing skips, dispatch denials) are bucketed by their
-    own timestamp (mode-aware when the logs show mode transitions,
-    LP-0MSPZUD4G007IYGH).
+    session (fallbacks, routing skips, provider context skips, dispatch
+    denials) are bucketed by their own timestamp using
+    :func:`bucketing.bucket_label` (mode timeline, else the configured
+    priority window, else the slot schedule; LP-0MVKSXXIR006OBI2).
     """
     def _label_at(ts: datetime) -> str:
-        if mode_map is not None and mode_map.transitions:
-            return mode_map.period_for(ts).label
-        return schedule.period_for(ts).label if schedule.periods else "fast"
+        return bucketing.bucket_label(ts, schedule, mode_map)
 
     buckets = {
         "fast": {
@@ -1512,12 +2238,14 @@ def _bucket_profile(
             "local_only": 0, "fell_back": 0, "remote_only": 0,
             "dispatch_denied": 0, "ctx": [],
             "fallback_reasons": Counter(), "routing_skip_reasons": Counter(),
+            "provider_context_skips": Counter(),
         },
         "cheap": {
             "sessions": 0, "requests": 0, "local": 0, "remote": 0,
             "local_only": 0, "fell_back": 0, "remote_only": 0,
             "dispatch_denied": 0, "ctx": [],
             "fallback_reasons": Counter(), "routing_skip_reasons": Counter(),
+            "provider_context_skips": Counter(),
         },
     }
     for s in sessions:
@@ -1547,6 +2275,11 @@ def _bucket_profile(
     for ev in dispatch_denied_events:
         label = _label_at(ev.ts)
         buckets[_bucket_key(label)]["dispatch_denied"] += 1
+    for ev in provider_context_skip_events or ():
+        label = _label_at(ev.ts)
+        buckets[_bucket_key(label)]["provider_context_skips"][
+            ev.provider or UNKNOWN_LABEL
+        ] += 1
     return buckets
 
 
@@ -1579,8 +2312,10 @@ def run_analysis(
     switches, LP-0MT1EE315007AKXG), and each session is bucketed by the
     profile active at its start. ``mode_map``
     may be passed explicitly (tests); otherwise it is built from the
-    discovered config profiles (``config-fast.yaml`` / ``config-cheap.yaml``)
-    and the persisted ``proxy/.mode``.
+    discovered config profiles. When the logs carry no mode transitions the
+    configured ``server.priority_window`` supplies the fast/cheap schedule
+    (LP-0MVKSXXIR006OBI2), and only a window with neither signal falls back to
+    the legacy slot-schedule attribution.
     """
     log_dir = Path(log_dir)
     output_dir = Path(output_dir)
@@ -1596,6 +2331,7 @@ def run_analysis(
             configs["profiles"],
             configs["analysis_mode"],
             (config or {}).get("session_slot_pool_size"),
+            priority_window=bucketing.PriorityWindow.from_config(config),
         )
     schedule = bucketing.schedule_from_config(config, (config or {}).get("session_slot_pool_size"))
 
@@ -1613,7 +2349,7 @@ def run_analysis(
 
     llama_files = llama_log_parser.discover_llama_logs(llama_log_dir, window_start)
     summary.speed = llama_log_parser.build_speed_stats(
-        llama_files, window_start, window_end, schedule, mode_map
+        llama_files, window_start, window_end, schedule, mode_map, log_dir=llama_log_dir
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1626,6 +2362,42 @@ def run_analysis(
         encoding="utf-8",
     )
     return AnalysisRun(summary=summary, files=files, archived_to=archived_to, mode_map=mode_map)
+
+
+def provider_context_skips_json(
+    summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None = None
+) -> dict:
+    """Provider context-ceiling skip summary for the ``--json`` output.
+
+    LP-0MVMBM1Y3001TPRT: ``routing_skip_provider_context`` events are
+    per-request size mismatches against a remote entry's ``max_context_tokens``
+    (not provider failures). ``share_of_skips`` uses all skip events
+    (``routing_skip_local`` + provider-context) as its denominator, matching
+    the report's ``% of skips`` column. An event whose line carried no
+    ``limit`` is keyed as ``"(unknown)"`` so the absence is visible instead of
+    silently dropped (AC8).
+    """
+    events = summary.provider_context_skip_events
+    schedule = bucketing.schedule_from_config(None, None)
+    standard = low = 0
+    by_provider: Counter = Counter()
+    by_limit: Counter = Counter()
+    for ev in events:
+        by_provider[ev.provider or UNKNOWN_LABEL] += 1
+        by_limit[str(ev.limit) if ev.limit is not None else UNKNOWN_LABEL] += 1
+        if bucketing.bucket_label(ev.ts, schedule, mode_map) == "cheap":
+            low += 1
+        else:
+            standard += 1
+    total_skips = len(summary.routing_skip_events) + len(events)
+    return {
+        "total": len(events),
+        "share_of_skips": round(len(events) / total_skips, 4) if total_skips else 0.0,
+        "standard": standard,
+        "low": low,
+        "by_provider": dict(by_provider.most_common()),
+        "by_limit": dict(by_limit.most_common()),
+    }
 
 
 def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None = None) -> dict:
@@ -1649,6 +2421,8 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "remote_requests": summary.remote_requests,
         "fallback_events": len(summary.fallback_events),
         "fallback_rate": round((len(summary.fallback_events) / total) if total else 0.0, 4),
+        # Per-session fallback-attribution states (LP-0MVMBMSWR0036RES AC5).
+        "fallback_attribution": dict(summary.fallback_attribution_counts.most_common()),
         "contention_dispatch": len(summary.contention_dispatch_events),
         "contention_fallback_after_queue": len(summary.contention_fallback_events),
         # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ AC2): verdicts taken
@@ -1674,6 +2448,68 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J AC3): economic
         # bypasses served locally because the GPU was idle.
         "local_idle_admit": len(getattr(summary, "idle_admit_events", []) or []),
+        # Residency-aware admission (LP-0MVN1IQTF0037WTG AC5): admission
+        # decisions carrying a measured reusable prefix, split by verdict, plus
+        # post-acceptance evictions by reason.
+        "residency_decisions": len(getattr(summary, "residency_events", []) or []),
+        "residency_resident_admits": sum(
+            1
+            for e in getattr(summary, "residency_events", []) or []
+            if getattr(e, "decision", None) == "admit"
+        ),
+        "residency_evicted_denials": sum(
+            1
+            for e in getattr(summary, "residency_events", []) or []
+            if getattr(e, "decision", None) == "resident_prefix_insufficient"
+        ),
+        "residency_tenant_limit_denials": sum(
+            1
+            for e in getattr(summary, "residency_events", []) or []
+            if getattr(e, "decision", None) == "tenant_limit"
+        ),
+        "local_evictions": len(getattr(summary, "eviction_events", []) or []),
+        # Parent AC7(a), LP-0MVN4LCQJ0034S5S AC2: accepted dispatches evicted
+        # before their first byte. Both keys are ADDITIVE — nothing above
+        # changes meaning or value.
+        "local_evictions_after_acceptance": len(
+            getattr(summary, "eviction_after_acceptance_events", []) or []
+        ),
+        "local_evictions_after_acceptance_by_reason": dict(
+            Counter(
+                ev.reason or UNKNOWN_LABEL
+                for ev in (
+                    getattr(summary, "eviction_after_acceptance_events", []) or []
+                )
+            )
+        ),
+        # LP-0MVOAQDB4002D56G (parent AC4): the prefill-regression checks the
+        # 24 h certification needs. All ADDITIVE — no key above changes value
+        # or meaning.
+        #
+        # ``audit`` class = a session id beginning ``audit-`` (agent audit
+        # traffic from parallel gate runs); every other session, including an
+        # unattributed one, is ``user`` traffic. Both are reported so the
+        # re-scoped AC4 can gate on user traffic while showing the total.
+        "prefill_deadline_events": len(
+            getattr(summary, "prefill_deadline_events", []) or []
+        ),
+        "prefill_deadline_events_by_class": _prefill_deadline_by_class(summary),
+        "prefill_budget_refusals": sum(
+            1
+            for e in getattr(summary, "local_admission_events", []) or []
+            if getattr(e, "decision", None) == "reject"
+            and (getattr(e, "reason", None) or "") == "prefill_budget_exceeded"
+        ),
+        "wasted_prefill_tokens": _wasted_prefill_tokens(summary),
+        "provider_exhausted_errors": len(
+            getattr(summary, "provider_exhausted_events", []) or []
+        ),
+        "upstream_status_503_errors": sum(
+            1
+            for e in getattr(summary, "error_events", []) or []
+            if getattr(e, "kind", None) == "upstream_http_error"
+            and getattr(e, "status", None) == 503
+        ),
         "contention_queued_duration_seconds": round(
             sum(float(e.queued_duration or 0.0) for e in summary.contention_dispatch_events)
             + sum(float(e.queued_duration or 0.0) for e in summary.contention_fallback_events),
@@ -1682,6 +2518,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "dispatch_denied": summary.dispatch_denied_count,
         "unattributed_events": summary.unattributed_events,
         "hold_cycle_routing_skip_events": summary.hold_cycle_reemission_count,
+        "provider_context_skips": provider_context_skips_json(summary, mode_map),
         "standard_sessions": sum(1 for s in sessions if s.bucket != "cheap"),
         "low_priority_sessions": sum(1 for s in sessions if s.bucket == "cheap"),
         "errors": len(summary.error_events),
@@ -1691,6 +2528,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "compaction": compaction_json(summary),
         "recommendations": len(recommendations.generate_recommendations(summary, None, mode_map)),
         "local_busy": _busy_json(summary.busy),
+        "local_prefill": _prefill_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
         "ttft": _ttft_json(summary.ttft_events, summary.sessions),
@@ -1720,18 +2558,33 @@ def _hourly_activity_json(summary: AnalysisResult) -> list[dict]:
 
     Mirrors the ``## Summary by hour`` activity columns so agents can query
     per-hour traffic without scraping the Markdown (LP-0MTYAZFGN003BYQS).
+
+    Each entry also carries the hour's local-availability classification
+    (LP-0MVKUKG3F0035I85): ``state`` is the rendered ``+``-joined label and
+    ``states`` the ordered tuple, accompanied by the raw evidence counters
+    (``local_dispatch_attempts`` / ``local_served`` / ``local_denials`` /
+    ``lease_active_fallbacks``) so a consumer can audit the verdict instead of
+    trusting it.
     """
-    return [
-        {
-            "hour": _fmt_ts(hour),
-            "requests_started": counts.get("requests_started", 0),
-            "local_attempts": counts.get("local_attempts", 0),
-            "local_served": counts.get("local_served", 0),
-            "fallbacks": counts.get("fallbacks", 0),
-            "local_skip": counts.get("local_skip", 0),
-        }
-        for hour, counts in sorted(summary.hourly_activity.items())
-    ]
+    entries: list[dict] = []
+    for hour, counts in sorted(summary.hourly_activity.items()):
+        availability = aggregation.hour_availability(hour, counts)
+        entries.append(
+            {
+                "hour": _fmt_ts(hour),
+                "state": availability.label,
+                "states": list(availability.states),
+                "requests_started": counts.get("requests_started", 0),
+                "local_attempts": counts.get("local_attempts", 0),
+                "local_served": counts.get("local_served", 0),
+                "local_dispatch_attempts": availability.local_dispatch_attempts,
+                "local_denials": availability.local_denials,
+                "lease_active_fallbacks": availability.lease_active_fallbacks,
+                "fallbacks": counts.get("fallbacks", 0),
+                "local_skip": counts.get("local_skip", 0),
+            }
+        )
+    return entries
 
 
 def _ttft_json(
@@ -1766,14 +2619,115 @@ def _ttft_json(
     }
 
 
+def _phase_json(stats: aggregation.SlotSecondsStats | None) -> dict:
+    """JSON-friendly slot-seconds statistics for one local phase.
+
+    Absent stats render as zeros/Nones (no samples), never as a missing key, so
+    a JSON consumer can always read ``prefill`` and ``decode``.
+    """
+    if stats is None:
+        return {
+            "slot_seconds": 0.0,
+            "pct": 0.0,
+            "samples": 0,
+            "unknown_streams": 0,
+            "p10": None,
+            "p50": None,
+            "p90": None,
+            "max_seconds": None,
+        }
+    return {
+        "slot_seconds": stats.total_seconds,
+        "pct": 0.0,  # filled by :func:`_prefill_vs_decode_json`
+        "samples": stats.count,
+        "unknown_streams": stats.unknown_count,
+        "p10": stats.p10,
+        "p50": stats.p50,
+        "p90": stats.p90,
+        "max_seconds": stats.max_seconds,
+    }
+
+
+def _prefill_vs_decode_json(busy: aggregation.BusyStats) -> dict:
+    """Machine-readable phase slot-time split (LP-0MVJNDOUU0059MMO)."""
+    _prefill_total, _decode_total, combined, prefill_pct = _phase_split(busy)
+    prefill = _phase_json(busy.prefill_stats)
+    decode = _phase_json(busy.decode_stats)
+    prefill["pct"] = prefill_pct
+    decode["pct"] = round(100.0 - prefill_pct, 1) if combined else 0.0
+    return {
+        "unit": aggregation.SLOT_SECONDS_UNIT,
+        "combined_slot_seconds": combined,
+        "prefill": prefill,
+        "decode": decode,
+    }
+
+
+def _prefill_json(busy: aggregation.BusyStats | None) -> dict | None:
+    """JSON-friendly local prefill statistics for ``summary_to_json``
+    (LP-0MVJNW6SN008AKH3).
+
+    ``None`` when the window has no local traffic (mirrors ``local_busy``); a
+    zeros/Nones object when there is local traffic but no measurable prefill,
+    so a consumer can always read the keys. Every duration is
+    **slot-seconds** (the sum of the per-stream prefill work, not the
+    wall-clock union on :class:`aggregation.BusyStats`), labelled via
+    ``unit``; streams without an observable prefill are counted in
+    ``unknown_prefill`` and excluded from the percentiles.
+    """
+    if busy is None:
+        return None
+    stats = busy.prefill_stats
+    if stats is None or not stats.has_samples:
+        return {
+            "unit": aggregation.SLOT_SECONDS_UNIT,
+            "slot_seconds": 0.0,
+            "count": 0,
+            "streams": stats.stream_count if stats is not None else 0,
+            "unknown_prefill": stats.unknown_count if stats is not None else 0,
+            "p10": None,
+            "p50": None,
+            "p90": None,
+            "max_seconds": None,
+        }
+    return {
+        "unit": aggregation.SLOT_SECONDS_UNIT,
+        "slot_seconds": stats.total_seconds,
+        "count": stats.count,
+        "streams": stats.stream_count,
+        "unknown_prefill": stats.unknown_count,
+        "p10": stats.p10,
+        "p50": stats.p50,
+        "p90": stats.p90,
+        "max_seconds": stats.max_seconds,
+    }
+
+
 def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
-    """JSON-friendly local-model utilization summary (None when no local traffic)."""
+    """JSON-friendly local-model utilization summary (None when no local traffic).
+
+    ``busy_seconds`` is the **dispatch → finish** union
+    (LP-0MVJN9H2I00116FP); the retained decode-only union lands in
+    ``decode_busy_seconds`` (the labelled lower bound), the wall-clock
+    prefill span (upper − lower) in ``prefill_busy_seconds``, and the
+    definition marker in ``definition`` so a consumer never needs to infer
+    the semantics (LP-0MVJNW6SN008AKH3).
+    """
     if busy is None:
         return None
     return {
         "window_seconds": busy.window_seconds,
         "busy_seconds": busy.busy_seconds,
         "busy_pct": round(busy.busy_pct, 1),
+        # Busy definition (LP-0MVJNW6SN008AKH3): the dispatch → finish
+        # union, with the retained decode-only figure as the lower bound and
+        # the wall-clock prefill span (upper − lower) alongside.
+        "definition": busy.busy_definition,
+        "decode_busy_seconds": busy.decode_busy_seconds,
+        "prefill_busy_seconds": busy.prefill_busy_seconds,
+        "prefill_extended_streams": busy.prefill_extended_streams,
+        "upper_bound_label": aggregation.BUSY_UPPER_BOUND_LABEL,
+        "lower_bound_label": aggregation.BUSY_LOWER_BOUND_LABEL,
         "idle_seconds": round(busy.idle_seconds, 1),
         "idle_pct": round(busy.idle_pct, 1),
         "total_compute_seconds": busy.total_compute_seconds,
@@ -1791,6 +2745,9 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
             {"hour": _fmt_ts(hour), "seconds": seconds}
             for hour, seconds in busy.hourly_busy
         ],
+        # Phase slot-time split (LP-0MVJNDOUU0059MMO): prefill vs decode as
+        # slot-seconds and % of combined phase slot-time (sums to 100%).
+        "prefill_vs_decode": _prefill_vs_decode_json(busy),
     }
 
 
@@ -1839,10 +2796,14 @@ def compaction_json(summary: AnalysisResult) -> dict:
 
 
 def _speed_json(speed: llama_log_parser.SpeedStats, kind: str = "decode") -> dict:
-    """JSON-friendly speed summary (total bucket only)."""
+    """JSON-friendly speed summary (total bucket only), plus the diagnostic
+    context that lets an empty window explain itself (LP-0MVJNIZRO008S031):
+    the log directory scanned, the files discovered/outside/unrecognised and
+    the per-file scan outcomes.
+    """
     buckets = speed.decode if kind == "decode" else speed.prompt_eval
     b = buckets[TOTAL]
-    return {
+    out = {
         "samples": b.count,
         "median_tok_s": b.median,
         "p90_tok_s": b.p90,
@@ -1850,3 +2811,29 @@ def _speed_json(speed: llama_log_parser.SpeedStats, kind: str = "decode") -> dic
         "files_parsed": speed.files_parsed,
         "files_skipped": speed.files_skipped,
     }
+    out["log_dir"] = speed.log_dir
+    out["files_discovered"] = speed.files_discovered
+    out["files_outside_window"] = list(speed.outside_window_files or [])
+    out["files_unrecognised"] = list(speed.ignored_logs or [])
+    out["qwen3_ports"] = list(speed.qwen3_ports or [])
+    out["eval_lines_total"] = sum(d.eval_lines for d in speed.file_diagnostics)
+    out["eval_lines_matched"] = sum(d.samples_in_window for d in speed.file_diagnostics)
+    out["file_diagnostics"] = [
+        {
+            "file": d.name,
+            "status": d.status,
+            "reason": d.reason,
+            "port": d.port,
+            "port_source": d.port_source,
+            "mtime": d.mtime,
+            "lines_scanned": d.lines_scanned,
+            "eval_lines": d.eval_lines,
+            "eval_lines_matched": d.eval_lines_matched,
+            "samples_in_window": d.samples_in_window,
+            "ports_seen": d.ports_seen,
+        }
+        for d in speed.file_diagnostics
+    ]
+    if b.count == 0:
+        out["empty_window_reasons"] = llama_log_parser.empty_window_reasons(speed)
+    return out

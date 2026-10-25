@@ -144,3 +144,38 @@ def test_script_reads_dash_named_and_gzip_rotated_logs(tmp_path):
     assert report["totals"]["slot_save_failed"] == 6
     assert report["totals"]["slot_save_success"] == 2
     assert report["totals"]["slot_restore_success"] == 2
+
+
+def test_session_bearing_fallback_line_still_counts_as_concurrency(tmp_path):
+    """LP-0MVMBMSWR0036RES appended ``session=``/``attempt=`` after ``reason=``.
+
+    The fallback parser must keep recognising ``local_concurrency_limit`` in
+    the new line shape so ``concurrency_fallbacks_in_window`` is unchanged for
+    post-change logs.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    proxy = SYNTH_PROXY.replace(
+        "reason=local_concurrency_limit",
+        "reason=local_concurrency_limit session=019fd491-bbbb attempt=2",
+    )
+    (log_dir / "proxy.log").write_text(proxy)
+    (log_dir / "llama-server.log").write_text(SYNTH_LLAMA)
+
+    proc = _run(log_dir)
+    assert proc.returncode == 0, f"script failed: {proc.stderr}"
+    report = json.loads(proc.stdout)
+
+    # The 02:00:00 fallback is 105s after the 01:58:15 failure, outside the
+    # default window, so widen it to bring the fallback into range.
+    assert report["failures"], report
+    wide = _run(
+        log_dir,
+        "--start", "2026-08-06 01:57:00",
+        "--end", "2026-08-06 02:00:30",
+        "--window", "300",
+    )
+    assert wide.returncode == 0, f"script failed: {wide.stderr}"
+    wide_report = json.loads(wide.stdout)
+    last_failure = wide_report["failures"][-1]
+    assert last_failure["concurrency_fallbacks_in_window"] == 1, wide_report

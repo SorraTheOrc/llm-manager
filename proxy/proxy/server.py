@@ -52,6 +52,10 @@ rocm_version: str = "unknown"
 # Set by the lifespan handler immediately before ``yield``.
 PROXY_START_TIME: float = 0.0
 
+# Exclusive single-instance lock handle (LP-0MVLHMAWV008EKTI AC2). Held for the
+# whole process lifetime and released on shutdown; ``None`` when not held.
+_instance_lock: Any | None = None
+
 # Session manager for incremental prompt ingestion
 session_manager: SessionManager = SessionManager(ttl_seconds=DEFAULT_SESSION_TTL_SECONDS)
 
@@ -172,12 +176,61 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
     """
     try:
         import proxy.server as _srv
-        from proxy.router_helpers import _release_local_dispatch
+        from proxy.router_helpers import (
+            _dispatch_key_session_id,
+            _emit_eviction_after_acceptance,
+            _endpoint_from_record,
+            _release_local_dispatch,
+        )
+
+        # LP-0MVN4LCED00661MX AC1 (``slot_assignment_freed``): capture the
+        # record BEFORE the release so a slot released after a session
+        # eviction can still be reported as a post-acceptance eviction when it
+        # had not served a first byte (the emitter classifies by the record's
+        # ``first_byte_seen`` flag, so normal churn stays quiet).
+        #
+        # LP-0MVO7IDTP005S92D: the lookup must cover EVERY key shape the
+        # session's records can live under — the legacy bare ``session_id``
+        # string AND per-endpoint ``(endpoint, session_id)`` tuples
+        # (LP-0MRPILSMW004T4H8). A string-only lookup always missed in
+        # production, which both leaked per-endpoint leases until their
+        # timeout and fed the post-acceptance emitter a ``None`` record, i.e.
+        # it fired an ERROR with zero evidence for sessions that may never
+        # have been dispatched at all.
+        released_records: list[tuple[str | None, dict]] = []
+        try:
+            records = getattr(_srv, "local_dispatch_records", None) or {}
+            for record_key in list(records):
+                if _dispatch_key_session_id(record_key) != session_id:
+                    continue
+                record = records.get(record_key)
+                if isinstance(record, dict):
+                    released_records.append(
+                        (_endpoint_from_record(record), record)
+                    )
+        except Exception:
+            released_records = []
+        # Release every record owned by the session: the legacy string key
+        # first, then each per-endpoint record (AC1). ``_release_local_dispatch``
+        # also frees the corresponding slot assignments and prefill markers.
         await _release_local_dispatch(_srv, session_id)
+        for record_endpoint in {ep for ep, _ in released_records if ep}:
+            await _release_local_dispatch(_srv, session_id, endpoint=record_endpoint)
         logger.info(
             "lease_released session=%s reason=session_evicted",
             session_id if session_id else "unknown",
         )
+        # Report each accepted-but-unserved dispatch exactly once (AC3); a
+        # session with no dispatch record was never accepted, so it is normal
+        # churn — no ERROR, no counter increment (AC2).
+        for record_endpoint, record in released_records:
+            _emit_eviction_after_acceptance(
+                _srv,
+                session_id,
+                "slot_assignment_freed",
+                record,
+                endpoint=record_endpoint,
+            )
     except Exception:
         logger.exception(
             "Failed to release dispatch lease on session eviction for %s",
@@ -407,6 +460,28 @@ def _startup_validate_local_routing_config(config: dict) -> None:
         )
 
 
+def _startup_validate_prefill_timeout_config(config: dict) -> None:
+    """Validate the local prefill timeout ordering (LP-0MVN4LBEQ005QRVL).
+
+    Asserts ``contention_queue_max_wait_seconds < local_prefill_deadline_seconds
+    < local_dispatch_first_byte_timeout_seconds <
+    local_dispatch_max_prefill_seconds`` and keeps the deadline strictly below
+    the client's 900 s queue deadline. Every problem this validator reports is
+    FATAL: an out-of-order timeout set either cuts off requests the admission
+    guard legitimately admitted or races the client's own deadline, so a
+    silently degraded startup is worse than a refused one.
+    """
+    from proxy.prefill_eta import validate_prefill_timeout_ordering
+
+    problems = validate_prefill_timeout_ordering(config)
+    for problem in problems:
+        logger.error("Prefill timeout config validation FAILED: %s", problem)
+    if problems:
+        raise ValueError(
+            "Prefill timeout config validation failed: " + "; ".join(problems)
+        )
+
+
 def _startup_validate_compaction_config(config: dict) -> None:
     """Validate the compaction configuration (LP-0MTG6RW3L003X122).
 
@@ -487,6 +562,84 @@ def _log_restart_attribution() -> None:
     )
 
 
+def _startup_acquire_instance_lock(lock_path: Path | None = None) -> Any | None:
+    """Acquire the exclusive single-instance lock for the proxy log directory.
+
+    Only one proxy process may own a log directory: on 2026-10-23 a second
+    ``uvicorn proxy.server:app`` process stayed alive with no listener but
+    with ``proxy.log`` open for write, and two writers on one log lost a
+    3 h 35 m verification window. Port binding cannot catch a bound-less twin;
+    this ``flock`` can (LP-0MVLHMAWV008EKTI AC2).
+
+    Returns the held lock (idempotent — a second call in the same process
+    returns the same handle) or ``None`` when the guard is disabled with
+    ``LLAMA_PROXY_SKIP_INSTANCE_LOCK=1`` (dev/isolated runs).
+
+    Raises ``RuntimeError`` naming the holder pid when another live instance
+    owns the log directory, so the caller fails fast instead of starting a
+    second writer. ``flock`` is released by the kernel when the holder exits,
+    so a crashed process never leaves a stale lock behind.
+    """
+    global _instance_lock
+    if _instance_lock is not None:
+        return _instance_lock
+
+    import os
+
+    from proxy.single_instance import (
+        LOCK_FILENAME,
+        acquire_instance_lock,
+        read_holder_pid,
+    )
+
+    if os.environ.get("LLAMA_PROXY_SKIP_INSTANCE_LOCK") == "1":
+        logger.warning(
+            "Single-instance lock skipped (LLAMA_PROXY_SKIP_INSTANCE_LOCK=1); "
+            "ensure no other proxy writes this log directory"
+        )
+        return None
+
+    if lock_path is None:
+        # Resolve the log directory the same way setup_logging() will, because
+        # the lock is taken *before* logging is configured (see
+        # _startup_config_logging): a rejected second instance must never touch
+        # the log files of the instance that owns them.
+        from proxy.utils import resolve_log_dir
+
+        lock_path = resolve_log_dir(config) / LOCK_FILENAME
+
+    lock = acquire_instance_lock(lock_path)
+    if lock is None:
+        holder = read_holder_pid(lock_path)
+        message = (
+            "Another LLama Proxy instance is already running "
+            f"(holder pid {holder if holder is not None else 'unknown'}, "
+            f"lock {lock_path}); refusing to start a second writer for the "
+            "same log. Stop that process (kill the specific pid, never a "
+            "blanket kill) and retry."
+        )
+        logger.critical(message)
+        raise RuntimeError(message)
+
+    _instance_lock = lock
+    logger.info(
+        "Single-instance lock acquired: %s pid=%s", lock_path, lock.holder_pid
+    )
+    return lock
+
+
+def _startup_release_instance_lock() -> None:
+    """Release the single-instance lock (idempotent; kernel releases on exit)."""
+    global _instance_lock
+    lock, _instance_lock = _instance_lock, None
+    if lock is None:
+        return
+    try:
+        lock.release()
+    except Exception:  # pragma: no cover - release is best-effort at shutdown
+        pass
+
+
 def _startup_config_logging():
     """Load configuration and set up logging.
 
@@ -495,9 +648,28 @@ def _startup_config_logging():
     """
     global config, logger
     config = load_config()
+    # Exactly one proxy per log directory (LP-0MVLHMAWV008EKTI AC2): a second
+    # instance must fail fast, not become a second writer of the same log.
+    # Acquired BEFORE setup_logging(): setup_logging() archives the live log
+    # (renames a non-empty proxy.log aside for restart safety), so a rejected
+    # second instance must be refused before that rename can strand the live
+    # writer's file. The message goes to stderr (logging is not configured yet);
+    # start-proxy.sh captures stderr into proxy-startup.log.
+    _startup_acquire_instance_lock()
     logger = setup_logging(config)
+    # Record the held lock now that logging exists: the guard runs before
+    # logging is configured (see above), so its own log lines cannot reach
+    # proxy.log. This line is what lets an operator confirm from the log alone
+    # that the single-writer guard is active.
+    if _instance_lock is not None:
+        logger.info(
+            "Single-instance lock held: %s pid=%s",
+            _instance_lock.path,
+            _instance_lock.holder_pid,
+        )
     _startup_validate_local_routing_config(config)
     _startup_validate_compaction_config(config)
+    _startup_validate_prefill_timeout_config(config)
 
     # Log resolved hard-routing caps (LP-0MTBOX45O005LD1S). With the mode
     # axis removed (LP-0MVDT94F0003VHUA AC4) there is a single unified cap
@@ -1164,6 +1336,7 @@ async def lifespan(app: FastAPI):
     await _shutdown_http_client()
     _shutdown_llama_server()
     await _shutdown_disconnect_reaper()
+    _startup_release_instance_lock()
 
 
 app = FastAPI(

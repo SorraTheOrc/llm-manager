@@ -9,10 +9,16 @@ work item's decisions:
   ``tokens=prompt/completion/total`` on ``Stream finished`` lines;
 - the initial model assignment is the provider/model of the session's first
   ``Stream started`` line;
-- the move to a remote model is attributed from the session's first
-  ``routing_skip_local`` line (carries session + reason), falling back to the
-  nearest ``Fallback triggered`` line within 60s before the first remote
-  stream, and finally to the first remote stream time itself;
+- the move to a remote model is attributed from the session's own
+  ``routing_skip_local`` or ``routing_skip_provider_context`` line (both carry
+  the session and the reason; the provider-context skip also names the
+  provider and the ceiling that blocked that attempt), or its own
+  session-bearing ``Fallback triggered`` line, falling back to the nearest
+  session-less ``Fallback triggered`` line within 60s before the first remote
+  stream (rotated logs predating the session stamp only), then to a local-lease
+  refusal, and finally to the first remote stream time itself. Another
+  session's reason is never inherited — the provenance is recorded in
+  ``SessionStats.fallback_attribution``;
 - fast/cheap bucket and slot count come from the slot schedule, keyed by
   session start time.
 
@@ -35,9 +41,115 @@ from log_parser import (
     FALLBACK_ATTRIBUTION_WINDOW_SECONDS,
     LOCAL_PROVIDER,
     LogEvent,
+    PrefillMatch,
+    pair_ttft_to_streams,
+)
+
+# Hourly local-availability states (LP-0MVKUKG3F0035I85): each hour's state is
+# derived **only from timestamped proxy-log evidence** (llama-server eval-timing
+# lines carry no per-line timestamps and cannot be attributed to an hour
+# deterministically — documented in REFERENCE.md "Limitations"). The four
+# states distinguish a wedged gate (lease held by a prefill that never decodes)
+# from a genuinely idle GPU, which busy-% alone cannot: busy is computed only
+# from paired ``Stream started``/``Stream finished`` events, so an outage where
+# work never yields a first byte renders as 0.0% idle.
+AVAILABILITY_SERVING = "serving"
+AVAILABILITY_PREFILL_ONLY_NO_DECODE = "prefill-only-no-decode"
+AVAILABILITY_LEASE_BLOCKED = "lease-blocked"
+AVAILABILITY_IDLE = "idle"
+# Canonical display order for multi-state hours (serving/prefill are derived
+# from decode/dispatch evidence; lease-blocked from refusal evidence).
+AVAILABILITY_ORDER = (
+    AVAILABILITY_SERVING,
+    AVAILABILITY_PREFILL_ONLY_NO_DECODE,
+    AVAILABILITY_LEASE_BLOCKED,
+)
+# Proxy ``reason=`` value that marks a local-lease refusal.
+LEASE_ACTIVE_REASON = "local_lease_active"
+
+# Per-session fallback-attribution states (LP-0MVMBMSWR0036RES AC5). Since the
+# proxy stamps every ``Fallback triggered`` line with ``session=``, a session's
+# reason is taken **only from its own evidence**; the legacy nearest-line
+# heuristic survives for rotated logs predating the change (their lines carry
+# no ``session=``), so historical windows keep working.
+#
+# - ``own_fallback`` — the session's own ``Fallback triggered`` line;
+# - ``own_skip`` — the session's own ``routing_skip_local`` line (unchanged
+#   precedence over the fallback line, which normally carries the same reason);
+# - ``own_provider_skip`` — the session's own ``routing_skip_provider_context``
+#   line (LP-0MVMBM1Y3001TPRT): a per-provider context-ceiling skip. It outranks
+#   the session's own fallback line because it names the provider and the
+#   ``limit`` that blocked that chain step, while ``own_skip`` still outranks it
+#   (a local-side skip explains why local was not used at all, and the digest
+#   of provider-context skips is reported separately);
+# - ``legacy_nearest`` — a session-less fallback line within
+#   :data:`FALLBACK_ATTRIBUTION_WINDOW_SECONDS` (pre-change rotated logs only);
+# - ``lease_denied`` — no fallback line, but the session was refused the local
+#   dispatch by another session's lease (``local_dispatch_denied``); the cause
+#   is lease/concurrency contention, not an inherited reason;
+# - ``unattributed`` — reached remote with no own evidence at all (never
+#   inherits another session's reason);
+# - ``no_remote_fallback`` — the session never used a remote provider, so no
+#   fallback occurred.
+FALLBACK_ATTRIBUTION_OWN_FALLBACK = "own_fallback"
+FALLBACK_ATTRIBUTION_OWN_SKIP = "own_skip"
+# Provider context-ceiling skip (LP-0MVMBM1Y3001TPRT): own session-bearing
+# evidence that outranks the own-fallback state, see the comment block above.
+FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP = "own_provider_skip"
+FALLBACK_ATTRIBUTION_LEGACY_NEAREST = "legacy_nearest"
+FALLBACK_ATTRIBUTION_LEASE_DENIED = "lease_denied"
+FALLBACK_ATTRIBUTION_UNATTRIBUTED = "unattributed"
+FALLBACK_ATTRIBUTION_NO_REMOTE = "no_remote_fallback"
+
+# Canonical display order for the report's attribution summary.
+FALLBACK_ATTRIBUTION_ORDER = (
+    FALLBACK_ATTRIBUTION_OWN_FALLBACK,
+    FALLBACK_ATTRIBUTION_OWN_SKIP,
+    FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP,
+    FALLBACK_ATTRIBUTION_LEASE_DENIED,
+    FALLBACK_ATTRIBUTION_UNATTRIBUTED,
+    FALLBACK_ATTRIBUTION_LEGACY_NEAREST,
+    FALLBACK_ATTRIBUTION_NO_REMOTE,
+)
+
+# Extra per-hour counters feeding the availability classification, layered on
+# the LP-0MTYAZFGN003BYQS counters: ``local_dispatch_attempts`` (every
+# ``[local] POST`` to llama-server, including attempts that never stream),
+# ``local_denials`` (``local_dispatch_denied`` refusals) and
+# ``lease_active_fallbacks`` (``Fallback triggered`` /
+# ``contention_queue_fallback_after_queue`` with ``reason=local_lease_active``).
+AVAILABILITY_COUNTERS = (
+    "local_dispatch_attempts",
+    "local_served",
+    "local_denials",
+    "lease_active_fallbacks",
 )
 
 UNKNOWN_LABEL = "(unknown)"
+
+# Unit of the slot-seconds figures on :class:`SlotSecondsStats` (and its
+# :class:`PrefillStats` / :class:`DecodeStats` subclasses) and on
+# :attr:`BusyStats.prefill_stats` / :attr:`BusyStats.decode_stats`
+# (LP-0MVJN45LF009CO2V, LP-0MVJNDOUU0059MMO). A phase is reported as
+# slot-seconds — the integral of concurrency, i.e. the sum of the per-stream
+# phase durations — which is NOT wall-clock elapsed time.
+SLOT_SECONDS_UNIT = "slot-seconds"
+
+# Back-compat alias for the original prefill-only name (LP-0MVJN45LF009CO2V).
+PREFILL_UNIT = SLOT_SECONDS_UNIT
+
+# Busy definition (LP-0MVJN9H2I00116FP). Local "busy" is at least one local slot
+# occupied **from dispatch to finish** (prefill + decode), not decode only: the
+# interval starts at the stream's back-calculated dispatch time
+# (``ttft.ts - ttft_ms/1000``) and ends at its ``Stream finished`` line. The
+# previous decode-only figure is retained as
+# :attr:`BusyStats.decode_busy_seconds` and labels the **lower bound** of the
+# busy figure, while the dispatch → finish union labels the **upper bound**:
+# a stream with no first-byte line contributes only its decode interval, so the
+# upper bound is never overstated by a fabricated prefill.
+BUSY_DEFINITION = "dispatch_to_finish"
+BUSY_UPPER_BOUND_LABEL = "dispatch → finish union (prefill + decode)"
+BUSY_LOWER_BOUND_LABEL = "decode-only union (Stream started → Stream finished)"
 
 # Root-cause classification for stream errors (LP-0MUQO82LJ008F1FS).
 # A stream error is the client-visible synthetic ``finish_reason: error``
@@ -145,6 +257,10 @@ class SessionStats:
     slots: int | None
     dispatch_denied: int
     routing_skips: int
+    # Provenance of ``fallback_reason`` (LP-0MVMBMSWR0036RES AC5): one of the
+    # ``FALLBACK_ATTRIBUTION_*`` states, so a consumer can tell own evidence
+    # from the legacy nearest-line heuristic and from a session with none.
+    fallback_attribution: str | None = None
     # Per-period context window of the profile active for this session (from
     # the mode profile's slot_schedule ctx_size, or its global
     # local_model_ctx_size when the entry did not pin one); None when not
@@ -189,6 +305,28 @@ class AnalysisResult:
     # cold-cache bypass that was overridden because the GPU had been idle for
     # at least ``threshold_seconds`` (``idle_seconds`` = measured idle age).
     idle_admit_events: list[LogEvent] = field(default_factory=list)
+    # Residency-aware admission decisions (LP-0MVN1IQTF0037WTG AC5): one event
+    # per decision with the *measured* reusable prefix (``n_past_actual``), the
+    # request estimate, the resulting ``reuse_ratio``, the slot owner at
+    # decision time and whether the ratio came from the live measurement, from
+    # slot ownership, or was unavailable.
+    residency_events: list[LogEvent] = field(default_factory=list)
+    # Post-acceptance eviction events (LP-0MVN1IQTF0037WTG AC6): a resident
+    # session's lease/slot was reclaimed, with the closed ``reason`` vocabulary
+    # and whether its KV snapshot was persisted for the returning client.
+    eviction_events: list[LogEvent] = field(default_factory=list)
+    #: Accepted local dispatches evicted before their first byte
+    #: (``local_eviction_after_acceptance``). A defect signal, not churn:
+    #: LP-0MVN4LCQJ0034S5S / parent AC7(a).
+    eviction_after_acceptance_events: list[LogEvent] = field(default_factory=list)
+    #: Prefill-deadline overruns (``prefill_deadline_exceeded``,
+    #: LP-0MVOAQDB4002D56G): a local prefill was cancelled at the deadline
+    #: after admission. AC4's deadline-rate check counts these, split into
+    #: user and agent-audit traffic by session id.
+    prefill_deadline_events: list[LogEvent] = field(default_factory=list)
+    #: Provider-chain exhaustion (``All providers exhausted``): the
+    #: client-visible failure AC4 compares against the pre-change window.
+    provider_exhausted_events: list[LogEvent] = field(default_factory=list)
     # Parsed error events (stream errors, slot_save failures, backend_retry
     # timeouts, upstream HTTP errors) inside the window.
     error_events: list[LogEvent] = field(default_factory=list)
@@ -219,6 +357,12 @@ class AnalysisResult:
     # ``routing_skip_reason_counts``) and surfaced here separately so a stuck
     # hold is distinguishable from a client retry storm.
     hold_cycle_routing_skip_events: list[LogEvent] = field(default_factory=list)
+    # Provider context-ceiling skips (LP-0MVMBM1Y3001TPRT): one event per
+    # provider whose ``max_context_tokens`` ceiling the estimated prompt
+    # exceeded. These are per-request size mismatches recorded by the proxy
+    # *before* a remote attempt, so they explain fallback chains that no
+    # session-less ``Fallback triggered`` line can attribute.
+    provider_context_skip_events: list[LogEvent] = field(default_factory=list)
     # Restart events (``restart`` kind, LP-0MUQO82LJ008F1FS) observed inside
     # the window, carrying the attribution markers (source/actor/reason,
     # LP-0MVC0S6U5003SEDJ) parsed from the log lines so the report can render
@@ -257,8 +401,34 @@ class AnalysisResult:
         return Counter(e.reason for e in self.fallback_events if e.reason)
 
     @property
+    def fallback_attribution_counts(self) -> Counter:
+        """Session count per fallback-attribution state (LP-0MVMBMSWR0036RES)."""
+        return Counter(
+            s.fallback_attribution
+            for s in self.sessions.values()
+            if s.fallback_attribution
+        )
+
+    @property
     def routing_skip_reason_counts(self) -> Counter:
         return Counter(e.reason for e in self.routing_skip_events if e.reason)
+
+    @property
+    def provider_context_skip_provider_counts(self) -> Counter:
+        """Provider context-ceiling skips grouped by provider (LP-0MVMBM1Y3001TPRT)."""
+        return Counter(
+            e.provider or "(unknown)" for e in self.provider_context_skip_events
+        )
+
+    @property
+    def provider_context_skip_limit_counts(self) -> Counter:
+        """Provider context-ceiling skips grouped by the ``limit`` they hit.
+
+        An event whose line carried no ``limit`` (older rotated logs, AC8) is
+        keyed as ``None`` so the caller can report it as unattributed rather
+        than silently dropping it.
+        """
+        return Counter(e.limit for e in self.provider_context_skip_events)
 
     @property
     def error_counts(self) -> Counter:
@@ -348,18 +518,179 @@ class AnalysisResult:
             result[key] = (inp, out, inp + out)
         return dict(sorted(result.items(), key=lambda kv: kv[1][2], reverse=True))
 
+
+def _percentile(sorted_values: list[float], p: float) -> float | None:
+    """Linear-interpolation percentile (numpy default) over sorted values.
+
+    Matches the percentile convention used by the rest of the skill
+    (``reporting._percentile`` / ``llama_log_parser._percentile``); returns
+    ``None`` for an empty sample set and rounds to one decimal place.
+    """
+    n = len(sorted_values)
+    if n == 0:
+        return None
+    if n == 1:
+        return round(sorted_values[0], 1)
+    pos = p / 100.0 * (n - 1)
+    lo = int(pos)
+    frac = pos - lo
+    hi = min(lo + 1, n - 1)
+    value = sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
+    return round(value, 1)
+
+
+@dataclass(frozen=True)
+class PrefillSample:
+    """One local stream's prefill measurement.
+
+    ``seconds`` is ``None`` for an unknown prefill — a stream that produced no
+    first-byte line (aborted request, log gap), so ``first_byte_ts`` is then
+    ``None`` as well. ``session`` keeps the pairing attributable per stream.
+    """
+
+    session: str | None
+    first_byte_ts: datetime | None
+    seconds: float | None
+
+    @property
+    def known(self) -> bool:
+        """Whether this stream's prefill duration is observable."""
+        return self.seconds is not None
+
+
+@dataclass(frozen=True)
+class DecodeSample:
+    """One local stream's decode (first byte → finish) measurement.
+
+    ``seconds`` is ``None`` for an unknown decode — a stream with no logged
+    ``Stream finished`` line (aborted or still running), so its decode time is
+    unknown rather than zero. ``session`` keeps the pairing attributable per
+    stream.
+    """
+
+    session: str | None
+    seconds: float | None
+
+    @property
+    def known(self) -> bool:
+        """Whether this stream's decode duration is observable."""
+        return self.seconds is not None
+
+
+@dataclass(frozen=True)
+class SlotSecondsStats:
+    """Shared slot-seconds statistics for one local phase.
+
+    Every figure here is **slot-time, not wall-clock**: ``total_seconds`` is
+    the sum of the per-stream phase durations (the total phase *work*), so two
+    concurrent 10 s prefills contribute 20 slot-seconds while occupying only
+    10 s of wall clock. Phase totals are therefore deliberately distinct from
+    the wall-clock unions on :class:`BusyStats` and must not be compared
+    against them.
+
+    ``streams`` holds one sample per local stream (in stream order). Streams
+    whose phase duration cannot be observed are **unknown**: excluded from
+    ``samples`` and the percentiles, but retained in
+    ``streams``/``stream_count`` so the unknown time is visible rather than
+    silently dropped.
+    """
+
+    streams: tuple[PrefillSample | DecodeSample, ...] = ()
+    unit: str = SLOT_SECONDS_UNIT
+
+    @property
+    def samples(self) -> tuple[float, ...]:
+        """Known per-stream phase durations in seconds (percentile input)."""
+        return tuple(s.seconds for s in self.streams if s.seconds is not None)
+
+    @property
+    def count(self) -> int:
+        """Number of streams with an observable phase duration."""
+        return len(self.samples)
+
+    @property
+    def unknown_count(self) -> int:
+        """Number of streams whose phase duration could not be observed."""
+        return sum(1 for stream in self.streams if not stream.known)
+
+    @property
+    def stream_count(self) -> int:
+        """All local streams considered: known + unknown phase duration."""
+        return len(self.streams)
+
+    @property
+    def has_samples(self) -> bool:
+        """Whether any stream had an observable phase duration."""
+        return self.count > 0
+
+    @property
+    def total_seconds(self) -> float:
+        """Window total in slot-seconds (sum of the per-stream durations).
+
+        This is total phase *work*, not the wall-clock union of the phase
+        intervals (see the class docstring).
+        """
+        return round(sum(self.samples), 1)
+
+    @property
+    def p10(self) -> float | None:
+        return _percentile(sorted(self.samples), 10)
+
+    @property
+    def p50(self) -> float | None:
+        return _percentile(sorted(self.samples), 50)
+
+    @property
+    def p90(self) -> float | None:
+        return _percentile(sorted(self.samples), 90)
+
+    @property
+    def max_seconds(self) -> float | None:
+        return round(max(self.samples), 1) if self.samples else None
+
+
+@dataclass(frozen=True)
+class PrefillStats(SlotSecondsStats):
+    """Per-stream local prefill (dispatch → first byte) statistics.
+
+    See :class:`SlotSecondsStats` for the shared slot-seconds semantics. A
+    stream whose first-byte line is missing is **unknown prefill**.
+    """
+
+    streams: tuple[PrefillSample, ...] = ()
+
+
+@dataclass(frozen=True)
+class DecodeStats(SlotSecondsStats):
+    """Per-stream local decode (first byte → finish) statistics.
+
+    See :class:`SlotSecondsStats` for the shared slot-seconds semantics. A
+    stream with no logged ``Stream finished`` line is **unknown decode**.
+    """
+
+    streams: tuple[DecodeSample, ...] = ()
+
+
 @dataclass
 class BusyStats:
     """Local-model utilization over the analysis window.
 
-    "Busy" means at least one local slot is actively generating: streams are
-    paired per session (FIFO across the full event stream, not just the
-    window), each pair is clipped to ``[window_start, window_end]``, and the
-    clipped intervals are merged so overlapping streams do not double-count.
+    "Busy" means at least one local slot is occupied **from dispatch to
+    finish** (prefill + decode, LP-0MVJN9H2I00116FP): streams are paired per
+    session (FIFO across the full event stream, not just the window), each
+    pair's interval starts at its back-calculated dispatch time
+    (``ttft.ts - ttft_ms/1000``, falling back to ``Stream started`` when the
+    stream has no first-byte line) and ends at ``Stream finished``; each pair
+    is clipped to ``[window_start, window_end]`` and the clipped intervals are
+    merged so overlapping streams do not double-count.
 
     ``total_compute_seconds`` is the sum of all clipped stream durations
-    (slot-seconds, i.e. the integral of concurrency); ``busy_seconds`` is the
-    union of active intervals. ``avg_concurrency`` = total / busy.
+    (slot-seconds, i.e. the integral of concurrency) on those dispatch →
+    finish intervals; ``busy_seconds`` is their union. ``avg_concurrency`` =
+    total / busy. The decode-only union (``Stream started`` → ``Stream
+    finished``) is retained in :attr:`decode_busy_seconds` — the lower bound
+    of the busy figure, whose labelled upper bound is :attr:`busy_seconds`
+    (see :data:`BUSY_UPPER_BOUND_LABEL` / :data:`BUSY_LOWER_BOUND_LABEL`).
     """
 
     window_seconds: float
@@ -386,6 +717,55 @@ class BusyStats:
     fast_window_seconds: float
     cheap_window_seconds: float
     hourly_busy: list[tuple[datetime, float]]
+    # Per-stream local prefill (dispatch → first byte) statistics
+    # (LP-0MVJN45LF009CO2V). Populated when the caller supplies the local
+    # TTFT events; ``None`` when they were not supplied at all, so a caller
+    # that never asked for prefill is distinguishable from one that found no
+    # first-byte lines (an empty :class:`PrefillStats`).
+    prefill_stats: PrefillStats | None = None
+    # Per-stream local decode (first byte → finish) statistics
+    # (LP-0MVJNDOUU0059MMO). Populated alongside ``prefill_stats`` so the
+    # report can split phase slot time; unlike prefill it needs no TTFT
+    # events, so it is present whenever there is local traffic.
+    decode_stats: DecodeStats | None = None
+    # Decode-only busy union (``Stream started`` → ``Stream finished``),
+    # clipped to the window — the lower bound of the busy figure
+    # (LP-0MVJN9H2I00116FP). It is what the report called "busy" before the
+    # dispatch → finish redefinition and stays visible for comparability.
+    decode_busy_seconds: float = 0.0
+    # The same decode-only union split across fast/cheap periods.
+    decode_fast_busy_seconds: float = 0.0
+    decode_cheap_busy_seconds: float = 0.0
+    # Number of paired streams whose busy interval was extended backwards to
+    # a measured dispatch time; the rest contribute their decode interval
+    # only (unknown prefill), which keeps the upper bound honest.
+    prefill_extended_streams: int = 0
+
+    @property
+    def busy_definition(self) -> str:
+        """Marker for the busy definition (``dispatch_to_finish``)."""
+        return BUSY_DEFINITION
+
+    @property
+    def busy_upper_bound_seconds(self) -> float:
+        """Upper bound of the busy figure: the dispatch → finish union."""
+        return self.busy_seconds
+
+    @property
+    def busy_lower_bound_seconds(self) -> float:
+        """Lower bound of the busy figure: the decode-only union."""
+        return self.decode_busy_seconds
+
+    @property
+    def prefill_busy_seconds(self) -> float:
+        """Wall-clock prefill occupancy: upper bound − lower bound.
+
+        This is the extra union time contributed by the measured prefills
+        (slot-time already spent before the first byte). It is a wall-clock
+        union, not the per-stream slot-seconds sum in
+        :class:`PrefillStats.total_seconds`.
+        """
+        return round(max(0.0, self.busy_seconds - self.decode_busy_seconds), 1)
 
     @property
     def busy_pct(self) -> float:
@@ -450,26 +830,77 @@ def _attribute_fallback(
     first_remote_ts: datetime,
     routing_skips: dict[str, list[LogEvent]],
     fallback_events: list[LogEvent],
-) -> tuple[datetime | None, str | None]:
-    """Find (move_time, reason) for a session that reached a remote provider.
+    dispatch_denied: int = 0,
+    provider_context_skips: dict[str, list[LogEvent]] | None = None,
+) -> tuple[datetime | None, str | None, str]:
+    """Find (move_time, reason, attribution) for a session that reached remote.
 
-    Priority:
-    1. The session's own ``routing_skip_local`` line at/before the first
-       remote stream (authoritative: carries the session UUID and reason).
-    2. The nearest session-less ``Fallback triggered`` line within
-       ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` before the first remote stream.
-    Returns ``(None, None)`` when there is no evidence.
+    Priority — a session's own evidence always wins, and another session's
+    reason is never inherited (LP-0MVMBMSWR0036RES):
+
+    1. The session's own ``routing_skip_local`` line at/before the first remote
+       stream (unchanged precedence; it names why local was skipped).
+    2. The session's own ``routing_skip_provider_context`` line at/before the
+       first remote stream (LP-0MVMBM1Y3001TPRT): also session-bearing, and it
+       names the provider + ``limit`` whose context ceiling blocked that
+       attempt, so it outranks the generic fallback line.
+    3. The session's own session-bearing ``Fallback triggered`` line at/before
+       the first remote stream (the actual decision line).
+    4. The nearest **session-less** ``Fallback triggered`` line within
+       ``FALLBACK_ATTRIBUTION_WINDOW_SECONDS`` before the first remote stream —
+       only rotated logs predating the session stamp can reach this branch; a
+       session-bearing line belongs to the session it names.
+    5. ``lease_denied`` when the session was refused local dispatch by another
+       session's lease (``local_dispatch_denied`` evidence) — the cause is
+       concurrency/lease contention, reported as such instead of inheriting a
+       neighbouring fallback's reason.
+    6. ``unattributed`` when there is no evidence at all.
+
+    A ``routing_skip_local`` line wins over a provider-context skip because it
+    explains why local was not used at all, while provider-context skips are
+    downstream per-provider ceiling hits recorded while walking the chain;
+    both reasons are reported separately (per-session reason and the
+    provider-context breakdown), so nothing is lost by this precedence.
+
+    Returns ``(None, None, attribution)`` when there is no timestamped
+    evidence.
     """
     skips = [e for e in routing_skips.get(session_id, []) if e.ts <= first_remote_ts]
     if skips:
         e = max(skips, key=lambda x: x.ts)
-        return e.ts, e.reason
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
+    if provider_context_skips:
+        ctx_skips = [
+            e
+            for e in provider_context_skips.get(session_id, [])
+            if e.ts <= first_remote_ts
+        ]
+        if ctx_skips:
+            e = max(ctx_skips, key=lambda x: x.ts)
+            return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
+    own = [
+        e
+        for e in fallback_events
+        if e.session == session_id and e.ts <= first_remote_ts
+    ]
+    if own:
+        e = max(own, key=lambda x: x.ts)
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
     earliest = first_remote_ts - timedelta(seconds=FALLBACK_ATTRIBUTION_WINDOW_SECONDS)
-    candidates = [e for e in fallback_events if earliest <= e.ts <= first_remote_ts]
+    candidates = [
+        e
+        for e in fallback_events
+        if not e.session and earliest <= e.ts <= first_remote_ts
+    ]
     if candidates:
         e = max(candidates, key=lambda x: x.ts)
-        return e.ts, e.reason
-    return None, None
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_LEGACY_NEAREST
+    if dispatch_denied > 0:
+        # The proxy logged ``local_dispatch_denied session=<this session>
+        # owner=<other session>``: local was refused by a lease held
+        # elsewhere, so the move is lease/concurrency contention.
+        return None, LEASE_ACTIVE_REASON, FALLBACK_ATTRIBUTION_LEASE_DENIED
+    return None, None, FALLBACK_ATTRIBUTION_UNATTRIBUTED
 
 
 def _build_session(
@@ -478,6 +909,7 @@ def _build_session(
     fallback_events: list[LogEvent],
     schedule: bucketing.SlotSchedule,
     mode_map: bucketing.ModeScheduleMap | None = None,
+    provider_context_skips: dict[str, list[LogEvent]] | None = None,
 ) -> SessionStats:
     started = sorted(builder.started, key=lambda e: e.ts)
     finished = sorted(builder.finished, key=lambda e: e.ts)
@@ -496,24 +928,28 @@ def _build_session(
     has_local = any(e.provider == LOCAL_PROVIDER for e in started)
 
     if first_remote is not None:
-        move_ts, reason = _attribute_fallback(
-            builder.session_id, first_remote.ts, routing_skips, fallback_events
+        move_ts, reason, attribution = _attribute_fallback(
+            builder.session_id,
+            first_remote.ts,
+            routing_skips,
+            fallback_events,
+            dispatch_denied=builder.dispatch_denied,
+            provider_context_skips=provider_context_skips,
         )
         if move_ts is None:
             move_ts = first_remote.ts if has_local else None
     else:
-        move_ts, reason = None, None
+        move_ts, reason, attribution = None, None, FALLBACK_ATTRIBUTION_NO_REMOTE
 
     # Bucket by the operating mode active at the session's first in-window
     # stream (LP-0MSPZUD4G007IYGH): when the logs show mode transitions, the
-    # period is the mode's profile period labelled with the mode name; without
-    # transitions (a single-mode window) the legacy slot-count bucketing from
-    # the analysis-time schedule applies unchanged.
-    period: bucketing.SlotPeriod | None = None
-    if mode_map is not None and mode_map.transitions:
-        period = mode_map.period_for(start)
-    elif schedule.periods:
-        period = schedule.period_for(start)
+    # period is the mode's profile period labelled with the mode name; when
+    # they do not, the configured ``server.priority_window`` supplies the
+    # fast/cheap split (LP-0MVKSXXIR006OBI2), falling back to the legacy
+    # slot-count bucketing from the analysis-time schedule.
+    period: bucketing.SlotPeriod | None = bucketing.bucket_period(
+        start, schedule, mode_map
+    )
 
     local_req = sum(1 for e in started if e.provider == LOCAL_PROVIDER)
     remote_req = len(started) - local_req
@@ -550,6 +986,7 @@ def _build_session(
         remote_model=first_remote.model if first_remote else None,
         remote_move_time=move_ts,
         fallback_reason=reason,
+        fallback_attribution=attribution,
         bucket=period.label if period else None,
         slots=period.slots if period else None,
         ctx_size=period.ctx_size if period else None,
@@ -591,12 +1028,13 @@ def _period_label_at(
     schedule: bucketing.SlotSchedule,
     mode_map: bucketing.ModeScheduleMap | None,
 ) -> str:
-    """Fast/cheap label for ``dt``: mode-aware when the logs show mode
-    transitions (LP-0MSPZUD4G007IYGH), else the legacy slot-count label from
-    the analysis-time schedule."""
-    if mode_map is not None and mode_map.transitions:
-        return mode_map.period_for(dt).label
-    return schedule.period_for(dt).label if schedule.periods else "fast"
+    """Fast/cheap label for ``dt``.
+
+    Mode-aware when the logs show mode transitions (LP-0MSPZUD4G007IYGH), else
+    the configured priority window (LP-0MVKSXXIR006OBI2), else the legacy
+    slot-count label from the analysis-time schedule.
+    """
+    return bucketing.bucket_label(dt, schedule, mode_map)
 
 
 
@@ -626,12 +1064,90 @@ def _attribute_interval(
         hourly[hour_key] = hourly.get(hour_key, 0.0) + (hi - lo).total_seconds()
 
 
+def _prefill_seconds(match: PrefillMatch) -> float | None:
+    """Prefill duration (dispatch → first byte) for one paired stream.
+
+    Resolution order, most authoritative first:
+
+    1. ``dispatch_first_byte_ms`` (the paired TTFT event's ``ttft_ms``): the
+       dispatch line is written at first byte and carries the total interval
+       including the single-slot queue wait.
+    2. ``dispatch_to_first_byte_ms + queue_wait_ms``: the logged service/queue
+       split of the same interval, summed back to the total when
+       ``dispatch_first_byte_ms`` itself is missing from a rotated log.
+    3. Pairing the dispatch and first-byte timestamps: ``ttft.ts - stream.ts``.
+       Only a **positive** difference is accepted — the proxy logs
+       ``Stream started`` at first byte, so a zero/negative delta carries no
+       evidence and the stream stays unknown prefill rather than claiming a
+       0 s prefill.
+
+    Returns ``None`` when no source yields evidence (unknown prefill).
+    """
+    ttft = match.ttft
+    if ttft is None:
+        return None
+    if ttft.ttft_ms is not None:
+        return max(0.0, ttft.ttft_ms / 1000.0)
+    if ttft.dispatch_to_first_byte_ms is not None and ttft.queue_wait_ms is not None:
+        return max(0.0, (ttft.dispatch_to_first_byte_ms + ttft.queue_wait_ms) / 1000.0)
+    delta = (ttft.ts - match.stream.ts).total_seconds()
+    return delta if delta > 0 else None
+
+
+def _merge_intervals(
+    intervals: Iterable[tuple[datetime, datetime]],
+) -> list[list[datetime]]:
+    """Merge overlapping/touching ``(start, end)`` intervals into a union."""
+    ordered = sorted(intervals)
+    merged: list[list[datetime]] = []
+    for start, end in ordered:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def _compute_prefill_stats(
+    matches: Iterable[PrefillMatch],
+    window_start: datetime,
+    window_end: datetime,
+) -> PrefillStats:
+    """Per-stream local prefill statistics for the window.
+
+    ``matches`` are the streams paired FIFO to their TTFT events per session
+    (the same pairing the busy intervals use), so each stream gets at most
+    one prefill interval ``[ttft.ts - ttft_ms/1000, ttft.ts]``. A stream is
+    attributed to the window whose bounds contain its first-byte timestamp
+    (its ``Stream started`` timestamp when it has no first-byte line, which
+    the proxy logs at the same instant); intervals are **not** clipped, so a
+    dispatch that started before ``window_start`` keeps its full duration and
+    a first byte after ``window_end`` belongs to the next window (no
+    double-counting).
+    """
+    streams: list[PrefillSample] = []
+    for match in matches:
+        anchor = match.ttft.ts if match.ttft is not None else match.stream.ts
+        if not (window_start <= anchor <= window_end):
+            continue
+        streams.append(
+            PrefillSample(
+                session=match.stream.session,
+                first_byte_ts=match.ttft.ts if match.ttft is not None else None,
+                seconds=_prefill_seconds(match),
+            )
+        )
+    return PrefillStats(streams=tuple(streams))
+
+
 def compute_busy_stats(
     local_events: Iterable[LogEvent],
     window_start: datetime,
     window_end: datetime,
     schedule: bucketing.SlotSchedule,
     mode_map: bucketing.ModeScheduleMap | None = None,
+    *,
+    ttft_events: Iterable[LogEvent] | None = None,
 ) -> BusyStats | None:
     """Compute local-model utilization from local stream events.
 
@@ -646,51 +1162,141 @@ def compute_busy_stats(
     ``pre_window_unfinished`` (LP-0MSVRRO3L0056N6C). Streams started after
     the window end are not counted (they belong to the next window).
     Fast/cheap attribution is mode-aware when the logs show mode transitions
-    (LP-0MSPZUD4G007IYGH), so busy seconds during cheap hours count as cheap
-    even when the analysis runs in fast mode. Returns ``None`` when there is
-    no local traffic in the window.
+    (LP-0MSPZUD4G007IYGH), falls back to the configured
+    ``server.priority_window`` when they do not (LP-0MVKSXXIR006OBI2), and
+    otherwise uses the legacy slot schedule, so busy seconds during cheap
+    hours count as cheap even when the analysis runs in fast mode. Returns
+    ``None`` when there is no local traffic in the window.
+
+    Busy is the union of **dispatch → finish** intervals (prefill + decode,
+    LP-0MVJN9H2I00116FP): each paired stream's interval starts at
+    ``ttft.ts - ttft_ms/1000`` when a first-byte line is available and at
+    ``Stream started`` otherwise, and ends at ``Stream finished``. Busy,
+    total compute, peak/average concurrency, the fast/cheap split and the
+    hourly split are all computed on those intervals. The decode-only union
+    (``Stream started`` → ``Stream finished``) is retained as
+    :attr:`BusyStats.decode_busy_seconds`, the labelled lower bound of the
+    busy figure; the dispatch → finish union is the labelled upper bound.
+    A stream with no first-byte line falls back to its decode interval, so it
+    can only ever contribute its lower-bound time — the busy figure is never
+    overstated.
+
+    ``ttft_events`` are the local ``dispatch_first_byte_ms`` TTFT events
+    (LP-0MVJN45LF009CO2V). When supplied they are paired FIFO to the local
+    streams per session and reported as :attr:`BusyStats.prefill_stats`:
+    p10/p50/p90/max plus the window total of the prefill interval
+    ``[ttft.ts - ttft_ms/1000, ttft.ts]``. Every prefill figure is
+    **slot-time, not wall-clock** (the per-stream durations are summed, not
+    unioned), unlike ``busy_seconds``. When ``dispatch_first_byte_ms`` is
+    absent the duration falls back to the logged
+    ``dispatch_to_first_byte_ms + queue_wait_ms`` split and then to pairing the
+    dispatch and first-byte timestamps (see :func:`_prefill_seconds`). Streams
+    with no first-byte line are counted as unknown prefill: excluded from the
+    percentiles, retained in the stream count. ``prefill_stats`` is ``None``
+    only when ``ttft_events`` was not supplied at all — in that case every
+    busy interval falls back to its decode interval, so ``busy_seconds`` and
+    ``decode_busy_seconds`` coincide.
+
+    ``decode_stats`` (:class:`DecodeStats`, LP-0MVJNDOUU0059MMO) reports the
+    same paired streams' decode durations (first byte → finish) as
+    slot-seconds with p10/p50/p90/max, attributed to the window containing the
+    stream's first byte and not clipped (matching the prefill samples), so the
+    report can split phase slot time into prefill vs decode. It needs no TTFT
+    events, so it is present whenever local traffic exists; streams without a
+    logged finish are unknown decode.
     """
-    started: dict[str, list[datetime]] = {}
-    finished: dict[str, list[datetime]] = {}
+    started: dict[str, list[LogEvent]] = {}
+    finished: dict[str, list[LogEvent]] = {}
+    started_events: list[LogEvent] = []
     for ev in local_events:
         if ev.session is None:
             continue
-        bucket = started if ev.kind == "stream_started" else finished
-        bucket.setdefault(ev.session, []).append(ev.ts)
+        if ev.kind == "stream_started":
+            started.setdefault(ev.session, []).append(ev)
+            started_events.append(ev)
+        else:
+            finished.setdefault(ev.session, []).append(ev)
+
+    ttft_list = list(ttft_events) if ttft_events is not None else None
+    matches = (
+        pair_ttft_to_streams(ttft_list, started_events) if ttft_list is not None else []
+    )
+    # Dispatch start per paired stream: ``ttft.ts - prefill_seconds`` — the
+    # prefill interval start from LP-0MVJN9H2I00116FP AC1. Streams with unknown
+    # prefill are absent from the map and fall back to their decode interval.
+    dispatch_start: dict[int, datetime] = {}
+    for match in matches:
+        seconds = _prefill_seconds(match)
+        if seconds is not None and match.ttft is not None:
+            dispatch_start[id(match.stream)] = match.ttft.ts - timedelta(seconds=seconds)
 
     intervals: list[tuple[datetime, datetime]] = []
+    decode_intervals: list[tuple[datetime, datetime]] = []
+    decode_samples: list[DecodeSample] = []
+    prefill_extended = 0
     unfinished = 0
     pre_window_unfinished = 0
     margin_start = window_start - BUSY_WINDOW_MARGIN
-    for session_id, starts in started.items():
-        ss = sorted(starts)
-        ff = sorted(finished.get(session_id, []))
-        for b, e in zip(ss, ff):
-            cb, ce = max(b, window_start), min(e, window_end)
-            if ce > cb:
-                intervals.append((cb, ce))
+    for session_id, session_starts in started.items():
+        ss = sorted(session_starts, key=lambda e: e.ts)
+        ff = sorted(finished.get(session_id, []), key=lambda e: e.ts)
+        for start_ev, finish_ev in zip(ss, ff):
+            # Decode-only interval (``Stream started`` → ``Stream finished``).
+            d_lo, d_hi = max(start_ev.ts, window_start), min(finish_ev.ts, window_end)
+            if d_hi > d_lo:
+                decode_intervals.append((d_lo, d_hi))
+            # Decode slot-seconds (LP-0MVJNDOUU0059MMO): the per-stream
+            # duration, attributed to the window containing its first byte
+            # (``Stream started``) and not clipped — matching the prefill
+            # sample attribution, so both phases cover the same streams.
+            if window_start <= start_ev.ts <= window_end:
+                decode_samples.append(
+                    DecodeSample(
+                        session=session_id,
+                        seconds=max(0.0, (finish_ev.ts - start_ev.ts).total_seconds()),
+                    )
+                )
+            # Busy interval (dispatch → finish): the same pair extended back to
+            # its measured dispatch time when a first-byte line exists.
+            measured_dispatch = dispatch_start.get(id(start_ev))
+            if measured_dispatch is not None:
+                busy_start = measured_dispatch
+                prefill_extended += 1
+            else:
+                busy_start = start_ev.ts
+            b_lo, b_hi = max(busy_start, window_start), min(finish_ev.ts, window_end)
+            if b_hi > b_lo:
+                intervals.append((b_lo, b_hi))
         # FIFO pairing: the earliest ``len(ff)`` starts pair with finishes;
         # the remaining starts are unpaired (no logged finish). Only starts
         # within the busy margin before the window (or inside it) count as
         # this window's unfinished; earlier starts are pre-window leftovers;
         # starts after the window end belong to the next window.
-        for ts in ss[len(ff):]:
-            if ts < margin_start:
+        for start_ev in ss[len(ff):]:
+            if start_ev.ts < margin_start:
                 pre_window_unfinished += 1
-            elif ts <= window_end:
+            elif start_ev.ts <= window_end:
                 unfinished += 1
+                # No finish line: the decode duration is unknown, not zero.
+                if window_start <= start_ev.ts:
+                    decode_samples.append(DecodeSample(session=session_id, seconds=None))
+    prefill_stats = (
+        _compute_prefill_stats(matches, window_start, window_end)
+        if ttft_list is not None
+        else None
+    )
     if not intervals:
-        return None
+        # No paired stream duration. Prefill evidence (a known sample or an
+        # unknown-prefill stream) can still exist when every stream is
+        # unfinished, so only report "no local traffic" when there is none.
+        if prefill_stats is None or prefill_stats.stream_count == 0:
+            return None
 
-    intervals.sort()
-    merged: list[list[datetime]] = []
-    for cb, ce in intervals:
-        if merged and cb <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], ce)
-        else:
-            merged.append([cb, ce])
+    merged = _merge_intervals(intervals)
+    decode_merged = _merge_intervals(decode_intervals)
 
     busy_seconds = sum((e - s).total_seconds() for s, e in merged)
+    decode_busy = sum((e - s).total_seconds() for s, e in decode_merged)
     total_compute = sum((e - s).total_seconds() for s, e in intervals)
     window_seconds = (window_end - window_start).total_seconds()
 
@@ -705,8 +1311,7 @@ def compute_busy_stats(
         cur += delta
         peak = max(peak, cur)
 
-    mode_aware = mode_map is not None and bool(mode_map.transitions)
-    periods = mode_map.all_periods if mode_aware else schedule.periods
+    periods = bucketing.bucket_periods(schedule, mode_map)
 
     def label_at(mid: datetime) -> str:
         return _period_label_at(mid, schedule, mode_map)
@@ -715,6 +1320,11 @@ def compute_busy_stats(
     hourly: dict[datetime, float] = {}
     for s, e in merged:
         _attribute_interval(s, e, periods, label_at, bucket_busy, hourly)
+    # The retained decode-only lower bound is bucketed the same way (its
+    # hourly split is not reported, so the throwaway dict is intentional).
+    decode_bucket_busy: dict[str, float] = {}
+    for s, e in decode_merged:
+        _attribute_interval(s, e, periods, label_at, decode_bucket_busy, {})
 
     fast_window = cheap_window = 0.0
     bounds = _segment_boundaries(window_start, window_end, periods)
@@ -743,6 +1353,12 @@ def compute_busy_stats(
         fast_window_seconds=round(fast_window, 1),
         cheap_window_seconds=round(cheap_window, 1),
         hourly_busy=sorted(hourly.items()),
+        prefill_stats=prefill_stats,
+        decode_stats=DecodeStats(streams=tuple(decode_samples)),
+        decode_busy_seconds=round(decode_busy, 1),
+        decode_fast_busy_seconds=round(decode_bucket_busy.get("fast", 0.0), 1),
+        decode_cheap_busy_seconds=round(decode_bucket_busy.get("cheap", 0.0), 1),
+        prefill_extended_streams=prefill_extended,
     )
 
 
@@ -869,6 +1485,101 @@ def compaction_impact(
     }
 
 
+@dataclass(frozen=True)
+class HourAvailability:
+    """One hour's local-model availability classification
+    (LP-0MVKUKG3F0035I85).
+
+    ``states`` is a **non-exclusive, canonically ordered** tuple of
+    :data:`AVAILABILITY_ORDER` members (or ``(AVAILABILITY_IDLE,)``): a wedged
+    hour is simultaneously ``prefill-only-no-decode`` (dispatch attempts with
+    no completed local stream) and ``lease-blocked`` (demand refused by the
+    foreign lease), and a busy hour can be ``serving`` while still refusing
+    other sessions. ``label`` is the render/JSON form: ``+``-joined states.
+
+    The counters are the raw evidence, kept so the classification is
+    auditable from the report and the ``--json`` summary.
+    """
+
+    hour: datetime
+    states: tuple[str, ...]
+    local_dispatch_attempts: int = 0
+    local_served: int = 0
+    local_denials: int = 0
+    lease_active_fallbacks: int = 0
+
+    @property
+    def label(self) -> str:
+        return "+".join(self.states)
+
+    @property
+    def is_idle(self) -> bool:
+        return self.states == (AVAILABILITY_IDLE,)
+
+
+def classify_hour(
+    hour: datetime,
+    *,
+    local_dispatch_attempts: int = 0,
+    local_served: int = 0,
+    local_denials: int = 0,
+    lease_active_fallbacks: int = 0,
+) -> HourAvailability:
+    """Classify one hour from timestamped proxy-log evidence.
+
+    Deterministic and priority-free (states accumulate instead of competing):
+
+    - ``serving`` — at least one local ``Stream finished``: decode happened.
+    - ``prefill-only-no-decode`` — local dispatch was attempted
+      (``[local] POST`` to llama-server) but no local stream completed, i.e.
+      prompt work with no decode. Suppressed when ``serving`` — a completed
+      stream already proves decode.
+    - ``lease-blocked`` — local demand was refused because another session
+      held the dispatch lease (``local_dispatch_denied`` or a
+      ``reason=local_lease_active`` fallback).
+    - ``idle`` — no dispatch attempt, no refusal and no completed local
+      stream: genuinely no local demand (never a false positive for a wedged
+      or refused hour).
+
+    Only the log evidence decides; nothing is inferred from wall-clock level
+    or from the absence of config. Prefill evidence comes from the proxy's own
+    dispatch-attempt marker because llama-server eval lines carry no
+    timestamps (see ``REFERENCE.md`` → Limitations).
+    """
+    present: set[str] = set()
+    if local_served > 0:
+        present.add(AVAILABILITY_SERVING)
+    elif local_dispatch_attempts > 0:
+        present.add(AVAILABILITY_PREFILL_ONLY_NO_DECODE)
+    if local_denials > 0 or lease_active_fallbacks > 0:
+        present.add(AVAILABILITY_LEASE_BLOCKED)
+    # Canonical order (:data:`AVAILABILITY_ORDER`), independent of the
+    # accumulation order above.
+    states = tuple(s for s in AVAILABILITY_ORDER if s in present)
+    if not states:
+        states = (AVAILABILITY_IDLE,)
+    return HourAvailability(
+        hour=hour,
+        states=tuple(states),
+        local_dispatch_attempts=local_dispatch_attempts,
+        local_served=local_served,
+        local_denials=local_denials,
+        lease_active_fallbacks=lease_active_fallbacks,
+    )
+
+
+def hour_availability(hour: datetime, counts: Counter) -> HourAvailability:
+    """Classify one hourly-activity counter bucket
+    (``AnalysisResult.hourly_activity``)."""
+    return classify_hour(
+        hour,
+        local_dispatch_attempts=counts.get("local_dispatch_attempts", 0),
+        local_served=counts.get("local_served", 0),
+        local_denials=counts.get("local_denials", 0),
+        lease_active_fallbacks=counts.get("lease_active_fallbacks", 0),
+    )
+
+
 def aggregate(
     events: Iterable[LogEvent],
     window_start: datetime,
@@ -891,7 +1602,11 @@ def aggregate(
     """
     builders: dict[str, _SessionBuilder] = {}
     routing_skips: dict[str, list[LogEvent]] = {}
+    # Provider context-ceiling skips indexed by session (LP-0MVMBM1Y3001TPRT):
+    # per-session attribution input, see ``_attribute_fallback``.
+    provider_context_skips: dict[str, list[LogEvent]] = {}
     fallback_events: list[LogEvent] = []
+    provider_context_skip_events: list[LogEvent] = []
     routing_skip_events: list[LogEvent] = []
     dispatch_denied_events: list[LogEvent] = []
     error_events: list[LogEvent] = []
@@ -899,6 +1614,11 @@ def aggregate(
     contention_fallback_events: list[LogEvent] = []
     local_admission_events: list[LogEvent] = []
     idle_admit_events: list[LogEvent] = []
+    residency_events: list[LogEvent] = []
+    eviction_events: list[LogEvent] = []
+    eviction_after_acceptance_events: list[LogEvent] = []
+    prefill_deadline_events: list[LogEvent] = []
+    provider_exhausted_events: list[LogEvent] = []
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
@@ -917,6 +1637,12 @@ def aggregate(
     # busy-time calculation; ``iter_events`` yields a margin beyond the window
     # so boundary-crossing streams pair correctly (clipped in compute_busy_stats).
     local_stream_events: list[LogEvent] = []
+    # Local TTFT events (``dispatch_first_byte_ms`` lines) across the same
+    # margin-widened stream: paired FIFO to the local streams to derive the
+    # per-stream prefill statistics (LP-0MVJN45LF009CO2V). The dispatch line
+    # carries no ``provider=`` field, so ``provider is None`` marks it as local
+    # (remote ``ttft_seconds=`` lines always name their provider).
+    local_ttft_events: list[LogEvent] = []
     # Operating-mode transitions across the (margin-widened) event stream:
     # the mode timeline used for fast/cheap session bucketing. Carries the
     # attribution markers (source/actor/reason) parsed by log_parser
@@ -958,6 +1684,8 @@ def aggregate(
             continue
         if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
             local_stream_events.append(ev)
+        if ev.kind == "ttft" and ev.provider in (None, LOCAL_PROVIDER):
+            local_ttft_events.append(ev)
         if not (window_start <= ev.ts <= window_end):
             continue
         total_lines += 1
@@ -972,8 +1700,23 @@ def aggregate(
                 counts["local_attempts"] += 1
         elif ev.kind == "stream_finished" and ev.provider == LOCAL_PROVIDER:
             hourly_activity.setdefault(hour_key, Counter())["local_served"] += 1
+        elif ev.kind == "local_dispatch":
+            # A ``[local] POST`` dispatch attempt (LP-0MVKUKG3F0035I85): counted
+            # regardless of whether the attempt ever produced a first byte or a
+            # ``Stream finished``, so wedged/prefill-only hours stay visible.
+            hourly_activity.setdefault(hour_key, Counter())["local_dispatch_attempts"] += 1
+        elif ev.kind == "dispatch_denied":
+            hourly_activity.setdefault(hour_key, Counter())["local_denials"] += 1
         elif ev.kind == "fallback":
-            hourly_activity.setdefault(hour_key, Counter())["fallbacks"] += 1
+            counts = hourly_activity.setdefault(hour_key, Counter())
+            counts["fallbacks"] += 1
+            if ev.reason == LEASE_ACTIVE_REASON:
+                counts["lease_active_fallbacks"] += 1
+        elif ev.kind == "contention_fallback_after_queue" and ev.reason == LEASE_ACTIVE_REASON:
+            # Contention-queue fallback refused by the local lease
+            # (``queued_duration=60s reason=local_lease_active``), a second
+            # ``local_lease_active`` refusal shape (LP-0MVKUKG3F0035I85).
+            hourly_activity.setdefault(hour_key, Counter())["lease_active_fallbacks"] += 1
         elif ev.kind == "routing_skip":
             # Demand counter for genuine skips only: a ``chain_hold_cycle > 0``
             # event is a hold-cycle re-emission, not new client demand
@@ -988,6 +1731,12 @@ def aggregate(
             "upstream_http_error",
         ):
             error_events.append(ev)
+            continue
+        if ev.kind == "local_dispatch":
+            # Dispatch-attempt marker: consumed by the hourly counter above;
+            # nothing else aggregates it (no session is attributed to these
+            # lines — the echoed request body may itself contain ``session=``
+            # text, which is why the parser extracts no fields).
             continue
         if ev.kind == "fallback":
             fallback_events.append(ev)
@@ -1010,6 +1759,17 @@ def aggregate(
                     routing_skips.setdefault(ev.session, []).append(ev)
                     builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
             continue
+        if ev.kind == "provider_context_skip":
+            # Provider context-ceiling skip (LP-0MVMBM1Y3001TPRT): a skip, not a
+            # stream/fallback event — it never contributes to request, token or
+            # fallback-event counts. It is collected globally for the report's
+            # provider-context breakdown and indexed by session so
+            # ``_attribute_fallback`` can prefer this session's own line.
+            provider_context_skip_events.append(ev)
+            if ev.session:
+                provider_context_skips.setdefault(ev.session, []).append(ev)
+                builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
+            continue
         if ev.kind == "contention_dispatch":
             contention_dispatch_events.append(ev)
             continue
@@ -1021,6 +1781,27 @@ def aggregate(
             continue
         if ev.kind == "idle_admit":
             idle_admit_events.append(ev)
+            continue
+        if ev.kind == "residency_decision":
+            residency_events.append(ev)
+            continue
+        if ev.kind == "local_eviction_after_acceptance":
+            # Must precede nothing else: the parser classifies it as its own
+            # kind (never as ``local_eviction``), so no prefix sharing leaks
+            # these events into the tenancy bucket.
+            eviction_after_acceptance_events.append(ev)
+            continue
+        if ev.kind == "prefill_deadline_exceeded":
+            # LP-0MVOAQDB4002D56G: AC4 deadline-rate evidence. Kept out of
+            # every other aggregate (it is not a routing skip, not an eviction
+            # counter event) so existing keys keep their meaning.
+            prefill_deadline_events.append(ev)
+            continue
+        if ev.kind == "provider_exhausted":
+            provider_exhausted_events.append(ev)
+            continue
+        if ev.kind == "local_eviction":
+            eviction_events.append(ev)
             continue
         if ev.kind in ("compaction_event", "compaction_backstop", "compaction_churn"):
             compaction_events.append(ev)
@@ -1052,9 +1833,23 @@ def aggregate(
         # already been window-filtered above).
         if not builder.started:
             continue
-        sessions[sid] = _build_session(builder, routing_skips, fallback_events, schedule, mode_map)
+        sessions[sid] = _build_session(
+            builder,
+            routing_skips,
+            fallback_events,
+            schedule,
+            mode_map,
+            provider_context_skips,
+        )
 
-    busy = compute_busy_stats(local_stream_events, window_start, window_end, schedule, mode_map)
+    busy = compute_busy_stats(
+        local_stream_events,
+        window_start,
+        window_end,
+        schedule,
+        mode_map,
+        ttft_events=local_ttft_events,
+    )
 
     return AnalysisResult(
         window_start=window_start,
@@ -1072,10 +1867,16 @@ def aggregate(
         contention_fallback_events=contention_fallback_events,
         local_admission_events=local_admission_events,
         idle_admit_events=idle_admit_events,
+        residency_events=residency_events,
+        eviction_events=eviction_events,
+        eviction_after_acceptance_events=eviction_after_acceptance_events,
+        prefill_deadline_events=prefill_deadline_events,
+        provider_exhausted_events=provider_exhausted_events,
         compaction_events=compaction_events,
         busy=busy,
         hourly_activity=hourly_activity,
         ttft_events=ttft_events,
         hold_cycle_routing_skip_events=hold_cycle_routing_skip_events,
+        provider_context_skip_events=provider_context_skip_events,
         restart_events=restart_events,
     )

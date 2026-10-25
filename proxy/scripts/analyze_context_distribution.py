@@ -19,6 +19,11 @@ history + new prompt, computed with the native tokenizer). Every local
 routing decision logs one. ``context_pressure`` warnings (same log) flag the
 sessions that cross the 0.80 warn ratio, and ``routing_skip_local`` lines
 count the ``context_too_large`` / ``large_context_bypass`` hard-cap skips.
+``routing_skip_provider_context`` lines (LP-0MVMBM1Y3001TPRT) are counted
+separately: they record a *per-provider* context-ceiling skip (the estimated
+prompt exceeded that remote entry's ``max_context_tokens``), which is the
+provider-side counterpart of a local hard-cap skip and explains why an
+oversized session's chain walked further than one provider.
 
 Mode classification
 
@@ -108,6 +113,19 @@ SKIP_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?routing_skip_local .*?"
     r"reason=(\w+) .*?session=([A-Za-z0-9_.-]+)"
 )
+# Per-provider context-ceiling skip (LP-0MVMBM1Y3001TPRT):
+#   routing_skip_provider_context provider=<p> type=remote
+#     status=provider_context_exceeded estimated_tokens=<n> limit=<n>
+#     reason=provider_context_exceeded session=<s>
+# Counted separately from the local hard-cap skips: this is the remote side of
+# the same size problem, and its ``limit`` names the ceiling that was hit.
+PROVIDER_SKIP_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?routing_skip_provider_context "
+    r".*?provider=(\S+).*?session=([A-Za-z0-9_.-]+)"
+)
+# Tolerant field extractors (older rotated logs may omit ``limit``).
+PROVIDER_SKIP_LIMIT_RE = re.compile(r"\blimit=(\d+)")
+PROVIDER_SKIP_EST_RE = re.compile(r"\bestimated_tokens=(\d+)")
 
 
 @dataclass
@@ -251,6 +269,28 @@ def parse_skip(line: str) -> tuple | None:
     return (datetime.strptime(ts_s, TS_FMT), reason, session)
 
 
+def parse_provider_skip(line: str) -> tuple | None:
+    """Parse a ``routing_skip_provider_context`` line.
+
+    Returns ``(window_ts, provider, session, limit, estimated_tokens)``; ``limit``
+    and ``estimated_tokens`` are ``None`` when the line omits them (older rotated
+    logs), so historical windows stay parseable (LP-0MVMBM1Y3001TPRT AC8).
+    """
+    m = PROVIDER_SKIP_RE.match(line)
+    if m is None:
+        return None
+    ts_s, provider, session = m.groups()
+    limit_m = PROVIDER_SKIP_LIMIT_RE.search(line)
+    est_m = PROVIDER_SKIP_EST_RE.search(line)
+    return (
+        datetime.strptime(ts_s, TS_FMT),
+        provider,
+        session,
+        int(limit_m.group(1)) if limit_m else None,
+        int(est_m.group(1)) if est_m else None,
+    )
+
+
 @dataclass
 class DayResult:
     """Per-day extraction: session aggregates + warning/skip tallies."""
@@ -260,6 +300,12 @@ class DayResult:
     pressure_count: int = 0
     pressure_sessions: set = field(default_factory=set)
     skip_counts: Counter = field(default_factory=Counter)
+    # Per-provider context-ceiling skips (LP-0MVMBM1Y3001TPRT): provider ->
+    # count, plus the ``limit`` values those skips exceeded (None -> not
+    # logged). Kept apart from ``skip_counts`` (local hard-cap reasons) so the
+    # local and provider-side ceilings stay distinguishable.
+    provider_skip_counts: Counter = field(default_factory=Counter)
+    provider_skip_limits: Counter = field(default_factory=Counter)
 
 
 def analyze_day(
@@ -299,6 +345,16 @@ def analyze_day(
                 ts, reason, _session = s
                 if start <= ts < end:
                     res.skip_counts[reason] += 1
+                continue
+            if include_skip and "routing_skip_provider_context" in line:
+                s = parse_provider_skip(line)
+                if s is None:
+                    continue
+                ts, provider, _session, limit, _est = s
+                if start <= ts < end:
+                    res.provider_skip_counts[provider] += 1
+                    res.provider_skip_limits[limit] += 1
+                continue
     return res
 
 
@@ -364,6 +420,13 @@ def build_report(
                 "context_pressure_warnings": r.pressure_count,
                 "context_pressure_sessions": len(r.pressure_sessions),
                 "routing_skips": dict(r.skip_counts),
+                "provider_context_skips": {
+                    "by_provider": dict(r.provider_skip_counts),
+                    "by_limit": {
+                        "not logged" if limit is None else str(limit): count
+                        for limit, count in r.provider_skip_limits.items()
+                    },
+                },
             }
             for r in results
         },
@@ -410,6 +473,19 @@ def render_markdown(report: dict) -> str:
         else:
             skip_str = "none"
         lines.append(f"- routing_skip_local: {skip_str}")
+        # Provider-side context-ceiling skips (LP-0MVMBM1Y3001TPRT): the
+        # remote counterpart of a local hard-cap skip, kept on its own line so
+        # the local reasons above are not diluted.
+        prov = d.get("provider_context_skips") or {}
+        by_provider = prov.get("by_provider") or {}
+        if by_provider:
+            prov_str = ", ".join(f"{k}={v}" for k, v in sorted(by_provider.items()))
+            limits = prov.get("by_limit") or {}
+            limit_str = ", ".join(f"{k}×{v}" for k, v in sorted(limits.items()))
+            lines.append(
+                f"- routing_skip_provider_context: {prov_str} "
+                f"(limit: {limit_str or 'not logged'})"
+            )
         lines.append("")
         lines.append("### Distribution (per-session max estimated context)")
         lines.append("")

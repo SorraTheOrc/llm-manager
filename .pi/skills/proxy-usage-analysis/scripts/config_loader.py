@@ -13,6 +13,7 @@ the module is unavailable, so there are no hard third-party dependencies.
 from __future__ import annotations
 
 import re
+from datetime import datetime as _datetime
 from pathlib import Path
 
 # Scalar keys the skill reads (recommendations + slot schedule fallback).
@@ -46,6 +47,9 @@ def _normalize(cfg: dict | None) -> dict | None:
         value = _find_nested(cfg, key)
         if value is not None:
             result[key] = int(value)
+    priority_window = normalize_priority_window(_find_nested(cfg, "priority_window"))
+    if priority_window is not None:
+        result["priority_window"] = priority_window
     models = _find_nested(cfg, "models")
     if isinstance(models, dict):
         # Carried through so a deduplicated mode overlay still exposes the
@@ -70,6 +74,64 @@ def _normalize(cfg: dict | None) -> dict | None:
         if ctx_by_time:
             result["slot_schedule"]["ctx_by_time"] = ctx_by_time
     return result or None
+
+
+def parse_window_minutes(value: object, default: int) -> int:
+    """Parse a ``"HH:MM"`` clock bound to minutes from midnight (local time).
+
+    Mirrors ``proxy/proxy/priority.py::in_cheap_window``: the bounds are local
+    wall-clock times, so no UTC conversion is applied. Invalid or missing
+    values return ``default`` (LP-0MVKSXXIR006OBI2 AC4).
+    """
+    try:
+        hh, mm = str(value).strip().split(":")[:2]
+        hours, minutes = int(hh), int(mm)
+    except (ValueError, AttributeError, TypeError):
+        return int(default)
+    if not (0 <= hours < 24 and 0 <= minutes < 60):
+        return int(default)
+    return hours * 60 + minutes
+
+
+def _as_bool(value: object, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("true", "yes", "1", "on")
+
+
+def normalize_priority_window(window: dict | None) -> dict | None:
+    """Canonical ``priority_window`` block (``None`` when absent).
+
+    Returns ``{"enabled", "start", "end", "start_minutes", "end_minutes"}``
+    so every consumer sees the same parsed shape; ``end <= start`` wraps past
+    midnight (e.g. ``22:00``–``06:00``). Defaults match the shipped config
+    (01:00–10:00, the retired mode-schedule cheap window).
+    """
+    if not isinstance(window, dict):
+        return None
+    start = str(window.get("start") or "01:00")
+    end = str(window.get("end") or "10:00")
+    return {
+        "enabled": _as_bool(window.get("enabled"), True),
+        "start": start,
+        "end": end,
+        "start_minutes": parse_window_minutes(start, 1 * 60),
+        "end_minutes": parse_window_minutes(end, 10 * 60),
+    }
+
+
+def priority_window_bounds(config: dict | None) -> dict | None:
+    """The parsed ``server.priority_window`` block of an effective config."""
+    if not isinstance(config, dict):
+        return None
+    window = config.get("priority_window")
+    if isinstance(window, dict):
+        # Already normalised by ``_normalize``; re-normalising is harmless and
+        # tolerates a raw dict from a caller that skipped the loader.
+        return normalize_priority_window(window)
+    return normalize_priority_window(_find_nested(config, "priority_window"))
 
 
 def _parse_config_raw(text: str) -> dict:
@@ -181,6 +243,25 @@ def _parse_config_text_regex(text: str) -> dict:
         cfg["slot_schedule"] = {"enabled": enabled, "entries": entries}
         if ctx_by_time:
             cfg["slot_schedule"]["ctx_by_time"] = ctx_by_time
+
+    window_matches = [
+        i for i, line in enumerate(lines) if re.match(r"^\s*priority_window:\s*$", line)
+    ]
+    if window_matches:
+        start_idx = window_matches[-1]
+        key_indent = len(lines[start_idx]) - len(lines[start_idx].lstrip())
+        window: dict = {}
+        for line in lines[start_idx + 1 :]:
+            indent = len(line) - len(line.lstrip())
+            if indent <= key_indent:
+                break
+            m_field = re.match(r"^\s*(enabled|start|end):\s*(.+?)\s*$", line)
+            if not m_field:
+                continue
+            field, raw_value = m_field.group(1), m_field.group(2).strip().strip("\"'")
+            window[field] = raw_value
+        if window:
+            cfg["priority_window"] = window
     return cfg
 
 
@@ -214,23 +295,16 @@ def priority_window_label(config_yaml: Path) -> str | None:
     config's ``server.priority_window`` (cheap window) at call time.
     """
     cfg = load_proxy_config(config_yaml) or {}
-    window = (cfg.get("server") or {}).get("priority_window") or {}
-    if not window.get("enabled", True):
+    window = priority_window_bounds(cfg)
+    if window is None or not window["enabled"]:
         return "standard"
-    from datetime import datetime as _dt
-    from datetime import time as _time
-
-    def _parse(v, default):
-        try:
-            hh, mm = str(v).strip().split(":")
-            return _time(int(hh), int(mm))
-        except (ValueError, AttributeError):
-            return default
-
-    start = _parse(window.get("start", "01:00"), _time(1, 0))
-    end = _parse(window.get("end", "10:00"), _time(10, 0))
-    now = _dt.now().time()
-    inside = (start <= now < end) if start <= end else (now >= start or now < end)
+    start = window["start_minutes"]
+    end = window["end_minutes"]
+    now = _datetime.now()
+    minutes = now.hour * 60 + now.minute + now.second / 60.0
+    inside = (start <= minutes < end) if start <= end else (
+        minutes >= start or minutes < end
+    )
     return "low" if inside else "standard"
 
 
@@ -245,7 +319,10 @@ def discover_configs(explicit: str | None = None, start: Path | None = None) -> 
     - ``analysis_mode``: legacy key retained as ``None`` (there is no mode);
     - ``analysis_config``: the unified config;
     - ``priority_window``: the current cheap-window label (``low`` inside,
-      else ``standard``).
+      else ``standard``);
+    - ``priority_window_bounds``: the parsed window bounds (``start_minutes`` /
+      ``end_minutes`` / ``enabled``) used to bucket historical windows;
+      ``None`` when the config has no priority window.
     """
     base = find_config_base_path(explicit, start)
     profiles: dict[str, dict | None] = {"default": None}
@@ -259,6 +336,7 @@ def discover_configs(explicit: str | None = None, start: Path | None = None) -> 
         "profiles": profiles,
         "analysis_mode": analysis_mode,
         "priority_window": label,
+        "priority_window_bounds": priority_window_bounds(profiles["default"]),
         "analysis_config": profiles["default"],
     }
 

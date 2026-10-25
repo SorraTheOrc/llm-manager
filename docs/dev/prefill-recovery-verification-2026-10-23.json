@@ -1,0 +1,273 @@
+{
+  "work_item": "LP-0MVKUKGER000TW2W",
+  "generated_at": "2026-10-23",
+  "deploy": {
+    "commit": "a4d2b233",
+    "proxy_restarted": "2026-10-23 20:08:53"
+  },
+  "pre_fix_24h": {
+    "label": "pre-fix 24h",
+    "window_start": "2026-10-22 20:05:11",
+    "window_end": "2026-10-23 20:05:11",
+    "hourly_activity": [
+      {
+        "hour": "2026-10-22 20:00:00",
+        "local_dispatch_attempts": 91,
+        "local_served": 28,
+        "local_denials": 37,
+        "lease_active_fallbacks": 44,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-22 21:00:00",
+        "local_dispatch_attempts": 264,
+        "local_served": 18,
+        "local_denials": 198,
+        "lease_active_fallbacks": 21,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-22 22:00:00",
+        "local_dispatch_attempts": 221,
+        "local_served": 5,
+        "local_denials": 178,
+        "lease_active_fallbacks": 14,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-22 23:00:00",
+        "local_dispatch_attempts": 166,
+        "local_served": 0,
+        "local_denials": 134,
+        "lease_active_fallbacks": 26,
+        "state": "prefill-only-no-decode+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 00:00:00",
+        "local_dispatch_attempts": 173,
+        "local_served": 54,
+        "local_denials": 80,
+        "lease_active_fallbacks": 70,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 01:00:00",
+        "local_dispatch_attempts": 254,
+        "local_served": 2,
+        "local_denials": 215,
+        "lease_active_fallbacks": 68,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 02:00:00",
+        "local_dispatch_attempts": 173,
+        "local_served": 0,
+        "local_denials": 141,
+        "lease_active_fallbacks": 14,
+        "state": "prefill-only-no-decode+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 03:00:00",
+        "local_dispatch_attempts": 82,
+        "local_served": 0,
+        "local_denials": 54,
+        "lease_active_fallbacks": 6,
+        "state": "prefill-only-no-decode+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 04:00:00",
+        "local_dispatch_attempts": 50,
+        "local_served": 2,
+        "local_denials": 27,
+        "lease_active_fallbacks": 3,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 05:00:00",
+        "local_dispatch_attempts": 72,
+        "local_served": 1,
+        "local_denials": 41,
+        "lease_active_fallbacks": 4,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 06:00:00",
+        "local_dispatch_attempts": 79,
+        "local_served": 0,
+        "local_denials": 49,
+        "lease_active_fallbacks": 27,
+        "state": "prefill-only-no-decode+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 07:00:00",
+        "local_dispatch_attempts": 93,
+        "local_served": 9,
+        "local_denials": 48,
+        "lease_active_fallbacks": 29,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 08:00:00",
+        "local_dispatch_attempts": 272,
+        "local_served": 1,
+        "local_denials": 238,
+        "lease_active_fallbacks": 67,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 09:00:00",
+        "local_dispatch_attempts": 84,
+        "local_served": 32,
+        "local_denials": 18,
+        "lease_active_fallbacks": 2,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 10:00:00",
+        "local_dispatch_attempts": 46,
+        "local_served": 0,
+        "local_denials": 16,
+        "lease_active_fallbacks": 21,
+        "state": "prefill-only-no-decode+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 11:00:00",
+        "local_dispatch_attempts": 151,
+        "local_served": 0,
+        "local_denials": 118,
+        "lease_active_fallbacks": 116,
+        "state": "prefill-only-no-decode+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 12:00:00",
+        "local_dispatch_attempts": 102,
+        "local_served": 2,
+        "local_denials": 71,
+        "lease_active_fallbacks": 58,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 13:00:00",
+        "local_dispatch_attempts": 189,
+        "local_served": 34,
+        "local_denials": 114,
+        "lease_active_fallbacks": 49,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 14:00:00",
+        "local_dispatch_attempts": 63,
+        "local_served": 13,
+        "local_denials": 19,
+        "lease_active_fallbacks": 23,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 15:00:00",
+        "local_dispatch_attempts": 65,
+        "local_served": 5,
+        "local_denials": 30,
+        "lease_active_fallbacks": 13,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 16:00:00",
+        "local_dispatch_attempts": 147,
+        "local_served": 70,
+        "local_denials": 35,
+        "lease_active_fallbacks": 19,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 17:00:00",
+        "local_dispatch_attempts": 82,
+        "local_served": 26,
+        "local_denials": 22,
+        "lease_active_fallbacks": 22,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 18:00:00",
+        "local_dispatch_attempts": 87,
+        "local_served": 23,
+        "local_denials": 23,
+        "lease_active_fallbacks": 11,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 19:00:00",
+        "local_dispatch_attempts": 115,
+        "local_served": 10,
+        "local_denials": 75,
+        "lease_active_fallbacks": 39,
+        "state": "serving+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 20:00:00",
+        "local_dispatch_attempts": 3,
+        "local_served": 0,
+        "local_denials": 0,
+        "lease_active_fallbacks": 0,
+        "state": "prefill-only-no-decode"
+      }
+    ],
+    "total_lease_active_fallbacks": 766
+  },
+  "post_fix_window": {
+    "label": "post-fix (restart -> 21:03:06)",
+    "window_start": "2026-10-23 20:08:53",
+    "window_end": "2026-10-23 21:03:06",
+    "hourly_activity": [
+      {
+        "hour": "2026-10-23 20:00:00",
+        "local_dispatch_attempts": 14,
+        "local_served": 0,
+        "local_denials": 3,
+        "lease_active_fallbacks": 0,
+        "state": "prefill-only-no-decode+lease-blocked"
+      },
+      {
+        "hour": "2026-10-23 21:00:00",
+        "local_dispatch_attempts": 2,
+        "local_served": 0,
+        "local_denials": 2,
+        "lease_active_fallbacks": 0,
+        "state": "prefill-only-no-decode+lease-blocked"
+      }
+    ],
+    "total_lease_active_fallbacks": 0
+  },
+  "ac2_live": {
+    "deadline_path": {
+      "dispatch": "2026-10-23 20:51:19",
+      "deadline": "2026-10-23 20:52:58",
+      "release": "2026-10-23 20:52:58",
+      "release_reason": "prefill_deadline",
+      "release_delta_seconds": 0.0,
+      "client_status": 503,
+      "gate_free_seconds": 142.9
+    },
+    "watchdog_path": {
+      "dispatch": "2026-10-23 20:19:17",
+      "release": "2026-10-23 20:22:26",
+      "release_reason": "no_progress_watchdog",
+      "release_delta_seconds": 189.0
+    }
+  },
+  "regression": {
+    "work_item": "LP-0MVLFVY6K003VYEL",
+    "client_dead_hold_seconds": 330,
+    "client_dead_hold_note": "dispatch 20:58:36 -> marker cleared ~21:04"
+  },
+  "ac3_live": {
+    "session": "ac3-serving-220422",
+    "dispatch": "2026-10-23 22:04:22.699",
+    "first_byte": "2026-10-23 22:04:25.544",
+    "dispatch_first_byte_ms": 2845.6,
+    "queue_wait_ms": 0.2,
+    "finish": "2026-10-23 22:04:25.702",
+    "finish_reason": "length",
+    "provider": "local",
+    "tokens_delivered": true
+  }
+}

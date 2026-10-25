@@ -90,6 +90,24 @@
 #                         model: deepseek-v4.1-flash
 #                         available_times: ["10:00-12:00", "14:00-16:00"]
 #
+# Priority-chain membership (optional; LP-0MVGPZWY0001JD1D):
+#   priorities - List of the low|medium|high priorities this provider may
+#                serve. The model's priority chain is its ordered
+#                ``providers`` list filtered by the request's effective
+#                priority (chain(P) = [p for p in providers if P in
+#                p["priorities"]]) — no separate route map exists anymore.
+#                Model-level opt-in, fail-closed: if ANY provider of a model
+#                declares ``priorities``, EVERY provider of that model must
+#                declare it, and together they must cover every priority
+#                (validated at load; models that declare no ``priorities``
+#                anywhere keep every provider eligible for every priority,
+#                e.g. embed/github/private). No tier implications:
+#                [medium, high] never includes ``low``.
+#                Example:
+#                  - name: munitoai
+#                    type: remote
+#                    priorities: [medium, high]
+#
 # Per-entry request budget (optional, remote providers only):
 #   rate_limit_rpm - maximum dispatches to this provider entry per rolling
 #                    60-second window (LP-0MVDQ1GMO00801PL). Intended for
@@ -383,6 +401,7 @@ models:
   plan:
     providers:
       - name: local-qwen3
+        priorities: [low, medium, high]
         type: local
         llama_model: Qwen3
       # MunitoAI Free (LP-0MV5UPXKL002MSKB): free-tier remote fallback, sits
@@ -396,6 +415,7 @@ models:
       # ``MunitoAI Free/<model>`` vs the paid ``MunitoAI/<model>`` in Pi
       # (LP-0MVCQ36QV009QX8K).
       - name: munitoai-free
+        priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
@@ -433,6 +453,7 @@ models:
         # both see the full 3-per-window cap.
         rate_limit_rpm: 3
       - name: opencode-go-3
+        priorities: [low, medium, high]
         display_name: OpenCode Go 3
         type: remote
         provider: opencode-go
@@ -461,6 +482,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go-2
+        priorities: [low, medium, high]
         display_name: OpenCode Go 2
         type: remote
         provider: opencode-go
@@ -482,6 +504,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go
+        priorities: [low, medium, high]
         display_name: OpenCode Go
         type: remote
         provider: opencode-go
@@ -507,6 +530,7 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
+        priorities: [medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
@@ -528,6 +552,7 @@ models:
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
       - name: deepseek-flash
+        priorities: [medium, high]
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
@@ -540,39 +565,6 @@ models:
         # destination (AC3).
         max_context_tokens: 1048576
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-    # Per-priority provider chains (LP-0MVDT94F0003VHUA AC2). Each entry is
-    # an ordered provider list (names resolved against ``providers``); the
-    # chain used for a request is selected by its effective priority. A
-    # missing priority falls back to the full ``providers`` chain (today's
-    # behaviour = ``medium`` semantics). ``medium``/``high`` use the full
-    # chain — high differs only in the routing knobs (never queues, economic
-    # bypass routes remote), not the chain (AC3).
-    #
-    # ``low`` prefers local, then the free tier. Off-peak exception
-    # (LP-0MVF17VP70053JXX): once the free tier is spent, the three
-    # opencode-go entries absorb local-slot overflow, gated by their
-    # timed-access (UTC) windows — unchanged from LP-0MSXPHTD9004DZ4P — so
-    # paid spend stays confined to off-peak hours
-    # (UTC 00:00-01:00, 04:00-06:00, 10:00-00:00).
-    # UTC-vs-local overlap: the cheap priority window (01:00-10:00 local
-    # Europe/Dublin = UTC 00:00-09:00), so the new tiers add capacity in ~3
-    # of the 9 cheap hours (00:00-01:00 and 04:00-06:00); the 01:00-04:00 /
-    # 06:00-10:00 gaps are deliberate paid-spend avoidance.
-    # 429 failover is per API-key account (``_usage_limit_account_key`` =
-    # ``api_key_env@endpoint``, LP-0MSMBWB23009XYPW / LP-0MVCX0E2V001VB5N),
-    # so the three entries carry independent rate-limit quota (3x capacity).
-    # Caveat: 5xx/stall failures share ONE failure domain
-    # (``_failure_domain_key``, LP-0MSG45I8Q0020N1F) — same-gateway siblings
-    # are skipped during an opencode outage, so the three entries do NOT
-    # multiply resilience. ``munitoai`` / ``deepseek-flash`` carry no window
-    # discipline and never join the low chain.
-    priority_routes:
-      low:
-        - local-qwen3
-        - munitoai-free
-        - opencode-go-3
-        - opencode-go-2
-        - opencode-go
     aliases:
     - plan*
     force_full_prompt: true
@@ -584,6 +576,7 @@ models:
   author:
     providers:
       - name: local-qwen3
+        priorities: [low, medium, high]
         type: local
         llama_model: Qwen3
       # MunitoAI Free: free-tier remote fallback, sits immediately after
@@ -591,6 +584,7 @@ models:
       # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
       # around the clock.
       - name: munitoai-free
+        priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
@@ -628,6 +622,7 @@ models:
         # both see the full 3-per-window cap.
         rate_limit_rpm: 3
       - name: opencode-go-3
+        priorities: [low, medium, high]
         display_name: OpenCode Go 3
         type: remote
         provider: opencode-go
@@ -649,6 +644,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go-2
+        priorities: [low, medium, high]
         display_name: OpenCode Go 2
         type: remote
         provider: opencode-go
@@ -670,6 +666,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go
+        priorities: [low, medium, high]
         display_name: OpenCode Go
         type: remote
         provider: opencode-go
@@ -695,6 +692,7 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
+        priorities: [medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
@@ -716,6 +714,7 @@ models:
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
       - name: deepseek-flash
+        priorities: [medium, high]
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
@@ -728,13 +727,6 @@ models:
         # destination (AC3).
         max_context_tokens: 1048576
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-    priority_routes:
-      low:
-        - local-qwen3
-        - munitoai-free
-        - opencode-go-3
-        - opencode-go-2
-        - opencode-go
     aliases:
     - author
     force_full_prompt: true
@@ -753,6 +745,7 @@ models:
   code:
     providers:
       - name: local-qwen3
+        priorities: [low, medium, high]
         type: local
         llama_model: Qwen3
       # MunitoAI Free: free-tier remote fallback, sits immediately after
@@ -760,6 +753,7 @@ models:
       # ``MUNITOAI_FREE_API_KEY``). No available_times window — eligible
       # around the clock.
       - name: munitoai-free
+        priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
@@ -797,6 +791,7 @@ models:
         # both see the full 3-per-window cap.
         rate_limit_rpm: 3
       - name: opencode-go-3
+        priorities: [low, medium, high]
         display_name: OpenCode Go 3
         type: remote
         provider: opencode-go
@@ -818,6 +813,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go-2
+        priorities: [low, medium, high]
         display_name: OpenCode Go 2
         type: remote
         provider: opencode-go
@@ -839,6 +835,7 @@ models:
         # model: muse-spark-1.3-contributor
         # api: openai-responses
       - name: opencode-go
+        priorities: [low, medium, high]
         display_name: OpenCode Go
         type: remote
         provider: opencode-go
@@ -864,6 +861,7 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
+        priorities: [medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
@@ -885,6 +883,7 @@ models:
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
       - name: deepseek-flash
+        priorities: [medium, high]
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
@@ -897,13 +896,6 @@ models:
         # destination (AC3).
         max_context_tokens: 1048576
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-    priority_routes:
-      low:
-        - local-qwen3
-        - munitoai-free
-        - opencode-go-3
-        - opencode-go-2
-        - opencode-go
     aliases:
     - code
     force_full_prompt: true
@@ -922,6 +914,7 @@ models:
   compact:
     providers:
       - name: opencode-go-compact
+        priorities: [low, medium, high]
         display_name: OpenCode Go Compact
         type: remote
         provider: opencode-go
@@ -934,6 +927,7 @@ models:
         api: openai-responses
         forward_session_headers: false
       - name: deepseek-flash-compact
+        priorities: [low, medium, high]
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
@@ -943,14 +937,6 @@ models:
         # GET /models/deepseek-flash context_window = 1048576.
         max_context_tokens: 1048576
         available_times: ["00:00-01:00", "04:00-06:00", "10:00-00:00"]
-    # Remote-only chain has no local tier, so every priority uses the same
-    # chain (summarisation never contends with the GPU slots;
-    # LP-0MTT0O74N009E7N2). Declared explicitly to satisfy the
-    # per-model ``priority_routes`` schema (AC2).
-    priority_routes:
-      low:
-        - opencode-go-compact
-        - deepseek-flash-compact
 server:
   embeddings_model: mxbai-embed
   host: 0.0.0.0
@@ -1309,6 +1295,71 @@ server:
   # at 3 slots.
   local_large_context_warm_cache_threshold: 120000
 
+  # Resident-prefix admission gate (LP-0MVN1IQTF0037WTG AC1/AC3). Local
+  # admission used to be priced purely from a *prediction* (`cached_ratio`
+  # from the session's snapshot sidecar). Under contention that prediction is
+  # structurally wrong — 27 sessions cycled through 2 slots in 5.4 h on
+  # 2026-10-24, aggregate prefix reuse was 26.1 % (median 15.6 % for prompts
+  # >20k tokens) and the same 49,103-token prompt measured `n_past=738` on one
+  # attempt and 100 % reuse on the immediate retry. A large prompt (estimated
+  # tokens above `local_large_context_cold_cache_threshold`) is now admitted
+  # locally only when at least this fraction of it is *actually* resident in
+  # the session's slot, measured from the ~1 s cached `/slots` snapshot plus
+  # the in-process slot-ownership registry. `/slots` is never queried on the
+  # admission hot path (llama-server holds it >15 s during prompt processing,
+  # LP-0MUXTW4MD003TVIC).
+  #
+  # - `0` disables the gate entirely and restores the predicted-ratio
+  #   decision; values are clamped to (0, 1].
+  # - On a denial the request skips local with reason
+  #   `resident_prefix_insufficient` and follows the normal fallback chain,
+  #   exactly like `large_context_bypass` today; the `contention_queue_*`
+  #   budget is untouched (a denied request never enters the queue).
+  # - `local_idle_admit_*` (LP-0MVGD9Z8Z0055Y5J) is the LAST rung of the
+  #   ladder: an idle GPU still overrides a residency denial, so enabling this
+  #   gate cannot make an idle local backend refuse cold work.
+  # - Fail-open: a missing/stale snapshot, a session that owns no slot, or a
+  #   build that does not report `context_tokens` (llama.cpp b8782 dropped
+  #   `n_past`) degrades to the session-owns-slot check and then to the
+  #   predicted ratio — never to a hard local outage.
+  # - Live-prefix pricing (AC3): when the measurement is available, the
+  #   cold-token cap (`local_large_context_cold_cache_threshold`, 25k from
+  #   LP-0MVN3KMGI009BZ0D once shipped) is evaluated against the *measured*
+  #   new-token count rather than the predicted one.
+  #
+  # Default: 0.5 (50 % of the prompt must still be resident).
+  local_resident_prefix_min_ratio: 0.5
+
+  # Session tenancy bound (LP-0MVN1IQTF0037WTG AC2). Per-request dispatch
+  # leases bound *in-flight* requests but not *which* sessions occupy the
+  # pool over time: 27 distinct sessions cycled through 2 slots in 5.4 h on
+  # 2026-10-24, and every newcomer evicted the resident session's KV prefix
+  # (median prefix reuse 15.6 % for prompts >20k tokens). At most this many
+  # distinct sessions may hold a local reservation for a large prompt at once;
+  # beyond the bound a new session's prompt follows the normal fallback chain
+  # (skip reason `tenant_limit`) instead of evicting a resident.
+  #
+  # - Default: the resolved slot count (`session_slot_pool_size`, i.e. 2), so
+  #   "N tenants, N slots".
+  # - `0` disables the bound (unlimited tenants).
+  # - Same-session re-entry is always allowed: a session's own next turn is
+  #   never blocked by the bound, only *new* sessions are.
+  # - Occupancy is read from the existing dispatch records plus the residency
+  #   view (a session whose slot is `is_processing` is holding its prefix).
+  #   No new lifecycle machinery, no `/slots` call.
+  local_session_tenants: 2
+
+  # Idle-lapse for a session tenancy (seconds, LP-0MVN1IQTF0037WTG AC2/AC6).
+  # A tenancy is a lease, not a lock: once a resident session has shown no
+  # activity for this long its tenancy lapses and a new session may take the
+  # pool. Defaults to `local_dispatch_lease_timeout_seconds` (below) so
+  # tenancy lapses on the same clock as the adaptive dispatch lease that holds
+  # the slot — one lifecycle, already bounded by the 180 s no-progress
+  # watchdog and the 900 s lifetime ceiling. Non-positive/malformed values
+  # fall back to that default (a zero would lapse tenancy instantly and
+  # silently disable the bound).
+  local_session_tenancy_idle_seconds: 30
+
   # Latency-derived economic-ceiling ratio for the WARM threshold
   # (LP-0MU466L1X003RTHN). The ceiling scales linearly with the model context
   # size (not the slot count) so a profile change (smaller model, different
@@ -1454,14 +1505,29 @@ server:
   #   signal under load — llama-server holds it for the duration of a
   #   prompt-processing batch (measured 8.7s, then >15s, versus the 1s
   #   ``STATUS_QUERY_TIMEOUT``), and a queued request's slot reports
-  #   ``is_processing=False``. The extension therefore also refreshes
-  #   ``last_progress_ts`` whenever the upstream request is still in flight
-  #   with no error (``prefill_in_flight``), which is authoritative and does not
+  #   ``is_processing=False``. The extension therefore also keeps the lease
+  #   valid whenever the caller's OWN upstream request is still in flight with
+  #   no error (``prefill_in_flight``), which is authoritative and does not
   #   depend on ``/slots``. Without it every prefill or queue wait longer than
   #   this timeout was released, its upstream stream cancelled, and the client
-  #   retried into a full re-prefill forever. A genuinely wedged slot (no
-  #   response, no chunks) is still bounded by
-  #   ``local_dispatch_max_prefill_seconds`` below.
+  #   retried into a full re-prefill forever.
+  #   NOTE (LP-0MVKUKFSO008GI6O): an open request is NOT progress. The in-flight
+  #   signal pushes ``expires_at`` out but does NOT refresh ``last_progress_ts``,
+  #   so a genuinely progress-less in-flight record is still released by this
+  #   timeout (only observed numeric progress or observed slot liveness refreshes
+  #   the clock). Refreshing it on the in-flight signal alone defeated this
+  #   watchdog and held the local pool ~4 h on 2026-10-23. The in-flight signal
+  #   is also own-session only (another session's marker never extends this
+  #   lease), and ``local_dispatch_max_prefill_seconds`` below remains the
+  #   lifetime backstop.
+  #   NOTE (LP-0MVIQ0FJC000YLX0): the orphan-cleanup sweep now applies the SAME
+  #   fail-closed rule at the point of release — an expired active lease whose
+  #   ``/slots`` probe is inconclusive (timeout/error/no slot) but whose
+  #   ``last_progress_ts`` is inside this timeout is EXTENDED, not orphaned
+  #   (``lease_verified_active reason=recent_progress``). A busy backend is not
+  #   a dead backend. Setting this to 0 disables the watchdog and therefore
+  #   the fail-closed extension too (a stale expired active record is then
+  #   orphan-cleaned).
   # local_dispatch_max_prefill_seconds: Hard ceiling on a single local dispatch
   #   record's lifetime (default 900s; 0 disables). A record active for longer than
   #   this is released regardless of observed progress or in-flight liveness —
@@ -1478,6 +1544,27 @@ server:
   #   the client exactly and logged ``dispatch_first_byte_timeout ...
   #   ceiling=900s``. The lifetime wedge bound above is unchanged; a healthy
   #   stream that delivered its first byte keeps its full lifetime window.
+  #   NOTE (LP-0MVIQ0G2M0006QF6): the effective ceiling is the TIGHTER of this
+  #   value and ``local_prefill_deadline_seconds`` below, so by default the
+  #   deadline (90 s) is the bound that fires; setting the deadline to 0
+  #   restores this ceiling unchanged.
+  # local_prefill_deadline_seconds: Prefill deadline — a hard backstop
+  #   INDEPENDENT of ETA-estimator quality (default 90 s; 0 disables;
+  #   LP-0MVIQ0G2M0006QF6 AC3). If a local dispatch has produced no first byte
+  #   by this deadline, the pending upstream request is cancelled and the local
+  #   dispatch aborts with the retryable 503 the first-byte ceiling already
+  #   produces, so the chain detours to the next provider instead of leaving
+  #   the client on a silent socket for minutes (baseline: 48 of 606 local
+  #   dispatches had a first byte after >120 s, max 592 s). It is deliberately
+  #   ABOVE the admission budget (``contention_queue_max_wait_seconds``, 60 s)
+  #   so a request admitted inside its budget is never cut off, and BELOW the
+  #   840 s wedge ceiling so it is the bound that actually fires. Precedence:
+  #   deadline < first-byte ceiling < ``local_dispatch_max_prefill_seconds``.
+  #   Logged as ``prefill_deadline_exceeded`` when it is what fired. On that
+  #   event the dispatch record and the session's
+  #   ``local_prefill_in_flight`` marker are released immediately
+  #   (``lease_released reason=prefill_deadline``) — a dispatch that never
+  #   produced a byte retains nothing (LP-0MVKUKFSO008GI6O).
   # local_dispatch_prefill_observability_warn_seconds: Threshold (default 30s) at
   #   which a long initial first-byte wait logs a ``prefill_wait_exceeds_threshold``
   #   warning. While awaiting the SSE response headers, the proxy polls prefill
@@ -1492,6 +1579,13 @@ server:
   #       coalesced /slots snapshot; callers within it share one request.
   #     SLOTS_POLL_FAILURE_BACKOFF_SECONDS (default 5.0) — how long a failed
   #       /slots fetch is cached so an unavailable backend is not hammered.
+  #     SLOTS_POLL_FOLLOWER_TIMEOUT_SECONDS (optional) — upper bound on how
+  #       long a follower waits for the leader's shared future before it
+  #       promotes itself to leader; defaults to the caller's own /slots
+  #       timeout and may only lower it (LP-0MVK1YDKB0009HTM).
+  #   A leader that is cancelled (e.g. the browser disconnects and Starlette
+  #   cancels the SSE handler) always settles that shared future, so followers
+  #   are released instead of hanging forever (LP-0MVJML600003CQ6Y).
   #   On failure callers fall back to the last-known counts with slots_stale.
   # Reduced from 180s to 60s to prevent long cross-session blocking, then
   # to 15s (LP-0MSKLI4FH0082TEB). Log analysis (5.3h, 198 local_dispatch_denied
@@ -1615,7 +1709,8 @@ server:
   # Contention queue (merged from the retired config-fast/cheap overlays)
   # -----------------------------------------------------------------------
   # The per-mode queue policy was declared by the mode overlays
-  # (config-fast.yaml / config-cheap.yaml, both ``queue`` depth 8 / wait 120s);
+  # (config-fast.yaml / config-cheap.yaml, both ``queue`` depth 8 / wait 120s;
+  # unified to a single value, 60 s since LP-0MVIQ0EXV00673HO);
   # with the mode axis removed the policy is a single server-level knob.
   # Circuit: a request that finds all local slots busy QUEUES (bounded by
   # these caps) instead of immediately falling back to a paid remote
@@ -1623,14 +1718,27 @@ server:
   # ``queue``; ``low`` always queues (cheap semantics); ``high`` never
   # queues (immediate remote fallback) — see proxy/proxy/priority.py.
   contention_queue_policy: queue
-  contention_queue_max_wait_seconds: 120
+  contention_queue_max_wait_seconds: 60   # halved from 120 → 60 (LP-0MVIQ0EXV00673HO: 1 481 full-120-s fallbacks in 24h were wasted; 60 s is the documented optimum for this queue); Server restart required to change.
   contention_queue_max_depth: 8
+  # ETA-aware admission ordering (LP-0MVIQ0G2M0006QF6 AC1). With
+  # ``local_max_concurrent_prefills: 1`` one long prefill is head-of-line
+  # blocking for every queued local request (1 827 prefill-saturated queue
+  # samples vs 468 generating in 24h). Within each retention class the queue
+  # now inserts a waiter by ascending projected prefill ETA, so a queue of
+  # 20 s turns is not parked behind one 7-minute prefill. Retention still wins
+  # over size: ordering never lets a newcomer overtake a retained session.
+  # ``false`` restores plain FIFO within each class (rollback).
+  contention_queue_eta_ordering: true
+  # Starvation bound for ETA ordering: a waiter that has waited this long is
+  # promoted to the front of its retention class (treated as ETA 0), so a
+  # long prefill that keeps losing to shorter ones still gets the slot.
+  contention_queue_eta_promotion_seconds: 30
   # Lease-owner retention priority (LP-0MVI2VRT2000V1AP). A session that
   # already holds a local lease, or was granted one within this grace window
   # AND still has local cache history, is placed ahead of non-retained
   # waiters in the contention queue (FIFO within each class). Rationale: a
   # returning session otherwise re-queues behind newcomers, waits the full
-  # 120 s budget and detours to a paid provider, then comes back and
+  # 60 s budget and detours to a paid provider, then comes back and
   # re-prefills — measured on 2026-10-21 as 7 local<->remote transitions in
   # 12 minutes for one session, with no ETA or context-size cause.
   # The cache-history requirement keeps the priority honest: a session whose
@@ -1644,9 +1752,10 @@ server:
   contention_queue_lease_grace_seconds: 300
 
   # -----------------------------------------------------------------------
-  # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ)
+  # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ,
+  # LP-0MVIQ0F8T002FS42)
   # -----------------------------------------------------------------------
-  # Before entering the contention queue the proxy costs the projected local
+  # Before dispatching a local request the proxy costs the projected local
   # prefill from OBSERVED dispatches (dispatch_first_byte_ms, per model and
   # context bucket, rolling window) and compares it with the caller's wait
   # budget (``contention_queue_max_wait_seconds`` above; ``high`` priority
@@ -1655,9 +1764,20 @@ server:
   # to the full budget and then fall back remote anyway (measured 2026-10-19
   # → 10-20: 4,947 of 5,805 queued waits = 85 % abandoned) — so local
   # admission is refused immediately and the request falls through to the
-  # next provider. A request refused this way that finds no remote provider
+  # next provider (LP-0MVIQ0EXV00673HO: halved budget from 120→60 s as 1 481
+  # full-120-s waits were wasted in 24h). A request refused this way that finds no remote provider
   # receives a retryable 429 with ``Retry-After`` and ``X-Local-Admission*``
   # headers.
+  #
+  # The guard runs on BOTH local dispatch paths (LP-0MVIQ0F8T002FS42):
+  #   - queue entry, when every local slot is busy; and
+  #   - the DIRECT (free-slot) path, immediately before dispatch. A free slot
+  #     is not permission to start a 40-80k-token prefill the caller will
+  #     abandon — baseline 48 of 606 local dispatches had a first byte after
+  #     >120 s, most of them on a free slot. The direct decision logs
+  #     ``reason=eta_exceeds_budget_direct free_slot=true`` (the queue
+  #     decision keeps ``reason=eta_exceeds_budget``); both use this one
+  #     estimator and this one budget knob — there is no second budget.
   #
   # The comparison is OCCUPANCY-AWARE (LP-0MVICD2YW004DJPV): the quantity
   # tested against the budget is
@@ -1673,6 +1793,32 @@ server:
   # estimate and the enforced verdict cannot drift. An in-flight prefill with
   # unobservable progress is charged the calibrated estimate (never "free
   # soon").
+  #
+  # CONSERVATIVE ETA FOR LARGE PROMPTS (LP-0MVKUKF65008D5UN). The projected
+  # prefill above is costed from a conservative percentile of observed
+  # first-byte times for prompts >= 32k tokens
+  # (``local_admission_guard_eta_percentile``, default p75, never below the
+  # bucket's measured p50), so a large prompt is not admitted on the
+  # optimistic point estimate that the 90 s deadline then cancels. Set the
+  # percentile to 0 for the rollback (point estimate, byte-for-byte).
+  #
+  # SECOND, INDEPENDENT BOUND — the prefill DEADLINE (LP-0MVKUKEU80022C3U).
+  # The budget bound above only refuses when the projected wait exceeds the
+  # queue budget, but nothing refused admission against the hard
+  # ``local_prefill_deadline_seconds`` (default 90 s) backstop. A prompt
+  # whose projected first-byte ETA >= the deadline is a guaranteed loss —
+  # the dispatch is cancelled by the deadline before its first byte
+  # (deterministic, measured 2026-10-23: 130-265 s prefills vs a 90 s
+  # deadline). The guard therefore ALSO refuses when
+  # ``eta_prefill >= local_prefill_deadline_seconds``, logging
+  # ``reason=prefill_eta_exceeds_deadline`` on BOTH paths (the deadline is
+  # the binding constraint — no second budget knob). Ordering to keep:
+  # ``contention_queue_max_wait_seconds < local_prefill_deadline_seconds <
+  # local_dispatch_first_byte_timeout_seconds <
+  # local_dispatch_max_prefill_seconds`` — an admitted request must never
+  # be cut off by the deadline (budget < deadline), and the deadline must
+  # fire before the first-byte ceiling and the wedge bound. Setting the
+  # deadline to 0 disables this bound (documented rollback).
   #
   # Fail-open: the change can only refuse further DOOMED admissions, never
   # admit more than before, and an uncalibrated bucket still admits.
@@ -1721,8 +1867,125 @@ server:
   local_admission_guard_min_samples: 5
   local_admission_guard_window_samples: 200
   # Prompt size used for the published estimate on /llama/local/status when
-  # no dispatch has been observed yet for the current model.
-  local_admission_guard_reference_tokens: 32000
+  # no dispatch has been observed yet for the current model. Aligned with the
+  # cold-prefill admission budget below (LP-0MVN4LBEQ005QRVL) so the published
+  # status reference and the budget are ONE number, not two.
+  local_admission_guard_reference_tokens: 25000
+  # Conservative ETA pricing for large prompts (LP-0MVKUKF65008D5UN): the
+  # point least-squares estimate is optimistic for large prompts (measured
+  # first-byte times p50 16s / p90 189s / max 591s; a 19,940-token prompt was
+  # once modelled at 19.9s). Prompts >= 32k tokens are therefore priced at
+  # this PERCENTILE of the observed ``dispatch_first_byte_ms`` window for
+  # their (model, context bucket) — default 75 (p75) — and never below the
+  # window's measured p50, so an infeasible large prompt is refused at
+  # admission by the ``local_prefill_deadline_seconds`` backstop (C2) instead
+  # of starting a prefill the deadline will cancel. Smaller prompts are
+  # unchanged, and setting this to 0 disables the percentile pricing
+  # (documented rollback — byte-for-byte the point estimate).
+  local_admission_guard_eta_percentile: 75
+  # Conservative percentile pricing now engages from this prompt size upwards
+  # (tokens; default 32768 = the pre-existing hard-coded CONSERVATIVE_MIN_TOKENS
+  # floor, so an absent key is byte-for-byte today's behaviour). Lowered to
+  # 20000 so the p75 pricing also covers the 25 000-token budget band
+  # (LP-0MVN4LBEQ005QRVL). If this exceeds local_cold_prefill_budget_tokens the
+  # percentile pricing would never engage for a budgeted prompt, so startup
+  # logs a WARNING that the band guard is silently dead.
+  local_admission_guard_eta_percentile_min_tokens: 20000
+  # Hard cap on the NEW (to-be-prefilled / uncached) tokens admitted for a
+  # local dispatch (tokens; 0 DISABLES the cap = documented rollback).
+  # LP-0MVN3KMGI009BZ0D / LP-0MVN4LBEQ005QRVL: the cap bounds what the GPU must
+  # actually compute, NOT the prompt size — a cache-warm request whose
+  # new_tokens are small stays admissible at any prompt size (measured
+  # 2026-10-24: warm 47k prompt / 549 new tokens completed locally). It is
+  # enforced on EVERY admission path, including the idle/economic bypass that
+  # admitted 33 oversized (>25k new-token) cold prompts in the measured
+  # 18:38-23:47 window; over-budget requests are refused at admission
+  # (reason=prefill_budget_exceeded) and detour, never dispatched then
+  # cancelled at the deadline. Interaction with cold_threshold (38000, derived
+  # from per-slot ctx) and warm_threshold: cold_threshold stays a
+  # large-context routing bypass and becomes a non-binding upper bound once
+  # this measured budget exists; warm requests are unaffected because the cap
+  # counts new tokens only. Interaction with the admission guard: the guard
+  # prices a budgeted prompt's conservative ETA and refuses it when that ETA
+  # exceeds local_admission_guard_budget_safety_fraction x
+  # local_prefill_deadline_seconds, so a band-slow prompt cannot slip past the
+  # flat token cap.
+  local_cold_prefill_budget_tokens: 25000
+  # Fraction of local_prefill_deadline_seconds a budgeted prompt's conservative
+  # p75 ETA must fit inside before it is admitted (default 0.0 = DISABLED =
+  # documented rollback). 0.95 x 120 s = 114 s: a 25k cold prompt prices ~93 s
+  # at the measured 20-30k band p75 rate (~270 t/s) and is admitted, while a
+  # band-slow 25k (~132 s at ~190 t/s) is refused
+  # (LP-0MVN4LBEQ005QRVL). This makes the budget deadline-relative instead of a
+  # bare token count, so a future deadline change stays consistent.
+  local_admission_guard_budget_safety_fraction: 0.95
+  # Deadline-aware admission bound (LP-0MVKUKEU80022C3U): the guard ALSO
+  # refuses local when the projected first-byte ETA exceeds this hard
+  # backstop (seconds; 0 disables the bound). Widened 90 -> 120 s
+  # (LP-0MVN4LBEQ005QRVL): at the measured 20-30k band rate (249 t/s) a 25 000
+  # new-token prefill costs ~100 s (~93 s at the band's p75 of ~270 t/s), so a
+  # 90 s deadline cancels a genuinely feasible prompt while 120 s admits it
+  # with ~16 % margin (~23 % at p75).
+  #
+  # ORDERING (asserted at startup, FATAL on violation by
+  # _startup_validate_prefill_timeout_config):
+  #   contention_queue_max_wait_seconds (60)
+  #     < local_prefill_deadline_seconds (120)
+  #     < local_dispatch_first_byte_timeout_seconds (840)
+  #     < local_dispatch_max_prefill_seconds (900)
+  #     < the client's 900 s queue deadline.
+  #
+  # ROLLBACK (restores the pre-LP-0MVN3KMGI009BZ0D behaviour): set
+  # local_prefill_deadline_seconds back to 90, local_cold_prefill_budget_tokens
+  # to 0 (cap disabled), local_admission_guard_eta_percentile_min_tokens to
+  # 32768 (the old hard-coded floor),
+  # local_admission_guard_budget_safety_fraction to 0.0 (bound disabled) and
+  # local_admission_guard_reference_tokens to 32000. Each is a pure value
+  # change — no code change and no restart ordering constraint beyond the
+  # usual process restart.
+  local_prefill_deadline_seconds: 120
+  # Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL): when a
+  # local dispatch is cancelled by the prefill deadline
+  # (``prefill_deadline_exceeded``), that session is kept OFF local for
+  # ``local_prefill_thrash_cooldown_seconds`` (default **600 s**; 0 disables)
+  # so the identical prompt is not re-prefilled every turn — the 2026-10-23
+  # incident re-dispatched the same 28k-124k-token prompt 41 times (35 inside
+  # 02:00-03:00), each burning a full prefill before the 90 s deadline
+  # cancelled it. During the window that session's local routing skips
+  # (``routing_skip_local reason=prefill_thrash_cooldown``,
+  # ``cooldown_remaining=Ns``) and the chain reaches the next provider
+  # immediately; OTHER sessions are unaffected (per-session key). The window
+  # clears early on a successful local first byte and expires lazily; this
+  # knob is the documented rollback — 0 restores the pre-fix behaviour
+  # (no cooldown, no skip).
+  local_prefill_thrash_cooldown_seconds: 600
+
+  # -----------------------------------------------------------------------
+  # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
+  # -----------------------------------------------------------------------
+  # When the local backend has been idle for ``local_idle_admit_seconds`` and
+  # nothing is queued, in flight or loading, an ECONOMIC cold/large bypass
+  # (``reason=large_context_bypass``) is served locally instead of falling
+  # back to a paid remote provider. The physical capacity cap
+  # (``context_too_large``) is never overridden. Each admission logs
+  # ``routing_idle_admit ... reason=economic_bypass_idle idle_seconds=...
+  # threshold_seconds=... estimated_tokens=... session=...`` and is counted as
+  # ``local_idle_admit`` by the usage report.
+  #
+  # MEASUREMENT WINDOW IN PROGRESS (LP-0MVJXGSEG0045IAF, approved by the
+  # producer 2026-10-22): the override is ON so the >= 24 h before/after
+  # measurement for LP-0MVGHXD59008UOUD can run. The window starts at the
+  # `POST /admin/reload-config` that made this flag live (recorded on the work
+  # item; no restart needed) and is analysed with
+  # ``scripts/idle_admit_impact.py --window-closed``.
+  #
+  # ROLLBACK is this flag back to ``false`` + the same reload (no other state).
+  # Keep it on only if the measured window supports `enable_by_default`; if the
+  # tool says `tune`, apply the tuning it proposes before leaving it enabled.
+  # A malformed or non-positive ``local_idle_admit_seconds`` also disables the
+  # override rather than admitting on a guess.
+  local_idle_admit_enabled: true
+  local_idle_admit_seconds: 60
 
   # -----------------------------------------------------------------------
   # Expected-reuse prefix credit (LP-0MVI2XOTY008Q4UV)

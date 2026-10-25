@@ -56,6 +56,7 @@ def _log_local_stream_client_disconnect(srv, session_id, model_name):
 # Imports from sibling extracted modules
 import proxy.metrics as metrics  # noqa: E402
 from proxy import cold_start  # noqa: E402
+from proxy.disconnect_reaper import client_disconnect_observed  # noqa: E402
 from proxy.lifecycle import (  # noqa: E402
     _compute_adaptive_timeout,
     _is_self_healing_active,
@@ -99,6 +100,7 @@ from proxy.utils import (  # noqa: E402
 
 # Imports from sibling router helpers
 from .router_helpers import (  # noqa: E402  # noqa: E402, F401
+    ClientDisconnectedDuringPrefillError,
     _apply_queue_wait_to_timeout,
     _await_first_byte_with_prefill_monitor,
     _build_backend_error_response,
@@ -106,6 +108,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _call_with_backend_retries,
     _call_with_empty_retry,
     _check_slot_availability,
+    _clear_prefill_thrash_cooldown,
     _client_identity_extra,
     _compute_request_timeout,
     _decrement_active_queries,
@@ -117,16 +120,22 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _get_chunk_refresh_buffer_seconds,
     _get_first_byte_timeout_seconds,
     _get_lease_timeout_seconds,
+    _get_prefill_deadline_seconds,
+    _get_prefill_thrash_cooldown_seconds,
     _get_request_preview,
     _handle_session,
     _increment_active_queries,
     _increment_local_active_queries,
     _increment_per_model_query,
     _normalize_outgoing_headers,
+    _record_prefill_thrash_cooldown,
+    _release_client_disconnect_dispatch,
+    _release_prefill_deadline_dispatch,
     _request_dedup_hash,
     _schedule_recv_token_increment,
     _schedule_token_increment,
     _schedule_traffic_recording,
+    _spawn_detached_release,
     _try_acquire_local_dispatch,
     log_request,
     log_response,
@@ -248,11 +257,38 @@ def _get_contention_queue_config(server_config: dict) -> dict:
             "(bounds [0, session_guardrail_max_runtime_seconds=%s])",
             raw_grace, lease_grace_seconds, max_runtime,
         )
+    # ETA-aware admission ordering (LP-0MVIQ0G2M0006QF6 AC1): within a
+    # retention class, admit the shortest projected prefill first so a long
+    # prefill cannot be head-of-line blocking for a queue of short turns.
+    # ``contention_queue_eta_ordering`` (default on) is the rollback switch;
+    # ``contention_queue_eta_promotion_seconds`` bounds starvation by
+    # promoting a waiter older than this to the front of its class.
+    raw_eta_ordering = server_config.get("contention_queue_eta_ordering", True)
+    if isinstance(raw_eta_ordering, str):
+        eta_ordering = raw_eta_ordering.strip().lower() not in (
+            "false", "0", "no", "off", "",
+        )
+    else:
+        eta_ordering = bool(raw_eta_ordering)
+    raw_promotion = server_config.get(
+        "contention_queue_eta_promotion_seconds", 30
+    )
+    try:
+        promotion = float(raw_promotion) if raw_promotion is not None else 30.0
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid contention_queue_eta_promotion_seconds=%r — using default 30",
+            raw_promotion,
+        )
+        promotion = 30.0
+    eta_promotion_seconds = max(0.0, min(promotion, float(max(1, max_runtime))))
     return {
         "policy": policy,
         "max_wait_seconds": max_wait_seconds,
         "max_depth": max_depth,
         "lease_grace_seconds": lease_grace_seconds,
+        "eta_ordering": eta_ordering,
+        "eta_promotion_seconds": eta_promotion_seconds,
     }
 
 
@@ -718,7 +754,11 @@ async def _cleanup_after_request(
             except Exception:
                 pass
 
-    # On client disconnect, immediately remove the dispatch lease record
+    # On client disconnect, immediately remove the dispatch lease record.
+    # The ``disconnect`` reason is the stream-end path (a client that vanished
+    # *after* the first byte, LP-0MQTHP828000JYM6); a client that vanished
+    # during prefill is released earlier with ``reason=client_disconnect``
+    # (LP-0MVLFVY6K003VYEL). Both are idempotent, so either may run first.
     if disconnected and session_id:
         try:
             lock = getattr(srv, "local_dispatch_records_lock", None)
@@ -736,6 +776,21 @@ async def _cleanup_after_request(
                             )
                         except Exception:
                             pass
+        except Exception:
+            pass
+        # A disconnect also drops the prefill hold (if the client vanished
+        # while prefilling and the marker somehow survived the release):
+        # an orphan marker counts against the prefill cap for the whole pool.
+        try:
+            markers = getattr(srv, "local_prefill_in_flight", None)
+            if markers is not None and session_id in markers:
+                markers.pop(session_id, None)
+                try:
+                    from proxy.contention_queue import wake
+
+                    await wake(1)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1439,7 +1494,18 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             llama_port=llama_port,
                             model_name=model_name,
                             slot_id=slot_id,
+                            # LP-0MVLFVY6K003VYEL: pre-first-byte disconnect
+                            # detection + release (the in-loop check only runs
+                            # once chunks flow, which a prefill never emits).
+                            request=request,
+                            dispatch_session_id=session_id,
                         )
+                        # LP-0MVKUKFHH005UDWL AC3: a successful local first
+                        # byte clears the session's post-deadline cooldown —
+                        # this dispatch just proved prefill works again, so
+                        # the next request may route local without waiting
+                        # out the window.
+                        _clear_prefill_thrash_cooldown(session_id)
                         srv.backend_ready = True
                         # LP-0MUGQHPJ50046LV8: pin the stream context manager
                         # on the dispatch record so the watchdog can cancel the
@@ -1451,6 +1517,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             async with srv.local_dispatch_records_lock:
                                 if _record_key in srv.local_dispatch_records:
                                     srv.local_dispatch_records[_record_key]["stream_cm"] = cm
+                                    # LP-0MVN4LCED00661MX AC3: the dispatch has
+                                    # now served its first byte, so any later
+                                    # release is normal churn, not an eviction
+                                    # error (classified by this flag, never by
+                                    # the release path).
+                                    srv.local_dispatch_records[_record_key][
+                                        "first_byte_seen"
+                                    ] = True
                         except Exception:
                             pass
                         restore_signal_detected = _has_explicit_restore_signal(
@@ -1462,16 +1536,132 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     session_id
                                 )
                             )
+                    except ClientDisconnectedDuringPrefillError:
+                        # LP-0MVLFVY6K003VYEL: the client died while the
+                        # dispatch was prefilling. The monitor already logged
+                        # ``client_disconnect_during_prefill``, released the
+                        # dispatch record, the ``local_prefill_in_flight``
+                        # marker, the slot assignment and the upstream
+                        # first-byte wait (``lease_released ...
+                        # reason=client_disconnect``); finish the per-request
+                        # accounting and stop — there is no client left to
+                        # read a response, and the backend itself is healthy
+                        # (do NOT mark it not ready, which would cool the
+                        # local provider down).
+                        try:
+                            await _cleanup_after_request(
+                                srv, session_id,
+                                disconnected=True,
+                                # Counters are decremented here (the only
+                                # owner of the per-request decrements); the
+                                # disconnect release removed the record and
+                                # marker already, so this is a no-op for them.
+                                decrement_local=True,
+                                session_explicit=session_explicit,
+                                model_name=model_name,
+                                request=request,
+                                backend=endpoint,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await client.aclose()
+                        except Exception:
+                            pass
+                        return Response(status_code=499, content=b"")
+                    except asyncio.CancelledError:
+                        # LP-0MVLFVY6K003VYEL: the disconnect reaper cancels
+                        # the in-flight request task when the client drops
+                        # the connection. Pre-fix that cancellation skipped
+                        # the whole cleanup (no chunk loop had started), so
+                        # the dispatch record and marker outlived the client.
+                        # The reaper recorded its confirmed verdict on the
+                        # ASGI scope before cancelling; release synchronously
+                        # (no ``await`` that a second cancel could skip) and
+                        # schedule the counter cleanup as a detached task,
+                        # then let the cancellation propagate.
+                        if client_disconnect_observed(request):
+                            _release_client_disconnect_dispatch(
+                                srv, session_id, endpoint=endpoint,
+                                request=request,
+                            )
+                            _spawn_detached_release(
+                                _cleanup_after_request(
+                                    srv, session_id,
+                                    disconnected=True,
+                                    decrement_local=True,
+                                    session_explicit=session_explicit,
+                                    model_name=model_name,
+                                    request=request,
+                                    backend=endpoint,
+                                )
+                            )
+                        raise
                     except Exception as _exc:
                         # LP-0MUCEFB8E003YVFF: distinct, observable log line
                         # when the first-byte ceiling aborts a stuck prefill.
+                        # LP-0MVIQ0G2M0006QF6: when the (tighter) prefill
+                        # deadline is what fired, log it as the safety detour
+                        # so the automatics are attributable.
+                        _prefill_deadline_fired = False
                         if isinstance(_exc, asyncio.TimeoutError):
                             try:
-                                srv.logger.warning(
-                                    "dispatch_first_byte_timeout session=%s "
-                                    "ceiling=%.0fs",
-                                    session_id if session_id else "unknown",
-                                    _first_byte_ceiling,
+                                _prefill_deadline = _get_prefill_deadline_seconds(srv)
+                                if (
+                                    _prefill_deadline > 0
+                                    and _first_byte_ceiling <= _prefill_deadline
+                                ):
+                                    _prefill_deadline_fired = True
+                                    srv.logger.warning(
+                                        "prefill_deadline_exceeded session=%s "
+                                        "deadline=%.0fs → cancelling local "
+                                        "dispatch and detouring to the next "
+                                        "provider",
+                                        session_id if session_id else "unknown",
+                                        _prefill_deadline,
+                                    )
+                                    # LP-0MVKUKFHH005UDWL: the deadline just
+                                    # proved this session cannot get a first
+                                    # byte inside the window — re-dispatching
+                                    # the identical prompt would burn the
+                                    # whole prefill again (the incident's 41
+                                    # local POSTs). Arm the session cooldown
+                                    # so the next request from this session
+                                    # skips local (provider.py) until it
+                                    # expires or a successful first byte
+                                    # clears it.
+                                    _prefill_cooldown_deadline = (
+                                        _record_prefill_thrash_cooldown(
+                                            session_id, server_config
+                                        )
+                                    )
+                                    if _prefill_cooldown_deadline > 0:
+                                        srv.logger.info(
+                                            "prefill_thrash_cooldown_started "
+                                            "session=%s cooldown_s=%.0f",
+                                            session_id if session_id else "unknown",
+                                            _get_prefill_thrash_cooldown_seconds(
+                                                server_config
+                                            ),
+                                        )
+                                else:
+                                    srv.logger.warning(
+                                        "dispatch_first_byte_timeout session=%s "
+                                        "ceiling=%.0fs",
+                                        session_id if session_id else "unknown",
+                                        _first_byte_ceiling,
+                                    )
+                            except Exception:
+                                pass
+                        # LP-0MVKUKFSO008GI6O AC1: a local dispatch cancelled
+                        # by the prefill deadline never produced a first byte,
+                        # so its lease and in-flight marker must be released
+                        # now — not retained as an inactive record with a
+                        # future ``expires_at`` (the 2026-10-23 ~4 h wedge).
+                        if _prefill_deadline_fired:
+                            try:
+                                await _release_prefill_deadline_dispatch(
+                                    srv, session_id, endpoint=endpoint
                                 )
                             except Exception:
                                 pass
@@ -1920,9 +2110,18 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     _qwait_ms = max(0.0, (_slot_acquired_ts - _dispatch_start) * 1000.0)
                                                 _first_byte_total_ms = _delta * 1000.0
                                                 _first_byte_service_ms = max(0.0, _first_byte_total_ms - _qwait_ms)
+                                                # ``priority=`` and ``estimated_tokens=`` are emitted for the
+                                                # idle-admission impact measurement (LP-0MVGHXD59008UOUD): AC2
+                                                # compares idle-admitted dispatches with non-idle ones in the
+                                                # SAME context bucket and AC4 compares high-priority latency, so
+                                                # both need to be carried by the dispatch event itself rather than
+                                                # joined heuristically from ``routing_check`` lines. Both values are
+                                                # already computed above in this function; appending them keeps
+                                                # every existing log consumer (and regex) byte-compatible.
                                                 srv.logger.info(
                                                     "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f "
-                                                    "cache_state=%s cached_ratio=%.3f queue_wait_ms=%.1f session=%s model=%s",
+                                                    "cache_state=%s cached_ratio=%.3f queue_wait_ms=%.1f session=%s model=%s "
+                                                    "priority=%s estimated_tokens=%d",
                                                     _first_byte_total_ms,
                                                     _first_byte_service_ms,
                                                     _cache_state,
@@ -1930,6 +2129,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     _qwait_ms,
                                                     session_id or "unknown",
                                                     model_name or "unknown",
+                                                    _priority or "unknown",
+                                                    int(_estimated_tokens or 0),
                                                 )
                                                 # Feed the prefill-ETA calibration window
                                                 # (LP-0MVGDUV5E005UWBQ): the observed service

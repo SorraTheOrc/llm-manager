@@ -31,14 +31,19 @@ server_pid=$!
 sleep 0.2
 
 # Run start-proxy.sh with a timeout to avoid indefinite blocking
-# Pass --port to override the default 8000 so we use the test port
+# Pass --port to override the default 8000 so we use the test port.
+# --foreground is passed defensively: this test asserts the pre-launch port
+# check, and start-proxy.sh now detaches by default (LP-0MVGT0E6W000Q8CY). If the
+# background listener ever failed to bind, a detached run would silently spawn a
+# real uvicorn; --foreground keeps any accidental launch in this process tree
+# where `timeout` reaps it.
 TMP_OUT=$(mktemp)
 rc=0
 if command -v timeout >/dev/null 2>&1; then
-  timeout 8 "$PROXY_SCRIPT" --port $TEST_PORT > "$TMP_OUT" 2>&1 || rc=$?
+  timeout 8 "$PROXY_SCRIPT" --foreground --port $TEST_PORT > "$TMP_OUT" 2>&1 || rc=$?
 else
   # Fallback: run and rely on internal exit
-  "$PROXY_SCRIPT" --port $TEST_PORT > "$TMP_OUT" 2>&1 || rc=$?
+  "$PROXY_SCRIPT" --foreground --port $TEST_PORT > "$TMP_OUT" 2>&1 || rc=$?
 fi
 
 # Clean up background server

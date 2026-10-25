@@ -845,6 +845,101 @@ async def _save_slot_snapshot(
     )
 
 
+def plan_eviction_snapshot(
+    session_id: str | None,
+    server_config: dict,
+    *,
+    endpoint: str | None = None,
+) -> tuple[int, str, float] | None:
+    """Resolve ``(slot_id, filename, timeout)`` for an evicted session's save.
+
+    Runs the *existing* persistence gates through ``_build_slot_context`` —
+    pool size / ``_slot_persistence_enabled``, ``session_slot_skip_when_busy``,
+    the context-size cap and the per-slot failure circuit breaker — so an
+    eviction never introduces a second save path or bypasses a safeguard.
+
+    Returns ``None`` when persistence is gated off *or* when the session owns
+    no slot. The second condition matters: ``_build_slot_context`` assigns a
+    free slot on demand, and an eviction must never allocate one just to save
+    an empty cache into it.
+
+    Call this **before** releasing the session's slot assignment (the plan
+    needs the assignment it is about to save).
+    """
+    if not session_id:
+        return None
+    try:
+        if _assigned_slot_for_session(session_id, endpoint=endpoint) is None:
+            return None
+        slot_id, filename, timeout = _build_slot_context(
+            server_config, session_id, None, endpoint=endpoint
+        )
+    except Exception:
+        return None
+    if slot_id is None or not filename:
+        return None
+    return int(slot_id), str(filename), float(timeout)
+
+
+async def save_evicted_session_snapshot(
+    session_id: str | None,
+    server_config: dict,
+    *,
+    endpoint: str | None = None,
+    reason: str = "eviction",
+    plan: tuple[int, str, float] | None = None,
+) -> dict:
+    """Persist the evicted session's KV snapshot so it restores warm later.
+
+    LP-0MVN1IQTF0037WTG AC6: when a tenancy/lease reclaims a slot, the KV cache
+    the session spent its prefill budget building is about to be overwritten
+    by the next tenant. Saving it as ``slot_<session>.bin`` (the existing
+    per-session filename convention) lets the returning client restore instead
+    of pre-filling cold.
+
+    Subject to every existing gate: the plan is built by
+    :func:`plan_eviction_snapshot` (pool size, busy, context cap, circuit
+    breaker), and a missing plan is a no-op. Never raises.
+
+    Returns a small report ``{"saved": bool, "slot_id": int|None,
+    "reason": str}`` for the caller's eviction record.
+    """
+    report: dict = {"saved": False, "slot_id": None, "reason": reason}
+    if plan is None:
+        plan = plan_eviction_snapshot(session_id, server_config, endpoint=endpoint)
+    if plan is None:
+        report["reason"] = f"{reason}:snapshot_gated"
+        return report
+    slot_id, filename, timeout = plan
+    report["slot_id"] = slot_id
+    try:
+        server_cfg = server_config or {}
+        llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+        model = getattr(_srv(), "current_model", None)
+        saved = await _save_slot_snapshot(
+            llama_port,
+            slot_id,
+            filename,
+            timeout,
+            model=model,
+            endpoint=endpoint,
+        )
+        report["saved"] = bool(saved)
+        try:
+            logger.info(
+                "slot_save session=%s slot=%s reason=%s saved=%s source=eviction",
+                session_id[:8] if session_id else "unknown",
+                slot_id,
+                reason,
+                bool(saved),
+            )
+        except Exception:
+            pass
+    except Exception:
+        report["reason"] = f"{reason}:snapshot_error"
+    return report
+
+
 # ===================================================================
 # Session ID helpers
 # ===================================================================

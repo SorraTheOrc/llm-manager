@@ -7,6 +7,7 @@ Tests for:
 """
 
 import json
+import re
 import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
@@ -5421,3 +5422,159 @@ def test_context_limit_field_absent_keeps_resolution_order():
 
     assert provider.resolve_provider(model_config)["name"] == "capped"
     assert provider._resolve_provider_with_exclusions(model_config, {"capped"})["name"] == "open"
+
+
+# ===================================================================
+# Fallback log evidence tests (LP-0MVMBMSWR0036RES AC1-AC3)
+# ===================================================================
+
+
+class TestFallbackLogEvidence:
+    """``Fallback triggered`` lines carry ``session=``/``attempt=`` plus the
+    budget evidence for ``rate_limited*`` reasons, so per-session fallback
+    attribution never has to guess.
+
+    All three emit helpers (streaming success, non-streaming success and the
+    reasoning-content promotion path) thread the request's resolved session id
+    from their caller; these unit tests poke the helpers directly with the
+    keyword argument the call sites pass.
+    """
+
+    def _last_fallback_line(self, caplog) -> str:
+        for record in reversed(caplog.records):
+            if "Fallback triggered" in record.getMessage():
+                return record.getMessage()
+        raise AssertionError("no 'Fallback triggered' log record emitted")
+
+    def _emit_build(self, caplog, *, session_id, reason, budget=None):
+        import logging
+        caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+        attempts = []
+        response = Response(content=b'{"choices":[{"message":{"content":"ok"}}]}', status_code=200)
+        provider._build_fallback_success_response(
+            response, "remote-fallback", "remote", attempts,
+            prev_provider="remote-primary", fallback_reason=reason,
+            path="v1/test", body_text='{"choices":[{"message":{"content":"ok"}}]}',
+            session_id=session_id, budget_evidence=budget,
+        )
+        return self._last_fallback_line(caplog)
+
+    def test_line_carries_session_and_attempt(self, caplog):
+        line = self._emit_build(caplog, session_id="sess-line-carries", reason="HTTP 502")
+        assert "reason=HTTP 502" in line
+        assert "session=sess-line-carries" in line
+        assert re.search(r"\battempt=\d+\b", line), line
+
+    def test_line_without_session_uses_unknown(self, caplog):
+        line = self._emit_build(caplog, session_id=None, reason="HTTP 502")
+        assert "session=unknown" in line
+        assert re.search(r"\battempt=\d+\b", line), line
+
+    def test_attempt_ordinal_increments_per_session(self, caplog):
+        """Two fallbacks from the same session are distinguishable even when
+        the second occurs within the same logging second (AC2)."""
+        first = self._emit_build(caplog, session_id="sess-ordinal", reason="HTTP 502")
+        second = self._emit_build(caplog, session_id="sess-ordinal", reason="HTTP 502")
+        n1 = int(re.search(r"\battempt=(\d+)\b", first).group(1))
+        n2 = int(re.search(r"\battempt=(\d+)\b", second).group(1))
+        assert n2 == n1 + 1
+        assert "session=sess-ordinal" in first and "session=sess-ordinal" in second
+
+    def test_attempt_ordinal_is_per_session_not_global(self, caplog):
+        """Another session's counter does not advance this session's ordinal."""
+        self._emit_build(caplog, session_id="sess-other-a", reason="HTTP 502")
+        line = self._emit_build(caplog, session_id="sess-other-b", reason="HTTP 502")
+        assert "attempt=1" in line
+
+    def test_budget_evidence_emitted_for_rate_limited(self, caplog):
+        budget = {"limit": 60, "remaining": 0, "waited": 1.234}
+        line = self._emit_build(
+            caplog, session_id="sess-budget",
+            reason="rate_limited", budget=budget,
+        )
+        assert "reason=rate_limited" in line
+        assert "limit=60" in line
+        assert "remaining=0" in line
+        assert "waited=1.234" in line
+
+    def test_budget_evidence_omitted_for_non_budget_reason(self, caplog):
+        budget = {"limit": 60, "remaining": 0, "waited": 1.234}
+        line = self._emit_build(
+            caplog, session_id="sess-nonbudget",
+            reason="HTTP 500", budget=budget,
+        )
+        assert "limit=" not in line
+        assert "remaining=" not in line
+        assert "waited=" not in line
+
+    def test_streaming_success_site_carries_evidence(self, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+        from fastapi.responses import StreamingResponse
+        async def dummy_stream():
+            yield b"test"
+        attempts = []
+        provider._handle_streaming_success(
+            StreamingResponse(dummy_stream(), status_code=200),
+            "remote-fallback", "remote", attempts,
+            prev_provider="remote-primary", fallback_reason="empty_response",
+            path="v1/test",
+            session_id="sess-streaming",
+        )
+        line = self._last_fallback_line(caplog)
+        assert "reason=empty_response" in line
+        assert "session=sess-streaming" in line
+        assert re.search(r"\battempt=\d+\b", line), line
+
+    def test_promotion_site_carries_evidence(self, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+        attempts = []
+        body = '{"choices":[{"message":{"reasoning_content":"thinking"}}]}'
+        provider._resolve_reasoning_content_promotion(
+            Response(content=body.encode(), status_code=200),
+            "remote-fallback", "remote", attempts,
+            prev_provider="remote-primary", fallback_reason="empty_response",
+            path="v1/test", body_text=body,
+            session_id="sess-promotion",
+        )
+        line = self._last_fallback_line(caplog)
+        # The promotion path passes the caller's fallback reason through
+        # unchanged; the evidence fields trail it.
+        assert "reason=empty_response" in line
+        assert "session=sess-promotion" in line
+        assert re.search(r"\battempt=\d+\b", line), line
+
+    @pytest.mark.asyncio
+    async def test_wire_level_fallback_line_contains_session_and_attempt(
+        self, caplog, sample_model_config,
+    ):
+        """End-to-end through proxy_with_remote_fallback: the logged line is
+        fully qualified with evidence (AC1/AC2/AC4 shape)."""
+        import logging
+        caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+        request = _DummyRequest()
+        cfg = {"provider_cooldown_seconds": 60}
+
+        call_count = 0
+
+        async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return Response(status_code=503, content=b"Unavailable")
+            return Response(
+                content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
+                status_code=200,
+                media_type="application/json",
+            )
+
+        with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+            await provider.proxy_with_remote_fallback(
+                request, "v1/chat/completions", sample_model_config, cfg
+            )
+
+        line = self._last_fallback_line(caplog)
+        assert "Fallback triggered" in line
+        assert re.search(r"\bsession=([a-zA-Z0-9_.-]+|unknown)\b", line), line
+        assert re.search(r"\battempt=\d+\b", line), line

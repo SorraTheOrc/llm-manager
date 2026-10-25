@@ -2,9 +2,18 @@
 set -euo pipefail
 
 # Start the proxy application
-# Usage: ./scripts/start-proxy.sh [--restart] [--reason "<text>"] [--verbose] [--use-env-keys] [uvicorn-args...]
+# Usage: ./scripts/start-proxy.sh [--restart] [--keep-llama-server] [--reason "<text>"] [--verbose] [--use-env-keys] [--foreground] [--log-file <path>] [uvicorn-args...]
 #
 # Flags:
+#   --foreground
+#               Blocking `exec` of uvicorn for interactive debugging. DEFAULT:
+#               validate, then detach uvicorn into its own session with stdio in
+#               a log file, print one handoff line and exit 0 — a launcher killed
+#               by an agent tool-call timeout can then no longer take the server
+#               down (LP-0MVGT0E6W000Q8CY). Unattended callers may instead set
+#               START_PROXY_FOREGROUND=1.
+#   --log-file <path>
+#               Detached server's stdout/stderr (default /tmp/proxy-startup.log).
 #   --restart   Kill all running proxy/llama-server/TTS processes before starting
 #   --reason    Restart reason echoed into the new process's startup log
 #               (LP-0MVAPNC2900145RH; flag > LLAMA_PROXY_RESTART_REASON >
@@ -30,6 +39,18 @@ set -euo pipefail
 #               may instead set LLAMA_PROXY_USE_ENV_KEYS=1. This flag is
 #               consumed here and never forwarded to uvicorn
 #               (LP-0MVF7DRMK001NHT8).
+#
+# Detached launch contract (LP-0MVGT0E6W000Q8CY): by default every
+# pre-launch check (port free, provider API keys resolved, config readable,
+# restart/cleanup) runs synchronously; then uvicorn is launched in its own
+# session with stdout/stderr in the log file, one handoff line is printed
+# (child PID, log path, curl /health command) and the script exits 0. Startup
+# failures AFTER the handoff (bind errors, model load, import errors) appear
+# only in the log — the exit code cannot report them, so callers MUST poll
+# /health instead of relying on the launcher's status. Never run in the
+# foreground under an agent tool call: a tool-call timeout SIGKILLs the whole
+# process group, taking uvicorn down with it; use `--foreground` only for an
+# interactive terminal session.
 #
 # Automatically resolves required API keys from:
 #   1. Environment variables (already set) — verified against auth.json; a
@@ -86,12 +107,25 @@ USE_ENV_KEYS=0
 if [ "${LLAMA_PROXY_USE_ENV_KEYS:-}" = "1" ]; then
   USE_ENV_KEYS=1
 fi
+# LP-0MVGT0E6W000Q8CY: the launch is detached by default so a killed launcher
+# (e.g. an agent tool-call timeout SIGKILLing the process group) cannot take the
+# server down with it. --foreground (or START_PROXY_FOREGROUND=1 for unattended
+# callers that cannot pass flags) restores the blocking `exec` behaviour.
+FOREGROUND=0
+if [ "${START_PROXY_FOREGROUND:-}" = "1" ]; then
+  FOREGROUND=1
+fi
+DETACH_LOG_FILE="/tmp/proxy-startup.log"
 UVICORN_ARGS=()
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "--reason" ]; then
     # --reason <text>: consumed here, never forwarded to uvicorn
     RESTART_REASON="$arg"
+    prev=""
+  elif [ "$prev" = "--log-file" ]; then
+    # --log-file <path>: consumed here, never forwarded to uvicorn
+    DETACH_LOG_FILE="$arg"
     prev=""
   elif [ "$prev" = "--port" ] || [ "$prev" = "-p" ]; then
     PORT="$arg"
@@ -117,6 +151,17 @@ for arg in "$@"; do
         ;;
       --reason=*)
         RESTART_REASON="${arg#*=}"
+        ;;
+      --foreground)
+        # LP-0MVGT0E6W000Q8CY: keep today's blocking `exec` for interactive
+        # debugging. Consumed here — uvicorn rejects unknown CLI flags.
+        FOREGROUND=1
+        ;;
+      --log-file)
+        prev="--log-file"
+        ;;
+      --log-file=*)
+        DETACH_LOG_FILE="${arg#*=}"
         ;;
       --keep-llama-server)
         # LP-0MUCEFCL6001ZXYN: proxy-only restart — preserve the co-located
@@ -302,6 +347,22 @@ if [ "$PORT_IN_USE" -eq 1 ]; then
   echo "Error: port $PORT is already in use. Is another proxy or service running?" >&2
   echo "If you intended to run in development mode, use --port <port> to specify a different port." >&2
   exit 1
+fi
+
+# LP-0MVLHMAWV008EKTI AC2: a proxy process that is alive but holds no listener
+# on its port is a wedged twin. It never fails the port check above, so it
+# survived every start on 2026-10-23 while keeping proxy.log open for write —
+# a second writer that could rotate/truncate the live window. The port check
+# has already refused when a *healthy* proxy owns the port, so any surviving
+# proxy.server process for this port here is stale: reap it before launching so
+# exactly one process owns the log. Killing it also releases its single-instance
+# lock (``flock`` dies with the holder), so the new process can acquire it.
+if [ "$RESTART" -eq 0 ]; then
+  if [ -x "$SCRIPT_DIR/reap-stale-proxy.sh" ]; then
+    bash "$SCRIPT_DIR/reap-stale-proxy.sh" --port "$PORT" >&2 || true
+  else
+    echo "Warning: $SCRIPT_DIR/reap-stale-proxy.sh not found; cannot reap a stale proxy twin." >&2
+  fi
 fi
 
 CONFIG_FILE="$REPO_ROOT/config.yaml"
@@ -500,5 +561,72 @@ resolve_api_keys
 echo ""
 echo "=== Starting proxy server ==="
 
-# Exec uvicorn using chosen python binary
-exec "$PY_BIN" -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PORT" "${UVICORN_ARGS[@]+${UVICORN_ARGS[@]}}"
+# ---------------------------------------------------------------------------
+# Launch (LP-0MVGT0E6W000Q8CY)
+#
+# All synchronous validation (port free, provider API keys resolved, config
+# readable, restart/cleanup phases) has already run by this point. The uvicorn
+# command line itself is unchanged in both modes.
+# ---------------------------------------------------------------------------
+
+if [ "$FOREGROUND" -eq 1 ]; then
+  # Explicit foreground opt-in: today's blocking behaviour, so Ctrl-C and the
+  # caller's exit code still describe the server.
+  echo "Foreground mode: uvicorn runs in this process group (interactive debugging only)." >&2
+  exec "$PY_BIN" -m uvicorn proxy.server:app --host 0.0.0.0 --port "$PORT" "${UVICORN_ARGS[@]+${UVICORN_ARGS[@]}}"
+fi
+
+# Detached launch (default). The child runs THIS script again with
+# --foreground, so it validates the same way and finally `exec`s uvicorn, but in
+# its own session and with its stdio redirected to the log file — inheriting the
+# caller's pipe would keep `... | tail -20` blocked until the tool timeout and
+# recreate the original failure. --restart is dropped because the kill/cleanup
+# and port-release phases already ran here; forwarding it would repeat the
+# restart storm (and every port-release wait) inside the child.
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+CHILD_ARGS=("--foreground")
+for arg in "$@"; do
+  case "$arg" in
+    --restart)
+      # Already performed by this launcher; the child must not repeat it.
+      ;;
+    *)
+      CHILD_ARGS+=("$arg")
+      ;;
+  esac
+done
+
+# Fail fast on an unusable log destination: a detached child whose stdio goes
+# nowhere would die silently with no diagnosable output.
+DETACH_LOG_DIR="$(dirname "$DETACH_LOG_FILE")"
+if [ ! -d "$DETACH_LOG_DIR" ] && ! mkdir -p "$DETACH_LOG_DIR" 2>/dev/null; then
+  echo "Error: cannot create the log directory $DETACH_LOG_DIR for the detached server." >&2
+  echo "       Pass --log-file <path> pointing at a writable location." >&2
+  exit 1
+fi
+if ! : > "$DETACH_LOG_FILE" 2>/dev/null; then
+  echo "Error: cannot write the detached-startup log file $DETACH_LOG_FILE." >&2
+  echo "       Pass --log-file <path> pointing at a writable location." >&2
+  exit 1
+fi
+
+if command -v setsid >/dev/null 2>&1; then
+  # setsid puts the child in its own session/process group, so a SIGKILL of the
+  # launcher's group no longer reaches the server.
+  setsid bash "$SELF" "${CHILD_ARGS[@]}" >"$DETACH_LOG_FILE" 2>&1 &
+  CHILD_PID=$!
+else
+  # Fallback for hosts without setsid (coreutils only): detach from the shell's
+  # job table with nohup + disown. Weaker than setsid (the child stays in the
+  # launcher's process group), but still immune to SIGHUP and to the launcher's
+  # exit.
+  nohup bash "$SELF" "${CHILD_ARGS[@]}" >"$DETACH_LOG_FILE" 2>&1 &
+  CHILD_PID=$!
+fi
+disown "$CHILD_PID" 2>/dev/null || true
+
+# Exactly ONE handoff line: the child PID, the log path (where any post-handoff
+# startup failure appears) and the health check callers must use instead of an
+# exit code, since uvicorn now outlives this process.
+echo "Proxy launched detached: child pid $CHILD_PID, output in $DETACH_LOG_FILE | health check: curl -sf http://127.0.0.1:$PORT/health"
+exit 0

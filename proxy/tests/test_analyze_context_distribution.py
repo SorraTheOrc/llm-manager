@@ -69,6 +69,20 @@ UNRELATED_LINE = (
     "2026-08-26 22:04:00,000 - INFO - Stream finished: reason=tool_calls "
     "session=herdr-1787669217-851654-15207 provider=local model=Qwen3"
 )
+# Per-provider context-ceiling skip (LP-0MVMBM1Y3001TPRT), verbatim shape.
+ROUTING_SKIP_PROVIDER_CONTEXT = (
+    "2026-08-26 22:03:30,000 - INFO - routing_skip_provider_context "
+    "provider=munitoai-free type=remote status=provider_context_exceeded "
+    "estimated_tokens=153917 limit=150000 reason=provider_context_exceeded "
+    "session=herdr-1787588474-220578-15272"
+)
+# Older rotated lines may omit ``limit=`` (AC8 tolerance).
+ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT = (
+    "2026-08-26 22:03:40,000 - INFO - routing_skip_provider_context "
+    "provider=opencode-go type=remote status=provider_context_exceeded "
+    "estimated_tokens=195787 reason=provider_context_exceeded "
+    "session=herdr-1787588474-220578-15272"
+)
 OUTSIDE_WINDOW = (
     "2026-08-23 23:59:59,999 - INFO - routing_check provider=local-qwen3 model=Qwen3 "
     "estimated_tokens=90000 cold_threshold=38000 warm_threshold=83285 new_tokens=2251 "
@@ -223,6 +237,34 @@ class TestWarningsAndSkips:
         assert res.skip_counts["context_too_large"] == 1
         assert res.skip_counts["large_context_bypass"] == 1
 
+    def test_provider_context_skips_tallied_separately(self, tmp_path):
+        # AC7 (LP-0MVMBM1Y3001TPRT): the provider-side context-ceiling skips are
+        # counted per provider and per limit, without polluting the local
+        # hard-cap reason tally.
+        _write_log(
+            tmp_path,
+            [
+                ROUTING_SKIP_TOO_LARGE,
+                ROUTING_SKIP_PROVIDER_CONTEXT,
+                ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT,
+            ],
+        )
+        res = analyzer.analyze_day(tmp_path, datetime(2026, 8, 26))
+        assert dict(res.provider_skip_counts) == {"munitoai-free": 1, "opencode-go": 1}
+        assert dict(res.provider_skip_limits) == {150000: 1, None: 1}
+        assert dict(res.skip_counts) == {"context_too_large": 1}
+
+    def test_provider_skip_parser_tolerates_missing_limit(self):
+        parsed = analyzer.parse_provider_skip(ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT)
+        assert parsed is not None
+        _ts, provider, session, limit, est = parsed
+        assert provider == "opencode-go"
+        assert session == "herdr-1787588474-220578-15272"
+        assert limit is None
+        assert est == 195787
+        # ``routing_skip_local`` lines are not provider-context skips.
+        assert analyzer.parse_provider_skip(ROUTING_SKIP_TOO_LARGE) is None
+
 
 class TestReportAndArtifacts:
     def test_build_report_shape(self, tmp_path):
@@ -244,6 +286,25 @@ class TestReportAndArtifacts:
         assert day26["context_pressure_warnings"] == 1
         # JSON-serialisable (no dates/objects).
         json.dumps(report)
+
+    def test_provider_context_skips_in_report_and_markdown(self, tmp_path):
+        _write_log(
+            tmp_path,
+            [
+                ROUTING_FAST_SMALL,
+                ROUTING_SKIP_PROVIDER_CONTEXT,
+                ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT,
+            ],
+        )
+        report = analyzer.build_report(
+            tmp_path, [datetime(2026, 8, 26)], {"fast": 83285, "cheap": 61440}
+        )
+        prov = report["days"]["2026-08-26"]["provider_context_skips"]
+        assert prov["by_provider"] == {"munitoai-free": 1, "opencode-go": 1}
+        assert prov["by_limit"] == {"150000": 1, "not logged": 1}
+        md = analyzer.render_markdown(report)
+        assert "routing_skip_provider_context: munitoai-free=1, opencode-go=1" in md
+        assert "150000×1" in md and "not logged×1" in md
 
     def test_writes_artifacts(self, tmp_path):
         report = {"window": "t", "caps": {}, "days": {}}

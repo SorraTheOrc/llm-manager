@@ -19,6 +19,12 @@ This module provides:
 The streaming chat path already polls ``request.is_disconnected()`` between
 chunks; this module covers the non-streaming / long-running cases where the
 handler does not self-check.
+
+It also carries the *verdict*: before cancelling a task the reaper records
+``client_disconnect_observed`` on the request's ASGI scope, because a
+cancelled task cannot reliably re-probe the connection. The local dispatch
+release path reads that flag synchronously to free a dispatch whose client
+died during prefill (LP-0MVLFVY6K003VYEL).
 """
 
 import asyncio
@@ -37,6 +43,41 @@ _REGISTRY_LOCK = asyncio.Lock()
 
 # How often the background reaper scans the registry (seconds).
 REAP_INTERVAL_SECONDS = 5.0
+
+CLIENT_DISCONNECTED_SCOPE_KEY = "llama_proxy.client_disconnected"
+"""ASGI scope key the reaper sets when it confirms a client disconnect.
+
+A cancelled request task cannot reliably re-probe ``request.is_disconnected()``
+(awaiting inside a cancellation handler can be cancelled again), so the
+reaper — which *did* observe the disconnect before cancelling — records the
+verdict on the request's ASGI ``scope``. The scope dict is shared by the
+middleware request and the handler request, so the local dispatch release
+path reads the same flag synchronously
+(LP-0MVLFVY6K003VYEL AC3).
+"""
+
+
+def mark_client_disconnected(request: Any) -> None:
+    """Record a confirmed client disconnect on the request's ASGI scope."""
+    try:
+        request.scope[CLIENT_DISCONNECTED_SCOPE_KEY] = True
+    except Exception:
+        pass
+
+
+def client_disconnect_observed(request: Any) -> bool:
+    """True only when the reaper confirmed this request's client is gone.
+
+    Fail-closed: anything other than an explicit ``True`` (missing scope,
+    scope without the key, a mock) reads as "not confirmed", so a request is
+    never released as client-dead on an inference.
+    """
+    if request is None:
+        return False
+    try:
+        return request.scope.get(CLIENT_DISCONNECTED_SCOPE_KEY) is True
+    except Exception:
+        return False
 
 
 class DisconnectReaperMiddleware(BaseHTTPMiddleware):
@@ -127,6 +168,7 @@ class DisconnectReaper:
 
         done_tasks: list[asyncio.Task] = []
         cancel_tasks: list[asyncio.Task] = []
+        cancel_requests: dict[asyncio.Task, Any] = {}
         for task, request in snapshot:
             if task.done():
                 done_tasks.append(task)
@@ -137,6 +179,7 @@ class DisconnectReaper:
                 disconnected = False
             if disconnected:
                 cancel_tasks.append(task)
+                cancel_requests[task] = request
 
         async with _REGISTRY_LOCK:
             for task in done_tasks:
@@ -145,6 +188,11 @@ class DisconnectReaper:
                 reaper_registry.pop(task, None)
 
         for task in cancel_tasks:
+            # Record the verdict on the request scope *before* cancelling: the
+            # cancelled task cannot re-probe the connection, and the local
+            # dispatch release path reads this flag synchronously
+            # (LP-0MVLFVY6K003VYEL).
+            mark_client_disconnected(cancel_requests.get(task))
             task.cancel()
             logger.info(
                 "client_disconnect reaped in-flight request task=%s",

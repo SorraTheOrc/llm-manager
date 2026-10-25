@@ -680,13 +680,16 @@ async def test_watchdog_releases_liveness_extended_lease_at_max_prefill_ceiling(
 
 @pytest.mark.asyncio
 async def test_extend_lease_on_in_flight_when_slots_unobservable(monkeypatch):
-    """LP-0MUXTW4MD003TVIC: when ``/slots`` is totally unobservable
-    (progress=None, alive=False) but the upstream request is still in flight,
-    the lease IS extended and the no-progress clock refreshed.
+    """LP-0MUXTW4MD003TVIC + LP-0MVKUKFSO008GI6O AC4: when ``/slots`` is
+    totally unobservable (progress=None, alive=False) but the caller's own
+    request is still in flight, the lease IS extended — but the no-progress
+    clock is NOT refreshed.
 
     This is the heavy-load failure mode: llama-server holds ``/slots`` for the
     whole prompt-processing batch, so liveness cannot be read. The in-flight
-    request is the authoritative signal.
+    request keeps the lease valid, while a genuinely progress-less record is
+    still released by the 180s no-progress watchdog (refreshing the clock on
+    the in-flight signal alone is what held the pool for ~4h on 2026-10-23).
     """
     from proxy.router_helpers import (
         _extend_lease_during_prefill,
@@ -710,6 +713,8 @@ async def test_extend_lease_on_in_flight_when_slots_unobservable(monkeypatch):
         },
         config=config,
     )
+    # The caller's own in-flight marker (set at lease acquisition).
+    srv.local_prefill_in_flight = {"sess-1": True}
     _install_fake_progress(monkeypatch, [(None, False)])
 
     last_progress, extended = await _extend_lease_during_prefill(
@@ -725,8 +730,12 @@ async def test_extend_lease_on_in_flight_when_slots_unobservable(monkeypatch):
 
     record = srv.local_dispatch_records["sess-1"]
     assert record["expires_at"] > time.monotonic()
-    assert record["last_progress_ts"] > now - 1.0
-    assert _watchdog_no_progress(srv, "sess-1", record) is False
+    assert record["last_progress_ts"] == now - 500.0, (
+        "AC4: an open request is not progress — the no-progress clock must not move"
+    )
+    assert _watchdog_no_progress(srv, "sess-1", record) is True, (
+        "AC4: the 180s watchdog must still release a progress-less in-flight record"
+    )
     assert _extension_log_calls(srv.logger), "expected an in-flight extension log"
     assert _logged_in_flight(srv.logger), "extension log must record in_flight=True"
 
@@ -758,6 +767,7 @@ async def test_in_flight_extension_bounded_by_max_prefill_ceiling(monkeypatch):
         },
         config=config,
     )
+    srv.local_prefill_in_flight = {"sess-1": True}
     _install_fake_progress(monkeypatch, [(None, False)])
 
     _, extended = await _extend_lease_during_prefill(
@@ -770,7 +780,6 @@ async def test_in_flight_extension_bounded_by_max_prefill_ceiling(monkeypatch):
     )
     assert extended is True
     record = srv.local_dispatch_records["sess-1"]
-    assert record["last_progress_ts"] > now - 1.0
     assert _watchdog_no_progress(srv, "sess-1", record) is True, (
         "The max-prefill ceiling must still bound an in-flight-extended lease"
     )
@@ -1194,9 +1203,10 @@ async def test_stream_loop_extends_lease_in_flight_when_status_unobservable(monk
 
 @pytest.mark.asyncio
 async def test_first_byte_monitor_extends_lease_in_flight_when_slots_unobservable(monkeypatch):
-    """LP-0MUXTW4MD003TVIC (AC1): a long first-byte wait extends the lease via
-    the in-flight signal even when ``/slots`` never returns usable state, so
-    the no-progress watchdog cannot kill a healthy prefill.
+    """LP-0MUXTW4MD003TVIC (AC1) + LP-0MVKUKFSO008GI6O AC4: a long first-byte
+    wait extends the lease via the caller's own in-flight marker even when
+    ``/slots`` never returns usable state, while the no-progress clock is left
+    alone (an open request is not progress).
     """
     from proxy.router_helpers import _await_first_byte_with_prefill_monitor
 
@@ -1217,6 +1227,8 @@ async def test_first_byte_monitor_extends_lease_in_flight_when_slots_unobservabl
         },
         config=config,
     )
+    # The dispatch's own prefill marker (set at lease acquisition).
+    srv.local_prefill_in_flight = {"test-session-id": True}
 
     # /slots AND the aggregate fallback are permanently unobservable.
     async def _fake_progress(*args, **kwargs):
@@ -1242,7 +1254,9 @@ async def test_first_byte_monitor_extends_lease_in_flight_when_slots_unobservabl
 
     record = srv.local_dispatch_records["test-session-id"]
     assert record["expires_at"] > now + 0.2, "lease must be extended while in flight"
-    assert record["last_progress_ts"] > now - 1.0, "no-progress clock must advance"
+    assert record["last_progress_ts"] == now - 500.0, (
+        "AC4: the in-flight signal must not pretend to be progress"
+    )
     assert _extension_log_calls(srv.logger), "expected an in-flight extension log"
     assert _logged_in_flight(srv.logger), "extension log must record in_flight=True"
 
@@ -1313,17 +1327,17 @@ async def test_first_byte_wait_emits_threshold_warning(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_accepted_but_never_progressed_held_to_ceiling_then_released(monkeypatch):
-    """AC1: the accepted-but-never-progressed shape is bounded by the
-    max-prefill ceiling.
+async def test_accepted_but_never_progressed_released_by_no_progress_watchdog(monkeypatch):
+    """LP-0MVKUKFSO008GI6O AC4 (supersedes the hold characterisation in
+    LP-0MUXYXZQB002S391): the accepted-but-never-progressed shape is released
+    by the 180s no-progress watchdog, not held until the 900s ceiling.
 
     Shape: an open in-flight upstream request with no first byte and no
-    ``/slots`` state (``progress=None, alive=False``), so the in-flight
-    signal is the only extension source. The signal refreshes the
-    no-progress clock and defeats the 180s no-progress watchdog, so the
-    lease is held for the whole window; it is released only when the record
-    exceeds ``local_dispatch_max_prefill_seconds``, at which point the
-    upstream stream is cancelled and the slot/counters are freed.
+    ``/slots`` state (``progress=None, alive=False``). The in-flight signal
+    keeps the lease *valid* (``expires_at`` is pushed out so expiry cannot
+    evict a request that is legitimately waiting), but it is not progress, so
+    ``last_progress_ts`` stays stale and ``_watchdog_no_progress`` releases
+    the record — cancelling the upstream and freeing the slot/counters.
     """
     from proxy.router_helpers import (
         _cleanup_stale_local_dispatch,
@@ -1342,12 +1356,11 @@ async def test_accepted_but_never_progressed_held_to_ceiling_then_released(monke
         records={
             "sess-1": {
                 "backend": "local",
-                "started_at": now,
+                "started_at": now - 200.0,
                 "active": True,
                 "expires_at": now + 0.3,
                 "last_progress": 0,
-                # Stale on entry: the no-progress watchdog would release it
-                # at once if the in-flight signal did not refresh it.
+                # No progress for 200s: past the 180s no-progress timeout.
                 "last_progress_ts": now - 200.0,
                 "stream_cm": stream_cm,
             },
@@ -1361,13 +1374,12 @@ async def test_accepted_but_never_progressed_held_to_ceiling_then_released(monke
     # /slots unobservable, no first byte, no numeric progress.
     _install_fake_progress(monkeypatch, [(None, False)])
 
-    # Baseline: without the in-flight refresh the record is already a wedge.
     assert _watchdog_no_progress(
         srv, "sess-1", srv.local_dispatch_records["sess-1"]
     ) is True
 
-    # The in-flight signal extends the lease and refreshes the no-progress
-    # clock, so the record survives the 180s no-progress window.
+    # The in-flight signal keeps the lease valid but does not fabricate
+    # progress, so the record is still a no-progress wedge.
     last_progress, extended = await _extend_lease_during_prefill(
         srv,
         "sess-1",
@@ -1376,24 +1388,21 @@ async def test_accepted_but_never_progressed_held_to_ceiling_then_released(monke
         last_progress=0,
         prefill_in_flight=True,
     )
-    assert extended is True, "in-flight request must extend the lease"
+    assert extended is True, "in-flight request must keep the lease valid"
     assert last_progress == 0
     record = srv.local_dispatch_records["sess-1"]
-    assert _watchdog_no_progress(srv, "sess-1", record) is False, (
-        "the in-flight signal must keep the lease past the no-progress window"
+    assert record["last_progress_ts"] == now - 200.0, (
+        "the in-flight signal must not refresh the no-progress clock"
     )
-
-    # The hold reaches the max-prefill ceiling: total active time 901s while
-    # every poll refreshed the in-flight clock.
-    record["started_at"] = time.monotonic() - 901.0
     assert _watchdog_no_progress(srv, "sess-1", record) is True, (
-        "the max-prefill ceiling must bound the in-flight hold"
+        "a progress-less in-flight record must still be released by the watchdog"
     )
 
-    # Release: record removed, upstream cancelled, slot/counters freed.
+    # Release happens at the no-progress timeout, well before the 900s ceiling.
     removed = await _cleanup_stale_local_dispatch(srv)
     assert removed == 1
     assert "sess-1" not in srv.local_dispatch_records
+    assert time.monotonic() - record["started_at"] < 900.0
     stream_cm.__aexit__.assert_awaited_once()
     assert srv.local_active_queries == 0
     assert "sess-1" not in srv.local_prefill_in_flight
@@ -1404,15 +1413,15 @@ async def test_accepted_but_never_progressed_held_to_ceiling_then_released(monke
 
 
 @pytest.mark.asyncio
-async def test_in_flight_hold_starves_single_slot_local_pool(monkeypatch):
-    """AC2: a held in-flight lease starves the local pool.
+async def test_in_flight_hold_does_not_starve_single_slot_local_pool(monkeypatch):
+    """LP-0MVKUKFSO008GI6O AC4: an accepted-but-never-progressed request no
+    longer starves the single-slot local pool.
 
-    On the single-slot default profile, one accepted-but-never-progressed
-    request extends its lease and occupies the only slot, so a second
-    session is denied local dispatch for the whole hold. The denial persists
-    until the max-prefill ceiling releases the holder, after which the
-    waiter is admitted — this is the evidence for the impact assessment in
-    ``docs/dev/in-flight-lease-hold-characterisation.md``.
+    On the single-slot default profile the holder occupies the only slot while
+    it waits. Because the in-flight signal does not refresh the no-progress
+    clock, the watchdog releases it at the 180s timeout (the pre-fix behaviour
+    held the pool for the whole 900s ceiling — the 2026-10-23 ~4h wedge), and
+    the waiter is then admitted.
     """
     from proxy.router_helpers import (
         _cleanup_stale_local_dispatch,
@@ -1429,7 +1438,7 @@ async def test_in_flight_hold_starves_single_slot_local_pool(monkeypatch):
         records={
             "holder": {
                 "backend": "local",
-                "started_at": now,
+                "started_at": now - 200.0,
                 "active": True,
                 "expires_at": now + 0.3,
                 "last_progress": 0,
@@ -1456,19 +1465,9 @@ async def test_in_flight_hold_starves_single_slot_local_pool(monkeypatch):
     )
     assert extended is True
 
-    # The hold persists past the 180s no-progress window because the
-    # in-flight signal keeps refreshing the clock (not merely because the
-    # base lease is short). Advance total active time to 300s and run the
-    # periodic watchdog: the holder survives and still starves the pool.
-    srv.local_dispatch_records["holder"]["started_at"] = time.monotonic() - 300.0
-    assert await _cleanup_stale_local_dispatch(srv) == 0, (
-        "the in-flight-refreshed holder must survive the no-progress watchdog"
-    )
-    assert "holder" in srv.local_dispatch_records
-
-    # With the in-flight hold active, a different session is denied: 100% of
-    # the single-slot local capacity is starved.
-    acquired, owner, count, retry_after = await _try_acquire_local_dispatch(
+    # While the holder is waiting it does occupy the single slot: a second
+    # session is denied (this much of the original characterisation holds).
+    acquired, owner, _count, retry_after = await _try_acquire_local_dispatch(
         srv,
         max_local=1,
         session_key="waiter",
@@ -1476,13 +1475,17 @@ async def test_in_flight_hold_starves_single_slot_local_pool(monkeypatch):
         model_name="test-model",
     )
     assert acquired is False, "the waiter must be denied while the hold is active"
-    assert owner == "holder", "the holder must be reported as the lease owner"
+    assert owner == "holder"
     assert retry_after >= 1.0
 
-    # Only the max-prefill ceiling releases the hold; the waiter then wins.
-    srv.local_dispatch_records["holder"]["started_at"] = time.monotonic() - 901.0
+    # ... but the hold is bounded by the 180s no-progress timeout, not the
+    # 900s ceiling: the watchdog releases it and the waiter then wins.
     removed = await _cleanup_stale_local_dispatch(srv)
-    assert removed == 1
+    assert removed == 1, (
+        "the progress-less in-flight holder must be released by the no-progress "
+        "watchdog (pre-fix it survived to the 900s ceiling)"
+    )
+    assert "holder" not in srv.local_prefill_in_flight
 
     acquired, _owner, active_count, _retry_after = await _try_acquire_local_dispatch(
         srv,
@@ -1503,9 +1506,10 @@ async def test_first_byte_ceiling_bounds_and_cancels_accepted_never_progressed(m
     This is the real cancellation path for the accepted-but-never-progressed
     shape: the upstream stream has not delivered a first byte, so no
     ``stream_cm`` is pinned on the dispatch record yet. The in-flight signal
-    extends the lease during the wait (defeating the no-progress watchdog),
-    then ``local_dispatch_first_byte_timeout_seconds`` aborts the wait and
-    cancels the pending ``open_task`` instead of leaking the upstream.
+    keeps the lease from lapsing mid-wait without refreshing the no-progress
+    clock (LP-0MVKUKFSO008GI6O AC4), then
+    ``local_dispatch_first_byte_timeout_seconds`` aborts the wait and cancels
+    the pending ``open_task`` instead of leaking the upstream.
     """
     from proxy.router_helpers import _await_first_byte_with_prefill_monitor
 
@@ -1562,6 +1566,7 @@ async def test_first_byte_ceiling_bounds_and_cancels_accepted_never_progressed(m
     # The in-flight signal extended the lease during the wait ...
     assert _extension_log_calls(srv.logger), "expected in-flight extension polls"
     assert _logged_in_flight(srv.logger)
-    assert srv.local_dispatch_records["sess-1"]["last_progress_ts"] > now - 1.0
-    # ... and the ceiling (not the 180s no-progress timeout) was the bound.
+    # ... without pretending the open request is progress, so the lease stays
+    # valid and the ceiling (not expiry) is what bounds the wait.
+    assert srv.local_dispatch_records["sess-1"]["last_progress_ts"] == now - 500.0
     assert srv.local_dispatch_records["sess-1"]["expires_at"] > now

@@ -33,13 +33,26 @@ Priority semantics (AC3)
 Provider chains (AC2)
 ---------------------
 
-Each model config may declare ``priority_routes`` — a map from
-``low|medium|high`` to an ordered provider list (either full provider config
-dicts or provider **names** resolved against the model's ``providers`` list).
-The chain used for a request is selected by its effective priority; a missing
-entry (or a config without ``priority_routes``) falls back to the model's
-``providers`` list — the existing base config is therefore 100% backward
-compatible (``medium`` semantics).
+Each provider entry of a model may declare ``priorities`` — a list of the
+``low|medium|high`` priorities it may serve. The chain used for a request is
+the model's own ``providers`` list filtered by the request's effective
+priority, in list order (LP-0MVGPZWY0001JD1D):
+
+    chain(P) = [p for p in providers if P in p["priorities"]]
+
+A model whose providers declare no ``priorities`` anywhere is **unlabelled**
+and keeps today's behaviour: every provider eligible for every priority (the
+full ``providers`` list). A labelled model never widens an empty filtered
+chain back to the full list — an empty ``chain(P)`` is rejected at load time
+(``validate_priority_config``) or surfaces as explicit exhaustion, never a
+silent fallback (AC11). The old per-model priority route map was removed
+with this item.
+
+Known limitation (not a gap): **per-priority ordering is not supported** —
+chain order is always the ``providers`` order, so one entry cannot be first
+for ``high`` and later for ``low``. The removed route map was the only way to
+express that, and no model used it; add a separate provider entry (or a
+separate model) if a real need appears.
 
 Observability (AC6)
 -------------------
@@ -339,65 +352,36 @@ def priority_routing_profile(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_chain_entries(
-    model_config: dict, chain: list[Any]
-) -> list[dict]:
-    """Resolve a ``priority_routes`` entry into provider config dicts.
-
-    Each entry is either a full provider config dict (kept as-is) or a
-    provider **name** (resolved against the model's ``providers`` list; a
-    name that cannot be resolved is skipped with a warning — a bad entry
-    must never crash routing).
-    """
-    providers = list(model_config.get("providers") or [])
-    by_name = {
-        str(p.get("name", "")): p
-        for p in providers
-        if isinstance(p, dict)
-    }
-    resolved: list[dict] = []
-    for entry in chain or []:
-        if isinstance(entry, dict):
-            resolved.append(entry)
-            continue
-        name = str(entry or "").strip()
-        if not name:
-            continue
-        match = by_name.get(name)
-        if match is not None:
-            resolved.append(match)
-        else:
-            logger.warning(
-                "priority_routes: unknown provider name %r (model has %d "
-                "providers); skipping entry",
-                name,
-                len(providers),
-            )
-    return resolved
-
-
 def provider_chain_for_priority(
     model_config: dict, priority: str
 ) -> list[dict]:
     """Provider chain selected by *priority* for *model_config* (AC2).
 
-    Precedence:
+    The chain is a filter over the model's own ``providers`` list, in list
+    order — no name lookup, rank table or monotonicity assumption:
 
-    1. ``model_config["priority_routes"][priority]`` when present (resolved
-       names / dicts).
-    2. The model's full ``providers`` list (backward-compatible default,
-       today's ``medium`` semantics).
+        chain(P) = [p for p in providers if P in p["priorities"]]
 
-    A malformed ``priority_routes`` falls back to ``providers`` (never an
-    empty or broken chain unless the model itself is empty).
+    A model whose providers declare no ``priorities`` anywhere is
+    **unlabelled** and keeps the legacy behaviour: every provider eligible
+    for every priority (the full ``providers`` list — what ``embed`` /
+    ``github`` / ``private`` use). A **labelled** model yields the filtered
+    chain as-is: an empty result is returned as ``[]`` and is **never**
+    widened to the full list (LP-0MVGPZWY0001JD1D AC11); a config validator
+    (``validate_priority_config``) rejects the shapes that would leave a
+    labelled model with no provider for a priority.
     """
-    routes = model_config.get("priority_routes")
-    if isinstance(routes, dict):
-        chain = routes.get(priority)
-        resolved = _resolve_chain_entries(model_config, chain) if chain is not None else None
-        if resolved:
-            return resolved
-    return list(model_config.get("providers") or [])
+    priority = parse_priority(priority)
+    raw = list(model_config.get("providers") or [])
+    entries = [p for p in raw if isinstance(p, dict)]
+    if not any("priorities" in p for p in entries):
+        return raw
+    return [
+        p
+        for p in entries
+        if priority
+        in [str(label).strip().lower() for label in (p.get("priorities") or [])]
+    ]
 
 
 def local_preference_for_request(request) -> str:
@@ -454,10 +438,12 @@ def effective_chain_for_request(
     priority-selected provider chain. The client's ``X-Local-Preference`` is
     applied last so ``remote-ok`` never attempts the local route
     (LP-0MVIKPCSG002B0NL AC5).
+
+    A labelled model's filtered chain is returned as-is, including when it is
+    empty: it is never widened back to the full ``providers`` list
+    (LP-0MVGPZWY0001JD1D AC11).
     """
     priority = request_priority(request, server_config)
     set_request_priority(request, priority)
     chain = provider_chain_for_priority(model_config, priority)
-    if not chain:
-        chain = list(model_config.get("providers") or [])
     return apply_local_preference(chain, local_preference_for_request(request))

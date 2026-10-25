@@ -1,0 +1,364 @@
+{
+  "meta": {
+    "generated_at": "2026-10-22T20:44:01",
+    "log_dir": "/var/log/llama-proxy",
+    "glob": "proxy.log*",
+    "slot_cache_dir": "/home/rgardler/projects/llm/slot-cache"
+  },
+  "windows": [
+    {
+      "window": {
+        "name": "baseline (intake)",
+        "start": "2026-10-19 07:23:12",
+        "end": "2026-10-20 07:23:12",
+        "hours": 24.0
+      },
+      "lines": 285594,
+      "streams": {
+        "total": 17459,
+        "local": 411,
+        "local_share_pct": 2.35
+      },
+      "routing": {
+        "decisions": 6734,
+        "cached_ratio_zero": 5616,
+        "cached_ratio_zero_pct": 83.4,
+        "mean_cached_ratio": 0.1361,
+        "by_cache_state": {}
+      },
+      "local_skip": {
+        "total": 4566,
+        "routing_skip_local": 3740,
+        "economic_bypass": 826,
+        "large_context_bypass": 1284,
+        "reasons": {
+          "context_too_large": 2456,
+          "large_context_bypass": 1284
+        }
+      },
+      "local_prefill_ms": {
+        "all": {
+          "count": 411,
+          "p10": 4.43,
+          "p50": 74.45,
+          "p90": 297.01,
+          "max": 817.34,
+          "sum_hours": 13.941
+        },
+        "by_cache_state": {
+          "cold": {
+            "count": 208,
+            "p10": 9.31,
+            "p50": 81.09,
+            "p90": 305.53,
+            "max": 817.34,
+            "sum_hours": 7.682
+          },
+          "warm": {
+            "count": 203,
+            "p10": 3.32,
+            "p50": 69.55,
+            "p90": 290.22,
+            "max": 676.78,
+            "sum_hours": 6.259
+          }
+        },
+        "by_context_bucket": {
+          "edges": [
+            38000,
+            120000
+          ],
+          "by_bucket": {
+            "38,000-120,000": {
+              "cold": {
+                "count": 11,
+                "p10": 31.2,
+                "p50": 189.21,
+                "p90": 313.41,
+                "max": 817.34,
+                "sum_hours": 0.689
+              },
+              "warm": {
+                "count": 101,
+                "p10": 7.17,
+                "p50": 111.29,
+                "p90": 371.48,
+                "max": 676.78,
+                "sum_hours": 4.507
+              }
+            },
+            "<= 38,000": {
+              "cold": {
+                "count": 195,
+                "p10": 8.75,
+                "p50": 76.66,
+                "p90": 288.25,
+                "max": 700.25,
+                "sum_hours": 6.887
+              },
+              "warm": {
+                "count": 101,
+                "p10": 1.97,
+                "p50": 27.5,
+                "p90": 157.38,
+                "max": 318.22,
+                "sum_hours": 1.637
+              }
+            }
+          }
+        }
+      },
+      "slots": {
+        "save_ok": 56,
+        "save_failed": 5,
+        "save_failure_pct": 8.2,
+        "restore_failed": 0,
+        "ratio_restored_events": 0,
+        "cache_state_restored_lines": 0
+      }
+    },
+    {
+      "window": {
+        "name": "post-deploy (full)",
+        "start": "2026-10-20 13:27:34",
+        "end": "2026-10-22 19:50:00",
+        "hours": 54.37
+      },
+      "lines": 363839,
+      "streams": {
+        "total": 19684,
+        "local": 1543,
+        "local_share_pct": 7.84
+      },
+      "routing": {
+        "decisions": 15021,
+        "cached_ratio_zero": 10783,
+        "cached_ratio_zero_pct": 71.79,
+        "mean_cached_ratio": 0.2452,
+        "by_cache_state": {
+          "cold": 11181,
+          "warm": 3840
+        }
+      },
+      "local_skip": {
+        "total": 9762,
+        "routing_skip_local": 9235,
+        "economic_bypass": 527,
+        "large_context_bypass": 4111,
+        "reasons": {
+          "context_too_large": 5124,
+          "large_context_bypass": 4111
+        }
+      },
+      "local_prefill_ms": {
+        "all": {
+          "count": 1543,
+          "p10": 0.78,
+          "p50": 6.99,
+          "p90": 65.14,
+          "max": 591.57,
+          "sum_hours": 11.301
+        },
+        "by_cache_state": {
+          "cold": {
+            "count": 340,
+            "p10": 0.66,
+            "p50": 13.35,
+            "p90": 100.09,
+            "max": 547.1,
+            "sum_hours": 3.548
+          },
+          "warm": {
+            "count": 1203,
+            "p10": 0.78,
+            "p50": 5.95,
+            "p90": 52.68,
+            "max": 591.57,
+            "sum_hours": 7.753
+          }
+        },
+        "by_context_bucket": {
+          "edges": [
+            38000,
+            120000
+          ],
+          "by_bucket": {
+            "38,000-120,000": {
+              "cold": {
+                "count": 22,
+                "p10": 10.45,
+                "p50": 106.58,
+                "p90": 382.56,
+                "max": 547.1,
+                "sum_hours": 0.986
+              },
+              "warm": {
+                "count": 594,
+                "p10": 1.34,
+                "p50": 8.6,
+                "p90": 89.01,
+                "max": 591.57,
+                "sum_hours": 5.677
+              }
+            },
+            "<= 38,000": {
+              "cold": {
+                "count": 318,
+                "p10": 0.6,
+                "p50": 12.62,
+                "p90": 80.82,
+                "max": 535.58,
+                "sum_hours": 2.562
+              },
+              "warm": {
+                "count": 609,
+                "p10": 0.51,
+                "p50": 4.37,
+                "p90": 30.25,
+                "max": 203.01,
+                "sum_hours": 2.076
+              }
+            }
+          }
+        }
+      },
+      "slots": {
+        "save_ok": 211,
+        "save_failed": 15,
+        "save_failure_pct": 6.64,
+        "restore_failed": 0,
+        "ratio_restored_events": 0,
+        "cache_state_restored_lines": 0
+      }
+    },
+    {
+      "window": {
+        "name": "post-deploy (last 24h)",
+        "start": "2026-10-21 19:50:00",
+        "end": "2026-10-22 19:50:00",
+        "hours": 24.0
+      },
+      "lines": 131530,
+      "streams": {
+        "total": 6659,
+        "local": 862,
+        "local_share_pct": 12.94
+      },
+      "routing": {
+        "decisions": 5021,
+        "cached_ratio_zero": 3430,
+        "cached_ratio_zero_pct": 68.31,
+        "mean_cached_ratio": 0.2915,
+        "by_cache_state": {
+          "cold": 3478,
+          "warm": 1543
+        }
+      },
+      "local_skip": {
+        "total": 2933,
+        "routing_skip_local": 2768,
+        "economic_bypass": 165,
+        "large_context_bypass": 1340,
+        "reasons": {
+          "context_too_large": 1428,
+          "large_context_bypass": 1340
+        }
+      },
+      "local_prefill_ms": {
+        "all": {
+          "count": 862,
+          "p10": 0.8,
+          "p50": 6.09,
+          "p90": 47.89,
+          "max": 591.57,
+          "sum_hours": 5.156
+        },
+        "by_cache_state": {
+          "cold": {
+            "count": 135,
+            "p10": 1.58,
+            "p50": 12.95,
+            "p90": 90.65,
+            "max": 535.58,
+            "sum_hours": 1.374
+          },
+          "warm": {
+            "count": 727,
+            "p10": 0.79,
+            "p50": 5.31,
+            "p90": 39.0,
+            "max": 591.57,
+            "sum_hours": 3.782
+          }
+        },
+        "by_context_bucket": {
+          "edges": [
+            38000,
+            120000
+          ],
+          "by_bucket": {
+            "38,000-120,000": {
+              "cold": {
+                "count": 11,
+                "p10": 9.4,
+                "p50": 72.83,
+                "p90": 326.69,
+                "max": 422.91,
+                "sum_hours": 0.437
+              },
+              "warm": {
+                "count": 407,
+                "p10": 1.32,
+                "p50": 6.13,
+                "p90": 57.06,
+                "max": 591.57,
+                "sum_hours": 2.733
+              }
+            },
+            "<= 38,000": {
+              "cold": {
+                "count": 124,
+                "p10": 1.02,
+                "p50": 10.55,
+                "p90": 78.45,
+                "max": 535.58,
+                "sum_hours": 0.937
+              },
+              "warm": {
+                "count": 320,
+                "p10": 0.47,
+                "p50": 4.43,
+                "p90": 28.82,
+                "max": 188.87,
+                "sum_hours": 1.049
+              }
+            }
+          }
+        }
+      },
+      "slots": {
+        "save_ok": 110,
+        "save_failed": 8,
+        "save_failure_pct": 6.78,
+        "restore_failed": 0,
+        "ratio_restored_events": 0,
+        "cache_state_restored_lines": 0
+      }
+    }
+  ],
+  "sidecars": {
+    "root": "/home/rgardler/projects/llm/slot-cache",
+    "count": 37,
+    "newest": "2026-10-22 19:43:10",
+    "oldest": "2026-10-20 13:27:34",
+    "by_model": {
+      "Qwen3": 37
+    }
+  },
+  "restored_engagement": {
+    "ratio_restored_events": 0,
+    "cache_state_restored_lines": 0,
+    "sidecars_on_disk": 37,
+    "engaged": false
+  }
+}
