@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.1.25 (2026-10-25)
+### Features
+- routing_resident_prefix logs reuse_ratio=0.0000 for non-resident sessions, so the usage report counts a non-measurement as a measured prefix (LP-0MVNPZY22008B536)
+- Proxy usage report mis-buckets cheap-mode traffic (priority_window vs retired mode schedule) (LP-0MVKSXXIR006OBI2)
+### Bug Fixes
+- Proxy Web UI /events stream hangs forever when a /slots single-flight leader is cancelled (LP-0MVJML600003CQ6Y)
+- Harden proxy start against foreground invocation being killed by tool-call timeouts (LP-0MVGT0E6W000Q8CY)
+- [test-failure] proxy/tests/test_slots_poll_coalescing.py::test_cancelled_leader_leaves_no_pending_future_or_leak_warnings — failing test (LP-0MVK6QUAQ002KFHU)
+- Cold-prefill admission budget 25k tokens + prefill deadline 90s -> 120s, with post-acceptance eviction logged as ERROR (LP-0MVN3KMGI009BZ0D)
+- False 'saturated' capacity signal starves herdr downtime dispatcher overnight (LP-0MVKSXR4P001V0CM)
+### Other
+- Install the .githooks/pre-push gate (core.hooksPath) so the dev-push full-suite gate actually runs (LP-0MVFFJWPW007ZEPK)
+- Parse routing_skip_provider_context lines in the usage analysis pipeline (LP-0MVMBM1Y3001TPRT)
+- Minimise local LLM tail latency — prefill-bound first-byte tails (epic) (LP-0MVIPY7QX0027XVD)
+- Quality Improvement - Refactoring (LP-0MVJXC95F000SYE2)
+- Quality Improvement - Refactoring (LP-0MVKE62YG002IIU4)
+- Quality Improvement - Refactoring (LP-0MVLK5H04003FZJS)
+- Replace priority_routes with a per-provider priorities list (LP-0MVGPZWY0001JD1D)
+- Add session + attempt + budget evidence to Fallback triggered log lines (LP-0MVMBMSWR0036RES)
+- Make local GPU busy/prefill metrics visible in the proxy usage report (LP-0MVGCQ421005IXGC)
+- Measure restored slot-prefix warmness impact over >=24h (before/after) (LP-0MVGGPSVM003W35K)
+
 ## v0.1.24 (2026-10-22)
 ### Features
 - Prefill-ETA admission guard ignores occupancy: admits guaranteed-loss contention-queue waits (LP-0MVICD2YW004DJPV)
