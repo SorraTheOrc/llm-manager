@@ -30,6 +30,7 @@ import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -2343,6 +2344,208 @@ class _RoutingEstimateCache:
         return self._value
 
 
+# ---------------------------------------------------------------------------
+# Residency-aware admission (LP-0MVN1IQTF0037WTG AC1/AC3)
+#
+# Local admission used to be priced purely from a *prediction*
+# (`expected_cached_ratio` / the `slot_cache_ratio` sidecar). Under contention
+# that prediction is structurally wrong: 27 sessions cycled through 2 slots in
+# 5.4 h on 2026-10-24, aggregate prefix reuse was 26.1 % (median 15.6 % for
+# prompts >20k), and the same 49,103-token prompt scored `n_past=738` on one
+# attempt and 100 % reuse on the immediate retry. The router therefore prices
+# and gates on the *measured* resident prefix read from the cached `/slots`
+# snapshot (see `proxy.residency`), falling back one rung at a time when the
+# measurement is unavailable.
+# ---------------------------------------------------------------------------
+
+#: Default threshold for `server.local_resident_prefix_min_ratio`: a large
+#: prompt is admitted locally only when at least this fraction of it is already
+#: resident in the session's slot. ``0`` disables the gate entirely.
+RESIDENT_PREFIX_MIN_RATIO_DEFAULT: float = 0.5
+
+#: Skip reason emitted when a large prompt's measured reusable prefix is below
+#: `local_resident_prefix_min_ratio`.
+SKIP_REASON_RESIDENT_PREFIX: str = "resident_prefix_insufficient"
+
+#: Skip reasons an idle local backend may override (LP-0MVGD9Z8Z0055Y5J). The
+#: idle-exempt override is the LAST rung of the admission ladder, so the new
+#: residency gate must not silently disable it: an idle GPU still serves cold
+#: work. The physical `context_too_large` cap is never overridable.
+IDLE_OVERRIDABLE_SKIP_REASONS: tuple[str, ...] = (
+    "large_context_bypass",
+    SKIP_REASON_RESIDENT_PREFIX,
+)
+
+#: Provenance of a residency measurement, reported in the admission log line.
+RESIDENCY_SOURCE_MEASURED = "measured"       # live context_tokens from /slots
+RESIDENCY_SOURCE_SESSION_SLOT = "session_slot"  # owns the slot, size unknown
+RESIDENCY_SOURCE_NON_RESIDENT = "non_resident"  # owns no slot (view is fresh)
+RESIDENCY_SOURCE_UNKNOWN = "unknown"            # no fresh view and no ownership
+
+
+@dataclass(frozen=True)
+class ResidentPrefixFacts:
+    """What the live slot state says about one session's reusable prefix."""
+
+    n_past_actual: int | None
+    reuse_ratio: float
+    slot_owner_session: str | None
+    source: str
+    view_known: bool = False
+
+    @property
+    def resident(self) -> bool:
+        """True when the session owns a slot (measured or restore path)."""
+        return self.source in (
+            RESIDENCY_SOURCE_MEASURED,
+            RESIDENCY_SOURCE_SESSION_SLOT,
+        )
+
+
+def _effective_resident_prefix_min_ratio(config: dict | None) -> float:
+    """Resolve `server.local_resident_prefix_min_ratio` (default 0.5).
+
+    ``0`` (or a non-positive / malformed value) disables the residency gate,
+    restoring the predicted-ratio decision this change replaces.
+    """
+    raw = None
+    if isinstance(config, dict):
+        raw = (config.get("server") or {}).get("local_resident_prefix_min_ratio")
+    if raw is None:
+        return RESIDENT_PREFIX_MIN_RATIO_DEFAULT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return RESIDENT_PREFIX_MIN_RATIO_DEFAULT
+    if value <= 0.0:
+        return 0.0
+    return min(1.0, value)
+
+
+def _session_owns_slot(session_id: str | None, endpoint: str | None = None) -> int | None:
+    """Return the slot id *session_id* currently owns, if any.
+
+    Reads the in-process ownership registry (``session._slot_owners``), which
+    is authoritative even when the `/slots` snapshot is stale or missing — the
+    restore path of the AC1 fallback ladder. Fail-open: any error reads as "no
+    ownership".
+    """
+    if not session_id:
+        return None
+    try:
+        from proxy.session import _assigned_slot_for_session
+    except Exception:
+        return None
+    # Prefer the request's endpoint scope, then fall back to any endpoint: the
+    # registry may key ownership with the empty endpoint (legacy single-server
+    # mode) while the router resolves a concrete URL, and vice versa.
+    for scope in ((endpoint,) if endpoint else ()) + (None,):
+        try:
+            slot_id = _assigned_slot_for_session(session_id, endpoint=scope)
+        except Exception:
+            slot_id = None
+        if slot_id is not None:
+            return slot_id
+    return None
+
+
+def resolve_resident_prefix(
+    session_id: str | None,
+    estimated_tokens: int,
+    *,
+    view=None,
+    endpoint: str | None = None,
+) -> ResidentPrefixFacts:
+    """Measure the session's reusable prefix and classify its residency.
+
+    The fallback ladder (never a hard local outage):
+
+    1. ``context_tokens`` known ⇒ measured ratio
+       ``min(context_tokens, estimated_tokens) / estimated_tokens``;
+    2. ``context_tokens`` unknown but the session owns the slot ⇒ treat as
+       resident (the restore path: the slot holds this session's prefix but
+       the build does not report its size — llama.cpp b8782 dropped `n_past`);
+    3. neither ⇒ non-resident (the caller then falls back to today's
+       predicted-ratio decision).
+
+    Only the two documented sources are consulted — the cached `/slots`
+    snapshot and the in-process ownership registry. There is deliberately no
+    synchronous `/slots` call here: llama-server holds `/slots` for >15 s while
+    processing a prompt batch (LP-0MUXTW4MD003TVIC).
+
+    Args:
+        session_id: Session whose prefix is being priced.
+        estimated_tokens: The request's estimated prompt size (tokens).
+        view: Pre-built :class:`proxy.residency.ResidencyView`; built on demand
+            when omitted (fail-open: an unknown view is not an error).
+        endpoint: Local llama-server endpoint scope when several are in play.
+    """
+    if view is None:
+        try:
+            from proxy.residency import get_residency_view
+
+            view = get_residency_view(endpoint=endpoint)
+        except Exception:
+            view = None
+
+    known = bool(getattr(view, "known", False))
+    slot = None
+    if view is not None and known:
+        try:
+            slot = view.slot_for_session(session_id, endpoint=endpoint)
+        except Exception:
+            slot = None
+
+    context_tokens = getattr(slot, "context_tokens", None) if slot is not None else None
+    owner = getattr(slot, "owner_session", None) if slot is not None else None
+    if slot is not None and owner is None:
+        owner = _session_owns_slot(session_id, endpoint)
+
+    if context_tokens is not None and estimated_tokens > 0:
+        reusable = min(int(context_tokens), int(estimated_tokens))
+        return ResidentPrefixFacts(
+            n_past_actual=int(context_tokens),
+            reuse_ratio=min(1.0, max(0.0, reusable / float(estimated_tokens))),
+            slot_owner_session=owner or session_id,
+            source=RESIDENCY_SOURCE_MEASURED,
+            view_known=known,
+        )
+
+    # Unknown size: ownership is the authoritative signal (restore path).
+    owned_slot = _session_owns_slot(session_id, endpoint)
+    if owned_slot is not None:
+        return ResidentPrefixFacts(
+            n_past_actual=None,
+            reuse_ratio=1.0,
+            slot_owner_session=owner or session_id,
+            source=RESIDENCY_SOURCE_SESSION_SLOT,
+            view_known=known,
+        )
+
+    # No ownership. With a *fresh* view that is a measured fact (the pool holds
+    # another session's prefix, so this session's reusable prefix is zero);
+    # with no fresh view the state is genuinely unknown and admission must
+    # fail open to the predicted-ratio decision rather than denying local on
+    # absent data.
+    if owner is None and view is not None and known:
+        # Name the session whose prefix is occupying the pool, so the denial is
+        # attributable in the admission log (AC5 ``slot_owner_session``).
+        try:
+            occupants = view.processing_sessions(endpoint=endpoint) or (
+                view.occupied_sessions(endpoint=endpoint)
+            )
+        except Exception:
+            occupants = ()
+        owner = occupants[0] if occupants else None
+    return ResidentPrefixFacts(
+        n_past_actual=None,
+        reuse_ratio=0.0,
+        slot_owner_session=owner,
+        source=RESIDENCY_SOURCE_NON_RESIDENT if known else RESIDENCY_SOURCE_UNKNOWN,
+        view_known=known,
+    )
+
+
 def _should_skip_local(
     model_name: str,
     session_id: str | None,
@@ -2351,6 +2554,9 @@ def _should_skip_local(
     estimated_tokens: int | None = None,
     warm_cache_threshold: int = 0,
     economic_bypass_serves_local: bool = False,
+    resident_prefix_min_ratio: float = 0.0,
+    residency_view=None,
+    endpoint: str | None = None,
 ) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -2393,6 +2599,20 @@ def _should_skip_local(
 
     A threshold of 0 disables the bypass entirely.
 
+    Residency-aware ladder (LP-0MVN1IQTF0037WTG AC1/AC3), applied when
+    *resident_prefix_min_ratio* > 0 for a prompt above *cold_cache_threshold*:
+
+    1. the hard ``context_too_large`` cap above (unchanged, still first);
+    2. **resident-prefix gate** — admit only when the session's *measured*
+       reusable prefix is at least ``resident_prefix_min_ratio`` of the
+       prompt, else skip with ``resident_prefix_insufficient``;
+    3. **live-prefix pricing** — price ``new_tokens`` from that same live
+       measurement (never the predicted sidecar ratio), so the cold cap is
+       evaluated against real prefill work;
+    4. the idle-exempt override is applied by the *caller* after this
+       function returns (``IDLE_OVERRIDABLE_SKIP_REASONS``), so an idle GPU
+       still serves cold work.
+
     Args:
         model_name: The llama_model name of the local provider.
         session_id: The session ID (for per-session ratio tracking).
@@ -2402,6 +2622,12 @@ def _should_skip_local(
         warm_cache_threshold: Hard cap on total context. 0 = disabled.
         economic_bypass_serves_local: Config-driven flag (from the active
             mode profile) enabling cheap-mode economic-bypass recovery.
+        resident_prefix_min_ratio: Threshold for the resident-prefix gate
+            (``server.local_resident_prefix_min_ratio``). ``0`` disables the
+            residency ladder and restores the predicted-ratio decision.
+        residency_view: Pre-built residency view (``proxy.residency``); built
+            on demand when omitted.
+        endpoint: Local llama-server endpoint scope.
 
     Returns:
         A tuple ``(skip, reason)`` where:
@@ -2409,12 +2635,12 @@ def _should_skip_local(
         - ``skip`` is True if local should be skipped, False for normal
           local routing.
         - ``reason`` is the skip reason when ``skip`` is True
-          (``"context_too_large"`` or ``"large_context_bypass"``), or None
-          when ``skip`` is False.  When ``economic_bypass_serves_local`` is
-          True and the economic check would normally trigger but physical
-          capacity is available, ``(False, None)`` is returned so the
-          request proceeds to local (with contention-queue wait if slots
-          are busy).
+          (``"context_too_large"``, ``"large_context_bypass"`` or
+          ``"resident_prefix_insufficient"``), or None when ``skip`` is
+          False.  When ``economic_bypass_serves_local`` is True and the
+          economic check would normally trigger but physical capacity is
+          available, ``(False, None)`` is returned so the request proceeds to
+          local (with contention-queue wait if slots are busy).
     """
     if cold_cache_threshold <= 0:
         return (False, None)
@@ -2429,7 +2655,39 @@ def _should_skip_local(
     if estimated_tokens <= cold_cache_threshold:
         return (False, None)
 
-    # Check 2: Dynamic new-token calculation
+    # Check 2: Residency-aware ladder (AC1 gate + AC3 live pricing).
+    if resident_prefix_min_ratio > 0.0:
+        facts = resolve_resident_prefix(
+            session_id,
+            estimated_tokens,
+            view=residency_view,
+            endpoint=endpoint,
+        )
+        if facts.source == RESIDENCY_SOURCE_UNKNOWN:
+            # Fail-open: no fresh measurement and no ownership — degrade to
+            # today's predicted-ratio decision instead of denying local.
+            pass
+        elif not facts.resident:
+            # Fresh view, no slot of its own: the resident prefix is measured
+            # at zero, so no prediction can make this prompt cheap.
+            return (True, SKIP_REASON_RESIDENT_PREFIX)
+        elif facts.reuse_ratio < resident_prefix_min_ratio:
+            return (True, SKIP_REASON_RESIDENT_PREFIX)
+        else:
+            reusable = (
+                min(facts.n_past_actual, estimated_tokens)
+                if facts.n_past_actual is not None
+                else estimated_tokens
+            )
+            if max(0, estimated_tokens - reusable) <= cold_cache_threshold:
+                return (False, None)
+            if economic_bypass_serves_local:
+                # Cheap mode still recovers the *economic* miss locally; the
+                # contention queue (if enabled) waits for a slot.
+                return (False, None)
+            return (True, "large_context_bypass")
+
+    # Check 3: Dynamic new-token calculation (predicted ratio).
     ratio = expected_cached_ratio(
         model_name,
         session_id,
@@ -5505,6 +5763,7 @@ async def _queue_context_bypass(
     session_id: str | None,
     priority: str | None = None,
     estimated_tokens: int | None = None,
+    endpoint: str | None = None,
 ) -> tuple[bool, str | None]:
     """Mirror of the smart-routing large-context skip decision.
 
@@ -5546,6 +5805,8 @@ async def _queue_context_bypass(
         estimated_tokens=_estimated_tokens,
         warm_cache_threshold=_warm_threshold,
         economic_bypass_serves_local=_recover_economic,
+        resident_prefix_min_ratio=_effective_resident_prefix_min_ratio(config),
+        endpoint=endpoint,
     )
     return _skip_local, _skip_reason
 
@@ -5952,6 +6213,7 @@ async def _maybe_queue_for_local_slot(
     skip_local, skip_reason = await _queue_context_bypass(
         config, model_config, provider_cfg, request, body_json, session_id,
         priority=priority, estimated_tokens=_estimated_tokens,
+        endpoint=endpoint,
     )
     if skip_local:
         return ("context_bypass", skip_reason, None)
@@ -9464,6 +9726,7 @@ async def _proxy_with_fallback_cycle(
                 # bypasses locally (cheap semantics); high routes remote;
                 # medium uses the merged base config flag (absent — false).
                 _recover_economic = _economic_bypass_serves_local(config, _priority)
+                _resident_min_ratio = _effective_resident_prefix_min_ratio(config)
                 _skip_local, _skip_reason = _should_skip_local(
                     _llama_model,
                     _session_id,
@@ -9472,13 +9735,17 @@ async def _proxy_with_fallback_cycle(
                     estimated_tokens=_estimated_tokens,
                     warm_cache_threshold=_warm_threshold,
                     economic_bypass_serves_local=_recover_economic,
+                    resident_prefix_min_ratio=_resident_min_ratio,
+                    endpoint=local_endpoint,
                 )
                 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): spend
                 # obviously idle GPU capacity instead of paying for a remote
-                # call. Only the ECONOMIC bypass is overridable — the physical
+                # call. Only the ECONOMIC misses are overridable — the physical
                 # ``context_too_large`` cap still applies (the request cannot
-                # fit the KV slot).
-                if _skip_local and _skip_reason == "large_context_bypass":
+                # fit the KV slot), while a residency-gate denial is overridable
+                # because an idle GPU has nothing to evict
+                # (``IDLE_OVERRIDABLE_SKIP_REASONS``).
+                if _skip_local and _skip_reason in IDLE_OVERRIDABLE_SKIP_REASONS:
                     _idle_admit = _evaluate_idle_admission_override(
                         config, provider_cfg, _estimated_tokens
                     )
@@ -9630,6 +9897,8 @@ async def _proxy_with_fallback_cycle(
                             estimated_tokens=_compacted_tokens,
                             warm_cache_threshold=_warm_threshold,
                             economic_bypass_serves_local=_recover_economic,
+                            resident_prefix_min_ratio=_resident_min_ratio,
+                            endpoint=local_endpoint,
                         )
                         if _skip_after:
                             logger.info(

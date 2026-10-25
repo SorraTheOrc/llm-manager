@@ -148,7 +148,6 @@ def _gate(
 # AC1 — resident accept / non-resident reject
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_resident_session_admitted(monkeypatch):
     """A session whose slot holds its full prompt is admitted locally."""
     view = _view(slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch)
@@ -158,7 +157,6 @@ def test_resident_session_admitted(monkeypatch):
     assert (skip, reason) == (False, None)
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_non_resident_session_rejected(monkeypatch):
     """A cold prompt from a session that owns no prefix is skipped locally."""
     view = _view(
@@ -177,36 +175,43 @@ def test_non_resident_session_rejected(monkeypatch):
 # AC1 — ratio boundary
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_ratio_at_boundary_admits(monkeypatch):
     """Exactly ``local_resident_prefix_min_ratio`` of the prompt is enough."""
     view = _view(
-        slots=[_slot(0, EST_TOKENS // 2)],
+        slots=[_slot(0, 50_000)],
         owners={("", 0): "sess-a"},
         monkeypatch=monkeypatch,
     )
 
-    skip, reason = _gate(view=view, min_ratio=0.5, monkeypatch=monkeypatch)
+    # The live new-token cap is raised here so the boundary under test is the
+    # ratio, not the (separately covered) live-pricing cap.
+    skip, reason = _gate(
+        view=view, estimated_tokens=100_000, min_ratio=0.5,
+        cold_threshold=60_000, monkeypatch=monkeypatch,
+    )
 
     assert (skip, reason) == (False, None)
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_one_token_below_boundary_rejects(monkeypatch):
     """One token below the boundary is not resident enough."""
     view = _view(
-        slots=[_slot(0, EST_TOKENS // 2 - 1)],
+        slots=[_slot(0, 49_999)],
         owners={("", 0): "sess-a"},
         monkeypatch=monkeypatch,
     )
 
-    skip, reason = _gate(view=view, min_ratio=0.5, monkeypatch=monkeypatch)
+    # The live new-token cap is raised here so the boundary under test is the
+    # ratio, not the (separately covered) live-pricing cap.
+    skip, reason = _gate(
+        view=view, estimated_tokens=100_000, min_ratio=0.5,
+        cold_threshold=60_000, monkeypatch=monkeypatch,
+    )
 
     assert skip is True
     assert reason == SKIP_RESIDENT_PREFIX
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_zero_min_ratio_disables_gate(monkeypatch):
     """``local_resident_prefix_min_ratio: 0`` restores the predicted-ratio ladder."""
     view = _view(
@@ -226,7 +231,6 @@ def test_zero_min_ratio_disables_gate(monkeypatch):
 # AC1/AC7 — unknown ``context_tokens`` fallback ladder
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_unknown_context_tokens_with_ownership_is_resident(monkeypatch):
     """Unreported ``context_tokens`` + slot ownership ⇒ treat as resident."""
     view = _view(
@@ -240,12 +244,40 @@ def test_unknown_context_tokens_with_ownership_is_resident(monkeypatch):
     assert (skip, reason) == (False, None)
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
-def test_unknown_context_tokens_without_ownership_falls_back_to_prediction(monkeypatch):
-    """No measurement and no ownership ⇒ today's predicted-ratio decision."""
+def test_unknown_context_tokens_without_ownership_with_fresh_view_rejects(monkeypatch):
+    """A fresh view showing no slot of its own is a measured zero prefix.
+
+    With a live snapshot that appears to own nothing, the session's reusable
+    prefix is measurably zero, so *no* prediction may readmit it (this is the
+    2026-10-24 eviction shape: the prediction says 0.99, the pool holds
+    another session's prefix).
+    """
     view = _view(
         slots=[_slot(0, None)],
         owners={},
+        monkeypatch=monkeypatch,
+    )
+
+    skip_cached, reason_cached = _gate(
+        view=view, predicted_ratio=0.99, monkeypatch=monkeypatch
+    )
+
+    assert skip_cached is True
+    assert reason_cached == SKIP_RESIDENT_PREFIX
+
+
+def test_unknown_state_falls_back_to_prediction(monkeypatch):
+    """No fresh view and no ownership ⇒ today's predicted-ratio decision.
+
+    Fail-open: a stale/missing snapshot must never become a hard local
+    outage for a session the ownership registry knows nothing about.
+    """
+    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
+
+    view = _view(
+        slots=[_slot(0, None)],
+        owners={},
+        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
         monkeypatch=monkeypatch,
     )
 
@@ -278,7 +310,6 @@ def test_stale_snapshot_is_unknown(monkeypatch):
     assert view.context_tokens_for_session("sess-a") == N_PAST_COLD
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_stale_snapshot_falls_open_to_ownership(monkeypatch):
     """A stale snapshot must not become a hard local outage."""
     from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
@@ -398,7 +429,6 @@ def test_view_exposes_decision_logging_fields(monkeypatch):
 # AC7 — predicted-vs-actual divergence (the 2026-10-24 failure shape)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_predicted_high_actual_low_rejects(monkeypatch):
     """Predicted 0.99 with a measured 738/49,103 (≈1.5 %) prefix is refused."""
     view = _view(
@@ -417,7 +447,6 @@ def test_predicted_high_actual_low_rejects(monkeypatch):
 # AC3 — live-prefix pricing
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_live_new_tokens_over_budget_rejected(monkeypatch):
     """A resident session whose *live* new_tokens exceed the cap is refused.
 
@@ -441,7 +470,6 @@ def test_live_new_tokens_over_budget_rejected(monkeypatch):
     assert reason == "large_context_bypass"
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_live_new_tokens_within_budget_admitted(monkeypatch):
     """A resident session with a small *live* new-token term is admitted."""
     view = _view(
@@ -455,7 +483,6 @@ def test_live_new_tokens_within_budget_admitted(monkeypatch):
     assert (skip, reason) == (False, None)
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_hard_warm_cap_still_wins(monkeypatch):
     """The physical warm-cache cap is unchanged and evaluated first."""
     view = _view(slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"},
@@ -476,7 +503,6 @@ def test_hard_warm_cap_still_wins(monkeypatch):
 # Idle-exempt override stays last in the ladder
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
 def test_resident_prefix_denial_is_idle_overridable(monkeypatch):
     """A resident-prefix denial may still be served by an idle GPU.
 
@@ -703,3 +729,121 @@ def test_reserve_falls_back_to_body_ratio_without_measurement(monkeypatch):
     assert status == 200
     assert payload["cached_ratio_source"] == "body"
     assert payload["cached_ratio"] == pytest.approx(0.99, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# C3 — gate plumbing: config knob, facts provenance, no hot-path /slots call
+# ---------------------------------------------------------------------------
+
+def test_resident_prefix_min_ratio_config_resolution():
+    """The knob's default, disable semantics and clamping."""
+    assert provider._effective_resident_prefix_min_ratio({"server": {}}) == 0.5
+    assert provider._effective_resident_prefix_min_ratio({}) == 0.5
+    assert provider._effective_resident_prefix_min_ratio(None) == 0.5
+    assert (
+        provider._effective_resident_prefix_min_ratio(
+            {"server": {"local_resident_prefix_min_ratio": 0}}
+        )
+        == 0.0
+    )
+    assert (
+        provider._effective_resident_prefix_min_ratio(
+            {"server": {"local_resident_prefix_min_ratio": 0.25}}
+        )
+        == 0.25
+    )
+    # Out-of-range / malformed values fail safe rather than opening or closing
+    # the gate silently.
+    assert (
+        provider._effective_resident_prefix_min_ratio(
+            {"server": {"local_resident_prefix_min_ratio": 4}}
+        )
+        == 1.0
+    )
+    assert (
+        provider._effective_resident_prefix_min_ratio(
+            {"server": {"local_resident_prefix_min_ratio": "nonsense"}}
+        )
+        == 0.5
+    )
+
+
+def test_resolve_resident_prefix_provenance(monkeypatch):
+    """The fallback ladder's facts are reported with their provenance."""
+    measured = provider.resolve_resident_prefix(
+        "sess-a",
+        EST_TOKENS,
+        view=_view(
+            slots=[_slot(0, N_PAST_COLD)],
+            owners={("", 0): "sess-a"},
+            monkeypatch=monkeypatch,
+        ),
+    )
+    assert measured.source == "measured"
+    assert measured.resident is True
+    assert measured.n_past_actual == N_PAST_COLD
+    assert measured.reuse_ratio == pytest.approx(N_PAST_COLD / EST_TOKENS)
+
+    restore = provider.resolve_resident_prefix(
+        "sess-a",
+        EST_TOKENS,
+        view=_view(
+            slots=[_slot(0, None)], owners={("", 0): "sess-a"},
+            monkeypatch=monkeypatch,
+        ),
+    )
+    assert restore.source == "session_slot"
+    assert restore.resident is True
+    assert restore.reuse_ratio == 1.0
+
+    evicted = provider.resolve_resident_prefix(
+        "sess-a",
+        EST_TOKENS,
+        view=_view(
+            slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-other"},
+            monkeypatch=monkeypatch,
+        ),
+    )
+    assert evicted.source == "non_resident"
+    assert evicted.resident is False
+    assert evicted.slot_owner_session == "sess-other"
+
+    unknown = provider.resolve_resident_prefix(
+        "sess-a",
+        EST_TOKENS,
+        view=_view(slots=[], owners={}, monkeypatch=monkeypatch),
+    )
+    assert unknown.source == "unknown"
+    assert unknown.resident is False
+
+
+def test_gate_never_issues_an_upstream_slots_query(monkeypatch):
+    """AC1's constraint: the ladder consumes only the cached view.
+
+    llama-server holds ``/slots`` for >15 s while processing a prompt batch
+    (LP-0MUXTW4MD003TVIC), so a synchronous query on the admission hot path
+    would stall every routing decision. Both query helpers are patched to
+    raise; running the ladder with no explicit view must still work.
+    """
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("/slots must not be queried on the admission path")
+
+    _install_slot_state(
+        monkeypatch, slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"}
+    )
+    monkeypatch.setattr(observability, "_query_slots_detail", _boom)
+    monkeypatch.setattr(observability, "_query_slots_progress", _boom)
+    monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 0.0)
+
+    skip, reason = provider._should_skip_local(
+        "Qwen3",
+        "sess-a",
+        {"messages": []},
+        COLD_THRESHOLD,
+        estimated_tokens=EST_TOKENS,
+        resident_prefix_min_ratio=0.5,
+        residency_view=None,
+    )
+
+    assert (skip, reason) == (False, None)

@@ -1295,6 +1295,41 @@ server:
   # at 3 slots.
   local_large_context_warm_cache_threshold: 120000
 
+  # Resident-prefix admission gate (LP-0MVN1IQTF0037WTG AC1/AC3). Local
+  # admission used to be priced purely from a *prediction* (`cached_ratio`
+  # from the session's snapshot sidecar). Under contention that prediction is
+  # structurally wrong — 27 sessions cycled through 2 slots in 5.4 h on
+  # 2026-10-24, aggregate prefix reuse was 26.1 % (median 15.6 % for prompts
+  # >20k tokens) and the same 49,103-token prompt measured `n_past=738` on one
+  # attempt and 100 % reuse on the immediate retry. A large prompt (estimated
+  # tokens above `local_large_context_cold_cache_threshold`) is now admitted
+  # locally only when at least this fraction of it is *actually* resident in
+  # the session's slot, measured from the ~1 s cached `/slots` snapshot plus
+  # the in-process slot-ownership registry. `/slots` is never queried on the
+  # admission hot path (llama-server holds it >15 s during prompt processing,
+  # LP-0MUXTW4MD003TVIC).
+  #
+  # - `0` disables the gate entirely and restores the predicted-ratio
+  #   decision; values are clamped to (0, 1].
+  # - On a denial the request skips local with reason
+  #   `resident_prefix_insufficient` and follows the normal fallback chain,
+  #   exactly like `large_context_bypass` today; the `contention_queue_*`
+  #   budget is untouched (a denied request never enters the queue).
+  # - `local_idle_admit_*` (LP-0MVGD9Z8Z0055Y5J) is the LAST rung of the
+  #   ladder: an idle GPU still overrides a residency denial, so enabling this
+  #   gate cannot make an idle local backend refuse cold work.
+  # - Fail-open: a missing/stale snapshot, a session that owns no slot, or a
+  #   build that does not report `context_tokens` (llama.cpp b8782 dropped
+  #   `n_past`) degrades to the session-owns-slot check and then to the
+  #   predicted ratio — never to a hard local outage.
+  # - Live-prefix pricing (AC3): when the measurement is available, the
+  #   cold-token cap (`local_large_context_cold_cache_threshold`, 25k from
+  #   LP-0MVN3KMGI009BZ0D once shipped) is evaluated against the *measured*
+  #   new-token count rather than the predicted one.
+  #
+  # Default: 0.5 (50 % of the prompt must still be resident).
+  local_resident_prefix_min_ratio: 0.5
+
   # Latency-derived economic-ceiling ratio for the WARM threshold
   # (LP-0MU466L1X003RTHN). The ceiling scales linearly with the model context
   # size (not the slot count) so a profile change (smaller model, different
