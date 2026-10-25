@@ -269,6 +269,22 @@ RE_EVICTION_AA_ETA = re.compile(r"\beta_prefill_s=([\d.]+|unknown)")
 RE_EVICTION_AA_ELAPSED = re.compile(r"\belapsed_s=([\d.]+)")
 RE_EVICTION_AA_SLOT_ID = re.compile(r"\bslot_id=(\d+|unknown)")
 RE_EVICTION_AA_TASK_ID = re.compile(r"\bllama_task_id=(\S+)")
+# Prefill-deadline cancellation (LP-0MVOAQDB4002D56G, parent AC4): the proxy
+# logs ``prefill_deadline_exceeded session=<id> deadline=<n>s → cancelling
+# local dispatch and detouring to the next provider`` at WARNING level when an
+# admitted local prefill overruns the deadline. Its own kind so AC4's
+# deadline-rate check reads from the report instead of a raw log scan.
+PREFILL_DEADLINE_EXCEEDED = "prefill_deadline_exceeded"
+RE_PREFILL_DEADLINE_SECONDS = re.compile(r"\bdeadline=(\d+(?:\.\d+)?)s")
+# Provider-chain exhaustion: ``All providers exhausted for model=<route>;
+# unavailable={...}; usage_limit_reset=<...>`` — the client-visible failure
+# the AC4 "no increase in 503s / exhaustion" check counts. Distinct from the
+# upstream per-provider errors (``upstream_http_error``), which are counted by
+# status code.
+PROVIDER_EXHAUSTED = "All providers exhausted"
+RE_PROVIDER_EXHAUSTED_MODEL = re.compile(
+    r"All providers exhausted for model=(\S+?);"
+)
 COMPACTION_EVENT = "compaction_event"
 COMPACTION_BACKSTOP = "compaction_backstop"
 COMPACTION_CHURN = "compaction_churn"
@@ -583,6 +599,9 @@ class LogEvent:
     eta_prefill_seconds: float | None = None
     elapsed_seconds: float | None = None
     llama_task_id: str | None = None
+    # Prefill-deadline overrun (``prefill_deadline_exceeded`` kind): the
+    # configured deadline that was exceeded, in seconds.
+    deadline_seconds: float | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -926,6 +945,25 @@ def parse_log_line(line: str) -> LogEvent | None:
                 if _first(RE_TENANT_OCCUPANTS, msg)
                 else None
             ),
+        )
+    if msg.startswith(PREFILL_DEADLINE_EXCEEDED):
+        # "prefill_deadline_exceeded session=<id> deadline=120s → cancelling
+        #  local dispatch and detouring to the next provider"
+        # Session-less lines are still counted (the AC4 rate does not depend on
+        # attribution); only the deadline token is optional.
+        return LogEvent(
+            PREFILL_DEADLINE_EXCEEDED,
+            ts,
+            session=_session_from(msg),
+            deadline_seconds=_float(RE_PREFILL_DEADLINE_SECONDS, msg),
+        )
+    if msg.startswith(PROVIDER_EXHAUSTED):
+        # "All providers exhausted for model=v1/chat/completions;
+        #  unavailable={'local-qwen3': 59}; usage_limit_reset=None"
+        return LogEvent(
+            "provider_exhausted",
+            ts,
+            model=_first(RE_PROVIDER_EXHAUSTED_MODEL, msg),
         )
     if msg.startswith(LOCAL_EVICTION_AFTER_ACCEPTANCE):
         # "local_eviction_after_acceptance session=<id> reason=prefill_deadline

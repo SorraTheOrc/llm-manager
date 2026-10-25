@@ -84,6 +84,31 @@ Outputs written to:
   "by_limit": {limit: count}}`. `share_of_skips` uses **all** skip events
   (`routing_skip_local` + provider-context) as its denominator; an event whose
   line carried no `limit` is keyed `(unknown)` rather than dropped.
+- **Prefill-regression keys** (LP-0MVOAQDB4002D56G, certifying the cold-prefill
+  admission budget of LP-0MVN3KMGI009BZ0D). Five additive keys, so the 24 h
+  AC4 certification no longer needs a hand-written log scan; the report renders
+  them in a **Prefill admission regression** section whenever any is non-zero.
+  - `prefill_deadline_events` — `prefill_deadline_exceeded` WARNING lines
+    (an admitted local prefill cancelled at the deadline).
+  - `prefill_deadline_events_by_class` — `{"user": N, "audit": M}`. A
+    session id beginning `audit-` is agent **audit** traffic (gate sweeps,
+    herdr child sessions); every other session — including an unattributed
+    one — is **user** traffic. Audit runs are real inference but are not the
+    workload the budget is priced for, so the deadline-rate criterion is gated
+    on `user`.
+  - `prefill_budget_refusals` — `local_admission_guard` events with
+    `decision=reject reason=prefill_budget_exceeded` (over-budget prompts
+    refused before any dispatch; other reject reasons are not counted here and
+    remain visible in `local_admission_reject`).
+  - `wasted_prefill_tokens` — sum of `new_tokens` over
+    `local_eviction_after_acceptance` events whose `reason` is
+    `prefill_deadline`: tokens the GPU computed for a dispatch then abandoned
+    before its first byte. Other eviction reasons are excluded.
+  - `provider_exhausted_errors` — `All providers exhausted` lines
+    (client-visible chain failures); `upstream_status_503_errors` —
+    `upstream_http_error` events with `status == 503` (provider-side 5xx).
+    The two are separate on purpose: a provider can return 503 while another
+    still serves the request.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**

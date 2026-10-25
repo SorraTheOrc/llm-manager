@@ -471,6 +471,11 @@ def build_report(
     # evidence they explain.
     _append_residency_section(ap, summary)
 
+    # Prefill-regression checks (LP-0MVOAQDB4002D56G, parent AC4): the four
+    # admission-budget numbers the 24 h certification reads, split into user
+    # and agent-audit traffic.
+    _append_prefill_regression_section(ap, summary)
+
     # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3): surfaced
     # separately so a stuck hold is not read as repeated client retries.
     _append_hold_cycle_section(ap, summary)
@@ -1248,6 +1253,69 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
                f"{snapshots} |")
 
 
+def _append_prefill_regression_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Prefill admission regression`` section (AC4 checks).
+
+    The cold-prefill admission budget (LP-0MVN3KMGI009BZ0D) is certified over
+    a 24 h window by four checks, which used to require hand-written log
+    scans. They are rendered together here, with the deadline count split into
+    ``user`` and agent ``audit`` traffic (LP-0MVOAQDB4002D56G) because audit
+    gate runs are real inference but not the workload the budget is priced
+    for. Omitted entirely when every check is zero, like the report's other
+    conditional sections.
+    """
+    deadline_events = len(getattr(summary, "prefill_deadline_events", []) or [])
+    by_class = _prefill_deadline_by_class(summary)
+    budget_refusals = sum(
+        1
+        for e in getattr(summary, "local_admission_events", []) or []
+        if getattr(e, "decision", None) == "reject"
+        and (getattr(e, "reason", None) or "") == "prefill_budget_exceeded"
+    )
+    wasted = _wasted_prefill_tokens(summary)
+    exhausted = len(getattr(summary, "provider_exhausted_events", []) or [])
+    upstream_503 = sum(
+        1
+        for e in getattr(summary, "error_events", []) or []
+        if getattr(e, "kind", None) == "upstream_http_error"
+        and getattr(e, "status", None) == 503
+    )
+    if not any((deadline_events, budget_refusals, wasted, exhausted, upstream_503)):
+        return
+
+    evictions = list(getattr(summary, "eviction_after_acceptance_events", []) or [])
+    ap("")
+    ap("## Prefill admission regression")
+    ap("")
+    ap("Cold-prefill admission budget checks (LP-0MVN3KMGI009BZ0D AC4). "
+       "`user` / `audit` splits the deadline count by session id: `audit-*` "
+       "sessions are agent audit runs, not user traffic.")
+    ap("")
+    ap("| Check | Value | Meaning |")
+    ap("|---|---|---|")
+    ap(f"| `prefill_deadline_exceeded` | {deadline_events} "
+       f"(user {by_class['user']} / audit {by_class['audit']}) | "
+       "admitted local prefills cancelled at the deadline |")
+    ap(f"| `prefill_budget_exceeded` refusals | {budget_refusals} | "
+       "over-budget prompts refused at admission (never dispatched) |")
+    ap(f"| Wasted prefill tokens | {wasted} | "
+       "tokens computed then discarded by deadline cancellations |")
+    ap(f"| Provider exhaustion | {exhausted} | "
+       "client-visible `All providers exhausted` failures |")
+    ap(f"| Upstream `status=503` | {upstream_503} | provider-side 5xx responses |")
+    if evictions:
+        ap("")
+        ap("Post-acceptance evictions in the window, by reason "
+           "(`local_evictions_after_acceptance`):")
+        ap("")
+        ap("| Reason | Count |")
+        ap("|---|---|")
+        for reason, count in Counter(
+            ev.reason or UNKNOWN_LABEL for ev in evictions
+        ).most_common():
+            ap(f"| {reason} | {count} |")
+
+
 def _append_hold_cycle_section(ap, summary: AnalysisResult) -> None:
     """Append the ``## Hold-cycle re-emissions`` section to the report.
 
@@ -1881,6 +1949,49 @@ def _pct(part: int, total: int) -> float:
     return (part / total * 100.0) if total else 0.0
 
 
+AUDIT_SESSION_PREFIX = "audit-"
+
+
+def _is_audit_session(session: str | None) -> bool:
+    """Whether *session* is agent audit traffic rather than user traffic.
+
+    Audit runs (``/skill:audit`` gate sweeps, ``herdr`` child sessions) use
+    session ids prefixed ``audit-``. They issue genuine local inference and
+    therefore genuinely consume prefill, but they are not the workload the
+    prefill budget is priced for (LP-0MVOAQDB4002D56G).
+    """
+    return bool(session) and str(session).startswith(AUDIT_SESSION_PREFIX)
+
+
+def _prefill_deadline_by_class(summary: AnalysisResult) -> dict[str, int]:
+    """``prefill_deadline_exceeded`` counts split user vs agent-audit traffic."""
+    counts = {"user": 0, "audit": 0}
+    for event in getattr(summary, "prefill_deadline_events", []) or []:
+        key = "audit" if _is_audit_session(getattr(event, "session", None)) else "user"
+        counts[key] += 1
+    return counts
+
+
+def _wasted_prefill_tokens(summary: AnalysisResult) -> int:
+    """Prefill tokens computed and discarded by deadline cancellations.
+
+    Sums ``new_tokens`` over ``local_eviction_after_acceptance`` events whose
+    ``reason`` is ``prefill_deadline``: those are the tokens the GPU had to
+    compute for a dispatch that was then abandoned before its first byte
+    (parent AC4's waste check). Other eviction reasons are excluded — their
+    ``new_tokens`` did not necessarily cost a fresh prefill.
+    """
+    total = 0
+    for event in getattr(summary, "eviction_after_acceptance_events", []) or []:
+        if (getattr(event, "reason", None) or "") != "prefill_deadline":
+            continue
+        try:
+            total += int(getattr(event, "new_tokens", None) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
 def _percentile(values: list[float], pct: float) -> float | None:
     """Return the ``pct``-th percentile of *values* (0–100), or ``None`` when empty."""
     if not values:
@@ -2370,6 +2481,34 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
                     getattr(summary, "eviction_after_acceptance_events", []) or []
                 )
             )
+        ),
+        # LP-0MVOAQDB4002D56G (parent AC4): the prefill-regression checks the
+        # 24 h certification needs. All ADDITIVE — no key above changes value
+        # or meaning.
+        #
+        # ``audit`` class = a session id beginning ``audit-`` (agent audit
+        # traffic from parallel gate runs); every other session, including an
+        # unattributed one, is ``user`` traffic. Both are reported so the
+        # re-scoped AC4 can gate on user traffic while showing the total.
+        "prefill_deadline_events": len(
+            getattr(summary, "prefill_deadline_events", []) or []
+        ),
+        "prefill_deadline_events_by_class": _prefill_deadline_by_class(summary),
+        "prefill_budget_refusals": sum(
+            1
+            for e in getattr(summary, "local_admission_events", []) or []
+            if getattr(e, "decision", None) == "reject"
+            and (getattr(e, "reason", None) or "") == "prefill_budget_exceeded"
+        ),
+        "wasted_prefill_tokens": _wasted_prefill_tokens(summary),
+        "provider_exhausted_errors": len(
+            getattr(summary, "provider_exhausted_events", []) or []
+        ),
+        "upstream_status_503_errors": sum(
+            1
+            for e in getattr(summary, "error_events", []) or []
+            if getattr(e, "kind", None) == "upstream_http_error"
+            and getattr(e, "status", None) == 503
         ),
         "contention_queued_duration_seconds": round(
             sum(float(e.queued_duration or 0.0) for e in summary.contention_dispatch_events)

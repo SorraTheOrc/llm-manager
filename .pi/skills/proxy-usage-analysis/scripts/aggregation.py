@@ -319,6 +319,14 @@ class AnalysisResult:
     #: (``local_eviction_after_acceptance``). A defect signal, not churn:
     #: LP-0MVN4LCQJ0034S5S / parent AC7(a).
     eviction_after_acceptance_events: list[LogEvent] = field(default_factory=list)
+    #: Prefill-deadline overruns (``prefill_deadline_exceeded``,
+    #: LP-0MVOAQDB4002D56G): a local prefill was cancelled at the deadline
+    #: after admission. AC4's deadline-rate check counts these, split into
+    #: user and agent-audit traffic by session id.
+    prefill_deadline_events: list[LogEvent] = field(default_factory=list)
+    #: Provider-chain exhaustion (``All providers exhausted``): the
+    #: client-visible failure AC4 compares against the pre-change window.
+    provider_exhausted_events: list[LogEvent] = field(default_factory=list)
     # Parsed error events (stream errors, slot_save failures, backend_retry
     # timeouts, upstream HTTP errors) inside the window.
     error_events: list[LogEvent] = field(default_factory=list)
@@ -1609,6 +1617,8 @@ def aggregate(
     residency_events: list[LogEvent] = []
     eviction_events: list[LogEvent] = []
     eviction_after_acceptance_events: list[LogEvent] = []
+    prefill_deadline_events: list[LogEvent] = []
+    provider_exhausted_events: list[LogEvent] = []
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
@@ -1781,6 +1791,15 @@ def aggregate(
             # these events into the tenancy bucket.
             eviction_after_acceptance_events.append(ev)
             continue
+        if ev.kind == "prefill_deadline_exceeded":
+            # LP-0MVOAQDB4002D56G: AC4 deadline-rate evidence. Kept out of
+            # every other aggregate (it is not a routing skip, not an eviction
+            # counter event) so existing keys keep their meaning.
+            prefill_deadline_events.append(ev)
+            continue
+        if ev.kind == "provider_exhausted":
+            provider_exhausted_events.append(ev)
+            continue
         if ev.kind == "local_eviction":
             eviction_events.append(ev)
             continue
@@ -1851,6 +1870,8 @@ def aggregate(
         residency_events=residency_events,
         eviction_events=eviction_events,
         eviction_after_acceptance_events=eviction_after_acceptance_events,
+        prefill_deadline_events=prefill_deadline_events,
+        provider_exhausted_events=provider_exhausted_events,
         compaction_events=compaction_events,
         busy=busy,
         hourly_activity=hourly_activity,
