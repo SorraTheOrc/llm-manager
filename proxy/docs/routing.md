@@ -740,6 +740,90 @@ server:
   `local_prefills_in_flight`, `local_max_concurrent_prefills` and
   `prefill_gate_waiters` (the contention queue depth).
 
+## Residency-aware admission ladder (LP-0MVN1IQTF0037WTG)
+
+Local admission used to be priced **per request** from a *prediction*
+(`expected_cached_ratio` / the `slot_cache_ratio` sidecar) with no notion of
+which session owned which slot. Under contention that prediction is
+structurally wrong: 27 distinct sessions cycled through 2 slots in 5.4 h on
+2026-10-24, aggregate prefix reuse was **26.1 %** (median **15.6 %** for prompts
+>20k tokens, 28 of 227 fully cold), and the *same* 49,103-token prompt measured
+`n_past=738` (1.5 % reusable) on one attempt and 100 % on the immediate retry.
+
+A large prompt (estimated tokens above `local_large_context_cold_cache_threshold`)
+now walks a **five-rung ladder**, in this order:
+
+1. **Hard context cap** — `context_too_large` when the prompt exceeds the warm
+   threshold. Unchanged, never overridable (the prompt cannot fit the KV slot).
+2. **Resident-prefix gate** — admit only when the session's *measured* reusable
+   prefix is at least `local_resident_prefix_min_ratio` of the prompt;
+   otherwise skip local with `resident_prefix_insufficient` and fall through the
+   chain as `large_context_bypass` does today. `0` disables this rung.
+3. **Session tenancy** — at most `local_session_tenants` distinct sessions hold a
+   local reservation at once (`tenant_limit` otherwise); same-session re-entry is
+   always permitted and a tenancy idle-lapses after
+   `local_session_tenancy_idle_seconds` of no activity.
+4. **Live-priced cold check** — `new_tokens` is priced from the same live
+   measurement (`estimated_tokens - min(context_tokens, estimated_tokens)`), so
+   the cold budget is evaluated against real prefill work; a cold miss is
+   `large_context_bypass`.
+5. **Idle-exempt override** — last, so an idle GPU still serves cold work
+   (`local_idle_admit_*`, below). It may override rungs 2 and 4, never rung 1.
+
+```yaml
+server:
+  local_resident_prefix_min_ratio: 0.5   # 0 disables the residency gate
+  local_session_tenants: 2               # default: the slot count; 0 disables
+  local_session_tenancy_idle_seconds: 30 # default: the adaptive dispatch lease
+```
+
+### What to read, what never to call
+
+Admission reads the **cached** slot snapshot only
+(`observability._last_slot_details_cache` + its `_last_slot_details_at` stamp,
+refreshed about once a second by `_periodic_broadcast_loop()`) joined with the
+in-process ownership registry (`session._slot_owners`) through
+`proxy.residency.get_residency_view()`.
+
+**Never issue a synchronous `/slots` call on the admission hot path.** Under a
+prompt-processing batch llama-server holds `/slots` for more than 15 s (measured
+8.7 s, then >15 s, against a 1 s status timeout — `LP-0MUXTW4MD003TVIC`), so a
+synchronous call would stall every routing decision. `proxy.residency` is
+dependency-free for exactly this reason: no poller, no new task, no upstream
+call.
+
+**Fail-open on unknown state.** A missing or stale snapshot (> 5 s), a session
+that owns no slot, or a build that no longer reports `context_tokens` (llama.cpp
+b8782 dropped `n_past`) degrades one rung at a time: measured ratio → session
+owns the slot (restore path) → today's predicted-ratio decision. Admission never
+turns absent data into a hard local outage.
+
+### Tenancy is a lease, not a lock
+
+Reservations follow the existing dispatch-record lease: held only while real
+activity is observed, reclaimed by the existing ~10 s `_dispatch_cleanup_loop`
+(observed client disconnect → released immediately) or by the 180 s no-progress
+watchdog for a silent half-open drop, never only by the 900 s lifetime ceiling.
+On reclaim the evicted session's KV snapshot is saved (`slot_<session>.bin`,
+subject to the existing pool-size / busy / circuit-breaker gates) so a returning
+client restores warm instead of prefilling cold, and the shared
+`local_eviction` ERROR event records the reason (`lease_evicted`,
+`slot_assignment_freed`, `resident_prefix_evicted_by_tenant`,
+`tenancy_lease_expired`; sink: `proxy/admission_events.py`).
+
+### Observability
+
+Every decision logs
+`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|session_slot|non_resident|unknown> min_ratio=… tenants=… occupants=… session=…`.
+`proxy-usage-analysis` renders the resident-vs-evicted reuse split and
+per-session slot-owner churn in its `## Residency-aware admission` section.
+
+Replay evidence: `proxy/scripts/replay_prefill_occupancy.py --residency-replay`
+(and `--window-fixture`) plus
+`proxy/tests/test_prefill_thrash_replay_2026_10_24.py` replay the pinned
+2026-10-24 window through this ladder: zero over-budget cold admissions without
+a resident prefix, and tasks 92383/92422 classified cold-then-resident.
+
 ## Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
 
 Routing is size/economics-driven and used to ignore whether the backend was

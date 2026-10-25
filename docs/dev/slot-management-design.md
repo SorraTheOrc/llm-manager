@@ -769,3 +769,51 @@ items of the parent epic.
 | **LP-0MQMC4MKY006J08E** (Prompt-cache / session reuse tests) | Execute after Phase 1 (P1–P3) — tests should verify cache preservation under reservation |
 | **LP-0MQMC4MNU002QJK4** (Slot-cache retention & cleanup) | Can be done in parallel with any phase — orthogonal to reservation |
 | **LP-0MQ0PYH8P008DLPJ** (Web based logging per slot) | Coordinate with Phase 4 (P9) — both touch metrics/logging infrastructure |
+
+## 6. Shipped: residency-aware admission and session tenancy (LP-0MVN1IQTF0037WTG)
+
+This proposal evaluated three approaches (session reservation, queued
+allocation, client backoff). What actually shipped is a narrower version of
+Approach A plus the occupancy work that followed it:
+
+- **Shared residency view** (`proxy/residency.py`): an immutable projection of
+  `(slot_id, owner_session, context_tokens, is_processing)` built from the
+  cached `/slots` snapshot (`observability._last_slot_details_cache` +
+  `_last_slot_details_at`) and `session._slot_owners`. Read-only, no poller, no
+  upstream call: `/slots` is unobservable for >15 s under prefill
+  (`LP-0MUXTW4MD003TVIC`), so admission must never call it synchronously. A
+  stale (> 5 s) or missing snapshot reports `known=False` and admission fails
+  open one rung at a time rather than denying local on absent data.
+- **Resident-prefix gate**: a large prompt is admitted locally only when the
+  session's measured reusable prefix is at least
+  `local_resident_prefix_min_ratio` (default 0.5) of it. This is the
+  per-session affinity objective of §2.1, enforced at admission instead of by
+  reserving a slot for the session's whole lifetime.
+- **Session tenancy bound**: at most `local_session_tenants` (default: the slot
+  count) distinct sessions hold a local reservation at once; a further session
+  follows the normal chain instead of evicting a resident. Same-session
+  re-entry is always allowed; a tenancy idle-lapses after
+  `local_session_tenancy_idle_seconds` (default: the adaptive dispatch lease,
+  30 s), so an abandoned resident cannot gate the pool.
+- **Tenancy as a lease** (not a lock): reclaim reuses the existing dispatch
+  machinery — the ~10 s `_dispatch_cleanup_loop` releases on an observed client
+  disconnect, the 180 s no-progress watchdog bounds a silent half-open drop, and
+  the 900 s lifetime ceiling is never the only release path. On reclaim the
+  evicted session's KV snapshot is saved (`slot_<session>.bin`, subject to the
+  existing pool-size / busy / circuit-breaker gates) so the returning client
+  restores warm instead of prefilling cold. Every eviction emits the shared
+  `local_eviction` ERROR event (`proxy/admission_events.py`).
+- **Observability**: `routing_resident_prefix` decision lines carry
+  `n_past_actual`, `estimated_tokens`, `reuse_ratio`, `slot_owner_session` and
+  the decision; `proxy-usage-analysis` reports the resident-vs-evicted reuse
+  split and per-session slot-owner churn.
+
+Not shipped here, deliberately: no slot-count change (evaluated separately in
+`LP-0MVN3KPEC007WWL5` — at 3 slots the per-slot context falls from 262,144 to
+87,381 tokens, excluding the long-context sessions that dominate this
+workload), and no client-side cooperation (the proxy remains the sole owner of
+abandonment reaping).
+
+Replay evidence for the 2026-10-24 thrash window:
+`proxy/tests/test_prefill_thrash_replay_2026_10_24.py` and
+`docs/dev/slot-thrashing-investigation/findings.md`.

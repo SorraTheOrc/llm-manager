@@ -94,3 +94,41 @@ head and truncated history earn nothing (AC3), the wired prefill-ETA guard's
 ETA drops below the budget (AC4), measured/restored ratios are preserved,
 clearing the session forgets the prefix, margin scaling and the 0.0 rollback
 (AC5), and invalid records are ignored.
+
+## Where the prediction still matters — and where it no longer does
+
+**Work item:** LP-0MVN1IQTF0037WTG.
+
+`expected_cached_ratio()` is a *prediction*: it is written from the previous
+local response's usage (above), from the persisted slot sidecar, or from the
+recorded prefix fingerprint. Under slot contention it is structurally wrong —
+the 2026-10-24 window measured `cached_ratio ≈ 0.99` predicted for requests that
+then prefilled from `n_past=738`, and 27 sessions cycled through 2 slots.
+
+Since LP-0MVN1IQTF0037WTG the **resident-prefix gate and the cold-token pricing
+of large prompts no longer read this prediction**: they price from the *measured*
+reusable prefix in the cached `/slots` snapshot
+(`proxy.residency.get_residency_view()` → `n_past_actual`), which is what makes
+the divergence case decidable at all (task 92383: predicted 0.99, measured
+1.5 % → refused; task 92422: measured 100 % → admitted).
+
+The prediction is still used, deliberately, in two places:
+
+1. **Fail-open fallback.** When there is no fresh snapshot *and* the session owns
+   no slot (`residency_source=unknown`), admission degrades to the predicted
+   ratio rather than denying local on absent data.
+2. **Everything below the budget.** Prompts at or under
+   `local_large_context_cold_cache_threshold` (and small contexts generally) are
+   routed local as before, as is the cheap-mode economic recovery, the
+   capacity-admission path and the prefill-ETA guard's ETA input.
+
+So the prefix-credit machinery documented above remains the mechanism that
+keeps *sub-threshold* multi-turn sessions cheap, while the residency gate
+decides the large-prompt band from measurement. The knob that disables the new
+gate (`server.local_resident_prefix_min_ratio: 0`) restores the predicted-ratio
+decision everywhere — the documented rollback for the residency work, exactly
+as `cached_prefix_credit_margin: 0.0` is the rollback for the credit itself.
+
+**Do not add a synchronous `/slots` call to make the prediction "more accurate".**
+`/slots` is held for >15 s during prompt processing
+(`LP-0MUXTW4MD003TVIC`); measurement comes from the ~1 s cached snapshot.
