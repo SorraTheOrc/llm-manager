@@ -1276,3 +1276,84 @@ def test_tenant_denial_logging_is_parseable(caplog, monkeypatch):
     assert event.decision == SKIP_TENANT_LIMIT
     assert event.tenant_limit == 2
     assert event.tenant_occupants == 2
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVNPZY22008B536 — reuse_ratio is logged only when it was measured
+# ---------------------------------------------------------------------------
+
+def test_non_resident_denial_logs_no_ratio(caplog, monkeypatch):
+    """A session owning no slot has *no* measurement: log ``reuse_ratio=none``.
+
+    Logging the internal 0.0 sentinel fabricated a 0 % measurement, which the
+    usage report then counted in its "measured ratio" denominator and averaged
+    into the evicted row.
+    """
+    import logging
+
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, predicted_ratio=0.99, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == SKIP_RESIDENT_PREFIX
+    assert event.residency_source == "non_resident"
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None, "a non-measurement must not be logged as 0.0"
+
+
+def test_unknown_state_logs_no_ratio(caplog, monkeypatch):
+    """Genuinely unknown state (stale view, no ownership) also logs ``none``.
+
+    The prediction-fallback path emits the decision line only once the
+    predicted-ratio ladder reaches its own verdict, so this asserts the shape
+    through ``_log_residency_decision`` directly (the ladder does not log an
+    ``unknown`` denial — there is no denial to report).
+    """
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        provider._log_residency_decision(
+            session_id="sess-a",
+            estimated_tokens=EST_TOKENS,
+            decision="resident_prefix_insufficient",
+            model_name="Qwen3",
+            facts=provider.resolve_resident_prefix(
+                "sess-a",
+                EST_TOKENS,
+                view=_view(slots=[], owners={}, monkeypatch=monkeypatch),
+            ),
+            min_ratio=0.5,
+        )
+
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == "unknown"
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None
+
+
+def test_measured_zero_ratio_is_still_logged_as_zero(caplog, monkeypatch):
+    """A genuine measured 0 (slot reports ``context_tokens=0``) stays numeric."""
+    import logging
+
+    view = _view(
+        slots=[_slot(0, 0)], owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.n_past_actual == 0
+    assert event.reuse_ratio == pytest.approx(0.0)
+    assert event.reuse_ratio is not None

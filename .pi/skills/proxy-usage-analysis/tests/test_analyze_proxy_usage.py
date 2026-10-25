@@ -7754,6 +7754,35 @@ class TestResidencyAdmission:
         assert "tenancy_lease_expired" in section
         assert "Snapshot saved" in section
 
+    def test_non_measurements_are_not_counted_as_measured(self):
+        """Decisions with no measurement never enter the measured/ratio split.
+
+        LP-0MVNPZY22008B536: a non-resident denial carries no measurement, so
+        the report must report it under "no measurement" and keep it out of the
+        measured denominator and the resident/evicted ratio rows (otherwise a
+        fabricated 0 % drags the evicted median down).
+        """
+        summary = aggregation.aggregate(
+            _events(
+                [
+                    fixtures.STREAM_STARTED_LOCAL,
+                    self.NO_SLOT,
+                    self.EVICTION,
+                    fixtures.STREAM_FINISHED_LOCAL,
+                ]
+            ),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+        section = self._section(reporting.build_report(summary, None))
+
+        assert "(measured ratio: 0, no measurement: 1)" in section
+        assert "**1** with no slot at all" in section
+        # No ratio row can be rendered: nothing was measured.
+        assert "| Resident (admitted) |" not in section
+        assert "| Evicted (denied) |" not in section
+
     def test_section_absent_without_residency_events(self):
         summary = aggregation.aggregate(
             _events([fixtures.STREAM_STARTED_LOCAL, fixtures.STREAM_FINISHED_LOCAL]),

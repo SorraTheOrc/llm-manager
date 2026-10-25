@@ -2615,6 +2615,15 @@ def _log_residency_decision(
         source = getattr(facts, "source", "none")
         occupants = len(getattr(tenancy, "occupants", ()) or ())
         tenant_limit = getattr(tenancy, "tenant_limit", None)
+        # ``reuse_ratio`` is a *measurement*, so it must be reported as
+        # unknown when there is no measurement. ``ResidentPrefixFacts`` keeps
+        # 0.0 as an internal sentinel for the gate comparison, but logging that
+        # sentinel would fabricate a 0 % measurement for a session that owns no
+        # slot (``n_past_actual=none``) and make ``proxy-usage-analysis`` count
+        # a non-measurement in its "measured ratio" denominator and in the
+        # resident/evicted ratio rows (LP-0MVNPZY22008B536). A genuine
+        # measured 0 (a slot reporting ``context_tokens=0``) still logs 0.0000.
+        measured_ratio = n_past is not None and isinstance(reuse, (int, float))
         logger.info(
             "routing_resident_prefix provider=local model=%s decision=%s "
             "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
@@ -2624,7 +2633,7 @@ def _log_residency_decision(
             decision,
             n_past if n_past is not None else "none",
             int(estimated_tokens),
-            f"{reuse:.4f}" if isinstance(reuse, (int, float)) else "none",
+            f"{reuse:.4f}" if measured_ratio else "none",
             owner or "none",
             source or "none",
             f"{min_ratio:.2f}" if isinstance(min_ratio, (int, float)) else "none",
