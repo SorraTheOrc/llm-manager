@@ -780,6 +780,8 @@ async def get_llama_local_status(request: Request):
     try:
         from proxy.observability import (
             compute_capacity_hint as _capacity_hint,
+        )
+        from proxy.observability import (
             downgrade_stale_capacity_hint as _downgrade_stale_hint,
         )
 
@@ -1255,6 +1257,21 @@ async def prometheus_metrics():
 # /admin/metrics
 # ---------------------------------------------------------------------------
 
+def _local_eviction_metrics() -> dict:
+    """Post-acceptance eviction counters (LP-0MVN4LCED00661MX AC5).
+
+    ``total`` plus a per-reason breakdown. Monotonic; reset only on process
+    restart (matching the in-process Prometheus counter). Never raises: an
+    observability endpoint must not fail because a counter is unavailable.
+    """
+    try:
+        from proxy.admission_events import eviction_after_acceptance_counters
+
+        return eviction_after_acceptance_counters()
+    except Exception:
+        return {"total": 0, "by_reason": {}}
+
+
 @router.get("/admin/metrics")
 async def admin_metrics():
     """Return router/memory/metrics for observability."""
@@ -1320,6 +1337,11 @@ async def admin_metrics():
         "restore_fallback_total": dict(srv.session_restore_observability.get("restore_fallback_total", {})),
         "delta_payload_bytes_total": int(srv.session_restore_observability.get("delta_payload_bytes_total", 0)),
         "single_flight_metrics": dict(srv.session_single_flight_observability),
+        # LP-0MVN4LCED00661MX AC5: post-acceptance local evictions (an accepted
+        # dispatch released before its first byte) with a per-reason
+        # breakdown, beside the guardrail block. Alert on any non-zero count
+        # for a within-budget prompt — that is a pricing/budget defect.
+        "local_evictions_after_acceptance": _local_eviction_metrics(),
         "guardrail_metrics": {
             "guardrail_cutoff_total": int(srv.session_guardrail_observability.get("guardrail_cutoff_total", 0)),
             "guardrail_cutoff_reasons": dict(srv.session_guardrail_observability.get("guardrail_cutoff_reasons", {})),

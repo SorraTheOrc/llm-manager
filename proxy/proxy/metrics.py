@@ -93,6 +93,13 @@ quota_last_poll_timestamp_seconds = None
 #: an alert instead of only a rate-limited WARN.
 quota_poll_failures_total = None
 
+# Post-acceptance local evictions (LP-0MVN4LCED00661MX, parent AC7): an accepted
+# local dispatch released before producing a first byte is a defect signal, so
+# it is counted by reason and alertable (>0 for a within-budget prompt). The
+# 2026-10-24 thrash window produced 125 such evictions that were invisible in
+# aggregate metrics.
+llama_local_evictions_after_acceptance_total = None
+
 #: Label names shared by every quota gauge.
 _QUOTA_GAUGE_LABELS = ['account', 'entry']
 
@@ -114,6 +121,11 @@ if _enabled:
             'proxy_http_errors_total',
             'Total HTTP errors by endpoint, status class, and reason',
             ['endpoint', 'status', 'reason']
+        )
+        llama_local_evictions_after_acceptance_total = Counter(
+            'llama_local_evictions_after_acceptance_total',
+            'Accepted local dispatches evicted before their first byte, by reason',
+            ['reason'],
         )
         # Token-rate metrics: gauge for current tokens/sec, histogram for distribution
         llama_token_rate_gauge = Gauge(
@@ -278,6 +290,25 @@ def record_http_error(endpoint: str, status: str, reason: str):
         return
     try:
         proxy_http_errors_total.labels(endpoint=endpoint, status=status, reason=reason).inc()
+    except Exception:
+        pass
+
+
+def record_local_eviction_after_acceptance(reason: str):
+    """Increment llama_local_evictions_after_acceptance_total{reason}.
+
+    Args:
+        reason: One of the six post-acceptance release reasons
+            (``prefill_deadline``, ``no_progress_watchdog``, ``idle_timeout``,
+            ``orphan_cleanup``, ``lease_evicted``, ``slot_assignment_freed``).
+
+    Best-effort no-op when prometheus_client is unavailable, matching the
+    other recorders in this module.
+    """
+    if not _enabled or llama_local_evictions_after_acceptance_total is None:
+        return
+    try:
+        llama_local_evictions_after_acceptance_total.labels(reason=reason).inc()
     except Exception:
         pass
 

@@ -1517,6 +1517,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             async with srv.local_dispatch_records_lock:
                                 if _record_key in srv.local_dispatch_records:
                                     srv.local_dispatch_records[_record_key]["stream_cm"] = cm
+                                    # LP-0MVN4LCED00661MX AC3: the dispatch has
+                                    # now served its first byte, so any later
+                                    # release is normal churn, not an eviction
+                                    # error (classified by this flag, never by
+                                    # the release path).
+                                    srv.local_dispatch_records[_record_key][
+                                        "first_byte_seen"
+                                    ] = True
                         except Exception:
                             pass
                         restore_signal_detected = _has_explicit_restore_signal(

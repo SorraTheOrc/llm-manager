@@ -38,13 +38,176 @@ EVICTION_RESIDENT_PREFIX_EVICTED = "resident_prefix_evicted_by_tenant"
 #: A tenancy idle-lapsed (or its watchdog fired) without observed activity.
 EVICTION_TENANCY_LEASE_EXPIRED = "tenancy_lease_expired"
 
+#: The prefill deadline cancelled an accepted dispatch (parent AC7).
+EVICTION_PREFILL_DEADLINE = "prefill_deadline"
+
+#: The no-progress watchdog released an accepted dispatch.
+EVICTION_NO_PROGRESS_WATCHDOG = "no_progress_watchdog"
+
+#: An inactive dispatch record expired past ``expires_at``.
+EVICTION_IDLE_TIMEOUT = "idle_timeout"
+
+#: The orphan-cleanup sweep released a dispatch with no live backend slot.
+EVICTION_ORPHAN_CLEANUP = "orphan_cleanup"
+
+#: The six reasons an ACCEPTED-and-unserved dispatch can be released for
+#: (LP-0MVN4LCED00661MX AC1). Every one of these is an ERROR when it happens
+#: before the first byte.
+EVICTION_REASONS_AFTER_ACCEPTANCE: tuple[str, ...] = (
+    EVICTION_PREFILL_DEADLINE,
+    EVICTION_NO_PROGRESS_WATCHDOG,
+    EVICTION_IDLE_TIMEOUT,
+    EVICTION_ORPHAN_CLEANUP,
+    EVICTION_LEASE_EVICTED,
+    EVICTION_SLOT_ASSIGNMENT_FREED,
+)
+
 #: The closed vocabulary of eviction reasons (AC6/AC7).
 EVICTION_REASONS: tuple[str, ...] = (
     EVICTION_LEASE_EVICTED,
     EVICTION_SLOT_ASSIGNMENT_FREED,
     EVICTION_RESIDENT_PREFIX_EVICTED,
     EVICTION_TENANCY_LEASE_EXPIRED,
+    EVICTION_PREFILL_DEADLINE,
+    EVICTION_NO_PROGRESS_WATCHDOG,
+    EVICTION_IDLE_TIMEOUT,
+    EVICTION_ORPHAN_CLEANUP,
 )
+
+
+# ---------------------------------------------------------------------------
+# Post-acceptance eviction (LP-0MVN4LCED00661MX, parent AC7)
+# ---------------------------------------------------------------------------
+
+#: Monotonic per-reason counters (reset only on process restart, AC5).
+_after_acceptance_counts: dict[str, int] = {}
+
+
+def record_eviction_after_acceptance(
+    srv,
+    session_id: str | None,
+    reason: str,
+    record: dict | None = None,
+    *,
+    endpoint: str | None = None,
+    elapsed_s: float | None = None,
+) -> bool:
+    """Record that an ACCEPTED local dispatch was evicted before its first byte.
+
+    This is the AC7 defect signal: an accepted dispatch (admitted, dispatch
+    record created) that is released before producing a first byte is not
+    expected churn — it means the admission/pricing model admitted something
+    the GPU could not serve, so it is logged at **ERROR** with machine-parseable
+    evidence and counted.
+
+    Classification is by the record's ``first_byte_seen`` flag, never by the
+    release path (AC3): a lease that expires *after* a served response is
+    normal churn and stays at its current level, so it is not an error and not
+    counted.
+
+    Idempotent per record: a second release path racing the first cannot emit
+    the event twice (the flag lives on the record).
+
+    Args:
+        srv: Server object (its ``logger`` when present); may be ``None``.
+        session_id: The evicted session.
+        reason: One of :data:`EVICTION_REASONS_AFTER_ACCEPTANCE`.
+        record: The dispatch record being released, when the caller has it.
+            ``None`` (a path without a record) is treated as post-acceptance
+            and is not de-duplicated — every caller that has a record must
+            pass it.
+        endpoint: llama-server endpoint scope of the eviction.
+        elapsed_s: Seconds from dispatch acceptance to the eviction; computed
+            from the record's ``started_at`` (monotonic) when omitted.
+
+    Returns:
+        True when an event was emitted (and counted), False when suppressed
+        (already reported, or the dispatch had already served a first byte).
+    """
+    if record is not None:
+        if record.get("eviction_logged"):
+            return False
+        if record.get("first_byte_seen"):
+            return False
+        record["eviction_logged"] = True
+
+    if elapsed_s is None:
+        try:
+            import time as _time
+
+            started = float((record or {}).get("started_at") or 0.0)
+            elapsed_s = max(0.0, _time.monotonic() - started) if started else 0.0
+        except Exception:
+            elapsed_s = 0.0
+
+    estimated_tokens = _int_field(record, "estimated_tokens")
+    new_tokens = _int_field(record, "new_tokens")
+    eta_prefill_s = _float_field(record, "eta_prefill_s")
+    slot_id = (record or {}).get("slot_id")
+    llama_task_id = (record or {}).get("llama_task_id")
+    endpoint = endpoint or (record or {}).get("endpoint")
+
+    _after_acceptance_counts[reason] = _after_acceptance_counts.get(reason, 0) + 1
+
+    try:
+        from proxy import metrics as _metrics
+
+        _metrics.record_local_eviction_after_acceptance(reason)
+    except Exception:
+        pass
+
+    logger = getattr(srv, "logger", None) or logging.getLogger("llama-proxy")
+    # One stable, machine-parseable line (AC1/AC7). Unknown values are emitted
+    # as ``unknown``/``0`` rather than omitted so the line is always parseable.
+    try:
+        logger.error(
+            "local_eviction_after_acceptance session=%s reason=%s "
+            "estimated_tokens=%d new_tokens=%d eta_prefill_s=%s "
+            "elapsed_s=%.1f slot_id=%s llama_task_id=%s endpoint=%s",
+            session_id or "unknown",
+            reason,
+            estimated_tokens,
+            new_tokens,
+            "unknown" if eta_prefill_s is None else f"{eta_prefill_s:.1f}",
+            elapsed_s or 0.0,
+            "unknown" if slot_id is None else slot_id,
+            "unknown" if llama_task_id is None else llama_task_id,
+            endpoint or "default",
+        )
+    except Exception:
+        pass
+    return True
+
+
+def eviction_after_acceptance_counters() -> dict:
+    """Monotonic counter snapshot: ``{"total": n, "by_reason": {...}}``."""
+    return {
+        "total": sum(_after_acceptance_counts.values()),
+        "by_reason": dict(_after_acceptance_counts),
+    }
+
+
+def reset_eviction_after_acceptance_counters() -> None:
+    """Clear the counters (test helper; production resets on process restart)."""
+    _after_acceptance_counts.clear()
+
+
+def _int_field(record: dict | None, key: str) -> int:
+    try:
+        return max(0, int((record or {}).get(key) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_field(record: dict | None, key: str) -> float | None:
+    raw = (record or {}).get(key)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value == value else None  # reject NaN
 
 
 def log_local_eviction(
