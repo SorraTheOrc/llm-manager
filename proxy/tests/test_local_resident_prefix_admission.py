@@ -55,8 +55,6 @@ SKIP_TENANT_LIMIT = "tenant_limit"
 
 PENDING_VIEW = "pending LP-0MVN4L7AG003PC80 (shared residency view)"
 PENDING_GATE = "pending LP-0MVN4L7KT003XUBA (resident-prefix gate / live pricing)"
-PENDING_TENANCY = "pending LP-0MVN4L7UX003KGTI (session tenancy bound)"
-PENDING_RECLAIM = "pending LP-0MVN4LADE001XD3M (tenancy lease reclaim)"
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +553,6 @@ class _NullLogger:
         return lambda *a, **k: None
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
 def test_tenancy_bound_denies_new_session():
     """A third session's large prompt falls through instead of evicting."""
     now = 1000.0
@@ -572,7 +569,6 @@ def test_tenancy_bound_denies_new_session():
     assert set(decision.occupants) == {"sess-a", "sess-b"}
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
 def test_tenancy_same_session_reentry_allowed():
     """A tenant's own later turn is never blocked by the bound."""
     now = 1000.0
@@ -588,7 +584,6 @@ def test_tenancy_same_session_reentry_allowed():
     assert decision.reason is None
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
 def test_tenancy_idle_lapsed_resident_is_not_counted():
     """A resident whose tenancy idle-lapsed no longer blocks a newcomer."""
     now = 1000.0
@@ -603,7 +598,6 @@ def test_tenancy_idle_lapsed_resident_is_not_counted():
     assert decision.admitted is True
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
 def test_tenancy_zero_disables_bound():
     """``local_session_tenants: 0`` disables the bound."""
     now = 1000.0
@@ -619,7 +613,6 @@ def test_tenancy_zero_disables_bound():
     assert decision.admitted is True
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
 def test_tenancy_default_bound_is_the_slot_count():
     """The resolved default is the slot count, i.e. two tenants for two slots."""
     assert router_helpers.resolve_session_tenants({"server": {}}, max_local=2) == 2
@@ -635,7 +628,6 @@ def test_tenancy_default_bound_is_the_slot_count():
 # AC6 — tenancy is a lease, not a lock (both reclaim bounds)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RECLAIM)
 def test_observed_disconnect_frees_tenancy_immediately(monkeypatch):
     """An observed disconnect releases the reservation without waiting."""
     now = 1000.0
@@ -655,7 +647,6 @@ def test_observed_disconnect_frees_tenancy_immediately(monkeypatch):
     assert ("", 0) not in session_registry._slot_owners
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_RECLAIM)
 def test_silent_drop_bounded_by_no_progress_window(monkeypatch):
     """A silent half-open drop is reclaimed inside the 180 s watchdog bound."""
     assert router_helpers.DEFAULT_TENANCY_IDLE_SECONDS <= 180.0
@@ -847,3 +838,190 @@ def test_gate_never_issues_an_upstream_slots_query(monkeypatch):
     )
 
     assert (skip, reason) == (False, None)
+
+
+# ---------------------------------------------------------------------------
+# C4 — the tenancy rung inside the admission ladder
+# ---------------------------------------------------------------------------
+
+def _install_tenancy(sessions, *, endpoint=None, ttl=30.0, age=0.0):
+    """Populate the real dispatch registry with live leases for *sessions*."""
+    import proxy.server as server_module
+
+    now = time.monotonic() - age
+    for name in sessions:
+        key = router_helpers._dispatch_lease_key(endpoint, name)
+        server_module.local_dispatch_records[key] = {
+            "backend": endpoint or "local",
+            "started_at": now,
+            "active": True,
+            "expires_at": now + ttl,
+            "model_name": "Qwen3",
+            "last_progress": 0,
+            "last_progress_ts": now,
+        }
+
+
+@pytest.fixture(autouse=True)
+def _reset_dispatch_registry_after_test():
+    yield
+    import proxy.server as server_module
+
+    server_module.local_dispatch_records.clear()
+
+
+def _gate_with_tenancy(*, session_id, tenants=2, idle_seconds=30.0, view=None,
+                       monkeypatch, min_ratio=0.5):
+    return provider._should_skip_local(
+        "Qwen3",
+        session_id,
+        {"messages": []},
+        COLD_THRESHOLD,
+        estimated_tokens=EST_TOKENS,
+        resident_prefix_min_ratio=min_ratio,
+        residency_view=view,
+        session_tenants=tenants,
+        tenancy_idle_seconds=idle_seconds,
+    )
+
+
+def test_ladder_denies_a_third_session_with_tenant_limit(monkeypatch):
+    """Two live tenants hold the pool ⇒ a third session's prompt falls through.
+
+    The residency view is unknown here (the case the gate fails open on), so
+    tenancy is the rung that keeps a newcomer from evicting a resident.
+    """
+    _install_tenancy(["sess-a", "sess-b"])
+    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
+
+    skip, reason = _gate_with_tenancy(
+        session_id="sess-c", view=view, monkeypatch=monkeypatch
+    )
+
+    assert skip is True
+    assert reason == SKIP_TENANT_LIMIT
+
+
+def test_ladder_admits_a_tenant_session_reentry(monkeypatch):
+    """A resident's own next turn is never blocked by the bound."""
+    _install_tenancy(["sess-a", "sess-b"])
+    view = _view(
+        slots=[_slot(0, EST_TOKENS), _slot(1, EST_TOKENS)],
+        owners={("", 0): "sess-a", ("", 1): "sess-b"},
+        monkeypatch=monkeypatch,
+    )
+
+    skip, reason = _gate_with_tenancy(
+        session_id="sess-a", view=view, monkeypatch=monkeypatch
+    )
+
+    assert (skip, reason) == (False, None)
+
+
+def test_ladder_admits_when_tenant_idle_lapsed(monkeypatch):
+    """A lapsed resident tenancy frees the pool for a newcomer."""
+    # Live leases (unexpired) whose last activity is 5 s old: they lapse on a
+    # 1 s idle bound but not on the default 30 s one.
+    _install_tenancy(["sess-a", "sess-b"], age=5.0)
+    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
+
+    skip, reason = _gate_with_tenancy(
+        session_id="sess-c",
+        idle_seconds=1.0,
+        view=view,
+        monkeypatch=monkeypatch,
+    )
+
+    # The tenancy rung released the pool; what remains is the (separately
+    # covered) cold-pricing decision, never a `tenant_limit` denial.
+    assert reason != SKIP_TENANT_LIMIT
+    assert reason == "large_context_bypass"
+
+
+def test_tenancy_bound_disabled_with_zero(monkeypatch):
+    """``local_session_tenants: 0`` disables the bound in the ladder."""
+    _install_tenancy(["sess-a", "sess-b", "sess-c"])
+    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
+    monkeypatch.setattr(provider, "expected_cached_ratio", lambda *a, **k: 0.99)
+
+    skip, reason = _gate_with_tenancy(
+        session_id="sess-d", tenants=0, view=view, monkeypatch=monkeypatch
+    )
+
+    assert (skip, reason) == (False, None)
+
+
+def test_tenancy_config_resolution():
+    """The two tenancy knobs resolve with their documented defaults."""
+    assert router_helpers.resolve_session_tenants({"server": {}}, max_local=2) == 2
+    assert (
+        router_helpers.resolve_session_tenants(
+            {"server": {"session_slot_pool_size": 4}}
+        )
+        == 4
+    )
+    assert (
+        router_helpers.resolve_session_tenants(
+            {"server": {"local_session_tenants": 1}}
+        )
+        == 1
+    )
+    assert (
+        router_helpers.resolve_session_tenants(
+            {"server": {"local_session_tenants": 0}}
+        )
+        == 0
+    )
+    assert (
+        router_helpers.resolve_session_tenants(
+            {"server": {"local_session_tenants": "nonsense", "session_slot_pool_size": 2}}
+        )
+        == 2
+    )
+    assert (
+        router_helpers.resolve_session_tenants(
+            {"server": {"local_session_tenants": "nonsense"}}, max_local=2
+        )
+        == 2
+    )
+
+    assert (
+        router_helpers.resolve_tenancy_idle_seconds({"server": {}})
+        == router_helpers.DEFAULT_TENANCY_IDLE_SECONDS
+    )
+    assert (
+        router_helpers.resolve_tenancy_idle_seconds(
+            {"server": {"local_session_tenancy_idle_seconds": 12}}
+        )
+        == 12.0
+    )
+    # Derived from the adaptive dispatch lease when the explicit knob is absent.
+    assert (
+        router_helpers.resolve_tenancy_idle_seconds(
+            {"server": {"local_dispatch_lease_timeout_seconds": 45}}
+        )
+        == 45.0
+    )
+    # A zero would lapse tenancies instantly: fall back to the default.
+    assert (
+        router_helpers.resolve_tenancy_idle_seconds(
+            {"server": {"local_session_tenancy_idle_seconds": 0}}
+        )
+        == router_helpers.DEFAULT_TENANCY_IDLE_SECONDS
+    )
+
+
+def test_tenancy_fails_open_when_registry_is_unreadable(monkeypatch):
+    """An unreadable registry must never deny local (fail-open)."""
+
+    class _Broken:
+        @property
+        def local_dispatch_records(self):
+            raise RuntimeError("registry unavailable")
+
+    decision = router_helpers.evaluate_session_tenancy(
+        _Broken(), "sess-new", tenants=1, idle_seconds=30.0
+    )
+
+    assert decision.admitted is True
+    assert decision.reason is None

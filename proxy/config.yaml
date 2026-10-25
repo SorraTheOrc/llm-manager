@@ -1330,6 +1330,36 @@ server:
   # Default: 0.5 (50 % of the prompt must still be resident).
   local_resident_prefix_min_ratio: 0.5
 
+  # Session tenancy bound (LP-0MVN1IQTF0037WTG AC2). Per-request dispatch
+  # leases bound *in-flight* requests but not *which* sessions occupy the
+  # pool over time: 27 distinct sessions cycled through 2 slots in 5.4 h on
+  # 2026-10-24, and every newcomer evicted the resident session's KV prefix
+  # (median prefix reuse 15.6 % for prompts >20k tokens). At most this many
+  # distinct sessions may hold a local reservation for a large prompt at once;
+  # beyond the bound a new session's prompt follows the normal fallback chain
+  # (skip reason `tenant_limit`) instead of evicting a resident.
+  #
+  # - Default: the resolved slot count (`session_slot_pool_size`, i.e. 2), so
+  #   "N tenants, N slots".
+  # - `0` disables the bound (unlimited tenants).
+  # - Same-session re-entry is always allowed: a session's own next turn is
+  #   never blocked by the bound, only *new* sessions are.
+  # - Occupancy is read from the existing dispatch records plus the residency
+  #   view (a session whose slot is `is_processing` is holding its prefix).
+  #   No new lifecycle machinery, no `/slots` call.
+  local_session_tenants: 2
+
+  # Idle-lapse for a session tenancy (seconds, LP-0MVN1IQTF0037WTG AC2/AC6).
+  # A tenancy is a lease, not a lock: once a resident session has shown no
+  # activity for this long its tenancy lapses and a new session may take the
+  # pool. Defaults to `local_dispatch_lease_timeout_seconds` (below) so
+  # tenancy lapses on the same clock as the adaptive dispatch lease that holds
+  # the slot — one lifecycle, already bounded by the 180 s no-progress
+  # watchdog and the 900 s lifetime ceiling. Non-positive/malformed values
+  # fall back to that default (a zero would lapse tenancy instantly and
+  # silently disable the bound).
+  local_session_tenancy_idle_seconds: 30
+
   # Latency-derived economic-ceiling ratio for the WARM threshold
   # (LP-0MU466L1X003RTHN). The ceiling scales linearly with the model context
   # size (not the slot count) so a profile change (smaller model, different

@@ -2546,6 +2546,47 @@ def resolve_resident_prefix(
     )
 
 
+#: Skip reason emitted when the tenancy bound refuses a new session (AC2).
+#: Mirrors ``proxy.router_helpers.TENANCY_SKIP_REASON``; kept local so the
+#: ladder does not need a module-level import of ``router_helpers`` (which
+#: imports the server lazily to avoid a cycle).
+SKIP_REASON_TENANT_LIMIT: str = "tenant_limit"
+
+
+def _evaluate_local_tenancy(
+    session_id: str | None,
+    *,
+    endpoint: str | None = None,
+    tenants: int,
+    idle_seconds: float | None = None,
+):
+    """Run the AC2 tenancy rung against the live dispatch registry.
+
+    Fail-open by construction: a session that is empty, a missing/unreadable
+    registry, or any unexpected error returns ``None`` ("no verdict"), which
+    the ladder reads as "tenancy permits" — the bound must never become a hard
+    local outage.
+    """
+    if not session_id:
+        return None
+    try:
+        from proxy import router_helpers
+    except Exception:
+        return None
+    try:
+        import proxy.server as server_module
+
+        return router_helpers.evaluate_session_tenancy(
+            server_module,
+            session_id,
+            endpoint=endpoint,
+            tenants=tenants,
+            idle_seconds=idle_seconds,
+        )
+    except Exception:
+        return None
+
+
 def _should_skip_local(
     model_name: str,
     session_id: str | None,
@@ -2557,6 +2598,8 @@ def _should_skip_local(
     resident_prefix_min_ratio: float = 0.0,
     residency_view=None,
     endpoint: str | None = None,
+    session_tenants: int | None = None,
+    tenancy_idle_seconds: float | None = None,
 ) -> tuple[bool, str | None]:
     """Determine whether a local provider should be skipped due to large context.
 
@@ -2655,7 +2698,11 @@ def _should_skip_local(
     if estimated_tokens <= cold_cache_threshold:
         return (False, None)
 
-    # Check 2: Residency-aware ladder (AC1 gate + AC3 live pricing).
+    # Check 2: Residency-aware ladder (AC1 gate + AC2 tenancy + AC3 pricing).
+    # ``facts`` is None when the residency gate is disabled (ratio 0) — the
+    # tenancy rung then still applies with its own knob, since tenancy is an
+    # independent bound on how many distinct sessions may hold the pool.
+    facts = None
     if resident_prefix_min_ratio > 0.0:
         facts = resolve_resident_prefix(
             session_id,
@@ -2666,28 +2713,45 @@ def _should_skip_local(
         if facts.source == RESIDENCY_SOURCE_UNKNOWN:
             # Fail-open: no fresh measurement and no ownership — degrade to
             # today's predicted-ratio decision instead of denying local.
-            pass
+            facts = None
         elif not facts.resident:
             # Fresh view, no slot of its own: the resident prefix is measured
             # at zero, so no prediction can make this prompt cheap.
             return (True, SKIP_REASON_RESIDENT_PREFIX)
         elif facts.reuse_ratio < resident_prefix_min_ratio:
             return (True, SKIP_REASON_RESIDENT_PREFIX)
-        else:
-            reusable = (
-                min(facts.n_past_actual, estimated_tokens)
-                if facts.n_past_actual is not None
-                else estimated_tokens
-            )
-            if max(0, estimated_tokens - reusable) <= cold_cache_threshold:
-                return (False, None)
-            if economic_bypass_serves_local:
-                # Cheap mode still recovers the *economic* miss locally; the
-                # contention queue (if enabled) waits for a slot.
-                return (False, None)
-            return (True, "large_context_bypass")
 
-    # Check 3: Dynamic new-token calculation (predicted ratio).
+    # Check 3: session tenancy bound (AC2). At most ``session_tenants``
+    # distinct sessions hold a local reservation at once, so a further
+    # session's large prompt falls through the normal chain instead of
+    # evicting a resident's prefix. Same-session re-entry and idle-lapsed
+    # tenancies are always admitted (see evaluate_session_tenancy).
+    if session_id and session_tenants is not None and session_tenants > 0:
+        tenancy = _evaluate_local_tenancy(
+            session_id,
+            endpoint=endpoint,
+            tenants=session_tenants,
+            idle_seconds=tenancy_idle_seconds,
+        )
+        if tenancy is not None and not tenancy.admitted:
+            return (True, SKIP_REASON_TENANT_LIMIT)
+
+    # Check 4: live-prefix pricing (AC3) when a residency measurement exists.
+    if facts is not None and facts.resident:
+        reusable = (
+            min(facts.n_past_actual, estimated_tokens)
+            if facts.n_past_actual is not None
+            else estimated_tokens
+        )
+        if max(0, estimated_tokens - reusable) <= cold_cache_threshold:
+            return (False, None)
+        if economic_bypass_serves_local:
+            # Cheap mode still recovers the *economic* miss locally; the
+            # contention queue (if enabled) waits for a slot.
+            return (False, None)
+        return (True, "large_context_bypass")
+
+    # Check 5: Dynamic new-token calculation (predicted ratio).
     ratio = expected_cached_ratio(
         model_name,
         session_id,
@@ -5807,8 +5871,30 @@ async def _queue_context_bypass(
         economic_bypass_serves_local=_recover_economic,
         resident_prefix_min_ratio=_effective_resident_prefix_min_ratio(config),
         endpoint=endpoint,
+        session_tenants=_resolve_tenants(config),
+        tenancy_idle_seconds=_resolve_tenancy_idle(config),
     )
     return _skip_local, _skip_reason
+
+
+def _resolve_tenants(config: dict | None) -> int:
+    """Resolve the AC2 tenancy bound (``server.local_session_tenants``)."""
+    try:
+        from proxy.router_helpers import resolve_session_tenants
+
+        return resolve_session_tenants(config)
+    except Exception:
+        return 0
+
+
+def _resolve_tenancy_idle(config: dict | None) -> float | None:
+    """Resolve the AC2 tenancy idle-lapse (``local_session_tenancy_idle_seconds``)."""
+    try:
+        from proxy.router_helpers import resolve_tenancy_idle_seconds
+
+        return resolve_tenancy_idle_seconds(config)
+    except Exception:
+        return None
 
 
 def _local_gate_occupancy(
@@ -9727,6 +9813,8 @@ async def _proxy_with_fallback_cycle(
                 # medium uses the merged base config flag (absent — false).
                 _recover_economic = _economic_bypass_serves_local(config, _priority)
                 _resident_min_ratio = _effective_resident_prefix_min_ratio(config)
+                _session_tenants = _resolve_tenants(config)
+                _tenancy_idle = _resolve_tenancy_idle(config)
                 _skip_local, _skip_reason = _should_skip_local(
                     _llama_model,
                     _session_id,
@@ -9737,6 +9825,8 @@ async def _proxy_with_fallback_cycle(
                     economic_bypass_serves_local=_recover_economic,
                     resident_prefix_min_ratio=_resident_min_ratio,
                     endpoint=local_endpoint,
+                    session_tenants=_session_tenants,
+                    tenancy_idle_seconds=_tenancy_idle,
                 )
                 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): spend
                 # obviously idle GPU capacity instead of paying for a remote
@@ -9899,6 +9989,8 @@ async def _proxy_with_fallback_cycle(
                             economic_bypass_serves_local=_recover_economic,
                             resident_prefix_min_ratio=_resident_min_ratio,
                             endpoint=local_endpoint,
+                            session_tenants=_session_tenants,
+                            tenancy_idle_seconds=_tenancy_idle,
                         )
                         if _skip_after:
                             logger.info(

@@ -25,6 +25,7 @@ import os
 import re
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -1898,6 +1899,190 @@ async def _decrement_generating_only_slot(srv, session_key: str | None = None) -
         await wake(1)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Session tenancy bound (LP-0MVN1IQTF0037WTG AC2)
+#
+# Per-request dispatch leases bound *in-flight* requests but not *which*
+# sessions occupy the pool over time: 27 distinct sessions cycled through 2
+# slots in 5.4 h on 2026-10-24, each newcomer evicting the resident session's
+# KV prefix. Tenancy bounds the number of distinct sessions that may hold a
+# local reservation at once, so a further session's large prompt follows the
+# normal chain instead of evicting a resident.
+#
+# A tenancy is a *lease*, not a lock: it is derived from the existing dispatch
+# records (no new lifecycle), it is always re-acquirable by the session that
+# already holds it (a session's own next turn is never blocked), and it
+# idle-lapses so a genuinely idle resident cannot gate the pool forever.
+# ---------------------------------------------------------------------------
+
+#: Skip reason emitted when the tenancy bound refuses a new session.
+TENANCY_SKIP_REASON: str = "tenant_limit"
+
+#: Default idle-lapse for a tenancy (seconds). Derived from the adaptive
+#: dispatch lease (``local_dispatch_lease_timeout_seconds``, 30 s base) so a
+#: tenancy is bounded by the same lifecycle that already governs slot
+#: ownership; in every case it stays well inside the 180 s no-progress
+#: watchdog and the 900 s lifetime ceiling (AC6).
+DEFAULT_TENANCY_IDLE_SECONDS: float = 30.0
+
+
+@dataclass(frozen=True)
+class TenancyDecision:
+    """Outcome of the tenancy check for one session's large prompt."""
+
+    admitted: bool
+    reason: str | None
+    occupants: tuple[str, ...] = ()
+    tenant_limit: int = 0
+
+
+def resolve_session_tenants(config: dict | None, max_local: int | None = None) -> int:
+    """Resolve ``server.local_session_tenants`` (default: the slot count).
+
+    ``0`` disables the bound (unlimited tenants), matching the
+    "0 disables" convention of the other admission knobs. Malformed values
+    fall back to the slot count so a typo can never widen the bound silently.
+    """
+    server_cfg = (config or {}).get("server") or {}
+    raw = server_cfg.get("local_session_tenants")
+    if raw is None:
+        return _default_tenants(server_cfg, max_local)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        # Malformed: fall back to the slot count, never to "unlimited".
+        return _default_tenants(server_cfg, max_local)
+    return max(0, value)
+
+
+def _default_tenants(server_cfg: dict, max_local: int | None) -> int:
+    """Slot count used as the tenancy default ("N tenants, N slots")."""
+    slots = max_local
+    if slots is None:
+        try:
+            slots = int(server_cfg.get("session_slot_pool_size", 1) or 1)
+        except (TypeError, ValueError):
+            slots = 1
+    return max(1, int(slots))
+
+
+def resolve_tenancy_idle_seconds(config: dict | None) -> float:
+    """Resolve ``server.local_session_tenancy_idle_seconds``.
+
+    Defaults to the adaptive dispatch-lease base
+    (``server.local_dispatch_lease_timeout_seconds``, itself defaulting to
+    :data:`DEFAULT_TENANCY_IDLE_SECONDS`) so tenancy lapses on the same clock
+    as the lease that holds the slot. A non-positive/malformed value falls back
+    to the default (a zero would otherwise make tenancy lapse instantly and
+    silently disable the bound).
+    """
+    server_cfg = (config or {}).get("server") or {}
+    raw = server_cfg.get("local_session_tenancy_idle_seconds")
+    if raw is None:
+        raw = server_cfg.get("local_dispatch_lease_timeout_seconds")
+    if raw is None:
+        return DEFAULT_TENANCY_IDLE_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_TENANCY_IDLE_SECONDS
+    if value <= 0.0:
+        return DEFAULT_TENANCY_IDLE_SECONDS
+    return value
+
+
+def evaluate_session_tenancy(
+    srv,
+    session_key: str | None,
+    *,
+    endpoint: str | None = None,
+    tenants: int | None = None,
+    idle_seconds: float | None = None,
+    now: float | None = None,
+    view=None,
+) -> TenancyDecision:
+    """Decide whether *session_key* may hold a local tenancy right now.
+
+    Occupants are the distinct sessions that provably hold the pool:
+
+    - sessions with a **live dispatch record** in the same endpoint scope
+      (``active`` or an unexpired no-preemption lease), and
+    - sessions whose slot is ``is_processing`` in the residency view (they are
+      actively prefill/decode-ing, so their prefix is resident).
+
+    A session already among the occupants is always admitted (same-session
+    re-entry: a session's own next turn is never blocked behind itself). An
+    occupant is dropped once its tenancy idle-lapses (``now - last activity >=``
+    *idle_seconds*), so an abandoned resident cannot gate the pool.
+
+    Fail-open: any unexpected error admits (admission must never break because
+    a registry read went wrong), and ``tenants <= 0`` disables the bound.
+
+    Returns:
+        A :class:`TenancyDecision`. ``admitted`` False only when a *new*
+        session would exceed the bound; ``reason`` is then
+        :data:`TENANCY_SKIP_REASON`.
+    """
+    if tenants is None:
+        tenants = resolve_session_tenants(None)
+    if idle_seconds is None:
+        idle_seconds = DEFAULT_TENANCY_IDLE_SECONDS
+    if tenants <= 0 or not session_key:
+        return TenancyDecision(True, None, (), tenants)
+
+    current = time.monotonic() if now is None else float(now)
+    ep_scope = endpoint or ""
+    occupants: list[str] = []
+
+    try:
+        records = dict(getattr(srv, "local_dispatch_records", None) or {})
+    except Exception:
+        return TenancyDecision(True, None, (), tenants)
+
+    # Snapshot the record dicts so a concurrent lease refresh cannot mutate a
+    # record mid-decision.
+    for key, record in records.items():
+        if not isinstance(record, dict):
+            continue
+        key_endpoint = key[0] if isinstance(key, tuple) and key else ""
+        if key_endpoint != ep_scope:
+            continue
+        owner = _dispatch_key_session_id(key)
+        if not owner or owner in occupants:
+            continue
+        live = bool(record.get("active")) or float(
+            record.get("expires_at") or 0.0
+        ) > current
+        if not live:
+            continue
+        last_activity = record.get("last_progress_ts") or record.get("started_at")
+        try:
+            lapsed = (
+                last_activity is not None
+                and (current - float(last_activity)) >= float(idle_seconds)
+            )
+        except (TypeError, ValueError):
+            lapsed = False
+        if lapsed:
+            continue
+        occupants.append(owner)
+
+    if view is not None and getattr(view, "known", False):
+        try:
+            processing = view.processing_sessions(endpoint=endpoint)
+        except Exception:
+            processing = ()
+        for owner in processing:
+            if owner and owner not in occupants:
+                occupants.append(owner)
+
+    if session_key in occupants:
+        return TenancyDecision(True, None, tuple(occupants), tenants)
+    if len(occupants) >= tenants:
+        return TenancyDecision(False, TENANCY_SKIP_REASON, tuple(occupants), tenants)
+    return TenancyDecision(True, None, tuple(occupants), tenants)
 
 
 async def _try_acquire_local_dispatch(
