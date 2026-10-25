@@ -1026,8 +1026,12 @@ async def reserve_local_slot(request: Request):
         busy_slots, in_flight_prefills = provider_mod._local_gate_occupancy(
             config, current_concurrency[1] or 1, endpoint=None
         )
+        occupant_prefill_seconds = provider_mod._local_occupant_prefill_seconds(
+            endpoint=None, session_id=body.get("session_id")
+        )
     except Exception:
         busy_slots, in_flight_prefills = 0, 0
+        occupant_prefill_seconds = 0.0
 
     status, payload = admission_reserve.reserve(
         body,
@@ -1035,6 +1039,7 @@ async def reserve_local_slot(request: Request):
         model=cm,
         busy_slots=busy_slots,
         in_flight_prefills=in_flight_prefills,
+        occupant_prefill_seconds=occupant_prefill_seconds,
     )
     headers: dict[str, str] = {
         "Cache-Control": "no-store",

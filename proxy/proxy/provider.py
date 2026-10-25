@@ -6167,6 +6167,34 @@ the occupied gate ahead of it* against the budget, so it needs the number of
     return busy, in_flight
 
 
+def _local_occupant_prefill_seconds(
+    endpoint: str | None = None, session_id: str | None = None
+) -> float:
+    """Measured remaining prefill service owed by other sessions' prefills.
+
+    LP-0MVOFVCA2008DQVE: the symmetric ``eta * busy_slots`` occupancy floor
+    prices an occupant at the newcomer's own prefill, which is wrong when a
+    small warm prompt queues behind a large cold one. This projects each live
+    occupant from its own dispatch record (calibrated ETA minus elapsed) so the
+    deadline bound sees the real time to first byte.
+
+    Never raises: a routing decision must not break on an observability gap
+    (0.0 leaves the symmetric floor in charge).
+    """
+    try:
+        import proxy.server as _srv
+        from proxy.router_helpers import _live_prefill_remaining_seconds
+
+        return float(
+            _live_prefill_remaining_seconds(
+                _srv, exclude_session=session_id, endpoint=endpoint
+            )
+            or 0.0
+        )
+    except Exception:
+        return 0.0
+
+
 def _note_local_fallback_reason(request, reason: str | None) -> None:
     """Record why local was not used, for ``X-Local-Fallback-Reason``.
 
@@ -6358,6 +6386,12 @@ async def _prefill_admission_guard(
         occupancy, in_flight_prefills = _local_gate_occupancy(
             config, max_local, endpoint=endpoint
         )
+        # Occupant-evidence pricing (LP-0MVOFVCA2008DQVE): price the remaining
+        # service the in-flight prefills still owe, not the newcomer's own
+        # ETA, so the deadline bound reflects the real time to first byte.
+        occupant_prefill_seconds = _local_occupant_prefill_seconds(
+            endpoint=endpoint, session_id=session_id
+        )
         decision = prefill_eta.evaluate_admission(
             config,
             model_name,
@@ -6366,6 +6400,7 @@ async def _prefill_admission_guard(
             priority,
             busy_slots=occupancy,
             in_flight_prefills=in_flight_prefills,
+            occupant_prefill_seconds=occupant_prefill_seconds,
         )
         if not decision.active:
             return None

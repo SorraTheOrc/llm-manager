@@ -21,6 +21,7 @@ Includes:
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -1774,6 +1775,78 @@ def _get_live_prefill_in_flight_count(srv) -> int:
         return max(0, sum(1 for s in markers if s in live_sessions))
     except Exception:
         return 0
+
+
+def _live_prefill_remaining_seconds(
+    srv,
+    *,
+    exclude_session: str | None = None,
+    endpoint: str | None = None,
+    now: float | None = None,
+) -> float:
+    """Total remaining prefill service owed by live in-flight prefills.
+
+    LP-0MVOFVCA2008DQVE: the admission guard's occupancy term must not price an
+    occupant at the *newcomer's* own prefill. Each dispatch record carries the
+    calibrated prefill ETA captured when it was admitted
+    (``_dispatch_evidence``: ``eta_prefill_s``) plus its ``started_at``
+    (``time.monotonic()``), so the service it still owes is
+    ``max(0, eta_prefill_s - (now - started_at))``. Summing that over the
+    in-flight prefills gives the wait a newcomer actually faces before its own
+    prefill can start.
+
+    Only records that are *genuinely prefilling* are priced: ``active`` (a
+    released/inactive lease is not consuming the gate) and no first byte yet
+    (``first_byte_seen`` false — once a byte is served the prefill is done).
+
+    The requesting session's own record is excluded via *exclude_session*: a
+    same-session re-entry never waits behind itself. When *endpoint* is given,
+    records belonging to another endpoint are ignored (endpoint-aware pools).
+
+    Fail-open by construction: a missing/invalid ``eta_prefill_s``, malformed
+    timestamps or a missing record set contribute nothing, leaving the
+    symmetric ``eta * busy_slots`` floor in charge. Never raises — a routing
+    decision must not break on an observability gap.
+    """
+    try:
+        records = getattr(srv, "local_dispatch_records", None) or {}
+        if not isinstance(records, dict) or not records:
+            return 0.0
+        _now = time.monotonic() if now is None else float(now)
+        total = 0.0
+        for key, record in list(records.items()):
+            if not isinstance(record, dict):
+                continue
+            if not record.get("active"):
+                continue
+            if record.get("first_byte_seen"):
+                continue
+            session_id = _dispatch_key_session_id(key)
+            if exclude_session is not None and session_id == exclude_session:
+                continue
+            record_endpoint = record.get("endpoint")
+            if (
+                endpoint is not None
+                and record_endpoint is not None
+                and record_endpoint != endpoint
+            ):
+                continue
+            try:
+                eta = float(record.get("eta_prefill_s"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(eta) or eta <= 0.0:
+                continue
+            try:
+                started_at = float(record.get("started_at"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(started_at):
+                continue
+            total += max(0.0, eta - max(0.0, _now - started_at))
+        return max(0.0, total)
+    except Exception:
+        return 0.0
 
 
 async def _increment_generating_only_slot(srv, session_key: str | None = None) -> None:

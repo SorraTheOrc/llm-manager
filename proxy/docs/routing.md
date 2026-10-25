@@ -968,10 +968,12 @@ eta_prefill = coded_tokens * coded_ms_per_token + new_tokens * prefill_ms_per_to
   coded_tokens = est_tokens * cached_ratio          # served from the prompt cache
   new_tokens   = est_tokens * (1 - cached_ratio)    # must actually be prefilled
 
-projected_wait = eta_prefill * (busy_slots + 1)
-  busy_slots = min(slot_pool, max(generating_concurrency, prefills_in_flight))
+projected_wait = own_prefill_seconds + occupied_seconds
+  occupied_seconds = max(eta_prefill * busy_slots, sum(remaining occupant prefill))
+  busy_slots       = min(slot_pool, max(generating_concurrency, prefills_in_flight))
 
 admit  if projected_wait <= wait_budget
+       and projected_wait <  local_prefill_deadline_seconds
 else   refuse local admission immediately -> next provider in the chain
 ```
 
@@ -988,6 +990,24 @@ when per-slot prefill progress is unobservable
 (`prefill_progress_unobservable`, `alive=False`, `in_flight=True`): an
 in-flight prefill is treated as occupying the gate for at least the calibrated
 estimate, never as "free soon".
+
+**Occupant-evidence pricing** (LP-0MVOFVCA2008DQVE). Pricing the occupant at
+the *newcomer's* own `eta_prefill` (the symmetric floor) is structurally wrong
+for heterogeneous traffic: a warm 7 s prompt behind a huge cold prefill was
+costed at ~14 s, admitted, then cancelled by
+`local_prefill_deadline_seconds` with **zero prefill progress** (measured
+2026-10-25: 22 `local_eviction_after_acceptance reason=prefill_deadline`
+events in 7.4 h, 12 of them user traffic; signature `eta_prefill_s=7.1
+elapsed_s=120.1 progress=None alive=False in_flight=True`). Each live
+dispatch record already carries the calibrated `eta_prefill_s` captured when
+it was admitted plus its `started_at`, so the guard adds the **measured
+remaining service** `sum(max(0, eta_prefill_s − (now − started_at)))` over the
+active, still-prefilling records of *other* sessions (a same-session re-entry
+never waits behind itself). Measured evidence can only raise the symmetric
+floor, never lower it, and a missing/invalid record contributes nothing —
+fail-open by construction. The deadline bound is evaluated against this same
+projected time to first byte, so admission and the deadline can no longer
+disagree about who the occupant is.
 
 `projected_wait` is computed by a single function
 (`prefill_eta.projected_wait_seconds`) that also produces the published
@@ -1048,12 +1068,18 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   to the next provider. It reuses the same estimator and the same single
   budget (`contention_queue_max_wait_seconds`) — there is no second budget
   knob, and a cold/uncalibrated bucket still admits.
-  **Deadline refusal** (LP-0MVKUKEU80022C3U): when the projected first-byte
-  ETA >= ``local_prefill_deadline_seconds`` (default 90 s) the guard also
-  refuses with ``reason=prefill_eta_exceeds_deadline`` (both paths). The
-  deadline reason dominates the budget reason whenever it fires — it names
-  the hard physical constraint that would cancel the dispatch; when the ETA
-  is below the deadline the budget reason is reported as before.
+  **Deadline refusal** (LP-0MVKUKEU80022C3U): when the projected **time to
+  first byte** — own ETA plus the occupied gate, i.e. the same
+  `projected_wait` above — reaches ``local_prefill_deadline_seconds``
+  (default 120 s) the guard also refuses with
+  ``reason=prefill_eta_exceeds_deadline`` (both paths). The deadline reason
+  dominates the budget reason whenever it fires — it names the hard physical
+  constraint that would cancel the dispatch; when the projected first byte is
+  below the deadline the budget reason is reported as before. Including the
+  occupancy term is the residual fix (LP-0MVOFVCA2008DQVE): a warm prompt
+  whose own prefill fits easily can still be cancelled at the deadline while
+  another session's prefill occupies the GPU, so it is refused (and falls
+  through) instead of being dispatched into a guaranteed cancellation.
 
 Rollout control (`server.local_admission_guard_policy`):
 

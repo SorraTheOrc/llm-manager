@@ -54,6 +54,22 @@ calibrated estimate, never as "free soon". The change is fail-open by
 construction — it can only refuse admits that were already guaranteed to
 lose, never admit more than before.
 
+Occupant-evidence pricing (LP-0MVOFVCA2008DQVE)
+-----------------------------------------------
+
+The symmetric ``eta * busy_slots`` term prices an occupant at the
+*newcomer's* own prefill, which is structurally wrong for heterogeneous
+traffic: a small warm prompt behind a huge cold prefill was priced at a few
+seconds and admitted, then cancelled by ``local_prefill_deadline_seconds``
+with zero prefill progress (measured 2026-10-25: own ETA 7.1 s, elapsed
+120.1 s, ``progress=None alive=False in_flight=True``). The occupancy term
+therefore also accepts the **measured remaining service** of the in-flight
+prefills (each occupant's calibrated ETA minus its elapsed run time, from its
+live dispatch record) and both bounds — the queue wait budget *and* the
+prefill deadline — are evaluated against the projected time to first byte.
+Measured evidence can only raise the symmetric floor, never lower it, so a
+missing record keeps today's behaviour byte-for-byte.
+
 Calibration is data-driven: every local dispatch records a sample
 ``(coded_tokens, new_tokens, dispatch_to_first_byte_ms)`` from the existing
 ``dispatch_first_byte_ms`` log line (service time, i.e. excluding the queue
@@ -768,6 +784,7 @@ def projected_wait_seconds(
     cached_ratio: float = 0.0,
     busy_slots: int = 0,
     config: dict | None = None,
+    occupant_prefill_seconds: float | None = None,
 ) -> ProjectedWait:
     """Projected pre-gate wait for a newcomer behind *busy_slots* occupants.
 
@@ -781,6 +798,17 @@ def projected_wait_seconds(
     unobservable (``prefill_progress_unobservable``, ``alive=False``): an
     in-flight prefill must be treated as occupying the gate for at least the
     calibrated estimate, never as "free soon" (AC4).
+
+    *occupant_prefill_seconds* is the **measured** remaining service owed by
+    the in-flight prefills, projected from each occupant's own admission
+    evidence (LP-0MVOFVCA2008DQVE). It can only raise the occupancy term above
+    the symmetric floor, never lower it: pricing the occupant at the
+    newcomer's own ETA is structurally wrong when a small warm prompt queues
+    behind a huge cold prefill (measured 2026-10-25: an own ETA of 7.1 s
+    waited 120 s behind a single occupant and was cancelled at the deadline).
+    ``None``/unparseable values leave the floor verdict byte-for-byte
+    unchanged, so every caller that does not probe the live records keeps
+    today's behaviour.
     """
     eta, coeffs = estimate_prefill_seconds(model, prompt_tokens, cached_ratio, config)
     try:
@@ -788,6 +816,11 @@ def projected_wait_seconds(
     except (TypeError, ValueError):
         busy = 0
     occupancy = eta * busy
+    try:
+        measured_occupancy = max(0.0, float(occupant_prefill_seconds or 0.0))
+    except (TypeError, ValueError):
+        measured_occupancy = 0.0
+    occupancy = max(occupancy, measured_occupancy)
     return ProjectedWait(
         own_prefill_seconds=eta,
         occupancy_seconds=occupancy,
@@ -875,6 +908,7 @@ def evaluate_admission(
     *,
     busy_slots: int = 0,
     in_flight_prefills: int = 0,
+    occupant_prefill_seconds: float | None = None,
 ) -> AdmissionDecision:
     """Decide whether a local dispatch can finish inside the wait budget.
 
@@ -885,16 +919,20 @@ def evaluate_admission(
        gate, :func:`projected_wait_seconds`) is compared against the wait
        budget (``contention_queue_max_wait_seconds``).
 
-    2. **Deadline bound (LP-0MVKUKEU80022C3U).** The projected first-byte
-       ETA (own-prefill term only, no occupancy) is compared against
-       ``local_prefill_deadline_seconds`` (default 90 s). When the ETA
-       exceeds the deadline the guard refuses so we never start a prefill
-       that the deadline will later cancel.
+    2. **Deadline bound (LP-0MVKUKEU80022C3U).** The projected time to first
+       byte — own-prefill ETA plus the occupied gate — is compared against
+       ``local_prefill_deadline_seconds`` (default 120 s). When it would
+       exceed the deadline the guard refuses so we never start a dispatch
+       that the deadline will later cancel. Including the occupancy term is
+       the LP-0MVOFVCA2008DQVE residual fix: a warm 7 s prompt admitted
+       behind a 120 s occupant was cancelled with zero prefill progress.
 
     *busy_slots* is the number of occupied gate slots ahead of this request
     (``max(generating concurrency, prefills in flight)``); *in_flight_prefills*
     is carried for the decision log so an unobservable-progress gate is
-    diagnosable (AC4/AC6).
+    diagnosable (AC4/AC6). *occupant_prefill_seconds* is the measured
+    remaining prefill service read from the occupants' own dispatch records
+    (raises, never lowers, the symmetric occupancy floor).
 
     Fail-open by construction: the guard is inert (``admit=True``) when the
     policy is ``off``, the priority never queues, the bucket is not yet
@@ -976,7 +1014,12 @@ def evaluate_admission(
     if budget <= 0:
         return _inert("no_budget")
     projected = projected_wait_seconds(
-        model, prompt_tokens, cached_ratio, occupancy, config
+        model,
+        prompt_tokens,
+        cached_ratio,
+        occupancy,
+        config,
+        occupant_prefill_seconds=occupant_prefill_seconds,
     )
     coeffs = projected.coefficients
     eta = projected.own_prefill_seconds
@@ -986,12 +1029,16 @@ def evaluate_admission(
     reason = "within_budget" if within else "eta_exceeds_budget"
     admit = within or guard_cfg.policy == POLICY_OBSERVE
     # Second independent bound: deadline check (LP-0MVKUKEU80022C3U).
-    # If the projected first-byte ETA >= the prefill deadline we refuse
-    # *now* so we never start a prefill the deadline will later cancel.
+    # If the projected TIME TO FIRST BYTE (own prefill + the occupied gate
+    # ahead of it) reaches the prefill deadline we refuse *now* so we never
+    # start a dispatch the deadline will later cancel. The own-prefill term
+    # alone is not the wait a newcomer faces: with prefills serialised the
+    # occupant's remaining prefill is spent inside the same deadline window
+    # (LP-0MVOFVCA2008DQVE residual, measured 2026-10-25).
     # The deadline is the dominant reason when it fires (AC1) and, like
     # the budget bound, honours ``observe`` (log but never refuse).
     deadline = guard_cfg.prefill_deadline_seconds
-    if deadline > 0 and eta >= deadline:
+    if deadline > 0 and projected.projected_seconds >= deadline:
         reason = "prefill_eta_exceeds_deadline"
         admit = guard_cfg.policy == POLICY_OBSERVE
     # Third bound, deadline-RELATIVE (LP-0MVN4LBZ500281Z7 / parent AC3): when a

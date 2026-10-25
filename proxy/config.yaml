@@ -1805,12 +1805,12 @@ server:
   # SECOND, INDEPENDENT BOUND — the prefill DEADLINE (LP-0MVKUKEU80022C3U).
   # The budget bound above only refuses when the projected wait exceeds the
   # queue budget, but nothing refused admission against the hard
-  # ``local_prefill_deadline_seconds`` (default 90 s) backstop. A prompt
-  # whose projected first-byte ETA >= the deadline is a guaranteed loss —
-  # the dispatch is cancelled by the deadline before its first byte
-  # (deterministic, measured 2026-10-23: 130-265 s prefills vs a 90 s
-  # deadline). The guard therefore ALSO refuses when
-  # ``eta_prefill >= local_prefill_deadline_seconds``, logging
+  # ``local_prefill_deadline_seconds`` backstop. A prompt whose projected
+  # TIME TO FIRST BYTE (its own prefill plus the occupied gate) reaches the
+  # deadline is a guaranteed loss — the dispatch is cancelled by the deadline
+  # before its first byte (deterministic, measured 2026-10-23: 130-265 s
+  # prefills vs a 90 s deadline). The guard therefore ALSO refuses when
+  # ``projected_wait >= local_prefill_deadline_seconds``, logging
   # ``reason=prefill_eta_exceeds_deadline`` on BOTH paths (the deadline is
   # the binding constraint — no second budget knob). Ordering to keep:
   # ``contention_queue_max_wait_seconds < local_prefill_deadline_seconds <
@@ -1822,6 +1822,20 @@ server:
   #
   # Fail-open: the change can only refuse further DOOMED admissions, never
   # admit more than before, and an uncalibrated bucket still admits.
+  #
+  # OCCUPANT-EVIDENCE PRICING (LP-0MVOFVCA2008DQVE). The occupancy term is no
+  # longer only the symmetric ``own_eta * busy_slots`` floor: the guard also
+  # projects each in-flight prefill's remaining service from its own dispatch
+  # record (``eta_prefill_s`` minus elapsed since ``started_at``) and uses the
+  # larger of the two. The deadline bound is evaluated against that same
+  # projected time to first byte, closing the measured residual where a warm
+  # prompt's own 7 s prefill fitted the 120 s deadline but the occupant ahead
+  # of it needed ~120 s, so the dispatch was admitted and then cancelled with
+  # zero prefill progress (22 events / 7.4 h on 2026-10-25; the residual is
+  # tracked by LP-0MVO8H7VQ003B12I). No new knob: measured evidence can only
+  # raise the floor, and a missing/malformed record leaves today's verdict
+  # byte-for-byte unchanged. Rollback is the existing one — policy
+  # ``observe``/``off``, or ``local_prefill_deadline_seconds: 0``.
   #
   #   reject  — refuse admission when the projected wait exceeds the budget
   #             (default)

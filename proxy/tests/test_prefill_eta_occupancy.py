@@ -76,6 +76,12 @@ def _cfg(**server_overrides) -> dict:
         "contention_queue_policy": "queue",
         "contention_queue_max_wait_seconds": 60,
         "contention_queue_max_depth": 4,
+        # This module pins the occupancy-aware BUDGET bound (60 s). The
+        # deadline bound is now occupancy-inclusive too (LP-0MVOFVCA2008DQVE),
+        # so keep it well clear of the ~112 s projected wait: otherwise the
+        # deadline would dominate the reason and the budget assertion would
+        # stop testing what it names.
+        "local_prefill_deadline_seconds": 300,
     }
     server.update(server_overrides)
     return {"provider_cooldown_seconds": 60, "server": server}

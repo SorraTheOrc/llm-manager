@@ -145,11 +145,15 @@ def reserve(
     model: str | None = None,
     busy_slots: int = 0,
     in_flight_prefills: int = 0,
+    occupant_prefill_seconds: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Evaluate and (unless refused / dry-run) claim a reservation ticket.
 
     *busy_slots* / *in_flight_prefills* must come from the caller's occupancy
     probe so the verdict is identical to the admission guard's (AC7).
+    *occupant_prefill_seconds* is the same measured remaining occupant service
+    the guard prices (LP-0MVOFVCA2008DQVE) so the two verdicts cannot drift
+    for identical live state.
 
     Returns ``(status_code, payload)``.
     """
@@ -203,6 +207,7 @@ def reserve(
         priority,
         busy_slots=busy_slots,
         in_flight_prefills=in_flight_prefills,
+        occupant_prefill_seconds=occupant_prefill_seconds,
     )
 
     projected = (
