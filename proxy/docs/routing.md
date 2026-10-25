@@ -1070,7 +1070,7 @@ expired` is the reserved-but-unused signal for ticket hoarding.
 ### Prefill deadline (LP-0MVIQ0G2M0006QF6)
 
 Before the first byte, a local dispatch is bounded by
-`server.local_prefill_deadline_seconds` (default **90 s**, 0 disables). The
+`server.local_prefill_deadline_seconds` (default **120 s**, 0 disables). The
 effective first-byte ceiling is the tighter of this and
 `local_dispatch_first_byte_timeout_seconds` (840 s), so by default the deadline
 is the bound that fires. On expiry the pending upstream request is cancelled
@@ -1095,8 +1095,56 @@ wedged session held the local pool for ~4 h on 2026-10-23
 The deadline sits **above** the admission budget
 (`contention_queue_max_wait_seconds`, 60 s) so a request legitimately admitted
 inside its budget is never cut off, and **below**
-`local_dispatch_max_prefill_seconds` (900 s, unchanged). It is the hard
-backstop that does not depend on ETA-estimator quality.
+`local_dispatch_first_byte_timeout_seconds` (840 s), which is itself below
+`local_dispatch_max_prefill_seconds` (900 s) and below the client's own 900 s
+queue deadline. The ordering is asserted at startup by
+`_startup_validate_prefill_timeout_config` (via
+`prefill_eta.validate_prefill_timeout_ordering`): a violating configuration is
+**fatal**, because an out-of-order timeout set either cuts off requests the
+admission guard legitimately admitted or races the client's own deadline. It
+is the hard backstop that does not depend on ETA-estimator quality.
+
+#### Cold-prefill admission budget (LP-0MVN3KMGI009BZ0D)
+
+A parallel, *measured* cap on what the GPU must actually compute:
+`server.local_cold_prefill_budget_tokens` (default in the shipped config
+**25 000**; **0 disables** it and is the documented rollback) bounds the **new
+(uncached, to-be-prefilled)** tokens admitted for a local dispatch — not the
+prompt size, so a cache-warm request stays admissible however large its prompt.
+It applies on **every** admission path, including the idle/economic bypass
+that admitted 33 oversized cold prompts in the measured 2026-10-24 18:38–23:47
+window. Over-budget requests are refused at admission and detour to the next
+provider; they are never dispatched and then cancelled at the deadline
+(baseline: 125 deadline cancellations and ~779k prefill tokens computed then
+discarded in that 5.2 h window).
+
+The cap alone is a bare token count, so it is paired with two
+deadline-relative knobs:
+
+- `local_admission_guard_eta_percentile_min_tokens` (shipped **20 000**,
+  default **32 768** = the pre-existing hard-coded floor) — the prompt size
+  from which conservative p75 percentile pricing engages. Lowering it to
+  20 000 makes the p75 pricing cover the whole 25k budget band. If it exceeds
+  the budget, percentile pricing would never engage for a budgeted prompt and
+  a startup WARNING says the band guard is silently dead.
+- `local_admission_guard_budget_safety_fraction` (shipped **0.95**, default
+  **0.0** = disabled) — a budgeted prompt is admitted only when its
+  conservative p75 ETA fits inside `0.95 × local_prefill_deadline_seconds`
+  (= 114 s at 120 s). A 25k cold prompt prices ~93 s at the band's p75 rate
+  (~270 t/s) and is admitted; a band-slow 25k (~132 s at ~190 t/s) is refused.
+
+`local_admission_guard_reference_tokens` (shipped **25 000**, previously
+32 000) aligns the published `/llama/local/status` reference prompt with the
+budget so there is one number instead of two. `cold_threshold` (derived,
+38 000) remains a large-context routing bypass and becomes a non-binding upper
+bound once this measured budget exists.
+
+**Rollback** (restores the pre-LP-0MVN3KMGI009BZ0D behaviour with values only —
+no code change): `local_prefill_deadline_seconds: 90`,
+`local_cold_prefill_budget_tokens: 0` (cap disabled),
+`local_admission_guard_eta_percentile_min_tokens: 32768` (the old floor),
+`local_admission_guard_budget_safety_fraction: 0.0` (bound disabled) and
+`local_admission_guard_reference_tokens: 32000`.
 
 Note: the existing `stream_heartbeat_interval_seconds` (default 10 s) emits
 `data: {"type":"heartbeat",…}` frames during prefill **after** the upstream

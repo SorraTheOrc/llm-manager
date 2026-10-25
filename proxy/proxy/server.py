@@ -411,6 +411,28 @@ def _startup_validate_local_routing_config(config: dict) -> None:
         )
 
 
+def _startup_validate_prefill_timeout_config(config: dict) -> None:
+    """Validate the local prefill timeout ordering (LP-0MVN4LBEQ005QRVL).
+
+    Asserts ``contention_queue_max_wait_seconds < local_prefill_deadline_seconds
+    < local_dispatch_first_byte_timeout_seconds <
+    local_dispatch_max_prefill_seconds`` and keeps the deadline strictly below
+    the client's 900 s queue deadline. Every problem this validator reports is
+    FATAL: an out-of-order timeout set either cuts off requests the admission
+    guard legitimately admitted or races the client's own deadline, so a
+    silently degraded startup is worse than a refused one.
+    """
+    from proxy.prefill_eta import validate_prefill_timeout_ordering
+
+    problems = validate_prefill_timeout_ordering(config)
+    for problem in problems:
+        logger.error("Prefill timeout config validation FAILED: %s", problem)
+    if problems:
+        raise ValueError(
+            "Prefill timeout config validation failed: " + "; ".join(problems)
+        )
+
+
 def _startup_validate_compaction_config(config: dict) -> None:
     """Validate the compaction configuration (LP-0MTG6RW3L003X122).
 
@@ -598,6 +620,7 @@ def _startup_config_logging():
         )
     _startup_validate_local_routing_config(config)
     _startup_validate_compaction_config(config)
+    _startup_validate_prefill_timeout_config(config)
 
     # Log resolved hard-routing caps (LP-0MTBOX45O005LD1S). With the mode
     # axis removed (LP-0MVDT94F0003VHUA AC4) there is a single unified cap

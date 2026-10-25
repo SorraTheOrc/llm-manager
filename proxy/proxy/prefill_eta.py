@@ -175,6 +175,32 @@ PREFILL_DEADLINE_KEY = "local_prefill_deadline_seconds"
 CONTEXT_BUCKET_BOUNDS = (16_384, 65_536, 131_072)
 
 # ---------------------------------------------------------------------------
+# Cold-prefill admission budget (LP-0MVN3KMGI009BZ0D / LP-0MVN4LBEQ005QRVL)
+# ---------------------------------------------------------------------------
+
+#: Hard cap on the NEW (to-be-prefilled) tokens admitted for a local dispatch.
+#: 0 disables the cap (the documented rollback / legacy default), so a config
+#: without the key behaves exactly as before.
+COLD_PREFILL_BUDGET_KEY = "local_cold_prefill_budget_tokens"
+DEFAULT_COLD_PREFILL_BUDGET_TOKENS = 0
+
+#: Prompt size from which conservative percentile pricing engages. Defaults to
+#: the pre-existing hard-coded floor (``CONSERVATIVE_MIN_TOKENS``, 32 768) so
+#: an absent key is byte-for-byte today's behaviour.
+ETA_PERCENTILE_MIN_TOKENS_KEY = "local_admission_guard_eta_percentile_min_tokens"
+DEFAULT_ETA_PERCENTILE_MIN_TOKENS = CONSERVATIVE_MIN_TOKENS
+
+#: Fraction of the prefill deadline a budgeted prompt's conservative ETA must
+#: fit inside (0.95 of 120 s = 114 s). 0.0 disables the bound and leaves the
+#: bare token budget (legacy/rollback).
+BUDGET_SAFETY_FRACTION_KEY = "local_admission_guard_budget_safety_fraction"
+DEFAULT_BUDGET_SAFETY_FRACTION = 0.0
+
+#: Client-visible queue deadline (seconds) the prefill deadline must stay
+#: strictly below, so the proxy answers before the client gives up.
+CLIENT_QUEUE_DEADLINE_SECONDS = 900.0
+
+# ---------------------------------------------------------------------------
 # Rolling calibration window (module scope = one proxy process)
 # ---------------------------------------------------------------------------
 
@@ -236,6 +262,29 @@ def _int_setting(server_cfg: dict, key: str, default: int) -> int:
     return int(_float_setting(server_cfg, key, float(default)))
 
 
+def _warn_malformed(server_cfg: dict, key: str, default: object) -> None:
+    """Warn that a present-but-unusable setting fell back to *default*.
+
+    ``_float_setting`` is deliberately silent (it is on the hot path); the
+    budget knobs are startup-visible so a typo must be diagnosable rather
+    than silently inert (LP-0MVN4LBEQ005QRVL AC2).
+    """
+    raw = server_cfg.get(key)
+    if raw is None:
+        return
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = float("nan")
+    if not math.isfinite(value) or value < 0:
+        logger.warning(
+            "Invalid %s=%r — using %r (expected a finite number >= 0)",
+            key,
+            raw,
+            default,
+        )
+
+
 @dataclass(frozen=True)
 class GuardConfig:
     """Resolved ``server.local_admission_guard_*`` settings."""
@@ -249,6 +298,14 @@ class GuardConfig:
     #: Percentile of the observed first-byte window large prompts are priced
     #: at (LP-0MVKUKF65008D5UN); 0 disables conservative pricing.
     eta_percentile: float = DEFAULT_ETA_PERCENTILE
+    #: Hard cap on NEW (to-be-prefilled) tokens admitted locally; 0 disables
+    #: (LP-0MVN4LBEQ005QRVL, enforced by LP-0MVN4LBZ500281Z7).
+    cold_prefill_budget_tokens: int = DEFAULT_COLD_PREFILL_BUDGET_TOKENS
+    #: Prompt size from which percentile pricing engages (default 32 768).
+    eta_percentile_min_tokens: int = DEFAULT_ETA_PERCENTILE_MIN_TOKENS
+    #: Fraction of the deadline a budgeted prompt's conservative ETA must fit
+    #: inside (0.95 x 120 s = 114 s); 0.0 disables the bound.
+    budget_safety_fraction: float = DEFAULT_BUDGET_SAFETY_FRACTION
 
 
 def resolve_config(config: dict | None) -> GuardConfig:
@@ -293,6 +350,46 @@ def resolve_config(config: dict | None) -> GuardConfig:
             DEFAULT_ETA_PERCENTILE,
         )
         percentile = DEFAULT_ETA_PERCENTILE
+    _warn_malformed(
+        server_cfg, COLD_PREFILL_BUDGET_KEY, DEFAULT_COLD_PREFILL_BUDGET_TOKENS
+    )
+    _warn_malformed(
+        server_cfg,
+        ETA_PERCENTILE_MIN_TOKENS_KEY,
+        DEFAULT_ETA_PERCENTILE_MIN_TOKENS,
+    )
+    _warn_malformed(
+        server_cfg, BUDGET_SAFETY_FRACTION_KEY, DEFAULT_BUDGET_SAFETY_FRACTION
+    )
+    budget_tokens = max(0, _int_setting(
+        server_cfg, COLD_PREFILL_BUDGET_KEY, DEFAULT_COLD_PREFILL_BUDGET_TOKENS,
+    ))
+    percentile_min_tokens = max(1, _int_setting(
+        server_cfg,
+        ETA_PERCENTILE_MIN_TOKENS_KEY,
+        DEFAULT_ETA_PERCENTILE_MIN_TOKENS,
+    ))
+    safety_fraction = _float_setting(
+        server_cfg, BUDGET_SAFETY_FRACTION_KEY, DEFAULT_BUDGET_SAFETY_FRACTION,
+    )
+    if safety_fraction > 1.0:
+        logger.warning(
+            "Invalid %s=%r — using %r (valid: 0.0-1.0; 0 disables)",
+            BUDGET_SAFETY_FRACTION_KEY,
+            server_cfg.get(BUDGET_SAFETY_FRACTION_KEY),
+            DEFAULT_BUDGET_SAFETY_FRACTION,
+        )
+        safety_fraction = DEFAULT_BUDGET_SAFETY_FRACTION
+    if budget_tokens > 0 and percentile_min_tokens > budget_tokens:
+        logger.warning(
+            "%s=%d exceeds %s=%d — percentile pricing would never engage, so "
+            "the band guard is silently dead; lower the percentile floor or "
+            "raise the budget",
+            ETA_PERCENTILE_MIN_TOKENS_KEY,
+            percentile_min_tokens,
+            COLD_PREFILL_BUDGET_KEY,
+            budget_tokens,
+        )
     return GuardConfig(
         policy=raw_policy,
         min_samples=min_samples,
@@ -300,7 +397,73 @@ def resolve_config(config: dict | None) -> GuardConfig:
         reference_tokens=reference,
         prefill_deadline_seconds=deadline,
         eta_percentile=percentile,
+        cold_prefill_budget_tokens=budget_tokens,
+        eta_percentile_min_tokens=percentile_min_tokens,
+        budget_safety_fraction=safety_fraction,
     )
+
+
+def validate_prefill_timeout_ordering(config: dict | None) -> list[str]:
+    """Return FATAL problems with the local prefill timeout ordering.
+
+The admitted-request lifetime must be strictly increasing so each bound fires
+before the next one and all of them fire before the client gives up
+(LP-0MVN4LBEQ005QRVL AC3)::
+
+        contention_queue_max_wait_seconds (60)
+          < local_prefill_deadline_seconds (120)
+          < local_dispatch_first_byte_timeout_seconds (840)
+          < local_dispatch_max_prefill_seconds (900)
+          < client queue deadline (900 s)
+
+A violating configuration is a startup FATAL: a deadline below the admission
+budget cuts off requests the guard legitimately admitted, and a deadline at or
+above the client's own deadline loses the race it exists to win. A zero
+(disabled) value is skipped rather than ordered — ``0`` means "no bound".
+"""
+    server_cfg = _server_config(config)
+    queue_budget = _float_setting(
+        server_cfg, "contention_queue_max_wait_seconds", 60.0
+    )
+    deadline = _float_setting(
+        server_cfg, PREFILL_DEADLINE_KEY, float(DEFAULT_PREFILL_DEADLINE_SECONDS)
+    )
+    first_byte = _float_setting(
+        server_cfg, "local_dispatch_first_byte_timeout_seconds", 840.0
+    )
+    max_prefill = _float_setting(
+        server_cfg, "local_dispatch_max_prefill_seconds", 900.0
+    )
+
+    problems: list[str] = []
+    if deadline > 0 and queue_budget > 0 and queue_budget >= deadline:
+        problems.append(
+            "FATAL: contention_queue_max_wait_seconds="
+            f"{queue_budget:g} must be < local_prefill_deadline_seconds="
+            f"{deadline:g} (an admitted request must not be cut off before "
+            "its wait budget expires)"
+        )
+    if deadline > 0 and first_byte > 0 and deadline >= first_byte:
+        problems.append(
+            "FATAL: local_prefill_deadline_seconds="
+            f"{deadline:g} must be < "
+            "local_dispatch_first_byte_timeout_seconds="
+            f"{first_byte:g} (the deadline must be the bound that fires)"
+        )
+    if first_byte > 0 and max_prefill > 0 and first_byte > max_prefill:
+        problems.append(
+            "FATAL: local_dispatch_first_byte_timeout_seconds="
+            f"{first_byte:g} must be <= local_dispatch_max_prefill_seconds="
+            f"{max_prefill:g} (a record cannot outlive its lifetime wedge)"
+        )
+    if deadline > 0 and deadline >= CLIENT_QUEUE_DEADLINE_SECONDS:
+        problems.append(
+            "FATAL: local_prefill_deadline_seconds="
+            f"{deadline:g} must be < the client queue deadline "
+            f"{CLIENT_QUEUE_DEADLINE_SECONDS:g} s (otherwise the proxy races "
+            "the client instead of answering first)"
+        )
+    return problems
 
 
 # ---------------------------------------------------------------------------

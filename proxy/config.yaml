@@ -1837,8 +1837,10 @@ server:
   local_admission_guard_min_samples: 5
   local_admission_guard_window_samples: 200
   # Prompt size used for the published estimate on /llama/local/status when
-  # no dispatch has been observed yet for the current model.
-  local_admission_guard_reference_tokens: 32000
+  # no dispatch has been observed yet for the current model. Aligned with the
+  # cold-prefill admission budget below (LP-0MVN4LBEQ005QRVL) so the published
+  # status reference and the budget are ONE number, not two.
+  local_admission_guard_reference_tokens: 25000
   # Conservative ETA pricing for large prompts (LP-0MVKUKF65008D5UN): the
   # point least-squares estimate is optimistic for large prompts (measured
   # first-byte times p50 16s / p90 189s / max 591s; a 19,940-token prompt was
@@ -1851,12 +1853,67 @@ server:
   # unchanged, and setting this to 0 disables the percentile pricing
   # (documented rollback — byte-for-byte the point estimate).
   local_admission_guard_eta_percentile: 75
+  # Conservative percentile pricing now engages from this prompt size upwards
+  # (tokens; default 32768 = the pre-existing hard-coded CONSERVATIVE_MIN_TOKENS
+  # floor, so an absent key is byte-for-byte today's behaviour). Lowered to
+  # 20000 so the p75 pricing also covers the 25 000-token budget band
+  # (LP-0MVN4LBEQ005QRVL). If this exceeds local_cold_prefill_budget_tokens the
+  # percentile pricing would never engage for a budgeted prompt, so startup
+  # logs a WARNING that the band guard is silently dead.
+  local_admission_guard_eta_percentile_min_tokens: 20000
+  # Hard cap on the NEW (to-be-prefilled / uncached) tokens admitted for a
+  # local dispatch (tokens; 0 DISABLES the cap = documented rollback).
+  # LP-0MVN3KMGI009BZ0D / LP-0MVN4LBEQ005QRVL: the cap bounds what the GPU must
+  # actually compute, NOT the prompt size — a cache-warm request whose
+  # new_tokens are small stays admissible at any prompt size (measured
+  # 2026-10-24: warm 47k prompt / 549 new tokens completed locally). It is
+  # enforced on EVERY admission path, including the idle/economic bypass that
+  # admitted 33 oversized (>25k new-token) cold prompts in the measured
+  # 18:38-23:47 window; over-budget requests are refused at admission
+  # (reason=prefill_budget_exceeded) and detour, never dispatched then
+  # cancelled at the deadline. Interaction with cold_threshold (38000, derived
+  # from per-slot ctx) and warm_threshold: cold_threshold stays a
+  # large-context routing bypass and becomes a non-binding upper bound once
+  # this measured budget exists; warm requests are unaffected because the cap
+  # counts new tokens only. Interaction with the admission guard: the guard
+  # prices a budgeted prompt's conservative ETA and refuses it when that ETA
+  # exceeds local_admission_guard_budget_safety_fraction x
+  # local_prefill_deadline_seconds, so a band-slow prompt cannot slip past the
+  # flat token cap.
+  local_cold_prefill_budget_tokens: 25000
+  # Fraction of local_prefill_deadline_seconds a budgeted prompt's conservative
+  # p75 ETA must fit inside before it is admitted (default 0.0 = DISABLED =
+  # documented rollback). 0.95 x 120 s = 114 s: a 25k cold prompt prices ~93 s
+  # at the measured 20-30k band p75 rate (~270 t/s) and is admitted, while a
+  # band-slow 25k (~132 s at ~190 t/s) is refused
+  # (LP-0MVN4LBEQ005QRVL). This makes the budget deadline-relative instead of a
+  # bare token count, so a future deadline change stays consistent.
+  local_admission_guard_budget_safety_fraction: 0.95
   # Deadline-aware admission bound (LP-0MVKUKEU80022C3U): the guard ALSO
   # refuses local when the projected first-byte ETA exceeds this hard
-  # backstop (default 90 s, same value as ``local_prefill_deadline_seconds``;
-  # 0 disables the bound). See the guard documentation above for the
-  # ordering: ``budget < deadline < first-byte ceiling < max prefill``.
-  local_prefill_deadline_seconds: 90
+  # backstop (seconds; 0 disables the bound). Widened 90 -> 120 s
+  # (LP-0MVN4LBEQ005QRVL): at the measured 20-30k band rate (249 t/s) a 25 000
+  # new-token prefill costs ~100 s (~93 s at the band's p75 of ~270 t/s), so a
+  # 90 s deadline cancels a genuinely feasible prompt while 120 s admits it
+  # with ~16 % margin (~23 % at p75).
+  #
+  # ORDERING (asserted at startup, FATAL on violation by
+  # _startup_validate_prefill_timeout_config):
+  #   contention_queue_max_wait_seconds (60)
+  #     < local_prefill_deadline_seconds (120)
+  #     < local_dispatch_first_byte_timeout_seconds (840)
+  #     < local_dispatch_max_prefill_seconds (900)
+  #     < the client's 900 s queue deadline.
+  #
+  # ROLLBACK (restores the pre-LP-0MVN3KMGI009BZ0D behaviour): set
+  # local_prefill_deadline_seconds back to 90, local_cold_prefill_budget_tokens
+  # to 0 (cap disabled), local_admission_guard_eta_percentile_min_tokens to
+  # 32768 (the old hard-coded floor),
+  # local_admission_guard_budget_safety_fraction to 0.0 (bound disabled) and
+  # local_admission_guard_reference_tokens to 32000. Each is a pure value
+  # change — no code change and no restart ordering constraint beyond the
+  # usual process restart.
+  local_prefill_deadline_seconds: 120
   # Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL): when a
   # local dispatch is cancelled by the prefill deadline
   # (``prefill_deadline_exceeded``), that session is kept OFF local for
