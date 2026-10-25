@@ -1,0 +1,547 @@
+"""Residency-aware local admission ladder (LP-0MVN1IQTF0037WTG).
+
+The local pool is scheduled **per request**: a request is admitted to one of
+two llama-server slots without any session→slot tenancy and without consulting
+the *actual* reusable prefix, so another session's turn evicts a resident
+prefix and the resident re-prefills from scratch (2026-10-24: 27 sessions
+through 2 slots, aggregate prefix reuse 26.1 %, median 15.6 % for prompts
+>20k tokens).
+
+This module pins the intended behaviour of the three-part fix before any of it
+exists (test-first, per the parent item's plan):
+
+- **AC1 — resident-prefix admission gate.** A large prompt is admitted locally
+  only when the session's *live* measured reusable prefix is at or above
+  ``local_resident_prefix_min_ratio`` (default 0.5, ``0`` disables). Denials
+  skip local with reason ``resident_prefix_insufficient`` and fall through to
+  the normal chain.
+- **AC2 — session tenancy.** At most ``local_session_tenants`` distinct
+  sessions hold a local reservation at once; a further session's large prompt
+  falls through instead of evicting a resident (denial reason ``tenant_limit``).
+  Same-session re-entry is always allowed and an idle-lapsed tenancy is free.
+- **AC3 — live-prefix pricing.** ``new_tokens`` is priced from the same live
+  measurement, so the cold-token cap is evaluated against real prefill work
+  rather than the (structurally over-optimistic) predicted sidecar ratio.
+- **AC6 — tenancy is a lease.** An observed client disconnect frees the
+  tenancy immediately; a silent half-open drop is bounded by the no-progress
+  watchdog window, never only by the 900 s lifetime ceiling.
+
+Store of truth: only the two documented sources are stubbed — the in-memory
+``/slots`` snapshot (``observability._last_slot_details_cache`` +
+``_last_slot_details_at``) and the in-process ownership registry
+(``session._slot_owners``). No HTTP, no ``/slots`` call on the admission hot
+path (LP-0MUXTW4MD003TVIC), no sleeps: every matrix cell is a pure call.
+"""
+
+from __future__ import annotations
+
+import time
+
+import proxy.observability as observability
+import proxy.provider as provider
+import proxy.router_helpers as router_helpers
+import proxy.session as session_registry
+import pytest
+
+# The 2026-10-24 divergence fixture: a 49,103-token prompt whose slot reported
+# n_past=738 (≈1.5 % reusable) while the sidecar prediction said 0.99.
+EST_TOKENS = 49_103
+N_PAST_COLD = 738
+COLD_THRESHOLD = 25_000
+
+# Skip reasons the ladder emits (parent AC1/AC2).
+SKIP_RESIDENT_PREFIX = "resident_prefix_insufficient"
+SKIP_TENANT_LIMIT = "tenant_limit"
+
+PENDING_VIEW = "pending LP-0MVN4L7AG003PC80 (shared residency view)"
+PENDING_GATE = "pending LP-0MVN4L7KT003XUBA (resident-prefix gate / live pricing)"
+PENDING_TENANCY = "pending LP-0MVN4L7UX003KGTI (session tenancy bound)"
+PENDING_RECLAIM = "pending LP-0MVN4LADE001XD3M (tenancy lease reclaim)"
+
+
+# ---------------------------------------------------------------------------
+# Fixture factory — stubs only the two documented residency sources
+# ---------------------------------------------------------------------------
+
+def _install_slot_state(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    slots: list[dict],
+    owners: dict[tuple, str],
+    age: float = 0.5,
+) -> None:
+    """Install a slot snapshot + ownership registry and return the view.
+
+    *slots* entries use the cache's own shape (``slot_id``, ``is_processing``,
+    ``context_tokens``); *owners* is keyed by ``(endpoint, slot_id)`` exactly
+    like ``session._slot_owners``.
+    """
+    observability._last_slot_details_cache[:] = [dict(s) for s in slots]
+    observability._last_slot_details_at = time.monotonic() - age
+    session_registry._slot_owners.clear()
+    session_registry._slot_owners.update(owners)
+
+
+@pytest.fixture(autouse=True)
+def _reset_residency_state():
+    """Keep the two documented sources (and the tenancy registry) isolated."""
+    observability._last_slot_details_cache[:] = []
+    observability._last_slot_details_at = 0.0
+    session_registry._slot_owners.clear()
+    yield
+    observability._last_slot_details_cache[:] = []
+    observability._last_slot_details_at = 0.0
+    session_registry._slot_owners.clear()
+
+
+def _slot(slot_id: int, context_tokens: int | None, *, processing: bool = True) -> dict:
+    return {
+        "slot_id": slot_id,
+        "is_processing": processing,
+        "n_decoded": None,
+        "context_tokens": context_tokens,
+    }
+
+
+def _view(*, slots=None, owners=None, age: float = 0.5, monkeypatch=None):
+    """Build a residency view from a stubbed snapshot (fails until C2 lands)."""
+    from proxy.residency import get_residency_view
+
+    _install_slot_state(
+        monkeypatch,
+        slots=slots if slots is not None else [_slot(0, EST_TOKENS)],
+        owners=owners if owners is not None else {("", 0): "sess-a"},
+        age=age,
+    )
+    return get_residency_view()
+
+
+def _gate(
+    *,
+    session_id: str = "sess-a",
+    estimated_tokens: int = EST_TOKENS,
+    min_ratio: float = 0.5,
+    predicted_ratio: float = 0.0,
+    view=None,
+    cold_threshold: int = COLD_THRESHOLD,
+    warm_threshold: int = 0,
+    monkeypatch: pytest.MonkeyPatch | None = None,
+):
+    """Run the local admission ladder as the router does for a large prompt."""
+    if monkeypatch is not None:
+        monkeypatch.setattr(
+            provider, "expected_cached_ratio", lambda *a, **k: predicted_ratio
+        )
+    return provider._should_skip_local(
+        "Qwen3",
+        session_id,
+        {"messages": []},
+        cold_threshold,
+        estimated_tokens=estimated_tokens,
+        warm_cache_threshold=warm_threshold,
+        resident_prefix_min_ratio=min_ratio,
+        residency_view=view,
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC1 — resident accept / non-resident reject
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_resident_session_admitted(monkeypatch):
+    """A session whose slot holds its full prompt is admitted locally."""
+    view = _view(slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch)
+
+    skip, reason = _gate(view=view, predicted_ratio=0.0, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_non_resident_session_rejected(monkeypatch):
+    """A cold prompt from a session that owns no prefix is skipped locally."""
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+        monkeypatch=monkeypatch,
+    )
+
+    skip, reason = _gate(view=view, predicted_ratio=0.99, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+
+
+# ---------------------------------------------------------------------------
+# AC1 — ratio boundary
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_ratio_at_boundary_admits(monkeypatch):
+    """Exactly ``local_resident_prefix_min_ratio`` of the prompt is enough."""
+    view = _view(
+        slots=[_slot(0, EST_TOKENS // 2)],
+        owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    skip, reason = _gate(view=view, min_ratio=0.5, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_one_token_below_boundary_rejects(monkeypatch):
+    """One token below the boundary is not resident enough."""
+    view = _view(
+        slots=[_slot(0, EST_TOKENS // 2 - 1)],
+        owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    skip, reason = _gate(view=view, min_ratio=0.5, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_zero_min_ratio_disables_gate(monkeypatch):
+    """``local_resident_prefix_min_ratio: 0`` restores the predicted-ratio ladder."""
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+        monkeypatch=monkeypatch,
+    )
+
+    # Non-resident, but the prediction says the prompt is already cached.
+    skip, reason = _gate(view=view, min_ratio=0.0, predicted_ratio=0.99,
+                         monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC7 — unknown ``context_tokens`` fallback ladder
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_unknown_context_tokens_with_ownership_is_resident(monkeypatch):
+    """Unreported ``context_tokens`` + slot ownership ⇒ treat as resident."""
+    view = _view(
+        slots=[_slot(0, None)],
+        owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_unknown_context_tokens_without_ownership_falls_back_to_prediction(monkeypatch):
+    """No measurement and no ownership ⇒ today's predicted-ratio decision."""
+    view = _view(
+        slots=[_slot(0, None)],
+        owners={},
+        monkeypatch=monkeypatch,
+    )
+
+    skip_cached, reason_cached = _gate(
+        view=view, predicted_ratio=0.99, monkeypatch=monkeypatch
+    )
+    skip_cold, reason_cold = _gate(
+        view=view, predicted_ratio=0.0, monkeypatch=monkeypatch
+    )
+
+    assert (skip_cached, reason_cached) == (False, None)
+    assert skip_cold is True
+    assert reason_cold == "large_context_bypass"
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_VIEW)
+def test_stale_snapshot_fails_open_to_ownership(monkeypatch):
+    """A snapshot older than the freshness bound is ``unknown``, not a denial."""
+    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
+
+    view = _view(
+        slots=[_slot(0, N_PAST_COLD)],
+        owners={("", 0): "sess-a"},
+        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
+        monkeypatch=monkeypatch,
+    )
+
+    assert view.known is False
+    # Session owns the slot (authoritative in-process registry) ⇒ resident.
+    skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+    assert (skip, reason) == (False, None)
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_VIEW)
+def test_missing_snapshot_reports_unknown_not_error(monkeypatch):
+    """No snapshot at all is an explicit ``unknown`` view, never an exception."""
+    _install_slot_state(monkeypatch, slots=[], owners={})
+    from proxy.residency import get_residency_view
+
+    view = get_residency_view()
+
+    assert view.known is False
+    assert view.slots == ()
+
+
+# ---------------------------------------------------------------------------
+# AC7 — predicted-vs-actual divergence (the 2026-10-24 failure shape)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_predicted_high_actual_low_rejects(monkeypatch):
+    """Predicted 0.99 with a measured 738/49,103 (≈1.5 %) prefix is refused."""
+    view = _view(
+        slots=[_slot(0, N_PAST_COLD)],
+        owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    skip, reason = _gate(view=view, predicted_ratio=0.99, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+
+
+# ---------------------------------------------------------------------------
+# AC3 — live-prefix pricing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_live_new_tokens_over_budget_rejected(monkeypatch):
+    """A resident session whose *live* new_tokens exceed the cap is refused.
+
+    The predicted ratio (0.99) would have admitted it (1,000 new tokens); the
+    live measurement (60,000 of 100,000 reusable ⇒ 40,000 new) must not.
+    """
+    view = _view(
+        slots=[_slot(0, 60_000)],
+        owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    skip, reason = _gate(
+        view=view,
+        estimated_tokens=100_000,
+        predicted_ratio=0.99,
+        monkeypatch=monkeypatch,
+    )
+
+    assert skip is True
+    assert reason == "large_context_bypass"
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_live_new_tokens_within_budget_admitted(monkeypatch):
+    """A resident session with a small *live* new-token term is admitted."""
+    view = _view(
+        slots=[_slot(0, EST_TOKENS - 1_000)],
+        owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    skip, reason = _gate(view=view, predicted_ratio=0.0, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_hard_warm_cap_still_wins(monkeypatch):
+    """The physical warm-cache cap is unchanged and evaluated first."""
+    view = _view(slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"},
+                 monkeypatch=monkeypatch)
+
+    skip, reason = _gate(
+        view=view,
+        estimated_tokens=200_000,
+        warm_threshold=120_000,
+        monkeypatch=monkeypatch,
+    )
+
+    assert skip is True
+    assert reason == "context_too_large"
+
+
+# ---------------------------------------------------------------------------
+# Idle-exempt override stays last in the ladder
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_resident_prefix_denial_is_idle_overridable(monkeypatch):
+    """A resident-prefix denial may still be served by an idle GPU.
+
+    The ladder itself refuses cold work from a non-resident session; the
+    idle-aware override (``local_idle_admit_*``) is applied *after* it, so the
+    new gate must not silently disable that behaviour.
+    """
+    view = _view(slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-other"},
+                 monkeypatch=monkeypatch)
+
+    skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    assert reason in provider.IDLE_OVERRIDABLE_SKIP_REASONS
+    assert "context_too_large" not in provider.IDLE_OVERRIDABLE_SKIP_REASONS
+
+
+# ---------------------------------------------------------------------------
+# AC2 — session tenancy bound
+# ---------------------------------------------------------------------------
+
+class _SrvStub:
+    """Minimal server stub: only the dispatch registry and a logger."""
+
+    def __init__(self, records: dict | None = None, *, now: float | None = None):
+        self.local_dispatch_records = dict(records or {})
+        self.local_prefill_in_flight: dict = {}
+        self.local_active_queries = 0
+        self.config = {"server": {}}
+        self.logger = _NullLogger()
+
+    def record(self, session_id: str, *, now: float, active: bool = True,
+               ttl: float = 30.0) -> str:
+        key = router_helpers._dispatch_lease_key(None, session_id)
+        self.local_dispatch_records[key] = {
+            "backend": "local",
+            "started_at": now,
+            "active": active,
+            "expires_at": now + ttl,
+            "model_name": "Qwen3",
+            "last_progress": 0,
+            "last_progress_ts": now,
+        }
+        return key
+
+
+class _NullLogger:
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
+def test_tenancy_bound_denies_new_session():
+    """A third session's large prompt falls through instead of evicting."""
+    now = 1000.0
+    srv = _SrvStub()
+    srv.record("sess-a", now=now)
+    srv.record("sess-b", now=now)
+
+    decision = router_helpers.evaluate_session_tenancy(
+        srv, "sess-c", tenants=2, idle_seconds=30.0, now=now
+    )
+
+    assert decision.admitted is False
+    assert decision.reason == SKIP_TENANT_LIMIT
+    assert set(decision.occupants) == {"sess-a", "sess-b"}
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
+def test_tenancy_same_session_reentry_allowed():
+    """A tenant's own later turn is never blocked by the bound."""
+    now = 1000.0
+    srv = _SrvStub()
+    srv.record("sess-a", now=now)
+    srv.record("sess-b", now=now)
+
+    decision = router_helpers.evaluate_session_tenancy(
+        srv, "sess-a", tenants=2, idle_seconds=30.0, now=now
+    )
+
+    assert decision.admitted is True
+    assert decision.reason is None
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
+def test_tenancy_idle_lapsed_resident_is_not_counted():
+    """A resident whose tenancy idle-lapsed no longer blocks a newcomer."""
+    now = 1000.0
+    srv = _SrvStub()
+    srv.record("sess-a", now=now)
+    srv.record("sess-b", now=now)
+
+    decision = router_helpers.evaluate_session_tenancy(
+        srv, "sess-c", tenants=2, idle_seconds=30.0, now=now + 31.0
+    )
+
+    assert decision.admitted is True
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
+def test_tenancy_zero_disables_bound():
+    """``local_session_tenants: 0`` disables the bound."""
+    now = 1000.0
+    srv = _SrvStub()
+    srv.record("sess-a", now=now)
+    srv.record("sess-b", now=now)
+    srv.record("sess-c", now=now)
+
+    decision = router_helpers.evaluate_session_tenancy(
+        srv, "sess-d", tenants=0, idle_seconds=30.0, now=now
+    )
+
+    assert decision.admitted is True
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_TENANCY)
+def test_tenancy_default_bound_is_the_slot_count():
+    """The resolved default is the slot count, i.e. two tenants for two slots."""
+    assert router_helpers.resolve_session_tenants({"server": {}}, max_local=2) == 2
+    assert router_helpers.resolve_session_tenants(
+        {"server": {"local_session_tenants": 1}}, max_local=2
+    ) == 1
+    assert router_helpers.resolve_session_tenants(
+        {"server": {"local_session_tenants": 0}}, max_local=2
+    ) == 0
+
+
+# ---------------------------------------------------------------------------
+# AC6 — tenancy is a lease, not a lock (both reclaim bounds)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(strict=True, reason=PENDING_RECLAIM)
+def test_observed_disconnect_frees_tenancy_immediately(monkeypatch):
+    """An observed disconnect releases the reservation without waiting."""
+    now = 1000.0
+    srv = _SrvStub()
+    srv.record("sess-a", now=now)
+    srv.record("sess-b", now=now)
+    session_registry._slot_owners[("", 0)] = "sess-a"
+    session_registry._slot_owners[("", 1)] = "sess-b"
+
+    released = router_helpers._release_client_disconnect_dispatch(srv, "sess-a")
+
+    decision = router_helpers.evaluate_session_tenancy(
+        srv, "sess-c", tenants=2, idle_seconds=30.0, now=now
+    )
+    assert released is True
+    assert decision.admitted is True
+    assert ("", 0) not in session_registry._slot_owners
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_RECLAIM)
+def test_silent_drop_bounded_by_no_progress_window(monkeypatch):
+    """A silent half-open drop is reclaimed inside the 180 s watchdog bound."""
+    assert router_helpers.DEFAULT_TENANCY_IDLE_SECONDS <= 180.0
+
+    now = 1000.0
+    srv = _SrvStub()
+    srv.record("sess-a", now=now)
+    srv.record("sess-b", now=now)
+
+    within = router_helpers.evaluate_session_tenancy(
+        srv, "sess-c", tenants=2, idle_seconds=180.0, now=now + 179.0
+    )
+    after = router_helpers.evaluate_session_tenancy(
+        srv, "sess-c", tenants=2, idle_seconds=180.0, now=now + 180.0
+    )
+
+    assert within.admitted is False
+    assert after.admitted is True
