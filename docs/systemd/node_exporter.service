@@ -1,0 +1,169 @@
+# node_exporter.service — Host-first deployment systemd unit
+
+## Overview
+
+This systemd unit runs **node_exporter 1.12.1** for the LLM proxy stack
+monitoring infrastructure. It uses the host-first model (binary in
+`~/bin/node_exporter/`, no containers) and is deployed as a **systemd user
+service** with `loginctl enable-linger`.
+
+node_exporter is the **only** exporter this stack runs. It provides:
+
+- the standard host metrics (CPU, load, memory, filesystem, network, systemd
+  state) that explain proxy and llama-server behaviour under load; and
+- the GPU signal, via two collectors:
+
+  | Collector | Series | Source |
+  |---|---|---|
+  | `--collector.hwmon` | `node_hwmon_power_average_watt`, `node_hwmon_chip_names`, `node_hwmon_temp_celsius`, … | `/sys/class/hwmon` — the `amdgpu` chip's `power1` sensor is GPU package power |
+  | `--collector.textfile.directory` | `gpu_gtt_used_bytes`, `gpu_vram_used_bytes`, `gpu_vram_total_bytes`, `gpu_busy_percent` | `*.prom` files written by the 10 s sysfs sampler in [gpu-metrics.service](gpu-metrics.service) |
+
+node_exporter has **no amdgpu collector**, which is why GPU memory comes
+through the textfile collector rather than being read directly. The
+AMD-authored exporter that would have provided those series
+(`amd/rocm-exporter`) publishes no release artefacts — see
+[rocm-exporter.service](rocm-exporter.service).
+
+### Listen address
+
+The unit binds `127.0.0.1:9100` — **loopback only**. Prometheus scrapes it from
+the same host, so there is no reason to publish it to the tailnet or the LAN,
+and node_exporter has no authentication.
+
+## User Service (recommended)
+
+**File location**: `~/.config/systemd/user/node_exporter.service`
+
+```ini
+[Unit]
+Description=Prometheus node_exporter (host + GPU sysfs metrics)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/rgardler/bin/node_exporter/node_exporter \
+  --web.listen-address=127.0.0.1:9100 \
+  --collector.textfile.directory=/home/rgardler/.local/share/node_exporter/textfile \
+  --collector.hwmon
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/rgardler/.local/state/node_exporter/logs/node_exporter.log
+StandardError=append:/home/rgardler/.local/state/node_exporter/logs/node_exporter.log
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target
+```
+
+## Setup commands (user service)
+
+```bash
+# 1. Download and install the binary
+NODE_EXPORTER_VERSION="1.12.1"
+ARCH="linux-amd64"
+wget "https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz"
+tar xzf "node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz"
+mkdir -p ~/bin/node_exporter
+cp "node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}/node_exporter" ~/bin/node_exporter/
+rm -rf "node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}" \
+       "node_exporter-${NODE_EXPORTER_VERSION}.${ARCH}.tar.gz"
+
+# 2. Create the textfile collector directory and the log directory.
+#    The textfile directory must match --collector.textfile.directory above;
+#    gpu-metrics.service writes gpu.prom into it.
+mkdir -p ~/.local/share/node_exporter/textfile
+mkdir -p ~/.local/state/node_exporter/logs
+
+# 3. Install the unit. docs/systemd/*.service are documents that wrap the unit
+#    in an `ini` block, so the block is extracted — `cp` would install markdown.
+mkdir -p ~/.config/systemd/user
+awk '/^```ini$/{f=1;next} /^```$/{f=0} f' \
+  docs/systemd/node_exporter.service \
+  > ~/.config/systemd/user/node_exporter.service
+
+# 4. Enable and start
+systemctl --user daemon-reload
+systemctl --user enable --now node_exporter.service
+
+# 5. Verify
+systemctl --user status node_exporter.service
+journalctl --user -u node_exporter.service -n 20
+```
+
+The sampler ([gpu-metrics.service](gpu-metrics.service)) can be installed
+before or after this unit; node_exporter picks up `gpu.prom` on the next
+scrape as soon as the file exists.
+
+## Metric names
+
+GPU series (from the textfile collector — see gpu-metrics.service for how each
+value is sampled and refreshed every 10 s):
+
+| Series | Type | Meaning |
+|---|---|---|
+| `gpu_gtt_used_bytes` | gauge | GTT (system RAM mapped for the GPU) in use — **the meaningful memory pool on this APU** |
+| `gpu_vram_used_bytes` | gauge | Used portion of the small BIOS VRAM carve-out (1 GiB here) |
+| `gpu_vram_total_bytes` | gauge | Size of the VRAM carve-out |
+| `gpu_busy_percent` | gauge | Driver-reported busy percentage. **Pinned at 100% on this APU regardless of GPU state — not a utilisation signal**; scraped for continuity only |
+
+GPU power (from the hwmon collector):
+
+| Series | Meaning |
+|---|---|
+| `node_hwmon_power_average_watt{chip_name="amdgpu",sensor="power1"}` | GPU package power in watts — the utilisation signal (idle ≈ 40-54 W, computing ≈ 115 W) |
+| `node_hwmon_chip_names{chip_name="amdgpu"}` | Join key that selects the amdgpu chip by name instead of a host-specific chip id |
+
+Host series used by the cookbook and alerts:
+`node_load1`, `node_memory_MemAvailable_bytes`, `node_filesystem_avail_bytes`,
+`node_network_receive_bytes_total`, `node_cpu_seconds_total`,
+`node_systemd_unit_state`.
+
+## Verification
+
+```bash
+# The exporter is listening on loopback only
+ss -tln | grep ':9100'
+# expected: 127.0.0.1:9100
+
+# Host metrics are served
+curl -s http://127.0.0.1:9100/metrics | grep -c '^node_'
+# expected: a four-digit count (1520 on this host)
+
+# GPU power is visible through the hwmon collector
+curl -s http://127.0.0.1:9100/metrics | grep 'node_hwmon_power_average_watt' | grep amdgpu
+# expected: one line per amdgpu power sensor, e.g.
+#   node_hwmon_power_average_watt{chip="0000:00:08_1_0000:c5:00_0",chip_name="amdgpu",sensor="power1"} 49.076
+
+# GPU memory is visible through the textfile collector (needs gpu-metrics.service)
+curl -s http://127.0.0.1:9100/metrics | grep -E '^gpu_(gtt_used|vram_used|vram_total|busy_percent)'
+# expected: four series, all with gpu="card0"
+
+# Prometheus sees the exporter as up
+curl -s http://127.0.0.1:9090/api/v1/query?query=up \
+  | jq -r '.data.result[] | "\(.metric.job) \(.value[1])"'
+# expected: llama-proxy 1 and node-exporter 1
+```
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Prometheus target `node-exporter` is DOWN | `systemctl --user status node_exporter.service`; check the log at `~/.local/state/node_exporter/logs/node_exporter.log` |
+| `node_hwmon_*` series missing | The `amdgpu` module/binary driver is not loaded, or the running unit lacks `--collector.hwmon` — check `curl -s http://127.0.0.1:9100/metrics \| grep node_hwmon` and `systemctl --user cat node_exporter.service` |
+| `gpu_*` series missing | `gpu-metrics.service` is not running or writes to a different directory than `--collector.textfile.directory` — see [gpu-metrics.service](gpu-metrics.service) |
+| Series go stale, then vanish | node_exporter reports the textfile's mtime; Prometheus marks the target stale when scrape data stops. `systemctl --user status gpu-metrics.service` |
+
+## Cross-references
+
+- [docs/systemd/gpu-metrics.service](gpu-metrics.service) — the sampler that
+  produces the `gpu_*` series.
+- [docs/systemd/prometheus.service](prometheus.service) — the Prometheus
+  instance that scrapes this exporter.
+- [monitoring/prometheus.yml](../../monitoring/prometheus.yml) — the
+  `node-exporter` scrape job (`localhost:9100`).
+- [monitoring/gpu_compute_rules.yaml](../../monitoring/gpu_compute_rules.yaml) —
+  power-derived utilisation rules.
+- [monitoring/gpu_memory_alerts.yaml](../../monitoring/gpu_memory_alerts.yaml) —
+  GTT pressure alerts.
+- [monitoring/README.md](../../monitoring/README.md) — deployment guide and
+  query cookbook.

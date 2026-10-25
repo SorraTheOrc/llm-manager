@@ -1,0 +1,191 @@
+# gpu-metrics.service — Host-first deployment systemd unit
+
+## Overview
+
+`gpu-metrics.service` is a **10-second sysfs sampler** for AMD GPU metrics. It
+is a bash loop that reads the `amdgpu` driver's attributes under
+`/sys/class/drm/card0/device/` and writes a Prometheus textfile
+(`gpu.prom`) into node_exporter's textfile collector directory, where
+[node_exporter.service](node_exporter.service) exposes it on
+`127.0.0.1:9100/metrics`.
+
+It exists because node_exporter has **no amdgpu collector** and the AMD
+rocm-exporter publishes no release artefacts ([rocm-exporter.service](rocm-exporter.service)).
+Reading sysfs needs no root, no ROCm userspace and no extra daemon — the loop
+costs one `cat` per attribute every 10 s.
+
+Two things this unit is **not**:
+
+- It is not a utilisation signal. `gpu_busy_percent` is published for
+  continuity only: on this Strix Halo APU it reads 100% whether the GPU is idle
+  or computing. Utilisation is derived from **power draw**
+  (`node_hwmon_power_average_watt`, from node_exporter's hwmon collector) — see
+  [monitoring/gpu_compute_rules.yaml](../../monitoring/gpu_compute_rules.yaml).
+- It is not a VRAM reporter in any useful sense: the VRAM carve-out is 1 GiB of
+  BIOS-reserved memory while models live in **GTT**. GTT is the pool the memory
+  alerts watch ([monitoring/gpu_memory_alerts.yaml](../../monitoring/gpu_memory_alerts.yaml)).
+
+## Metric names
+
+| Series | Labels | Type | Meaning |
+|---|---|---|---|
+| `gpu_busy_percent` | `gpu="card0"` | gauge | Driver-reported busy percentage — **pinned at 100% on this APU; not a utilisation measure** |
+| `gpu_vram_used_bytes` | `gpu="card0"` | gauge | Used portion of the VRAM carve-out (`mem_info_vram_used`) |
+| `gpu_vram_total_bytes` | `gpu="card0"` | gauge | Size of the VRAM carve-out (`mem_info_vram_total`, 1 GiB here) |
+| `gpu_gtt_used_bytes` | `gpu="card0"` | gauge | GTT in use (`mem_info_gtt_used`) — the meaningful pool: models map most of their weights here (~36 GiB of a 128 GiB pool in normal operation) |
+
+**Sampling interval: 10 s** (`sleep 10` in the unit's `ExecStart`). Prometheus
+scrapes at 15 s, so consecutive scrapes see alternating samples; that is fine
+for a gauge that changes slowly and is averaged in the rules.
+
+If `gpu_busy_percent` is unreadable the sampler exits **without writing** a
+file rather than publishing zeros — a zero would silently look like an idle
+GPU. `gpu_vram_*` is written only when both VRAM attributes are readable, and
+`gpu_gtt_used_bytes` only when the GTT attribute is.
+
+## The sampler script
+
+**File location**: `~/.local/bin/gpu-metrics-textfile.sh` (executable)
+
+```bash
+#!/usr/bin/env bash
+# Emit AMD GPU utilisation/memory metrics for node_exporter's textfile collector.
+# Source: amdgpu sysfs attributes on /sys/class/drm/card0/device. No root needed.
+set -u
+OUT_DIR="${1:-$HOME/.local/share/node_exporter/textfile}"
+DEV="${GPU_SYSFS:-/sys/class/drm/card0/device}"
+TMP="$OUT_DIR/.gpu.prom.$$"
+
+read_attr() { [ -r "$DEV/$1" ] && cat "$DEV/$1" 2>/dev/null || echo ""; }
+
+busy=$(read_attr gpu_busy_percent)
+vram_used=$(read_attr mem_info_vram_used)
+vram_total=$(read_attr mem_info_vram_total)
+gtt_used=$(read_attr mem_info_gtt_used)
+
+[ -n "$busy" ] || exit 0
+
+{
+  echo '# HELP gpu_busy_percent GPU utilisation as reported by the amdgpu driver (0-100).'
+  echo '# TYPE gpu_busy_percent gauge'
+  echo "gpu_busy_percent{gpu=\"card0\"} $busy"
+  if [ -n "$vram_used" ] && [ -n "$vram_total" ]; then
+    echo '# HELP gpu_vram_used_bytes VRAM currently allocated (sysfs mem_info_vram_used).'
+    echo '# TYPE gpu_vram_used_bytes gauge'
+    echo "gpu_vram_used_bytes{gpu=\"card0\"} $vram_used"
+    echo '# HELP gpu_vram_total_bytes VRAM visible to the driver (sysfs mem_info_vram_total).'
+    echo '# TYPE gpu_vram_total_bytes gauge'
+    echo "gpu_vram_total_bytes{gpu=\"card0\"} $vram_total"
+  fi
+  if [ -n "$gtt_used" ]; then
+    echo '# HELP gpu_gtt_used_bytes GTT (system RAM mapped for the GPU) in use — the meaningful memory pool on this APU.'
+    echo '# TYPE gpu_gtt_used_bytes gauge'
+    echo "gpu_gtt_used_bytes{gpu=\"card0\"} $gtt_used"
+  fi
+} > "$TMP" && mv -f "$TMP" "$OUT_DIR/gpu.prom"
+```
+
+The write is atomic (`mv` from a `$$`-suffixed temp file), so node_exporter
+never reads a half-written file. `OUT_DIR` can be passed as `$1` and the sysfs
+root overridden with `GPU_SYSFS`, which is what the repository test harness
+uses to exercise it against a fixture directory.
+
+## User Service (recommended)
+
+**File location**: `~/.config/systemd/user/gpu-metrics.service`
+
+```ini
+[Unit]
+Description=GPU busy/memory sysfs sampler for node_exporter textfile collector
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'while :; do /home/rgardler/.local/bin/gpu-metrics-textfile.sh; sleep 10; done'
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/rgardler/.local/state/node_exporter/logs/gpu-metrics.log
+StandardError=append:/home/rgardler/.local/state/node_exporter/logs/gpu-metrics.log
+
+[Install]
+WantedBy=default.target
+```
+
+The unit deliberately runs the loop inside `ExecStart` rather than using a
+systemd timer: a `Type=simple` loop keeps one process for the lifetime of the
+service, which is simpler to observe (`systemctl status`) than a
+`Type=oneshot` timer and avoids missing a sample after a suspend.
+
+## Setup commands (user service)
+
+```bash
+# 1. Install the sampler script (copy the block from § The sampler script above)
+mkdir -p ~/.local/bin ~/.local/share/node_exporter/textfile
+chmod +x ~/.local/bin/gpu-metrics-textfile.sh
+
+# 2. Run it once by hand and check the output before wiring up systemd
+~/.local/bin/gpu-metrics-textfile.sh
+cat ~/.local/share/node_exporter/textfile/gpu.prom
+# expected: gpu_busy_percent, gpu_vram_used_bytes, gpu_vram_total_bytes and
+#           gpu_gtt_used_bytes, each with gpu="card0"
+
+# 3. Install the unit. docs/systemd/*.service are documents that wrap the unit
+#    in an `ini` block, so the block is extracted — `cp` would install markdown.
+mkdir -p ~/.config/systemd/user
+awk '/^```ini$/{f=1;next} /^```$/{f=0} f' \
+  docs/systemd/gpu-metrics.service \
+  > ~/.config/systemd/user/gpu-metrics.service
+
+# 4. Enable and start
+systemctl --user daemon-reload
+systemctl --user enable --now gpu-metrics.service
+
+# 5. Verify
+systemctl --user status gpu-metrics.service
+journalctl --user -u gpu-metrics.service -n 20
+```
+
+## Verification
+
+```bash
+# The sampler is running and restarting cleanly
+systemctl --user is-active gpu-metrics.service
+# expected: active
+
+# The textfile is refreshed roughly every 10 s
+date +%s; stat -c %Y ~/.local/share/node_exporter/textfile/gpu.prom
+# expected: two epochs within 10 s of each other
+
+# The series reach Prometheus through node_exporter
+curl -s http://127.0.0.1:9100/metrics | grep -E '^gpu_'
+curl -s --get http://127.0.0.1:9090/api/v1/query \
+  --data-urlencode 'query=gpu_gtt_used_bytes'
+# expected: a single series, job="node-exporter", instance="localhost:9100",
+#           gpu="card0", value ≈ 3.66e10 (34 GiB) after models load
+
+# Cross-check against the driver's own numbers
+cat /sys/class/drm/card0/device/mem_info_gtt_used
+rocm-smi --showmeminfo vram
+```
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `gpu.prom` never appears | `gpu_busy_percent` is unreadable: `cat /sys/class/drm/card0/device/gpu_busy_percent`. On a host without an AMD GPU there is nothing to sample and the script exits 0 by design |
+| File appears but `gpu_*` series are missing in Prometheus | The textfile directory in the script's `OUT_DIR` differs from node_exporter's `--collector.textfile.directory`; compare `systemctl --user cat node_exporter.service` with the unit above |
+| `gpu.prom` stops updating | `systemctl --user status gpu-metrics.service`; the log is at `~/.local/state/node_exporter/logs/gpu-metrics.log` |
+| `gpu_gtt_used_bytes` is far above installed RAM | GTT is capped by the driver/BIOS carve-out and can exceed physical RAM; the alert thresholds assume a 128 GiB pool — update `monitoring/gpu_memory_alerts.yaml` if that changes |
+
+## Cross-references
+
+- [docs/systemd/node_exporter.service](node_exporter.service) — the textfile
+  collector that serves these series.
+- [monitoring/gpu_compute_rules.yaml](../../monitoring/gpu_compute_rules.yaml) —
+  why utilisation comes from power, not `gpu_busy_percent`.
+- [monitoring/gpu_memory_alerts.yaml](../../monitoring/gpu_memory_alerts.yaml) —
+  GTT pressure alerts.
+- [monitoring/prometheus.yml](../../monitoring/prometheus.yml) — the
+  `node-exporter` scrape job.
+- [monitoring/README.md](../../monitoring/README.md) — deployment guide,
+  exposure decision record and query cookbook.
