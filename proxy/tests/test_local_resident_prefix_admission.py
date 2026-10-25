@@ -1183,3 +1183,96 @@ def test_tenancy_idle_bound_stays_inside_the_lease_ceiling():
     assert router_helpers.DEFAULT_TENANCY_IDLE_SECONDS <= 180.0
     if ceiling > 0:
         assert router_helpers.DEFAULT_TENANCY_IDLE_SECONDS < ceiling
+
+
+# ---------------------------------------------------------------------------
+# C6 — observability: every admission decision is logged and machine-parseable
+# ---------------------------------------------------------------------------
+
+def _parse_logged_caught(caplog, needle: str):
+    """Parse the first caught log record whose message contains *needle*.
+
+    Uses the real ``proxy-usage-analysis`` parser so the assertion is about the
+    operator-visible contract (the report consumes these lines), not about the
+    format string.
+    """
+    import sys
+    from pathlib import Path
+
+    scripts = (
+        Path(__file__).resolve().parents[2]
+        / ".pi/skills/proxy-usage-analysis/scripts"
+    )
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import log_parser
+
+    record = next(r for r in caplog.records if needle in r.getMessage())
+    line = f"2026-10-25 01:14:37,460 - INFO - {record.getMessage()}"
+    event = log_parser.parse_log_line(line)
+    assert event is not None, f"unparseable decision line: {line!r}"
+    return event
+
+
+def test_admission_decision_logging_is_parseable(caplog, monkeypatch):
+    """A resident admission logs decision, n_past, ratio and slot owner."""
+    import logging
+
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.kind == "residency_decision"
+    assert event.decision == "admit"
+    assert event.session == "sess-a"
+    assert event.n_past_actual == EST_TOKENS
+    assert event.estimated_tokens == EST_TOKENS
+    assert event.reuse_ratio == pytest.approx(1.0)
+    assert event.slot_owner_session == "sess-a"
+    assert event.residency_source == "measured"
+
+
+def test_evicted_denial_logging_is_parseable(caplog, monkeypatch):
+    """An evicted denial logs the measured cheap-prefix ratio, not a prediction."""
+    import logging
+
+    view = _view(
+        slots=[_slot(0, N_PAST_COLD)], owners={("", 0): "sess-a"},
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == SKIP_RESIDENT_PREFIX
+    assert event.n_past_actual == N_PAST_COLD
+    assert event.reuse_ratio == pytest.approx(N_PAST_COLD / EST_TOKENS, abs=1e-3)
+
+
+def test_tenant_denial_logging_is_parseable(caplog, monkeypatch):
+    """The tenancy denial is logged with the bound and the occupant count."""
+    import logging
+
+    _install_tenancy(["sess-a", "sess-b"])
+    view = _view(slots=[], owners={}, monkeypatch=monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate_with_tenancy(
+            session_id="sess-c", view=view, monkeypatch=monkeypatch
+        )
+
+    assert skip is True
+    assert reason == SKIP_TENANT_LIMIT
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == SKIP_TENANT_LIMIT
+    assert event.tenant_limit == 2
+    assert event.tenant_occupants == 2

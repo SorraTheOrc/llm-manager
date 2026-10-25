@@ -7612,3 +7612,154 @@ class TestPriorityWindowEndToEnd:
         assert run.summary.busy is not None
         assert run.summary.busy.cheap_window_seconds == 0.0
         assert run.summary.busy.cheap_busy_seconds == 0.0
+
+
+class TestResidencyAdmission:
+    """Residency-aware admission evidence (LP-0MVN1IQTF0037WTG AC5).
+
+    ``routing_resident_prefix`` carries the *measured* reusable prefix next to
+    the request estimate, so the report can split resident from evicted reuse
+    and show which session owned the slot at each decision — the two facts the
+    predicted ``cached_ratio`` could not provide under contention.
+    """
+
+    RESIDENT = (
+        "2026-08-02 14:00:00,000 - INFO - routing_resident_prefix "
+        "provider=local model=Qwen3 decision=admit n_past_actual=49103 "
+        "estimated_tokens=49103 reuse_ratio=1.0000 "
+        "slot_owner_session=sess-a residency_source=measured min_ratio=0.50 "
+        "tenants=2 occupants=1 session=sess-a"
+    )
+    EVICTED = (
+        "2026-08-02 14:05:00,000 - INFO - routing_resident_prefix "
+        "provider=local model=Qwen3 decision=resident_prefix_insufficient "
+        "n_past_actual=738 estimated_tokens=49103 reuse_ratio=0.0150 "
+        "slot_owner_session=sess-b residency_source=measured min_ratio=0.50 "
+        "tenants=2 occupants=2 session=sess-a"
+    )
+    NO_SLOT = (
+        "2026-08-02 14:06:00,000 - INFO - routing_resident_prefix "
+        "provider=local model=Qwen3 decision=resident_prefix_insufficient "
+        "n_past_actual=none estimated_tokens=49103 reuse_ratio=none "
+        "slot_owner_session=sess-b residency_source=non_resident min_ratio=0.50 "
+        "tenants=2 occupants=2 session=sess-c"
+    )
+    TENANT = (
+        "2026-08-02 14:07:00,000 - INFO - routing_resident_prefix "
+        "provider=local model=Qwen3 decision=tenant_limit "
+        "n_past_actual=none estimated_tokens=49103 reuse_ratio=none "
+        "slot_owner_session=sess-b residency_source=non_resident min_ratio=0.50 "
+        "tenants=2 occupants=2 session=sess-d"
+    )
+    EVICTION = (
+        "2026-08-02 14:08:00,000 - ERROR - local_eviction session=sess-a "
+        "reason=tenancy_lease_expired endpoint=default slot=1 "
+        "slot_owner_session=sess-a tenants=2 snapshot_planned=true"
+    )
+
+    def _summary(self) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events(
+                [
+                    fixtures.STREAM_STARTED_LOCAL,
+                    self.RESIDENT,
+                    self.EVICTED,
+                    self.NO_SLOT,
+                    self.TENANT,
+                    self.EVICTION,
+                    fixtures.STREAM_FINISHED_LOCAL,
+                ]
+            ),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+
+    @staticmethod
+    def _section(md: str) -> str:
+        return md.split("## Residency-aware admission", 1)[1].split("\n## ", 1)[0]
+
+    def test_parser_reads_measured_prefix_and_owner(self):
+        ev = log_parser.parse_log_line(self.RESIDENT)
+        assert ev.kind == "residency_decision"
+        assert ev.decision == "admit"
+        assert ev.n_past_actual == 49103
+        assert ev.estimated_tokens == 49103
+        assert ev.reuse_ratio == pytest.approx(1.0)
+        assert ev.slot_owner_session == "sess-a"
+        assert ev.residency_source == "measured"
+        assert ev.session == "sess-a"
+
+    def test_parser_treats_none_as_unknown_not_zero(self):
+        ev = log_parser.parse_log_line(self.NO_SLOT)
+        assert ev.n_past_actual is None
+        assert ev.reuse_ratio is None
+        assert ev.residency_source == "non_resident"
+        assert ev.decision == "resident_prefix_insufficient"
+
+    def test_tenant_limit_fields_parsed(self):
+        ev = log_parser.parse_log_line(self.TENANT)
+        assert ev.decision == "tenant_limit"
+        assert ev.tenant_limit == 2
+        assert ev.tenant_occupants == 2
+
+    def test_eviction_event_parsed(self):
+        ev = log_parser.parse_log_line(self.EVICTION)
+        assert ev.kind == "local_eviction"
+        assert ev.reason == "tenancy_lease_expired"
+        assert ev.slot_id == 1
+        assert ev.snapshot_planned is True
+        assert ev.session == "sess-a"
+
+    def test_aggregation_collects_residency_and_evictions(self):
+        res = self._summary()
+        assert len(res.residency_events) == 4
+        assert len(res.eviction_events) == 1
+
+    def test_report_splits_resident_and_evicted_reuse(self):
+        md = reporting.build_report(self._summary(), None)
+        section = self._section(md)
+
+        assert "Resident (admitted)" in section
+        assert "Evicted (denied)" in section
+        resident_row = next(
+            ln for ln in section.splitlines() if ln.startswith("| Resident")
+        )
+        evicted_row = next(
+            ln for ln in section.splitlines() if ln.startswith("| Evicted")
+        )
+        # One resident decision at 100 % reuse, one *measured* eviction at
+        # 1.5 % (the no-slot denial carries no ratio and is reported on its own
+        # bullet line instead of being priced as a 0 % measurement).
+        assert "| 1 |" in resident_row
+        assert "100.0%" in resident_row
+        assert "| 1 |" in evicted_row
+        assert "1.5%" in evicted_row
+        assert "**1** with no slot at all" in section
+
+    def test_report_reports_slot_owner_churn(self):
+        md = reporting.build_report(self._summary(), None)
+        section = self._section(md)
+
+        assert "slot churn" in section
+        # sess-a's slot owner changed between decisions (sess-a → sess-b).
+        churn_rows = [ln for ln in section.splitlines() if ln.startswith("| sess-")]
+        assert any("sess-a" in row or "sess" in row for row in churn_rows)
+        assert any("sess-b" in row for row in churn_rows)
+
+    def test_report_lists_evictions_by_reason(self):
+        md = reporting.build_report(self._summary(), None)
+        section = self._section(md)
+
+        assert "tenancy_lease_expired" in section
+        assert "Snapshot saved" in section
+
+    def test_section_absent_without_residency_events(self):
+        summary = aggregation.aggregate(
+            _events([fixtures.STREAM_STARTED_LOCAL, fixtures.STREAM_FINISHED_LOCAL]),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+        md = reporting.build_report(summary, None)
+        assert "## Residency-aware admission" not in md

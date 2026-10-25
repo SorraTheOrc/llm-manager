@@ -2587,6 +2587,55 @@ def _evaluate_local_tenancy(
         return None
 
 
+def _log_residency_decision(
+    *,
+    session_id: str | None,
+    estimated_tokens: int,
+    decision: str,
+    model_name: str | None = None,
+    facts=None,
+    min_ratio: float | None = None,
+    tenancy=None,
+) -> None:
+    """Emit the residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5).
+
+    One structured ``routing_resident_prefix`` line per admission decision, at
+    the same INFO level as ``routing_skip_local`` / ``routing_hop`` so the
+    operator can see, per decision, the *measured* reusable prefix and which
+    session owned the slot — residency regressions become visible without
+    forensics. Consumed by ``proxy-usage-analysis`` (resident-vs-evicted reuse
+    split and per-session slot-owner churn).
+
+    Never raises: logging must not become an admission failure mode.
+    """
+    try:
+        n_past = getattr(facts, "n_past_actual", None)
+        reuse = getattr(facts, "reuse_ratio", None)
+        owner = getattr(facts, "slot_owner_session", None)
+        source = getattr(facts, "source", "none")
+        occupants = len(getattr(tenancy, "occupants", ()) or ())
+        tenant_limit = getattr(tenancy, "tenant_limit", None)
+        logger.info(
+            "routing_resident_prefix provider=local model=%s decision=%s "
+            "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
+            "slot_owner_session=%s residency_source=%s min_ratio=%s "
+            "tenants=%s occupants=%d session=%s",
+            model_name or "unknown",
+            decision,
+            n_past if n_past is not None else "none",
+            int(estimated_tokens),
+            f"{reuse:.4f}" if isinstance(reuse, (int, float)) else "none",
+            owner or "none",
+            source or "none",
+            f"{min_ratio:.2f}" if isinstance(min_ratio, (int, float)) else "none",
+            tenant_limit if tenant_limit is not None else "none",
+            occupants,
+            session_id or "unknown",
+        )
+    except Exception:
+        pass
+
+
 def _should_skip_local(
     model_name: str,
     session_id: str | None,
@@ -2717,8 +2766,24 @@ def _should_skip_local(
         elif not facts.resident:
             # Fresh view, no slot of its own: the resident prefix is measured
             # at zero, so no prediction can make this prompt cheap.
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=SKIP_REASON_RESIDENT_PREFIX,
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
             return (True, SKIP_REASON_RESIDENT_PREFIX)
         elif facts.reuse_ratio < resident_prefix_min_ratio:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=SKIP_REASON_RESIDENT_PREFIX,
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
             return (True, SKIP_REASON_RESIDENT_PREFIX)
 
     # Check 3: session tenancy bound (AC2). At most ``session_tenants``
@@ -2734,6 +2799,15 @@ def _should_skip_local(
             idle_seconds=tenancy_idle_seconds,
         )
         if tenancy is not None and not tenancy.admitted:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision=SKIP_REASON_TENANT_LIMIT,
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio or None,
+                tenancy=tenancy,
+            )
             return (True, SKIP_REASON_TENANT_LIMIT)
 
     # Check 4: live-prefix pricing (AC3) when a residency measurement exists.
@@ -2744,11 +2818,35 @@ def _should_skip_local(
             else estimated_tokens
         )
         if max(0, estimated_tokens - reusable) <= cold_cache_threshold:
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision="admit",
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
             return (False, None)
         if economic_bypass_serves_local:
             # Cheap mode still recovers the *economic* miss locally; the
             # contention queue (if enabled) waits for a slot.
+            _log_residency_decision(
+                session_id=session_id,
+                estimated_tokens=estimated_tokens,
+                decision="admit",
+                model_name=model_name,
+                facts=facts,
+                min_ratio=resident_prefix_min_ratio,
+            )
             return (False, None)
+        _log_residency_decision(
+            session_id=session_id,
+            estimated_tokens=estimated_tokens,
+            decision="large_context_bypass",
+            model_name=model_name,
+            facts=facts,
+            min_ratio=resident_prefix_min_ratio,
+        )
         return (True, "large_context_bypass")
 
     # Check 5: Dynamic new-token calculation (predicted ratio).

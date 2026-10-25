@@ -305,6 +305,16 @@ class AnalysisResult:
     # cold-cache bypass that was overridden because the GPU had been idle for
     # at least ``threshold_seconds`` (``idle_seconds`` = measured idle age).
     idle_admit_events: list[LogEvent] = field(default_factory=list)
+    # Residency-aware admission decisions (LP-0MVN1IQTF0037WTG AC5): one event
+    # per decision with the *measured* reusable prefix (``n_past_actual``), the
+    # request estimate, the resulting ``reuse_ratio``, the slot owner at
+    # decision time and whether the ratio came from the live measurement, from
+    # slot ownership, or was unavailable.
+    residency_events: list[LogEvent] = field(default_factory=list)
+    # Post-acceptance eviction events (LP-0MVN1IQTF0037WTG AC6): a resident
+    # session's lease/slot was reclaimed, with the closed ``reason`` vocabulary
+    # and whether its KV snapshot was persisted for the returning client.
+    eviction_events: list[LogEvent] = field(default_factory=list)
     # Parsed error events (stream errors, slot_save failures, backend_retry
     # timeouts, upstream HTTP errors) inside the window.
     error_events: list[LogEvent] = field(default_factory=list)
@@ -1592,6 +1602,8 @@ def aggregate(
     contention_fallback_events: list[LogEvent] = []
     local_admission_events: list[LogEvent] = []
     idle_admit_events: list[LogEvent] = []
+    residency_events: list[LogEvent] = []
+    eviction_events: list[LogEvent] = []
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
@@ -1755,6 +1767,12 @@ def aggregate(
         if ev.kind == "idle_admit":
             idle_admit_events.append(ev)
             continue
+        if ev.kind == "residency_decision":
+            residency_events.append(ev)
+            continue
+        if ev.kind == "local_eviction":
+            eviction_events.append(ev)
+            continue
         if ev.kind in ("compaction_event", "compaction_backstop", "compaction_churn"):
             compaction_events.append(ev)
             continue
@@ -1819,6 +1837,8 @@ def aggregate(
         contention_fallback_events=contention_fallback_events,
         local_admission_events=local_admission_events,
         idle_admit_events=idle_admit_events,
+        residency_events=residency_events,
+        eviction_events=eviction_events,
         compaction_events=compaction_events,
         busy=busy,
         hourly_activity=hourly_activity,

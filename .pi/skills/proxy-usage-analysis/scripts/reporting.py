@@ -466,6 +466,11 @@ def build_report(
     # reads together and its `% of skips` column is comparable.
     _append_provider_context_skip_section(ap, summary, schedule, mode_map)
 
+    # Residency-aware admission (LP-0MVN1IQTF0037WTG AC5): resident-vs-evicted
+    # reuse split and per-session slot-owner churn, immediately after the skip
+    # evidence they explain.
+    _append_residency_section(ap, summary)
+
     # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3): surfaced
     # separately so a stuck hold is not read as repeated client retries.
     _append_hold_cycle_section(ap, summary)
@@ -1085,6 +1090,138 @@ def _append_provider_context_skip_section(
         ap(f"| {provider} | {types} | {count} | {_pct(count, total_skips):.1f}% | "
            f"{fast} ({_pct(fast, fast_total):.1f}%) | "
            f"{cheap} ({_pct(cheap, cheap_total):.1f}%) | {ceiling} |")
+
+
+def _append_residency_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Residency-aware admission`` section to the report.
+
+    LP-0MVN1IQTF0037WTG AC5. Two questions the pre-change report could not
+    answer:
+
+    - **Resident vs evicted reuse.** `routing_resident_prefix` lines carry the
+      *measured* reusable prefix (`n_past_actual`) next to the request estimate
+      (`estimated_tokens`), so admission can be split into genuinely resident
+      work (ratio at/above the configured threshold) versus evicted work (the
+      session held no slot, or held one whose prefix had been replaced). The
+      2026-10-24 baseline — median reuse 15.6 % for prompts >20k tokens — is
+      exactly this split, and it is invisible in the predicted
+      `cached_ratio` figures.
+    - **Slot-owner churn.** Which sessions owned the slot at decision time.
+      A session whose `slot_owner_session` changes between decisions lost its
+      resident prefix to another tenant; counting distinct owners per session
+      per hour is the churn signal behind the 27-sessions-through-2-slots
+      observation.
+
+    Also lists post-acceptance evictions (`local_eviction`) by reason so a
+    regression in reclaim behaviour (dead sessions gating the pool) shows up
+    as data rather than as a client-visible stall.
+    """
+    residency_events = list(getattr(summary, "residency_events", []) or [])
+    eviction_events = list(getattr(summary, "eviction_events", []) or [])
+    if not residency_events and not eviction_events:
+        return
+
+    measured = [ev for ev in residency_events if ev.reuse_ratio is not None]
+    resident = [ev for ev in measured if ev.decision == "admit"]
+    evicted = [
+        ev
+        for ev in measured
+        if ev.decision == "resident_prefix_insufficient"
+    ]
+    no_slot = [
+        ev
+        for ev in residency_events
+        if ev.reuse_ratio is None
+        and ev.decision == "resident_prefix_insufficient"
+    ]
+    tenant_denials = [ev for ev in residency_events if ev.decision == "tenant_limit"]
+
+    ap("")
+    ap("## Residency-aware admission")
+    ap("")
+    ap("`routing_resident_prefix` decisions carry the **measured** reusable "
+       "prefix (`n_past_actual`) next to the request estimate, so resident and "
+       "evicted reuse are separable — the predicted `cached_ratio` cannot do "
+       "this under contention.")
+    ap("")
+    ap(f"- Residency decisions: **{len(residency_events)}** "
+       f"(measured ratio: {len(measured)}, no measurement: "
+       f"{len(residency_events) - len(measured)})")
+    ap(f"- Resident admissions (ratio at/above threshold): **{len(resident)}**")
+    ap(f"- Evicted denials (`resident_prefix_insufficient`): **{len(evicted)}** "
+       f"with a measured prefix, **{len(no_slot)}** with no slot at all")
+    ap(f"- Tenant-limit denials (`tenant_limit`): **{len(tenant_denials)}**")
+    if eviction_events:
+        ap(f"- Post-acceptance evictions (`local_eviction`): "
+           f"**{len(eviction_events)}**")
+
+    if measured:
+        def _ratio_stats(events) -> str:
+            ratios = sorted(ev.reuse_ratio for ev in events)
+            if not ratios:
+                return "none"
+            return (
+                f"median {_percentile(ratios, 50) * 100:.1f}%, "
+                f"p10 {_percentile(ratios, 10) * 100:.1f}%, "
+                f"max {ratios[-1] * 100:.1f}%"
+            )
+
+        ap("")
+        ap("| Class | Decisions | Reuse ratio | Est. prompt tokens | Median new tokens |")
+        ap("|---|---|---|---|---|")
+        for label, events in (("Resident (admitted)", resident), ("Evicted (denied)", evicted)):
+            if not events:
+                continue
+            estimates = [
+                ev.estimated_tokens for ev in events if ev.estimated_tokens
+            ]
+            new_tokens = sorted(max(0, ev.estimated_tokens - ev.n_past_actual)
+                                for ev in events
+                                if ev.estimated_tokens and ev.n_past_actual is not None)
+            ap(f"| {label} | {len(events)} | {_ratio_stats(events)} | "
+               f"{int(_percentile(estimates, 50)) if estimates else '-'} | "
+               f"{int(_percentile(new_tokens, 50)) if new_tokens else '-'} |")
+
+    # Slot-owner churn per session: distinct owners seen across decisions.
+    owners_by_session: dict[str, set] = {}
+    decisions_by_session: Counter = Counter()
+    for ev in residency_events:
+        if not ev.session:
+            continue
+        decisions_by_session[ev.session] += 1
+        if ev.slot_owner_session and ev.slot_owner_session != "none":
+            owners_by_session.setdefault(ev.session, set()).add(ev.slot_owner_session)
+    churned = {
+        session: owners
+        for session, owners in owners_by_session.items()
+        if len(owners) > 1
+    }
+    ap("")
+    ap(f"- Sessions whose slot owner changed between decisions "
+       f"(slot churn): **{len(churned)}** of "
+       f"{len(decisions_by_session)} session(s) making residency decisions")
+    if churned:
+        ap("")
+        ap("| Session | Decisions | Slot owners seen |")
+        ap("|---|---|---|")
+        for session, owners in sorted(
+            churned.items(), key=lambda kv: -len(kv[1])
+        )[:10]:
+            names = ", ".join(sorted(owners)[:5])
+            if len(owners) > 5:
+                names += f", … (+{len(owners) - 5})"
+            ap(f"| {session[:8]} | {decisions_by_session[session]} | {names} |")
+
+    if eviction_events:
+        reasons = Counter(ev.reason or UNKNOWN_LABEL for ev in eviction_events)
+        snapshots = sum(1 for ev in eviction_events if ev.snapshot_planned)
+        ap("")
+        ap("| Eviction reason | Count | Share | Snapshot saved |")
+        ap("|---|---|---|---|")
+        for reason, count in reasons.most_common():
+            ap(f"| {reason} | {count} | "
+               f"{_pct(count, len(eviction_events)):.1f}% | "
+               f"{snapshots} |")
 
 
 def _append_hold_cycle_section(ap, summary: AnalysisResult) -> None:
@@ -2176,6 +2313,26 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J AC3): economic
         # bypasses served locally because the GPU was idle.
         "local_idle_admit": len(getattr(summary, "idle_admit_events", []) or []),
+        # Residency-aware admission (LP-0MVN1IQTF0037WTG AC5): admission
+        # decisions carrying a measured reusable prefix, split by verdict, plus
+        # post-acceptance evictions by reason.
+        "residency_decisions": len(getattr(summary, "residency_events", []) or []),
+        "residency_resident_admits": sum(
+            1
+            for e in getattr(summary, "residency_events", []) or []
+            if getattr(e, "decision", None) == "admit"
+        ),
+        "residency_evicted_denials": sum(
+            1
+            for e in getattr(summary, "residency_events", []) or []
+            if getattr(e, "decision", None) == "resident_prefix_insufficient"
+        ),
+        "residency_tenant_limit_denials": sum(
+            1
+            for e in getattr(summary, "residency_events", []) or []
+            if getattr(e, "decision", None) == "tenant_limit"
+        ),
+        "local_evictions": len(getattr(summary, "eviction_events", []) or []),
         "contention_queued_duration_seconds": round(
             sum(float(e.queued_duration or 0.0) for e in summary.contention_dispatch_events)
             + sum(float(e.queued_duration or 0.0) for e in summary.contention_fallback_events),

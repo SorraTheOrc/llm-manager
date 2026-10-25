@@ -142,6 +142,10 @@ def main(argv: list[str] | None = None) -> int:
             f"{data.get('local_admission_reject', 0)} local-admission-refused "
             f"(prefill ETA), "
             f"{data.get('local_idle_admit', 0)} idle-admitted-local, "
+            f"{data.get('residency_resident_admits', 0)} resident-prefix admits "
+            f"/ {data.get('residency_evicted_denials', 0)} evicted denials "
+            f"({data.get('residency_tenant_limit_denials', 0)} tenant-limit, "
+            f"{data.get('local_evictions', 0)} evictions), "
             f"{errors} error event(s){decode_summary}{busy_summary}."
         )
         output_lines = _summary_output_paths(out_dir)

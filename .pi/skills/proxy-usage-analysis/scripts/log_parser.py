@@ -164,6 +164,23 @@ RE_LOCAL_ADMISSION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
 RE_ROUTING_IDLE_SECONDS = re.compile(r"\bidle_seconds=([\d.]+)")
 RE_IDLE_ADMIT_THRESHOLD = re.compile(r"\bthreshold_seconds=([\d.]+)")
 
+# Residency-aware admission + eviction evidence (LP-0MVN1IQTF0037WTG AC5).
+# ``none`` is a *meaningful* value for ``n_past_actual`` / ``reuse_ratio`` /
+# ``slot_owner_session`` (measurement unavailable, or the session owns no
+# slot), so it parses to ``None`` and is never read as zero.
+RE_RESIDENCY_DECISION = re.compile(
+    r"\bdecision=([A-Za-z_]+)"
+)
+RE_N_PAST_ACTUAL = re.compile(r"\bn_past_actual=(\d+|none)\b")
+RE_REUSE_RATIO = re.compile(r"\breuse_ratio=([\d.]+|none)\b")
+RE_SLOT_OWNER_SESSION = re.compile(r"\bslot_owner_session=(\S+)")
+RE_RESIDENCY_SOURCE = re.compile(r"\bresidency_source=([A-Za-z_]+)")
+RE_TENANT_LIMIT = re.compile(r"\btenants=(\d+|none)\b")
+RE_TENANT_OCCUPANTS = re.compile(r"\boccupants=(\d+)")
+RE_EVICTION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
+RE_SLOT_ID = re.compile(r"\bslot=(\d+|none)\b")
+RE_SNAPSHOT_PLANNED = re.compile(r"\bsnapshot_planned=(true|false|unknown)\b")
+
 # Enriched error payload on ``Stream finished: reason=error`` (LP-0MT6322OT00900OX).
 # The proxy now logs ``error_type=<type> error_message=<msg> suggested_action=<act>``
 # before the trailing session/provider/model/entry fields. Messages/actions may
@@ -216,6 +233,21 @@ CONTENTION_DISPATCH = "contention_queue_dispatch"
 CONTENTION_FALLBACK_AFTER_QUEUE = "contention_queue_fallback_after_queue"
 LOCAL_ADMISSION_GUARD = "local_admission_guard"
 ROUTING_IDLE_ADMIT = "routing_idle_admit"
+# Residency-aware admission decision (LP-0MVN1IQTF0037WTG AC5): the proxy emits
+# ``routing_resident_prefix provider=local model=... decision=<verdict>
+# n_past_actual=<n|none> estimated_tokens=<n> reuse_ratio=<f|none>
+# slot_owner_session=<id|none> residency_source=<measured|session_slot|
+# non_resident|unknown> min_ratio=<f> tenants=<n> occupants=<n> session=<id>``
+# once per admission decision. ``decision`` is one of ``admit``,
+# ``resident_prefix_insufficient``, ``tenant_limit`` (plus
+# ``large_context_bypass`` for a live-priced cold miss).
+ROUTING_RESIDENT_PREFIX = "routing_resident_prefix"
+# Shared post-acceptance eviction event (LP-0MVN1IQTF0037WTG AC6,
+# LP-0MVN3KMGI009BZ0D AC7): ``local_eviction session=... reason=<vocab>
+# endpoint=... slot=<n|none> slot_owner_session=... tenants=...
+# snapshot_planned=<bool>`` emitted at ERROR level whenever a resident
+# session's lease/slot is reclaimed.
+LOCAL_EVICTION = "local_eviction"
 COMPACTION_EVENT = "compaction_event"
 COMPACTION_BACKSTOP = "compaction_backstop"
 COMPACTION_CHURN = "compaction_churn"
@@ -504,6 +536,24 @@ class LogEvent:
     # ``idle_admit`` events only.
     idle_seconds: str | None = None
     threshold_seconds: str | None = None
+    # Residency-aware admission evidence (LP-0MVN1IQTF0037WTG AC5,
+    # ``residency_decision`` kind): the measured reusable prefix, the request
+    # estimate, the resulting reuse ratio and which session owned the slot at
+    # decision time (``residency_source`` records whether the ratio was
+    # measured, inferred from slot ownership, or absent). ``n_past_actual`` /
+    # ``reuse_ratio`` / ``slot_owner_session`` are ``None`` when the line
+    # reports ``none`` — never coerced to zero.
+    n_past_actual: int | None = None
+    reuse_ratio: float | None = None
+    slot_owner_session: str | None = None
+    residency_source: str | None = None
+    tenant_limit: int | None = None
+    tenant_occupants: int | None = None
+    # Eviction evidence (LP-0MVN1IQTF0037WTG AC6, ``local_eviction`` kind): the
+    # reclaimed slot, whether the evicted session's KV snapshot was planned,
+    # and the closed reason vocabulary in ``reason``.
+    slot_id: int | None = None
+    snapshot_planned: bool | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -808,6 +858,77 @@ def parse_log_line(line: str) -> LogEvent | None:
             enforced=_first(RE_LOCAL_ADMISSION_ENFORCED, msg),
             eta_prefill_s=_first(RE_LOCAL_ADMISSION_ETA, msg),
             budget_s=_first(RE_LOCAL_ADMISSION_BUDGET, msg),
+        )
+    if msg.startswith(ROUTING_RESIDENT_PREFIX):
+        # "routing_resident_prefix provider=local model=Qwen3 decision=admit
+        #  n_past_actual=49103 estimated_tokens=49103 reuse_ratio=1.0000
+        #  slot_owner_session=<id> residency_source=measured min_ratio=0.50
+        #  tenants=2 occupants=1 session=<id>"
+        decision = _first(RE_RESIDENCY_DECISION, msg)
+        if decision is None:
+            return None
+        raw_n_past = _first(RE_N_PAST_ACTUAL, msg)
+        raw_ratio = _first(RE_REUSE_RATIO, msg)
+        owner = _first(RE_SLOT_OWNER_SESSION, msg)
+        return LogEvent(
+            "residency_decision",
+            ts,
+            provider=_first(RE_PROVIDER, msg),
+            model=_first(RE_MODEL, msg),
+            session=_session_from(msg),
+            decision=decision,
+            estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
+            n_past_actual=(
+                int(raw_n_past) if raw_n_past and raw_n_past != "none" else None
+            ),
+            reuse_ratio=(
+                float(raw_ratio) if raw_ratio and raw_ratio != "none" else None
+            ),
+            slot_owner_session=None if not owner or owner == "none" else owner,
+            residency_source=_first(RE_RESIDENCY_SOURCE, msg),
+            tenant_limit=(
+                int(_first(RE_TENANT_LIMIT, msg))
+                if _first(RE_TENANT_LIMIT, msg)
+                and _first(RE_TENANT_LIMIT, msg) != "none"
+                else None
+            ),
+            tenant_occupants=(
+                int(_first(RE_TENANT_OCCUPANTS, msg))
+                if _first(RE_TENANT_OCCUPANTS, msg)
+                else None
+            ),
+        )
+    if msg.startswith(LOCAL_EVICTION):
+        # "local_eviction session=<id> reason=lease_evicted endpoint=default
+        #  slot=1 slot_owner_session=<id> tenants=2 snapshot_planned=true"
+        reason = _first(RE_EVICTION_REASON, msg)
+        if reason is None:
+            return None
+        raw_slot = _first(RE_SLOT_ID, msg)
+        raw_planned = _first(RE_SNAPSHOT_PLANNED, msg)
+        return LogEvent(
+            "local_eviction",
+            ts,
+            session=_session_from(msg),
+            reason=reason,
+            slot_id=int(raw_slot) if raw_slot and raw_slot != "none" else None,
+            slot_owner_session=(
+                None
+                if not _first(RE_SLOT_OWNER_SESSION, msg)
+                or _first(RE_SLOT_OWNER_SESSION, msg) == "none"
+                else _first(RE_SLOT_OWNER_SESSION, msg)
+            ),
+            tenant_limit=(
+                int(_first(RE_TENANT_LIMIT, msg))
+                if _first(RE_TENANT_LIMIT, msg)
+                and _first(RE_TENANT_LIMIT, msg) != "none"
+                else None
+            ),
+            snapshot_planned=(
+                None
+                if raw_planned in (None, "unknown")
+                else raw_planned == "true"
+            ),
         )
     if msg.startswith(MODE_SWITCH_PREFIX):
         # "Mode scheduler: applied scheduled mode cheap" — the mode that the
