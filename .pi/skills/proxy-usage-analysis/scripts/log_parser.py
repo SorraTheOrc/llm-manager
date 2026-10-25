@@ -247,7 +247,25 @@ ROUTING_RESIDENT_PREFIX = "routing_resident_prefix"
 # endpoint=... slot=<n|none> slot_owner_session=... tenants=...
 # snapshot_planned=<bool>`` emitted at ERROR level whenever a resident
 # session's lease/slot is reclaimed.
+#: A committed `local_eviction` line as emitted by `_record_local_eviction`
+#: (used to distinguish it from the after-acceptance event below, which shares
+#: the prefix but is its OWN kind).
 LOCAL_EVICTION = "local_eviction"
+# Post-acceptance eviction (LP-0MVN4LCED00661MX, parent AC7): the proxy emits
+# ``local_eviction_after_acceptance session=<id> reason=<vocab>
+# estimated_tokens=<n> new_tokens=<n> eta_prefill_s=<f|unknown>
+# elapsed_s=<f> slot_id=<n|unknown> llama_task_id=<id|unknown> endpoint=<...>``
+# at ERROR level when an ACCEPTED local dispatch is released before producing a
+# first byte. It shares the `local_eviction` prefix, so it must be matched
+# explicitly and classified as its own kind — never folded into the
+# `local_eviction` tenancy event (different fields, different meaning).
+LOCAL_EVICTION_AFTER_ACCEPTANCE = "local_eviction_after_acceptance"
+RE_EVICTION_AA_ESTIMATED = re.compile(r"\bestimated_tokens=(\d+)")
+RE_EVICTION_AA_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
+RE_EVICTION_AA_ETA = re.compile(r"\beta_prefill_s=([\d.]+|unknown)")
+RE_EVICTION_AA_ELAPSED = re.compile(r"\belapsed_s=([\d.]+)")
+RE_EVICTION_AA_SLOT_ID = re.compile(r"\bslot_id=(\d+|unknown)")
+RE_EVICTION_AA_TASK_ID = re.compile(r"\bllama_task_id=(\S+)")
 COMPACTION_EVENT = "compaction_event"
 COMPACTION_BACKSTOP = "compaction_backstop"
 COMPACTION_CHURN = "compaction_churn"
@@ -554,6 +572,14 @@ class LogEvent:
     # and the closed reason vocabulary in ``reason``.
     slot_id: int | None = None
     snapshot_planned: bool | None = None
+    # Post-acceptance eviction evidence (LP-0MVN4LCED00661MX, parent AC7).
+    # ``eta_prefill_seconds``/``elapsed_seconds`` are floats with a distinct
+    # name from the admission guard's string-valued ``eta_prefill_s`` so the
+    # two events can never be conflated.
+    new_tokens: int | None = None
+    eta_prefill_seconds: float | None = None
+    elapsed_seconds: float | None = None
+    llama_task_id: str | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -896,6 +922,39 @@ def parse_log_line(line: str) -> LogEvent | None:
                 int(_first(RE_TENANT_OCCUPANTS, msg))
                 if _first(RE_TENANT_OCCUPANTS, msg)
                 else None
+            ),
+        )
+    if msg.startswith(LOCAL_EVICTION_AFTER_ACCEPTANCE):
+        # "local_eviction_after_acceptance session=<id> reason=prefill_deadline
+        #  estimated_tokens=40000 new_tokens=40000 eta_prefill_s=148.1
+        #  elapsed_s=92.4 slot_id=1 llama_task_id=unknown endpoint=default"
+        # A missing reason makes the line unparseable (the whole point of the
+        # event is its cause), so it is skipped rather than guessed.
+        reason = _first(RE_EVICTION_REASON, msg)
+        if reason is None:
+            return None
+        raw_eta = _first(RE_EVICTION_AA_ETA, msg)
+        raw_slot_id = _first(RE_EVICTION_AA_SLOT_ID, msg)
+        raw_task_id = _first(RE_EVICTION_AA_TASK_ID, msg)
+        raw_elapsed = _first(RE_EVICTION_AA_ELAPSED, msg)
+        return LogEvent(
+            LOCAL_EVICTION_AFTER_ACCEPTANCE,
+            ts,
+            session=_session_from(msg),
+            reason=reason,
+            slot_id=(
+                int(raw_slot_id)
+                if raw_slot_id and raw_slot_id != "unknown"
+                else None
+            ),
+            estimated_tokens=_int(RE_EVICTION_AA_ESTIMATED, msg),
+            new_tokens=_int(RE_EVICTION_AA_NEW_TOKENS, msg),
+            eta_prefill_seconds=(
+                float(raw_eta) if raw_eta and raw_eta != "unknown" else None
+            ),
+            elapsed_seconds=float(raw_elapsed) if raw_elapsed else None,
+            llama_task_id=(
+                None if not raw_task_id or raw_task_id == "unknown" else raw_task_id
             ),
         )
     if msg.startswith(LOCAL_EVICTION):

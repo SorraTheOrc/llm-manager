@@ -77,6 +77,43 @@ figures as `provider_context_skips`.
 See [REFERENCE.md](REFERENCE.md#outputs) for the full schema of each
 artifact and the archival behaviour.
 
+## Post-acceptance evictions (alert threshold + triage rule)
+
+`local_eviction_after_acceptance` (parent AC7, LP-0MVN4LCQJ0034S5S) is an
+**ERROR** the proxy emits when an *accepted* local dispatch (admitted, dispatch
+record created) is released **before producing a first byte** — cancelled by
+the prefill deadline, the no-progress watchdog, an idle timeout, the orphan
+sweep, a lease reclaim or a slot-assignment free.
+
+The report prints the count with a per-reason breakdown, and the `--json`
+summary exposes it as `local_evictions_after_acceptance` (total) plus
+`local_evictions_after_acceptance_by_reason` (all six reasons are
+addressable). Both keys are additive; no existing key changed.
+
+**Alert threshold: `> 0`.** For a prompt inside the configured cold-prefill
+budget, *any* such event is an alert — not a trend to watch. It means the
+budget/pricing model admitted a dispatch the GPU could not serve, which is
+exactly the failure the budget exists to prevent (baseline: 125 deadline
+cancellations and ~779k discarded prefill tokens in the 2026-10-24 18:38–23:47
+window).
+
+**Triage rule.** Any `local_eviction_after_acceptance` for a within-budget
+prompt is treated as a **defect** and filed as a **critical `test-failure`-class
+work item** through the triage path:
+
+```bash
+python3 $(skill_path triage)/scripts/check_or_create.py \
+  '{"test_name": "local_eviction_after_acceptance:<reason>",
+    "stdout_excerpt": "<the ERROR line>",
+    "stack_trace": "", "parent_work_item_id": "<current work item>"}'
+```
+
+Do not dismiss the event as churn: a lease expiring *after* a served response
+is normal and is not reported (classification is by the dispatch record's
+`first_byte_seen` flag), so everything that does appear here is unserved work.
+If the events cluster in one prompt band, the band's calibrated rate is wrong —
+re-measure before changing the budget.
+
 ## Further reference
 
 Report interpretation, root-cause taxonomy, implementation notes, and

@@ -1118,7 +1118,10 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
     """
     residency_events = list(getattr(summary, "residency_events", []) or [])
     eviction_events = list(getattr(summary, "eviction_events", []) or [])
-    if not residency_events and not eviction_events:
+    after_acceptance = list(
+        getattr(summary, "eviction_after_acceptance_events", []) or []
+    )
+    if not residency_events and not eviction_events and not after_acceptance:
         return
 
     measured = [ev for ev in residency_events if ev.reuse_ratio is not None]
@@ -1211,6 +1214,27 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
             if len(owners) > 5:
                 names += f", … (+{len(owners) - 5})"
             ap(f"| {session[:8]} | {decisions_by_session[session]} | {names} |")
+
+    if after_acceptance:
+        # LP-0MVN4LCQJ0034S5S AC3: the counter, its per-reason breakdown and
+        # the alert threshold, inline. This is a defect signal — any count for
+        # within-budget prompts is an alert, not a trend to watch.
+        by_reason = Counter(ev.reason or UNKNOWN_LABEL for ev in after_acceptance)
+        ap("")
+        ap(f"- **Post-acceptance evictions, ERROR "
+           f"(`local_eviction_after_acceptance`): "
+           f"{len(after_acceptance)}**")
+        ap("  | Reason | Count | Share |")
+        ap("  |---|---|---|")
+        for reason, count in by_reason.most_common():
+            ap(f"  | {reason} | {count} | "
+               f"{_pct(count, len(after_acceptance)):.1f}% |")
+        ap("")
+        ap("  **Alert threshold: >0.** An accepted local dispatch evicted before "
+           "its first byte is a defect in the budget/pricing model for that "
+           "prompt band — file a critical `test-failure` work item via the "
+           "triage path (see the skill's triage rule), do not treat it as "
+           "expected churn.")
 
     if eviction_events:
         reasons = Counter(ev.reason or UNKNOWN_LABEL for ev in eviction_events)
@@ -2333,6 +2357,20 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
             if getattr(e, "decision", None) == "tenant_limit"
         ),
         "local_evictions": len(getattr(summary, "eviction_events", []) or []),
+        # Parent AC7(a), LP-0MVN4LCQJ0034S5S AC2: accepted dispatches evicted
+        # before their first byte. Both keys are ADDITIVE — nothing above
+        # changes meaning or value.
+        "local_evictions_after_acceptance": len(
+            getattr(summary, "eviction_after_acceptance_events", []) or []
+        ),
+        "local_evictions_after_acceptance_by_reason": dict(
+            Counter(
+                ev.reason or UNKNOWN_LABEL
+                for ev in (
+                    getattr(summary, "eviction_after_acceptance_events", []) or []
+                )
+            )
+        ),
         "contention_queued_duration_seconds": round(
             sum(float(e.queued_duration or 0.0) for e in summary.contention_dispatch_events)
             + sum(float(e.queued_duration or 0.0) for e in summary.contention_fallback_events),

@@ -143,3 +143,25 @@ If the issue cannot be resolved at the proxy layer:
   - `status`: `"5xx"` (HTTP status class)
   - `reason`: `"backend_error"`, `"backend_unavailable"`, `"self_healing"`, or `"slot_exhaustion"`
 - **Dashboard**: See `monitoring/grafana_llama_memory_dashboard.json` — "Proxy 5xx Errors (/v1/chat/completions)" panel.
+
+
+## Post-acceptance eviction (`local_eviction_after_acceptance`)
+
+An `ERROR` line `local_eviction_after_acceptance session=… reason=…` means an
+**accepted** local dispatch was released before its first byte (reasons:
+`prefill_deadline`, `no_progress_watchdog`, `idle_timeout`, `orphan_cleanup`,
+`lease_evicted`, `slot_assignment_freed`). It is a defect signal, not churn.
+
+1. Read the line's evidence: `estimated_tokens`, `new_tokens`,
+   `eta_prefill_s`, `elapsed_s`, `slot_id`.
+2. If `new_tokens` is within `server.local_cold_prefill_budget_tokens`, the
+   budget/pricing model is wrong for that prompt band — file a **critical
+   `test-failure`** work item via the triage path (see the
+   `proxy-usage-analysis` skill's triage rule).
+3. Cross-check the 24 h report: `local_evictions_after_acceptance_by_reason`
+   shows whether the events cluster in one reason (a path regression) or in one
+   prompt-size band (a calibration defect).
+4. Rollback if the events are volume-critical: `local_cold_prefill_budget_tokens: 0`,
+   `local_prefill_deadline_seconds: 90`,
+   `local_admission_guard_eta_percentile_min_tokens: 32768`,
+   `local_admission_guard_budget_safety_fraction: 0.0`.

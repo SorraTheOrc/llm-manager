@@ -315,6 +315,10 @@ class AnalysisResult:
     # session's lease/slot was reclaimed, with the closed ``reason`` vocabulary
     # and whether its KV snapshot was persisted for the returning client.
     eviction_events: list[LogEvent] = field(default_factory=list)
+    #: Accepted local dispatches evicted before their first byte
+    #: (``local_eviction_after_acceptance``). A defect signal, not churn:
+    #: LP-0MVN4LCQJ0034S5S / parent AC7(a).
+    eviction_after_acceptance_events: list[LogEvent] = field(default_factory=list)
     # Parsed error events (stream errors, slot_save failures, backend_retry
     # timeouts, upstream HTTP errors) inside the window.
     error_events: list[LogEvent] = field(default_factory=list)
@@ -1604,6 +1608,7 @@ def aggregate(
     idle_admit_events: list[LogEvent] = []
     residency_events: list[LogEvent] = []
     eviction_events: list[LogEvent] = []
+    eviction_after_acceptance_events: list[LogEvent] = []
     compaction_events: list[LogEvent] = []
     # TTFT events (LP-0MTSSM5SO003PKU0)
     ttft_events: list[LogEvent] = []
@@ -1770,6 +1775,12 @@ def aggregate(
         if ev.kind == "residency_decision":
             residency_events.append(ev)
             continue
+        if ev.kind == "local_eviction_after_acceptance":
+            # Must precede nothing else: the parser classifies it as its own
+            # kind (never as ``local_eviction``), so no prefix sharing leaks
+            # these events into the tenancy bucket.
+            eviction_after_acceptance_events.append(ev)
+            continue
         if ev.kind == "local_eviction":
             eviction_events.append(ev)
             continue
@@ -1839,6 +1850,7 @@ def aggregate(
         idle_admit_events=idle_admit_events,
         residency_events=residency_events,
         eviction_events=eviction_events,
+        eviction_after_acceptance_events=eviction_after_acceptance_events,
         compaction_events=compaction_events,
         busy=busy,
         hourly_activity=hourly_activity,
