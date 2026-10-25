@@ -619,6 +619,62 @@ class TestPrometheusRuleValidation:
             "directory, so they must not repeat the 'monitoring/' prefix."
         )
 
+    def test_promtool_loads_every_configured_rule_file(self):
+        """AC 1/4 (LP-0MVO8DO7100309LH): the config *and* all its rule files load.
+
+        `promtool check config` exits 0 even when a `rule_files` entry matches
+        nothing (a glob that resolves to no files is silently skipped), so the
+        exit code alone does not prove the rule paths are right. Assert what
+        promtool actually loaded against what the config lists: the historical
+        bug (rule paths repeating the `monitoring/` prefix) then fails here.
+
+        This is the regression guard for rule-path drift: `rule_files` paths are
+        resolved relative to prometheus.yml's own directory, so they must stay
+        bare filenames rather than being listed once per file with a prefix.
+        """
+        promtool = _promtool()
+        if promtool is None:
+            pytest.skip("promtool not installed")
+        configured = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")["rule_files"]
+        result = subprocess.run(
+            [promtool, "check", "config", str(MONITORING_DIR / "prometheus.yml")],
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+        )
+        assert result.returncode == 0, (
+            "promtool check config failed:\n" f"{result.stdout}\n{result.stderr}"
+        )
+        match = re.search(r"SUCCESS: (\d+) rule files? found", result.stdout)
+        assert match, (
+            "promtool did not report how many rule files it loaded:\n"
+            f"{result.stdout}"
+        )
+        assert int(match.group(1)) == len(configured), (
+            f"promtool loaded {match.group(1)} rule file(s) but prometheus.yml "
+            f"lists {len(configured)} ({configured}); an entry that matches no "
+            f"file is silently skipped, so its alerts would never be evaluated"
+        )
+        unchecked = [rf for rf in configured if rf not in result.stdout]
+        assert not unchecked, (
+            f"promtool never checked {unchecked}; rule_files paths are resolved "
+            f"relative to prometheus.yml's own directory (monitoring/), so they "
+            f"must not repeat the 'monitoring/' prefix"
+        )
+
+    def test_every_rule_file_on_disk_is_loaded(self):
+        """The inverse drift: a rule file present but unloaded can never fire."""
+        loaded = set(assert_valid_yaml(MONITORING_DIR / "prometheus.yml")["rule_files"])
+        unloaded = []
+        for path in sorted(MONITORING_DIR.glob("*.yaml")):
+            data = assert_valid_yaml(path)
+            if isinstance(data, dict) and data.get("groups") and path.name not in loaded:
+                unloaded.append(path.name)
+        assert not unloaded, (
+            f"rule file(s) {unloaded} live in monitoring/ but prometheus.yml does "
+            f"not load them, so their alerts would never be evaluated"
+        )
+
     def test_rule_unit_tests_pass(self):
         """Behavioural tests: threshold semantics, alert firing, duration."""
         promtool = _promtool()
