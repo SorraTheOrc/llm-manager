@@ -1,0 +1,3256 @@
+{
+  "window": {
+    "since": "2026-10-23 22:04:14",
+    "until": "2026-10-24 22:04:14",
+    "log_dir": "/var/log/llama-proxy"
+  },
+  "coverage": {
+    "max_gap_seconds": 3600.0,
+    "files": [
+      {
+        "file": "proxy.log.2026-10-23_234827.gz",
+        "first": "2026-10-23 22:04:16",
+        "last": "2026-10-23 23:48:27",
+        "lines": 30026
+      },
+      {
+        "file": "proxy.log-2026-10-24_00.gz",
+        "first": "2026-10-23 23:48:31",
+        "last": "2026-10-23 23:59:59",
+        "lines": 4063
+      },
+      {
+        "file": "proxy.log.2026-10-24_000838.gz",
+        "first": "2026-10-24 00:00:00",
+        "last": "2026-10-24 00:08:38",
+        "lines": 2039
+      },
+      {
+        "file": "proxy.log.2026-10-24_003357.gz",
+        "first": "2026-10-24 00:08:42",
+        "last": "2026-10-24 00:33:57",
+        "lines": 6664
+      },
+      {
+        "file": "proxy.log.2026-10-24_00.gz",
+        "first": "2026-10-24 00:34:00",
+        "last": "2026-10-24 06:33:56",
+        "lines": 22425
+      },
+      {
+        "file": "proxy.log.2026-10-24_103459.gz",
+        "first": "2026-10-24 06:34:02",
+        "last": "2026-10-24 10:34:59",
+        "lines": 14557
+      },
+      {
+        "file": "proxy.log.2026-10-24_10.gz",
+        "first": "2026-10-24 10:35:06",
+        "last": "2026-10-24 16:35:05",
+        "lines": 135096
+      },
+      {
+        "file": "proxy.log.2026-10-24_173748.gz",
+        "first": "2026-10-24 16:35:06",
+        "last": "2026-10-24 17:37:48",
+        "lines": 18420
+      },
+      {
+        "file": "proxy.log.2026-10-24_17.gz",
+        "first": "2026-10-24 17:37:52",
+        "last": "2026-10-24 22:04:13",
+        "lines": 43524
+      }
+    ],
+    "gaps": [],
+    "window_start_gap_seconds": 2.0,
+    "window_end_gap_seconds": 1.0,
+    "verdict_met": true
+  },
+  "ac1": {
+    "min_attempts": 10,
+    "thrash_hours": [
+      "2026-10-23 23:00:00",
+      "2026-10-24 00:00:00",
+      "2026-10-24 01:00:00",
+      "2026-10-24 03:00:00",
+      "2026-10-24 05:00:00",
+      "2026-10-24 06:00:00",
+      "2026-10-24 07:00:00",
+      "2026-10-24 08:00:00",
+      "2026-10-24 11:00:00",
+      "2026-10-24 13:00:00",
+      "2026-10-24 17:00:00",
+      "2026-10-24 18:00:00",
+      "2026-10-24 19:00:00",
+      "2026-10-24 20:00:00"
+    ],
+    "lease_active_fallbacks": 93,
+    "hours_checked": 25,
+    "verdict_met": false
+  },
+  "ac2": {
+    "recovery_bound_seconds": 300,
+    "pairs": [
+      {
+        "session": "herdr-1792789701-1790904-4522",
+        "deadline": "2026-10-23 22:11:15",
+        "release": "2026-10-23 22:11:15",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789736-1791402-21837",
+        "deadline": "2026-10-23 22:14:35",
+        "release": "2026-10-23 22:14:35",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789736-1791402-21837",
+        "deadline": "2026-10-23 22:16:15",
+        "release": "2026-10-23 22:16:15",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789718-1791190-4678",
+        "deadline": "2026-10-23 22:17:46",
+        "release": "2026-10-23 22:17:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789718-1791190-4678",
+        "deadline": "2026-10-23 22:19:16",
+        "release": "2026-10-23 22:19:16",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789718-1791190-4678",
+        "deadline": "2026-10-23 22:29:31",
+        "release": "2026-10-23 22:29:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789718-1791190-4678",
+        "deadline": "2026-10-23 22:31:01",
+        "release": "2026-10-23 22:31:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789684-1790656-13656",
+        "deadline": "2026-10-23 22:32:31",
+        "release": "2026-10-23 22:32:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789684-1790656-13656",
+        "deadline": "2026-10-23 22:34:02",
+        "release": "2026-10-23 22:34:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789684-1790656-13656",
+        "deadline": "2026-10-23 22:35:32",
+        "release": "2026-10-23 22:35:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789701-1790904-4522",
+        "deadline": "2026-10-23 22:38:14",
+        "release": "2026-10-23 22:38:14",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789701-1790904-4522",
+        "deadline": "2026-10-23 22:39:54",
+        "release": "2026-10-23 22:39:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789701-1790904-4522",
+        "deadline": "2026-10-23 22:41:34",
+        "release": "2026-10-23 22:41:34",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16aa7-45b8-70e5-8e2a-9fae8c908a43",
+        "deadline": "2026-10-23 22:46:08",
+        "release": "2026-10-23 22:46:08",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789718-1791190-4678",
+        "deadline": "2026-10-23 22:47:39",
+        "release": "2026-10-23 22:47:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789718-1791190-4678",
+        "deadline": "2026-10-23 22:49:09",
+        "release": "2026-10-23 22:49:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789718-1791190-4678",
+        "deadline": "2026-10-23 22:50:40",
+        "release": "2026-10-23 22:50:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792789703-1791019-9482",
+        "deadline": "2026-10-23 22:53:31",
+        "release": "2026-10-23 22:53:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792792399-1941354-10152",
+        "deadline": "2026-10-23 22:55:11",
+        "release": "2026-10-23 22:55:11",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792792399-1941354-10152",
+        "deadline": "2026-10-23 22:56:50",
+        "release": "2026-10-23 22:56:50",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792792399-1941354-10152",
+        "deadline": "2026-10-23 22:58:30",
+        "release": "2026-10-23 22:58:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ac1-f136-71cd-8407-a42b5113ac90",
+        "deadline": "2026-10-23 23:01:07",
+        "release": "2026-10-23 23:01:07",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ac1-f136-71cd-8407-a42b5113ac90",
+        "deadline": "2026-10-23 23:02:38",
+        "release": "2026-10-23 23:02:38",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ac1-f136-71cd-8407-a42b5113ac90",
+        "deadline": "2026-10-23 23:04:08",
+        "release": "2026-10-23 23:04:08",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ac7-7eb9-7218-a50e-c74719804f2d",
+        "deadline": "2026-10-23 23:06:40",
+        "release": "2026-10-23 23:06:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ac7-7eb9-7218-a50e-c74719804f2d",
+        "deadline": "2026-10-23 23:08:10",
+        "release": "2026-10-23 23:08:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ac7-7eb9-7218-a50e-c74719804f2d",
+        "deadline": "2026-10-23 23:09:41",
+        "release": "2026-10-23 23:09:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792792493-1944755-20818",
+        "deadline": "2026-10-23 23:12:18",
+        "release": "2026-10-23 23:12:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793521-1958711-9729",
+        "deadline": "2026-10-23 23:13:49",
+        "release": "2026-10-23 23:13:49",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793521-1958711-9729",
+        "deadline": "2026-10-23 23:15:19",
+        "release": "2026-10-23 23:15:19",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793521-1958711-9729",
+        "deadline": "2026-10-23 23:16:49",
+        "release": "2026-10-23 23:16:49",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792792437-1942536-27912",
+        "deadline": "2026-10-23 23:19:20",
+        "release": "2026-10-23 23:19:20",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793914-1974241-8450",
+        "deadline": "2026-10-23 23:20:50",
+        "release": "2026-10-23 23:20:50",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793914-1974241-8450",
+        "deadline": "2026-10-23 23:22:30",
+        "release": "2026-10-23 23:22:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793914-1974241-8450",
+        "deadline": "2026-10-23 23:24:10",
+        "release": "2026-10-23 23:24:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793963-1990741-14898",
+        "deadline": "2026-10-23 23:26:50",
+        "release": "2026-10-23 23:26:50",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793963-1990741-14898",
+        "deadline": "2026-10-23 23:28:30",
+        "release": "2026-10-23 23:28:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793963-1990741-14898",
+        "deadline": "2026-10-23 23:30:09",
+        "release": "2026-10-23 23:30:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792794027-2009924-30854",
+        "deadline": "2026-10-23 23:32:43",
+        "release": "2026-10-23 23:32:43",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-LP-0MVGPEP3O000RKKD-false-positive-screen-a2bbc529",
+        "deadline": "2026-10-23 23:34:13",
+        "release": "2026-10-23 23:34:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-LP-0MVGPEP3O000RKKD-false-positive-screen-a2bbc529",
+        "deadline": "2026-10-23 23:35:43",
+        "release": "2026-10-23 23:35:43",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-LP-0MVGPEP3O000RKKD-false-positive-screen-a2bbc529",
+        "deadline": "2026-10-23 23:37:13",
+        "release": "2026-10-23 23:37:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792794517-1394687-26247",
+        "deadline": "2026-10-23 23:39:44",
+        "release": "2026-10-23 23:39:44",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-LP-0MVGPEP3O000RKKD-phase2_deep-f4a30400",
+        "deadline": "2026-10-23 23:41:14",
+        "release": "2026-10-23 23:41:14",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-LP-0MVGPEP3O000RKKD-phase2_deep-f4a30400",
+        "deadline": "2026-10-23 23:42:44",
+        "release": "2026-10-23 23:42:44",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-LP-0MVGPEP3O000RKKD-phase2_deep-f4a30400",
+        "deadline": "2026-10-23 23:44:15",
+        "release": "2026-10-23 23:44:15",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792793914-1974241-8450",
+        "deadline": "2026-10-23 23:46:56",
+        "release": "2026-10-23 23:46:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-23 23:50:44",
+        "release": "2026-10-23 23:50:44",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-23 23:52:23",
+        "release": "2026-10-23 23:52:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-23 23:54:03",
+        "release": "2026-10-23 23:54:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795996-1400311-19292",
+        "deadline": "2026-10-23 23:55:42",
+        "release": "2026-10-23 23:55:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792796058-1993246-10807",
+        "deadline": "2026-10-23 23:57:12",
+        "release": "2026-10-23 23:57:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792796058-1993246-10807",
+        "deadline": "2026-10-23 23:58:42",
+        "release": "2026-10-23 23:58:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792796058-1993246-10807",
+        "deadline": "2026-10-24 00:00:13",
+        "release": "2026-10-24 00:00:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792796067-1993746-11655",
+        "deadline": "2026-10-24 00:02:48",
+        "release": "2026-10-24 00:02:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792796067-1993746-11655",
+        "deadline": "2026-10-24 00:04:19",
+        "release": "2026-10-24 00:04:19",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792796067-1993746-11655",
+        "deadline": "2026-10-24 00:05:49",
+        "release": "2026-10-24 00:05:49",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795996-1400311-19292",
+        "deadline": "2026-10-24 00:08:36",
+        "release": "2026-10-24 00:08:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16adc-2bdf-73ae-802f-c058c3fbc049",
+        "deadline": "2026-10-24 00:11:24",
+        "release": "2026-10-24 00:11:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16adc-2bdf-73ae-802f-c058c3fbc049",
+        "deadline": "2026-10-24 00:13:06",
+        "release": "2026-10-24 00:13:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16adc-2bdf-73ae-802f-c058c3fbc049",
+        "deadline": "2026-10-24 00:14:44",
+        "release": "2026-10-24 00:14:44",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795996-1400311-19292",
+        "deadline": "2026-10-24 00:17:25",
+        "release": "2026-10-24 00:17:25",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795996-1400311-19292",
+        "deadline": "2026-10-24 00:19:05",
+        "release": "2026-10-24 00:19:05",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795996-1400311-19292",
+        "deadline": "2026-10-24 00:20:46",
+        "release": "2026-10-24 00:20:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792797731-2587028-23066",
+        "deadline": "2026-10-24 00:23:48",
+        "release": "2026-10-24 00:23:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792797732-2587116-2720",
+        "deadline": "2026-10-24 00:25:18",
+        "release": "2026-10-24 00:25:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792797732-2587116-2720",
+        "deadline": "2026-10-24 00:26:48",
+        "release": "2026-10-24 00:26:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792797732-2587116-2720",
+        "deadline": "2026-10-24 00:28:19",
+        "release": "2026-10-24 00:28:19",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b15-e5cd-72f0-aa4c-b1d4cc54891d",
+        "deadline": "2026-10-24 00:30:52",
+        "release": "2026-10-24 00:30:52",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b15-e5cd-72f0-aa4c-b1d4cc54891d",
+        "deadline": "2026-10-24 00:32:22",
+        "release": "2026-10-24 00:32:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b15-e5cd-72f0-aa4c-b1d4cc54891d",
+        "deadline": "2026-10-24 00:33:53",
+        "release": "2026-10-24 00:33:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b1b-f68f-743d-9fff-98ebefd58d04",
+        "deadline": "2026-10-24 00:36:36",
+        "release": "2026-10-24 00:36:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b1b-f68f-743d-9fff-98ebefd58d04",
+        "deadline": "2026-10-24 00:38:18",
+        "release": "2026-10-24 00:38:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b1b-f68f-743d-9fff-98ebefd58d04",
+        "deadline": "2026-10-24 00:39:58",
+        "release": "2026-10-24 00:39:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16adc-2bdf-73ae-802f-c058c3fbc049",
+        "deadline": "2026-10-24 00:42:47",
+        "release": "2026-10-24 00:42:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16adc-2bdf-73ae-802f-c058c3fbc049",
+        "deadline": "2026-10-24 00:44:30",
+        "release": "2026-10-24 00:44:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16adc-2bdf-73ae-802f-c058c3fbc049",
+        "deadline": "2026-10-24 00:46:10",
+        "release": "2026-10-24 00:46:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b15-e5cd-72f0-aa4c-b1d4cc54891d",
+        "deadline": "2026-10-24 00:48:51",
+        "release": "2026-10-24 00:48:51",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b29-b42f-77b6-be68-11f2d4b4aa0c",
+        "deadline": "2026-10-24 00:50:21",
+        "release": "2026-10-24 00:50:21",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b29-b42f-77b6-be68-11f2d4b4aa0c",
+        "deadline": "2026-10-24 00:51:51",
+        "release": "2026-10-24 00:51:51",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b29-b42f-77b6-be68-11f2d4b4aa0c",
+        "deadline": "2026-10-24 00:53:21",
+        "release": "2026-10-24 00:53:21",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b1b-f68f-743d-9fff-98ebefd58d04",
+        "deadline": "2026-10-24 00:56:26",
+        "release": "2026-10-24 00:56:26",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b1b-f68f-743d-9fff-98ebefd58d04",
+        "deadline": "2026-10-24 00:58:04",
+        "release": "2026-10-24 00:58:04",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b1b-f68f-743d-9fff-98ebefd58d04",
+        "deadline": "2026-10-24 00:59:43",
+        "release": "2026-10-24 00:59:43",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b15-e5cd-72f0-aa4c-b1d4cc54891d",
+        "deadline": "2026-10-24 01:03:30",
+        "release": "2026-10-24 01:03:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b15-e5cd-72f0-aa4c-b1d4cc54891d",
+        "deadline": "2026-10-24 01:05:01",
+        "release": "2026-10-24 01:05:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b15-e5cd-72f0-aa4c-b1d4cc54891d",
+        "deadline": "2026-10-24 01:06:31",
+        "release": "2026-10-24 01:06:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b29-b42f-77b6-be68-11f2d4b4aa0c",
+        "deadline": "2026-10-24 01:09:07",
+        "release": "2026-10-24 01:09:07",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b29-b42f-77b6-be68-11f2d4b4aa0c",
+        "deadline": "2026-10-24 01:10:37",
+        "release": "2026-10-24 01:10:37",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b3d-f2ef-7049-9523-b3b8ac3a2b66",
+        "deadline": "2026-10-24 01:12:07",
+        "release": "2026-10-24 01:12:07",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b3d-f2ef-7049-9523-b3b8ac3a2b66",
+        "deadline": "2026-10-24 01:13:37",
+        "release": "2026-10-24 01:13:37",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b3d-f2ef-7049-9523-b3b8ac3a2b66",
+        "deadline": "2026-10-24 01:15:08",
+        "release": "2026-10-24 01:15:08",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b1b-f68f-743d-9fff-98ebefd58d04",
+        "deadline": "2026-10-24 01:17:55",
+        "release": "2026-10-24 01:17:55",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b1b-f68f-743d-9fff-98ebefd58d04",
+        "deadline": "2026-10-24 01:19:35",
+        "release": "2026-10-24 01:19:35",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b1b-f68f-743d-9fff-98ebefd58d04",
+        "deadline": "2026-10-24 01:21:16",
+        "release": "2026-10-24 01:21:16",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b4f-2449-70b1-a2b5-1773cebefdd1",
+        "deadline": "2026-10-24 01:30:01",
+        "release": "2026-10-24 01:30:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b4f-2449-70b1-a2b5-1773cebefdd1",
+        "deadline": "2026-10-24 01:31:32",
+        "release": "2026-10-24 01:31:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b4f-2449-70b1-a2b5-1773cebefdd1",
+        "deadline": "2026-10-24 01:33:02",
+        "release": "2026-10-24 01:33:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b3d-f2ef-7049-9523-b3b8ac3a2b66",
+        "deadline": "2026-10-24 01:36:01",
+        "release": "2026-10-24 01:36:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b3d-f2ef-7049-9523-b3b8ac3a2b66",
+        "deadline": "2026-10-24 01:37:31",
+        "release": "2026-10-24 01:37:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b3d-f2ef-7049-9523-b3b8ac3a2b66",
+        "deadline": "2026-10-24 01:39:02",
+        "release": "2026-10-24 01:39:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 01:42:22",
+        "release": "2026-10-24 01:42:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 01:43:52",
+        "release": "2026-10-24 01:43:52",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 01:45:23",
+        "release": "2026-10-24 01:45:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b4f-2449-70b1-a2b5-1773cebefdd1",
+        "deadline": "2026-10-24 01:47:53",
+        "release": "2026-10-24 01:47:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b4f-2449-70b1-a2b5-1773cebefdd1",
+        "deadline": "2026-10-24 01:49:24",
+        "release": "2026-10-24 01:49:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b4f-2449-70b1-a2b5-1773cebefdd1",
+        "deadline": "2026-10-24 01:50:54",
+        "release": "2026-10-24 01:50:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-24 01:53:36",
+        "release": "2026-10-24 01:53:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-24 01:55:06",
+        "release": "2026-10-24 01:55:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-24 01:56:36",
+        "release": "2026-10-24 01:56:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b73-1c3e-70a0-b6ab-2eba0c7331ff",
+        "deadline": "2026-10-24 02:11:09",
+        "release": "2026-10-24 02:11:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b73-1c3e-70a0-b6ab-2eba0c7331ff",
+        "deadline": "2026-10-24 02:12:40",
+        "release": "2026-10-24 02:12:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b73-1c3e-70a0-b6ab-2eba0c7331ff",
+        "deadline": "2026-10-24 02:14:10",
+        "release": "2026-10-24 02:14:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792792417-1941669-13741",
+        "deadline": "2026-10-24 02:17:35",
+        "release": "2026-10-24 02:17:35",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792792417-1941669-13741",
+        "deadline": "2026-10-24 02:19:06",
+        "release": "2026-10-24 02:19:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792792417-1941669-13741",
+        "deadline": "2026-10-24 02:20:36",
+        "release": "2026-10-24 02:20:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 02:31:41",
+        "release": "2026-10-24 02:31:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 02:33:17",
+        "release": "2026-10-24 02:33:17",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 02:56:29",
+        "release": "2026-10-24 02:56:29",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 02:58:00",
+        "release": "2026-10-24 02:58:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 02:59:30",
+        "release": "2026-10-24 02:59:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 03:11:06",
+        "release": "2026-10-24 03:11:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 03:12:36",
+        "release": "2026-10-24 03:12:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 03:14:07",
+        "release": "2026-10-24 03:14:07",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792794059-2017433-29088",
+        "deadline": "2026-10-24 03:21:29",
+        "release": "2026-10-24 03:21:29",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792794059-2017433-29088",
+        "deadline": "2026-10-24 03:23:00",
+        "release": "2026-10-24 03:23:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792794059-2017433-29088",
+        "deadline": "2026-10-24 03:24:30",
+        "release": "2026-10-24 03:24:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 03:27:02",
+        "release": "2026-10-24 03:27:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 03:28:33",
+        "release": "2026-10-24 03:28:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16b87-98b9-7746-a23f-abdd9ca0be34",
+        "deadline": "2026-10-24 03:30:03",
+        "release": "2026-10-24 03:30:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-24 04:29:30",
+        "release": "2026-10-24 04:29:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-24 04:31:09",
+        "release": "2026-10-24 04:31:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 04:32:49",
+        "release": "2026-10-24 04:32:49",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 04:34:28",
+        "release": "2026-10-24 04:34:28",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 04:36:11",
+        "release": "2026-10-24 04:36:11",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-24 05:36:52",
+        "release": "2026-10-24 05:36:52",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-24 05:38:31",
+        "release": "2026-10-24 05:38:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795739-2282978-1972",
+        "deadline": "2026-10-24 05:40:12",
+        "release": "2026-10-24 05:40:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792794059-2017433-29088",
+        "deadline": "2026-10-24 05:42:56",
+        "release": "2026-10-24 05:42:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792794059-2017433-29088",
+        "deadline": "2026-10-24 05:44:27",
+        "release": "2026-10-24 05:44:27",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792794059-2017433-29088",
+        "deadline": "2026-10-24 05:45:57",
+        "release": "2026-10-24 05:45:57",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c3a-5607-7354-9264-db3c8b4a81d8",
+        "deadline": "2026-10-24 05:47:27",
+        "release": "2026-10-24 05:47:27",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c3b-c81d-7473-b51b-7e9e01ab47fa",
+        "deadline": "2026-10-24 05:48:57",
+        "release": "2026-10-24 05:48:57",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c3b-c81d-7473-b51b-7e9e01ab47fa",
+        "deadline": "2026-10-24 05:50:27",
+        "release": "2026-10-24 05:50:27",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 05:52:08",
+        "release": "2026-10-24 05:52:08",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 05:53:47",
+        "release": "2026-10-24 05:53:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 05:55:29",
+        "release": "2026-10-24 05:55:29",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+        "deadline": "2026-10-24 05:58:31",
+        "release": "2026-10-24 05:58:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+        "deadline": "2026-10-24 06:00:01",
+        "release": "2026-10-24 06:00:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+        "deadline": "2026-10-24 06:01:32",
+        "release": "2026-10-24 06:01:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c4a-19d6-7261-95f3-33e0f3313d9b",
+        "deadline": "2026-10-24 06:04:09",
+        "release": "2026-10-24 06:04:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c4a-19d6-7261-95f3-33e0f3313d9b",
+        "deadline": "2026-10-24 06:05:39",
+        "release": "2026-10-24 06:05:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c4a-19d6-7261-95f3-33e0f3313d9b",
+        "deadline": "2026-10-24 06:07:10",
+        "release": "2026-10-24 06:07:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c3f-4fb6-703e-9fda-ea9ceb188c14",
+        "deadline": "2026-10-24 06:10:16",
+        "release": "2026-10-24 06:10:16",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c3f-4fb6-703e-9fda-ea9ceb188c14",
+        "deadline": "2026-10-24 06:11:47",
+        "release": "2026-10-24 06:11:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c3f-4fb6-703e-9fda-ea9ceb188c14",
+        "deadline": "2026-10-24 06:13:17",
+        "release": "2026-10-24 06:13:17",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c59-8de4-75c6-b1a0-4bcdd0d165ff",
+        "deadline": "2026-10-24 06:21:02",
+        "release": "2026-10-24 06:21:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c59-8de4-75c6-b1a0-4bcdd0d165ff",
+        "deadline": "2026-10-24 06:22:32",
+        "release": "2026-10-24 06:22:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c59-8de4-75c6-b1a0-4bcdd0d165ff",
+        "deadline": "2026-10-24 06:24:03",
+        "release": "2026-10-24 06:24:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c4a-19d6-7261-95f3-33e0f3313d9b",
+        "deadline": "2026-10-24 06:26:39",
+        "release": "2026-10-24 06:26:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c4a-19d6-7261-95f3-33e0f3313d9b",
+        "deadline": "2026-10-24 06:28:10",
+        "release": "2026-10-24 06:28:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c4a-19d6-7261-95f3-33e0f3313d9b",
+        "deadline": "2026-10-24 06:29:40",
+        "release": "2026-10-24 06:29:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+        "deadline": "2026-10-24 06:32:12",
+        "release": "2026-10-24 06:32:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+        "deadline": "2026-10-24 06:33:43",
+        "release": "2026-10-24 06:33:43",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+        "deadline": "2026-10-24 06:35:13",
+        "release": "2026-10-24 06:35:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+        "deadline": "2026-10-24 06:49:18",
+        "release": "2026-10-24 06:49:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+        "deadline": "2026-10-24 06:50:48",
+        "release": "2026-10-24 06:50:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c44-f0e9-75fa-9a08-46729bb844bb",
+        "deadline": "2026-10-24 06:52:19",
+        "release": "2026-10-24 06:52:19",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 06:55:00",
+        "release": "2026-10-24 06:55:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c79-1b7f-73b4-9985-57f285ec1ad8",
+        "deadline": "2026-10-24 06:56:30",
+        "release": "2026-10-24 06:56:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c79-1b7f-73b4-9985-57f285ec1ad8",
+        "deadline": "2026-10-24 06:58:00",
+        "release": "2026-10-24 06:58:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c79-1b7f-73b4-9985-57f285ec1ad8",
+        "deadline": "2026-10-24 06:59:30",
+        "release": "2026-10-24 06:59:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c59-8de4-75c6-b1a0-4bcdd0d165ff",
+        "deadline": "2026-10-24 07:02:10",
+        "release": "2026-10-24 07:02:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c59-8de4-75c6-b1a0-4bcdd0d165ff",
+        "deadline": "2026-10-24 07:03:41",
+        "release": "2026-10-24 07:03:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c59-8de4-75c6-b1a0-4bcdd0d165ff",
+        "deadline": "2026-10-24 07:05:11",
+        "release": "2026-10-24 07:05:11",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c79-1b7f-73b4-9985-57f285ec1ad8",
+        "deadline": "2026-10-24 07:11:02",
+        "release": "2026-10-24 07:11:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c79-1b7f-73b4-9985-57f285ec1ad8",
+        "deadline": "2026-10-24 07:12:32",
+        "release": "2026-10-24 07:12:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c79-1b7f-73b4-9985-57f285ec1ad8",
+        "deadline": "2026-10-24 07:14:02",
+        "release": "2026-10-24 07:14:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 07:24:51",
+        "release": "2026-10-24 07:24:51",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 07:26:21",
+        "release": "2026-10-24 07:26:21",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 07:44:01",
+        "release": "2026-10-24 07:44:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 07:45:31",
+        "release": "2026-10-24 07:45:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 07:47:01",
+        "release": "2026-10-24 07:47:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 07:53:39",
+        "release": "2026-10-24 07:53:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 07:55:18",
+        "release": "2026-10-24 07:55:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 07:56:58",
+        "release": "2026-10-24 07:56:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 07:59:31",
+        "release": "2026-10-24 07:59:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 08:01:01",
+        "release": "2026-10-24 08:01:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 08:02:31",
+        "release": "2026-10-24 08:02:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 08:04:01",
+        "release": "2026-10-24 08:04:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 08:05:31",
+        "release": "2026-10-24 08:05:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 08:12:45",
+        "release": "2026-10-24 08:12:45",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 08:14:16",
+        "release": "2026-10-24 08:14:16",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16c93-fc86-7007-850e-a82efbba7f9b",
+        "deadline": "2026-10-24 08:15:46",
+        "release": "2026-10-24 08:15:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 08:25:44",
+        "release": "2026-10-24 08:25:44",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 08:27:22",
+        "release": "2026-10-24 08:27:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 08:29:02",
+        "release": "2026-10-24 08:29:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792830238-4012424-7722",
+        "deadline": "2026-10-24 09:29:58",
+        "release": "2026-10-24 09:29:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d0b-b482-748e-92d9-ec9ac99843f9",
+        "deadline": "2026-10-24 09:39:46",
+        "release": "2026-10-24 09:39:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d0b-b482-748e-92d9-ec9ac99843f9",
+        "deadline": "2026-10-24 09:41:16",
+        "release": "2026-10-24 09:41:16",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d0b-b482-748e-92d9-ec9ac99843f9",
+        "deadline": "2026-10-24 09:42:47",
+        "release": "2026-10-24 09:42:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d2e-d094-723e-b017-0ffaab84111d",
+        "deadline": "2026-10-24 10:14:06",
+        "release": "2026-10-24 10:14:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d2e-d094-723e-b017-0ffaab84111d",
+        "deadline": "2026-10-24 10:15:47",
+        "release": "2026-10-24 10:15:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d2e-d094-723e-b017-0ffaab84111d",
+        "deadline": "2026-10-24 10:21:09",
+        "release": "2026-10-24 10:21:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d2e-d094-723e-b017-0ffaab84111d",
+        "deadline": "2026-10-24 10:22:50",
+        "release": "2026-10-24 10:22:50",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 10:24:20",
+        "release": "2026-10-24 10:24:20",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 10:25:50",
+        "release": "2026-10-24 10:25:50",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 10:27:20",
+        "release": "2026-10-24 10:27:20",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 10:36:53",
+        "release": "2026-10-24 10:36:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792834544-2169720-22137",
+        "deadline": "2026-10-24 10:38:33",
+        "release": "2026-10-24 10:38:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792834544-2169720-22137",
+        "deadline": "2026-10-24 10:40:15",
+        "release": "2026-10-24 10:40:15",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792834544-2169720-22137",
+        "deadline": "2026-10-24 10:41:58",
+        "release": "2026-10-24 10:41:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d2e-d094-723e-b017-0ffaab84111d",
+        "deadline": "2026-10-24 10:44:30",
+        "release": "2026-10-24 10:44:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d4b-af41-74ff-bd50-cc00c8ec8be9",
+        "deadline": "2026-10-24 10:46:00",
+        "release": "2026-10-24 10:46:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d4b-af41-74ff-bd50-cc00c8ec8be9",
+        "deadline": "2026-10-24 10:47:31",
+        "release": "2026-10-24 10:47:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d4b-af41-74ff-bd50-cc00c8ec8be9",
+        "deadline": "2026-10-24 10:49:01",
+        "release": "2026-10-24 10:49:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 10:51:41",
+        "release": "2026-10-24 10:51:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835423-4072886-24",
+        "deadline": "2026-10-24 10:53:12",
+        "release": "2026-10-24 10:53:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835423-4072886-24",
+        "deadline": "2026-10-24 10:54:52",
+        "release": "2026-10-24 10:54:52",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835508-4074376-6546",
+        "deadline": "2026-10-24 10:56:23",
+        "release": "2026-10-24 10:56:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835508-4074376-6546",
+        "deadline": "2026-10-24 10:57:53",
+        "release": "2026-10-24 10:57:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835508-4074376-6546",
+        "deadline": "2026-10-24 10:59:23",
+        "release": "2026-10-24 10:59:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835953-4082670-21661",
+        "deadline": "2026-10-24 11:01:54",
+        "release": "2026-10-24 11:01:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836002-4084071-22565",
+        "deadline": "2026-10-24 11:03:24",
+        "release": "2026-10-24 11:03:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836002-4084071-22565",
+        "deadline": "2026-10-24 11:04:55",
+        "release": "2026-10-24 11:04:55",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836002-4084071-22565",
+        "deadline": "2026-10-24 11:06:25",
+        "release": "2026-10-24 11:06:25",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d60-2b2a-7692-a03c-6d50ad9895e0",
+        "deadline": "2026-10-24 11:08:56",
+        "release": "2026-10-24 11:08:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 11:10:34",
+        "release": "2026-10-24 11:10:34",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 11:12:12",
+        "release": "2026-10-24 11:12:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 11:13:47",
+        "release": "2026-10-24 11:13:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836810-1564776-19316",
+        "deadline": "2026-10-24 11:16:18",
+        "release": "2026-10-24 11:16:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836931-4187220-8990",
+        "deadline": "2026-10-24 11:17:48",
+        "release": "2026-10-24 11:17:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836931-4187220-8990",
+        "deadline": "2026-10-24 11:19:18",
+        "release": "2026-10-24 11:19:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836931-4187220-8990",
+        "deadline": "2026-10-24 11:20:49",
+        "release": "2026-10-24 11:20:49",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835821-1548463-25925",
+        "deadline": "2026-10-24 11:23:23",
+        "release": "2026-10-24 11:23:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835821-1548463-25925",
+        "deadline": "2026-10-24 11:24:54",
+        "release": "2026-10-24 11:24:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835821-1548463-25925",
+        "deadline": "2026-10-24 11:26:24",
+        "release": "2026-10-24 11:26:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792837490-1583840-31465",
+        "deadline": "2026-10-24 11:27:55",
+        "release": "2026-10-24 11:27:55",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 11:29:34",
+        "release": "2026-10-24 11:29:34",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 11:31:12",
+        "release": "2026-10-24 11:31:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16cb5-941b-73e1-b65c-0776fda14f09",
+        "deadline": "2026-10-24 11:32:56",
+        "release": "2026-10-24 11:32:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836699-1563944-28128",
+        "deadline": "2026-10-24 11:35:27",
+        "release": "2026-10-24 11:35:27",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836699-1563944-28128",
+        "deadline": "2026-10-24 11:49:11",
+        "release": "2026-10-24 11:49:11",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836699-1563944-28128",
+        "deadline": "2026-10-24 11:50:41",
+        "release": "2026-10-24 11:50:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-SA-0MVE34D9B005TUYJ-parent-4b7bb62a",
+        "deadline": "2026-10-24 11:52:12",
+        "release": "2026-10-24 11:52:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-SA-0MVE34D9B005TUYJ-parent-4b7bb62a",
+        "deadline": "2026-10-24 11:53:42",
+        "release": "2026-10-24 11:53:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-SA-0MVE34D9B005TUYJ-parent-4b7bb62a",
+        "deadline": "2026-10-24 11:55:12",
+        "release": "2026-10-24 11:55:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d66-507f-7279-aaed-b3988a341c4b",
+        "deadline": "2026-10-24 11:59:32",
+        "release": "2026-10-24 11:59:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d66-507f-7279-aaed-b3988a341c4b",
+        "deadline": "2026-10-24 12:01:03",
+        "release": "2026-10-24 12:01:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-SA-0MVE34D9B005TUYJ-phase2_deep-93c082d7",
+        "deadline": "2026-10-24 12:02:33",
+        "release": "2026-10-24 12:02:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-SA-0MVE34D9B005TUYJ-phase2_deep-93c082d7",
+        "deadline": "2026-10-24 12:04:03",
+        "release": "2026-10-24 12:04:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-SA-0MVE34D9B005TUYJ-phase2_deep-93c082d7",
+        "deadline": "2026-10-24 12:05:33",
+        "release": "2026-10-24 12:05:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836290-4094432-7131",
+        "deadline": "2026-10-24 12:08:09",
+        "release": "2026-10-24 12:08:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d98-0a2d-72ae-98cb-20cac549a240",
+        "deadline": "2026-10-24 12:09:39",
+        "release": "2026-10-24 12:09:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d98-0a2d-72ae-98cb-20cac549a240",
+        "deadline": "2026-10-24 12:11:18",
+        "release": "2026-10-24 12:11:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16d98-0a2d-72ae-98cb-20cac549a240",
+        "deadline": "2026-10-24 12:12:59",
+        "release": "2026-10-24 12:12:59",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 12:15:30",
+        "release": "2026-10-24 12:15:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792795503-2205429-31992",
+        "deadline": "2026-10-24 12:17:00",
+        "release": "2026-10-24 12:17:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840537-1797500-8889",
+        "deadline": "2026-10-24 12:18:31",
+        "release": "2026-10-24 12:18:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840537-1797500-8889",
+        "deadline": "2026-10-24 12:20:01",
+        "release": "2026-10-24 12:20:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840537-1797500-8889",
+        "deadline": "2026-10-24 12:21:32",
+        "release": "2026-10-24 12:21:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840939-433510-28674",
+        "deadline": "2026-10-24 12:24:04",
+        "release": "2026-10-24 12:24:04",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 12:25:34",
+        "release": "2026-10-24 12:25:34",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 12:27:05",
+        "release": "2026-10-24 12:27:05",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 12:28:35",
+        "release": "2026-10-24 12:28:35",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16da1-64c8-735e-8d62-bad93d755c8d",
+        "deadline": "2026-10-24 12:31:11",
+        "release": "2026-10-24 12:31:11",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16dad-6810-744b-b89f-3347d20348b8",
+        "deadline": "2026-10-24 12:32:41",
+        "release": "2026-10-24 12:32:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16dad-6810-744b-b89f-3347d20348b8",
+        "deadline": "2026-10-24 12:34:12",
+        "release": "2026-10-24 12:34:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16dad-6810-744b-b89f-3347d20348b8",
+        "deadline": "2026-10-24 12:35:42",
+        "release": "2026-10-24 12:35:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-OSL-0MVJ8I7YS008XV91-phase2_deep-95a98bc6",
+        "deadline": "2026-10-24 12:38:13",
+        "release": "2026-10-24 12:38:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-OSL-0MVJ8I7YS008XV91-phase2_deep-95a98bc6",
+        "deadline": "2026-10-24 12:39:44",
+        "release": "2026-10-24 12:39:44",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16db5-4a63-74dd-8180-0bc3f0088905",
+        "deadline": "2026-10-24 12:41:15",
+        "release": "2026-10-24 12:41:15",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16db5-4a63-74dd-8180-0bc3f0088905",
+        "deadline": "2026-10-24 12:42:47",
+        "release": "2026-10-24 12:42:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16db5-4a63-74dd-8180-0bc3f0088905",
+        "deadline": "2026-10-24 12:44:18",
+        "release": "2026-10-24 12:44:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16dba-770b-76f7-bad0-434678e0cf6c",
+        "deadline": "2026-10-24 12:46:53",
+        "release": "2026-10-24 12:46:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-OSL-0MVMAFACT007Q79F-parent-cc93a603",
+        "deadline": "2026-10-24 12:48:23",
+        "release": "2026-10-24 12:48:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-OSL-0MVMAFACT007Q79F-parent-cc93a603",
+        "deadline": "2026-10-24 12:49:53",
+        "release": "2026-10-24 12:49:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840921-432844-21783",
+        "deadline": "2026-10-24 12:54:09",
+        "release": "2026-10-24 12:54:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840921-432844-21783",
+        "deadline": "2026-10-24 12:55:39",
+        "release": "2026-10-24 12:55:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840921-432844-21783",
+        "deadline": "2026-10-24 12:57:10",
+        "release": "2026-10-24 12:57:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840548-1798118-4762",
+        "deadline": "2026-10-24 12:59:54",
+        "release": "2026-10-24 12:59:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840548-1798118-4762",
+        "deadline": "2026-10-24 13:01:25",
+        "release": "2026-10-24 13:01:25",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840548-1798118-4762",
+        "deadline": "2026-10-24 13:02:55",
+        "release": "2026-10-24 13:02:55",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792843414-2226385-31626",
+        "deadline": "2026-10-24 13:05:28",
+        "release": "2026-10-24 13:05:28",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792843423-2226939-6465",
+        "deadline": "2026-10-24 13:06:58",
+        "release": "2026-10-24 13:06:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792843423-2226939-6465",
+        "deadline": "2026-10-24 13:08:28",
+        "release": "2026-10-24 13:08:28",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792843423-2226939-6465",
+        "deadline": "2026-10-24 13:09:58",
+        "release": "2026-10-24 13:09:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16dce-ddf9-7073-aad6-9e7d5a72c9fc",
+        "deadline": "2026-10-24 13:20:46",
+        "release": "2026-10-24 13:20:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16dce-ddf9-7073-aad6-9e7d5a72c9fc",
+        "deadline": "2026-10-24 13:22:16",
+        "release": "2026-10-24 13:22:16",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ddc-5b90-75c9-954b-1cbc31d01eb2",
+        "deadline": "2026-10-24 13:23:46",
+        "release": "2026-10-24 13:23:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ddc-5b90-75c9-954b-1cbc31d01eb2",
+        "deadline": "2026-10-24 13:25:17",
+        "release": "2026-10-24 13:25:17",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ddc-5b90-75c9-954b-1cbc31d01eb2",
+        "deadline": "2026-10-24 13:26:47",
+        "release": "2026-10-24 13:26:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-OSL-0MVJ8I7YS008XV91-phase2_deep-afa950cb",
+        "deadline": "2026-10-24 13:29:27",
+        "release": "2026-10-24 13:29:27",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-OSL-0MVJ8I7YS008XV91-phase2_deep-afa950cb",
+        "deadline": "2026-10-24 13:30:59",
+        "release": "2026-10-24 13:30:59",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-OSL-0MVJ8I7YS008XV91-phase2_deep-afa950cb",
+        "deadline": "2026-10-24 13:32:29",
+        "release": "2026-10-24 13:32:29",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16dce-ddf9-7073-aad6-9e7d5a72c9fc",
+        "deadline": "2026-10-24 13:35:02",
+        "release": "2026-10-24 13:35:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16dce-ddf9-7073-aad6-9e7d5a72c9fc",
+        "deadline": "2026-10-24 13:36:35",
+        "release": "2026-10-24 13:36:35",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16dce-ddf9-7073-aad6-9e7d5a72c9fc",
+        "deadline": "2026-10-24 13:38:05",
+        "release": "2026-10-24 13:38:05",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835980-4083471-19831",
+        "deadline": "2026-10-24 13:40:40",
+        "release": "2026-10-24 13:40:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835980-4083471-19831",
+        "deadline": "2026-10-24 13:42:10",
+        "release": "2026-10-24 13:42:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835980-4083471-19831",
+        "deadline": "2026-10-24 13:43:42",
+        "release": "2026-10-24 13:43:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16def-1e04-72f2-b017-5db89d824300",
+        "deadline": "2026-10-24 13:45:12",
+        "release": "2026-10-24 13:45:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16df1-1bb4-7424-9efa-b9b8b00aba04",
+        "deadline": "2026-10-24 13:46:42",
+        "release": "2026-10-24 13:46:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16df1-1bb4-7424-9efa-b9b8b00aba04",
+        "deadline": "2026-10-24 13:48:13",
+        "release": "2026-10-24 13:48:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16df1-1bb4-7424-9efa-b9b8b00aba04",
+        "deadline": "2026-10-24 13:49:43",
+        "release": "2026-10-24 13:49:43",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792843527-637008-30346",
+        "deadline": "2026-10-24 13:52:24",
+        "release": "2026-10-24 13:52:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792843527-637008-30346",
+        "deadline": "2026-10-24 13:53:55",
+        "release": "2026-10-24 13:53:55",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792843527-637008-30346",
+        "deadline": "2026-10-24 13:55:25",
+        "release": "2026-10-24 13:55:25",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16def-1e04-72f2-b017-5db89d824300",
+        "deadline": "2026-10-24 13:58:04",
+        "release": "2026-10-24 13:58:04",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16def-1e04-72f2-b017-5db89d824300",
+        "deadline": "2026-10-24 13:59:34",
+        "release": "2026-10-24 13:59:34",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16def-1e04-72f2-b017-5db89d824300",
+        "deadline": "2026-10-24 14:01:05",
+        "release": "2026-10-24 14:01:05",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 14:03:38",
+        "release": "2026-10-24 14:03:38",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 14:05:09",
+        "release": "2026-10-24 14:05:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 14:06:40",
+        "release": "2026-10-24 14:06:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16df1-1bb4-7424-9efa-b9b8b00aba04",
+        "deadline": "2026-10-24 14:09:22",
+        "release": "2026-10-24 14:09:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16df1-1bb4-7424-9efa-b9b8b00aba04",
+        "deadline": "2026-10-24 14:10:52",
+        "release": "2026-10-24 14:10:52",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16df1-1bb4-7424-9efa-b9b8b00aba04",
+        "deadline": "2026-10-24 14:12:23",
+        "release": "2026-10-24 14:12:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16def-1e04-72f2-b017-5db89d824300",
+        "deadline": "2026-10-24 14:14:54",
+        "release": "2026-10-24 14:14:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16def-1e04-72f2-b017-5db89d824300",
+        "deadline": "2026-10-24 14:16:24",
+        "release": "2026-10-24 14:16:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16def-1e04-72f2-b017-5db89d824300",
+        "deadline": "2026-10-24 14:17:54",
+        "release": "2026-10-24 14:17:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 14:21:47",
+        "release": "2026-10-24 14:21:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 14:23:18",
+        "release": "2026-10-24 14:23:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 14:24:48",
+        "release": "2026-10-24 14:24:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ddc-5b90-75c9-954b-1cbc31d01eb2",
+        "deadline": "2026-10-24 14:27:20",
+        "release": "2026-10-24 14:27:20",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e17-8614-771a-ae88-11ee9bf7fd55",
+        "deadline": "2026-10-24 14:28:50",
+        "release": "2026-10-24 14:28:50",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e17-8614-771a-ae88-11ee9bf7fd55",
+        "deadline": "2026-10-24 14:30:21",
+        "release": "2026-10-24 14:30:21",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e17-8614-771a-ae88-11ee9bf7fd55",
+        "deadline": "2026-10-24 14:31:51",
+        "release": "2026-10-24 14:31:51",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e29-3799-7304-ac74-335c7f613395",
+        "deadline": "2026-10-24 14:55:53",
+        "release": "2026-10-24 14:55:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e29-3799-7304-ac74-335c7f613395",
+        "deadline": "2026-10-24 14:57:23",
+        "release": "2026-10-24 14:57:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e29-3799-7304-ac74-335c7f613395",
+        "deadline": "2026-10-24 14:58:53",
+        "release": "2026-10-24 14:58:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849356-966842-29501",
+        "deadline": "2026-10-24 15:02:52",
+        "release": "2026-10-24 15:02:52",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849356-966842-29501",
+        "deadline": "2026-10-24 15:04:23",
+        "release": "2026-10-24 15:04:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849356-966842-29501",
+        "deadline": "2026-10-24 15:06:07",
+        "release": "2026-10-24 15:06:07",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e35-542e-75dc-af89-a4d69ece9bd6",
+        "deadline": "2026-10-24 15:08:45",
+        "release": "2026-10-24 15:08:45",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e35-542e-75dc-af89-a4d69ece9bd6",
+        "deadline": "2026-10-24 15:10:15",
+        "release": "2026-10-24 15:10:15",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849964-2255367-5338",
+        "deadline": "2026-10-24 15:11:45",
+        "release": "2026-10-24 15:11:45",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849964-2255367-5338",
+        "deadline": "2026-10-24 15:13:16",
+        "release": "2026-10-24 15:13:16",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849964-2255367-5338",
+        "deadline": "2026-10-24 15:14:46",
+        "release": "2026-10-24 15:14:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849973-979521-21766",
+        "deadline": "2026-10-24 15:17:43",
+        "release": "2026-10-24 15:17:43",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849973-979521-21766",
+        "deadline": "2026-10-24 15:19:14",
+        "release": "2026-10-24 15:19:14",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849973-979521-21766",
+        "deadline": "2026-10-24 15:20:45",
+        "release": "2026-10-24 15:20:45",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e29-3799-7304-ac74-335c7f613395",
+        "deadline": "2026-10-24 15:26:25",
+        "release": "2026-10-24 15:26:25",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e29-3799-7304-ac74-335c7f613395",
+        "deadline": "2026-10-24 15:27:56",
+        "release": "2026-10-24 15:27:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e29-3799-7304-ac74-335c7f613395",
+        "deadline": "2026-10-24 15:29:27",
+        "release": "2026-10-24 15:29:27",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849973-979521-21766",
+        "deadline": "2026-10-24 15:32:38",
+        "release": "2026-10-24 15:32:38",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849973-979521-21766",
+        "deadline": "2026-10-24 15:34:18",
+        "release": "2026-10-24 15:34:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792849973-979521-21766",
+        "deadline": "2026-10-24 15:35:56",
+        "release": "2026-10-24 15:35:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 15:40:40",
+        "release": "2026-10-24 15:40:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792852773-2315512-14913",
+        "deadline": "2026-10-24 15:42:10",
+        "release": "2026-10-24 15:42:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792852773-2315512-14913",
+        "deadline": "2026-10-24 15:43:40",
+        "release": "2026-10-24 15:43:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792852773-2315512-14913",
+        "deadline": "2026-10-24 15:45:22",
+        "release": "2026-10-24 15:45:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792852857-2318069-20941",
+        "deadline": "2026-10-24 15:48:06",
+        "release": "2026-10-24 15:48:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853198-1177645-30228",
+        "deadline": "2026-10-24 15:49:36",
+        "release": "2026-10-24 15:49:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853198-1177645-30228",
+        "deadline": "2026-10-24 15:51:07",
+        "release": "2026-10-24 15:51:07",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853198-1177645-30228",
+        "deadline": "2026-10-24 15:52:37",
+        "release": "2026-10-24 15:52:37",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792852773-2315512-14913",
+        "deadline": "2026-10-24 15:57:18",
+        "release": "2026-10-24 15:57:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792852773-2315512-14913",
+        "deadline": "2026-10-24 15:59:05",
+        "release": "2026-10-24 15:59:05",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792852773-2315512-14913",
+        "deadline": "2026-10-24 16:00:47",
+        "release": "2026-10-24 16:00:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e6a-3365-747b-8ce4-f767c2d7feb2",
+        "deadline": "2026-10-24 16:03:22",
+        "release": "2026-10-24 16:03:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e6a-3365-747b-8ce4-f767c2d7feb2",
+        "deadline": "2026-10-24 16:04:53",
+        "release": "2026-10-24 16:04:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e6a-3365-747b-8ce4-f767c2d7feb2",
+        "deadline": "2026-10-24 16:06:23",
+        "release": "2026-10-24 16:06:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853198-1177645-30228",
+        "deadline": "2026-10-24 16:16:39",
+        "release": "2026-10-24 16:16:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792854994-2281311-17123",
+        "deadline": "2026-10-24 16:18:09",
+        "release": "2026-10-24 16:18:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792854990-2280933-6877",
+        "deadline": "2026-10-24 16:26:24",
+        "release": "2026-10-24 16:26:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855546-1279464-23713",
+        "deadline": "2026-10-24 16:27:54",
+        "release": "2026-10-24 16:27:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855546-1279464-23713",
+        "deadline": "2026-10-24 16:29:24",
+        "release": "2026-10-24 16:29:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855546-1279464-23713",
+        "deadline": "2026-10-24 16:30:55",
+        "release": "2026-10-24 16:30:55",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e86-d9f9-7773-a08c-6a3a9fa17cea",
+        "deadline": "2026-10-24 16:33:28",
+        "release": "2026-10-24 16:33:28",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e86-d9f9-7773-a08c-6a3a9fa17cea",
+        "deadline": "2026-10-24 16:35:00",
+        "release": "2026-10-24 16:35:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e86-d9f9-7773-a08c-6a3a9fa17cea",
+        "deadline": "2026-10-24 16:36:30",
+        "release": "2026-10-24 16:36:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e6b-fd9e-7513-8a69-22b2800d74b7",
+        "deadline": "2026-10-24 16:39:04",
+        "release": "2026-10-24 16:39:04",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e6b-fd9e-7513-8a69-22b2800d74b7",
+        "deadline": "2026-10-24 16:40:35",
+        "release": "2026-10-24 16:40:35",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e6b-fd9e-7513-8a69-22b2800d74b7",
+        "deadline": "2026-10-24 16:42:06",
+        "release": "2026-10-24 16:42:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835980-4083471-19831",
+        "deadline": "2026-10-24 16:44:37",
+        "release": "2026-10-24 16:44:37",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835980-4083471-19831",
+        "deadline": "2026-10-24 16:46:09",
+        "release": "2026-10-24 16:46:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792835980-4083471-19831",
+        "deadline": "2026-10-24 16:47:39",
+        "release": "2026-10-24 16:47:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e89-fe4d-70d3-ab29-d0c27c8ae72f",
+        "deadline": "2026-10-24 16:50:11",
+        "release": "2026-10-24 16:50:11",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e89-fe4d-70d3-ab29-d0c27c8ae72f",
+        "deadline": "2026-10-24 16:51:42",
+        "release": "2026-10-24 16:51:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e89-fe4d-70d3-ab29-d0c27c8ae72f",
+        "deadline": "2026-10-24 16:53:13",
+        "release": "2026-10-24 16:53:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e86-d9f9-7773-a08c-6a3a9fa17cea",
+        "deadline": "2026-10-24 16:55:49",
+        "release": "2026-10-24 16:55:49",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e86-d9f9-7773-a08c-6a3a9fa17cea",
+        "deadline": "2026-10-24 16:57:19",
+        "release": "2026-10-24 16:57:19",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e86-d9f9-7773-a08c-6a3a9fa17cea",
+        "deadline": "2026-10-24 16:58:50",
+        "release": "2026-10-24 16:58:50",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e85-e5c6-721e-b1e4-e98e4b7e0127",
+        "deadline": "2026-10-24 17:01:30",
+        "release": "2026-10-24 17:01:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e85-e5c6-721e-b1e4-e98e4b7e0127",
+        "deadline": "2026-10-24 17:03:00",
+        "release": "2026-10-24 17:03:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e85-e5c6-721e-b1e4-e98e4b7e0127",
+        "deadline": "2026-10-24 17:04:31",
+        "release": "2026-10-24 17:04:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-LP-0MVMBM1Y3001TPRT-parent-ecb2a87b",
+        "deadline": "2026-10-24 17:07:03",
+        "release": "2026-10-24 17:07:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-LP-0MVMBM1Y3001TPRT-parent-ecb2a87b",
+        "deadline": "2026-10-24 17:08:33",
+        "release": "2026-10-24 17:08:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-LP-0MVMBM1Y3001TPRT-parent-ecb2a87b",
+        "deadline": "2026-10-24 17:10:03",
+        "release": "2026-10-24 17:10:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ea6-2858-7638-8c26-052c8bddf2b9",
+        "deadline": "2026-10-24 17:12:40",
+        "release": "2026-10-24 17:12:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ea6-2858-7638-8c26-052c8bddf2b9",
+        "deadline": "2026-10-24 17:14:11",
+        "release": "2026-10-24 17:14:11",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ea6-2858-7638-8c26-052c8bddf2b9",
+        "deadline": "2026-10-24 17:15:41",
+        "release": "2026-10-24 17:15:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e85-e5c6-721e-b1e4-e98e4b7e0127",
+        "deadline": "2026-10-24 17:18:14",
+        "release": "2026-10-24 17:18:14",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e85-e5c6-721e-b1e4-e98e4b7e0127",
+        "deadline": "2026-10-24 17:19:44",
+        "release": "2026-10-24 17:19:44",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16e85-e5c6-721e-b1e4-e98e4b7e0127",
+        "deadline": "2026-10-24 17:21:15",
+        "release": "2026-10-24 17:21:15",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 17:23:45",
+        "release": "2026-10-24 17:23:45",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 17:25:16",
+        "release": "2026-10-24 17:25:16",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 17:26:48",
+        "release": "2026-10-24 17:26:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 17:29:26",
+        "release": "2026-10-24 17:29:26",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 17:30:56",
+        "release": "2026-10-24 17:30:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 17:32:27",
+        "release": "2026-10-24 17:32:27",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792859577-1504585-28248",
+        "deadline": "2026-10-24 17:34:58",
+        "release": "2026-10-24 17:34:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792859577-1504585-28248",
+        "deadline": "2026-10-24 17:36:43",
+        "release": "2026-10-24 17:36:43",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792859577-1504585-28248",
+        "deadline": "2026-10-24 17:39:39",
+        "release": "2026-10-24 17:39:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792859736-2314709-30610",
+        "deadline": "2026-10-24 17:41:22",
+        "release": "2026-10-24 17:41:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792859736-2314709-30610",
+        "deadline": "2026-10-24 17:43:03",
+        "release": "2026-10-24 17:43:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792859736-2314709-30610",
+        "deadline": "2026-10-24 17:44:43",
+        "release": "2026-10-24 17:44:43",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ec2-eab6-738f-911a-42e236567a1d",
+        "deadline": "2026-10-24 17:47:14",
+        "release": "2026-10-24 17:47:14",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ec2-eab6-738f-911a-42e236567a1d",
+        "deadline": "2026-10-24 17:48:45",
+        "release": "2026-10-24 17:48:45",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ec2-eab6-738f-911a-42e236567a1d",
+        "deadline": "2026-10-24 17:50:15",
+        "release": "2026-10-24 17:50:15",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ed0-d052-7602-8bd2-9945e794ccfc",
+        "deadline": "2026-10-24 17:51:46",
+        "release": "2026-10-24 17:51:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ed0-d052-7602-8bd2-9945e794ccfc",
+        "deadline": "2026-10-24 17:53:17",
+        "release": "2026-10-24 17:53:17",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ed0-d052-7602-8bd2-9945e794ccfc",
+        "deadline": "2026-10-24 17:54:48",
+        "release": "2026-10-24 17:54:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ebb-f8e0-7784-9d82-96dafd546964",
+        "deadline": "2026-10-24 17:57:33",
+        "release": "2026-10-24 17:57:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ebb-f8e0-7784-9d82-96dafd546964",
+        "deadline": "2026-10-24 17:59:03",
+        "release": "2026-10-24 17:59:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ebb-f8e0-7784-9d82-96dafd546964",
+        "deadline": "2026-10-24 18:00:34",
+        "release": "2026-10-24 18:00:34",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ec3-15a1-7788-8efa-60de026423ce",
+        "deadline": "2026-10-24 18:03:09",
+        "release": "2026-10-24 18:03:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ec3-15a1-7788-8efa-60de026423ce",
+        "deadline": "2026-10-24 18:04:40",
+        "release": "2026-10-24 18:04:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ec3-15a1-7788-8efa-60de026423ce",
+        "deadline": "2026-10-24 18:06:10",
+        "release": "2026-10-24 18:06:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16edf-e7e8-7077-903b-79be43695af6",
+        "deadline": "2026-10-24 18:07:41",
+        "release": "2026-10-24 18:07:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16edf-e7e8-7077-903b-79be43695af6",
+        "deadline": "2026-10-24 18:09:11",
+        "release": "2026-10-24 18:09:11",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16edf-e7e8-7077-903b-79be43695af6",
+        "deadline": "2026-10-24 18:10:42",
+        "release": "2026-10-24 18:10:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ee4-1180-7501-8463-c10e2e928f40",
+        "deadline": "2026-10-24 18:12:13",
+        "release": "2026-10-24 18:12:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ee4-1180-7501-8463-c10e2e928f40",
+        "deadline": "2026-10-24 18:13:43",
+        "release": "2026-10-24 18:13:43",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ee4-1180-7501-8463-c10e2e928f40",
+        "deadline": "2026-10-24 18:15:13",
+        "release": "2026-10-24 18:15:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 18:18:32",
+        "release": "2026-10-24 18:18:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 18:20:03",
+        "release": "2026-10-24 18:20:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 18:21:33",
+        "release": "2026-10-24 18:21:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855580-1282163-4276",
+        "deadline": "2026-10-24 18:25:56",
+        "release": "2026-10-24 18:25:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855580-1282163-4276",
+        "deadline": "2026-10-24 18:27:26",
+        "release": "2026-10-24 18:27:26",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855580-1282163-4276",
+        "deadline": "2026-10-24 18:28:57",
+        "release": "2026-10-24 18:28:57",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ee4-1180-7501-8463-c10e2e928f40",
+        "deadline": "2026-10-24 18:31:44",
+        "release": "2026-10-24 18:31:44",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ee4-1180-7501-8463-c10e2e928f40",
+        "deadline": "2026-10-24 18:33:14",
+        "release": "2026-10-24 18:33:14",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ee4-1180-7501-8463-c10e2e928f40",
+        "deadline": "2026-10-24 18:34:45",
+        "release": "2026-10-24 18:34:45",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855549-1279638-9172",
+        "deadline": "2026-10-24 18:38:02",
+        "release": "2026-10-24 18:38:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855549-1279638-9172",
+        "deadline": "2026-10-24 18:39:32",
+        "release": "2026-10-24 18:39:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855549-1279638-9172",
+        "deadline": "2026-10-24 18:41:03",
+        "release": "2026-10-24 18:41:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f01-64ef-7415-ab9e-a53932b242cd",
+        "deadline": "2026-10-24 18:43:37",
+        "release": "2026-10-24 18:43:37",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f01-64ef-7415-ab9e-a53932b242cd",
+        "deadline": "2026-10-24 18:45:07",
+        "release": "2026-10-24 18:45:07",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f01-64ef-7415-ab9e-a53932b242cd",
+        "deadline": "2026-10-24 18:46:38",
+        "release": "2026-10-24 18:46:38",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853743-1222968-8918",
+        "deadline": "2026-10-24 18:51:00",
+        "release": "2026-10-24 18:51:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853743-1222968-8918",
+        "deadline": "2026-10-24 18:52:31",
+        "release": "2026-10-24 18:52:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853743-1222968-8918",
+        "deadline": "2026-10-24 18:54:02",
+        "release": "2026-10-24 18:54:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ec3-15a1-7788-8efa-60de026423ce",
+        "deadline": "2026-10-24 18:56:57",
+        "release": "2026-10-24 18:56:57",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ec3-15a1-7788-8efa-60de026423ce",
+        "deadline": "2026-10-24 18:58:27",
+        "release": "2026-10-24 18:58:27",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16ec3-15a1-7788-8efa-60de026423ce",
+        "deadline": "2026-10-24 18:59:58",
+        "release": "2026-10-24 18:59:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f01-64ef-7415-ab9e-a53932b242cd",
+        "deadline": "2026-10-24 19:02:30",
+        "release": "2026-10-24 19:02:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f01-64ef-7415-ab9e-a53932b242cd",
+        "deadline": "2026-10-24 19:04:01",
+        "release": "2026-10-24 19:04:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f01-64ef-7415-ab9e-a53932b242cd",
+        "deadline": "2026-10-24 19:05:32",
+        "release": "2026-10-24 19:05:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f11-e53c-735e-8973-dc2be1ff7f46",
+        "deadline": "2026-10-24 19:08:03",
+        "release": "2026-10-24 19:08:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f11-e53c-735e-8973-dc2be1ff7f46",
+        "deadline": "2026-10-24 19:09:34",
+        "release": "2026-10-24 19:09:34",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f11-e53c-735e-8973-dc2be1ff7f46",
+        "deadline": "2026-10-24 19:11:04",
+        "release": "2026-10-24 19:11:04",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f1e-86e6-718e-b228-9d5df98f3458",
+        "deadline": "2026-10-24 19:15:25",
+        "release": "2026-10-24 19:15:25",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f1e-86e6-718e-b228-9d5df98f3458",
+        "deadline": "2026-10-24 19:16:55",
+        "release": "2026-10-24 19:16:55",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f1e-86e6-718e-b228-9d5df98f3458",
+        "deadline": "2026-10-24 19:18:25",
+        "release": "2026-10-24 19:18:25",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855580-1282163-4276",
+        "deadline": "2026-10-24 19:21:06",
+        "release": "2026-10-24 19:21:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855580-1282163-4276",
+        "deadline": "2026-10-24 19:22:36",
+        "release": "2026-10-24 19:22:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f25-9bbc-7774-be41-9a2136655603",
+        "deadline": "2026-10-24 19:24:06",
+        "release": "2026-10-24 19:24:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f25-9bbc-7774-be41-9a2136655603",
+        "deadline": "2026-10-24 19:25:37",
+        "release": "2026-10-24 19:25:37",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f25-9bbc-7774-be41-9a2136655603",
+        "deadline": "2026-10-24 19:27:07",
+        "release": "2026-10-24 19:27:07",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f25-2c73-755f-aba2-e293b5a722a5",
+        "deadline": "2026-10-24 19:29:41",
+        "release": "2026-10-24 19:29:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f25-2c73-755f-aba2-e293b5a722a5",
+        "deadline": "2026-10-24 19:31:12",
+        "release": "2026-10-24 19:31:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f25-2c73-755f-aba2-e293b5a722a5",
+        "deadline": "2026-10-24 19:32:46",
+        "release": "2026-10-24 19:32:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f30-1784-73b8-b687-64f5e1bf3256",
+        "deadline": "2026-10-24 19:35:18",
+        "release": "2026-10-24 19:35:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f30-1784-73b8-b687-64f5e1bf3256",
+        "deadline": "2026-10-24 19:36:48",
+        "release": "2026-10-24 19:36:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f32-5058-7197-9103-630e8f58aecb",
+        "deadline": "2026-10-24 19:38:19",
+        "release": "2026-10-24 19:38:19",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f32-5058-7197-9103-630e8f58aecb",
+        "deadline": "2026-10-24 19:39:49",
+        "release": "2026-10-24 19:39:49",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f32-5058-7197-9103-630e8f58aecb",
+        "deadline": "2026-10-24 19:41:19",
+        "release": "2026-10-24 19:41:19",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f25-9bbc-7774-be41-9a2136655603",
+        "deadline": "2026-10-24 19:44:00",
+        "release": "2026-10-24 19:44:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f25-9bbc-7774-be41-9a2136655603",
+        "deadline": "2026-10-24 19:45:31",
+        "release": "2026-10-24 19:45:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f25-9bbc-7774-be41-9a2136655603",
+        "deadline": "2026-10-24 19:47:01",
+        "release": "2026-10-24 19:47:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f30-1784-73b8-b687-64f5e1bf3256",
+        "deadline": "2026-10-24 19:49:46",
+        "release": "2026-10-24 19:49:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f30-1784-73b8-b687-64f5e1bf3256",
+        "deadline": "2026-10-24 19:51:17",
+        "release": "2026-10-24 19:51:17",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f30-1784-73b8-b687-64f5e1bf3256",
+        "deadline": "2026-10-24 19:52:47",
+        "release": "2026-10-24 19:52:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 19:55:26",
+        "release": "2026-10-24 19:55:26",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 19:56:57",
+        "release": "2026-10-24 19:56:57",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 19:58:28",
+        "release": "2026-10-24 19:58:28",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853743-1222968-8918",
+        "deadline": "2026-10-24 20:02:22",
+        "release": "2026-10-24 20:02:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853743-1222968-8918",
+        "deadline": "2026-10-24 20:03:53",
+        "release": "2026-10-24 20:03:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792853743-1222968-8918",
+        "deadline": "2026-10-24 20:05:23",
+        "release": "2026-10-24 20:05:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f30-1784-73b8-b687-64f5e1bf3256",
+        "deadline": "2026-10-24 20:08:38",
+        "release": "2026-10-24 20:08:38",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f30-1784-73b8-b687-64f5e1bf3256",
+        "deadline": "2026-10-24 20:10:08",
+        "release": "2026-10-24 20:10:08",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f30-1784-73b8-b687-64f5e1bf3256",
+        "deadline": "2026-10-24 20:11:39",
+        "release": "2026-10-24 20:11:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855580-1282163-4276",
+        "deadline": "2026-10-24 20:14:39",
+        "release": "2026-10-24 20:14:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855580-1282163-4276",
+        "deadline": "2026-10-24 20:16:09",
+        "release": "2026-10-24 20:16:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855580-1282163-4276",
+        "deadline": "2026-10-24 20:17:40",
+        "release": "2026-10-24 20:17:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f58-1b7e-73f1-912c-a540cff107b9",
+        "deadline": "2026-10-24 20:19:10",
+        "release": "2026-10-24 20:19:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f58-1b7e-73f1-912c-a540cff107b9",
+        "deadline": "2026-10-24 20:20:40",
+        "release": "2026-10-24 20:20:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f58-1b7e-73f1-912c-a540cff107b9",
+        "deadline": "2026-10-24 20:22:10",
+        "release": "2026-10-24 20:22:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 20:24:47",
+        "release": "2026-10-24 20:24:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 20:26:18",
+        "release": "2026-10-24 20:26:18",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792840950-434064-31464",
+        "deadline": "2026-10-24 20:27:48",
+        "release": "2026-10-24 20:27:48",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 20:30:36",
+        "release": "2026-10-24 20:30:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792836930-4186830-6977",
+        "deadline": "2026-10-24 20:32:06",
+        "release": "2026-10-24 20:32:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 20:33:36",
+        "release": "2026-10-24 20:33:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 20:35:07",
+        "release": "2026-10-24 20:35:07",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 20:36:37",
+        "release": "2026-10-24 20:36:37",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855549-1279638-9172",
+        "deadline": "2026-10-24 20:44:02",
+        "release": "2026-10-24 20:44:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855549-1279638-9172",
+        "deadline": "2026-10-24 20:45:33",
+        "release": "2026-10-24 20:45:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855549-1279638-9172",
+        "deadline": "2026-10-24 20:47:03",
+        "release": "2026-10-24 20:47:03",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 20:51:51",
+        "release": "2026-10-24 20:51:51",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 20:53:34",
+        "release": "2026-10-24 20:53:34",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 20:55:12",
+        "release": "2026-10-24 20:55:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 21:07:09",
+        "release": "2026-10-24 21:07:09",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 21:08:51",
+        "release": "2026-10-24 21:08:51",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 21:10:32",
+        "release": "2026-10-24 21:10:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 21:25:42",
+        "release": "2026-10-24 21:25:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 21:27:22",
+        "release": "2026-10-24 21:27:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f63-c9bc-7568-9450-6f72d28f5f1f",
+        "deadline": "2026-10-24 21:29:02",
+        "release": "2026-10-24 21:29:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f9d-2d8d-7074-b363-593f7f468bcc",
+        "deadline": "2026-10-24 21:33:56",
+        "release": "2026-10-24 21:33:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f9d-2d8d-7074-b363-593f7f468bcc",
+        "deadline": "2026-10-24 21:35:35",
+        "release": "2026-10-24 21:35:35",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855549-1279638-9172",
+        "deadline": "2026-10-24 21:37:06",
+        "release": "2026-10-24 21:37:06",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855549-1279638-9172",
+        "deadline": "2026-10-24 21:38:36",
+        "release": "2026-10-24 21:38:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1792855549-1279638-9172",
+        "deadline": "2026-10-24 21:40:11",
+        "release": "2026-10-24 21:40:11",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fa4-b178-749c-b5c1-5f9cf71324e5",
+        "deadline": "2026-10-24 21:42:46",
+        "release": "2026-10-24 21:42:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fa4-b178-749c-b5c1-5f9cf71324e5",
+        "deadline": "2026-10-24 21:44:16",
+        "release": "2026-10-24 21:44:16",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fa8-03e5-7600-aa7f-04e575dc9f1a",
+        "deadline": "2026-10-24 21:45:47",
+        "release": "2026-10-24 21:45:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fa8-03e5-7600-aa7f-04e575dc9f1a",
+        "deadline": "2026-10-24 21:47:17",
+        "release": "2026-10-24 21:47:17",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fa8-03e5-7600-aa7f-04e575dc9f1a",
+        "deadline": "2026-10-24 21:48:47",
+        "release": "2026-10-24 21:48:47",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16f9d-2d8d-7074-b363-593f7f468bcc",
+        "deadline": "2026-10-24 21:51:30",
+        "release": "2026-10-24 21:51:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fae-2a95-760f-88da-457984a241d8",
+        "deadline": "2026-10-24 21:53:00",
+        "release": "2026-10-24 21:53:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fae-2a95-760f-88da-457984a241d8",
+        "deadline": "2026-10-24 21:54:30",
+        "release": "2026-10-24 21:54:30",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fae-2a95-760f-88da-457984a241d8",
+        "deadline": "2026-10-24 21:56:00",
+        "release": "2026-10-24 21:56:00",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fa4-b178-749c-b5c1-5f9cf71324e5",
+        "deadline": "2026-10-24 21:58:39",
+        "release": "2026-10-24 21:58:39",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fa4-b178-749c-b5c1-5f9cf71324e5",
+        "deadline": "2026-10-24 22:00:10",
+        "release": "2026-10-24 22:00:10",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a16fa4-b178-749c-b5c1-5f9cf71324e5",
+        "deadline": "2026-10-24 22:01:40",
+        "release": "2026-10-24 22:01:40",
+        "release_seconds": 0.0
+      }
+    ],
+    "unreleased_sessions": [],
+    "max_release_seconds": 0.0,
+    "verdict_met": true
+  },
+  "ac3": {
+    "resume_window_seconds": 3600,
+    "local_finishes_after_last_release": 0,
+    "verdict_met": false
+  },
+  "all_verdicts_met": false
+}

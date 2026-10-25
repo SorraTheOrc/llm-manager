@@ -1,0 +1,530 @@
+{
+  "window_start": "2026-10-23 22:04:14",
+  "window_end": "2026-10-24 22:04:14",
+  "total_requests": 14606,
+  "fallback_rate": 0.9213,
+  "hourly_activity": [
+    {
+      "fallbacks": 542,
+      "hour": "2026-10-23 22:00:00",
+      "lease_active_fallbacks": 10,
+      "local_attempts": 20,
+      "local_denials": 24,
+      "local_dispatch_attempts": 76,
+      "local_served": 20,
+      "local_skip": 163,
+      "requests_started": 624,
+      "state": "serving+lease-blocked",
+      "states": [
+        "serving",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 1351,
+      "hour": "2026-10-23 23:00:00",
+      "lease_active_fallbacks": 4,
+      "local_attempts": 0,
+      "local_denials": 53,
+      "local_dispatch_attempts": 86,
+      "local_served": 0,
+      "local_skip": 493,
+      "requests_started": 1443,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 747,
+      "hour": "2026-10-24 00:00:00",
+      "lease_active_fallbacks": 13,
+      "local_attempts": 0,
+      "local_denials": 21,
+      "local_dispatch_attempts": 54,
+      "local_served": 0,
+      "local_skip": 427,
+      "requests_started": 792,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 255,
+      "hour": "2026-10-24 01:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 0,
+      "local_denials": 39,
+      "local_dispatch_attempts": 65,
+      "local_served": 0,
+      "local_skip": 149,
+      "requests_started": 291,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 54,
+      "hour": "2026-10-24 02:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 7,
+      "local_denials": 2,
+      "local_dispatch_attempts": 22,
+      "local_served": 7,
+      "local_skip": 48,
+      "requests_started": 69,
+      "state": "serving+lease-blocked",
+      "states": [
+        "serving",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 58,
+      "hour": "2026-10-24 03:00:00",
+      "lease_active_fallbacks": 1,
+      "local_attempts": 0,
+      "local_denials": 7,
+      "local_dispatch_attempts": 16,
+      "local_served": 0,
+      "local_skip": 72,
+      "requests_started": 66,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 2,
+      "hour": "2026-10-24 04:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 0,
+      "local_denials": 2,
+      "local_dispatch_attempts": 7,
+      "local_served": 0,
+      "local_skip": 0,
+      "requests_started": 6,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 76,
+      "hour": "2026-10-24 05:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 0,
+      "local_denials": 28,
+      "local_dispatch_attempts": 42,
+      "local_served": 0,
+      "local_skip": 14,
+      "requests_started": 91,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 290,
+      "hour": "2026-10-24 06:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 0,
+      "local_denials": 79,
+      "local_dispatch_attempts": 102,
+      "local_served": 0,
+      "local_skip": 130,
+      "requests_started": 320,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 67,
+      "hour": "2026-10-24 07:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 0,
+      "local_denials": 0,
+      "local_dispatch_attempts": 19,
+      "local_served": 0,
+      "local_skip": 84,
+      "requests_started": 82,
+      "state": "prefill-only-no-decode",
+      "states": [
+        "prefill-only-no-decode"
+      ]
+    },
+    {
+      "fallbacks": 23,
+      "hour": "2026-10-24 08:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 0,
+      "local_denials": 2,
+      "local_dispatch_attempts": 11,
+      "local_served": 0,
+      "local_skip": 26,
+      "requests_started": 40,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 71,
+      "hour": "2026-10-24 09:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 25,
+      "local_denials": 4,
+      "local_dispatch_attempts": 44,
+      "local_served": 25,
+      "local_skip": 65,
+      "requests_started": 105,
+      "state": "serving+lease-blocked",
+      "states": [
+        "serving",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 825,
+      "hour": "2026-10-24 10:00:00",
+      "lease_active_fallbacks": 7,
+      "local_attempts": 2,
+      "local_denials": 22,
+      "local_dispatch_attempts": 49,
+      "local_served": 2,
+      "local_skip": 261,
+      "requests_started": 892,
+      "state": "serving+lease-blocked",
+      "states": [
+        "serving",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 1664,
+      "hour": "2026-10-24 11:00:00",
+      "lease_active_fallbacks": 21,
+      "local_attempts": 0,
+      "local_denials": 39,
+      "local_dispatch_attempts": 69,
+      "local_served": 0,
+      "local_skip": 458,
+      "requests_started": 1775,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 1591,
+      "hour": "2026-10-24 12:00:00",
+      "lease_active_fallbacks": 13,
+      "local_attempts": 1,
+      "local_denials": 33,
+      "local_dispatch_attempts": 72,
+      "local_served": 1,
+      "local_skip": 565,
+      "requests_started": 1692,
+      "state": "serving+lease-blocked",
+      "states": [
+        "serving",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 783,
+      "hour": "2026-10-24 13:00:00",
+      "lease_active_fallbacks": 4,
+      "local_attempts": 0,
+      "local_denials": 12,
+      "local_dispatch_attempts": 47,
+      "local_served": 0,
+      "local_skip": 398,
+      "requests_started": 860,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 540,
+      "hour": "2026-10-24 14:00:00",
+      "lease_active_fallbacks": 2,
+      "local_attempts": 20,
+      "local_denials": 8,
+      "local_dispatch_attempts": 56,
+      "local_served": 19,
+      "local_skip": 319,
+      "requests_started": 602,
+      "state": "serving+lease-blocked",
+      "states": [
+        "serving",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 664,
+      "hour": "2026-10-24 15:00:00",
+      "lease_active_fallbacks": 4,
+      "local_attempts": 0,
+      "local_denials": 21,
+      "local_dispatch_attempts": 49,
+      "local_served": 1,
+      "local_skip": 335,
+      "requests_started": 730,
+      "state": "serving+lease-blocked",
+      "states": [
+        "serving",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 1259,
+      "hour": "2026-10-24 16:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 13,
+      "local_denials": 18,
+      "local_dispatch_attempts": 59,
+      "local_served": 13,
+      "local_skip": 692,
+      "requests_started": 1322,
+      "state": "serving+lease-blocked",
+      "states": [
+        "serving",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 944,
+      "hour": "2026-10-24 17:00:00",
+      "lease_active_fallbacks": 6,
+      "local_attempts": 0,
+      "local_denials": 11,
+      "local_dispatch_attempts": 44,
+      "local_served": 0,
+      "local_skip": 659,
+      "requests_started": 983,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 456,
+      "hour": "2026-10-24 18:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 0,
+      "local_denials": 2,
+      "local_dispatch_attempts": 32,
+      "local_served": 0,
+      "local_skip": 358,
+      "requests_started": 486,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 468,
+      "hour": "2026-10-24 19:00:00",
+      "lease_active_fallbacks": 3,
+      "local_attempts": 0,
+      "local_denials": 9,
+      "local_dispatch_attempts": 40,
+      "local_served": 0,
+      "local_skip": 308,
+      "requests_started": 527,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 310,
+      "hour": "2026-10-24 20:00:00",
+      "lease_active_fallbacks": 4,
+      "local_attempts": 0,
+      "local_denials": 5,
+      "local_dispatch_attempts": 31,
+      "local_served": 0,
+      "local_skip": 231,
+      "requests_started": 336,
+      "state": "prefill-only-no-decode+lease-blocked",
+      "states": [
+        "prefill-only-no-decode",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 374,
+      "hour": "2026-10-24 21:00:00",
+      "lease_active_fallbacks": 1,
+      "local_attempts": 2,
+      "local_denials": 8,
+      "local_dispatch_attempts": 32,
+      "local_served": 2,
+      "local_skip": 223,
+      "requests_started": 426,
+      "state": "serving+lease-blocked",
+      "states": [
+        "serving",
+        "lease-blocked"
+      ]
+    },
+    {
+      "fallbacks": 42,
+      "hour": "2026-10-24 22:00:00",
+      "lease_active_fallbacks": 0,
+      "local_attempts": 0,
+      "local_denials": 0,
+      "local_dispatch_attempts": 1,
+      "local_served": 0,
+      "local_skip": 31,
+      "requests_started": 46,
+      "state": "prefill-only-no-decode",
+      "states": [
+        "prefill-only-no-decode"
+      ]
+    }
+  ],
+  "local_busy": {
+    "avg_concurrency": 1.03,
+    "avg_stream_duration_seconds": 36.6,
+    "busy_pct": 3.7,
+    "busy_seconds": 3202.2,
+    "cheap_busy_seconds": 1545.9,
+    "cheap_window_seconds": 32400.0,
+    "decode_busy_seconds": 2238.8,
+    "definition": "dispatch_to_finish",
+    "fast_busy_seconds": 1656.3,
+    "fast_window_seconds": 54000.0,
+    "hourly_busy": [
+      {
+        "hour": "2026-10-23 22:00:00",
+        "seconds": 450.35749999999985
+      },
+      {
+        "hour": "2026-10-24 02:00:00",
+        "seconds": 268.6791
+      },
+      {
+        "hour": "2026-10-24 09:00:00",
+        "seconds": 1277.227
+      },
+      {
+        "hour": "2026-10-24 10:00:00",
+        "seconds": 57.2783
+      },
+      {
+        "hour": "2026-10-24 12:00:00",
+        "seconds": 56.5794
+      },
+      {
+        "hour": "2026-10-24 14:00:00",
+        "seconds": 717.4893
+      },
+      {
+        "hour": "2026-10-24 15:00:00",
+        "seconds": 156.957
+      },
+      {
+        "hour": "2026-10-24 16:00:00",
+        "seconds": 157.3443
+      },
+      {
+        "hour": "2026-10-24 21:00:00",
+        "seconds": 60.254999999999995
+      }
+    ],
+    "idle_pct": 96.3,
+    "idle_seconds": 83197.8,
+    "lower_bound_label": "decode-only union (Stream started \u2192 Stream finished)",
+    "peak_concurrency": 2,
+    "pre_window_unfinished": 3,
+    "prefill_busy_seconds": 963.4,
+    "prefill_extended_streams": 1976,
+    "prefill_vs_decode": {
+      "combined_slot_seconds": 3295.8,
+      "decode": {
+        "max_seconds": 605.2,
+        "p10": 2.2,
+        "p50": 5.9,
+        "p90": 30.8,
+        "pct": 68.6,
+        "samples": 90,
+        "slot_seconds": 2259.6,
+        "unknown_streams": 0
+      },
+      "prefill": {
+        "max_seconds": 68.0,
+        "p10": 0.5,
+        "p50": 3.5,
+        "p90": 38.3,
+        "pct": 31.4,
+        "samples": 90,
+        "slot_seconds": 1036.2,
+        "unknown_streams": 0
+      },
+      "unit": "slot-seconds"
+    },
+    "streams": 90,
+    "total_compute_seconds": 3295.8,
+    "unfinished_streams": 0,
+    "upper_bound_label": "dispatch \u2192 finish union (prefill + decode)",
+    "window_seconds": 86400.0
+  },
+  "local_prefill": {
+    "count": 90,
+    "max_seconds": 68.0,
+    "p10": 0.5,
+    "p50": 3.5,
+    "p90": 38.3,
+    "slot_seconds": 1036.2,
+    "streams": 90,
+    "unit": "slot-seconds",
+    "unknown_prefill": 0
+  },
+  "prefill_deadline_events": 525,
+  "prefill_deadline_events_by_class": {
+    "audit": 22,
+    "user": 503
+  },
+  "local_admission_admit": 92,
+  "local_admission_reject": 314,
+  "local_admission_reject_enforced": 314,
+  "local_evictions": 0,
+  "local_evictions_after_acceptance": 0,
+  "local_evictions_after_acceptance_by_reason": {},
+  "dispatch_denied": 449,
+  "local_requests": 90,
+  "wasted_prefill_tokens": 0,
+  "prefill_budget_refusals": 0,
+  "provider_context_skips": {
+    "by_limit": {
+      "150000": 2464
+    },
+    "by_provider": {
+      "munitoai-free": 2464
+    },
+    "low": 29,
+    "share_of_skips": 0.2746,
+    "standard": 2435,
+    "total": 2464
+  }
+}

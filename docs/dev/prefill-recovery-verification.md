@@ -24,10 +24,10 @@ re-dispatching the same giant prompt for hours?
 
 | AC | Claim | Result |
 |---|---|---|
-| AC1 | post-fix report: no thrash hour and zero `local_lease_active` fallbacks | **fallbacks 0 in every post-fix hour**; hours with >=10 dispatch attempts are the deliberate verification stalls, whose llama-server prompt-eval/eval batches are present (so not the incident's zero-eval thrash shape). Full 24 h sample follows in the device window below |
-| AC2 | a deliberately stalled prefill releases the gate in <=5 min | **MET — 0 s (streaming/deadline path) and 189 s (non-streaming/watchdog path)** |
-| AC3 | local serving resumes after recovery | **MET** — local stream served at 22:04:25 (first byte 2.85 s, tokens delivered) |
-| AC4 | evidence + regressions filed | this document + comment; one bounded-regression item filed (see below) |
+| AC1 | post-fix report: no thrash hour and zero `local_lease_active` fallbacks | **NOT MET over the completed 24 h window** (14 thrash hours, 93 `local_lease_active` fallbacks — down from 766 pre-fix; see [the 24 h section](#24-h-post-deploy-window-completed-2026-10-24-220414)). In the short 54 min post-restart window it was clean: fallbacks 0 in every hour and no zero-eval thrash hour |
+| AC2 | a deliberately stalled prefill releases the gate in <=5 min | **MET — 0 s (streaming/deadline path) and 189 s (non-streaming/watchdog path)**; confirmed at scale in the 24 h window: 525/525 deadline releases at 0.0 s, none unreleased |
+| AC3 | local serving resumes after recovery | **MET** — local stream served at 22:04:25 (first byte 2.85 s, tokens delivered); 90 local streams completed inside the 24 h window, but the last one was 21:18:13 — the final ~2 h 46 m served nothing (see the 24 h section) |
+| AC4 | evidence + regressions filed | this document + comment; bounded-regression items filed (see below) |
 
 ## AC2 — gate release after a deliberately stalled prefill
 
@@ -236,12 +236,163 @@ python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
     --start '2026-10-23 22:04:14' --end '2026-10-24 22:04:14' --json
 ```
 
+## 24 h post-deploy window (completed 2026-10-24 22:04:14)
+
+Full-window measurement for **LP-0MVM83F6X0005V8S** (feeding
+**LP-0MVLGNUDJ009NRX2**), run on 2026-10-25 against the complete log set:
+
+```bash
+python3 scripts/prefill_recovery_verification.py --measure \
+    --log-dir /var/log/llama-proxy \
+    --since '2026-10-23 22:04:14' --until '2026-10-24 22:04:14' --json
+# deterministic: two runs produced byte-identical output (md5 a95c5dad…)
+python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+    --start '2026-10-23 22:04:14' --end '2026-10-24 22:04:14' --json --quiet
+```
+
+Artifacts: [`prefill-recovery-verification-24h-2026-10-24.json`](prefill-recovery-verification-24h-2026-10-24.json)
+(verbatim measurement, all 525 deadline→release pairs) and
+[`prefill-recovery-usage-24h-2026-10-24.json`](prefill-recovery-usage-24h-2026-10-24.json)
+(report figures: `hourly_activity`, local busy/prefill, deadline events,
+admission-guard decisions).
+
+### Log coverage — MET
+
+9 files cover the window with no interior gap (LP-0MVLHMAWV008EKTI, the
+restart-safe logging fix, holds across four mid-window restarts and three
+rotations):
+
+| File | First | Last | Lines |
+|---|---|---|---|
+| `proxy.log.2026-10-23_234827.gz` | 2026-10-23 22:04:16 | 2026-10-23 23:48:27 | 30,026 |
+| `proxy.log-2026-10-24_00.gz` | 2026-10-23 23:48:31 | 2026-10-23 23:59:59 | 4,063 |
+| `proxy.log.2026-10-24_000838.gz` | 2026-10-24 00:00:00 | 2026-10-24 00:08:38 | 2,039 |
+| `proxy.log.2026-10-24_003357.gz` | 2026-10-24 00:08:42 | 2026-10-24 00:33:57 | 6,664 |
+| `proxy.log.2026-10-24_00.gz` | 2026-10-24 00:34:00 | 2026-10-24 06:33:56 | 22,425 |
+| `proxy.log.2026-10-24_103459.gz` | 2026-10-24 06:34:02 | 2026-10-24 10:34:59 | 14,557 |
+| `proxy.log.2026-10-24_10.gz` | 2026-10-24 10:35:06 | 2026-10-24 16:35:05 | 135,096 |
+| `proxy.log.2026-10-24_173748.gz` | 2026-10-24 16:35:06 | 2026-10-24 17:37:48 | 18,420 |
+| `proxy.log.2026-10-24_17.gz` | 2026-10-24 17:37:52 | 2026-10-24 22:04:13 | 43,524 |
+
+`gaps: []`, `window_start_gap_seconds: 2.0` (the lost pre-22:04:16 span),
+`window_end_gap_seconds: 1.0`, **`coverage.verdict_met: true`** — this closes
+AC3 of LP-0MVLHMAWV008EKTI: the 24 h re-anchored window is fully covered.
+
+### Verdicts
+
+| AC | Verdict | Evidence |
+|---|---|---|
+| AC2 — deadline → lease release within 300 s | **MET** | 525 pairs, `max_release_seconds: 0.0`, `unreleased_sessions: []`. Every cancellation released its lease in the same second (e.g. `2026-10-24 00:36:36,644 prefill_deadline_exceeded session=01a16b1b…` immediately followed by `lease_released session=01a16b1b… reason=prefill_deadline`). The incident's ~4 h retention did not recur. |
+| AC3 — local serving resumes | **NOT MET as scored** | `local_finishes_after_last_release: 0` within 3,600 s of the last release (2026-10-24 22:01:40). 90 local streams did complete inside the window, so recovery works request-by-request, but the last one was at 2026-10-24 21:18:13 — the final ~2 h 46 m delivered no local stream, and no local stream followed the last deadline release. |
+| AC1 — report figures | **NOT MET** | 14 thrash hours (≥10 dispatch attempts, 0 served), 93 `reason=local_lease_active` fallbacks over 25 hour buckets. |
+
+### Hourly report (state is the C6 prefill-only/lease-blocked classification)
+
+| Hour | State | Requests | Local dispatch attempts | Local served | `local_lease_active` fallbacks | Fallbacks |
+|---|---|---|---|---|---|---|
+| 10-23 22:00 | serving+lease-blocked | 624 | 76 | 20 | 10 | 542 |
+| 10-23 23:00 | prefill-only-no-decode+lease-blocked | 1,443 | 86 | 0 | 4 | 1,351 |
+| 10-24 00:00 | prefill-only-no-decode+lease-blocked | 792 | 54 | 0 | 13 | 747 |
+| 10-24 01:00 | prefill-only-no-decode+lease-blocked | 291 | 65 | 0 | 0 | 255 |
+| 10-24 02:00 | serving+lease-blocked | 69 | 22 | 7 | 0 | 54 |
+| 10-24 03:00 | prefill-only-no-decode+lease-blocked | 66 | 16 | 0 | 1 | 58 |
+| 10-24 04:00 | prefill-only-no-decode+lease-blocked | 6 | 7 | 0 | 0 | 2 |
+| 10-24 05:00 | prefill-only-no-decode+lease-blocked | 91 | 42 | 0 | 0 | 76 |
+| 10-24 06:00 | prefill-only-no-decode+lease-blocked | 320 | 102 | 0 | 0 | 290 |
+| 10-24 07:00 | prefill-only-no-decode | 82 | 19 | 0 | 0 | 67 |
+| 10-24 08:00 | prefill-only-no-decode+lease-blocked | 40 | 11 | 0 | 0 | 23 |
+| 10-24 09:00 | serving+lease-blocked | 105 | 44 | 25 | 0 | 71 |
+| 10-24 10:00 | serving+lease-blocked | 892 | 49 | 2 | 7 | 825 |
+| 10-24 11:00 | prefill-only-no-decode+lease-blocked | 1,775 | 69 | 0 | 21 | 1,664 |
+| 10-24 12:00 | serving+lease-blocked | 1,692 | 72 | 1 | 13 | 1,591 |
+| 10-24 13:00 | prefill-only-no-decode+lease-blocked | 860 | 47 | 0 | 4 | 783 |
+| 10-24 14:00 | serving+lease-blocked | 602 | 56 | 19 | 2 | 540 |
+| 10-24 15:00 | serving+lease-blocked | 730 | 49 | 1 | 4 | 664 |
+| 10-24 16:00 | serving+lease-blocked | 1,322 | 59 | 13 | 0 | 1,259 |
+| 10-24 17:00 | prefill-only-no-decode+lease-blocked | 983 | 44 | 0 | 6 | 944 |
+| 10-24 18:00 | prefill-only-no-decode+lease-blocked | 486 | 32 | 0 | 0 | 456 |
+| 10-24 19:00 | prefill-only-no-decode+lease-blocked | 527 | 40 | 0 | 3 | 468 |
+| 10-24 20:00 | prefill-only-no-decode+lease-blocked | 336 | 31 | 0 | 4 | 310 |
+| 10-24 21:00 | serving+lease-blocked | 426 | 32 | 2 | 1 | 374 |
+| 10-24 22:00 | prefill-only-no-decode | 46 | 1 | 0 | 0 | 42 |
+
+Window totals: **14,606 requests, 1,125 local dispatch attempts, 90 local
+streams served (8 %), 525 `prefill_deadline_exceeded` events (503 user-class,
+22 audit-class ≈ 22/h), 314 admission-guard rejects vs 92 admits, 449
+`local_dispatch_denied`, 93 `reason=local_lease_active` fallbacks, decode-based
+local busy 3.7 % (2,238.8 s of 86,400 s).**
+
+### What the window shows
+
+1. **The wedge itself is fixed.** The failure mode of 2026-10-23 — leases
+   retained for ~4 h after a cancelled dispatch — does not appear: every one
+   of the 525 deadline cancellations releases its lease in 0.0 s and no
+   session is left `unreleased`. Lease starvation is down 88 % (93 vs the
+   766 `local_lease_active` fallbacks in the 24 h pre-fix baseline).
+2. **The dispatch side still thrashes.** One dispatch attempt in twelve was
+   served and 16 of 25 hour buckets served no local stream at all, 14 of them
+   with ≥10 attempts. Each attempt is individually bounded, but the aggregate
+   is the incident's wasted-prefill regime: the local slots spend most of the
+   window re-prefilling prompts that the deadline then cancels. Example
+   (hour 19):
+
+   ```text
+   2026-10-24 18:17:01,427 routing_check provider=local-qwen3 estimated_tokens=78972 … cache_state=cold session=herdr-1792836930-4186830-6977
+   2026-10-24 18:17:01,687 [local] POST … session=herdr-1792836930-4186830-6977
+   2026-10-24 18:18:32,646 prefill_deadline_exceeded session=herdr-1792836930-4186830-6977 deadline=90s → cancelling local dispatch and detouring
+   2026-10-24 18:18:32,646 prefill_thrash_cooldown_started session=herdr-1792836930-4186830-6977 cooldown_s=600
+   2026-10-24 18:18:32,646 lease_released session=herdr-1792836930-4186830-6977 reason=prefill_deadline
+   ```
+
+   i.e. a 78,972-token cold prompt was admitted although its prefill cannot
+   complete inside 90 s at the measured 400-750 tok/s. The same hour shows a
+   second dispatch for that session 0.29 s after its own cooldown armed
+   (`18:18:32,932 [local] POST`, lease extensions for the same session from
+   `18:18:42`) with no `routing_skip_local reason=prefill_thrash_cooldown` and
+   no `routing_check`/`local_admission_guard` line in between — a dispatch
+   path that bypasses both the cooldown and the admission bound. Worth
+   verifying against **LP-0MVNBJYE3003MF6J** (ETA-guard/deadline interaction
+   review) rather than assumed from one event.
+3. **The admission bound (epic AC5) did not hold in this window.** 525
+   deadline cancellations in 24 h means the guard let through prompts whose
+   projected prefill exceeded `local_prefill_deadline_seconds`, and in the
+   hours with zero service it was not even consulted (`local_admission_guard`
+   decision lines are absent for the whole 18:00 hour and for 23:00-01:00,
+   while dispatch attempts and cancellations continue).
+4. **Report visibility works.** Every zero-service hour is labelled
+   `prefill-only-no-decode` (+`lease-blocked` where applicable), so the state
+   is no longer rendered as plain "idle" — the C6 half of the parent's AC3 is
+   satisfied and this window is the first 24 h sample where the outage shape
+   is self-evident in the report.
+
+### Why this is not a new incident, and what it is not comparable to
+
+- The remaining waste is the admission/scheduling residual, tracked by
+  **LP-0MVN1IQTF0037WTG** (slot tenancy + resident-prefix admission; its
+  evidence is the 2026-10-24 window itself: 160 cancellations in 5.4 h ≈ 93 %
+  of local compute wasted), with residuals **LP-0MVO8H7VQ003B12I** (second-slot
+  head-of-line deadline evictions) and **LP-0MVOFVCA2008DQVE** (occupancy-aware
+  deadline admission). No duplicate item is filed from this measurement.
+- The measured configuration is the 90 s-deadline one. The current tree
+  (2026-10-25) ships `local_prefill_deadline_seconds: 120` plus
+  `local_cold_prefill_budget_tokens: 25000`
+  (LP-0MVN3KMGI009BZ0D, LP-0MVN4LBZ500281Z7), with its own 24 h verification
+  scheduled at LP-0MVN4LD2F006B76I (window closes 2026-10-26 20:17 UTC). These
+  figures are therefore historical evidence for the C1-C5 deploy, not a
+  statement about the current build.
+- Thrash-hour counts are **not** directly comparable with the earlier pre-fix
+  "six thrash hours": the `prefill-only-no-decode` classification landed with
+  C6 after that measurement, so the pre-fix figure used a weaker signal
+  (attempts>0 with zero local streams only, no llama-server eval check).
+
 ## Limitations
 
 1. **24 h sample.** The fix went live at 20:08:53 on 2026-10-23, so the
    post-fix window measurable in-session is under an hour; the full-window
    check is tracked separately (see the coverage audit above — the window is
-   re-anchored to 22:04:14 because the 18:29→22:04 log span was lost).
+   re-anchored to 22:04:14 because the 18:29→22:04 log span was lost) and was
+   completed on 2026-10-25: coverage met, AC2 met, AC1/AC3 not met (see
+   [the 24 h section](#24-h-post-deploy-window-completed-2026-10-24-220414)).
 2. **Log truncation.** A concurrent benchmark restarted the proxy repeatedly
    from ~21:08, truncating `proxy.log`; the post-fix figures above were captured
    from the analysis run at 21:03, the log excerpts quoted at the time, and a
