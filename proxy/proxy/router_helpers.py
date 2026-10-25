@@ -2085,6 +2085,89 @@ def evaluate_session_tenancy(
     return TenancyDecision(True, None, tuple(occupants), tenants)
 
 
+async def _save_evicted_snapshot(
+    srv,
+    session_key: str | None,
+    *,
+    endpoint: str | None,
+    plan,
+    reason: str,
+) -> None:
+    """Detached: persist an evicted session's KV snapshot (AC6).
+
+    Runs as a detached task so a reclaim path never blocks the cleanup cycle
+    on a multi-second KV save (and never holds the dispatch-records lock while
+    doing it). Fail-soft: a gated or failed save is reported by
+    :func:`proxy.session.save_evicted_session_snapshot`, never raised.
+    """
+    try:
+        from proxy import session as session_mod
+
+        await session_mod.save_evicted_session_snapshot(
+            session_key,
+            _server_config_of(srv),
+            endpoint=endpoint,
+            reason=reason,
+            plan=plan,
+        )
+    except Exception:
+        pass
+
+
+def _record_local_eviction(
+    srv,
+    session_key: str | None,
+    *,
+    endpoint: str | None = None,
+    reason: str,
+    slot_id: int | None = None,
+    slot_owner_session: str | None = None,
+) -> bool:
+    """Emit the shared eviction event and schedule the snapshot save (AC6).
+
+    One chokepoint for every tenancy/lease reclaim, so the ERROR-level
+    ``local_eviction`` record (the convention owned by
+    ``LP-0MVN3KMGI009BZ0D`` AC7, see :mod:`proxy.admission_events`) and the
+    "save the evicted prefix so the client restores warm" step can never
+    drift apart.
+
+    Returns whether a snapshot save was planned (i.e. not gated off).
+    """
+    plan = None
+    try:
+        from proxy import session as session_mod
+
+        plan = session_mod.plan_eviction_snapshot(
+            session_key, _server_config_of(srv), endpoint=endpoint
+        )
+    except Exception:
+        plan = None
+
+    slot_owner = slot_owner_session or session_key
+    try:
+        from proxy.admission_events import log_local_eviction
+
+        log_local_eviction(
+            srv,
+            session_key,
+            reason,
+            endpoint=endpoint,
+            slot_id=slot_id if slot_id is not None else (plan[0] if plan else None),
+            slot_owner_session=slot_owner,
+            snapshot_planned=plan is not None,
+        )
+    except Exception:
+        pass
+
+    if plan is not None:
+        _spawn_detached_release(
+            _save_evicted_snapshot(
+                srv, session_key, endpoint=endpoint, plan=plan, reason=reason
+            )
+        )
+    return plan is not None
+
+
 async def _try_acquire_local_dispatch(
     srv,
     max_local: int,
@@ -2468,6 +2551,16 @@ async def _release_prefill_deadline_dispatch(
     except Exception:
         pass
     if removed or marker_popped:
+        # LP-0MVN1IQTF0037WTG AC6: a deadline-cancelled dispatch evicts the
+        # session's lease. Record it through the shared eviction event and
+        # plan the KV snapshot *before* the slot assignment is freed below, so
+        # the session that retries restores its resident prefix warm.
+        _record_local_eviction(
+            srv,
+            session_key,
+            endpoint=endpoint,
+            reason="lease_evicted",
+        )
         try:
             from proxy.contention_queue import wake
 
@@ -2655,6 +2748,17 @@ def _release_client_disconnect_dispatch(
         marker_popped = False
 
     if removed or marker_popped:
+        # LP-0MVN1IQTF0037WTG AC6: an observed client disconnect releases the
+        # reservation immediately (one cleanup cycle, no waiting). Record the
+        # eviction through the shared event and plan the KV snapshot *before*
+        # the slot assignment is freed below, so a client that reconnects
+        # restores its resident prefix warm.
+        _record_local_eviction(
+            srv,
+            session_key,
+            endpoint=endpoint,
+            reason="lease_evicted",
+        )
         try:
             from proxy.session import _free_slot_assignment
 
@@ -2886,6 +2990,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # Normal idle timeout for inactive records
                     del srv.local_dispatch_records[sid]
                     removed += 1
+                    # LP-0MVN1IQTF0037WTG AC6: record the eviction and plan
+                    # the KV snapshot BEFORE the slot assignment is released
+                    # (the plan needs it); the slot is then freed for reuse.
+                    _record_local_eviction(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        endpoint=_endpoint_from_record(record),
+                        reason="slot_assignment_freed",
+                    )
                     # Free the slot registry entry so the slot can be
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
                     try:
@@ -3014,6 +3127,14 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                             await stream_cm.__aexit__(None, None, None)
                         except Exception:
                             pass
+                    # LP-0MVN1IQTF0037WTG AC6: emit the shared eviction event
+                    # and plan the KV snapshot before the assignment is freed.
+                    _record_local_eviction(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        endpoint=_endpoint_from_record(record),
+                        reason="lease_evicted",
+                    )
                     # Free the slot registry entry so the slot can be
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
                     try:
@@ -3066,6 +3187,16 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
             except Exception:
                 pass
             # Free the slot registry entry (LP-0MSB0RP7F000U0WJ).
+            # LP-0MVN1IQTF0037WTG AC6: a watchdog-released lease is a
+            # tenancy that expired without observed activity — record it and
+            # plan the KV snapshot before the assignment is freed, so a client
+            # that comes back restores warm instead of pre-filling cold.
+            _record_local_eviction(
+                srv,
+                session_key,
+                endpoint=endpoint_from_record,
+                reason="tenancy_lease_expired",
+            )
             try:
                 from proxy.session import _free_slot_assignment
                 _free_slot_assignment(

@@ -527,11 +527,17 @@ class _SrvStub:
     """Minimal server stub: only the dispatch registry and a logger."""
 
     def __init__(self, records: dict | None = None, *, now: float | None = None):
+        import asyncio
+
         self.local_dispatch_records = dict(records or {})
         self.local_prefill_in_flight: dict = {}
         self.local_active_queries = 0
         self.config = {"server": {}}
         self.logger = _NullLogger()
+        # Locks exist so the async release helpers take their production path.
+        self.local_dispatch_records_lock = asyncio.Lock()
+        self.local_active_queries_lock = asyncio.Lock()
+        self.local_prefill_in_flight_lock = asyncio.Lock()
 
     def record(self, session_id: str, *, now: float, active: bool = True,
                ttl: float = 30.0) -> str:
@@ -1025,3 +1031,155 @@ def test_tenancy_fails_open_when_registry_is_unreadable(monkeypatch):
 
     assert decision.admitted is True
     assert decision.reason is None
+
+
+# ---------------------------------------------------------------------------
+# C5 — reclaim is a lease: eviction event + snapshot so the client restores warm
+# ---------------------------------------------------------------------------
+
+class _LoggingSrvStub(_SrvStub):
+    """Server stub whose logger is the real module logger (caplog-visible)."""
+
+    def __init__(self, records=None):
+        super().__init__(records)
+        import logging
+
+        self.logger = logging.getLogger("llama-proxy")
+        self.current_model = "Qwen3"
+
+
+def _eviction_srv(tmp_path, sessions=("sess-a",), *, slots=2):
+    """Server stub with slot persistence enabled for eviction-save tests."""
+    srv = _LoggingSrvStub()
+    srv.config = {
+        "server": {
+            "session_slot_save_path": str(tmp_path / "slots"),
+            "session_slot_pool_size": slots,
+            "session_slot_skip_when_busy": False,
+            "session_slot_timeout_seconds": 3.0,
+            "llama_server_port": 8080,
+        }
+    }
+    now = time.monotonic()
+    for index, name in enumerate(sessions):
+        srv.record(name, now=now)
+        session_registry._slot_owners[("", index)] = name
+    return srv
+
+
+def test_eviction_saves_slot_snapshot(tmp_path, monkeypatch, caplog):
+    """A reclaim persists the evicted session's KV as ``slot_<session>.bin``."""
+    import asyncio
+    import logging
+
+    from proxy import admission_events
+    from proxy import session as session_mod
+
+    calls = []
+
+    async def _fake_save(port, slot_id, filename, timeout, model=None, endpoint=None):
+        calls.append((port, slot_id, filename))
+        return True
+
+    monkeypatch.setattr(session_mod, "_save_slot_snapshot", _fake_save)
+    srv = _eviction_srv(tmp_path)
+
+    async def _run():
+        released = await router_helpers._release_prefill_deadline_dispatch(
+            srv, "sess-a"
+        )
+        # Let the detached snapshot task run.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return released
+
+    with caplog.at_level(logging.ERROR, logger="llama-proxy"):
+        released = asyncio.run(_run())
+
+    assert released is True
+    assert calls == [(8080, 0, str(tmp_path / "slots" / "slot_sess-a.bin"))]
+    # The shared eviction event (ERROR, post-acceptance eviction) names the
+    # cause and reports that the snapshot was planned.
+    events = [r for r in caplog.records if "local_eviction" in r.getMessage()]
+    assert events, "the shared eviction event must be emitted"
+    assert events[0].levelno == logging.ERROR
+    assert events[0].reason in admission_events.EVICTION_REASONS
+    assert events[0].snapshot_planned is True
+
+
+def test_eviction_skips_snapshot_when_persistence_gated(tmp_path, monkeypatch):
+    """No slot assignment ⇒ no snapshot attempt (never allocate a slot to save)."""
+    from proxy import session as session_mod
+
+    calls = []
+
+    async def _fake_save(*args, **kwargs):
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(session_mod, "_save_slot_snapshot", _fake_save)
+    srv = _eviction_srv(tmp_path, sessions=())
+    srv.local_dispatch_records[router_helpers._dispatch_lease_key(None, "ghost")] = {
+        "backend": "local",
+        "started_at": time.monotonic(),
+        "active": True,
+        "expires_at": time.monotonic() + 30.0,
+        "last_progress_ts": time.monotonic(),
+    }
+
+    planned = router_helpers._record_local_eviction(
+        srv, "ghost", reason="lease_evicted"
+    )
+
+    assert planned is False
+    assert calls == []
+
+
+def test_eviction_snapshot_respects_pool_size_gate(tmp_path):
+    """Persistence gates (here: zero-slot pool) suppress the snapshot plan."""
+    from proxy import session as session_mod
+
+    srv = _eviction_srv(tmp_path, slots=0)
+
+    plan = session_mod.plan_eviction_snapshot(
+        "sess-a", srv.config["server"], endpoint=None
+    )
+
+    assert plan is None
+
+
+def test_eviction_event_reason_vocabulary(caplog):
+    """The eviction event carries a closed reason vocabulary (single convention)."""
+    import logging
+
+    from proxy import admission_events
+
+    srv = _LoggingSrvStub()
+    with caplog.at_level(logging.ERROR, logger="llama-proxy"):
+        for reason in admission_events.EVICTION_REASONS:
+            admission_events.log_local_eviction(
+                srv,
+                "sess-a",
+                reason,
+                endpoint="http://localhost:8080",
+                slot_id=1,
+                slot_owner_session="sess-a",
+                snapshot_planned=False,
+            )
+
+    records = [r for r in caplog.records if "local_eviction" in r.getMessage()]
+    assert [r.reason for r in records] == list(admission_events.EVICTION_REASONS)
+    assert all(r.levelno == logging.ERROR for r in records)
+    assert all(r.event == "local_eviction" for r in records)
+
+
+def test_tenancy_idle_bound_stays_inside_the_lease_ceiling():
+    """The idle bound never becomes the *only* release path (AC6 bounds)."""
+    srv = _SrvStub()
+    srv.config = {"server": {}}
+
+    ceiling = router_helpers._get_max_prefill_seconds(srv)
+
+    assert router_helpers.DEFAULT_TENANCY_IDLE_SECONDS <= 180.0
+    if ceiling > 0:
+        assert router_helpers.DEFAULT_TENANCY_IDLE_SECONDS < ceiling
