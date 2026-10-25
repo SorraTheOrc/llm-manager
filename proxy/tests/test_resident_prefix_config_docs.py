@@ -241,3 +241,38 @@ def test_config_comments_explain_defaults_and_zero_semantics():
             f"{knob} must document its 0-disables/fallback semantics"
         )
         assert "default" in block.lower(), f"{knob} must document its default"
+
+
+# ---------------------------------------------------------------------------
+# Staged rollout documentation (LP-0MVN4LC7N005XH7P)
+# ---------------------------------------------------------------------------
+
+ROLLOUT_DOC = REPO_ROOT / "docs" / "dev" / "resident-prefix-rollout.md"
+
+
+def test_rollout_doc_documents_every_knob_and_both_rollback_switches():
+    """The operator's rollout/rollback runbook stays in step with the knobs."""
+    text = ROLLOUT_DOC.read_text(encoding="utf-8")
+
+    for knob in NEW_KNOBS:
+        assert knob in text, f"{knob} missing from the rollout doc"
+    # Both documented 0-disables rollbacks.
+    assert "local_resident_prefix_min_ratio: 0" in text
+    assert "local_session_tenants: 0" in text
+    # The observation contract: absence of the report section is a finding.
+    assert "## Residency-aware admission" in text
+    # Out-of-scope knobs the rollout must not disturb.
+    for knob in (
+        "local_prefill_deadline_seconds",
+        "local_max_concurrent_prefills",
+        "session_slot_pool_size",
+    ):
+        assert knob in text, f"{knob} must be named as unchanged"
+
+
+def test_rollout_doc_does_not_promise_out_of_scope_changes():
+    """No slot-count increase ships here (evaluated separately)."""
+    text = ROLLOUT_DOC.read_text(encoding="utf-8")
+
+    assert "LP-0MVN3KPEC007WWL5" in text
+    assert "deliberately does not change" in text
