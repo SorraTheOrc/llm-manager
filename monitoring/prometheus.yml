@@ -15,10 +15,19 @@ global:
 # Paths are resolved relative to THIS config file, so they must not repeat the
 # `monitoring/` prefix (they did, which made `promtool check config` fail with
 # "monitoring/monitoring/..." and blocked startup).
+#
+# GPU coverage (LP-0MVO8DOHP008FL48): utilisation comes from power draw (see
+# gpu_compute_rules.yaml) because gpu_busy_percent is pinned at 100% on this APU,
+# and memory pressure is measured on GTT (gpu_memory_alerts.yaml) because
+# rocm_vram_* has no exporter. The previous gpu_vram_alerts.yaml and
+# llama_memory_alerts.yaml were removed: the former selected series that no
+# exporter publishes, the latter compared llama_process_rss_bytes against 90 GB
+# although the proxy publishes it as 0 (llama-server runs in a podman container,
+# so the proxy has no host process handle) - see LP-0MVO8DOHP008FL48.
 rule_files:
-  - "llama_memory_alerts.yaml"
+  - "gpu_compute_rules.yaml"
+  - "gpu_memory_alerts.yaml"
   - "proxy_5xx_alerts.yaml"
-  - "gpu_vram_alerts.yaml"
   - "slots_query_alerts.yaml"
   - "remote_stream_alerts.yaml"
 
@@ -30,11 +39,15 @@ scrape_configs:
       - targets: ["localhost:8000"]
     metrics_path: /metrics
 
-  # Host + GPU metrics from node_exporter. The GPU series (gpu_busy_percent,
-  # gpu_gtt_used_bytes, gpu_vram_*_bytes) are produced by
+  # Host + GPU metrics from node_exporter. The GPU series (gpu_gtt_used_bytes,
+  # gpu_vram_*_bytes, gpu_busy_percent) are produced by
   # ~/.local/bin/gpu-metrics-textfile.sh (gpu-metrics.service) into the
   # node_exporter textfile directory, because node_exporter has no amdgpu
-  # collector and amd/rocm-exporter publishes no release artifacts.
+  # collector and amd/rocm-exporter publishes no release artifacts. GPU power
+  # (node_hwmon_power_average_watt, chip_name="amdgpu") comes from the same
+  # exporter's hwmon collector and is the utilisation signal used by
+  # gpu_compute_rules.yaml. gpu_busy_percent is scraped for continuity only - it
+  # is pinned at 100% on this APU and is NOT a utilisation measure.
   - job_name: "node-exporter"
     static_configs:
       - targets: ["localhost:9100"]

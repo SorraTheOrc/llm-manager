@@ -1,0 +1,75 @@
+# GPU compute utilisation derived from power draw
+#
+# WHY NOT gpu_busy_percent
+# -----------------------
+# On this host (Strix Halo APU, Radeon 8060S iGPU, gfx1151) the amdgpu driver
+# reports gpu_busy_percent as pinned at 100% regardless of the actual GPU state:
+# 30/30 samples read 100 while power draw showed the GPU idle (~54 W) versus
+# computing (~115 W). See proxy/proxy/backends/llama.py ("False-positive guard
+# (LP-0MS9GA6QL007XTBP)") and proxy/config.yaml (llama_gpu_wedge_* block).
+# gpu_busy_percent is therefore NOT a utilisation signal here and must not be
+# used in any rule; the proxy's own wedge detector had to be disabled because of
+# it.
+#
+# WHAT IS USED INSTEAD
+# --------------------
+# Power draw is the discriminating signal on this hardware:
+#
+#   idle      ~40-54 W
+#   computing ~115 W
+#   threshold  90 W  == server.llama_gpu_wedge_power_low_threshold_watts
+#                      (proxy/config.yaml), reused here so the two layers agree
+#
+# Series source: node_exporter's hwmon collector. 'PPT' (package power) is the
+# GPU power sensor; the amdgpu device is selected by joining
+# node_hwmon_chip_names on chip_name="amdgpu" rather than by a host-specific
+# chip id, so the rule works on any node_exporter target exposing an AMD GPU.
+#
+# QUERIES THESE RULES ENABLE
+# --------------------------
+#   avg_over_time(gpu:computing:bool[2h])      computing-time fraction (0..1)
+#   gpu:power_watts:avg5m                      smoothed power for dashboards
+#   sum_over_time(gpu:computing:bool[24h:15s]) * 15   computing seconds
+#
+# Validation: `promtool check rules monitoring/gpu_compute_rules.yaml` and the
+# behavioural unit tests in monitoring/tests/gpu_rules_test.yml
+# (`promtool test rules`), which assert the threshold, the 0/1 semantics and the
+# 15-minute alert duration against synthetic power series.
+#
+# LP-0MVO8DOHP008FL48 (GPU utilisation must come from power).
+
+groups:
+  - name: gpu-compute.rules
+    rules:
+      # GPU package power in watts, restricted to the amdgpu hwmon device.
+      - record: gpu:power_watts:amdgpu
+        expr: |
+          node_hwmon_power_average_watt
+            * on (chip, instance) group_left (chip_name)
+              node_hwmon_chip_names{chip_name="amdgpu"}
+
+      # 1 while the GPU is drawing compute-level power, 0 while it is idle.
+      # `bool` is required: without it the comparison would filter series
+      # instead of yielding 0/1, and the averaging queries below would silently
+      # drop idle samples (overstating utilisation).
+      - record: gpu:computing:bool
+        expr: gpu:power_watts:amdgpu >= bool 90
+
+      # Smoothed power for dashboards/trend graphs.
+      - record: gpu:power_watts:avg5m
+        expr: avg_over_time(gpu:power_watts:amdgpu[5m])
+
+      # Sustained compute episode. Local streams are short on this host (median
+      # decode 2.4 s, p90 8 s, worst observed prefill 108 s in the 2026-10-25
+      # 17:00-19:00 window), so a quarter of an hour of unbroken compute-level
+      # power is abnormal and worth a look: a runaway generation loop, a wedged
+      # llama-server that keeps kernels alive, or a batch job competing for the
+      # GPU. Fires on the power-derived series, never on gpu_busy_percent.
+      - alert: GpuComputingSustained
+        expr: gpu:computing:bool == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU has been computing continuously for 15 minutes"
+          description: "GPU package power on {{ $labels.instance }} ({{ $labels.chip_name }}) has stayed at or above the 90 W compute threshold for more than 15 minutes. That is far longer than any normal local stream (p90 decode 8 s; worst prefill 108 s), so check for a runaway generation loop, a wedged llama-server still holding kernels, or another process competing for the GPU. See gpu:power_watts:avg5m for the current draw."

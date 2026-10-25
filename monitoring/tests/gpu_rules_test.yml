@@ -1,0 +1,140 @@
+# promtool unit tests for the GPU rules
+#
+# Run from the repository root:
+#   promtool test rules monitoring/tests/gpu_rules_test.yml
+#
+# These are behavioural tests: they feed synthetic hwmon series through the real
+# rule files and assert the recorded values and alert firing behaviour, so a
+# change to a threshold, the `bool` modifier or an alert duration fails here.
+#
+# LP-0MVO8DOHP008FL48 (GPU utilisation must come from power).
+
+rule_files:
+  - ../gpu_compute_rules.yaml
+  - ../gpu_memory_alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------
+  # Idle -> computing transition: 0/1 semantics and the 90 W threshold
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      # amdgpu package power: idle (45 W) for 5m, then compute (115 W).
+      - series: 'node_hwmon_power_average_watt{chip="0000:c5:00_0",sensor="power1",instance="localhost:9100",job="node-exporter"}'
+        values: '45 45 45 45 45 115 115 115 115 115'
+      # Device-class label the rules join on.
+      - series: 'node_hwmon_chip_names{chip="0000:c5:00_0",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+        values: '1 1 1 1 1 1 1 1 1 1'
+      # A second hwmon device that must NOT be treated as GPU power.
+      - series: 'node_hwmon_power_average_watt{chip="cpu0",sensor="power1",instance="localhost:9100",job="node-exporter"}'
+        values: '200 200 200 200 200 200 200 200 200 200'
+      - series: 'node_hwmon_chip_names{chip="cpu0",chip_name="k10temp",instance="localhost:9100",job="node-exporter"}'
+        values: '1 1 1 1 1 1 1 1 1 1'
+
+    promql_expr_test:
+      # Idle samples must be recorded as 0, not dropped (the `bool` modifier).
+      - expr: 'gpu:computing:bool{chip="0000:c5:00_0"}'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'gpu:computing:bool{chip="0000:c5:00_0",sensor="power1",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+            value: 0
+      # Compute samples must be recorded as 1.
+      - expr: 'gpu:computing:bool{chip="0000:c5:00_0"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'gpu:computing:bool{chip="0000:c5:00_0",sensor="power1",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+            value: 1
+      # The 200 W CPU device must never appear in the GPU series.
+      - expr: 'count(gpu:power_watts:amdgpu)'
+        eval_time: 8m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      # Raw power restricted to the GPU device.
+      - expr: 'gpu:power_watts:amdgpu{chip="0000:c5:00_0"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'gpu:power_watts:amdgpu{chip="0000:c5:00_0",sensor="power1",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+            value: 115
+
+    alert_rule_test:
+      # 5 minutes of compute is not yet sustained for 15m: no alert.
+      - eval_time: 9m
+        alertname: GpuComputingSustained
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # Sustained compute for 15m fires the alert exactly once, on the power series
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'node_hwmon_power_average_watt{chip="0000:c5:00_0",sensor="power1",instance="localhost:9100",job="node-exporter"}'
+        values: '115x25'
+      - series: 'node_hwmon_chip_names{chip="0000:c5:00_0",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+        values: '1x25'
+
+    alert_rule_test:
+      # 14 minutes in: below `for: 15m`.
+      - eval_time: 14m
+        alertname: GpuComputingSustained
+        exp_alerts: []
+      # 16 minutes in: firing, carrying the joined device labels.
+      - eval_time: 16m
+        alertname: GpuComputingSustained
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              chip: "0000:c5:00_0"
+              chip_name: amdgpu
+              sensor: power1
+              instance: localhost:9100
+              job: node-exporter
+            exp_annotations:
+              summary: "GPU has been computing continuously for 15 minutes"
+              description: "GPU package power on localhost:9100 (amdgpu) has stayed at or above the 90 W compute threshold for more than 15 minutes. That is far longer than any normal local stream (p90 decode 8 s; worst prefill 108 s), so check for a runaway generation loop, a wedged llama-server still holding kernels, or another process competing for the GPU. See gpu:power_watts:avg5m for the current draw."
+
+  # ---------------------------------------------------------------------------
+  # GTT memory alerts: 75% / 90% of the 128 GiB pool
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      # 100 GiB in use: above 75% (96 GiB), below 90% (115.2 GiB).
+      - series: 'gpu_gtt_used_bytes{gpu="card0",instance="localhost:9100",job="node-exporter"}'
+        values: '107374182400x6'
+
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: GpuGttHighWarning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              gpu: card0
+              instance: localhost:9100
+              job: node-exporter
+            exp_annotations:
+              summary: "GPU GTT memory usage > 75% of the 128 GiB pool"
+              description: "GTT (system RAM mapped for the GPU) on localhost:9100 is above 75% of the 128 GiB pool (100GiB in use). Loaded models are consuming most of the GPU-visible memory; check loaded models and consider unloading an idle model before the next load fails."
+      - eval_time: 4m
+        alertname: GpuGttHighCritical
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      # 124 GiB in use: above 90% of the pool.
+      - series: 'gpu_gtt_used_bytes{gpu="card0",instance="localhost:9100",job="node-exporter"}'
+        values: '133143986176x4'
+
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: GpuGttHighCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              gpu: card0
+              instance: localhost:9100
+              job: node-exporter
+            exp_annotations:
+              summary: "GPU GTT memory usage > 90% of the 128 GiB pool (critical)"
+              description: "GTT on localhost:9100 is above 90% of the 128 GiB pool (124GiB in use). A further model load, or a large-context session, is likely to fail. Unload an idle model or reduce local context immediately."

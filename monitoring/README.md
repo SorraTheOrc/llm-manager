@@ -59,8 +59,15 @@ The Prometheus configuration is at `monitoring/prometheus.yml` in this
 repository. It is pre-configured to:
 
 - Scrape the proxy `/metrics` endpoint every 15s.
-- Load alert rules from `monitoring/llama_memory_alerts.yaml` and
-  `monitoring/proxy_5xx_alerts.yaml`.
+- Load alert rules from `monitoring/gpu_compute_rules.yaml`,
+  `monitoring/gpu_memory_alerts.yaml`, `monitoring/proxy_5xx_alerts.yaml`,
+  `monitoring/slots_query_alerts.yaml` and
+  `monitoring/remote_stream_alerts.yaml`.
+
+> GPU utilisation is derived from **power draw**, not `gpu_busy_percent`: on this
+> Strix Halo APU that counter is pinned at 100% regardless of GPU state
+> (LP-0MS9GA6QL007XTBP, `proxy/proxy/backends/llama.py`). See
+> `monitoring/gpu_compute_rules.yaml` for the rationale and the 90 W threshold.
 
 No additional configuration changes are needed for basic operation.
 
@@ -228,7 +235,7 @@ systemctl --user enable grafana-server.service
 | `scrape_interval` | 15s | How often to scrape targets |
 | `evaluation_interval` | 15s | How often to evaluate alert rules |
 | Scrape target | `localhost:8000` | Proxy `/metrics` endpoint |
-| Alert rules | `monitoring/llama_memory_alerts.yaml`, `monitoring/proxy_5xx_alerts.yaml` | Pre-defined alert rules |
+| Alert rules | `gpu_compute_rules.yaml`, `gpu_memory_alerts.yaml`, `proxy_5xx_alerts.yaml`, `slots_query_alerts.yaml`, `remote_stream_alerts.yaml` | Pre-defined alert rules |
 
 ### Grafana Datasource (`monitoring/grafana/datasources/datasources.yaml`)
 
