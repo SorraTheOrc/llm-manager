@@ -672,7 +672,7 @@ def coefficients(model: str | None, prompt_tokens: int, config: dict | None = No
     uplift = 1.0
     if (
         guard_cfg.eta_percentile > 0.0
-        and prompt_tokens >= CONSERVATIVE_MIN_TOKENS
+        and prompt_tokens >= guard_cfg.eta_percentile_min_tokens
     ):
         ref_coded = _median([float(c) for c, _, _ in samples])
         ref_new = _median([float(n) for _, n, _ in samples])
@@ -820,6 +820,14 @@ class AdmissionDecision:
     in_flight_prefills: int = 0
     #: Projected first-byte deadline (seconds) used by this decision.
     prefill_deadline_seconds: float = 0.0
+    #: New (uncached, to-be-prefilled) tokens priced by this decision
+    #: (LP-0MVN4LBZ500281Z7).
+    new_tokens: int = 0
+    #: Configured cold-prefill budget in new tokens (0 = cap disabled).
+    budget_tokens: int = 0
+    #: ``budget_safety_fraction * prefill_deadline_seconds`` — the ETA a
+    #: budgeted prompt must fit inside (0 = bound disabled).
+    deadline_budget_seconds: float = 0.0
 
     @property
     def active(self) -> bool:
@@ -828,6 +836,8 @@ class AdmissionDecision:
             "within_budget",
             "eta_exceeds_budget",
             "prefill_eta_exceeds_deadline",
+            "prefill_budget_exceeded",
+            "prefill_eta_exceeds_safety_budget",
         )
 
 
@@ -895,6 +905,12 @@ def evaluate_admission(
     guard_cfg = resolve_config(config)
 
     try:
+        ratio = min(1.0, max(0.0, float(cached_ratio or 0.0)))
+        new_tokens = max(0, int(round(float(prompt_tokens or 0) * (1.0 - ratio))))
+    except (TypeError, ValueError):
+        new_tokens = 0
+
+    try:
         occupancy = max(0, int(busy_slots or 0))
     except (TypeError, ValueError):
         occupancy = 0
@@ -923,10 +939,39 @@ def evaluate_admission(
             busy_slots=projected.busy_slots if projected else occupancy,
             in_flight_prefills=in_flight,
             prefill_deadline_seconds=guard_cfg.prefill_deadline_seconds,
+            new_tokens=new_tokens,
+            budget_tokens=guard_cfg.cold_prefill_budget_tokens,
+            deadline_budget_seconds=_deadline_budget_seconds(guard_cfg),
         )
 
     if guard_cfg.policy == POLICY_OFF:
         return _inert("policy_off")
+    # Cold-prefill budget (LP-0MVN4LBZ500281Z7, parent AC1): a FLAT cap on the
+    # new (uncached) tokens, checked BEFORE every other bound so it can never
+    # be skipped — not by an uncalibrated bucket, not by a zero wait budget
+    # (``high`` priority), not by the idle/economic bypass. It prices GPU
+    # compute, not queue patience, so it is calibration-independent.
+    if (
+        guard_cfg.cold_prefill_budget_tokens > 0
+        and new_tokens > guard_cfg.cold_prefill_budget_tokens
+    ):
+        return AdmissionDecision(
+            admit=guard_cfg.policy == POLICY_OBSERVE,
+            reason="prefill_budget_exceeded",
+            eta_prefill_seconds=None,
+            budget_seconds=wait_budget_seconds(config, priority),
+            policy=guard_cfg.policy,
+            calibrated=False,
+            samples=0,
+            projected_wait_seconds=None,
+            eta_occupancy_seconds=None,
+            busy_slots=occupancy,
+            in_flight_prefills=in_flight,
+            prefill_deadline_seconds=guard_cfg.prefill_deadline_seconds,
+            new_tokens=new_tokens,
+            budget_tokens=guard_cfg.cold_prefill_budget_tokens,
+            deadline_budget_seconds=_deadline_budget_seconds(guard_cfg),
+        )
     budget = wait_budget_seconds(config, priority)
     if budget <= 0:
         return _inert("no_budget")
@@ -949,6 +994,15 @@ def evaluate_admission(
     if deadline > 0 and eta >= deadline:
         reason = "prefill_eta_exceeds_deadline"
         admit = guard_cfg.policy == POLICY_OBSERVE
+    # Third bound, deadline-RELATIVE (LP-0MVN4LBZ500281Z7 / parent AC3): when a
+    # budget is configured, a prompt must fit inside
+    # ``budget_safety_fraction * deadline`` (0.95 x 120 s = 114 s), not merely
+    # inside the deadline. This is what stops a prompt whose BAND is slow from
+    # slipping past the flat token cap priced at the fast band's rate.
+    deadline_budget = _deadline_budget_seconds(guard_cfg)
+    if deadline_budget > 0.0 and eta > deadline_budget:
+        reason = "prefill_eta_exceeds_safety_budget"
+        admit = guard_cfg.policy == POLICY_OBSERVE
     return AdmissionDecision(
         admit=admit,
         reason=reason,
@@ -962,7 +1016,24 @@ def evaluate_admission(
         busy_slots=projected.busy_slots,
         in_flight_prefills=in_flight,
         prefill_deadline_seconds=deadline,
+        new_tokens=new_tokens,
+        budget_tokens=guard_cfg.cold_prefill_budget_tokens,
+        deadline_budget_seconds=deadline_budget,
     )
+
+
+def _deadline_budget_seconds(guard_cfg: GuardConfig) -> float:
+    """``budget_safety_fraction * prefill_deadline_seconds`` (0 = disabled).
+
+    Single source of truth for the deadline-relative budget: the admission
+    guard, the decision log and the rejection headers all read it, so the
+    advertised threshold can never drift from the enforced one.
+    """
+    if guard_cfg.budget_safety_fraction <= 0.0:
+        return 0.0
+    if guard_cfg.prefill_deadline_seconds <= 0.0:
+        return 0.0
+    return guard_cfg.budget_safety_fraction * guard_cfg.prefill_deadline_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -1135,7 +1206,13 @@ def record_guard_decision(
     (``prefill_eta_exceeds_deadline``) on BOTH paths; ``free_slot=true``
     already identifies the direct path, so the override does not apply.
     """
-    if not decision.active or decision.eta_prefill_seconds is None:
+    # A cold-prefill budget refusal is logged even though it carries no ETA:
+    # the cap is calibration-independent, so its evidence is the token counts
+    # (AC7, LP-0MVN4LBZ500281Z7), not a priced estimate.
+    if not decision.active or (
+        decision.eta_prefill_seconds is None
+        and decision.reason != "prefill_budget_exceeded"
+    ):
         return
     # The logged ``decision`` is the guard's *verdict* (admit/reject); the
     # ``enforced`` flag distinguishes an enforced refusal from an ``observe``
@@ -1145,6 +1222,8 @@ def record_guard_decision(
         "reject"
         if str(decision.reason).startswith("eta_exceeds_budget")
         or str(decision.reason).startswith("prefill_eta_exceeds_deadline")
+        or str(decision.reason).startswith("prefill_eta_exceeds_safety_budget")
+        or str(decision.reason).startswith("prefill_budget_exceeded")
         else "admit"
     )
     projected = (
@@ -1152,28 +1231,39 @@ def record_guard_decision(
         if decision.projected_wait_seconds is not None
         else decision.eta_prefill_seconds
     )
+    if projected is None:
+        # A cold-prefill budget refusal carries no priced ETA (the cap is
+        # calibration-independent), so the projection falls back to 0.0 and
+        # the token evidence carries the decision (LP-0MVN4LBZ500281Z7 AC7).
+        projected = 0.0
     # The deadline refusal keeps its own reason on both paths so AC1 holds
     # literally (``reason=prefill_eta_exceeds_deadline``); ``free_slot``
     # already distinguishes the direct dispatch.
     effective_label = reason_label
     if reason_label and str(decision.reason).startswith(
-        "prefill_eta_exceeds_deadline"
+        ("prefill_eta_exceeds_deadline", "prefill_eta_exceeds_safety_budget",
+         "prefill_budget_exceeded")
     ):
         effective_label = decision.reason
     logger.info(
         "local_admission_guard decision=%s reason=%s enforced=%s "
         "eta_prefill_s=%.1f eta_occupancy_s=%.1f projected_wait_s=%.1f "
-        "budget_s=%.1f deadline_s=%.1f busy_slots=%d in_flight_prefills=%d "
+        "budget_s=%.1f deadline_s=%.1f deadline_budget_s=%.1f "
+        "new_tokens=%d budget_tokens=%d "
+        "busy_slots=%d in_flight_prefills=%d "
         "free_slot=%s priority=%s policy=%s model=%s samples=%d provider=%s "
         "session=%s",
         verdict,
         effective_label or decision.reason,
         "false" if decision.admit else "true",
-        float(decision.eta_prefill_seconds),
+        float(decision.eta_prefill_seconds or 0.0),
         float(decision.eta_occupancy_seconds or 0.0),
         float(projected),
         float(decision.budget_seconds or 0.0),
         float(decision.prefill_deadline_seconds or 0.0),
+        float(decision.deadline_budget_seconds or 0.0),
+        int(decision.new_tokens or 0),
+        int(decision.budget_tokens or 0),
         int(decision.busy_slots or 0),
         int(decision.in_flight_prefills or 0),
         "true" if free_slot else "false",
