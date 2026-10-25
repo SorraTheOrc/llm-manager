@@ -261,9 +261,8 @@ def test_unknown_context_tokens_without_ownership_falls_back_to_prediction(monke
     assert reason_cold == "large_context_bypass"
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_VIEW)
-def test_stale_snapshot_fails_open_to_ownership(monkeypatch):
-    """A snapshot older than the freshness bound is ``unknown``, not a denial."""
+def test_stale_snapshot_is_unknown(monkeypatch):
+    """A snapshot older than the freshness bound is ``unknown``, not trusted."""
     from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
 
     view = _view(
@@ -274,12 +273,28 @@ def test_stale_snapshot_fails_open_to_ownership(monkeypatch):
     )
 
     assert view.known is False
+    # The (untrusted) measurement is still readable for logging, but the
+    # admission ladder must not act on it.
+    assert view.context_tokens_for_session("sess-a") == N_PAST_COLD
+
+
+@pytest.mark.xfail(strict=True, reason=PENDING_GATE)
+def test_stale_snapshot_falls_open_to_ownership(monkeypatch):
+    """A stale snapshot must not become a hard local outage."""
+    from proxy.residency import RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS
+
+    view = _view(
+        slots=[_slot(0, N_PAST_COLD)],
+        owners={("", 0): "sess-a"},
+        age=RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS + 1.0,
+        monkeypatch=monkeypatch,
+    )
+
     # Session owns the slot (authoritative in-process registry) ⇒ resident.
     skip, reason = _gate(view=view, monkeypatch=monkeypatch)
     assert (skip, reason) == (False, None)
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_VIEW)
 def test_missing_snapshot_reports_unknown_not_error(monkeypatch):
     """No snapshot at all is an explicit ``unknown`` view, never an exception."""
     _install_slot_state(monkeypatch, slots=[], owners={})
@@ -289,6 +304,94 @@ def test_missing_snapshot_reports_unknown_not_error(monkeypatch):
 
     assert view.known is False
     assert view.slots == ()
+
+
+# ---------------------------------------------------------------------------
+# C2 — shared residency view projection
+# ---------------------------------------------------------------------------
+
+def test_view_maps_snapshot_and_owner_registry(monkeypatch):
+    """Per-slot fields come from the snapshot, ownership from the registry."""
+    _install_slot_state(
+        monkeypatch,
+        slots=[_slot(0, EST_TOKENS, processing=True), _slot(1, None, processing=False)],
+        owners={("", 0): "sess-a", ("http://192.0.2.9:8080", 1): "sess-b"},
+    )
+    from proxy.residency import get_residency_view
+
+    view = get_residency_view()
+
+    assert view.known is True
+    slot0, slot1 = view.slots
+    assert (slot0.endpoint, slot0.slot_id, slot0.owner_session) == ("", 0, "sess-a")
+    assert slot0.context_tokens == EST_TOKENS
+    assert slot0.is_processing is True
+    # Multi-endpoint key shape is preserved for the second server.
+    assert (slot1.endpoint, slot1.slot_id, slot1.owner_session) == (
+        "http://192.0.2.9:8080",
+        1,
+        "sess-b",
+    )
+    assert slot1.context_tokens is None
+    assert view.owner_of_slot(1) == "sess-b"
+    assert view.context_tokens_for_session("sess-a") == EST_TOKENS
+    assert view.context_tokens_for_session("sess-unknown") is None
+
+
+def test_view_issues_no_upstream_slots_query(monkeypatch):
+    """Building the view must never call ``/slots`` on the hot path."""
+    _install_slot_state(
+        monkeypatch, slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"}
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("/slots must not be queried on the admission path")
+
+    monkeypatch.setattr(observability, "_query_slots_detail", _boom)
+    monkeypatch.setattr(observability, "_query_slots_progress", _boom)
+    from proxy.residency import get_residency_view
+
+    view = get_residency_view()
+
+    assert view.known is True
+    assert view.context_tokens_for_session("sess-a") == EST_TOKENS
+
+
+def test_view_is_a_detached_snapshot(monkeypatch):
+    """A concurrent refresh cannot mutate a view that is mid-decision."""
+    _install_slot_state(
+        monkeypatch, slots=[_slot(0, EST_TOKENS)], owners={("", 0): "sess-a"}
+    )
+    from proxy.residency import get_residency_view
+
+    view = get_residency_view()
+    # Simulate the ~1 s poller landing while the decision is in flight.
+    observability._last_slot_details_cache[:] = [_slot(0, 1)]
+    session_registry._slot_owners[("", 0)] = "sess-other"
+
+    assert view.context_tokens_for_session("sess-a") == EST_TOKENS
+    assert view.owner_of_slot(0) == "sess-a"
+    assert view.occupied_sessions() == ("sess-a",)
+
+
+def test_view_exposes_decision_logging_fields(monkeypatch):
+    """AC5 fields (n_past_actual, slot owner, snapshot age) come from here."""
+    _install_slot_state(
+        monkeypatch,
+        slots=[_slot(0, N_PAST_COLD), _slot(1, 0, processing=False)],
+        owners={("", 0): "sess-a", ("", 1): "sess-b"},
+        age=1.5,
+    )
+    from proxy.residency import get_residency_view
+
+    view = get_residency_view()
+
+    assert view.snapshot_age is not None
+    assert 1.4 <= view.snapshot_age <= 2.5
+    assert view.context_tokens_for_session("sess-a") == N_PAST_COLD
+    assert view.owner_of_slot(0) == "sess-a"
+    assert view.processing_sessions() == ("sess-a",)
+    assert view.occupied_sessions() == ("sess-a", "sess-b")
 
 
 # ---------------------------------------------------------------------------
@@ -545,3 +648,58 @@ def test_silent_drop_bounded_by_no_progress_window(monkeypatch):
 
     assert within.admitted is False
     assert after.admitted is True
+
+
+def test_reserve_prices_from_live_residency(monkeypatch):
+    """``POST /llama/local/reserve`` prices the same live prefix as the guard.
+
+    A caller that predicted ``cached_ratio: 0.99`` but whose slot actually
+    holds 60 % of the prompt must be priced at 0.6, so a reservation can never
+    promise capacity the guard would refuse.
+    """
+    from proxy import admission_reserve
+
+    admission_reserve.reset()
+    _install_slot_state(
+        monkeypatch,
+        slots=[_slot(0, 60_000)],
+        owners={("", 0): "sess-a"},
+    )
+
+    status, payload = admission_reserve.reserve(
+        {
+            "estimated_tokens": 100_000,
+            "cached_ratio": 0.99,
+            "session_id": "sess-a",
+            "dry_run": True,
+        },
+        {"server": {}},
+    )
+
+    admission_reserve.reset()
+    assert status == 200
+    assert payload["cached_ratio_source"] == "live"
+    assert payload["cached_ratio"] == pytest.approx(0.6, abs=1e-6)
+
+
+def test_reserve_falls_back_to_body_ratio_without_measurement(monkeypatch):
+    """No fresh measurement (or no slot) leaves the caller's ratio alone."""
+    from proxy import admission_reserve
+
+    admission_reserve.reset()
+    _install_slot_state(monkeypatch, slots=[], owners={})
+
+    status, payload = admission_reserve.reserve(
+        {
+            "estimated_tokens": 100_000,
+            "cached_ratio": 0.99,
+            "session_id": "sess-a",
+            "dry_run": True,
+        },
+        {"server": {}},
+    )
+
+    admission_reserve.reset()
+    assert status == 200
+    assert payload["cached_ratio_source"] == "body"
+    assert payload["cached_ratio"] == pytest.approx(0.99, abs=1e-6)

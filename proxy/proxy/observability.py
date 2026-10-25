@@ -827,6 +827,20 @@ Updated by ``_periodic_broadcast_loop()`` on each successful query.
 Read by ``status_events()`` in ``proxy.ui`` and by the
 ``/llama/local/status`` handler (``proxy.handlers``) as a fallback when
 the initial /slots query fails or times out (LP-0MUFSVXID0039ZAQ).
+
+Also the measurement source of the residency-aware admission view
+(``proxy.residency.get_residency_view()``, LP-0MVN1IQTF0037WTG AC1): local
+admission must never issue a synchronous ``/slots`` call, so it ages this
+cache instead. Its freshness stamp is ``_last_slot_details_at``.
+"""
+
+
+_last_slot_details_at: float = 0.0
+"""``time.monotonic()`` stamp of the last successful ``/slots`` snapshot.
+
+Set only when a fresh ``/slots`` query populated
+``_last_slot_details_cache`` (never when the last-known cache is reused), so
+``proxy.residency`` can age the measurement and fail open when it is stale.
 """
 
 
@@ -1879,9 +1893,16 @@ def _resolve_slot_details_for_enrichment(slot_details: list[dict] | None) -> lis
 
     The cache list object is preserved (slice assignment) so any module
     holding a reference to it keeps observing updates.
+
+    The snapshot's freshness stamp (``_last_slot_details_at``) is refreshed
+    only on a successful fresh query, so a stale cache keeps ageing and
+    ``proxy.residency`` can fail open instead of denying local on old data
+    (LP-0MVN1IQTF0037WTG AC1).
     """
     if slot_details:
+        global _last_slot_details_at
         _last_slot_details_cache[:] = [dict(s) for s in slot_details]
+        _last_slot_details_at = time.monotonic()
     return [dict(s) for s in _last_slot_details_cache]
 
 

@@ -178,6 +178,15 @@ def reserve(
     except (TypeError, ValueError):
         cached_ratio = 0.0
     session_id = body.get("session_id") or None
+    # Live-prefix agreement with the admission guard (LP-0MVN1IQTF0037WTG
+    # AC1/AC3): when the residency view carries a *measured* reusable prefix
+    # for this session it wins over the caller's prediction, so
+    # ``POST /llama/local/reserve`` and ``_should_skip_local`` price the same
+    # prefill from the same facts. Fail-open: no fresh view / no measurement
+    # leaves today's body-supplied ratio untouched.
+    cached_ratio, cached_ratio_source = _resolve_cached_ratio(
+        cached_ratio, session_id, estimated_tokens
+    )
     priority = body.get("priority") or None
     try:
         ttl = int(body.get("ttl_seconds", DEFAULT_RESERVE_TTL_SECONDS))
@@ -222,6 +231,8 @@ def reserve(
             "queue_eta_s": round(projected, 1),
             "budget_s": round(float(decision.budget_seconds or 0.0), 1),
             "retry_after_s": retry_after,
+            "cached_ratio": round(cached_ratio, 4),
+            "cached_ratio_source": cached_ratio_source,
         }
 
     if dry_run:
@@ -236,6 +247,8 @@ def reserve(
                 else None
             ),
             "busy_slots": decision.busy_slots,
+            "cached_ratio": round(cached_ratio, 4),
+            "cached_ratio_source": cached_ratio_source,
         }
 
     ticket_id = _new_ticket_id()
@@ -268,7 +281,40 @@ def reserve(
         "reservation_id": ticket_id,
         "projected_wait_s": round(projected, 1),
         "ttl_s": ttl,
+        "cached_ratio": round(cached_ratio, 4),
+        "cached_ratio_source": cached_ratio_source,
     }
+
+
+def _resolve_cached_ratio(
+    body_ratio: float, session_id: str | None, estimated_tokens: int
+) -> tuple[float, str]:
+    """Price the reusable prefix from the live residency view when possible.
+
+    Returns ``(cached_ratio, source)`` where *source* is ``"live"`` when the
+    cached ``/slots`` snapshot measured a reusable prefix for *session_id*,
+    else ``"body"`` (the caller's own ``cached_ratio``) or ``"none"`` when
+    the body carried no ratio at all.
+
+    Fail-open by construction: an unknown/stale view, a session that owns no
+    slot, or a slot that did not report ``context_tokens`` all leave the
+    caller's ratio in place (LP-0MVN1IQTF0037WTG AC1 fallback ladder).
+    """
+    if not session_id or estimated_tokens <= 0:
+        return body_ratio, ("body" if body_ratio > 0.0 else "none")
+    try:
+        from proxy.residency import get_residency_view
+
+        view = get_residency_view()
+        if not view.known:
+            return body_ratio, ("body" if body_ratio > 0.0 else "none")
+        context_tokens = view.context_tokens_for_session(session_id)
+    except Exception:
+        return body_ratio, ("body" if body_ratio > 0.0 else "none")
+    if context_tokens is None:
+        return body_ratio, ("body" if body_ratio > 0.0 else "none")
+    reusable = min(int(context_tokens), int(estimated_tokens))
+    return min(1.0, max(0.0, reusable / float(estimated_tokens))), "live"
 
 
 # ---------------------------------------------------------------------------
