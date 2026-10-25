@@ -176,11 +176,31 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
     """
     try:
         import proxy.server as _srv
-        from proxy.router_helpers import _release_local_dispatch
+        from proxy.router_helpers import (
+            _dispatch_lease_key,
+            _emit_eviction_after_acceptance,
+            _release_local_dispatch,
+        )
+
+        # LP-0MVN4LCED00661MX AC1 (``slot_assignment_freed``): capture the
+        # record BEFORE the release so a slot released after a session
+        # eviction can still be reported as a post-acceptance eviction when it
+        # had not served a first byte (the emitter classifies by the record's
+        # ``first_byte_seen`` flag, so normal churn stays quiet).
+        released_record = None
+        try:
+            records = getattr(_srv, "local_dispatch_records", None)
+            if records is not None:
+                released_record = records.get(_dispatch_lease_key(None, session_id))
+        except Exception:
+            released_record = None
         await _release_local_dispatch(_srv, session_id)
         logger.info(
             "lease_released session=%s reason=session_evicted",
             session_id if session_id else "unknown",
+        )
+        _emit_eviction_after_acceptance(
+            _srv, session_id, "slot_assignment_freed", released_record
         )
     except Exception:
         logger.exception(

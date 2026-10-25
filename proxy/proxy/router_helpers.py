@@ -1644,12 +1644,16 @@ async def _increment_local_active_queries(
                         "active": True,
                         "expires_at": time.monotonic() + lease_timeout,
                         "model_name": model_name,
+                        "endpoint": backend,
                         # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
                         # A record that never makes progress is bounded by
                         # ``local_dispatch_no_progress_timeout_seconds`` from
                         # creation (no waiting on an unobservable signal).
                         "last_progress": 0,
                         "last_progress_ts": time.monotonic(),
+                        # LP-0MVN4LCED00661MX AC2: the admission evidence the
+                        # post-acceptance eviction ERROR reports.
+                        **_dispatch_evidence(body_json, model_name, session_key),
                     }
         except Exception:
             pass
@@ -2168,6 +2172,104 @@ def _record_local_eviction(
     return plan is not None
 
 
+def _dispatch_evidence(
+    body_json: dict | None,
+    model_name: str | None,
+    session_key: str | None,
+) -> dict:
+    """Accepted-dispatch evidence for the post-acceptance eviction event.
+
+    LP-0MVN4LCED00661MX AC2: the eviction ERROR must carry the numbers the
+    admission model used, so a defect is diagnosable without log archaeology.
+    Captured ONCE at record creation (cheap, best-effort) and never recomputed
+    on release — the values must describe the decision that admitted the
+    dispatch, not the state at eviction.
+    """
+    evidence: dict = {
+        "estimated_tokens": 0,
+        "cached_ratio": 0.0,
+        "new_tokens": 0,
+        "eta_prefill_s": None,
+        "slot_id": None,
+        "llama_task_id": None,
+        "first_byte_seen": False,
+    }
+    try:
+        if isinstance(body_json, dict) and body_json:
+            from proxy.lifecycle import _estimate_prompt_tokens
+
+            estimated = int(_estimate_prompt_tokens(body_json) or 0)
+            evidence["estimated_tokens"] = max(0, estimated)
+            ratio = 0.0
+            try:
+                from proxy.provider import _get_cached_ratio
+
+                ratio = float(_get_cached_ratio(model_name, session_key) or 0.0)
+            except Exception:
+                ratio = 0.0
+            ratio = min(1.0, max(0.0, ratio))
+            evidence["cached_ratio"] = ratio
+            evidence["new_tokens"] = max(0, int(round(estimated * (1.0 - ratio))))
+            try:
+                from proxy import prefill_eta
+
+                eta, _ = prefill_eta.estimate_prefill_seconds(
+                    model_name, estimated, ratio
+                )
+                evidence["eta_prefill_s"] = float(eta)
+            except Exception:
+                evidence["eta_prefill_s"] = None
+    except Exception:
+        pass
+    return evidence
+
+
+def mark_local_first_byte(srv, session_key: str | None, endpoint: str | None = None) -> None:
+    """Flag the session's dispatch record as having served a first byte (AC3).
+
+    After this the dispatch is no longer "accepted and unserved", so a later
+    release is normal churn and must NOT be reported as an eviction error.
+    Best-effort: a missing record or lock is a no-op.
+    """
+    try:
+        key = _dispatch_lease_key(endpoint, session_key)
+        records = getattr(srv, "local_dispatch_records", None)
+        if records is None:
+            return
+        record = records.get(key)
+        if record is None:
+            # Legacy string-key form (pre per-endpoint keys).
+            record = records.get(session_key) if session_key else None
+        if record is not None:
+            record["first_byte_seen"] = True
+    except Exception:
+        pass
+
+
+def _emit_eviction_after_acceptance(
+    srv,
+    session_key: str | None,
+    reason: str,
+    record: dict | None,
+    *,
+    endpoint: str | None = None,
+) -> bool:
+    """Report an accepted-and-unserved dispatch release (AC1/AC7).
+
+    Thin wrapper over :func:`proxy.admission_events.record_eviction_after_acceptance`
+    so the six release paths share one call shape. Never raises: an eviction
+    path is already an exceptional path.
+    """
+    try:
+        from proxy.admission_events import record_eviction_after_acceptance
+
+        return record_eviction_after_acceptance(
+            srv, session_key, reason, record, endpoint=endpoint
+        )
+    except Exception:
+        return False
+
+
 async def _try_acquire_local_dispatch(
     srv,
     max_local: int,
@@ -2364,9 +2466,12 @@ async def _try_acquire_local_dispatch(
                     "active": True,
                     "expires_at": now + lease_timeout,
                     "model_name": model_name,
+                    "endpoint": backend,
                     # LP-0MUCEFB8E003YVFF: no-progress watchdog baseline.
                     "last_progress": 0,
                     "last_progress_ts": now,
+                    # LP-0MVN4LCED00661MX AC2: admitted-dispatch evidence.
+                    **_dispatch_evidence(body_json, model_name, session_key),
                 }
                 # Register prefill hold for the prefill-aware guard.
                 try:
@@ -2510,16 +2615,19 @@ async def _release_prefill_deadline_dispatch(
     if not session_key:
         return False
     removed = False
+    released_record = None
     record_key = _dispatch_lease_key(endpoint, session_key)
     try:
         async with srv.local_dispatch_records_lock:
             if record_key in srv.local_dispatch_records:
-                del srv.local_dispatch_records[record_key]
+                released_record = srv.local_dispatch_records.pop(record_key)
                 removed = True
             elif endpoint and (endpoint, session_key) in srv.local_dispatch_records:
                 # Belt-and-braces: tuple-key form for callers that pass the
                 # endpoint directly (mirrors ``_release_local_dispatch``).
-                del srv.local_dispatch_records[(endpoint, session_key)]
+                released_record = srv.local_dispatch_records.pop(
+                    (endpoint, session_key)
+                )
                 removed = True
             if removed:
                 try:
@@ -2560,6 +2668,16 @@ async def _release_prefill_deadline_dispatch(
             session_key,
             endpoint=endpoint,
             reason="lease_evicted",
+        )
+        # LP-0MVN4LCED00661MX AC1: an ACCEPTED dispatch cancelled by the
+        # deadline before its first byte is the defect signal the whole
+        # budget/pricing model exists to prevent — reported at ERROR.
+        _emit_eviction_after_acceptance(
+            srv,
+            session_key,
+            "prefill_deadline",
+            released_record,
+            endpoint=endpoint,
         )
         try:
             from proxy.contention_queue import wake
@@ -2710,6 +2828,7 @@ def _release_client_disconnect_dispatch(
 
     removed = False
     stream_cm = None
+    released_record = None
     records = getattr(srv, "local_dispatch_records", None)
     if records is not None:
         try:
@@ -2721,6 +2840,7 @@ def _release_client_disconnect_dispatch(
             for key in keys:
                 record = records.pop(key, None)
                 if isinstance(record, dict):
+                    released_record = record
                     stream_cm = record.get("stream_cm")
                     removed = True
                     break
@@ -2758,6 +2878,15 @@ def _release_client_disconnect_dispatch(
             session_key,
             endpoint=endpoint,
             reason="lease_evicted",
+        )
+        # LP-0MVN4LCED00661MX AC1 (``lease_evicted``): an accepted dispatch
+        # whose lease was reclaimed before the first byte.
+        _emit_eviction_after_acceptance(
+            srv,
+            session_key,
+            "lease_evicted",
+            released_record,
+            endpoint=endpoint,
         )
         try:
             from proxy.session import _free_slot_assignment
@@ -2960,6 +3089,9 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     stream_cm = record.pop("stream_cm", None)
                     del srv.local_dispatch_records[sid]
                     removed += 1
+                    # LP-0MVN4LCED00661MX AC1: the record is captured before
+                    # deletion so the eviction event carries its evidence.
+                    released_record = dict(record)
                     # Decrement counter while still under the lock for
                     # atomicity (LP-0MUCEFB8E003YVFF).
                     try:
@@ -2979,7 +3111,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         pass
                     # Deferred: free slot assignment and preflight tracking
                     # after the lock, and close the upstream stream.
-                    deferred_watchdog.append((sid, session_key, endpoint_from_record, stream_cm))
+                    deferred_watchdog.append(
+                        (
+                            sid,
+                            session_key,
+                            endpoint_from_record,
+                            stream_cm,
+                            released_record,
+                        )
+                    )
                     continue
 
                 expires_at = record.get("expires_at", 0)
@@ -2988,6 +3128,7 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 
                 if not active:
                     # Normal idle timeout for inactive records
+                    idle_record = dict(record)
                     del srv.local_dispatch_records[sid]
                     removed += 1
                     # LP-0MVN1IQTF0037WTG AC6: record the eviction and plan
@@ -3016,6 +3157,17 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 
                     except Exception:
                         pass
+                    # LP-0MVN4LCED00661MX AC1 (``idle_timeout``): classified by
+                    # the record's ``first_byte_seen`` flag, NOT by this path —
+                    # an inactive record that already served its response is
+                    # normal churn and is suppressed by the emitter (AC3).
+                    _emit_eviction_after_acceptance(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        "idle_timeout",
+                        idle_record,
+                        endpoint=_endpoint_from_record(record),
+                    )
                     try:
                         srv.logger.info(
                             "lease_released session=%s reason=idle_timeout endpoint=%s",
@@ -3135,6 +3287,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         endpoint=_endpoint_from_record(record),
                         reason="lease_evicted",
                     )
+                    # LP-0MVN4LCED00661MX AC1 (``orphan_cleanup``): the orphan
+                    # sweep released an accepted dispatch with no live slot.
+                    _emit_eviction_after_acceptance(
+                        srv,
+                        _dispatch_key_session_id(sid),
+                        "orphan_cleanup",
+                        record,
+                        endpoint=_endpoint_from_record(record),
+                    )
                     # Free the slot registry entry so the slot can be
                     # reused by a new session (LP-0MSB0RP7F000U0WJ)
                     try:
@@ -3174,7 +3335,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
     # LP-0MUGQHPJ50046LV8: close upstream streams for watchdog-released
     # records and free their slot assignments (deferred past the lock).
     if deferred_watchdog:
-        for sid, session_key, endpoint_from_record, stream_cm in deferred_watchdog:
+        for (
+            sid,
+            session_key,
+            endpoint_from_record,
+            stream_cm,
+            released_record,
+        ) in deferred_watchdog:
             try:
                 # Close the upstream httpx stream to cancel the in-flight
                 # request so the llama-server slot is actually freed.
@@ -3196,6 +3363,15 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 session_key,
                 endpoint=endpoint_from_record,
                 reason="tenancy_lease_expired",
+            )
+            # LP-0MVN4LCED00661MX AC1 (``no_progress_watchdog``): the watchdog
+            # released an accepted dispatch that never produced a first byte.
+            _emit_eviction_after_acceptance(
+                srv,
+                session_key,
+                "no_progress_watchdog",
+                released_record,
+                endpoint=endpoint_from_record,
             )
             try:
                 from proxy.session import _free_slot_assignment
