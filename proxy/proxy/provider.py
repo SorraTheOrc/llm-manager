@@ -2887,6 +2887,7 @@ def _evaluate_idle_admission_override(
     config: dict,
     provider_cfg: dict,
     estimated_tokens: int,
+    cached_ratio: float = 0.0,
 ) -> dict | None:
     """Decide whether idle local capacity should serve a bypassed request.
 
@@ -2897,9 +2898,18 @@ def _evaluate_idle_admission_override(
     blocker, a decision dict is returned; otherwise ``None`` (today's
     behaviour, byte-for-byte).
 
+    An idle GPU is NOT permission to start a doomed prefill
+    (LP-0MVN4LBZ500281Z7 AC3c): the shared
+    :func:`proxy.prefill_eta.evaluate_admission` cold-prefill budget is
+    consulted through this one implementation (never a second copy of the
+    budget maths). When it refuses, the returned dict carries
+    ``admitted: False`` plus the refusal ``reason`` so the caller can keep
+    skipping local and log the refusal as attributable — silent routing as if
+    idle capacity were blocked would hide the budget doing its job.
+
     Returns:
-        ``{"reason", "idle_seconds", "threshold_seconds"}`` when the request
-        should be admitted locally, else ``None``.
+        ``{"admitted", "reason", "idle_seconds", "threshold_seconds",
+        "guard_reason"}`` when idle capacity applies, else ``None``.
     """
     try:
         server_config = config.get("server", config) if isinstance(config, dict) else {}
@@ -2921,13 +2931,72 @@ def _evaluate_idle_admission_override(
         idle_seconds = local_idle_seconds()
         if idle_seconds < threshold:
             return None
+        admission = _idle_admission_budget_verdict(
+            config, provider_cfg, estimated_tokens, cached_ratio
+        )
         return {
+            "admitted": admission is None or bool(admission.admit),
             "reason": IDLE_ADMIT_REASON,
             "idle_seconds": idle_seconds,
             "threshold_seconds": threshold,
+            "guard_reason": admission.reason if admission is not None else None,
+            "guard_decision": admission,
         }
     except Exception:
         logger.debug("idle admission evaluation failed", exc_info=True)
+        return None
+
+
+def _idle_admission_budget_verdict(
+    config: dict,
+    provider_cfg: dict,
+    estimated_tokens: int,
+    cached_ratio: float,
+):
+    """Run the shared cold-prefill admission guard for the idle bypass path.
+
+    Returns the :class:`proxy.prefill_eta.AdmissionDecision` when the guard
+    actually refused (so the caller can log it and keep skipping local), else
+    ``None`` — an inert guard or an admitted verdict leaves the idle bypass
+    behaviour byte-for-byte unchanged (LP-0MVN4LBZ500281Z7 AC3c/AC8).
+    """
+    try:
+        from proxy import prefill_eta
+
+        if estimated_tokens <= 0:
+            return None
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        guard_cfg = prefill_eta.resolve_config(server_cfg)
+        if guard_cfg.policy == prefill_eta.POLICY_OFF:
+            return None
+        # Only the cold-prefill budget and its deadline-relative sibling are
+        # consulted here: the idle bypass exists precisely because the
+        # occupancy/queue bounds do not apply to an idle GPU.
+        if (
+            guard_cfg.cold_prefill_budget_tokens <= 0
+            and guard_cfg.budget_safety_fraction <= 0.0
+        ):
+            return None
+        model_name = provider_cfg.get("llama_model", "") if isinstance(
+            provider_cfg, dict
+        ) else ""
+        decision = prefill_eta.evaluate_admission(
+            config, model_name, estimated_tokens, cached_ratio, "medium"
+        )
+        if decision.admit or not decision.active:
+            return None
+        prefill_eta.record_guard_decision(
+            decision,
+            provider=(
+                provider_cfg.get("name") if isinstance(provider_cfg, dict) else None
+            ),
+            model=model_name,
+            priority="medium",
+            free_slot=False,
+        )
+        return decision
+    except Exception:
+        logger.debug("idle admission budget verdict failed", exc_info=True)
         return None
 
 
@@ -6115,9 +6184,11 @@ async def _prefill_admission_guard(
         guard_cfg = prefill_eta.resolve_config(server_cfg)
         if guard_cfg.policy == prefill_eta.POLICY_OFF:
             return None
-        if prefill_eta.wait_budget_seconds(config, priority) <= 0:
-            # ``high`` priority never queues, so there is no budget to guard.
-            return None
+        # NOTE (LP-0MVN4LBZ500281Z7): no early return on a zero wait budget.
+        # ``high`` priority has no queue budget, but the cold-prefill budget
+        # prices GPU COMPUTE and must still bind; ``evaluate_admission``
+        # returns ``no_budget`` (inert) for the wait bound on its own, so the
+        # pre-existing never-queue semantics are preserved.
         model_name = (
             provider_cfg.get("llama_model", "")
             if isinstance(provider_cfg, dict)
@@ -6152,10 +6223,16 @@ async def _prefill_admission_guard(
         # For the deadline refusal keep the decision's own reason so the
         # log reason is ``prefill_eta_exceeds_deadline`` on both paths
         # (LP-0MVKUKEU80022C3U AC1).  The budget refusal still gets the
-        # queue/direct suffix.
+        # queue/direct suffix.  The cold-prefill budget and its
+        # deadline-relative sibling keep their own reasons too
+        # (LP-0MVN4LBZ500281Z7 AC7).
         log_label = reason_label
         if reason_label and str(decision.reason).startswith(
-            "prefill_eta_exceeds_deadline"
+            (
+                "prefill_eta_exceeds_deadline",
+                "prefill_eta_exceeds_safety_budget",
+                "prefill_budget_exceeded",
+            )
         ):
             log_label = decision.reason
         prefill_eta.record_guard_decision(
@@ -9837,8 +9914,49 @@ async def _proxy_with_fallback_cycle(
                 # (``IDLE_OVERRIDABLE_SKIP_REASONS``).
                 if _skip_local and _skip_reason in IDLE_OVERRIDABLE_SKIP_REASONS:
                     _idle_admit = _evaluate_idle_admission_override(
-                        config, provider_cfg, _estimated_tokens
+                        config,
+                        provider_cfg,
+                        _estimated_tokens,
+                        _routing_cached_ratio,
                     )
+                    if _idle_admit is not None and not _idle_admit.get(
+                        "admitted", True
+                    ):
+                        # Idle capacity is available but the shared cold-prefill
+                        # budget refused the dispatch (LP-0MVN4LBZ500281Z7
+                        # AC3c/AC7): keep skipping local and log the refusal so
+                        # it is attributable, not silently mistaken for an idle
+                        # block.
+                        logger.info(
+                            "routing_idle_admit_refused provider=%s model=%s "
+                            "reason=%s idle_seconds=%.1f "
+                            "threshold_seconds=%.1f estimated_tokens=%d "
+                            "new_tokens=%d cached_ratio=%.2f cache_state=%s "
+                            "session=%s",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _idle_admit.get("guard_reason")
+                            or "prefill_budget_exceeded",
+                            _idle_admit["idle_seconds"],
+                            _idle_admit["threshold_seconds"],
+                            _estimated_tokens,
+                            _routing_new_tokens,
+                            _routing_cached_ratio,
+                            _routing_cache_state,
+                            _session_id or "unknown",
+                        )
+                        _record_attempt(
+                            attempts,
+                            provider=provider_name,
+                            type=provider_type,
+                            status="idle_admit_refused",
+                            reason=_idle_admit.get("guard_reason")
+                            or "prefill_budget_exceeded",
+                            estimated_tokens=_estimated_tokens,
+                            idle_seconds=round(_idle_admit["idle_seconds"], 1),
+                            threshold_seconds=_idle_admit["threshold_seconds"],
+                        )
+                        _idle_admit = None
                     if _idle_admit is not None:
                         logger.info(
                             "routing_idle_admit provider=%s model=%s "

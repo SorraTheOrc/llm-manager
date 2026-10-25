@@ -297,22 +297,31 @@ def test_rollback_set_is_documented_in_config_and_docs():
 
 
 # ---------------------------------------------------------------------------
-# AC5: no admission-decision change yet
+# AC5: no admission-decision change in THIS child
 # ---------------------------------------------------------------------------
 
-def test_budget_key_does_not_change_the_admission_decision_yet():
-    """The decision logic is a sibling child's job — this child only ships knobs.
+def test_shipped_config_resolves_every_new_knob():
+    """The knobs this child ships are all reachable through ``resolve_config``.
 
-    A 40k cold prompt priced below the deadline is still admitted even though
-    it exceeds the 25k budget: enforcing the cap is LP-0MVN4LBZ500281Z7.
-    """
-    for _ in range(6):
-        prefill_eta.record_dispatch_sample("Qwen3", 40_000, 0.0, 20_000.0)
-    config = _shipped_config()
+The *enforcement* of the budget is LP-0MVN4LBZ500281Z7's scope (its
+``test_cold_prefill_budget.py`` owns the behaviour), so this test stays on
+the configuration surface: every value the operator sets is resolved, and
+none is silently ignored by the resolver.
+"""
+    guard = prefill_eta.resolve_config(_shipped_config())
 
-    decision = prefill_eta.evaluate_admission(
-        config, "Qwen3", 40_000, 0.0, priority="medium"
+    assert guard.cold_prefill_budget_tokens == SHIPPED[
+        "local_cold_prefill_budget_tokens"
+    ]
+    assert guard.eta_percentile_min_tokens == SHIPPED[
+        "local_admission_guard_eta_percentile_min_tokens"
+    ]
+    assert guard.budget_safety_fraction == pytest.approx(
+        SHIPPED["local_admission_guard_budget_safety_fraction"]
     )
-
-    assert decision.admit is True
-    assert decision.reason == "within_budget"
+    assert guard.prefill_deadline_seconds == pytest.approx(
+        SHIPPED["local_prefill_deadline_seconds"]
+    )
+    assert guard.reference_tokens == SHIPPED[
+        "local_admission_guard_reference_tokens"
+    ]
