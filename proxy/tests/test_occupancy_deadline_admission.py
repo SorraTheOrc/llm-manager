@@ -190,7 +190,13 @@ def test_remaining_seconds_excludes_the_requesting_session():
             "other": _occupant_record(eta=12.0, started_ago=0.0),
         }
     )
-    assert _live_prefill_remaining_seconds(srv, exclude_session="s-1") == pytest.approx(12.0)
+    # ``abs`` tolerance: the helper subtracts the real monotonic elapsed time
+    # since each record's ``started_ago=0.0`` timestamp, so the measured value
+    # is a few microseconds below the nominal ETA (12.0). The default relative
+    # tolerance (1e-6) is tighter than that drift and failed intermittently.
+    assert _live_prefill_remaining_seconds(srv, exclude_session="s-1") == pytest.approx(
+        12.0, abs=0.5
+    )
 
 
 def test_remaining_seconds_scopes_to_endpoint_when_known():
@@ -203,9 +209,14 @@ def test_remaining_seconds_scopes_to_endpoint_when_known():
             "legacy": _occupant_record(eta=5.0, started_ago=0.0, endpoint=None),
         }
     )
+    # 10 (scoped) + 5 (legacy, unscoped). ``abs`` tolerance because the helper
+    # subtracts the real monotonic elapsed time since each record's
+    # ``started_ago=0.0`` timestamp: three sequential record constructions plus
+    # the call itself already consume tens of microseconds, which exceeded the
+    # default relative tolerance (1e-6) and made this assertion flaky.
     assert (
         _live_prefill_remaining_seconds(srv, endpoint="http://a:8080")
-        == pytest.approx(15.0)  # 10 (scoped) + 5 (legacy, unscoped)
+        == pytest.approx(15.0, abs=0.5)
     )
 
 
