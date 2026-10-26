@@ -318,7 +318,12 @@ entry is a local runtime edit, not a committed artifact.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the
    authoritative `tokens=prompt/completion/total` from `Stream finished`
-   lines (payloads in logs are truncated and never used for sizes).
+   lines (payloads in logs are truncated and never used for sizes). Local
+   streams report real measured usage since LP-0MVMHNVKT003PRIK (see
+   [Local token reporting and the cold-cache cap](#local-token-reporting-and-the-cold-cache-cap)),
+   and per-model token totals are attributed to the provider/model stamped on
+   each `Stream finished` line — the one that actually served that stream —
+   rather than to the session's initial provider.
 4. **Local model utilization (busy time)** — local `Stream started` /
    `Stream finished` events are collected across the analysis's effective
    margin beyond the window (48h, shared with the mode timeline in step 5;
@@ -475,7 +480,12 @@ entry is a local runtime edit, not a committed artifact.
    logic (mode timeline → `server.priority_window` → slot schedule),
    unattributed streams excluded or documented), and a by-model
    sub-table (one row per `provider/model`, absolute + %, sorted by Total desc;
-   unknown provider/model renders as the `(unknown)` placeholder).
+   unknown provider/model renders as the `(unknown)` placeholder). The section
+   also states the **measured-usage coverage** — how many `Stream finished`
+   lines carried `tokens=` and how many did not, split by provider — so
+   "size unknown" is visible instead of being silently counted as zero
+   (`streams_with_usage` / `streams_without_usage` /
+   `streams_without_usage_by_provider` in the JSON summary).
 7. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
 8. **Error taxonomy** — error events (`Stream finished: reason=error`,
@@ -545,6 +555,50 @@ entry is a local runtime edit, not a committed artifact.
    `empty_window_reasons` when the window is empty). The per-session CSV
    `decode_tok_s` column is derived from proxy.log instead (local completion
    tokens ÷ local active span) and stays empty when not derivable.
+
+### Local token reporting and the cold-cache cap
+
+Local streams report **measured** usage since LP-0MVMHNVKT003PRIK. Before that
+change, 0 of ~225 local `Stream finished` lines in a 24h window carried
+`tokens=`, so local prompt sizes were unknown, the per-model token table
+attributed local tokens only via sessions whose *initial* provider was local,
+and the usage-driven cache-credit path (`update_cached_ratio` /
+`record_prompt_prefix` in `proxy/provider.py`) could never fire for local.
+
+The proxy now adds `stream_options: {"include_usage": true}` to local
+streaming requests, so llama-server returns its OpenAI-compatible `usage`
+block (`prompt_tokens`, `completion_tokens`, `total_tokens`,
+`prompt_tokens_details.cached_tokens`). Two log-format details matter when
+reading the logs:
+
+- llama-server emits the usage block in a **separate chunk after** the
+  `finish_reason` chunk, so the proxy defers the `Stream finished` line by one
+  chunk and emits it as
+  `Stream finished: reason=<r> tokens=<p>/<c>/<t> session=<uuid> provider=local model=<m>`.
+  A stream that never delivers usage (client disconnect, aborted prefill)
+  still logs exactly one terminal line, without `tokens=`.
+- When the client did not ask for usage itself, the usage-only chunk is not
+  forwarded, so the client-visible SSE stream is unchanged. Buffered
+  (non-streaming) local replies log the same terminal line with an extra
+  `stream=false` marker; it carries measured tokens but is **not** paired with
+  a `Stream started` (there is none), so it never perturbs busy/decode/first-byte
+  statistics.
+
+**Cold-cache cap semantics.** Two independent limits guard local routing
+(`_should_skip_local` in `proxy/provider.py`):
+
+- the **cold cap** (`local_large_context_cold_cache_threshold`, 38K by default)
+  bounds the **new (uncached) tokens** — `new_tokens = estimated_tokens ×
+  (1 − cached_ratio)`. With a measured previous turn, `cached_ratio` reflects
+  the reusable prefix, so a 40K-total turn whose only ~10K tokens are new is
+  still admitted;
+- the **warm cap** (`local_large_context_warm_cache_threshold`) bounds **total
+  context** regardless of cache warmth, and the per-entry
+  `max_context_tokens` can only tighten it.
+
+Measured usage makes the first limit honest: a turn whose measurement is
+missing is priced as fully cold (`cached_ratio = 0.0`), which is what pushed
+large-context sessions permanently onto remote providers.
 
 ## Interpreting the report
 
@@ -649,10 +703,13 @@ entry is a local runtime edit, not a committed artifact.
   `local_prefill_deadline_seconds` versus projected prefill ETA).
 - **Total tokens**: Input + Output + Total (prompt + completion summed from
   `tokens=prompt/completion/total` on `Stream finished` lines; streams without
-  `tokens=` contribute `0`). Check the per-bucket and per-model tables in the
-  **Total tokens** section — all shares are of the same grand total, so
-  fast% + cheap% = 100% and model %s sum to 100%. A large Input / Output
-  disparity can reveal long-prompt sessions driving capacity pressure.
+  `tokens=` contribute `0` and are counted in the section's
+  **Streams without usage** line, split by provider — a non-zero local entry
+  means that stream predates measured local usage or was aborted). Check the
+  per-bucket and per-model tables in the **Total tokens** section — all shares
+  are of the same grand total, so fast% + cheap% = 100% and model %s sum to
+  100%. A large Input / Output disparity can reveal long-prompt sessions
+  driving capacity pressure.
 - **Fast vs cheap**: a large fallback-rate gap between buckets suggests the
   profile under-serves one period. Read the `## Priority window timeline &
   restarts` note first: it states whether the split came from the mode

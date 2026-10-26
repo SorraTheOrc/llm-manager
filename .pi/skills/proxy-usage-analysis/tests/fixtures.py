@@ -71,6 +71,26 @@ STREAM_FINISHED_LOCAL = (
     "provider=local model=Qwen3 request=[{'type': 'text', 'text': '/plan SA-0MSAS108O009DYKT'}]"
 )
 
+# --- Measured local usage (LP-0MVMHNVKT003PRIK) -----------------------------
+#
+# Local streams now report llama-server's usage block, so ``Stream finished``
+# lines carry real ``tokens=prompt/completion/total``. Buffered (non-streaming)
+# local replies carry the same payload plus ``stream=false`` so consumers can
+# keep them out of stream/busy pairing while still using the measured counts.
+
+STREAM_FINISHED_LOCAL_MEASURED = (
+    "2026-08-02 14:00:12,000 - INFO - Stream finished: reason=stop "
+    "tokens=30000/200/30200 session=019fc284-dcb8-74ca-9a64-9306b6f9d286 "
+    "provider=local model=Qwen3 request=[{'type': 'text', 'text': 'explain the router'}]"
+)
+
+STREAM_FINISHED_LOCAL_NON_STREAM = (
+    "2026-08-02 14:05:00,000 - INFO - Stream finished: reason=stop "
+    "tokens=31000/150/31150 stream=false "
+    "session=019fc284-dcb8-74ca-9a64-9306b6f9d286 provider=local model=Qwen3"
+)
+
+
 # --- Prefill TTFT lines (real /var/log/llama-proxy/proxy.log lines) --------
 #
 # Local requests log ``dispatch_first_byte_ms`` (dispatch → first byte, the

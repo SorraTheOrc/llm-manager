@@ -527,7 +527,12 @@ def build_report(
     ap(
         "- Sessions are identified by their session UUID; context/response sizes use the "
         "authoritative per-request `tokens=prompt/completion/total` from `Stream finished` lines "
-        "(log-line payloads are truncated and are never used for sizes)."
+        "(log-line payloads are truncated and are never used for sizes). Local streams report "
+        "llama-server's measured usage since LP-0MVMHNVKT003PRIK (the proxy requests "
+        "`stream_options.include_usage`), so local prompt sizes and per-model local tokens are "
+        "measured rather than inferred from the session's initial provider. Logs written before "
+        "that change carry no `tokens=` for local streams; the count of terminal lines without "
+        "usage is reported in the **Total tokens** section rather than silently treated as zero."
     )
     ap(
         "- A session is included when it has at least one `Stream started` inside the window; "
@@ -1904,9 +1909,37 @@ def _append_total_tokens_section(ap, summary) -> None:
        "``tokens=prompt/completion/total`` on ``Stream finished`` lines.  "
        "Input = sum(prompt), Output = sum(completion), Total = Input + Output.  "
        "Shares are of the grand Total Tokens, so standard% + low% = 100% and model "
-       "%s sum to 100%.  Streams without ``tokens=`` contribute ``0``; sessions "
-       "without a bucket (unattributed) are excluded from the bucket share.")
+       "%s sum to 100%.  Streams without ``tokens=`` contribute ``0`` and are "
+       "counted below; sessions without a bucket (unattributed) are excluded from "
+       "the bucket share.")
     ap("")
+    # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): local streams report
+    # llama-server's usage block since this work item (the proxy requests
+    # ``stream_options.include_usage``), so real local prompt sizes are
+    # measurable. A non-zero count means some terminal lines still carry no
+    # usage (older rotated logs, providers that omit it, aborted streams).
+    without = getattr(summary, "streams_without_usage", 0)
+    measured = getattr(summary, "streams_finished", 0)
+    total_finished = measured + without
+    if total_finished:
+        by_provider = getattr(summary, "streams_without_usage_by_provider", None) or {}
+        provider_part = ""
+        if without:
+            provider_part = " (" + ", ".join(
+                f"{provider} {count}"
+                for provider, count in sorted(by_provider.items())
+            ) + ")"
+        ap(
+            f"Measured usage: **{measured:,} of {total_finished:,}** "
+            f"``Stream finished`` lines carry ``tokens=``."
+        )
+        ap("")
+        ap(
+            f"Streams without usage: **{without:,}**{provider_part}. Their "
+            "context/response sizes are unknown (not zero) and are excluded "
+            "from the token totals and the local prompt-size figures."
+        )
+        ap("")
     ap("| Kind | Count | % of total |")
     ap("|---|---|---|")
     ap(f"| Input (prompt) | {_fmt_tokens(grand_input)} | {_pct(grand_input, grand_total):.1f}% |")
@@ -1930,9 +1963,14 @@ def _append_total_tokens_section(ap, summary) -> None:
     ap("")
     ap("### Tokens — by model")
     ap("")
-    ap("Grouped by the session's initial ``(provider, model)`` (same grouping as "
-       "the Per-model breakdown), sorted by Total desc; unknown provider/model "
-       "render as the placeholder ``(unknown)``.")
+    ap("Grouped by the ``(provider, model)`` stamped on each ``Stream finished`` "
+       "line — the provider/model that actually served the stream — sorted by "
+       "Total desc; unknown provider/model render as the placeholder "
+       "``(unknown)``. A session that starts local and falls back to a remote "
+       "provider therefore splits its tokens across both instead of piling them "
+       "onto its initial provider (LP-0MVMHNVKT003PRIK). Local rows are real "
+       "measured prompt/completion counts, so they can be compared against "
+       "remote rows.")
     ap("")
     if grand_total == 0:
         ap("_No tokens in window._")
@@ -2517,6 +2555,13 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         ),
         "dispatch_denied": summary.dispatch_denied_count,
         "unattributed_events": summary.unattributed_events,
+        # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): terminal lines with
+        # measured token counts vs. terminal lines with none (unknown, not zero).
+        "streams_with_usage": getattr(summary, "streams_finished", 0),
+        "streams_without_usage": getattr(summary, "streams_without_usage", 0),
+        "streams_without_usage_by_provider": dict(
+            getattr(summary, "streams_without_usage_by_provider", None) or {}
+        ),
         "hold_cycle_routing_skip_events": summary.hold_cycle_reemission_count,
         "provider_context_skips": provider_context_skips_json(summary, mode_map),
         "standard_sessions": sum(1 for s in sessions if s.bucket != "cheap"),

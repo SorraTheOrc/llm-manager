@@ -137,6 +137,9 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _schedule_traffic_recording,
     _spawn_detached_release,
     _try_acquire_local_dispatch,
+    flush_pending_stream_finish,
+    is_usage_only_chunk,
+    log_non_stream_usage,
     log_request,
     log_response,
     log_response_chunk,
@@ -1059,6 +1062,30 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             body_json["model"] = slot_model_name
             body = json.dumps(body_json).encode("utf-8")
 
+    # LP-0MVMHNVKT003PRIK AC1: ask llama-server for the measured OpenAI
+    # ``usage`` block on streamed responses (``stream_options.include_usage``,
+    # supported by the deployed llama.cpp b8782 build). Local streams never
+    # reported usage, so ``Stream finished`` lines carried no ``tokens=`` and
+    # the usage-driven cache-credit path was dead for local. When the client
+    # did not request usage itself, the extra usage-only chunk is suppressed
+    # below so the client-visible SSE stream is byte-compatible.
+    _expect_usage_chunk = False
+    _suppress_usage_chunk = False
+    if isinstance(body_json, dict) and body_json.get("stream"):
+        _stream_opts = body_json.get("stream_options")
+        _client_wants_usage = bool(
+            isinstance(_stream_opts, dict) and _stream_opts.get("include_usage")
+        )
+        if not _client_wants_usage:
+            _stream_opts = (
+                dict(_stream_opts) if isinstance(_stream_opts, dict) else {}
+            )
+            _stream_opts["include_usage"] = True
+            body_json["stream_options"] = _stream_opts
+            body = json.dumps(body_json).encode("utf-8")
+            _suppress_usage_chunk = True
+        _expect_usage_chunk = True
+
     # Capture the processed proxy→provider request payload for recording (LP-0MR8FEKK6005V9ML)
     _proxy_provider_payload = body_json if session_id else None
     if _proxy_provider_payload:
@@ -1717,6 +1744,16 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 "v1/chat/completions", "5xx", "upstream_error"
                             )
 
+                        # A successful buffered reply to a streaming request
+                        # still carries measured usage (LP-0MVMHNVKT003PRIK AC1).
+                        if upstream_status < 400:
+                            log_non_stream_usage(
+                                body_bytes,
+                                session_id=session_id,
+                                model=model_name,
+                                provider="local",
+                            )
+
                         err_headers = _normalize_outgoing_headers(
                             dict(response.headers), buffered=True
                         )
@@ -2299,8 +2336,26 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 # are flushed immediately; a trailing partial is
                                 # held until complete and dropped on any stop.
                                 for _event in _reframer.feed(chunk):
+                                    if (
+                                        _suppress_usage_chunk
+                                        and b'"usage"' in _event
+                                        and is_usage_only_chunk(_event)
+                                    ):
+                                        # The proxy asked for usage on the
+                                        # client's behalf: measure it but do not
+                                        # change the client-visible stream
+                                        # (LP-0MVMHNVKT003PRIK AC1).
+                                        log_response_chunk(
+                                            _event,
+                                            session_id=session_id,
+                                            model=model_name,
+                                            provider="local",
+                                            body_json=body_json,
+                                            expect_usage=True,
+                                        )
+                                        continue
                                     yield _event
-                                    log_response_chunk(_event, session_id=session_id, model=model_name, provider="local", body_json=body_json)
+                                    log_response_chunk(_event, session_id=session_id, model=model_name, provider="local", body_json=body_json, expect_usage=_expect_usage_chunk)
 
                                 # Prepare the next anext task
                                 _stream_iter = asyncio.ensure_future(
@@ -2418,6 +2473,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             yield done_bytes
                             log_response_chunk(done_bytes, session_id=session_id, model=model_name, provider="local", body_json=body_json)
                         finally:
+                            # A stream that never delivered its usage chunk
+                            # (client disconnect, aborted upstream) still logs
+                            # its deferred ``Stream finished`` line
+                            # (LP-0MVMHNVKT003PRIK AC1).
+                            flush_pending_stream_finish(
+                                session_id, provider="local", model=model_name
+                            )
+
                             # Record assembled streaming response (fire-and-forget)
                             if session_id and collected_content:
                                 _stream_full_response = "".join(collected_content)
@@ -2751,6 +2814,16 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
                             log_response(
                                 response.status_code, response.content
+                            )
+
+                            # AC1 non-streaming path (LP-0MVMHNVKT003PRIK): the
+                            # buffered reply carries llama-server's measured
+                            # ``usage`` block, so the terminal line reports it.
+                            log_non_stream_usage(
+                                response.content,
+                                session_id=session_id,
+                                model=model_name,
+                                provider="local",
                             )
 
                             # Build response headers with session info

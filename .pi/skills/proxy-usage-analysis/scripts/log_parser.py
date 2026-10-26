@@ -73,6 +73,12 @@ RE_TTFT_SECONDS = re.compile(
 )
 RE_TOKENS = re.compile(r"\btokens=(\d+)/(\d+)/(\d+)")
 RE_ENTRY = re.compile(r"\bentry=(\S+)")
+#: Buffered (non-streamed) reply marker on terminal ``Stream finished`` lines
+#: (LP-0MVMHNVKT003PRIK AC1 non-streaming path): such lines carry measured
+#: ``tokens=`` but are not paired into busy/stream counts — there is no
+#: ``Stream started`` for them. Falling back to ``None`` (streaming or
+#: pre-marker logs) keeps every historic consumer unchanged.
+RE_STREAM_FALSE = re.compile(r"\bstream=false\b")
 RE_ERROR_DETAIL = re.compile(r"\berror=([^\s,}]+)")
 RE_FALLBACK = re.compile(
     r"Fallback triggered for model=(\S+?), from=(\S+?), to=(\S+?), "
@@ -602,6 +608,12 @@ class LogEvent:
     # Prefill-deadline overrun (``prefill_deadline_exceeded`` kind): the
     # configured deadline that was exceeded, in seconds.
     deadline_seconds: float | None = None
+    # Buffered-reply marker on ``stream_finished`` events
+    # (LP-0MVMHNVKT003PRIK AC1 non-streaming path): ``False`` when the line
+    # carried ``stream=false`` (a single JSON reply, not a chunked stream), so
+    # consumers can keep it out of stream pairing while still using its measured
+    # ``tokens=``. ``None`` on streaming lines and on pre-marker logs.
+    streamed: bool | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -790,6 +802,9 @@ def parse_log_line(line: str) -> LogEvent | None:
             prompt=prompt,
             completion=completion,
             total=total,
+            # ``stream=false`` marks a buffered reply's terminal line
+            # (LP-0MVMHNVKT003PRIK): measured tokens, no stream pairing.
+            streamed=False if RE_STREAM_FALSE.search(msg) else None,
         )
     if msg.startswith(FALLBACK):
         m2 = RE_FALLBACK.search(msg)

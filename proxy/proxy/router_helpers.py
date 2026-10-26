@@ -294,6 +294,196 @@ def log_response(status_code: int, content: bytes) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Deferred ``Stream finished`` emission (LP-0MVMHNVKT003PRIK)
+# ---------------------------------------------------------------------------
+#
+# llama.cpp (and any OpenAI-compatible upstream honouring
+# ``stream_options.include_usage``) reports the usage block in a *separate*
+# final chunk that arrives AFTER the ``finish_reason`` chunk:
+#
+#   data: {"choices":[{"finish_reason":"stop", ...}]}
+#   data: {"choices":[], "usage":{"prompt_tokens":N, ...}}
+#   data: [DONE]
+#
+# The ``Stream finished`` line is emitted from the finish_reason chunk, so the
+# measured token counts were never on it — local streams never carried
+# ``tokens=`` and the usage-driven cache-credit path was dead for local.  When
+# the caller knows a usage chunk is expected (``expect_usage=True``), the
+# finish parts are deferred and emitted — with ``tokens=p/c/t`` — as soon as
+# the usage chunk arrives.  A stream that ends without a usage chunk (aborted,
+# old upstream) is flushed unchanged at ``[DONE]`` or by
+# :func:`flush_pending_stream_finish`, so no terminal line is ever lost.
+
+#: Upper bound on deferred per-stream finish parts (aborted streams are
+#: flushed explicitly; the cap only guards against a leak if a caller never
+#: flushes).
+_PENDING_STREAM_FINISH_LIMIT = 64
+
+#: Deferred ``Stream finished`` parts keyed by stream identity.
+_pending_stream_finish: dict[tuple[str, str, str, str], list[str]] = {}
+
+
+def _stream_finish_key(
+    session_id: str | None,
+    provider: str | None,
+    model: str | None,
+    entry: str | None,
+) -> tuple[str, str, str, str]:
+    """Identity of one stream for the deferred-finish buffer."""
+    return (session_id or "", provider or "", model or "", entry or "")
+
+
+def _usage_token_field(usage: Any) -> str | None:
+    """Render a ``usage`` dict as ``tokens=prompt/completion/total``.
+
+    Returns ``None`` when *usage* is absent or carries no token counts, so a
+    line that genuinely has no usage keeps its historical shape.
+    """
+    if not isinstance(usage, dict):
+        return None
+    pt = usage.get("prompt_tokens")
+    ct = usage.get("completion_tokens")
+    tt = usage.get("total_tokens")
+    if pt is None and ct is None and tt is None:
+        return None
+    return f"tokens={pt or 0}/{ct or 0}/{tt or 0}"
+
+
+def _defer_stream_finish(
+    key: tuple[str, str, str, str], parts: list[str]
+) -> None:
+    """Buffer *parts* until the stream's usage chunk arrives."""
+    if len(_pending_stream_finish) >= _PENDING_STREAM_FINISH_LIMIT:
+        try:
+            _pending_stream_finish.pop(next(iter(_pending_stream_finish)))
+        except (StopIteration, KeyError):
+            pass
+    _pending_stream_finish[key] = parts
+
+
+def _flush_deferred_stream_finish(
+    key: tuple[str, str, str, str], token_field: str | None
+) -> bool:
+    """Emit a buffered ``Stream finished`` line, optionally with usage.
+
+    *token_field* is inserted directly after the ``reason=`` field so the
+    line keeps the historical ``Stream finished: reason=<r> tokens=p/c/t``
+    shape. Returns True when a deferred line was emitted.
+    """
+    parts = _pending_stream_finish.pop(key, None)
+    if parts is None:
+        return False
+    if token_field and len(parts) > 1:
+        parts.insert(1, token_field)
+    try:
+        _srv().logger.info(" ".join(parts))
+    except Exception:
+        pass
+    return True
+
+
+def flush_pending_stream_finish(
+    session_id: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    entry: str | None = None,
+) -> bool:
+    """Flush a deferred ``Stream finished`` line that never saw usage.
+
+    Called at end-of-stream by the local streaming loop so an aborted or
+    usage-less stream still logs its terminal line (without ``tokens=``).
+    """
+    return _flush_deferred_stream_finish(
+        _stream_finish_key(session_id, provider, model, entry), None
+    )
+
+
+def is_usage_only_chunk(chunk: bytes) -> bool:
+    """Whether *chunk* carries only an OpenAI ``usage`` block (no choices).
+
+    Used by the local streaming loop to keep the client-visible SSE stream
+    byte-compatible when the proxy requested ``include_usage`` on the client's
+    behalf: the measurement chunk is logged but not forwarded.
+    """
+    if not chunk:
+        return False
+    saw_usage = False
+    try:
+        text = chunk.decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            return False
+        if not isinstance(obj, dict):
+            return False
+        if obj.get("choices"):
+            return False
+        if isinstance(obj.get("usage"), dict):
+            saw_usage = True
+    return saw_usage
+
+
+def log_non_stream_usage(
+    content: bytes | str | None,
+    session_id: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+) -> None:
+    """Emit the terminal ``Stream finished`` line for a non-streamed reply.
+
+    Non-streaming local responses carry llama-server's ``usage`` block in the
+    JSON body, so the measured token counts are logged here (AC1's
+    non-streaming path) with ``stream=false`` marking it as a single buffered
+    response rather than a chunked stream. Nothing is logged when the body
+    carries no reportable usage.
+    """
+    if not content:
+        return
+    try:
+        text = (
+            content.decode("utf-8", errors="replace")
+            if isinstance(content, (bytes, bytearray))
+            else str(content)
+        )
+        body = json.loads(text) if text else None
+    except Exception:
+        return
+    if not isinstance(body, dict):
+        return
+    token_field = _usage_token_field(body.get("usage"))
+    if token_field is None:
+        return
+    finish_reason = "stop"
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        finish_reason = choices[0].get("finish_reason") or finish_reason
+    parts = [
+        f"Stream finished: reason={finish_reason}",
+        token_field,
+        "stream=false",
+    ]
+    if session_id:
+        parts.append(f"session={session_id}")
+    if provider:
+        parts.append(f"provider={provider}")
+    if model:
+        parts.append(f"model={model}")
+    try:
+        _srv().logger.info(" ".join(parts))
+    except Exception:
+        pass
+
+
 def log_response_chunk(
     chunk: bytes,
     session_id: str | None = None,
@@ -301,6 +491,7 @@ def log_response_chunk(
     provider: str | None = None,
     body_json: dict | bytes | None = None,
     entry: str | None = None,
+    expect_usage: bool = False,
 ) -> None:
     """Log streaming response chunk.
 
@@ -329,8 +520,17 @@ def log_response_chunk(
 
     When *body_json* is provided, a request preview (first 80 characters of
     the first non-system user message) is included in the finished line.
+
+    *expect_usage* declares that the upstream was asked for an
+    OpenAI ``usage`` block (``stream_options.include_usage``), which arrives
+    in a chunk of its own after the ``finish_reason`` chunk
+    (LP-0MVMHNVKT003PRIK). The ``Stream finished`` line is then deferred by
+    one chunk so it can carry the measured ``tokens=prompt/completion/total``;
+    a stream that never delivers usage is flushed unchanged on ``[DONE]`` or
+    by :func:`flush_pending_stream_finish`.
     """
     srv = _srv()
+    stream_key = _stream_finish_key(session_id, provider, model, entry)
     try:
         chunk_str = chunk.decode("utf-8")[:500] if chunk else ""
         if getattr(srv, "verbose_chunks", False):
@@ -351,6 +551,10 @@ def log_response_chunk(
                 continue
             payload = line[len("data:"):].strip()
             if payload == "[DONE]":
+                if expect_usage:
+                    # No usage chunk arrived (aborted / usage-less upstream):
+                    # emit the deferred terminal line without token counts.
+                    _flush_deferred_stream_finish(stream_key, None)
                 continue
             try:
                 j = json.loads(payload)
@@ -366,64 +570,73 @@ def log_response_chunk(
                     if fr is not None:
                         finish_reason = fr
                         break
-            if finish_reason is not None:
-                parts = [f"Stream finished: reason={finish_reason}"]
-                usage = j.get("usage")
-                if isinstance(usage, dict):
-                    pt = usage.get("prompt_tokens")
-                    ct = usage.get("completion_tokens")
-                    tt = usage.get("total_tokens")
-                    if pt is not None or ct is not None or tt is not None:
-                        parts.append(f"tokens={pt or 0}/{ct or 0}/{tt or 0}")
-                # LP-0MT60S55M000TK1H: when the error is a synthetic stream-error
-                # event (LP-0MSETOTWY000SU0Z) carry the enriched error payload so
-                # the proxy-usage analysis tool can classify it (previously the
-                # log line reported "no error payload").
-                if finish_reason == "error":
-                    for choice in j.get("choices", []):
-                        if isinstance(choice, dict):
-                            err = choice.get("error")
-                            if isinstance(err, dict):
-                                err_type = err.get("type")
-                                err_msg = err.get("message")
-                                err_action = err.get("suggested_action")
-                                if err_type:
-                                    parts.append(f"error_type={err_type}")
-                                if err_msg:
-                                    parts.append(f"error_message={err_msg}")
-                                if err_action:
-                                    parts.append(f"suggested_action={err_action}")
-                                break  # only use the first choice's error
-                # Add session, provider, model and request preview (LP-0MR90HJED005WI1Z)
-                if session_id:
-                    parts.append(f"session={session_id}")
-                if provider:
-                    parts.append(f"provider={provider}")
-                if model:
-                    parts.append(f"model={model}")
-                if entry:
-                    parts.append(f"entry={entry}")
-                if body_json is not None:
-                    preview = _get_request_preview(body_json)
-                    if preview:
-                        parts.append(f"request={preview}")
+            usage = j.get("usage")
+            token_field = _usage_token_field(usage)
+            if finish_reason is None:
+                # A usage-only chunk following the finish chunk completes the
+                # deferred ``Stream finished`` line with measured tokens
+                # (LP-0MVMHNVKT003PRIK AC1).
+                if token_field is not None and expect_usage:
+                    _flush_deferred_stream_finish(stream_key, token_field)
+                continue
+            parts = [f"Stream finished: reason={finish_reason}"]
+            parts = [f"Stream finished: reason={finish_reason}"]
+            if token_field is not None:
+                parts.append(token_field)
+            # LP-0MT60S55M000TK1H: when the error is a synthetic stream-error
+            # event (LP-0MSETOTWY000SU0Z) carry the enriched error payload so
+            # the proxy-usage analysis tool can classify it (previously the
+            # log line reported "no error payload").
+            if finish_reason == "error":
+                for choice in j.get("choices", []):
+                    if isinstance(choice, dict):
+                        err = choice.get("error")
+                        if isinstance(err, dict):
+                            err_type = err.get("type")
+                            err_msg = err.get("message")
+                            err_action = err.get("suggested_action")
+                            if err_type:
+                                parts.append(f"error_type={err_type}")
+                            if err_msg:
+                                parts.append(f"error_message={err_msg}")
+                            if err_action:
+                                parts.append(f"suggested_action={err_action}")
+                            break  # only use the first choice's error
+            # Add session, provider, model and request preview (LP-0MR90HJED005WI1Z)
+            if session_id:
+                parts.append(f"session={session_id}")
+            if provider:
+                parts.append(f"provider={provider}")
+            if model:
+                parts.append(f"model={model}")
+            if entry:
+                parts.append(f"entry={entry}")
+            if body_json is not None:
+                preview = _get_request_preview(body_json)
+                if preview:
+                    parts.append(f"request={preview}")
+            if expect_usage and token_field is None:
+                # The usage block arrives in the NEXT chunk: defer so the
+                # line can carry the measured counts (LP-0MVMHNVKT003PRIK).
+                _defer_stream_finish(stream_key, parts)
+            else:
                 srv.logger.info(" ".join(parts))
 
-                # Log a WARNING when the upstream provider truncated the response
-                # due to reaching its max_tokens (LP-0MS4C6E2L004HLLZ).
-                if finish_reason == "length":
-                    _parts = ["Response truncated: finish_reason=length"]
-                    if session_id:
-                        _parts.append(f"session={session_id}")
-                    if model:
-                        _parts.append(f"model={model}")
-                    if entry:
-                        _parts.append(f"entry={entry}")
-                    if isinstance(usage, dict):
-                        ct = usage.get("completion_tokens")
-                        if ct is not None:
-                            _parts.append(f"completion_tokens={ct}")
-                    srv.logger.warning(" ".join(_parts))
+            # Log a WARNING when the upstream provider truncated the response
+            # due to reaching its max_tokens (LP-0MS4C6E2L004HLLZ).
+            if finish_reason == "length":
+                _parts = ["Response truncated: finish_reason=length"]
+                if session_id:
+                    _parts.append(f"session={session_id}")
+                if model:
+                    _parts.append(f"model={model}")
+                if entry:
+                    _parts.append(f"entry={entry}")
+                if isinstance(usage, dict):
+                    ct = usage.get("completion_tokens")
+                    if ct is not None:
+                        _parts.append(f"completion_tokens={ct}")
+                srv.logger.warning(" ".join(_parts))
     except Exception:
         pass
 

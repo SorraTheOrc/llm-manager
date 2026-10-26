@@ -9,13 +9,17 @@ per-slot cap, so proactive compaction can be sized before any behavior change.
 Why the raw logs and not the report CSVs?
 
 The daily proxy-usage reports (``~/proxy-usage-reports/2026-08-2X/``) carry
-session metadata (bucket, fallback reason, request counts) but their context
-columns (``start_context_size`` / ``avg_context_size`` / ``max_context_size``)
-are empty: the ``Stream finished: tokens=p/c/t`` payload the reporting
-pipeline keys on is not emitted in this deployment. The authoritative
-per-session context signal is the proxy's own routing-time estimate in the
-``routing_check`` log line — ``estimated_tokens`` (accumulated session
-history + new prompt, computed with the native tokenizer). Every local
+session metadata (bucket, fallback reason, request counts) and context columns
+(``start_context_size`` / ``avg_context_size`` / ``max_context_size``) derived
+from the ``Stream finished: tokens=p/c/t`` payload. Local streams report
+llama-server's measured usage since LP-0MVMHNVKT003PRIK (the proxy requests
+``stream_options.include_usage``), so those columns are now populated for local
+traffic too; a window still shows blanks only where a terminal line carried no
+usage (reported as "streams without usage") or predates that change. The
+second, independent per-session context signal is the proxy's own routing-time
+estimate in the ``routing_check`` log line — ``estimated_tokens`` (accumulated
+session history + new prompt, computed with the native tokenizer) — which this
+analysis uses for breach classification. Every local
 routing decision logs one. ``context_pressure`` warnings (same log) flag the
 sessions that cross the 0.80 warn ratio, and ``routing_skip_local`` lines
 count the ``context_too_large`` / ``large_context_bypass`` hard-cap skips.

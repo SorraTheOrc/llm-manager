@@ -272,6 +272,14 @@ class SessionStats:
     # Token totals from this session's Stream finished events.
     input_tokens: int = 0
     output_tokens: int = 0
+    # Token totals per SERVING ``(provider, model)`` — the provider/model on
+    # each ``Stream finished`` line itself rather than the session's initial
+    # provider (LP-0MVMHNVKT003PRIK AC4). A session that started local and fell
+    # back to a remote provider therefore attributes each stream's tokens to
+    # the provider that actually served it. Values are ``(input, output)``.
+    tokens_by_model: dict[tuple[str, str], tuple[int, int]] = field(
+        default_factory=dict
+    )
 
     @property
     def fell_back(self) -> bool:
@@ -372,6 +380,15 @@ class AnalysisResult:
     # already contribute their timestamp to ``restart_signals`` for
     # root-cause correlation (unchanged).
     restart_events: list[LogEvent] = field(default_factory=list)
+    # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): how many terminal
+    # ``Stream finished`` lines were seen in the window at all, and how many of
+    # them carried no ``tokens=`` payload (so their context/size figures are
+    # unknown rather than zero). ``streams_without_usage_by_provider`` splits
+    # the latter by provider, which is what makes "local streams now report
+    # usage" auditable.
+    streams_finished: int = 0
+    streams_without_usage: int = 0
+    streams_without_usage_by_provider: Counter = field(default_factory=Counter)
 
     @property
     def restart_events_sorted(self) -> list[LogEvent]:
@@ -506,15 +523,23 @@ class AnalysisResult:
 
     @property
     def token_by_model(self) -> dict[tuple[str, str], tuple[int, int, int]]:
-        """Token totals grouped by ``(provider, model)`` sorted by total descending."""
-        totals: dict[tuple[str, str], list[tuple[int, int]]] = {}
+        """Token totals grouped by the SERVING ``(provider, model)``.
+
+        Grouped by the ``provider``/``model`` stamped on each ``Stream
+        finished`` line, not by the session's initial provider
+        (LP-0MVMHNVKT003PRIK AC4): a session that started local and fell back
+        to a remote provider splits its tokens between the two instead of
+        attributing every token to the initial provider. Sorted by total
+        descending.
+        """
+        totals: dict[tuple[str, str], list[int]] = {}
         for s in self.sessions.values():
-            key = (s.initial_provider or UNKNOWN_LABEL, s.initial_model or UNKNOWN_LABEL)
-            totals.setdefault(key, []).append((s.input_tokens, s.output_tokens))
+            for key, (inp, out) in s.tokens_by_model.items():
+                pair = totals.setdefault(key, [0, 0])
+                pair[0] += inp
+                pair[1] += out
         result: dict[tuple[str, str], tuple[int, int, int]] = {}
-        for key, pairs in totals.items():
-            inp = sum(p[0] for p in pairs)
-            out = sum(p[1] for p in pairs)
+        for key, (inp, out) in totals.items():
             result[key] = (inp, out, inp + out)
         return dict(sorted(result.items(), key=lambda kv: kv[1][2], reverse=True))
 
@@ -787,6 +812,12 @@ class _SessionBuilder:
         self.session_id = session_id
         self.started: list[LogEvent] = []
         self.finished: list[LogEvent] = []
+        # Buffered replies logged with ``stream=false`` (LP-0MVMHNVKT003PRIK):
+        # measured usage with no ``Stream started`` to pair, so they contribute
+        # tokens but never a busy/stream pairing.
+        self.non_stream_finished: list[LogEvent] = []
+        # Per-serving-(provider, model) ``[input, output]`` token totals.
+        self.tokens_by_model: dict[tuple[str, str], list[int]] = {}
         self.last_seen: datetime | None = None
         self.dispatch_denied = 0
         self.routing_skips: list[LogEvent] = []
@@ -800,18 +831,41 @@ class _SessionBuilder:
         if ev.kind == "stream_started":
             self.started.append(ev)
         elif ev.kind == "stream_finished":
-            self.finished.append(ev)
+            if getattr(ev, "streamed", None) is False:
+                self.non_stream_finished.append(ev)
+            else:
+                self.finished.append(ev)
         elif ev.kind == "routing_skip":
             self.routing_skips.append(ev)
         elif ev.kind == "dispatch_denied":
             self.dispatch_denied += 1
+        if ev.kind == "stream_finished":
+            self._add_tokens_by_model(ev)
         if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
             if self.local_first is None or ev.ts < self.local_first:
                 self.local_first = ev.ts
             if self.local_last is None or ev.ts > self.local_last:
                 self.local_last = ev.ts
-            if ev.kind == "stream_finished" and ev.completion is not None:
+            if (
+                ev.kind == "stream_finished"
+                and getattr(ev, "streamed", None) is not False
+                and ev.completion is not None
+            ):
                 self.local_completion += ev.completion
+
+    def _add_tokens_by_model(self, ev: LogEvent) -> None:
+        """Accumulate *ev*'s measured tokens under its serving provider/model.
+
+        The provider/model come from the terminal line itself, so tokens are
+        attributed to whoever actually served the stream rather than to the
+        session's initial provider (LP-0MVMHNVKT003PRIK AC4).
+        """
+        if ev.prompt is None and ev.completion is None:
+            return
+        key = (ev.provider or UNKNOWN_LABEL, ev.model or UNKNOWN_LABEL)
+        pair = self.tokens_by_model.setdefault(key, [0, 0])
+        pair[0] += int(ev.prompt or 0)
+        pair[1] += int(ev.completion or 0)
 
 
 def _mean(values: list) -> float | None:
@@ -913,6 +967,12 @@ def _build_session(
 ) -> SessionStats:
     started = sorted(builder.started, key=lambda e: e.ts)
     finished = sorted(builder.finished, key=lambda e: e.ts)
+    # Buffered (``stream=false``) replies carry measured usage too, so token /
+    # context statistics include them even though they never pair with a
+    # ``Stream started`` (LP-0MVMHNVKT003PRIK).
+    usage_finished = sorted(
+        builder.finished + builder.non_stream_finished, key=lambda e: e.ts
+    )
 
     first = started[0] if started else (finished[0] if finished else None)
     start = first.ts if first is not None else builder.last_seen
@@ -921,8 +981,10 @@ def _build_session(
     first_provider = first.provider if first is not None else ""
     first_model = first.model if first is not None else ""
 
-    prompt_tokens = [e.prompt for e in finished if e.prompt is not None]
-    completion_tokens = [e.completion for e in finished if e.completion is not None]
+    prompt_tokens = [e.prompt for e in usage_finished if e.prompt is not None]
+    completion_tokens = [
+        e.completion for e in usage_finished if e.completion is not None
+    ]
 
     first_remote = _first_remote(started)
     has_local = any(e.provider == LOCAL_PROVIDER for e in started)
@@ -995,6 +1057,10 @@ def _build_session(
         decode_tok_s=decode_tok_s,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        tokens_by_model={
+            key: (pair[0], pair[1])
+            for key, pair in builder.tokens_by_model.items()
+        },
     )
 
 
@@ -1215,6 +1281,11 @@ def compute_busy_stats(
             started.setdefault(ev.session, []).append(ev)
             started_events.append(ev)
         else:
+            if getattr(ev, "streamed", None) is False:
+                # Buffered reply: measured usage, but no ``Stream started`` to
+                # pair with — keeping it out of the FIFO keeps every stream's
+                # busy/decode interval correct (LP-0MVMHNVKT003PRIK).
+                continue
             finished.setdefault(ev.session, []).append(ev)
 
     ttft_list = list(ttft_events) if ttft_events is not None else None
@@ -1633,6 +1704,11 @@ def aggregate(
     unattributed = 0
     lines_skipped = 0
     total_lines = 0
+    # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): terminal lines seen
+    # and terminal lines whose payload carried no ``tokens=``.
+    streams_finished = 0
+    streams_without_usage = 0
+    streams_without_usage_by_provider: Counter = Counter()
     # Local stream events across the (margin-widened) event stream for the
     # busy-time calculation; ``iter_events`` yields a margin beyond the window
     # so boundary-crossing streams pair correctly (clipped in compute_busy_stats).
@@ -1700,6 +1776,17 @@ def aggregate(
                 counts["local_attempts"] += 1
         elif ev.kind == "stream_finished" and ev.provider == LOCAL_PROVIDER:
             hourly_activity.setdefault(hour_key, Counter())["local_served"] += 1
+        if ev.kind == "stream_finished":
+            # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): count every
+            # terminal line, and separately those whose payload carried no
+            # token counts ("unknown", not "zero").
+            if ev.prompt is None and ev.completion is None:
+                streams_without_usage += 1
+                streams_without_usage_by_provider[
+                    ev.provider or UNKNOWN_LABEL
+                ] += 1
+            else:
+                streams_finished += 1
         elif ev.kind == "local_dispatch":
             # A ``[local] POST`` dispatch attempt (LP-0MVKUKG3F0035I85): counted
             # regardless of whether the attempt ever produced a first byte or a
@@ -1879,4 +1966,7 @@ def aggregate(
         hold_cycle_routing_skip_events=hold_cycle_routing_skip_events,
         provider_context_skip_events=provider_context_skip_events,
         restart_events=restart_events,
+        streams_finished=streams_finished,
+        streams_without_usage=streams_without_usage,
+        streams_without_usage_by_provider=streams_without_usage_by_provider,
     )
