@@ -42,6 +42,7 @@ Key features
 ### Logging & Observability
 - **Live dual-pane log viewer** (`/logs`) — streaming proxy and llama-server logs with line limits, autoscroll, clear, and download controls.
 - **Per-slot log isolation** — a dedicated Slots tab shows a live log section per llama-server slot, filterable server-side by slot/session.
+- **Prompt Log tab** (`prompt-log.jsonl`) — a structured, append-only JSONL record of every handled chat/completions request: time, first non-system message, session ID, requested model and the model that actually served it after fallback routing. Browse it newest-first in the `/logs` Prompt Log tab (config `prompt_log:`; see `proxy/README.md#prompt-log-prompt-logjsonl`).
 - **Request summary** — per-endpoint request counts and token statistics (with per-role breakdowns for chat traffic).
 - **Session recordings** — PRIVACY WARNING: every prompt/completion/embedding is optionally recorded to disk; browse sessions, replay conversations, and inspect raw JSON via the admin API.
 - **Prometheus metrics** — `/metrics` endpoint for monitoring.

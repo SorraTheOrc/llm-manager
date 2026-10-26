@@ -780,6 +780,22 @@ async def view_logs(request: Request):
     return HTMLResponse(content=html)
 
 
+async def prompt_log_recent(request: Request, limit: int | None = None):
+    """Return the recent prompt-log window (newest first) for the Prompt Log tab.
+
+    Reads a bounded tail of ``prompt-log.jsonl`` (never the whole file) so a
+    long-running log cannot stall the UI. A missing/empty file, a disabled
+    prompt log and read failures all render as an empty/disabled payload
+    rather than an error (LP-0MVP79OBP002G6Z1 AC3/AC4/AC5).
+    """
+    from proxy import prompt_log
+
+    return JSONResponse(
+        content=prompt_log.recent_payload(limit=limit),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared local-model dispatch orchestration
 # ---------------------------------------------------------------------------
@@ -1353,7 +1369,14 @@ async def proxy_openai_api(request: Request, path: str):
     async def _process_request():
         return await _do_proxy_openai_api(request, path, body, srv)
 
-    response = await get_coalescer().coalesce_or_execute(path, body, _process_request)
+    try:
+        response = await get_coalescer().coalesce_or_execute(path, body, _process_request)
+    except Exception as exc:
+        # Record the prompt-log entry for pre-routing rejections (unknown
+        # model, invalid config) that surface as exceptions (LP-0MVP79OBP002G6Z1
+        # AC1/AC2) before re-raising.
+        _record_prompt_log(request, path, body, exc=exc)
+        raise
 
     # Observability (AC6): record the effective priority on the response so
     # clients and operators can verify which tier actually routed the request
@@ -1362,7 +1385,41 @@ async def proxy_openai_api(request: Request, path: str):
     # response object exposing mutable headers.
     _attach_priority_applied_header(response, request, srv)
 
+    # Prompt log (LP-0MVP79OBP002G6Z1): exactly one entry per handled HTTP
+    # request, appended once routing resolved (the routed model is read from
+    # the response headers). Lives OUTSIDE the coalescer so a coalesced
+    # duplicate HTTP request also produces its own entry.
+    _record_prompt_log(request, path, body, response=response)
+
     return response
+
+
+def _record_prompt_log(
+    request: Request,
+    path: str,
+    body: bytes,
+    *,
+    response=None,
+    exc: BaseException | None = None,
+) -> None:
+    """Best-effort prompt-log record for one handled request (AC1).
+
+    Never raises and never blocks: ``prompt_log.record_exchange`` only
+    enqueues; append failures are counted/logged rate-limited inside the
+    module (AC3).
+    """
+    try:
+        from proxy import prompt_log
+
+        prompt_log.record_exchange(
+            headers=getattr(request, "headers", None) or {},
+            path=path,
+            body=body,
+            response=response,
+            exc=exc,
+        )
+    except Exception:  # pragma: no cover - defensive: never fail a request
+        pass
 
 
 def _attach_priority_applied_header(response, request, srv) -> None:

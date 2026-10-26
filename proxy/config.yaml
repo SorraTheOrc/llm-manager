@@ -245,6 +245,37 @@ logging:
   verbose_chunks: false
 
 # ---------------------------------------------------------------------------
+# Prompt Log (LP-0MVP79OBP002G6Z1)
+# ---------------------------------------------------------------------------
+# Append-only JSONL record of every handled chat/completions and
+# /v1/completions request: time, first non-system message (prompt), session ID,
+# requested model and the model that actually served it after fallback routing
+# (read from the response's X-Resolved-Model header; ``error:<code>`` for
+# requests rejected before routing, e.g. ``error:startup_ramp``).
+#
+# Surfaced in the /logs Web UI as the "Prompt Log" tab (GET /logs/prompt-log).
+#
+# Fields:
+#   enabled:           write the log at all (default true). When false nothing
+#                      is written and the UI tab shows a "disabled" notice.
+#   path:              optional file path override. Default:
+#                      <logging.directory>/prompt-log.jsonl.
+#   max_prompt_chars:  prompt text cap; longer prompts are stored truncated
+#                      with ``truncated: true`` (default 2000).
+#   max_entries:       bounded recent window the UI reads/renders (default 500).
+#   max_file_bytes:    rotate to prompt-log.jsonl.1 once the file exceeds this
+#                      size (default 52428800 = 50 MiB; 0 disables rotation).
+#   max_rotated_files: how many .N backups to keep from rotation; older
+#                      backups are dropped, so total on-disk growth is bounded
+#                      by (1 + max_rotated_files) * max_file_bytes (default 3).
+prompt_log:
+  enabled: true
+  max_prompt_chars: 2000
+  max_entries: 500
+  max_file_bytes: 52428800
+  max_rotated_files: 3
+
+# ---------------------------------------------------------------------------
 # Session Recording
 # ---------------------------------------------------------------------------
 # Records raw client-proxy-provider message payloads to disk for later

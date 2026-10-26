@@ -129,6 +129,48 @@ def _request_dedup_hash(body_json: dict | None) -> str | None:
 # Request/response logging helpers
 # ===================================================================
 
+def _first_message_content(body_json: dict | bytes | None) -> str:
+    """Return the full content of the first non-system message.
+
+    This is the shared first-message extraction shared by the log body
+    preview (:func:`_get_request_preview`) and the structured prompt log
+    (:mod:`proxy.prompt_log`), so both apply the same redaction policy: the
+    first message whose ``role`` is not ``"system"``, never system-prompt
+    content.
+
+    Parameters
+    ----------
+    body_json : dict or bytes or None
+        The request body as a parsed dict, raw bytes, or None.
+
+    Returns
+    -------
+    str
+        The message content (uncapped), or ``""`` when the body cannot be
+        parsed, contains no messages, or contains only system messages.
+    """
+    try:
+        if isinstance(body_json, bytes):
+            body_json = json.loads(body_json.decode("utf-8", errors="replace"))
+        if not isinstance(body_json, dict):
+            return ""
+        messages = body_json.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "system":
+                continue
+            content = msg.get("content", "")
+            if not content:
+                continue
+            return str(content)
+    except Exception:
+        pass
+    return ""
+
+
 def _get_request_preview(body_json: dict | bytes | None) -> str:
     """Extract the first 80 characters of the first non-system user message.
 
@@ -149,29 +191,10 @@ def _get_request_preview(body_json: dict | bytes | None) -> str:
     str
         The request preview (max 83 characters including ``...``).
     """
-    try:
-        if isinstance(body_json, bytes):
-            body_json = json.loads(body_json.decode("utf-8", errors="replace"))
-        if not isinstance(body_json, dict):
-            return ""
-        messages = body_json.get("messages")
-        if not isinstance(messages, list):
-            return ""
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") == "system":
-                continue
-            content = msg.get("content", "")
-            if not content:
-                continue
-            content_str = str(content)
-            if len(content_str) > 80:
-                return content_str[:80] + "..."
-            return content_str
-    except Exception:
-        pass
-    return ""
+    content_str = _first_message_content(body_json)
+    if len(content_str) > 80:
+        return content_str[:80] + "..."
+    return content_str
 
 
 def _strip_system_messages_from_preview(body: bytes) -> str:

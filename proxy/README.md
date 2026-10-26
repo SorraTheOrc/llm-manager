@@ -17,7 +17,7 @@ A proxy server that routes OpenAI-compatible API requests to either a local llam
 - **Session Recordings Index**: The `/admin/sessions` endpoint (web UI session dropdown) is served from an in-memory metadata index instead of re-reading the recordings tree on every call. See [Session recordings](#session-recordings).
 - **Priority-based routing**: every request carries an effective priority (`X-Priority: low|medium|high`, default `medium`; capped to `low` during the configured cheap window, `server.priority_window`, default 01:00–10:00 local). The effective priority selects the model's provider chain — each provider entry declares the priorities it serves as a `priorities` list, and the chain is that model's `providers` list filtered by the priority (LP-0MVGPZWY0001JD1D) — and gates the routing knobs (contention-queue entry, economic-bypass recovery, local-vs-remote preference) — LP-0MVDT94F0003VHUA AC1–AC3. The slot pool is fixed at 2 (`session_slot_pool_size`); no routing-policy change ever restarts the proxy. The fast/cheap mode machinery (overlays, `proxy/.mode`, `mode_schedule.yaml`, `/admin/set-mode`) was removed (AC4).
 - **Session-Based Incremental Ingestion**: Reduce CPU and latency with per-session KV cache reuse
-- **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has two tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), and **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view. Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in). Each slot header badge shows the **full session ID** (untruncated, with the full ID also on hover) — slot session IDs are no longer shortened to 8 characters (LP-0MV6CZGN6003Z5QI).
+- **Live Log Tail + Stats**: `/logs` UI and `/logs/tail` SSE stream for logs/counts/tokens. The logs page has three tabs: **Slots** (default) shows one live log section per slot reported by llama-server (idle slots included, with a live status badge), **All Logs** keeps the unfiltered proxy/llama panes plus the session-recording view, and **Prompt Log** lists the structured prompt-log entries newest-first (see [Prompt Log](#prompt-log-jsonl)). Slot sections are ordered numerically by slot id (0, 1, 2, …) regardless of the `/slots` payload order, and a working slot with no matching log lines yet shows a "no log lines yet" placeholder instead of an empty pane (cleared as soon as the first line streams in). Each slot header badge shows the **full session ID** (untruncated, with the full ID also on hover) — slot session IDs are no longer shortened to 8 characters (LP-0MV6CZGN6003Z5QI).
 - **Host-first Deployment**: systemd service units for llama-server and proxy with host-based startup model
 -- Systemd integration details removed: the repository no longer distributes systemd unit files. Run the proxy manually or manage service units outside this repo. See [Host-first deployment](#host-first-deployment) for example systemd units.
 
@@ -51,6 +51,60 @@ The proxy logs every incoming request at **INFO** level via the `llama-proxy` lo
 ### System Prompt Redaction
 
 The body preview automatically filters out messages with `role: "system"` to prevent sensitive system-prompt content from leaking into proxy logs. Only `role: "user"` and `role: "assistant"` messages are included in the preview.
+
+### Prompt Log (`prompt-log.jsonl`)
+
+Every handled `POST /v1/chat/completions` and `POST /v1/completions` request
+appends **exactly one** JSON line to `prompt-log.jsonl` in the configured log
+directory (`logging.directory`, default `/var/log/llama-proxy`), and the
+`/logs` page surfaces it in its **Prompt Log** tab (LP-0MVP79OBP002G6Z1).
+Unlike the raw `proxy.log`, this is a compact, machine-readable record of
+*what* was submitted and *where it went*:
+
+```json
+{"endpoint":"v1/chat/completions","prompt":"Refactor the parser","requested_model":"qwen3.6","routed_model":"local/qwen3.6-35b","session_id":"sess-123","status_code":200,"timestamp":"2026-10-26T12:34:56.789Z","truncated":false}
+```
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | ISO-8601 UTC arrival timestamp (millisecond precision). |
+| `session_id` | Resolved via the shared header chain (`x-session-id` → `session_id` → `x-client-request-id` → `x-session-affinity`), else `"unknown"` — the same IDs shown elsewhere in the UI. |
+| `prompt` | The request's first **non-system** message (chat) or its `prompt` field (completions). System-prompt content is never written, matching the body-preview redaction above. |
+| `truncated` | `true` when `prompt` was shortened to `prompt_log.max_prompt_chars`. |
+| `requested_model` | The model alias the client asked for (`body.model`). |
+| `routed_model` | The model that actually served the request, from the response's `X-Resolved-Model` header: `local/<llama_model>` for local dispatch, `<provider>/<model>` for a remote/fallback dispatch. Requests rejected before routing record `error:<code>` instead (e.g. `error:startup_ramp`, `error:model_loading`, `error:unknown_model`, `error:http_503`). |
+| `endpoint`, `status_code` | The API path and the response status. |
+
+The entry is written **once**, after dispatch resolved, so the requested and
+routed model are always consistent — there is no in-place line mutation and no
+partially written line. Recording happens outside the request coalescer, so a
+coalesced duplicate HTTP request also produces its own entry (both report the
+same routed model). The append is fire-and-forget: the request path only
+enqueues the line, a daemon writer thread performs the file I/O, and append
+errors are counted (`write_errors`) and logged at most once a minute instead
+of failing the request.
+
+Configuration (`prompt_log:` in `proxy/config.yaml`):
+
+```yaml
+prompt_log:
+  enabled: true            # false -> nothing written; the UI tab shows a disabled notice
+  max_prompt_chars: 2000   # prompt cap; longer prompts are stored truncated
+  max_entries: 500         # bounded recent window the UI reads/renders
+  max_file_bytes: 52428800 # rotate to prompt-log.jsonl.1 past this size (0 disables)
+  max_rotated_files: 3     # .N backups kept; older ones are dropped
+  # path: /custom/prompt-log.jsonl   # optional override (default: <logging.directory>/prompt-log.jsonl)
+```
+
+Retention is bounded on three axes: prompt text is capped by
+`max_prompt_chars`, the UI reads at most `max_entries` lines from a **bounded
+tail** of the file (never the whole file), and rotation keeps at most
+`1 + max_rotated_files` files of `max_file_bytes` each. Embeddings, TTS,
+`/v1/models` requests and historical backfill are deliberately out of scope.
+
+The tab polls `GET /logs/prompt-log` (JSON: `enabled`, `entries` newest-first,
+`counters`, `max_entries`, `file`) while it is visible; a missing or empty log
+file renders an empty state rather than an error.
 
 ### Usage analysis (proxy-usage-analysis skill)
 

@@ -1461,6 +1461,15 @@ async def reload_config():
     srv = _srv()
     try:
         srv.config = srv.load_config()
+        # Re-resolve the prompt log so an edited ``prompt_log:`` section takes
+        # effect without a restart (LP-0MVP79OBP002G6Z1). Best-effort: a bad
+        # section must not fail the whole reload.
+        try:
+            from proxy import prompt_log
+
+            prompt_log.configure(srv.config, getattr(srv, "log_dir", None))
+        except Exception:
+            logger.warning("Prompt log reconfiguration failed", exc_info=True)
         logger.info("Configuration reloaded successfully via admin endpoint")
         return {"status": "success", "message": "Configuration reloaded"}
     except Exception as e:

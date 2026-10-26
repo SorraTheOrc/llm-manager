@@ -667,6 +667,26 @@ def _startup_config_logging():
             _instance_lock.path,
             _instance_lock.holder_pid,
         )
+
+    # Prompt log (LP-0MVP79OBP002G6Z1): the JSONL writer needs the resolved log
+    # directory, which setup_logging() assigns just above. Fail-open — a broken
+    # prompt log must never prevent startup.
+    try:
+        from proxy import prompt_log as _prompt_log
+
+        _plog = _prompt_log.configure(config, log_dir)
+        logger.info(
+            "Prompt log: %s (file=%s max_prompt_chars=%s max_entries=%s)",
+            "enabled" if _plog.enabled else "disabled",
+            _plog.path,
+            _plog.config.max_prompt_chars,
+            _plog.config.max_entries,
+        )
+    except Exception:
+        logger.warning(
+            "Prompt log initialisation failed; prompt logging disabled",
+            exc_info=True,
+        )
     _startup_validate_local_routing_config(config)
     _startup_validate_compaction_config(config)
     _startup_validate_prefill_timeout_config(config)
@@ -1407,6 +1427,12 @@ async def tail_slot_logs(
 async def view_logs(request: Request):
     return await _ui_view_logs(request)
 
+
+@app.get("/logs/prompt-log")
+async def prompt_log_recent(request: Request, limit: int | None = None):
+    """Recent prompt-log window for the Prompt Log tab (LP-0MVP79OBP002G6Z1)."""
+    return await _ui_prompt_log_recent(request, limit)
+
 @app.post("/v1/embeddings")
 async def create_embeddings(request: Request):
     return await _ui_create_embeddings(request)
@@ -1681,6 +1707,9 @@ from .ui import (  # noqa: E402
 )
 from .ui import (  # noqa: E402
     index as _ui_index,
+)
+from .ui import (  # noqa: E402
+    prompt_log_recent as _ui_prompt_log_recent,
 )
 from .ui import (  # noqa: E402
     proxy_openai_api as _ui_proxy_openai_api,
