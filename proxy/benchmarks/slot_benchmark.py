@@ -21,6 +21,11 @@ Usage:
 
     # Custom output directory
     python3 -m proxy.benchmarks.slot_benchmark --all --output-dir ./benchmark-results
+
+    # Sweep with the warm-start priming gate (default in --sweep mode) and an
+    # explicit all-at-once measured launch:
+    python3 -m proxy.benchmarks.slot_benchmark --sweep --resume 2 \
+        --concurrency 3 --prompt-tokens 2000 --warm-start --stagger-seconds 0
 """
 
 import argparse
@@ -81,8 +86,37 @@ TARGET_RESPONSE_TIME_S = 600       # ~10 minutes per query
 TARGET_OUTPUT_TOKENS = 18_000      # ~30 tok/s × 600s
 TOTAL_REQUESTS_PER_RUN = 6         # 6 concurrent requests per slot-count run
 WARMUP_REQUESTS = 1                # 1 warmup request before measurements
-INTER_REQUEST_GAP_S = 60.0          # 1 min stagger between request starts to simulate realistic workloads
+#: Default stagger between *measured* request starts, in seconds.
+#: 0 = all measured requests launch at once. Overridden per run by
+#: ``--stagger-seconds``; the historical hard-coded 60 s gap is gone
+#: (LP-0MVLHNEDO008FTBH AC2).
+STAGGER_SECONDS_DEFAULT = 0.0
 HEARTBEAT_INTERVAL_S = 15           # seconds between live progress updates during a request
+
+# ---------------------------------------------------------------------------
+# Warm-start priming gate (LP-0MVLHNEDO008FTBH)
+# ---------------------------------------------------------------------------
+# After a slot-count restart the proxy arms its cold-start admission window
+# (``proxy/cold_start.py``): local dispatch is capped at
+# ``COLD_START_DEFAULT_MAX_CONCURRENT`` (= 1) until the first local prefill
+# completes and calls ``mark_warm()``. Launching ``--concurrency N`` inside
+# that window is why the 2026-10-23 N=2/N=3 sweep reported local stream share
+# 0.0 % (no request ever completed a local prefill, so the cap never lifted).
+#
+# The gate sends ONE deliberately small priming request (single turn, "Say
+# Hi", WARM_START_MAX_TOKENS completion tokens) and requires it to complete on
+# the LOCAL backend — the only harness-visible proof that the first local
+# prefill ran (the cold state lives in-process and is not exposed by
+# ``/health``). It is bounded and must fit the 120 s cold grace window and the
+# 1 200 s client timeout. The production guard itself is never touched.
+WARM_START_MAX_ATTEMPTS = 3        # bounded retry budget before failing the run
+WARM_START_TIMEOUT_S = 120.0       # per-attempt client timeout (cold grace window)
+WARM_START_RETRY_DELAY_S = 15.0    # pause between priming attempts
+WARM_START_MAX_TOKENS = 20         # priming completion-token cap (small request)
+WARM_START_MESSAGES = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Say Hi"},
+]
 PROGRESS_POLL_URL = f"http://localhost:{PROXY_PORT}/health"  # polled for kv_cache_tokens
 
 TOTAL_SESSION_TURNS = 4              # turns per session (initial + 3 follow-ups)
@@ -548,12 +582,19 @@ class RequestResult:
     tokens_per_second: float = 0.0
     resolved_model: str | None = None
     error: str | None = None
+    #: Wall-clock window of the HTTP request (unix seconds). Recorded so the
+    #: peak local concurrency of a run is derivable from the artefact alone
+    #: (LP-0MVLHNEDO008FTBH AC3).
+    started_at: float | None = None
+    ended_at: float | None = None
 
     def to_dict(self):
         return dict(
             request_index=self.request_index,
             status=self.status,
             total_duration_seconds=round(self.total_duration_seconds, 3),
+            started_at=self.started_at,
+            ended_at=self.ended_at,
             time_to_first_token_seconds=(
                 round(self.time_to_first_token_seconds, 3)
                 if self.time_to_first_token_seconds is not None
@@ -568,6 +609,45 @@ class RequestResult:
 
 
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class WarmStartResult:
+    """Outcome of the warm-start priming gate for one slot-count run.
+
+    Recorded in the run artefact so a measured local stream share can be
+    attributed to a proven-warm backend (``completed_locally`` is the
+    harness-visible ``cold_start.is_cold() == False`` evidence). Defined
+    before :class:`SlotRunResult` because that dataclass annotates it.
+    """
+
+    enabled: bool = False
+    attempts: int = 0
+    completed_locally: bool = False
+    resolved_model: str | None = None
+    duration_seconds: float | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    def summary(self) -> dict:
+        return dict(
+            enabled=self.enabled,
+            attempts=self.attempts,
+            completed_locally=self.completed_locally,
+            resolved_model=self.resolved_model,
+            duration_seconds=(
+                round(self.duration_seconds, 3)
+                if self.duration_seconds is not None else None
+            ),
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            errors=list(self.errors),
+        )
+
+    def to_dict(self) -> dict:
+        return self.summary()
+
 
 @dataclass
 class ContentionMetrics:
@@ -595,6 +675,9 @@ class ContentionMetrics:
     local_stream_count: int | None = None
     observed_stream_count: int | None = None
     local_stream_share: float | None = None
+    #: Peak number of local streams running at the same time, derived from the
+    #: per-request windows. AC3 of LP-0MVLHNEDO008FTBH requires >= 2.
+    max_concurrent_local_streams: int | None = None
     quarantine_episode_count: int | None = None
     health_samples: int = 0
     log_files: list[str] = field(default_factory=list)
@@ -613,6 +696,7 @@ class ContentionMetrics:
             ),
             local_stream_count=self.local_stream_count,
             observed_stream_count=self.observed_stream_count,
+            max_concurrent_local_streams=self.max_concurrent_local_streams,
             quarantine_episode_count=self.quarantine_episode_count,
             unavailable=dict(self.unavailable),
         )
@@ -647,6 +731,8 @@ class SlotRunResult:
     system_memory_bytes: int | None = None  # MemAvailable at run end
     llama_started: bool | None = None  # None = n/a (skip-restart), True/False = restart
     viability_warnings: list[str] = field(default_factory=list)  # OOM/start-failure/ctx-reduction
+    stagger_seconds: float = STAGGER_SECONDS_DEFAULT  # measured-request stagger
+    warm_start: WarmStartResult | None = None  # priming-gate outcome for this run
 
     def summary(self) -> dict:
         completed = [r for r in self.results if r.status == "completed"]
@@ -697,6 +783,8 @@ class SlotRunResult:
             requests=[r.to_dict() for r in self.results],
             summary=self.summary(),
             contention=self.contention.to_dict() if self.contention else {},
+            warm_start=(self.warm_start.to_dict() if self.warm_start
+                        else WarmStartResult().to_dict()),
         )
 
     def reproducibility_dict(self) -> dict:
@@ -751,6 +839,43 @@ def derive_local_stream_share(
         return 0, 0, None, "no completed requests reported a resolved model"
     local = sum(1 for r in observed if is_local_resolved_model(r.resolved_model))
     return local, len(observed), local / len(observed), None
+
+
+def derive_max_concurrent_local_streams(
+    results: Sequence[RequestResult],
+) -> tuple[int | None, str | None]:
+    """Peak number of local streams that ran at the same time.
+
+    Uses each completed local request's wall-clock window. Returns ``0`` when
+    no local stream completed, and ``None`` with a reason when local streams
+    exist but carry no timing data. AC3 of LP-0MVLHNEDO008FTBH requires this
+    to reach **2** for a valid local-concurrency sample.
+    """
+    local = [
+        r for r in results
+        if r.status == "completed" and is_local_resolved_model(r.resolved_model)
+    ]
+    if not local:
+        return 0, None
+    windows = [
+        (r.started_at, r.ended_at) for r in local
+        if r.started_at is not None and r.ended_at is not None
+    ]
+    if not windows:
+        return None, "no local stream carried start/end timestamps"
+    events: list[tuple[float, int]] = []
+    for started, ended in windows:
+        events.append((started, 1))
+        events.append((ended, -1))
+    # At an identical instant, closes sort before opens so back-to-back streams
+    # are not counted as overlapping.
+    events.sort(key=lambda event: (event[0], event[1]))
+    current = 0
+    peak = 0
+    for _, delta in events:
+        current += delta
+        peak = max(peak, current)
+    return peak, None
 
 
 def _local_backend_available(snapshot: dict) -> bool | None:
@@ -866,6 +991,11 @@ def build_contention_metrics(
     metrics.local_stream_share = share
     if reason:
         metrics.unavailable["local_stream_share"] = reason
+
+    peak, reason = derive_max_concurrent_local_streams(results)
+    metrics.max_concurrent_local_streams = peak
+    if reason:
+        metrics.unavailable["max_concurrent_local_streams"] = reason
 
     snapshots = list(health_snapshots or [])
     metrics.health_samples = len(snapshots)
@@ -1072,6 +1202,13 @@ async def send_request(
     }
 
     start = time.monotonic()
+    started_at = time.time()
+
+    def _result(**fields) -> RequestResult:
+        """Build a result stamped with this request's wall-clock window."""
+        fields.setdefault("started_at", started_at)
+        fields.setdefault("ended_at", time.time())
+        return RequestResult(**fields)
 
     async def _do_post():
         kwargs = {"json": payload, "timeout": timeout}
@@ -1115,7 +1252,7 @@ async def send_request(
 
         if resp.status_code != 200:
             body = resp.text[:500]
-            return RequestResult(
+            return _result(
                 request_index=index,
                 status="error",
                 total_duration_seconds=elapsed,
@@ -1137,7 +1274,7 @@ async def send_request(
         if completion_tokens > 0:
             time_to_first_token = elapsed / completion_tokens * 1.5
 
-        return RequestResult(
+        return _result(
             request_index=index,
             status="completed",
             total_duration_seconds=elapsed,
@@ -1150,7 +1287,7 @@ async def send_request(
 
     except httpx.TimeoutException as e:
         elapsed = time.monotonic() - start
-        return RequestResult(
+        return _result(
             request_index=index,
             status="error",
             total_duration_seconds=elapsed,
@@ -1158,7 +1295,7 @@ async def send_request(
         )
     except httpx.ConnectError as e:
         elapsed = time.monotonic() - start
-        return RequestResult(
+        return _result(
             request_index=index,
             status="error",
             total_duration_seconds=elapsed,
@@ -1166,12 +1303,108 @@ async def send_request(
         )
     except Exception as e:
         elapsed = time.monotonic() - start
-        return RequestResult(
+        return _result(
             request_index=index,
             status="error",
             total_duration_seconds=elapsed,
             error=f"Exception: {e}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Warm-start priming gate + stagger math (LP-0MVLHNEDO008FTBH)
+# ---------------------------------------------------------------------------
+
+
+class WarmStartError(RuntimeError):
+    """The warm-start gate could not land a request on the local backend.
+
+    Raised instead of silently measuring remote fallback: a slot run whose
+    measured set never reaches the local backend produces an all-remote
+    latency sample, which is exactly the INVALID result the 2026-10-23 sweep
+    recorded (local stream share 0.0 %).
+    """
+
+
+def stagger_delay_seconds(idx: int, stagger_seconds: float) -> float:
+    """Delay before measured request *idx* starts, in seconds.
+
+    Requests still run concurrently once started — the delay only spaces the
+    arrivals. ``idx <= 0`` (the warmup task) never waits and a non-positive
+    ``stagger_seconds`` means all measured requests start at once
+    (``--stagger-seconds 0``, the default).
+    """
+    if idx <= 0 or stagger_seconds <= 0:
+        return 0.0
+    return float(stagger_seconds) * idx
+
+
+async def warm_start_local_backend(
+    client,
+    base_url: str = f"http://localhost:{PROXY_PORT}",
+    max_attempts: int = WARM_START_MAX_ATTEMPTS,
+    timeout: float = WARM_START_TIMEOUT_S,
+    retry_delay_s: float = WARM_START_RETRY_DELAY_S,
+    sleep=None,
+) -> WarmStartResult:
+    """Prime the local backend until one small request completes locally.
+
+    Sends ``WARM_START_MESSAGES`` (single turn, "Say Hi", capped at
+    ``WARM_START_MAX_TOKENS``) and requires the response's ``X-Resolved-Model``
+    to be a local provider. A local completion proves the first local prefill
+    ran and therefore that ``cold_start.mark_warm()`` lifted the admission
+    cap — the state itself is in-process and not exposed via ``/health``.
+
+    Retries up to *max_attempts* times with *retry_delay_s* between attempts
+    (llama-server may still be settling just after ``Llama-server ready``).
+    Raises :class:`WarmStartError` when no attempt lands locally, so the caller
+    fails the run rather than measuring remote fallback.
+    """
+    sleeper = sleep or asyncio.sleep
+    attempts = max(1, int(max_attempts))
+    gate = WarmStartResult(enabled=True)
+
+    for attempt in range(1, attempts + 1):
+        gate.attempts = attempt
+        req = await send_request(
+            client,
+            [dict(m) for m in WARM_START_MESSAGES],
+            index=0,
+            base_url=base_url,
+            max_tokens=WARM_START_MAX_TOKENS,
+            timeout=timeout,
+            progress_label=f"Warm-start priming {attempt}/{attempts}",
+        )
+        if req.status == "completed" and is_local_resolved_model(req.resolved_model):
+            gate.completed_locally = True
+            gate.resolved_model = req.resolved_model
+            gate.duration_seconds = req.total_duration_seconds
+            gate.prompt_tokens = req.prompt_tokens
+            gate.completion_tokens = req.completion_tokens
+            return gate
+        if req.status == "completed":
+            gate.errors.append(
+                f"attempt {attempt}: served remotely by "
+                f"{req.resolved_model or 'an unknown provider'} after "
+                f"{req.total_duration_seconds:.1f}s"
+            )
+        else:
+            gate.errors.append(f"attempt {attempt}: {req.error or 'request failed'}")
+        if attempt < attempts and retry_delay_s > 0:
+            await sleeper(retry_delay_s)
+
+    detail = "; ".join(gate.errors) or "no attempts made"
+    raise WarmStartError(
+        f"Warm-start priming gate failed after {gate.attempts} attempt(s): no "
+        f"priming request completed on the local backend ({detail}). "
+        f"Local dispatch is capped while the proxy's cold-start admission "
+        f"window is armed (proxy/cold_start.py: ``is_cold()`` -> "
+        f"``effective_max_concurrent``=1) and only ``mark_warm()`` after the "
+        f"first completed local prefill lifts it. Check llama-server health "
+        f"and the proxy log for 'local_dispatch_denied' / 'backend busy "
+        f"(health check timeout)', then re-run; pass --no-warm-start only to "
+        f"deliberately measure remote fallback."
+    )
 
 
 async def run_slot_benchmark(
@@ -1185,6 +1418,12 @@ async def run_slot_benchmark(
     health_samples: list | None = None,
     health_interval_s: float = HEALTH_SAMPLE_INTERVAL_S,
     clean_cache: bool = False,
+    stagger_seconds: float = STAGGER_SECONDS_DEFAULT,
+    warm_start: bool = False,
+    warm_start_attempts: int = WARM_START_MAX_ATTEMPTS,
+    warm_start_timeout: float = WARM_START_TIMEOUT_S,
+    warm_start_retry_delay: float = WARM_START_RETRY_DELAY_S,
+    sleep=None,
 ) -> SlotRunResult:
     """Execute a benchmark run for a given slot count.
 
@@ -1195,15 +1434,30 @@ async def run_slot_benchmark(
     Slot cache is cleared ONLY when *clean_cache* is True (explicit opt-in via
     ``--clean-cache``); a live production proxy's warm KV cache must never be
     dropped by a benchmark default (AC5 config-drift guard, LP-0MVAZPQUM006EAC7).
+
+    When *warm_start* is True the measured set is launched only after a small
+    priming request has completed on the **local** backend, proving the
+    post-restart cold-start cap has been lifted (LP-0MVLHNEDO008FTBH). If the
+    gate cannot land locally within ``warm_start_attempts`` attempts it raises
+    :class:`WarmStartError` and no measured request is sent.
+
+    *stagger_seconds* spaces the *measured* request starts by
+    ``stagger_seconds * idx`` (0 = all at once); requests still run
+    concurrently once started. *sleep* is injectable for deterministic tests.
     """
     result = SlotRunResult(slot_count=slot_count, concurrency=num_requests,
-                           prompt_tokens_target=prompt_tokens)
+                           prompt_tokens_target=prompt_tokens,
+                           stagger_seconds=stagger_seconds)
+    result.warm_start = WarmStartResult(enabled=bool(warm_start))
     result.start_time = datetime.now(UTC).isoformat()
     result.start_unix = time.time()
+    sleeper = sleep or asyncio.sleep
 
     print(f"\n{'='*60}")
     print(f"  Slot count: {slot_count}")
     print(f"  Requests: {num_requests}")
+    print(f"  Stagger: {stagger_seconds:g}s between measured starts")
+    print(f"  Warm start: {'enabled' if warm_start else 'disabled'}")
     print(f"  {'='*54}")
 
     if httpx is None:
@@ -1223,9 +1477,30 @@ async def run_slot_benchmark(
 
     try:
         async with httpx.AsyncClient(timeout=TARGET_RESPONSE_TIME_S * 2) as client:
+            # Warm-start priming gate: prove a local prefill completed (and so
+            # the cold-start admission cap is lifted) BEFORE launching the
+            # measured set. A stagger alone cannot fix a first request that
+            # never lands locally (LP-0MVLHNEDO008FTBH).
+            if warm_start:
+                print("  Warm-start gate: priming the local backend "
+                      "(must complete locally before the measured set)...")
+                gate = await warm_start_local_backend(
+                    client,
+                    base_url=base_url,
+                    max_attempts=warm_start_attempts,
+                    timeout=warm_start_timeout,
+                    retry_delay_s=warm_start_retry_delay,
+                    sleep=sleep,
+                )
+                result.warm_start = gate
+                print(f"  Warm-start gate: ✓ local prefill completed "
+                      f"({gate.resolved_model}, attempt {gate.attempts}, "
+                      f"{gate.duration_seconds or 0.0:.1f}s) — cold cap lifted")
+
             # Create all tasks with staggered start delays.
             # Each task independently sleeps for stagger * index seconds before
-            # sending, so requests start 60s apart but run concurrently.
+            # sending, so measured starts are ``--stagger-seconds`` apart while
+            # still running concurrently once started (default 0 = all at once).
             async def _run_session(idx):
                 """Run a 4-turn session for one benchmark request.
 
@@ -1237,9 +1512,10 @@ async def run_slot_benchmark(
                 session_id = f"benchmark-{slot_count}-{idx}-{uuid.uuid4().hex[:8]}"
                 label = "Warmup" if is_warmup else f"Request {idx+1}/{num_requests}"
 
-                # Stagger: delay start by INTER_REQUEST_GAP_S * position
-                if idx > 0 and not is_warmup:
-                    await asyncio.sleep(INTER_REQUEST_GAP_S * idx)
+                # Stagger: delay start by stagger_seconds * position (0 = now)
+                delay = stagger_delay_seconds(idx, stagger_seconds)
+                if delay > 0:
+                    await sleeper(delay)
 
                 # Build initial system prompt with varied content
                 varied = build_varied_content(idx, prompt_tokens)
@@ -1517,9 +1793,10 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         "    Queue-timeout = contention_queue_fallback_after_queue count",
         "    Queue rate    = queue-timeouts / queue-path arrivals (dispatch+timeout)",
         "    Local share   = local stream share (local / observed resolved streams)",
+        "    Peak local    = peak concurrent local streams (AC3 needs >= 2)",
         "    Quarantine    = local quarantine episodes (from /health snapshots)",
         "",
-        f"{'Slots':>6}  {'Queue t/o':>10}  {'Queue rate':>10}  {'Local share':>12}  {'Local streams':>14}  {'Quarant. episodes':>18}",
+        f"{'Slots':>6}  {'Queue t/o':>10}  {'Queue rate':>10}  {'Local share':>12}  {'Local streams':>14}  {'Peak local':>10}  {'Quarant. episodes':>18}",
         "-" * 80,
     ]
 
@@ -1530,6 +1807,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         l_share = c.get("local_stream_share")
         l_count = c.get("local_stream_count")
         l_observed = c.get("observed_stream_count")
+        peak_local = c.get("max_concurrent_local_streams")
         q_epi = c.get("quarantine_episode_count")
 
         q_count_str = '--' if q_count is None else f"{q_count}"
@@ -1539,6 +1817,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
             f"{l_count}/{l_observed or 0}"
         )
         q_epi_str = '--' if q_epi is None else f"{q_epi}"
+        peak_str = '--' if peak_local is None else f"{peak_local}"
 
         lines.append(
             f"{r.slot_count:>6}  "
@@ -1546,6 +1825,7 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
             f"{q_rate_str:>10}  "
             f"{l_share_str:>12}  "
             f"{l_count_str:>14}  "
+            f"{peak_str:>10}  "
             f"{q_epi_str:>18}"
         )
 
@@ -1579,6 +1859,16 @@ def generate_report(all_results: list[SlotRunResult], output_dir: Path) -> Path:
         )
         mem = _format_viability_gb(r.system_memory_bytes)
         lines.append(f"      system MemAvailable: {mem}  llama_started: {r.llama_started}")
+        ws = r.warm_start.summary() if r.warm_start else {}
+        if ws.get("enabled"):
+            lines.append(
+                f"      warm_start: completed_locally={ws.get('completed_locally')} "
+                f"attempts={ws.get('attempts')} "
+                f"resolved_model={ws.get('resolved_model') or '--'}"
+            )
+        else:
+            lines.append("      warm_start: disabled (measured set launched cold)")
+        lines.append(f"      stagger_seconds: {r.stagger_seconds:g}")
         if r.viability_warnings:
             for w in r.viability_warnings:
                 lines.append(f"      ! VIABILITY: {w}")
@@ -1597,11 +1887,20 @@ async def run_test_mode(
     skip_restart: bool = False,
     clean_cache: bool = False,
     phase: str = "cold",
+    warm_start: bool = False,
+    warm_start_attempts: int = WARM_START_MAX_ATTEMPTS,
+    warm_start_timeout: float = WARM_START_TIMEOUT_S,
 ) -> None:
     """Send a single small 'Say Hi' request to verify proxy/llama-server connectivity.
 
     This is a lightweight connectivity check.  It does not update config.yaml or
     restart services unless ``skip_restart`` is False (the default).
+
+    With ``warm_start=True`` the same "Say Hi" probe doubles as the
+    warm-start priming gate (LP-0MVLHNEDO008FTBH): it is retried within the
+    bounded budget and must complete on the **local** backend. A failed gate
+    restores the original config and exits non-zero, so the probe can be used
+    to prove the cold-start cap has been lifted before a sweep.
 
     Args:
         slot_count: Slot count to configure (only used when restarting). When
@@ -1611,6 +1910,9 @@ async def run_test_mode(
         skip_restart: If True, skip config update and service restart.
         clean_cache: If True, clear slot cache before restart. Default: False.
         phase: Measurement phase ('cold' or 'warm'). Default: 'cold'.
+        warm_start: Require the probe to complete locally (warm-start gate).
+        warm_start_attempts: Bounded retry budget for the gate.
+        warm_start_timeout: Per-attempt timeout for the gate.
     """
     print(f"\n{'='*60}")
     print(f"  TEST MODE: Sending a single small prompt (phase={phase})")
@@ -1639,39 +1941,61 @@ async def run_test_mode(
         print("Error: httpx is not installed. Install with: pip install httpx", file=sys.stderr)
         return
 
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Say Hi"},
-    ]
+    messages = [dict(m) for m in WARM_START_MESSAGES]
+    exit_code = 0
+    try:
+        client_timeout = max(120.0, warm_start_timeout)
+        async with httpx.AsyncClient(timeout=client_timeout) as client:
+            if warm_start:
+                print("  Warm-start gate: 'Say Hi' must complete locally "
+                      f"(up to {warm_start_attempts} attempts)...")
+                try:
+                    gate = await warm_start_local_backend(
+                        client,
+                        base_url=base_url,
+                        max_attempts=warm_start_attempts,
+                        timeout=warm_start_timeout,
+                    )
+                except WarmStartError as exc:
+                    print(f"  ✗ Warm-start gate FAILED: {exc}")
+                    exit_code = 1
+                else:
+                    print("  ✓ Warm-start gate passed — local prefill completed")
+                    print(f"      Resolved model: {gate.resolved_model}")
+                    print(f"      Attempts: {gate.attempts}")
+                    print(f"      Duration: {gate.duration_seconds or 0.0:.1f}s")
+            else:
+                print("  Sending: 'Say Hi'")
+                req = await send_request(
+                    client, messages, index=0, base_url=base_url,
+                    max_tokens=20, timeout=120.0,
+                    progress_label="Test",
+                )
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        print("  Sending: 'Say Hi'")
-        req = await send_request(
-            client, messages, index=0, base_url=base_url,
-            max_tokens=20, timeout=120.0,
-            progress_label="Test",
-        )
-
-    if req.status == "completed":
-        print("  ✓ Test passed!")
-        print(f"      Duration: {req.total_duration_seconds:.1f}s")
-        print(f"      Prompt tokens: {req.prompt_tokens}")
-        print(f"      Completion tokens: {req.completion_tokens}")
-        print(f"      Tokens/sec: {req.tokens_per_second:.1f}")
-        if req.time_to_first_token_seconds is not None:
-            print(f"      TTFT: {req.time_to_first_token_seconds:.3f}s")
-    else:
-        print(f"  ✗ Test FAILED: {req.error}")
-
-    # Restore the config we changed (test mode must never leave drift)
-    if not skip_restart and original_config is not None:
-        print(f"  Restoring original config (session_slot_pool_size: {original_slot})...")
-        _write_config(original_config)
-        restart_services(original_slot or 1)
+                if req.status == "completed":
+                    print("  ✓ Test passed!")
+                    print(f"      Duration: {req.total_duration_seconds:.1f}s")
+                    print(f"      Prompt tokens: {req.prompt_tokens}")
+                    print(f"      Completion tokens: {req.completion_tokens}")
+                    print(f"      Tokens/sec: {req.tokens_per_second:.1f}")
+                    if req.time_to_first_token_seconds is not None:
+                        print(f"      TTFT: {req.time_to_first_token_seconds:.3f}s")
+                else:
+                    print(f"  ✗ Test FAILED: {req.error}")
+    finally:
+        # Restore the config we changed (test mode must never leave drift),
+        # including when the warm-start gate aborts.
+        if not skip_restart and original_config is not None:
+            print(f"  Restoring original config (session_slot_pool_size: {original_slot})...")
+            _write_config(original_config)
+            restart_services(original_slot or 1)
 
     print(f"\n{'='*60}")
     print("  TEST MODE COMPLETE")
     print(f"{'='*60}")
+
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 # ---------------------------------------------------------------------------
@@ -1723,6 +2047,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--warmup", action="store_true",
         help="Include 1 warmup request before measured requests (default: no warmup)",
+    )
+    # NOTE: ``--warmup`` is a concurrent *task*, not a gate — it does not prove
+    # the local backend is warm. ``--warm-start`` is the gate (LP-0MVLHNEDO008FTBH).
+    parser.add_argument(
+        "--warm-start", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Warm-start priming gate: send one small 'Say Hi' request after the "
+            "restart and require it to complete on the LOCAL backend before the "
+            "measured set launches (proves the cold-start admission cap has "
+            "been lifted by mark_warm(); fails the run if it cannot land "
+            "locally within --warm-start-attempts). Default: ON for --sweep, "
+            "OFF otherwise. Use --no-warm-start to measure remote fallback "
+            "deliberately."
+        ),
+    )
+    parser.add_argument(
+        "--warm-start-attempts", type=int, default=WARM_START_MAX_ATTEMPTS,
+        help=(
+            "Bounded retry budget for the warm-start priming request "
+            f"(default: {WARM_START_MAX_ATTEMPTS})"
+        ),
+    )
+    parser.add_argument(
+        "--warm-start-timeout", type=float, default=WARM_START_TIMEOUT_S,
+        help=(
+            "Per-attempt client timeout for the warm-start priming request, in "
+            f"seconds (default: {WARM_START_TIMEOUT_S:.0f} — the cold grace window)"
+        ),
+    )
+    parser.add_argument(
+        "--stagger-seconds", type=float, default=STAGGER_SECONDS_DEFAULT,
+        help=(
+            "Seconds between MEASURED request starts (requests still run "
+            "concurrently once started). 0 = all at once. Default: "
+            f"{STAGGER_SECONDS_DEFAULT:g} — the old hard-coded 60 s gap is gone "
+            "(LP-0MVLHNEDO008FTBH AC2)"
+        ),
     )
     parser.add_argument(
         "--clean-cache", action="store_true",
@@ -1784,6 +2145,20 @@ def resolve_slot_counts(args: argparse.Namespace) -> list[int]:
     return slot_counts
 
 
+def resolve_warm_start(args: argparse.Namespace) -> bool:
+    """Resolve whether the warm-start priming gate runs for this invocation.
+
+    ``--warm-start`` / ``--no-warm-start`` are explicit and always win. With
+    neither given the gate is **ON for ``--sweep``** (the mode whose purpose is
+    comparing slot counts under warm, production-representative concurrency)
+    and OFF for the other modes, where a single deliberate cold measurement is
+    legitimate (LP-0MVLHNEDO008FTBH AC1).
+    """
+    if args.warm_start is not None:
+        return bool(args.warm_start)
+    return bool(args.sweep)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
@@ -1800,6 +2175,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.prompt_tokens < 1:
         print("Error: --prompt-tokens must be >= 1", file=sys.stderr)
         sys.exit(2)
+    if args.stagger_seconds < 0:
+        print("Error: --stagger-seconds must be >= 0", file=sys.stderr)
+        sys.exit(2)
+    if args.warm_start_attempts < 1:
+        print("Error: --warm-start-attempts must be >= 1", file=sys.stderr)
+        sys.exit(2)
+    if args.warm_start_timeout <= 0:
+        print("Error: --warm-start-timeout must be > 0", file=sys.stderr)
+        sys.exit(2)
+
+    warm_start = resolve_warm_start(args)
 
     # Build prompt materials
     print("Building prompt materials...")
@@ -1828,6 +2214,10 @@ def main(argv: list[str] | None = None) -> None:
         if not args.test:
             planned = resolve_slot_counts(args)
             print(f"  Slot counts: {', '.join(str(s) for s in planned)}")
+            print(f"  Warm start: {'enabled' if warm_start else 'disabled'}"
+                  + (f" (attempts={args.warm_start_attempts}, "
+                     f"timeout={args.warm_start_timeout:g}s)" if warm_start else ""))
+            print(f"  Stagger: {args.stagger_seconds:g}s between measured starts")
         print("\nDry run — config looks valid. Run without --dry-run to execute.")
         return
 
@@ -1839,6 +2229,9 @@ def main(argv: list[str] | None = None) -> None:
             skip_restart=args.skip_restart,
             clean_cache=args.clean_cache,
             phase=args.phase,
+            warm_start=warm_start,
+            warm_start_attempts=args.warm_start_attempts,
+            warm_start_timeout=args.warm_start_timeout,
         ))
         return
 
@@ -1903,6 +2296,10 @@ def main(argv: list[str] | None = None) -> None:
                 prompt_tokens=args.prompt_tokens,
                 health_samples=health_samples,
                 clean_cache=args.clean_cache,
+                stagger_seconds=args.stagger_seconds,
+                warm_start=warm_start,
+                warm_start_attempts=args.warm_start_attempts,
+                warm_start_timeout=args.warm_start_timeout,
             ))
             # Attach metadata for JSON output
             run_result.phase = args.phase

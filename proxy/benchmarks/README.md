@@ -188,7 +188,18 @@ representative measurements:
 | `--prompt-tokens N` | `6000` (`TARGET_PROMPT_TOKENS`) | Target total prompt size in tokens, split ~50/50 shared/varied. Default preserves existing behaviour; use a small value (e.g. `--prompt-tokens 2000`) for the small-request workload. |
 | `--log-dir PATH` | `/var/log/llama-proxy` | Proxy log directory scanned for queue-timeout metrics. |
 | `--no-health-samples` | OFF (sampling ON) | By default `/health` is sampled during each run to count local quarantine episodes; pass this flag to disable sampling. |
+| `--warm-start` / `--no-warm-start` | **ON for `--sweep`**, OFF otherwise | **Warm-start priming gate** (LP-0MVLHNEDO008FTBH): after each restart, one small single-turn "Say Hi" priming request (≤ `--warm-start-timeout` s, ≤ 20 completion tokens) must complete on the **local** backend (`X-Resolved-Model` local — proving the first local prefill ran and `cold_start.mark_warm()` lifted the admission cap) before the measured set launches. Retried within `--warm-start-attempts`; persistent failure fails the run with an actionable `cold_start.is_cold()` / `local_dispatch_denied` diagnostic — never a silent remote fallback. Without this gate, `--concurrency N` launches into the post-restart cold window and measures 0 % local share (the 2026-10-23 INVALID sweep). |
+| `--warm-start-attempts N` | `3` | Bounded retry budget for the priming request (default `WARM_START_MAX_ATTEMPTS`). |
+| `--warm-start-timeout S` | `120` | Per-attempt client timeout for the priming request — the cold grace window. Must stay well under the 1 200 s client timeout. |
+| `--stagger-seconds N` | `0` (all at once) | Seconds between **measured** request starts (`N × idx`); requests still run concurrently once started. Default `0` preserves the all-at-once launch; the historical hard-coded `INTER_REQUEST_GAP_S` 60 s gap is **removed**. |
 | restart timestamps | — | `proxy_restart_time` and `llama_ready_time` ISO timestamps are recorded in each run's JSON `config` for reproducible measurement windows. |
+
+Every run artefact records a `warm_start` block (the gate outcome),
+`config.stagger_seconds` plan, and — via `contention` —
+`max_concurrent_local_streams` (peak concurrent local streams), so a
+`local_stream_share > 0` result is attributable to a proven-warm backend
+and the "≥ 2 concurrent local streams" success evidence is auditable from
+`slot_<N>.json` alone.
 
 Both `--concurrency` and `--prompt-tokens` are recorded in the JSON
 artefact (`runs[].config`) and in the summary report header, so a run is
@@ -204,7 +215,33 @@ python -m proxy.benchmarks.slot_benchmark --slots 6 --phase cold --clean-cache
 # Small-request contention run at the observed concurrency:
 python -m proxy.benchmarks.slot_benchmark --slots 3 \
     --concurrency 3 --prompt-tokens 2000
+
+# The N=2 then N=3 sweep with the warm-start gate (ON by default for --sweep)
+# and an explicit all-at-once measured launch:
+python -m proxy.benchmarks.slot_benchmark --sweep --resume 2 \
+    --concurrency 3 --prompt-tokens 2000 --warm-start --stagger-seconds 0
+# Staggered arrivals instead (production sessions arrive staggered):
+python -m proxy.benchmarks.slot_benchmark --sweep --resume 2 \
+    --concurrency 3 --prompt-tokens 2000 --stagger-seconds 30
 ```
+
+### slot_benchmark.py warm-start gate: why it exists
+
+The proxy's cold-start admission control (`proxy/proxy/cold_start.py`,
+LP-0MUCEFCAT005NFNN) caps local dispatch at 1 concurrent request for the
+first `cold_start.grace_seconds` after every restart (a post-restart GPU
+must not receive a thundering herd of concurrent prefills). The cap lifts
+only when the first local prefill completes (`mark_warm()`). The
+2026-10-23 controlled N=2/N=3 sweep launched `--concurrency N` **inside** that
+window; none of its requests ever completed a local prefill (`backend busy
+(health check timeout)`), so the cap never lifted and every measured stream
+fell back remote — local stream share 0.0 %. A fixed stagger (the then-60 s
+`INTER_REQUEST_GAP_S`) cannot fix a first request that never lands; only a
+gate that *proves* a local prefill completed before the measured set launches
+can. The cold-state lives in-process and is not exposed via `/health`, so the
+priming request's local `X-Resolved-Model` is the harness-visible proof of
+`cold_start.is_cold() == False`. The production guard is never weakened — the
+fix lives entirely in the harness.
 
 ### slot_benchmark.py quiet-window preflight (run this first)
 
@@ -252,6 +289,7 @@ production instrumentation:
 |--------|--------|----------|
 | Queue-timeout count / rate | Proxy log parsing of the `contention_queue_fallback_after_queue` and `contention_queue_dispatch` markers in the run window (reusing `contention_queue_simulation`). The rate is `timeout / (dispatch + timeout)`. | `contention.queue_timeout_count`, `contention.queue_timeout_rate` |
 | Local stream share | Per-request `X-Resolved-Model` response header; the fraction of completed streams served by a local provider (`local/…`, `local-qwen3/…`). | `contention.local_stream_share`, `contention.local_stream_count`, `contention.observed_stream_count` |
+| Peak local concurrency | Per-request start/end windows (recorded on every request); the max number of local streams that ran at the same time. LP-0MVLHNEDO008FTBH AC3 requires ≥ 2 for a valid warm-concurrency sample. | `contention.max_concurrent_local_streams` |
 | Local quarantine episodes | `/health` snapshots taken during the run (sampling is on by default; disable with `--no-health-samples`); a count of transitions from a known-available local backend into `self_healing_in_progress` / `gpu_wedge_detected` / `llama_server_running=false` / `backend_reachable=false`. | `contention.quarantine_episode_count`, `contention.health_samples` |
 
 Every metric appears in both the JSON artefact (`contention` block plus the
