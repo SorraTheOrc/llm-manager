@@ -1962,7 +1962,7 @@ http://localhost:8000/
 
 **Slot Status**
 - Real-time per-slot status cards for the local llama-server (idle/processing/waiting indicators, decoded-token progress)
-- Updates live via SSE broadcasts from `/events` (per-slot data queried from the llama-server `/slots` endpoint)
+- Updates live via SSE broadcasts from `/events` (per-slot data queried from the llama-server `/slots` endpoint, targeting the discovered model-child port rather than the router — see _Child-port discovery_ below)
 - The per-slot `session_id` (and the top-level `local_owner_session_id`) is always a plain session-id **string**. Per-endpoint dispatch leases are keyed internally by an `(endpoint, session_id)` tuple; the proxy normalises it via `_dispatch_key_session_id()` before it reaches the wire (WL-0MUKY4MAX0008I0L). Older proxies may still send the legacy two-element array (`["<endpoint>", "<session-id>"]`); the UI (`normaliseSessionId()` in `templates/index.html`) tolerates both shapes and never calls `.substring()` on a non-string.
 - Covered by Playwright E2E tests in `tests/slot-status.spec.js`
 
@@ -2062,6 +2062,45 @@ variable). If the query times out, safe defaults (mostly `false`/`null`) are
 returned and `llama_server_running` is set to `false`.
 
 This endpoint requires no authentication (internal) and is rate-unlimited.
+
+### Child-port discovery (why `/slots` bypasses the router)
+
+The llama-server **router** (port `server.llama_server_port`, usually 8080)
+proxies `GET /slots` to the owning model child (Qwen3 etc. on dynamic ports).
+When the child is mid-giant-prefill it cancels the proxied connection and the
+router answers **HTTP 500** — a proxy-polling artifact, not a model failure
+(F3 triage / `docs/dev/slots-500-triage.md`). Every proxy-initiated `/slots`
+query (status handler, SSE payload, slot-availability check, progress probes),
+resolved centrally by `_resolve_local_slots_target()`
+(`proxy/proxy/router_helpers.py`), therefore targets the **model child port
+directly** whenever one is known.
+
+Discovery sources, in order (rotation- and restart-proof,
+LP-0MVP7525P008RXMF):
+
+1. **Live signal (tail of `llama-server.log`)** — the router's per-request
+   line `proxying request to model <model> on port <port>` survives logrotate
+   (baseline: 38,761 lines and zero spawn lines in the 2026-10-26 log).
+2. **Startup spawn line** — `spawning server instance with name=<model> on
+   port <port>` (head of a fresh log; covers the very first polls after a
+   restart before any request is proxied).
+3. **Rotated logs** — scanned newest-first when the current log is sparse
+   (NUL-padded after logrotate).
+
+Caching: positives per `(pid, model)` re-verified every `CHILD_PORT_CACHE_TTL`
+(default 300 s); negatives TTL-bounded (`CHILD_PORT_MISS_TTL`, default 30 s)
+so a signal that appears later is picked up instead of being pinned to `None`
+for the life of the pid.
+
+**Fallback (observable, AC3):** when no child port can be discovered the query
+falls back to the router port and the proxy logs (throttled to one per 300 s)
+`slots_child_port_unavailable: no model child port discovered for model=<m>;
+falling back to router port <p> — every proxy-initiated /slots poll will
+traverse the router and can 500 during giant prefills`, and increments
+`llama_slots_child_port_fallbacks_total{reason="no_child_port_router_mode"|
+"no_child_port_single_server"}` in `/metrics`. In single-server mode
+(`llama_router_mode: false`) there is no child, so the fallback is expected:
+counted, logged at debug level only.
 
 #### List Models
 ```bash

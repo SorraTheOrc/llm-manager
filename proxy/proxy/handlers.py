@@ -239,6 +239,25 @@ async def poll_slots_for_model(
     polls = 0
     if not model:
         return None
+    # LP-0MVP7525P008RXMF AC2: the per-model slot poller must target the
+    # discovered child port when it polls the local router, so a page-load
+    # that triggers slot polling cannot generate router-proxied /slots 500s
+    # during a giant prefill.
+    try:
+        srv0 = _srv()
+        cfg0 = getattr(srv0, "config", None)
+        server_cfg0 = cfg0.get("server", {}) if isinstance(cfg0, dict) else {}
+        router_port0 = int(server_cfg0.get("llama_server_port", 8080) or 8080)
+        if not llama_port or int(llama_port) == router_port0:
+            from proxy.router_helpers import _resolve_local_slots_target
+
+            _ep, _port = _resolve_local_slots_target(
+                srv0, model=model, router_port=llama_port
+            )
+            if _port:
+                llama_port = _port
+    except Exception:
+        pass
     slots_url = f"http://localhost:{llama_port}/slots?model={model}"
     while True:
         try:
@@ -582,18 +601,19 @@ async def get_llama_local_status(request: Request):
         if cm:
             try:
                 llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
-                # Prefer the discovered local child port: the router serializes
-                # /slots?model=... behind the busy child (LP-0MTDGBRPU003Z7KU,
-                # measured 5-7s vs 0.17s direct), which starved the shared
-                # client pool and made status polls report llama_server_running
-                # = false on ~76% of polls.
-                from proxy.router_helpers import _discover_local_child_port
-                # LP-0MTP1FQXH004JYEF: pass current_model so the lookup
-                # filters to the Qwen3 child, not the first spawn line
-                # (mxbai-embed) which yields idle n_ctx 256 slots.
-                child_port = _discover_local_child_port(srv, model=cm)
-                if child_port is not None:
-                    llama_port = child_port
+                # LP-0MVP7525P008RXMF AC2: route every proxy-initiated /slots
+                # query through the single shared resolver, which prefers the
+                # discovered model-child port over this router port (the
+                # router serializes /slots?model=... behind the busy child —
+                # 5-7s vs 0.17s direct — and converts a cancelled proxied poll
+                # into an HTTP 500). LP-0MTP1FQXH004JYEF: pass current_model so
+                # the lookup filters to the Qwen3 child, not the first spawn
+                # line (mxbai-embed).
+                from proxy.router_helpers import _resolve_local_slots_target
+
+                _, llama_port = _resolve_local_slots_target(
+                    srv, model=cm, router_port=llama_port
+                )
                 client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
                 from proxy.observability import (
                     _last_slot_details_cache,

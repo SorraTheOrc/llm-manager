@@ -10,6 +10,12 @@ This module exposes a small set of metrics required by LP-0MNA7G5JB004P5O6:
 Extended by LP-0MQ1HDY1N00502S7:
 - proxy_http_errors_total{endpoint="...",status="...",reason="..."} (counter)
 
+Extended by LP-0MVP7525P008RXMF (child-port discovery observability):
+- llama_slots_child_port_fallbacks_total{reason="..."} (counter) — proxy /slots
+  queries that fell back to the router port because no model child port could
+  be discovered (the previously silent regression that made the rank-1
+  direct-polling fix inert).
+
 Extended by LP-0MVF7KQED005TG9Z (quota observability surface):
 - quota_rolling_percent{account,entry} (gauge)
 - quota_weekly_percent{account,entry} (gauge)
@@ -68,6 +74,14 @@ llama_token_rate_histogram = None
 # of silently wedging orchestrators (herdr downtime worker) into fail-closed
 # busy via total_slots=0.
 llama_slots_query_failures_total = None
+# Child-port discovery fallback (LP-0MVP7525P008RXMF AC3): every proxy-initiated
+# /slots query is routed to the discovered model-child port when one is known; a
+# fallback to the router port means the child could not be discovered for this
+# pid/model and the poll will traverse the router (re-introducing the cancel-500
+# path during giant prefills). Counted by reason so a regression was previously
+# hidden by `except Exception: pass` (weeks of silent router 500s) now surfaces
+# as an alert/trend instead.
+llama_slots_child_port_fallbacks_total = None
 # Remote-stream watchdog terminations (LP-0MSVP7ZML003XZTJ): a remote
 # stream terminated by the max-duration or activity-timeout watchdog (a
 # "connected but idle" upstream that never goes silent). Counts by reason
@@ -144,6 +158,12 @@ if _enabled:
         llama_slots_query_failures_total = Counter(
             'llama_slots_query_failures_total',
             'Total llama-server /slots query failures by reason',
+            ['reason'],
+        )
+        llama_slots_child_port_fallbacks_total = Counter(
+            'llama_slots_child_port_fallbacks_total',
+            'Proxy /slots queries falling back to the router port because no '
+            'model child port could be discovered, by reason',
             ['reason'],
         )
         llama_remote_stream_terminated_total = Counter(
@@ -331,6 +351,32 @@ def record_slots_query_failure(reason: str):
         return
     try:
         llama_slots_query_failures_total.labels(reason=reason).inc()
+    except Exception:
+        pass
+
+
+def record_slots_child_port_fallback(reason: str):
+    """Increment ``llama_slots_child_port_fallbacks_total`` for a fallback.
+
+    Args:
+        reason: Why the child port could not be discovered —
+            ``no_child_port_router_mode`` (router mode active but no child
+            port discovered: a real regression) or
+            ``no_child_port_single_server`` (single-server mode, where the
+            router port *is* the model instance and a fallback is expected).
+
+    LP-0MVP7525P008RXMF AC3: before this counter the discovery helper
+    swallowed every failure (`except Exception: pass`), so the rank-1 fix
+    (LP-0MTIHZ8M5005ZAU8) was inert for weeks — every /slots poll silently
+    traversed the router and kept producing router 500s. This counter makes
+    the fallback observable in `/metrics` and alertable.
+
+    Best-effort no-op when prometheus_client is unavailable.
+    """
+    if not _enabled or llama_slots_child_port_fallbacks_total is None:
+        return
+    try:
+        llama_slots_child_port_fallbacks_total.labels(reason=reason).inc()
     except Exception:
         pass
 

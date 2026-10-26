@@ -392,6 +392,19 @@ async def status_events():
                 server_cfg = srv.config.get("server", {})
                 llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
                 model_name = srv.current_model or None
+                # LP-0MVP7525P008RXMF AC2: the SSE initial payload's per-slot
+                # detail query must target the discovered child port too — it
+                # previously built the URL from server.llama_server_port with
+                # no discovery at all, so page-loads during a giant prefill hit
+                # the router and its 500 echo.
+                try:
+                    from proxy.router_helpers import _resolve_local_slots_target
+
+                    _, llama_port = _resolve_local_slots_target(
+                        srv, model=model_name, router_port=llama_port
+                    )
+                except Exception:
+                    pass
                 # 5s timeout: llama-server may be slow to respond
                 # to /slots when busy generating tokens.
                 slot_details = await _query_slots_detail(

@@ -2084,18 +2084,23 @@ async def _periodic_broadcast_loop():
                         # serializes /slots?model=... behind the busy child
                         # (LP-0MTDGBRPU003Z7KU, 5-7s vs 0.17s direct), so the
                         # broadcast SSE loop must query the model instance
-                        # directly to avoid the 6,865/day router 500 storm
+                        # directly to avoid the router 500 storm
                         # (LP-0MTIHZ8M5005ZAU8 / F3 triage rank 1).
-                        # Use current_model as the model param for /slots
+                        # LP-0MVP7525P008RXMF AC2: use the single shared resolver
+                        # so this path can never silently fall back to the router
+                        # again (the previous inline `except Exception: pass`
+                        # lookup did exactly that for weeks).
                         model_name = srv.current_model or None
                         try:
-                            from proxy.router_helpers import _discover_local_child_port
+                            from proxy.router_helpers import (
+                                _resolve_local_slots_target,
+                            )
                             # LP-0MTP1FQXH004JYEF: filter to the current model
                             # so the SSE broadcast does not query the embed
                             # child (idle 256-ctx slots) when Qwen3 is busy.
-                            _child = _discover_local_child_port(srv, model=model_name)
-                            if _child is not None:
-                                llama_port = _child
+                            _, llama_port = _resolve_local_slots_target(
+                                srv, model=model_name, router_port=llama_port
+                            )
                         except Exception:
                             pass
                         # 5s timeout: llama-server may be slow to respond

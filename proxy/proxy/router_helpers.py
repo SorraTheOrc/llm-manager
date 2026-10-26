@@ -1327,10 +1327,16 @@ async def _query_prefill_progress(
         try:
             from proxy.observability import _query_slots_progress
 
+            # LP-0MVP7525P008RXMF AC2: this probe runs *during* the prefill it
+            # observes, so it must never traverse the router (the router
+            # serializes /slots behind the busy child and 500s on cancel).
+            _slots_endpoint, _slots_port = _resolve_local_slots_target(
+                srv, model=model_name, endpoint=endpoint, router_port=llama_port
+            )
             states = await asyncio.wait_for(
                 _query_slots_progress(
-                    llama_port, timeout=timeout, model=model_name,
-                    endpoint=endpoint,
+                    _slots_port, timeout=timeout, model=model_name,
+                    endpoint=_slots_endpoint,
                 ),
                 timeout=timeout + 0.5,
             )
@@ -3237,9 +3243,16 @@ async def _query_slot_processing(srv, session_id: str, model_name: str | None, e
         from proxy.observability import _query_slots_progress
 
         timeout = float(os.environ.get("STATUS_QUERY_TIMEOUT", "1.0"))
+        # LP-0MVP7525P008RXMF AC2: lease-liveness probes must not traverse the
+        # router — resolve to the discovered child port (the pool of this probe
+        # is exactly the giant prefill that makes the router 500).
+        _slots_endpoint, _slots_port = _resolve_local_slots_target(
+            srv, model=model_name, endpoint=endpoint, router_port=llama_port
+        )
         states = await asyncio.wait_for(
             _query_slots_progress(
-                llama_port, timeout=timeout, model=model_name, endpoint=endpoint
+                _slots_port, timeout=timeout, model=model_name,
+                endpoint=_slots_endpoint,
             ),
             timeout=timeout + 0.5,
         )
@@ -4784,27 +4797,93 @@ _QWEN3_SPAWN_RE = re.compile(r"name=(\S+) on port (\d+)")
 # Alias kept for backward-compat; new code uses _SPAWN_RE.
 _SPAWN_RE = _QWEN3_SPAWN_RE
 
-_child_port_cache: dict[tuple[int, str], int | None] = {}
-"""Cached child port per (llama-server pid, normalized target model).
+#: Live, rotation-proof child-port signal (LP-0MVP7525P008RXMF AC1). The router
+#: writes one of these per proxied request, e.g. ``srv  proxy_reques: proxying
+#: request to model Qwen3 on port 41395``. Unlike the spawn line it keeps
+#: appearing for the whole life of the process, so it survives logrotate — the
+#: 2026-10-26 window had 38,761 of these and zero spawn lines in the current
+#: ``llama-server.log``, which is exactly why discovery returned ``None`` for the
+#: lifetime of the pid and every ``/slots`` poll silently used the router.
+_PROXY_REQUEST_RE = re.compile(r"proxying request to model (\S+) on port (\d+)")
+
+_CHILD_PORT_HEAD_SCAN_BYTES = 256 * 1024
+"""Head window scanned for startup spawn lines (unchanged behaviour)."""
+
+_CHILD_PORT_TAIL_SCAN_BYTES = 1024 * 1024
+"""Tail window scanned for the live ``proxying request ... on port`` signal.
+
+Only read on a cache miss / re-verification (see the TTLs below), so the
+per-request cost stays at zero once a port is cached.
+"""
+
+_child_port_cache: dict[Any, int] = {}
+"""Cached **positive** child port per (llama-server pid, normalized model).
 
 The router llama-server (port 8080) spawns child instances on dynamic ports
-(``--port 0``). The child port is discoverable from the spawn line in the
-llama-server log (``spawning server instance with name=Qwen3 on port 58113``).
+(``--port 0``). The child port is discoverable from the llama-server log:
+
+1. ``spawning server instance with name=Qwen3 on port 58113`` — written once at
+   startup and lost at the next logrotate.
+2. ``proxying request to model Qwen3 on port 58113`` — written for every
+   proxied request, so it is present in any non-trivial current log
+   (LP-0MVP7525P008RXMF AC1).
 
 The router serializes ``GET /slots?model=...`` behind the busy child's
 generation loop (LP-0MTDGBRPU003Z7KU: measured 5-7s via the router vs 0.17s
-direct), so availability/status checks should target the child port directly.
+direct), so availability/status/progress checks must target the child port.
 
-LP-0MTP1FQXH004JYEF: the previous implementation returned the *first*
-spawn line (which is ``mxbai-embed`` — embeddings child) instead of the
-target model (Qwen3), so ``/llama/local/status`` queried the embed child
-(``n_ctx 256, is_processing=false``) and reported ``3/3`` idle while the
-Qwen3 child was busy. The cache was also per-pid only and sticky. Now the
-lookup filters by target model, strips NUL padding from sparse logrotate
-files, scans the full current log + rotated logs, and caches per
-``(pid, model)``. Callers should pass the target model (``current_model``
-or ``slot_model``) so the right child is returned.
+LP-0MTP1FQXH004JYEF: the lookup filters by target model, because the *first*
+spawn line is ``mxbai-embed`` (embeddings child); querying it reported
+``3/3`` idle while the Qwen3 child was busy.
+
+Cache policy (LP-0MVP7525P008RXMF): only positives are cached here (a negative
+result is cached separately with a short TTL, so a signal that appears later is
+picked up instead of being pinned for the life of the pid); a positive entry is
+re-verified every :func:`_child_port_cache_ttl` seconds so a child restart with
+the same parent pid cannot pin a stale port forever. A bare ``int`` pid key is
+still honoured for backward compatibility.
 """
+
+_child_port_cache_at: dict[Any, float] = {}
+"""``time.monotonic()`` timestamp of each positive cache entry (re-verify TTL)."""
+
+_child_port_miss_cache: dict[tuple[int, str, str], float] = {}
+"""Negative cache: ``(pid, model, log path)`` -> monotonic time of the miss.
+
+TTL-bounded by :func:`_child_port_miss_ttl`. Without this the helper would
+re-read the log on every poll while no child port is discoverable; with a
+permanent cache it would pin ``None`` for the whole life of the pid (the
+2026-10-26 regression). The log path is part of the key so unit tests that
+use a fresh ``tmp_path`` per case never collide.
+"""
+
+
+# -------------------------------------------------------------------
+# Discovery tuning (env-overridable so an operator can shorten the
+# re-verification window without a code change)
+# -------------------------------------------------------------------
+
+def _child_port_cache_ttl() -> float:
+    """Seconds a positive child-port result is trusted before re-verification."""
+    try:
+        return max(0.0, float(os.environ.get("CHILD_PORT_CACHE_TTL", "300")))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _child_port_miss_ttl() -> float:
+    """Seconds a negative child-port result is cached (then re-scanned)."""
+    try:
+        return max(0.0, float(os.environ.get("CHILD_PORT_MISS_TTL", "30")))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+_CHILD_PORT_FALLBACK_WARN_INTERVAL = 300.0
+"""Seconds between repeated 'no child port / falling back to router' warnings."""
+
+_last_child_port_fallback_warn_ts = 0.0
+"""Monotonic timestamp of the last child-port fallback warning (throttle)."""
 
 
 def _is_sparse_log(log_path: Path) -> bool:
@@ -4844,72 +4923,170 @@ def _llama_log_path(srv) -> Path:
     return Path(__file__).parent / "logs" / "llama-server.log"
 
 
-def _scan_spawn_ports(log_path: Path, target_model: str | None) -> int | None:
-    """Scan a single log file for spawn ports, filtered by target model.
+def _read_log_window(log_path: Path, *, tail: bool, window: int) -> str:
+    """Read up to *window* bytes from the head or tail of *log_path*.
 
-    Strips NUL padding (sparse logrotate files) and returns the *last*
-    matching port for *target_model* so restarts pick the newest line.
-    ``target_model`` is matched case-insensitively; when no exact match is
-    found the function returns ``None`` (caller may fall back to a non-embed
-    heuristic or to ``None`` / router port). Returns a special sentinel
-    ``None`` both for "file unreadable" and "no matching spawn" — caller
-    distinguishes sparse vs. real-content via :func:`_is_sparse_log`.
+    Returns the decoded text with NUL padding (sparse logrotate files) stripped,
+    or an empty string when the file is missing/unreadable/empty. A tail read
+    can start mid-line; the partial first line simply does not match either
+    port pattern, so the result is unaffected.
     """
     try:
         if not log_path.exists():
-            return None
+            return ""
         size = log_path.stat().st_size
-        # Spawn lines are at startup (head) but NUL-padded sparse files can
-        # hide them; read up to 256 KiB so we cover head + a bit of tail
-        # without loading multi-MB logs fully. If the file is larger we still
-        # scan only that window — the caller iterates rotated logs for older
-        # spawn lines.
-        read_size = min(262144, size) if size else 0
-        if read_size == 0:
-            return None
+        if size == 0 or window <= 0:
+            return ""
+        n = min(window, size)
+        offset = size - n if tail else 0
         with open(log_path, "rb") as f:
-            raw = f.read(read_size)
-        text = raw.decode("utf-8", errors="replace").replace("\x00", "")
-        if not text.strip():
-            return None
-        want = (target_model or "").strip().lower() or None
-        # Collect all matches so the last (newest) wins after a restart.
-        matches: list[tuple[str, int]] = []
-        for line in text.splitlines():
-            m = _SPAWN_RE.search(line)
-            if not m:
-                continue
-            try:
-                name = str(m.group(1)).strip()
-                port = int(m.group(2))
-            except (TypeError, ValueError, IndexError):
-                continue
-            matches.append((name, port))
-        if not matches:
-            return None
-        if want is not None:
-            # Exact case-insensitive match for the requested model.
-            filtered = [p for n, p in matches if n.lower() == want]
-            if filtered:
-                return filtered[-1]
-            return None
-        # No target requested — prefer a non-embed model (Qwen3) over
-        # mxbai-embed; fall back to the last match.
-        non_embed = [(n, p) for n, p in matches if "embed" not in n.lower()]
-        if non_embed:
-            return non_embed[-1][1]
-        return matches[-1][1]
+            f.seek(offset)
+            raw = f.read(n)
+        return raw.decode("utf-8", errors="replace").replace("\x00", "")
     except Exception:
+        return ""
+
+
+def _last_matching_port(
+    text: str, target_model: str | None, pattern: re.Pattern[str]
+) -> int | None:
+    """Return the port on the *last* line of *text* matching *pattern*.
+
+    The last match wins so a restart / child re-spawn (which appends a newer
+    line) is picked up. When *target_model* is given only an exact
+    case-insensitive model match is accepted; otherwise a non-embed model is
+    preferred over an embed one (the first spawn line is ``mxbai-embed`` —
+    LP-0MTP1FQXH004JYEF).
+    """
+    if not text:
         return None
+    want = (target_model or "").strip().lower() or None
+    matches: list[tuple[str, int]] = []
+    for line in text.splitlines():
+        m = pattern.search(line)
+        if not m:
+            continue
+        try:
+            name = str(m.group(1)).strip()
+            port = int(m.group(2))
+        except (TypeError, ValueError, IndexError):
+            continue
+        matches.append((name, port))
+    if not matches:
+        return None
+    if want is not None:
+        filtered = [p for n, p in matches if n.lower() == want]
+        if filtered:
+            return filtered[-1]
+        return None
+    non_embed = [(n, p) for n, p in matches if "embed" not in n.lower()]
+    if non_embed:
+        return non_embed[-1][1]
+    return matches[-1][1]
+
+
+def _scan_spawn_ports(log_path: Path, target_model: str | None) -> int | None:
+    """Scan the head of one log file for startup spawn ports.
+
+    Returns the *last* matching ``spawning server instance with name=<model>
+    on port <port>`` line in the first
+    :data:`_CHILD_PORT_HEAD_SCAN_BYTES` bytes, filtered by *target_model*
+    (case-insensitive). ``None`` means "no matching spawn line in this
+    window" — the caller distinguishes sparse vs. real content via
+    :func:`_is_sparse_log` and may fall back to
+    :func:`_scan_proxy_request_ports` (the live source) or a rotated log.
+    """
+    text = _read_log_window(
+        log_path, tail=False, window=_CHILD_PORT_HEAD_SCAN_BYTES
+    )
+    return _last_matching_port(text, target_model, _SPAWN_RE)
+
+
+def _scan_proxy_request_ports(
+    log_path: Path, target_model: str | None
+) -> int | None:
+    """Scan the tail of one log file for the *live* child-port signal.
+
+    Returns the port from the last ``proxying request to model <model> on port
+    <port>`` line in the tail window — the rotation-proof source introduced by
+    LP-0MVP7525P008RXMF AC1. Unlike the startup spawn line this keeps being
+    written for the whole life of the process, so it survives logrotate.
+    """
+    text = _read_log_window(
+        log_path, tail=True, window=_CHILD_PORT_TAIL_SCAN_BYTES
+    )
+    return _last_matching_port(text, target_model, _PROXY_REQUEST_RE)
+
+
+def _scan_child_port_signals(
+    log_path: Path, target_model: str | None
+) -> int | None:
+    """Return the newest child-port signal in a single log file.
+
+    Tail first (live ``proxying request ... on port`` lines — newer than
+    anything in the head window and present even when the startup spawn line
+    has been rotated away), then the head window's spawn line (a fresh restart
+    writes it before any request is proxied, so the very first polls after a
+    restart still resolve — documented risk of the live source).
+    """
+    port = _scan_proxy_request_ports(log_path, target_model)
+    if port is not None:
+        return port
+    return _scan_spawn_ports(log_path, target_model)
+
+
+def _rotated_log_candidates(log_path: Path) -> list[Path]:
+    """Return rotated llama-server logs, newest first, excluding *log_path*.
+
+    Scans both the log's own directory and the canonical
+    ``/var/log/llama-proxy`` location (so a worktree/test log dir can still
+    find a real spawn line); compressed archives are skipped.
+    """
+    candidates: list[Path] = []
+    try:
+        parent = log_path.parent
+        for base in {parent, Path("/var/log/llama-proxy")}:
+            try:
+                if not base.exists():
+                    continue
+                for p in base.glob("llama-server*.log*"):
+                    if p.suffix == ".gz":
+                        continue
+                    try:
+                        if p.resolve() == log_path.resolve():
+                            continue
+                    except Exception:
+                        if p == log_path:
+                            continue
+                    candidates.append(p)
+            except Exception:
+                continue
+        candidates.sort(
+            key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True
+        )
+    except Exception:
+        return []
+    return candidates
+
+
+def _remember_child_port(cache_key: Any, port: int, now: float) -> int:
+    """Cache a positive discovery result and return it."""
+    _child_port_cache[cache_key] = int(port)
+    _child_port_cache_at[cache_key] = now
+    return int(port)
 
 
 def _discover_local_child_port(srv, model: str | None = None) -> int | None:
     """Discover the local model child port from the llama-server log.
 
     The router (``llama_server_port``) spawns model children on dynamic ports
-    (``--port 0``); the spawn line ``spawning server instance with
-    name=<model> on port <port>`` is written near the top of the fresh
-    llama-server log on startup.
+    (``--port 0``); the child port is discoverable from the llama-server log:
+
+    1. ``spawning server instance with name=<model> on port <port>`` — written
+       near the top of the fresh log on startup, lost at the next logrotate.
+    2. ``proxying request to model <model> on port <port>`` — written for every
+       proxied request, so it is present in any live current log
+       (LP-0MVP7525P008RXMF AC1).
 
     Args:
         srv: Server module / namespace with ``llama_process.pid`` and
@@ -4921,15 +5098,18 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
             (first spawn line ``mxbai-embed``) — LP-0MTP1FQXH004JYEF.
 
     Returns the port for the target model, or ``None`` when the log is
-    missing/unreadable or contains no matching spawn line (caller should
-    fall back to the router port). NUL padding from sparse logrotate files
-    is stripped before matching.
+    missing/unreadable or contains no matching child-port signal (caller
+    should fall back to the router port). NUL padding from sparse logrotate
+    files is stripped before matching.
 
-    The result is cached per ``(pid, normalized target model)`` so repeated
-    calls (every request) do not re-read the log; a new pid (restart) or
-    different target re-parses. A sparse/empty read is *not* cached as a
-    hard ``None`` for the pid — only for the specific ``(pid, model)`` key
-    — so a later valid log or rotated log can still be found.
+    Cache policy (LP-0MVP7525P008RXMF AC1): positives are cached per
+    ``(pid, normalized target model)`` and re-verified every
+    :func:`_child_port_cache_ttl` seconds (a child restart with the same
+    parent pid cannot pin a stale port); negatives are cached per
+    ``(pid, model, log-path)`` with the short TTL from
+    :func:`_child_port_miss_ttl`, so a signal that appears later (e.g. the
+    first proxied request after a restart) is picked up instead of being
+    pinned for the life of the pid. A new pid (restart) re-parses.
     """
     try:
         proc = getattr(srv, "llama_process", None)
@@ -4942,76 +5122,177 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
         if not target:
             target = "Qwen3"
         cache_key = (int(pid), target.lower())
-        if cache_key in _child_port_cache:
-            return _child_port_cache[cache_key]
-        # Compatibility: legacy cache used int pid -> port; honour it for
-        # the default Qwen3 target so old tests that populate {pid: port}
-        # still hit.
-        legacy = _child_port_cache.get(int(pid))  # type: ignore[arg-type]
-        if legacy is not None and target.lower() in ("qwen3",):
-            # Only reuse legacy for Qwen3; otherwise re-parse correctly.
-            return legacy  # type: ignore[return-value]
-        # Primary log path.
         log_path = _llama_log_path(srv)
+        now = time.monotonic()
+        # --- Positive cache (re-verified every _child_port_cache_ttl()) ---
+        cached = _child_port_cache.get(cache_key)
+        if not isinstance(cached, int):
+            # Compatibility: legacy cache used int pid -> port; honour it for
+            # the default Qwen3 target so old tests that populate {pid: port}
+            # still hit.
+            legacy = _child_port_cache.get(int(pid))  # type: ignore[arg-type]
+            if legacy is not None and target.lower() in ("qwen3",):
+                cached = legacy
+        if isinstance(cached, int):
+            at = _child_port_cache_at.get(cache_key, 0.0)
+            if now - at < _child_port_cache_ttl():
+                return cached
+            # TTL expired: re-verify. A model reload / child re-spawn with the
+            # same parent pid can move the child port; the live signal at the
+            # log tail reflects the newest mapping. If no newer signal exists
+            # we keep serving the last known-good port instead of regressing
+            # to the router (LP-0MVP7525P008RXMF AC1 — sticky positive).
+            fresh = _scan_child_port_signals(log_path, target)
+            if fresh is not None:
+                return _remember_child_port(cache_key, fresh, now)
+            _child_port_cache_at[cache_key] = now
+            return cached
+        # --- Negative cache (TTL-bounded so a late signal is picked up) ---
+        miss_key = (int(pid), target.lower(), str(log_path))
+        miss_at = _child_port_miss_cache.get(miss_key)
+        if miss_at is not None and now - miss_at < _child_port_miss_ttl():
+            return None
         # Missing file -> no fallback scan (test isolation: tmp_path that
         # does not contain the log should stay None, not find the global
         # /var/log/llama-proxy file — LP-0MTP1FQXH004JYEF).
         if not log_path.exists():
-            _child_port_cache[cache_key] = None
+            _child_port_miss_cache[miss_key] = now
             return None
-        port = _scan_spawn_ports(log_path, target)
+        # 1. Live signal first: the proxying-request line survives logrotate
+        #    (the 2026-10-26 production log had 38,761 of them and zero spawn
+        #    lines — the exact shape that previously pinned None for the whole
+        #    pid lifetime). LP-0MVP7525P008RXMF AC1.
+        port = _scan_child_port_signals(log_path, target)
         if port is not None:
-            _child_port_cache[cache_key] = port
-            return port
-        # Primary had real content but no matching spawn for this target
-        # (e.g. test file "[58113] main: model loaded" or a non-Qwen3-only
-        # log) — do NOT fall back to global /var/log/llama-proxy rotated
-        # logs, otherwise tmp_path isolation leaks into tests. Only fall
-        # back when the primary is sparse/NUL-padded/empty (logrotate case)
-        # — LP-0MTP1FQXH004JYEF.
+            return _remember_child_port(cache_key, port, now)
+        # Primary had real content but no matching child-port signal for this
+        # target (e.g. test file "[58113] main: model loaded" or a
+        # non-Qwen3-only log) — do NOT fall back to global
+        # /var/log/llama-proxy rotated logs, otherwise tmp_path isolation
+        # leaks into tests. Only fall back when the primary is
+        # sparse/NUL-padded/empty (logrotate case) — LP-0MTP1FQXH004JYEF.
         if not _is_sparse_log(log_path):
-            _child_port_cache[cache_key] = None
+            _child_port_miss_cache[miss_key] = now
             return None
         # Sparse current log (e.g. NUL-padded after logrotate) — scan
         # rotated logs (llama-server*.log) by mtime descending for the most
-        # recent matching spawn line. Only when the primary file exists but
-        # had no matching spawn line; a missing file already returned above.
+        # recent matching signal. Only when the primary file exists but had
+        # no matching signal; a missing file already returned above.
         try:
-            parent = log_path.parent
-            # Also check the canonical /var/log/llama-proxy location when
-            # log_dir is custom, so a sparse worktree log can still find the
-            # real spawn line.
-            candidates: list[Path] = []
-            for base in {parent, Path("/var/log/llama-proxy")}:
-                try:
-                    if base.exists():
-                        for p in base.glob("llama-server*.log*"):
-                            # Avoid re-scanning the primary we already tried.
-                            try:
-                                if p.resolve() == log_path.resolve():
-                                    continue
-                            except Exception:
-                                if p == log_path:
-                                    continue
-                            # Skip compressed archives.
-                            if p.suffix == ".gz":
-                                continue
-                            candidates.append(p)
-                except Exception:
-                    continue
-            # Most-recent first so the newest restart wins.
-            candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-            for cand in candidates[:8]:
-                cand_port = _scan_spawn_ports(cand, target)
+            for cand in _rotated_log_candidates(log_path)[:8]:
+                cand_port = _scan_child_port_signals(cand, target)
                 if cand_port is not None:
-                    _child_port_cache[cache_key] = cand_port
-                    return cand_port
+                    return _remember_child_port(cache_key, cand_port, now)
         except Exception:
             pass
-        _child_port_cache[cache_key] = None
+        _child_port_miss_cache[miss_key] = now
         return None
     except Exception:
         return None
+
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
+"""Hosts that resolve to the local router instance (never rewritten)."""
+
+
+def _warn_child_port_fallback(srv, model: str | None, router_port: int) -> None:
+    """Throttled warning + counter when a proxy ``/slots`` query falls back
+    to the router port because no child port could be discovered
+    (LP-0MVP7525P008RXMF AC3).
+
+    The old implementation swallowed the discovery failure
+    (``except Exception: pass``) and silently used the router for the whole
+    life of the pid — the 2026-10-26 log had 1,754 router 500s and zero child
+    500s because of it. Now the fallback is observable in ``proxy.log``
+    (throttled to one line per :data:`_CHILD_PORT_FALLBACK_WARN_INTERVAL`
+    seconds) and in the ``llama_slots_child_port_fallbacks_total`` counter.
+
+    In single-server mode (``llama_router_mode`` off) the router port *is* the
+    model instance, so the fallback is expected behaviour: we log at debug
+    level there and still count it under ``no_child_port_single_server``.
+    """
+    global _last_child_port_fallback_warn_ts
+    cfg = getattr(srv, "config", None)
+    server_cfg = cfg.get("server", {}) if isinstance(cfg, dict) else {}
+    router_mode = bool(server_cfg.get("llama_router_mode", False))
+    try:
+        from proxy.metrics import record_slots_child_port_fallback
+
+        record_slots_child_port_fallback(
+            "no_child_port_router_mode"
+            if router_mode
+            else "no_child_port_single_server"
+        )
+    except Exception:
+        pass
+    now = time.monotonic()
+    if now - _last_child_port_fallback_warn_ts < _CHILD_PORT_FALLBACK_WARN_INTERVAL:
+        return
+    _last_child_port_fallback_warn_ts = now
+    message = (
+        "slots_child_port_unavailable: no model child port discovered for "
+        f"model={model or getattr(srv, 'current_model', None) or 'unknown'}; "
+        f"falling back to router port {router_port} — every proxy-initiated "
+        "/slots poll will traverse the router and can 500 during giant "
+        "prefills (LP-0MVP7525P008RXMF AC3)"
+    )
+    try:
+        if router_mode:
+            srv.logger.warning(message)
+        else:
+            srv.logger.debug(message)
+    except Exception:
+        pass
+
+
+def _resolve_local_slots_target(
+    srv,
+    model: str | None = None,
+    endpoint: str | None = None,
+    router_port: int | None = None,
+) -> tuple[str | None, int]:
+    """Resolve ``(endpoint, port)`` for a proxy-initiated ``/slots`` query.
+
+    Single shared path for every proxy ``/slots`` call site (status handler,
+    SSE payload, slot-availability check, progress/liveness probes) so no
+    query silently traverses the router (LP-0MVP7525P008RXMF AC2).
+
+    Rules:
+
+    - When *endpoint* points at a genuinely different llama-server instance
+      (non-loopback host, or a loopback port that is not the configured router
+      port — e.g. it is already a child port), the endpoint is returned
+      untouched.
+    - When *endpoint* is the local router (loopback host on
+      ``server.llama_server_port``) or omitted, the discovered child port is
+      returned as ``(None, child_port)``; when discovery yields nothing, the
+      router port is returned after a throttled warning + counter
+      (``_warn_child_port_fallback``, AC3).
+
+    Returns ``(endpoint_or_None, port)``: pass the tuple to
+    ``_query_slots*`` so it builds the URL from the resolved port instead of
+    the router.
+    """
+    cfg = getattr(srv, "config", None)
+    server_cfg = cfg.get("server", {}) if isinstance(cfg, dict) else {}
+    if router_port is None:
+        try:
+            router_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+        except (TypeError, ValueError):
+            router_port = 8080
+    else:
+        router_port = int(router_port)
+    if endpoint:
+        host, port = _parse_endpoint_url(endpoint)
+        if host not in _LOOPBACK_HOSTS or port != router_port:
+            # A genuinely different instance — the router-proxied-500 problem
+            # does not apply, never rewrite it.
+            return endpoint, port
+    child = _discover_local_child_port(srv, model=model)
+    if child is not None:
+        return None, child
+    _warn_child_port_fallback(srv, model, router_port)
+    return None, router_port
 
 
 # ===================================================================
@@ -5039,9 +5320,14 @@ async def _check_slot_availability(
     would be redundant and, via the router, can take 5-7s under load
     (LP-0MTDGBRPU003Z7KU).
 
-    The query targets the discovered local child port (``_discover_local_child_port``)
-    instead of the router port when available — the router serializes
-    ``GET /slots?model=...`` behind the busy child's generation loop.
+    The query targets the discovered local child port when one is known —
+    including when *endpoint* is the local router URL (the local provider
+    endpoint in router mode) — because the router serializes
+    ``GET /slots?model=...`` behind the busy child's generation loop and turns a
+    cancelled proxied poll into an HTTP 500. A genuinely different
+    llama-server instance passed as *endpoint* is used unchanged. Resolution is
+    centralised in :func:`_resolve_local_slots_target`
+    (LP-0MVP7525P008RXMF AC2).
 
     The query uses a dedicated per-call ``httpx.AsyncClient`` with a short
     timeout (``session_slot_availability_timeout_seconds``, default 2.0) so a
@@ -5058,13 +5344,16 @@ async def _check_slot_availability(
         slot_model = (
             slot_model_name or model_name or srv.current_model or "Qwen3"
         )
-        # LP-0MTP1FQXH004JYEF: target the slot's model so we query the
-        # Qwen3 child not the embed child (first spawn line).
-        if endpoint:
-            slots_url = f"{endpoint.rstrip('/')}/slots?model={slot_model}"
+        # LP-0MVP7525P008RXMF AC2: single shared resolution path — a
+        # *local* endpoint (the router) is rewritten to the discovered child
+        # port so this availability check never serializes behind the busy
+        # child via the router (LP-0MTDGBRPU003Z7KU measured 5-7s vs 0.17s).
+        slots_endpoint, slots_port = _resolve_local_slots_target(
+            srv, model=slot_model, endpoint=endpoint, router_port=llama_port
+        )
+        if slots_endpoint:
+            slots_url = f"{slots_endpoint.rstrip('/')}/slots?model={slot_model}"
         else:
-            child_port = _discover_local_child_port(srv, model=slot_model)
-            slots_port = child_port if child_port is not None else llama_port
             slots_url = f"http://localhost:{slots_port}/slots?model={slot_model}"
         availability_timeout = float(
             server_config.get(
