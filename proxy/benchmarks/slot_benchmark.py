@@ -113,6 +113,12 @@ WARM_START_MAX_ATTEMPTS = 3        # bounded retry budget before failing the run
 WARM_START_TIMEOUT_S = 120.0       # per-attempt client timeout (cold grace window)
 WARM_START_RETRY_DELAY_S = 15.0    # pause between priming attempts
 WARM_START_MAX_TOKENS = 20         # priming completion-token cap (small request)
+#: Session-id prefix for the priming request. The priming request MUST carry an
+#: explicit ``X-Session-Id`` (like every measured request) because the proxy
+#: applies the cold-start admission cap only to explicitly-sessioned requests
+#: (``router.py``: ``if session_id and session_explicit``). An anonymous local
+#: success would therefore not prove the cap was lifted.
+WARM_START_SESSION_PREFIX = "benchmark-warmstart"
 WARM_START_MESSAGES = [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Say Hi"},
@@ -628,6 +634,7 @@ class WarmStartResult:
     duration_seconds: float | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    session_id: str | None = None
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> dict:
@@ -642,6 +649,7 @@ class WarmStartResult:
             ),
             prompt_tokens=self.prompt_tokens,
             completion_tokens=self.completion_tokens,
+            session_id=self.session_id,
             errors=list(self.errors),
         )
 
@@ -1350,10 +1358,12 @@ async def warm_start_local_backend(
     """Prime the local backend until one small request completes locally.
 
     Sends ``WARM_START_MESSAGES`` (single turn, "Say Hi", capped at
-    ``WARM_START_MAX_TOKENS``) and requires the response's ``X-Resolved-Model``
-    to be a local provider. A local completion proves the first local prefill
-    ran and therefore that ``cold_start.mark_warm()`` lifted the admission
-    cap — the state itself is in-process and not exposed via ``/health``.
+    ``WARM_START_MAX_TOKENS``) under an explicit ``X-Session-Id`` and requires
+    the response's ``X-Resolved-Model`` to be a local provider. The explicit
+    session matters: the proxy applies the cold-start admission cap only to
+    explicitly-sessioned requests, so a local completion on that path proves
+    the cap was lifted (``cold_start.mark_warm()`` ran); the state itself is
+    in-process and not exposed via ``/health``.
 
     Retries up to *max_attempts* times with *retry_delay_s* between attempts
     (llama-server may still be settling just after ``Llama-server ready``).
@@ -1362,7 +1372,8 @@ async def warm_start_local_backend(
     """
     sleeper = sleep or asyncio.sleep
     attempts = max(1, int(max_attempts))
-    gate = WarmStartResult(enabled=True)
+    session_id = f"{WARM_START_SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
+    gate = WarmStartResult(enabled=True, session_id=session_id)
 
     for attempt in range(1, attempts + 1):
         gate.attempts = attempt
@@ -1374,6 +1385,7 @@ async def warm_start_local_backend(
             max_tokens=WARM_START_MAX_TOKENS,
             timeout=timeout,
             progress_label=f"Warm-start priming {attempt}/{attempts}",
+            extra_headers={"X-Session-Id": session_id},
         )
         if req.status == "completed" and is_local_resolved_model(req.resolved_model):
             gate.completed_locally = True
@@ -1402,8 +1414,10 @@ async def warm_start_local_backend(
         f"``effective_max_concurrent``=1) and only ``mark_warm()`` after the "
         f"first completed local prefill lifts it. Check llama-server health "
         f"and the proxy log for 'local_dispatch_denied' / 'backend busy "
-        f"(health check timeout)', then re-run; pass --no-warm-start only to "
-        f"deliberately measure remote fallback."
+        f"(health check timeout)' — and for a local provider cooldown "
+        f"('Skipping provider=local-...: in cooldown'), which would also keep "
+        f"the priming request remote. Then re-run; pass --no-warm-start only "
+        f"to deliberately measure remote fallback."
     )
 
 

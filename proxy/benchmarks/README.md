@@ -188,7 +188,7 @@ representative measurements:
 | `--prompt-tokens N` | `6000` (`TARGET_PROMPT_TOKENS`) | Target total prompt size in tokens, split ~50/50 shared/varied. Default preserves existing behaviour; use a small value (e.g. `--prompt-tokens 2000`) for the small-request workload. |
 | `--log-dir PATH` | `/var/log/llama-proxy` | Proxy log directory scanned for queue-timeout metrics. |
 | `--no-health-samples` | OFF (sampling ON) | By default `/health` is sampled during each run to count local quarantine episodes; pass this flag to disable sampling. |
-| `--warm-start` / `--no-warm-start` | **ON for `--sweep`**, OFF otherwise | **Warm-start priming gate** (LP-0MVLHNEDO008FTBH): after each restart, one small single-turn "Say Hi" priming request (≤ `--warm-start-timeout` s, ≤ 20 completion tokens) must complete on the **local** backend (`X-Resolved-Model` local — proving the first local prefill ran and `cold_start.mark_warm()` lifted the admission cap) before the measured set launches. Retried within `--warm-start-attempts`; persistent failure fails the run with an actionable `cold_start.is_cold()` / `local_dispatch_denied` diagnostic — never a silent remote fallback. Without this gate, `--concurrency N` launches into the post-restart cold window and measures 0 % local share (the 2026-10-23 INVALID sweep). |
+| `--warm-start` / `--no-warm-start` | **ON for `--sweep`**, OFF otherwise | **Warm-start priming gate** (LP-0MVLHNEDO008FTBH): after each restart, one small single-turn "Say Hi" priming request (≤ `--warm-start-timeout` s, ≤ 20 completion tokens, **explicit `X-Session-Id`** so it goes through the same cold-capped local admission path as the measured requests) must complete on the **local** backend (`X-Resolved-Model` local — proving the first local prefill ran and `cold_start.mark_warm()` lifted the admission cap) before the measured set launches. Retried within `--warm-start-attempts`; persistent failure fails the run with an actionable `cold_start.is_cold()` / `local_dispatch_denied` / provider-cooldown diagnostic — never a silent remote fallback. Without this gate, `--concurrency N` launches into the post-restart cold window and measures 0 % local share (the 2026-10-23 INVALID sweep). |
 | `--warm-start-attempts N` | `3` | Bounded retry budget for the priming request (default `WARM_START_MAX_ATTEMPTS`). |
 | `--warm-start-timeout S` | `120` | Per-attempt client timeout for the priming request — the cold grace window. Must stay well under the 1 200 s client timeout. |
 | `--stagger-seconds N` | `0` (all at once) | Seconds between **measured** request starts (`N × idx`); requests still run concurrently once started. Default `0` preserves the all-at-once launch; the historical hard-coded `INTER_REQUEST_GAP_S` 60 s gap is **removed**. |
@@ -240,7 +240,10 @@ fell back remote — local stream share 0.0 %. A fixed stagger (the then-60 s
 gate that *proves* a local prefill completed before the measured set launches
 can. The cold-state lives in-process and is not exposed via `/health`, so the
 priming request's local `X-Resolved-Model` is the harness-visible proof of
-`cold_start.is_cold() == False`. The production guard is never weakened — the
+`cold_start.is_cold() == False`. The priming request carries an explicit
+`X-Session-Id` because the proxy applies the cap only to explicitly-sessioned
+requests (`router.py`: `if session_id and session_explicit`) — the same path
+every measured request takes. The production guard is never weakened — the
 fix lives entirely in the harness.
 
 ### slot_benchmark.py quiet-window preflight (run this first)

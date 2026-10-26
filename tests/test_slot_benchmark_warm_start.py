@@ -130,6 +130,30 @@ class TestWarmStartGate:
         assert call["timeout"] <= 120.0
         assert call["url"].endswith("/v1/chat/completions")
 
+    def test_priming_request_uses_an_explicit_session(self):
+        """The cold-start cap only applies to explicitly-sessioned requests.
+
+        Without an ``X-Session-Id`` the priming request bypasses the
+        ``_try_acquire_local_dispatch`` cold cap entirely, so a local success
+        would NOT prove the cap lifted.
+        """
+        delays: list[float] = []
+        client = _FakeClient([REMOTE, LOCAL])
+
+        gate = asyncio.run(
+            sb.warm_start_local_backend(
+                client, max_attempts=2, retry_delay_s=1.0,
+                sleep=_recording_sleep(delays),
+            )
+        )
+
+        headers = [c["headers"] for c in client.calls]
+        assert all(h and h.get("X-Session-Id") for h in headers)
+        assert headers[0]["X-Session-Id"].startswith(sb.WARM_START_SESSION_PREFIX)
+        # One logical client: retries keep the same session id.
+        assert headers[0]["X-Session-Id"] == headers[1]["X-Session-Id"]
+        assert gate.session_id == headers[0]["X-Session-Id"]
+
     def test_priming_gate_retries_until_request_lands_locally(self):
         delays: list[float] = []
         client = _FakeClient([REMOTE, LOCAL])
@@ -181,6 +205,7 @@ class TestWarmStartGate:
         # can find the cause without re-reading the harness source.
         assert "cold-start" in message
         assert "local_dispatch_denied" in message
+        assert "in cooldown" in message
         assert "--no-warm-start" in message
         # Bounded retry budget: exactly max_attempts requests, max_attempts-1 waits.
         assert len(client.calls) == 3
