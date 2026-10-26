@@ -114,6 +114,13 @@ is normal and is not reported (classification is by the dispatch record's
 If the events cluster in one prompt band, the band's calibrated rate is wrong —
 re-measure before changing the budget.
 
+**Reading the numbers.** `estimated_tokens` / `new_tokens` / `eta_prefill_s` are
+the **admission-time** values the routing decision priced and the dispatch
+record stored verbatim (LP-0MVODJ3P6000AIUM): `new_tokens > local_cold_prefill_budget_tokens`
+is therefore genuine evidence of an over-budget admission, never a re-pricing
+artefact. A record created without an admission snapshot reports `0`/`unknown`
+instead of a recomputed value.
+
 ## Further reference
 
 Report interpretation, root-cause taxonomy, implementation notes, and

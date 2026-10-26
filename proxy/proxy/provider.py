@@ -3118,11 +3118,18 @@ def _evaluate_idle_admission_override(
     budget maths). When it refuses, the returned dict carries
     ``admitted: False`` plus the refusal ``reason`` so the caller can keep
     skipping local and log the refusal as attributable — silent routing as if
-    idle capacity were blocked would hide the budget doing its job.
+    idle capacity were blocked would hide the budget doing its work.
+
+    ``guard_decision`` is the :class:`proxy.prefill_eta.AdmissionDecision`
+    that priced this request against the budget, carried on BOTH verdicts
+    (LP-0MVODJ3P6000AIUM AC1): on an admit it lets the dispatch record thread
+    the ETA the budget guard actually costed instead of re-pricing the prompt
+    at record creation.
 
     Returns:
         ``{"admitted", "reason", "idle_seconds", "threshold_seconds",
-        "guard_reason"}`` when idle capacity applies, else ``None``.
+        "guard_reason", "guard_decision"}`` when idle capacity applies, else
+        ``None``.
     """
     try:
         server_config = config.get("server", config) if isinstance(config, dict) else {}
@@ -3168,10 +3175,13 @@ def _idle_admission_budget_verdict(
 ):
     """Run the shared cold-prefill admission guard for the idle bypass path.
 
-    Returns the :class:`proxy.prefill_eta.AdmissionDecision` when the guard
-    actually refused (so the caller can log it and keep skipping local), else
-    ``None`` — an inert guard or an admitted verdict leaves the idle bypass
-    behaviour byte-for-byte unchanged (LP-0MVN4LBZ500281Z7 AC3c/AC8).
+    Returns the :class:`proxy.prefill_eta.AdmissionDecision` that priced this
+    request against the cold-prefill budget, or ``None`` when the guard is
+    inert (policy off / no budget / unmeasurable prompt). The decision is
+    returned on BOTH verdicts (LP-0MVODJ3P6000AIUM AC1) so the idle-admit
+    accept path can thread the costed ETA to the dispatch record; before that
+    fix only refusals were observable and accepted dispatches were re-priced
+    at record creation from drifted inputs.
     """
     try:
         from proxy import prefill_eta
@@ -3196,17 +3206,26 @@ def _idle_admission_budget_verdict(
         decision = prefill_eta.evaluate_admission(
             config, model_name, estimated_tokens, cached_ratio, "medium"
         )
-        if decision.admit or not decision.active:
+        # LP-0MVODJ3P6000AIUM AC1: return the decision for BOTH verdicts so
+        # the idle-admit accept path can thread the ETA the guard actually
+        # costed. An *active* decision is always returned (refusals must keep
+        # refusing); an inert decision is returned only when it priced the
+        # prompt (``insufficient_samples`` carries an ETA), so ``policy_off`` /
+        # ``no_budget`` stay inert (``None``) and the documented byte-for-byte
+        # fallback is preserved. ``record_guard_decision`` stays refusal-only —
+        # on an admit there is no guard event to record.
+        if not decision.active and decision.eta_prefill_seconds is None:
             return None
-        prefill_eta.record_guard_decision(
-            decision,
-            provider=(
-                provider_cfg.get("name") if isinstance(provider_cfg, dict) else None
-            ),
-            model=model_name,
-            priority="medium",
-            free_slot=False,
-        )
+        if not decision.admit:
+            prefill_eta.record_guard_decision(
+                decision,
+                provider=(
+                    provider_cfg.get("name") if isinstance(provider_cfg, dict) else None
+                ),
+                model=model_name,
+                priority="medium",
+                free_slot=False,
+            )
         return decision
     except Exception:
         logger.debug("idle admission budget verdict failed", exc_info=True)
@@ -6530,6 +6549,79 @@ def _set_queue_wait_on_request(request, elapsed: float) -> None:
     (Q2=a: total wait + serve stays within ``llama_adaptive_timeout_*``)."""
     try:
         setattr(request, "_contention_queue_wait_seconds", float(elapsed or 0.0))
+    except Exception:
+        pass
+
+
+#: Attribute name on the request holding the admission-time pricing snapshot.
+#: LP-0MVODJ3P6000AIUM AC1: stamped once by :func:`_stamp_local_admission_evidence`
+#: before the first local dispatch so every dispatch-record creation path
+#: (router ``_try_acquire_local_dispatch`` / ``_increment_local_active_queries``,
+#: including the slot-retry re-dispatches) inherits the same verbatim numbers
+#: instead of re-pricing the prompt at record creation.
+LOCAL_ADMISSION_EVIDENCE_ATTR = "_local_admission_evidence"
+
+
+def _stamp_local_admission_evidence(
+    request,
+    *,
+    estimated_tokens: int | None,
+    cached_ratio: float,
+    new_tokens: int | None,
+    decision=None,
+    model_name: str | None = None,
+) -> None:
+    """Stamp the routing/admission decision's pricing values on the request.
+
+    Called exactly once, immediately before the first local dispatch, with the
+    values the admission model actually used: ``_estimated_tokens``,
+    ``_routing_cached_ratio`` and ``_routing_new_tokens`` from the routing
+    probe plus ``eta_prefill_seconds`` from the governing admission decision
+    (direct guard, queue-entry guard, or the idle-admit budget verdict — the
+    most authoritative one available). The dispatch record then stores these
+    numbers verbatim (LP-0MVODJ3P6000AIUM AC1), so the post-acceptance
+    eviction event can never claim an over-budget admission that the decision
+    never priced (AC3).
+
+    Best-effort: a non-request object or a stamping failure is a no-op — a
+    routing decision must never break on observability instrumentation.
+    """
+    try:
+        eta = None
+        if decision is not None:
+            try:
+                eta = getattr(decision, "eta_prefill_seconds", None)
+            except Exception:
+                eta = None
+        if eta is None:
+            # No governing decision carried an ETA (inert/uncalibrated guard,
+            # or no budget-configured gate): cost the prompt NOW with the
+            # admission-time routing values through the same conservative
+            # estimator the guards use. This keeps the ETA on every accept
+            # path (LP-0MVODJ3P6000AIUM AC1) without ever re-sampling
+            # drifted inputs at record creation.
+            try:
+                from proxy import prefill_eta
+
+                eta, _ = prefill_eta.estimate_prefill_seconds(
+                    model_name,
+                    max(0, int(estimated_tokens or 0)) if estimated_tokens is not None else 0,
+                    float(cached_ratio or 0.0) if cached_ratio is not None else 0.0,
+                )
+            except Exception:
+                eta = None
+        setattr(
+            request,
+            LOCAL_ADMISSION_EVIDENCE_ATTR,
+            {
+                "estimated_tokens": max(0, int(estimated_tokens or 0))
+                if estimated_tokens is not None else None,
+                "cached_ratio": cached_ratio,
+                "new_tokens": max(0, int(new_tokens or 0))
+                if new_tokens is not None else None,
+                "eta_prefill_s": eta,
+            },
+        )
     except Exception:
         pass
 
@@ -10498,6 +10590,10 @@ async def _proxy_with_fallback_cycle(
                     session_tenants=_session_tenants,
                     tenancy_idle_seconds=_tenancy_idle,
                 )
+                # LP-0MVODJ3P6000AIUM: initialised here so the admission-evidence
+                # stamp below can consult the idle-admit verdict even on the
+                # direct-admit path (where this block does not run).
+                _idle_admit = None
                 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): spend
                 # obviously idle GPU capacity instead of paying for a remote
                 # call. Only the ECONOMIC misses are overridable — the physical
@@ -10944,6 +11040,41 @@ async def _proxy_with_fallback_cycle(
                     all_slot_exhaustion = False
                     _note_local_fallback_reason(request, fallback_reason)
                     continue
+
+                # LP-0MVODJ3P6000AIUM AC1: stamp the admission-time pricing
+                # snapshot (the numbers the decision above actually used) ONCE,
+                # immediately before the first local dispatch, so every
+                # dispatch-record creation path — including the slot-retry
+                # re-dispatches below, which reuse this request — inherits the
+                # same verbatim values. The ETA comes from the most
+                # authoritative decision in scope: the direct free-slot guard,
+                # else the idle-admit budget verdict (which now carries its
+                # decision on the admit path). Best-effort; never throws.
+                _admission_snapshot_decision = None
+                for _snapshot_candidate in (
+                    _direct_admission,
+                    (_idle_admit or {}).get("guard_decision"),
+                ):
+                    if (
+                        _snapshot_candidate is not None
+                        and getattr(
+                            _snapshot_candidate, "eta_prefill_seconds", None
+                        )
+                        is not None
+                    ):
+                        _admission_snapshot_decision = _snapshot_candidate
+                        break
+                try:
+                    _stamp_local_admission_evidence(
+                        request,
+                        estimated_tokens=_estimated_tokens,
+                        cached_ratio=_routing_cached_ratio,
+                        new_tokens=_routing_new_tokens,
+                        decision=_admission_snapshot_decision,
+                        model_name=_llama_model or provider_name,
+                    )
+                except Exception:
+                    pass
 
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 

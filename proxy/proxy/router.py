@@ -1268,6 +1268,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             backend=backend_label,
             body_json=body_json if isinstance(body_json, dict) else None,
             model_name=model_name,
+            # LP-0MVODJ3P6000AIUM AC1: the routing/admission decision's
+            # pricing snapshot (stamped by provider before dispatch), stored
+            # verbatim on the dispatch record so the post-acceptance eviction
+            # event reports the numbers the admission model used.
+            admission_evidence=getattr(request, "_local_admission_evidence", None),
         )
         if not acquired:
             _cold = cold_start.is_cold(server_config)
@@ -1370,6 +1375,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             backend=endpoint or "local",
             body_json=body_json if isinstance(body_json, dict) else None,
             model_name=model_name,
+            # LP-0MVODJ3P6000AIUM AC1: same admission-time snapshot for the
+            # anonymous-session path (verbatim; never a recompute).
+            admission_evidence=getattr(request, "_local_admission_evidence", None),
         )
 
     # Token accounting

@@ -19,6 +19,13 @@ Contract:
   ``slot``, ``endpoint``, tenant count) plus ``snapshot_planned`` (whether the
   evicted session's KV snapshot is being persisted so a returning client
   restores warm);
+- the pricing evidence (``estimated_tokens`` / ``new_tokens`` /
+  ``cached_ratio`` / ``eta_prefill_s``) is the **admission-time snapshot** the
+  routing decision stamped on the request (LP-0MVODJ3P6000AIUM AC1): the
+  dispatch record stores the decision's numbers verbatim, so an eviction event
+  never re-prices the prompt from drifted state. A record created without a
+  snapshot carries explicit ``None`` markers rendered as ``0``/``unknown``
+  (AC4) — never a silent recompute.
 - never raises: an eviction path is already an exceptional path.
 """
 
@@ -107,6 +114,13 @@ def record_eviction_after_acceptance(
 
     Idempotent per record: a second release path racing the first cannot emit
     the event twice (the flag lives on the record).
+
+    Evidence semantics (LP-0MVODJ3P6000AIUM AC1/AC4): the pricing fields are
+    the admission-time values the routing decision used and the request's
+    dispatch record stored verbatim — the event must never claim an over-
+    budget admission that the decision never priced. Records without a
+    threaded snapshot render ``0``/``unknown`` explicitly; nothing here is
+    recomputed from the request body.
 
     Args:
         srv: Server object (its ``logger`` when present); may be ``None``.

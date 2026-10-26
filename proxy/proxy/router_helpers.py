@@ -1848,6 +1848,7 @@ async def _increment_local_active_queries(
     backend: str | None = None,
     body_json: dict | None = None,
     model_name: str | None = None,
+    admission_evidence: dict | None = None,
 ) -> None:
     """Safely increment the local-only active queries counter.
 
@@ -1896,7 +1897,15 @@ async def _increment_local_active_queries(
                         "last_progress_ts": time.monotonic(),
                         # LP-0MVN4LCED00661MX AC2: the admission evidence the
                         # post-acceptance eviction ERROR reports.
-                        **_dispatch_evidence(body_json, model_name, session_key),
+                        # LP-0MVODJ3P6000AIUM AC1/AC4: verbatim admission-time
+                        # snapshot when one was threaded; explicit ``None``
+                        # markers (never a recompute) otherwise.
+                        **_dispatch_evidence(
+                            body_json,
+                            model_name,
+                            session_key,
+                            admission_evidence=admission_evidence,
+                        ),
                     }
         except Exception:
             pass
@@ -2491,6 +2500,8 @@ def _dispatch_evidence(
     body_json: dict | None,
     model_name: str | None,
     session_key: str | None,
+    *,
+    admission_evidence: dict | None = None,
 ) -> dict:
     """Accepted-dispatch evidence for the post-acceptance eviction event.
 
@@ -2499,40 +2510,56 @@ def _dispatch_evidence(
     Captured ONCE at record creation (cheap, best-effort) and never recomputed
     on release — the values must describe the decision that admitted the
     dispatch, not the state at eviction.
+
+    LP-0MVODJ3P6000AIUM (AC1/AC4): the authoritative source is the admission-
+    time snapshot threaded from the routing/admission decision
+    (``admission_evidence``, stamped once on the request before the first
+    local dispatch — see ``provider._stamp_local_admission_evidence``). The
+    numbers are stored verbatim, never recomputed from the request body or a
+    drifted cached-ratio sample at record creation.
+
+    Fallback (AC4): when no admission decision is available (a record created
+    outside the guarded routing path, e.g. legacy callers), the pricing fields
+    are emitted as explicit ``None`` markers — the eviction event renders them
+    as ``0``/``unknown`` — rather than silently recomputed from drifted inputs,
+    so a ``new_tokens > budget`` field is unambiguous evidence of an over-
+    budget admission and never a re-pricing artefact.
+
+    ``body_json`` / ``model_name`` / ``session_key`` are retained for call-site
+    compatibility only: the prompt is deliberately NOT re-estimated and the
+    cached ratio is deliberately NOT re-sampled here (that recompute was the
+    defect this fixes).
     """
     evidence: dict = {
-        "estimated_tokens": 0,
-        "cached_ratio": 0.0,
-        "new_tokens": 0,
+        "estimated_tokens": None,
+        "cached_ratio": None,
+        "new_tokens": None,
         "eta_prefill_s": None,
         "slot_id": None,
         "llama_task_id": None,
         "first_byte_seen": False,
     }
+    if not isinstance(admission_evidence, dict):
+        return evidence
     try:
-        if isinstance(body_json, dict) and body_json:
-            from proxy.lifecycle import _estimate_prompt_tokens
-
-            estimated = int(_estimate_prompt_tokens(body_json) or 0)
-            evidence["estimated_tokens"] = max(0, estimated)
-            ratio = 0.0
+        estimated = admission_evidence.get("estimated_tokens")
+        if estimated is not None:
+            evidence["estimated_tokens"] = max(0, int(estimated))
+        ratio = admission_evidence.get("cached_ratio")
+        if ratio is not None:
             try:
-                from proxy.provider import _get_cached_ratio
-
-                ratio = float(_get_cached_ratio(model_name, session_key) or 0.0)
-            except Exception:
-                ratio = 0.0
-            ratio = min(1.0, max(0.0, ratio))
-            evidence["cached_ratio"] = ratio
-            evidence["new_tokens"] = max(0, int(round(estimated * (1.0 - ratio))))
+                evidence["cached_ratio"] = min(1.0, max(0.0, float(ratio)))
+            except (TypeError, ValueError):
+                evidence["cached_ratio"] = None
+        new_tokens = admission_evidence.get("new_tokens")
+        if new_tokens is not None:
+            evidence["new_tokens"] = max(0, int(new_tokens))
+        eta = admission_evidence.get("eta_prefill_s")
+        if eta is not None:
             try:
-                from proxy import prefill_eta
-
-                eta, _ = prefill_eta.estimate_prefill_seconds(
-                    model_name, estimated, ratio
-                )
-                evidence["eta_prefill_s"] = float(eta)
-            except Exception:
+                value = float(eta)
+                evidence["eta_prefill_s"] = value if value == value else None
+            except (TypeError, ValueError):
                 evidence["eta_prefill_s"] = None
     except Exception:
         pass
@@ -2592,6 +2619,7 @@ async def _try_acquire_local_dispatch(
     backend: str,
     body_json: dict | None = None,
     model_name: str | None = None,
+    admission_evidence: dict | None = None,
 ) -> tuple:
     """Try to acquire the local dispatch for *session_key*.
 
@@ -2786,7 +2814,15 @@ async def _try_acquire_local_dispatch(
                     "last_progress": 0,
                     "last_progress_ts": now,
                     # LP-0MVN4LCED00661MX AC2: admitted-dispatch evidence.
-                    **_dispatch_evidence(body_json, model_name, session_key),
+                    # LP-0MVODJ3P6000AIUM AC1/AC4: verbatim admission-time
+                    # snapshot when one was threaded; explicit ``None`` markers
+                    # (never a recompute) otherwise.
+                    **_dispatch_evidence(
+                        body_json,
+                        model_name,
+                        session_key,
+                        admission_evidence=admission_evidence,
+                    ),
                 }
                 # Register prefill hold for the prefill-aware guard.
                 try:

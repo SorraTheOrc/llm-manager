@@ -2018,6 +2018,13 @@ def _wasted_prefill_tokens(summary: AnalysisResult) -> int:
     compute for a dispatch that was then abandoned before its first byte
     (parent AC4's waste check). Other eviction reasons are excluded — their
     ``new_tokens`` did not necessarily cost a fresh prefill.
+
+    Token semantics (LP-0MVODJ3P6000AIUM AC5): ``new_tokens`` is the
+    **admission-time** value the routing/admission decision priced and the
+    dispatch record stored verbatim — never a value recomputed at eviction
+    time. An event whose record carried no admission snapshot contributes
+    ``0`` (explicit ``unknown`` marker), so the figure can never over-account
+    a re-priced prompt.
     """
     total = 0
     for event in getattr(summary, "eviction_after_acceptance_events", []) or []:

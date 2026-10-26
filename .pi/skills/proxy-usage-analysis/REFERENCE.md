@@ -103,7 +103,12 @@ Outputs written to:
   - `wasted_prefill_tokens` — sum of `new_tokens` over
     `local_eviction_after_acceptance` events whose `reason` is
     `prefill_deadline`: tokens the GPU computed for a dispatch then abandoned
-    before its first byte. Other eviction reasons are excluded.
+    before its first byte. Other eviction reasons are excluded. The summed
+    `new_tokens` are the **admission-time** values the routing decision priced
+    and the dispatch record stored verbatim (LP-0MVODJ3P6000AIUM AC5): the
+    budget's own numbers, never a recompute at eviction time. Records without
+    an admission snapshot contribute 0 (explicit `unknown` marker), so the
+    figure cannot over-account a re-priced prompt.
   - `provider_exhausted_errors` — `All providers exhausted` lines
     (client-visible chain failures); `upstream_status_503_errors` —
     `upstream_http_error` events with `status == 503` (provider-side 5xx).
