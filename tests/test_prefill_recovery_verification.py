@@ -15,9 +15,11 @@ contract the acceptance criteria are written against:
   * AC2 — ``prefill_deadline_exceeded`` is paired with the session's
     ``lease_released ... reason=prefill_deadline`` and the wall-clock delta
     is bounded (default <= 300 s); a deadline with no release is flagged;
-  * AC1 — hours with >= ``min_attempts`` local dispatch attempts and zero
-    local streams served are thrash hours; ``local_lease_active`` fallbacks
-    are summed and must be zero;
+  * AC1 — restated by LP-0MVLHMCN6003GAMD AC1 to the fix-attributable
+    target: no denial happens while a lease owner holds the gate with no
+    client-visible first byte beyond the wedge bound (the pre-fix incident
+    shape). Thrash hours and the ``local_lease_active`` fallback volume stay
+    as reported diagnostics;
   * AC3 — local stream finishes in the window after a deadline are counted
     and resume verdict derived.
 """
@@ -33,6 +35,13 @@ sys.path.insert(
     ),
 )
 import prefill_recovery_verification as prv
+
+
+def _mmss(seconds: int) -> str:
+    """``seconds`` past 10:00:00 as ``HH:MM:SS`` (test fixture helper)."""
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{10 + hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def _lines() -> list[str]:
@@ -111,18 +120,27 @@ class Ac1ClassificationTest(unittest.TestCase):
          "local_served": 70, "lease_active_fallbacks": 19},
     ]
 
-    def test_thrash_hour_detection(self):
-        m = prv.measure_ac1(self.RECORDS, min_attempts=10)
+    def test_thrash_hours_and_fallback_volume_are_diagnostics(self):
+        # LP-0MVLHMCN6003GAMD AC1 restated the verdict to the wedge
+        # attribution; thrash hours and the lease-active fallback volume are
+        # retained as reported diagnostics, not as the verdict.
+        m = prv.measure_ac1(self.RECORDS, prv.WedgeDenialSummary(), min_attempts=10)
         self.assertEqual(m.thrash_hours, ["2026-10-23 02:00:00"])
         self.assertEqual(m.lease_active_fallbacks, 33)
-        self.assertFalse(m.clean)  # 33 fallbacks, one thrash hour
+        self.assertTrue(m.clean)  # no wedge denial
+
+    def test_wedge_denial_fails_the_verdict(self):
+        m = prv.measure_ac1(
+            self.RECORDS, prv.WedgeDenialSummary(wedge_denials=2), min_attempts=10
+        )
+        self.assertFalse(m.clean)
 
     def test_clean_window(self):
         records = [
             {"hour": "2026-10-23 20:00:00", "local_dispatch_attempts": 12,
              "local_served": 8, "lease_active_fallbacks": 0},
         ]
-        m = prv.measure_ac1(records, min_attempts=10)
+        m = prv.measure_ac1(records, prv.WedgeDenialSummary(), min_attempts=10)
         self.assertTrue(m.clean)
         self.assertEqual(m.thrash_hours, [])
 
@@ -225,6 +243,168 @@ class PromptGeneratorTest(unittest.TestCase):
         a = prv.build_novel_prompt(token_target=40000, seed=1)
         b = prv.build_novel_prompt(token_target=40000, seed=2)
         self.assertNotEqual(a, b, "two seeds must produce distinct prompts")
+
+
+class WedgeDenialAttributionTest(unittest.TestCase):
+    """AC1 restated (LP-0MVLHMCN6003GAMD): a denial is a *wedge* denial only
+    when the lease owner held the gate with no client-visible first byte for
+    at least the wedge bound, measured over the continuous prefill-hold chain
+    (deadline/renew churn does not reset it)."""
+
+    @staticmethod
+    def _deny(ts, session, owner):
+        return (
+            f"2026-10-23 {ts},000 - INFO - local_dispatch_denied "
+            f"session={session} owner={owner} active=1 cold_start=False"
+        )
+
+    @staticmethod
+    def _ext(ts, owner):
+        return (
+            f"2026-10-23 {ts},000 - INFO - lease_extended_during_prefill "
+            f"session={owner} progress=None alive=False in_flight=True "
+            f"buffer=30s"
+        )
+
+    @staticmethod
+    def _release(ts, owner, reason="prefill_deadline"):
+        return (
+            f"2026-10-23 {ts},000 - INFO - lease_released session={owner} "
+            f"reason={reason} endpoint=default"
+        )
+
+    @staticmethod
+    def _local_start(ts, owner):
+        return (
+            f"2026-10-23 {ts},000 - INFO - Stream started: provider=local "
+            f"model=Qwen3 session={owner} request=[{{'type': 'text'}}]"
+        )
+
+    @classmethod
+    def _hold(cls, owner, start_s, end_s, step_s=30):
+        """Continuous lease extensions (the proxy renews every ~10 s)."""
+        return [
+            cls._ext(_mmss(s), owner) for s in range(start_s, end_s + 1, step_s)
+        ]
+
+    def test_denial_during_over_bound_unproductive_hold_is_a_wedge(self):
+        lines = self._hold("owner", 0, 300) + [                      # 10:00:00-10:05:00
+            self._deny("10:05:30", "victim", "owner"),            # 330 s, no byte
+            self._release("10:05:31", "owner"),
+        ]
+        w = prv.measure_wedge_denials(lines, bound_seconds=300)
+        self.assertEqual(w.wedge_denials, 1)
+        self.assertEqual(w.short_hold_denials, 0)
+        self.assertFalse(w.clean)
+        self.assertGreaterEqual(w.max_unproductive_hold_seconds, 330)
+        self.assertEqual(w.wedge_examples[0]["owner"], "owner")
+
+    def test_deadline_churn_does_not_reset_an_unproductive_chain(self):
+        # The incident shape: deadline -> lease_renewed -> re-dispatch with no
+        # lease_released, so the hold must be measured across the churn.
+        lines = self._hold("owner", 0, 60)  # 10:00:00-10:01:00
+        lines += [
+            "2026-10-23 10:01:30,000 - WARNING - prefill_deadline_exceeded "
+            "session=owner deadline=90s cancelling local dispatch",
+            "2026-10-23 10:01:30,000 - INFO - lease_renewed session=owner timeout=30s",
+        ]
+        lines += self._hold("owner", 60, 120)  # 10:01:00-10:02:00
+        lines += [
+            "2026-10-23 10:02:30,000 - WARNING - prefill_deadline_exceeded "
+            "session=owner deadline=90s cancelling local dispatch",
+            "2026-10-23 10:02:30,000 - INFO - lease_renewed session=owner timeout=30s",
+        ]
+        lines += self._hold("owner", 120, 240)  # 10:02:00-10:04:00
+        lines += [self._deny("10:05:05", "victim", "owner")]        # 305 s hold
+        w = prv.measure_wedge_denials(lines, bound_seconds=300)
+        self.assertEqual(w.wedge_denials, 1)
+
+    def test_productive_holder_denial_is_not_a_wedge(self):
+        lines = self._hold("owner", 0, 300)
+        lines.insert(1, self._local_start("10:00:10", "owner"))
+        lines.append(self._deny("10:06:05", "victim", "owner"))   # 365 s hold
+        w = prv.measure_wedge_denials(lines, bound_seconds=300)
+        self.assertEqual(w.wedge_denials, 0)
+        self.assertEqual(w.productive_holder_denials, 1)
+        self.assertTrue(w.clean)
+
+    def test_short_unproductive_hold_is_not_a_wedge(self):
+        lines = [
+            self._ext("10:00:00", "owner"),
+            self._deny("10:00:50", "victim", "owner"),
+        ]
+        w = prv.measure_wedge_denials(lines, bound_seconds=300)
+        self.assertEqual(w.wedge_denials, 0)
+        self.assertEqual(w.short_hold_denials, 1)
+        self.assertTrue(w.clean)
+
+    def test_released_owner_denial_is_stale(self):
+        lines = [
+            self._ext("10:00:00", "owner"),
+            self._release("10:00:05", "owner"),
+            self._deny("10:00:30", "victim", "owner"),
+        ]
+        w = prv.measure_wedge_denials(lines, bound_seconds=300)
+        self.assertEqual(w.stale_owner_denials, 1)
+        self.assertEqual(w.wedge_denials, 0)
+
+    def test_inactivity_gap_starts_a_new_hold(self):
+        # Extensions 8 minutes apart are two holds, not one: the second is
+        # only 60 s old when the denial lands.
+        lines = [
+            self._ext("10:00:00", "owner"),
+            self._ext("10:08:00", "owner"),
+            self._deny("10:09:00", "victim", "owner"),
+        ]
+        w = prv.measure_wedge_denials(lines, bound_seconds=300)
+        self.assertEqual(w.wedge_denials, 0)
+        self.assertEqual(w.short_hold_denials, 1)
+
+    def test_release_long_after_last_extension_is_not_a_hold(self):
+        # A lease_released hours after the last extension closes a lapsed
+        # chain, not a multi-hour hold.
+        lines = [
+            self._ext("10:00:00", "owner"),
+            self._release("17:00:00", "owner"),
+        ]
+        w = prv.measure_wedge_denials(lines, bound_seconds=300)
+        self.assertIsNone(w.max_unproductive_hold_seconds)
+
+    def test_hold_maxima_are_window_scoped(self):
+        import datetime as dt
+
+        # The 10:00 hold is outside the requested window; only the 12:00 one
+        # may be reported.
+        lines = (
+            self._hold("owner", 0, 600, step_s=60)
+            + [self._release("10:10:30", "owner")]
+            + self._hold("other", 7200, 7500, step_s=60)
+            + [self._release("12:05:30", "other")]
+        )
+        w = prv.measure_wedge_denials(
+            lines,
+            since=dt.datetime(2026, 10, 23, 11, 59, 0),
+            until=dt.datetime(2026, 10, 23, 13, 0, 0),
+            bound_seconds=300,
+        )
+        self.assertEqual(w.max_unproductive_hold_seconds, 330)
+
+    def test_denials_outside_the_window_are_ignored(self):
+        import datetime as dt
+
+        lines = [
+            self._ext("10:00:00", "owner"),
+            self._ext("10:04:00", "owner"),
+            self._deny("10:06:00", "victim", "owner"),
+        ]
+        w = prv.measure_wedge_denials(
+            lines,
+            since=dt.datetime(2026, 10, 23, 11, 0, 0),
+            until=dt.datetime(2026, 10, 23, 12, 0, 0),
+            bound_seconds=300,
+        )
+        self.assertEqual(w.wedge_denials, 0)
+        self.assertEqual(w.denials_examined, 0)
 
 
 class MeasureLogCoverageTest(unittest.TestCase):

@@ -24,7 +24,7 @@ re-dispatching the same giant prompt for hours?
 
 | AC | Claim | Result |
 |---|---|---|
-| AC1 | post-fix report: no thrash hour and zero `local_lease_active` fallbacks | **NOT MET over the completed 24 h window** (14 thrash hours, 93 `local_lease_active` fallbacks — down from 766 pre-fix; see [the 24 h section](#24-h-post-deploy-window-completed-2026-10-24-220414)). In the short 54 min post-restart window it was clean: fallbacks 0 in every hour and no zero-eval thrash hour |
+| AC1 | post-fix: no wedge (an owner holding the gate with no first byte starves everyone) | **MET (restated 2026-10-25)** — 0 wedge denials over the completed 24 h window, longest unproductive hold 164 s < the 300 s bound; the same code reports 567 / 55 wedge denials on the pre-fix and incident windows (controls below). The report diagnostics still show 14 thrash hours and 93 `local_lease_active` fallbacks — admission-side, tracked by LP-0MVN1IQTF0037WTG |
 | AC2 | a deliberately stalled prefill releases the gate in <=5 min | **MET — 0 s (streaming/deadline path) and 189 s (non-streaming/watchdog path)**; confirmed at scale in the 24 h window: 525/525 deadline releases at 0.0 s, none unreleased |
 | AC3 | local serving resumes after recovery | **MET** — local stream served at 22:04:25 (first byte 2.85 s, tokens delivered); 90 local streams completed inside the 24 h window, but the last one was 21:18:13 — the final ~2 h 46 m served nothing (see the 24 h section) |
 | AC4 | evidence + regressions filed | this document + comment; bounded-regression items filed (see below) |
@@ -91,7 +91,16 @@ The incident re-dispatched 41 local POSTs for one wedged session (35 inside
 deadline, and the observed local POST count for the whole post-fix window was
 14 (all deliberate or deadline-cancelled dispatches).
 
-## AC1 — post-fix report figures
+## AC1 — post-fix report figures (diagnostics) and the restated verdict
+
+> **Restated 2026-10-25 (LP-0MVLHMCN6003GAMD AC1, producer decision).** The
+> original wording — "no thrash hour and zero `reason=local_lease_active`
+> fallbacks" — conflated the fix's own property (a *wedge*: an owner holding
+> the gate with no first byte) with an admission-side one (a *productive*
+> holder: normal on a 2-slot pool at multi-session demand, and never zero).
+> The verdict is now **wedge attribution**; the report figures below and in
+> the 24 h section are kept as diagnostics. See
+> [AC1 restated](#ac1-restated--wedge-attribution-lp-0mvlhmcn6003gamd-ac1).
 
 `analyze_proxy_usage.py` over the post-fix window (20:08:53 → 21:03:06),
 hourly activity (`report.md` in the run's output directory):
@@ -126,6 +135,44 @@ The literal "24 h post-fix window" cannot exist until 24 h after the 20:08:53
 restart; the follow-up window item reruns the same measurement
 (`python3 scripts/prefill_recovery_verification.py --measure --since … --until …`)
 over the full window.
+
+### AC1 restated — wedge attribution (LP-0MVLHMCN6003GAMD AC1)
+
+`--measure` now classifies every `local_dispatch_denied` event by the state of
+the named lease owner at that instant, measured on the owner's **continuous
+prefill-hold chain** (`lease_extended_during_prefill` every ~10 s, ended only by
+a genuine `lease_released`; deadline / `lease_renewed` churn deliberately does
+**not** end a chain, because that is the incident's shape):
+
+| Class | Meaning |
+|---|---|
+| `wedge_denials` | owner held ≥ `--wedge-bound-seconds` (default 300 = the AC's ≤5 min bound) with **no client-visible first byte** — the verdict metric |
+| `productive_holder_denials` | owner had already delivered a local first byte (fairness/monopoly shape) |
+| `short_hold_denials` | unproductive owner, hold shorter than the bound (fresh prefill — admission-side) |
+| `stale_owner_denials` | denial names an owner with no live hold (lease already released/expired) |
+
+`verdict_met = (wedge_denials == 0)`. The per-hour thrash count and the
+`reason=local_lease_active` fallback volume stay in
+`ac1.diagnostics` — they are admission-side signals owned by
+LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I / LP-0MVOFVCA2008DQVE.
+
+Sensitivity controls (same code, same log set — the metric must fail the
+incident): `docs/dev/prefill-recovery-wedge-controls-2026-10-25.json`
+
+| Window | `wedge_denials` | denials examined | longest unproductive hold | Verdict |
+|---|---|---|---|---|
+| 2026-10-21 20:00 → 2026-10-22 20:00 (pre-fix 24 h) | **567** | 1,554 | 1,512 s | NOT MET |
+| 2026-10-23 00:00 → 08:00 (incident day) | **55** | 655 | 338 s | NOT MET |
+| 2026-10-23 02:00 → 03:00 (incident hour) | 0 | 141 | 300 s | MET |
+| 2026-10-23 22:04 → 2026-10-24 22:04 (24 h post-fix) | **0** | 449 | 164 s | MET |
+
+The single incident hour scores 0 because that hour's leases were recycled by
+`idle_timeout` roughly every four minutes — no *single* hold exceeded the
+5-minute bound, even though the gate was starved continuously for hours by a
+rolling handover between wedged sessions. That shape is caught by the
+day-window count (55), by the thrash-hour diagnostics (14 zero-service hours)
+and by the lease-release bound (AC2: every deadline releases in 0.0 s), which
+is why the 24 h verdict uses the whole window rather than one hour.
 
 ## AC3 — local serving resumes
 
@@ -284,7 +331,8 @@ AC3 of LP-0MVLHMAWV008EKTI: the 24 h re-anchored window is fully covered.
 |---|---|---|
 | AC2 — deadline → lease release within 300 s | **MET** | 525 pairs, `max_release_seconds: 0.0`, `unreleased_sessions: []`. Every cancellation released its lease in the same second (e.g. `2026-10-24 00:36:36,644 prefill_deadline_exceeded session=01a16b1b…` immediately followed by `lease_released session=01a16b1b… reason=prefill_deadline`). The incident's ~4 h retention did not recur. |
 | AC3 — local serving resumes | **NOT MET as scored** | `local_finishes_after_last_release: 0` within 3,600 s of the last release (2026-10-24 22:01:40). 90 local streams did complete inside the window, so recovery works request-by-request, but the last one was at 2026-10-24 21:18:13 — the final ~2 h 46 m delivered no local stream, and no local stream followed the last deadline release. |
-| AC1 — report figures | **NOT MET** | 14 thrash hours (≥10 dispatch attempts, 0 served), 93 `reason=local_lease_active` fallbacks over 25 hour buckets. |
+| AC1 — wedge attribution (restated) | **MET** | `wedge_denials: 0` of 449 denials examined; longest unproductive hold **164 s** (bound 300 s). Breakdown: 2 productive-holder, 306 short-hold, 141 stale-owner. Pre-fix/incident controls report 567 / 55 wedge denials with the same code. |
+| AC1 — report diagnostics | see diagnostics | 14 thrash hours (≥10 dispatch attempts, 0 served) and 93 `reason=local_lease_active` fallbacks over 25 hour buckets — admission-side, LP-0MVN1IQTF0037WTG. |
 
 ### Hourly report (state is the C6 prefill-only/lease-blocked classification)
 
@@ -411,10 +459,18 @@ local busy 3.7 % (2,238.8 s of 86,400 s).**
 ## Reproduce
 
 ```bash
-# Post-fix window measurement (AC1 from the report figures + AC2 pairing)
+# Post-fix window measurement (AC1 wedge attribution + AC2 pairing + AC3)
 python3 scripts/prefill_recovery_verification.py --measure \
     --log-dir /var/log/llama-proxy \
     --since '2026-10-23 20:08:53' --until '<window end>' --json
+
+# AC1 sensitivity control — the same measurement must FAIL pre-fix
+python3 scripts/prefill_recovery_verification.py --measure --no-pipeline \
+    --since '2026-10-21 20:00:00' --until '2026-10-22 20:00:00' --json
+
+# Tighter/looser wedge bound (default: --recovery-bound-seconds, 300 s)
+python3 scripts/prefill_recovery_verification.py --measure \
+    --wedge-bound-seconds 240 --json
 
 # Deliberate stalled prefill (streaming: deadline path)
 python3 scripts/prefill_recovery_verification.py --stall-test --stream \
