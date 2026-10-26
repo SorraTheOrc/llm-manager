@@ -464,6 +464,10 @@ above; the entry-level cooldown described there is unchanged.
   720 s) are unchanged: the account is
   excluded, the request advances down the chain, and siblings keep their
   normal eligibility.
+- **No window metadata:** a header-derived quarantine is not tied to a quota
+  window, so it is revalidated as a *legacy* entry — the first fresh
+  `/v1/usage` poll that shows no window exhausted clears it (see the
+  usage-limit section below).
 - **Flag gate:** the header is only consulted when
   `respect_ratelimit_headers` is enabled for the entry (or globally); with it
   off the reset is ignored and no account quarantine is created.
@@ -1410,15 +1414,35 @@ distinct API keys on the same gateway keep independent limits
 (LP-0MSMBWB23009XYPW), and the 2-minute `_USAGE_LIMIT_RESET_MARGIN_SECONDS`
 safety margin is always added.
 
-The reset duration is resolved in this order (LP-0MVF7MPZN009GOJB):
+The reset duration is resolved in this order, **per quota window**
+(LP-0MVPAE77Z002VGIA; supersedes the fixed monthly reading of
+LP-0MVF7MPZN009GOJB):
 
-1. **Authoritative quota snapshot** — for an `opencode-*` account with a
-   **fresh** quota snapshot and quota behaviour strictly enabled, the
-   snapshot's account-level `seconds_to_reset` (the monthly window derived
-   from `monthly.resetsAt` by the `/v1/usage` poller, LP-0MVF4FIP1001RD8P) is
-   used and logged as `source=snapshot`. This is a hard (`explicit`)
-   quarantine: it is exempt from the guessed-quarantine 24 h cap and is
-   persisted. The snapshot wins over any `Resets in ...` text in the message.
+1. **Authoritative quota snapshot, window-aware** — for an `opencode-*` account
+   with a **fresh** quota snapshot and quota behaviour strictly enabled, the
+   window the 429 names in `metadata.limitName`
+   (`rolling`/`weekly`/`monthly`, normalised case/whitespace) determines the
+   quarantine:
+   - a known window with a positive reset countdown quarantines for **that
+     window's** `seconds_to_reset` + the margin (`source=snapshot`,
+     `window=<name>`); a weekly-limited account therefore returns within the
+     week, never waiting for the monthly reset;
+   - a known window whose snapshot reset is non-positive (contradictory, stale
+     evidence) is bounded by the named period capped at
+     `_usage_limit_guess_cap_seconds` and marked *guessed*
+     (`source=snapshot-bounded`), so the self-healing probe revalidates it;
+   - an absent/empty/unknown `limitName` (e.g. `daily`) is bounded by the
+     **soonest usable window** reset and marked *guessed* — never the monthly
+     value while a shorter window is still open;
+   - when no window yields a usable reset, the account-level
+     `seconds_to_reset` (monthly) path is retained unchanged.
+   The chosen window is persisted with the quarantine
+   (`usage_reset_window` in `provider-state.json`) and revalidated on the poll
+   cadence: as soon as a fresh `/v1/usage` poll shows that window reset
+   (effectively empty, or its countdown extended past the quarantine), the
+   quarantine is cleared and the account returns to rotation without a proxy
+   restart. Legacy entries with no window metadata (schema version 1) clear on
+   the first healthy poll that shows no window exhausted.
 2. **Message duration** — for a non-`opencode-*` entry (no quota source), or
    when the snapshot is stale/absent or the quota source is disabled
    (`quota_surge_enabled: false`) / dry-run, an explicit `Resets in 22hr
@@ -1431,8 +1455,10 @@ The reset duration is resolved in this order (LP-0MVF7MPZN009GOJB):
    never used without explicit evidence (LP-0MUQTCMW2001VXH8).
 
 Routing decisions during the block log `usage_limit_reset_pending` with the
-reset time and do not contact the upstream; once the reset time arrives the
-account becomes eligible again without operator intervention.
+reset time and the window that holds the account out (e.g.
+`window=weekly`); once the reset time arrives (or a fresh poll proves the
+window reset) the account becomes eligible again without operator
+intervention.
 `FreeUsageLimitError` responses without a reset time get the default 3-hour
 cooldown (10800s; per-provider overrides were retired with
 `opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in

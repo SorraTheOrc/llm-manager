@@ -115,16 +115,25 @@ and one poll — `test_shared_api_key_env_shares_one_snapshot_and_poll`).
   retires the class of failure behind LP-0MUQTCMW2001VXH8, where a guessed
   reset locked an account out for up to 30 days.
 - **The reactive `GoUsageLimitError` quarantine consumes this authoritative
-  value** (LP-0MVF7MPZN009GOJB). For an `opencode-*` account with a fresh
-  snapshot and quota behaviour enabled, a 429 usage-limit error quarantines the
-  account for exactly the snapshot's `seconds_to_reset` (monthly window) plus
-  the 2-minute margin — the `metadata.limitName` guess is now fallback-only,
-  reachable only when the snapshot is stale/absent or the quota source is
-  disabled/dry-run (`source=snapshot|message|guess` in the proxy log).
+  value per window** (LP-0MVF7MPZN009GOJB, made window-aware by
+  LP-0MVPAE77Z002VGIA). For an `opencode-*` account with a fresh snapshot and
+  quota behaviour enabled, a 429 usage-limit error quarantines the account for
+  the reset of the **window the 429 named** in `metadata.limitName` (plus the
+  2-minute margin) — a `weekly` limit waits for the weekly reset, not for the
+  monthly one. An absent/unknown `limitName` is bounded by the **soonest
+  still-usable window** and marked *guessed* (probe-eligible, never
+  persisted); only when no window yields a usable reset does the account-level
+  monthly `seconds_to_reset` path apply. The chosen window is persisted with
+  the quarantine and revalidated on the poll cadence, so a poll showing that
+  window reset clears it without a restart (`source=snapshot|snapshot-bounded|
+  message|guess` plus `window=<name>` in the proxy log).
 - **The account-level `seconds_to_reset` reports the monthly window** — the
   allowance period that resets per account. The rolling and weekly windows
-  reset on much shorter cadences and are exposed per window for callers that
-  need them.
+  reset on much shorter cadences and are exposed per window; use
+  `quota_state.window_for_limit_name()` to map an upstream `limitName` onto a
+  `QuotaWindow`, and read the reset from that window rather than
+  `QuotaSnapshot.seconds_to_reset` (which is monthly-only and returns `0`
+  whenever any window's `resetsAt` is missing).
 - **An account is `exhausted`** when any window blocks or no effective
   headroom remains.
 

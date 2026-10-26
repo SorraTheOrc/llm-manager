@@ -43,6 +43,7 @@ def reset_cooldown_state():
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
     # Sibling-fallback breaker state (LP-0MTPMF03P0046MFG)
     provider._sibling_failure_count.clear()
     provider._sibling_failure_streak_start.clear()
@@ -3670,6 +3671,7 @@ class TestSharedFallbackPrimitives:
         provider._provider_unavailable_until.clear()
         provider._provider_failure_count.clear()
         provider._usage_reset_at.clear()
+        provider._usage_reset_window.clear()
         attempts = []
         response = Response(status_code=502, content=b"Bad gateway")
         cooldown = provider._handle_http_error_with_cooldown(

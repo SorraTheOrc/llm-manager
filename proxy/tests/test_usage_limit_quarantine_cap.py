@@ -23,9 +23,11 @@ This module covers:
 
 import json
 import time
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import proxy.provider as provider
+import proxy.quota_state as quota_state
 import proxy.server as server
 import pytest
 from fastapi import Response
@@ -122,10 +124,14 @@ def _reset_probe_transport():
     provider._usage_limit_probe_transport = None
     provider._usage_limit_last_probe.clear()
     provider._usage_reset_guessed.clear()
+    provider._usage_reset_window.clear()
+    quota_state.reset_quota_state()
     yield
     provider._usage_limit_probe_transport = None
     provider._usage_limit_last_probe.clear()
     provider._usage_reset_guessed.clear()
+    provider._usage_reset_window.clear()
+    quota_state.reset_quota_state()
 
 
 # ---------------------------------------------------------------------------
@@ -548,3 +554,296 @@ class TestAdminClearUsageLimit:
     def test_route_is_registered(self):
         paths = {getattr(route, "path", None) for route in server.app.routes}
         assert "/admin/clear-usage-limit" in paths
+
+
+# ---------------------------------------------------------------------------
+# Window-aware quarantine revalidation (LP-0MVPAE77Z002VGIA AC4/AC7/AC8/AC11)
+# ---------------------------------------------------------------------------
+#
+# When the 429 names a quota window, the quarantine must follow THAT window's
+# own reset and must be clearable as soon as a fresh `/v1/usage` poll shows
+# the limit lifted — never a multi-week explicit lockout, and never the
+# monthly reset for a weekly-limited account.
+
+_NOW = datetime(2026, 10, 19, 12, 0, 0, tzinfo=UTC)
+
+
+class _QuotaClock:
+    def __init__(self, start: datetime = _NOW):
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def _windowed_body(
+    *,
+    rolling: tuple[float, float | None] = (0.0, 5 * 3600),
+    weekly: tuple[float, float | None] = (0.0, 7 * 86400),
+    monthly: tuple[float, float | None] = (50.0, 24 * 86400),
+) -> dict:
+    def w(spec):
+        percent, offset = spec
+        return {
+            "status": "ok",
+            "percent": percent,
+            "resetsAt": _iso(_NOW + timedelta(seconds=offset))
+            if offset is not None
+            else None,
+        }
+
+    return {
+        "usage": {
+            "rolling": w(rolling),
+            "weekly": w(weekly),
+            "monthly": w(monthly),
+        }
+    }
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+class _UsageTransport:
+    """Injectable ``/v1/usage`` transport keyed by account key."""
+
+    def __init__(self, bodies: dict[str, dict]):
+        self._bodies = dict(bodies)
+
+    async def __call__(self, provider_cfg: dict) -> dict:
+        return self._bodies[quota_state.account_key(provider_cfg)]
+
+
+async def _seed_snapshot(entry: dict, config: dict, body: dict) -> None:
+    account = quota_state.account_key(entry)
+    quota_state.set_quota_transport(_UsageTransport({account: body}))
+    await quota_state.refresh_quota_accounts(
+        {"providers": [entry]}, config, force=True
+    )
+
+
+class TestWindowRevalidation:
+    @pytest.mark.asyncio
+    async def test_window_derived_quarantine_clears_when_window_rolls_over(self):
+        """AC7: a weekly-derived quarantine clears as soon as a fresh poll
+        shows the weekly window reset — no restart, no command."""
+        chain = _TWO_GO_CHAIN
+        entry = chain["providers"][0]
+        config = {"provider_cooldown_seconds": 60}
+        clock = _QuotaClock()
+        quota_state.set_clock(clock)
+        await _seed_snapshot(
+            entry, config, _windowed_body(weekly=(99.0, 86400), monthly=(54.0, 24 * 86400))
+        )
+        account = _account(entry)
+
+        # A weekly 429 quarantine follows the weekly window (explicit/hard).
+        provider._set_usage_limit_quarantine(
+            account,
+            provider._UsageLimitReset(
+                86400 + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                True,
+                "weekly",
+                "weekly",
+            ),
+        )
+        assert provider._usage_reset_remaining(account) > 0
+        assert account not in provider._usage_reset_guessed
+        assert provider._usage_reset_window[account] == "weekly"
+
+        # Restart survival: the explicit quarantine + window ride the state
+        # file, so a restarted proxy can still revalidate it.
+        state_path = provider.default_provider_state_file()
+        provider.save_provider_state(state_path)
+        provider._usage_reset_at.clear()
+        provider._usage_reset_window.clear()
+        provider._usage_reset_guessed.clear()
+        provider.load_provider_state(state_path)
+        assert account in provider._usage_reset_at
+        assert provider._usage_reset_window[account] == "weekly"
+
+        # The weekly window rolls over: a fresh poll reports 0% consumed.
+        clock.now = _NOW + timedelta(days=2)
+        await _seed_snapshot(
+            entry, config, _windowed_body(weekly=(0.0, 7 * 86400), monthly=(55.0, 24 * 86400))
+        )
+
+        await provider._maybe_probe_quarantined_accounts(chain, config)
+
+        assert provider._usage_reset_remaining(account) == 0.0
+        assert account not in provider._usage_reset_at
+        assert account not in provider._usage_reset_window
+        # Persisted state no longer blocks it either.
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        assert account not in raw["usage_reset_at"]
+        assert account not in raw.get("usage_reset_window", {})
+        # Eligible again in the same cycle, without a proxy restart.
+        assert provider.resolve_provider(chain, config=config)["name"] == entry["name"]
+
+    @pytest.mark.asyncio
+    async def test_window_derived_quarantine_lifts_before_expiry_without_probe(self):
+        """AC7 contrast: a still-exhausted weekly window keeps the quarantine,
+        and the revalidation is snapshot-based (no probe transport needed)."""
+        chain = _TWO_GO_CHAIN
+        entry = chain["providers"][0]
+        config = {"provider_cooldown_seconds": 60}
+        clock = _QuotaClock()
+        quota_state.set_clock(clock)
+        await _seed_snapshot(
+            entry, config, _windowed_body(weekly=(99.0, 7 * 86400), monthly=(54.0, 24 * 86400))
+        )
+        account = _account(entry)
+        provider._set_usage_limit_quarantine(
+            account,
+            provider._UsageLimitReset(
+                7 * 86400 + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                True,
+                "weekly",
+                "weekly",
+            ),
+        )
+        # Weekly still exhausted on the fresh poll → quarantine stays.
+        clock.now = _NOW + timedelta(minutes=30)
+        await _seed_snapshot(
+            entry, config, _windowed_body(weekly=(99.0, 6 * 86400), monthly=(54.0, 24 * 86400))
+        )
+        await provider._maybe_probe_quarantined_accounts(chain, config)
+        assert provider._usage_reset_remaining(account) > 0
+
+    @pytest.mark.asyncio
+    async def test_legacy_quarantine_clears_on_first_healthy_poll(self, tmp_path, monkeypatch):
+        """AC7/AC11: a version-1 (window-less) persisted quarantine cannot
+        survive as a multi-week lockout — the first healthy poll clears it."""
+        monkeypatch.setenv(
+            provider._PROVIDER_STATE_FILE_ENV,
+            str(tmp_path / "provider-state.json"),
+        )
+        chain = _TWO_GO_CHAIN
+        entry = chain["providers"][0]
+        config = {"provider_cooldown_seconds": 60}
+        clock = _QuotaClock()
+        quota_state.set_clock(clock)
+        account = _account(entry)
+
+        # Schema version 1 payload exactly like the incident's (no window map).
+        path = provider.default_provider_state_file()
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "provider_unavailable_until": {},
+                    "usage_reset_at": {account: time.time() + 20 * 86400},
+                }
+            ),
+            encoding="utf-8",
+        )
+        provider.load_provider_state(path)
+        assert account in provider._usage_reset_at
+        assert provider._usage_reset_window == {}
+
+        # A fresh poll shows every window healthy → cleared without a restart.
+        await _seed_snapshot(
+            entry, config, _windowed_body(rolling=(2.0, 3600), weekly=(7.0, 3 * 86400), monthly=(55.0, 24 * 86400))
+        )
+        await provider._maybe_probe_quarantined_accounts(chain, config)
+
+        assert provider._usage_reset_remaining(account) == 0.0
+        # And the persisted state no longer blocks it.
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert account not in raw["usage_reset_at"]
+
+    @pytest.mark.asyncio
+    async def test_missing_snapshot_keeps_legacy_quarantine_until_polled(self):
+        """AC11 guard: with no snapshot yet the revalidation waits (no
+        guessing), so a stale entry is never cleared on thin evidence."""
+        chain = _TWO_GO_CHAIN
+        entry = chain["providers"][0]
+        config = {"provider_cooldown_seconds": 60}
+        quota_state.set_clock(_QuotaClock())
+        account = _account(entry)
+        provider._usage_reset_at[account] = time.time() + 3600
+
+        await provider._maybe_probe_quarantined_accounts(chain, config)
+
+        assert provider._usage_reset_remaining(account) > 0
+
+
+class TestBoundedGuessedPaths:
+    @pytest.mark.asyncio
+    async def test_unknown_limit_name_is_guessed_bounded_and_not_persisted(self):
+        """AC4 flow: an absent limitName with a fresh snapshot quarantines for
+        the soonest usable window and is recorded guessed (never persisted,
+        probe-eligible)."""
+        chain = _TWO_GO_CHAIN
+        entry = chain["providers"][0]
+        config = {"provider_cooldown_seconds": 60}
+        quota_state.set_clock(_QuotaClock())
+        await _seed_snapshot(
+            entry, config, _windowed_body(rolling=(10.0, 5 * 3600), weekly=(20.0, 6 * 86400), monthly=(30.0, 24 * 86400))
+        )
+        account = _account(entry)
+
+        body = json.dumps({
+            "type": "error",
+            "error": {"type": "GoUsageLimitError", "message": "Usage limit reached."},
+            "metadata": {},
+        })
+        resp = Response(status_code=429, content=body.encode("utf-8"))
+        info = provider._usage_limit_reset_info(resp, body, config, provider_cfg=entry)
+
+        assert info is not None
+        assert info.window == "rolling"
+        assert info.explicit is False
+        provider._set_usage_limit_quarantine(account, info)
+        assert account in provider._usage_reset_guessed
+        # Soonest usable window, never the monthly 24-day value.
+        assert info.seconds <= 5 * 3600 + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+        # Guessed quarantines are not persisted (with or without window map).
+        provider.save_provider_state()
+        raw = json.loads(provider.default_provider_state_file().read_text(encoding="utf-8"))
+        assert account not in raw["usage_reset_at"]
+        assert account not in raw.get("usage_reset_window", {})
+
+    @pytest.mark.asyncio
+    async def test_contradictory_named_window_is_bounded_and_probe_armed(self):
+        """AC8 flow: a named window whose snapshot reset is non-positive is
+        bounded at the guess cap and remains probe-eligible (self-heals)."""
+        chain = _TWO_GO_CHAIN
+        entry = chain["providers"][0]
+        config = {"provider_cooldown_seconds": 60}
+        quota_state.set_clock(_QuotaClock())
+        await _seed_snapshot(
+            entry, config, _windowed_body(rolling=(0.0, 4 * 3600), weekly=(99.0, -60), monthly=(54.0, 24 * 86400))
+        )
+        account = _account(entry)
+
+        body = json.dumps({
+            "type": "error",
+            "error": {"type": "GoUsageLimitError", "message": "Weekly usage limit reached."},
+            "metadata": {"limitName": "weekly"},
+        })
+        resp = Response(status_code=429, content=body.encode("utf-8"))
+        info = provider._usage_limit_reset_info(resp, body, config, provider_cfg=entry)
+
+        assert info is not None
+        assert info.window == "weekly"
+        assert info.explicit is False
+        margin = provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+        assert info.seconds == pytest.approx(provider._USAGE_LIMIT_GUESS_MAX_SECONDS + margin, abs=5)
+
+        provider._set_usage_limit_quarantine(account, info)
+        assert account in provider._usage_reset_guessed
+
+        # The probe path is armed: a successful cheap probe reintroduces it.
+        probed: list[str] = []
+
+        async def _probe_ok(provider_cfg):
+            probed.append(provider_cfg["name"])
+            return True
+
+        provider._usage_limit_probe_transport = _probe_ok
+        await provider._maybe_probe_quarantined_accounts(chain, config)
+
+        assert probed == [entry["name"]]
+        assert provider._usage_reset_remaining(account) == 0.0

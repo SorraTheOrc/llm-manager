@@ -799,7 +799,7 @@ After a provider fails, it is marked as unavailable for a cooldown period. Durin
   window, or any error after the window expires, is still quarantined
   normally so genuine local faults are never masked.
 - **FreeUsageLimitError (HTTP 429, LP-0MRGU0I91006ODFD)**: When a remote provider returns a `FreeUsageLimitError` without an explicit reset duration, it is marked unavailable for 3 hours (10800s). No per-provider overrides are active (the last override, `opencode-big-pickle`'s 24h entry, was removed with the provider in LP-0MT652JRM004ZLSI). 429s that carry an explicit reset duration take the usage-limit reset quarantine path instead (see Routing), which takes precedence.
-- **Usage-limit quarantine (LP-0MSLJPOCC0001ROJ, bounded by LP-0MUQTCMW2001VXH8)**: A 429 usage-limit error (`GoUsageLimitError`, or a `FreeUsageLimitError` carrying a reset time) quarantines only the failing **API-key account**, not the whole gateway. An **explicit** `Resets in …` duration is honoured in full (plus a 2-minute margin). A **guessed** duration — derived from `metadata.limitName` alone when the gateway omits the reset time, which is the common opencode case — is capped at **24 hours** (`server.usage_limit_guess_cap_seconds`, or the `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` env override) and is **never persisted**, so a duration-less 429 can no longer lock a healthy account out for the full 7/30-day period. Guessed quarantines are also re-validated by a cheap self-healing probe (at most one probe per 5 minutes per account); the first successful probe clears the quarantine and the account is routed to within the same request cycle. An operator can clear any quarantine immediately with `POST /admin/clear-usage-limit`.
+- **Usage-limit quarantine (LP-0MSLJPOCC0001ROJ, bounded by LP-0MUQTCMW2001VXH8, window-aware by LP-0MVPAE77Z002VGIA)**: A 429 usage-limit error (`GoUsageLimitError`, or a `FreeUsageLimitError` carrying a reset time) quarantines only the failing **API-key account**, not the whole gateway. An **explicit** `Resets in …` duration is honoured in full (plus a 2-minute margin). For an `opencode-*` account with a fresh `/v1/usage` snapshot the quarantine follows the **quota window the 429 named** (`metadata.limitName`): a `weekly` limit returns after the weekly reset, never after the monthly one (previously every 429 was pinned to the monthly account-level reset, so a weekly-limited account could stay out for weeks — the 2026-10-24 incident). An absent/unknown `limitName` is bounded by the soonest still-open window instead of the monthly value, and a named window whose snapshot data is contradictory is capped at the guess cap. Window-derived quarantines are **revalidated on the quota-poll cadence**: as soon as a fresh poll shows that window reset, the quarantine is cleared and the account is routed to again without a restart. A **guessed** duration — derived from `metadata.limitName` alone when the gateway omits the reset time, which is the common opencode case — is capped at **24 hours** (`server.usage_limit_guess_cap_seconds`, or the `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` env override) and is **never persisted**, so a duration-less 429 can no longer lock a healthy account out for the full 7/30-day period. Guessed quarantines are also re-validated by a cheap self-healing probe (at most one probe per 5 minutes per account); the first successful probe clears the quarantine and the account is routed to within the same request cycle. An operator can clear any quarantine immediately with `POST /admin/clear-usage-limit`.
 - **Reset-aware account quarantine (LP-0MVFA1VRT007T9HT)**: With `respect_ratelimit_headers` enabled, a **quota** 429 (body `rate_limit_error`/`rate_limit_exceeded`, or `x-ratelimit-over-limit: yes`) that also carries a parseable `x-ratelimit-reset-*` duration quarantines the failing **API-key account** for the parsed reset **plus the 2-minute usage-limit margin** — distinct from the 2-second `ratelimit_cooldown_margin_seconds` applied to the provider-ENTRY cooldown. The quarantine is keyed on `api_key_env@endpoint:model`, so a paid sibling on the same gateway stays eligible; it is persisted to `provider-state.json`, survives restarts, and feeds the exhaustion `retry_after`. A 429 with no reset signal keeps the plain short cooldown and per-request account-key exclusion. See the account-scoped quarantine subsection in `docs/routing.md`.
 - **State**: Cooldown state is persisted across restarts (see Provider Availability Persistence below) — a cooldown set before a restart is still honoured after it.
 - **Scope**: Cooldown state is global across all sessions within a single proxy process.
@@ -823,7 +823,13 @@ fresh HTTP 429.
   restart neither extends nor resets a cooldown/quarantine. **Guessed**
   (period-name-only) quarantines are deliberately excluded: a `limitName` is
   weak evidence and must not survive a restart as a long-lived lockout
-  (LP-0MUQTCMW2001VXH8).
+  (LP-0MUQTCMW2001VXH8). Since schema **version 2** the payload also carries
+  `usage_reset_window` — the quota window each persistable quarantine was
+  derived from — so a restarted proxy can still revalidate (and clear) a
+  window-derived quarantine as soon as `/v1/usage` reports that window reset
+  (LP-0MVPAE77Z002VGIA). A **version-1** payload still loads: its entries have
+  no window metadata and are revalidated as legacy entries, cleared by the
+  first healthy poll rather than surviving as a multi-week lockout.
 - **Written**: atomically (temp file + `os.replace`) on every availability
   mutation — the cold path (a provider failing or an upstream 429). Already
   expired entries are omitted from the payload. A write failure is logged and
@@ -983,7 +989,7 @@ hint.
 | Cause | `diagnostics` status | `unavailable_providers` | Log line |
 |-------|----------------------|-------------------------|----------|
 | Outside `available_times` window | `outside_time_window` | — (window-skipped) | `Skipping provider=<p>: outside its available_times window (UTC)` |
-| Usage-limit quarantine | `usage_limit_reset` (+ `reset_in`/`reset_at`) | `<provider>: <reset seconds>` | `Skipping provider=<p>: usage_limit_reset_pending` / `usage_limit_reset=` on the exhaustion line |
+| Usage-limit quarantine | `usage_limit_reset` (+ `reset_in`/`reset_at`) | `<provider>: <reset seconds>` | `Skipping provider=<p>: usage_limit_reset_pending (account=…, window=<rolling\|weekly\|monthly\|unknown>, …)` / `usage_limit_reset=` on the exhaustion line |
 | Local slot held by another session | `local_lease_active` / `fallback_after_queue` | — | `local_dispatch_denied session=… owner=… active=…` |
 | Free-tier request budget exhausted (`rate_limit_rpm`) | `rate_limited` / `rate_limited_waited` | — | `Provider budget exhausted: skipping provider=<p> limit=<n> remaining=<n> reason=rate_limited …` |
 | Prompt context above the entry's `max_context_tokens` | `provider_context_exceeded` | — | `routing_skip_provider_context provider=<p> type=<t> status=provider_context_exceeded estimated_tokens=<n> limit=<limit> reason=provider_context_exceeded …` |
@@ -1537,7 +1543,7 @@ before now, wrapping circularly" rule.
 | `OPENAI_API_KEY` | API key for OpenAI |
 | `ANTHROPIC_API_KEY` | API key for Anthropic |
 | `PROXY_PORT` | Override proxy web server port (default: 8000 prod, 8001 dev) |
-| `LLAMA_PROXY_PROVIDER_STATE_FILE` | Override the provider-availability state file (default: `proxy/provider-state.json`). Used by tests; `_provider_unavailable_until` and the explicit-duration `_usage_reset_at` quarantine are persisted here (guessed quarantines are not) |
+| `LLAMA_PROXY_PROVIDER_STATE_FILE` | Override the provider-availability state file (default: `proxy/provider-state.json`). Used by tests; `_provider_unavailable_until` and the explicit-duration `_usage_reset_at` quarantine (plus its `usage_reset_window` metadata) are persisted here (guessed quarantines are not) |
 | `LLAMA_PROXY_USAGE_LIMIT_GUESS_CAP_SECONDS` | Cap (seconds) applied to a guessed (period-name-only) usage-limit quarantine; default 24h. Overridden by `server.usage_limit_guess_cap_seconds` |
 | `LLAMA_SERVER_PORT` | Override llama-server backend port (default: 8080 prod, 8081 dev) |
 | `PORT` | Override backend port (alias for LLAMA_SERVER_PORT) |
@@ -3103,7 +3109,7 @@ Logs are written with time-based rotation:
 | `llama-server.log` | llama-server stdout/stderr | On each restart, last 15 kept |
 | `request_counts.json` | Persisted request counters (endpoint keys) | Updated periodically and on reset |
 | `token_counts.json` | Persisted token counters (endpoint keys + totals) | Updated periodically and on reset |
-| `provider-state.json` | Persisted provider cooldowns and usage-limit account quarantine (beside `proxy/.mode`, **not** in the log directory) | Rewritten atomically on each availability change; expired entries pruned; restored at startup |
+| `provider-state.json` | Persisted provider cooldowns and usage-limit account quarantine (with the per-account quota `usage_reset_window`) (beside `proxy/.mode`, **not** in the log directory) | Rewritten atomically on each availability change; expired entries pruned; restored at startup |
 
 ### Proxy Log Settings
 - **Rotation**: Every 6 hours

@@ -172,6 +172,15 @@ _usage_reset_at: dict[str, float] = {}
 # after a restart (LP-0MUQTCMW2001VXH8).
 _usage_reset_guessed: set[str] = set()
 
+# Account key -> the quota window (``rolling`` / ``weekly`` / ``monthly``)
+# whose own reset bounded the quarantine, or absent when the quarantine came
+# from an explicit message duration, an x-ratelimit header, or legacy state.
+# The window is what makes a quarantine revalidatable: as soon as a fresh
+# ``/v1/usage`` poll shows that window lifted, the quarantine is cleared, so
+# an account can never stay locked out past its own window
+# (LP-0MVPAE77Z002VGIA AC7/AC11).
+_usage_reset_window: dict[str, str] = {}
+
 # 2-minute safety margin added to the computed usage-limit reset time so a
 # clock-skewed upstream does not start re-serving 429s the moment the limit
 # nominally resets.
@@ -232,7 +241,10 @@ _usage_limit_probe_transport: Callable[[dict], Awaitable[bool]] | None = None
 # ---------------------------------------------------------------------------
 
 # On-disk schema version for the persisted provider-availability document.
-_PROVIDER_STATE_VERSION = 1
+# Version 2 adds the optional ``usage_reset_window`` companion map; version-1
+# documents are still read (their quarantine entries simply carry no window
+# metadata, LP-0MVPAE77Z002VGIA AC11).
+_PROVIDER_STATE_VERSION = 2
 
 # Environment override for the state-file path (used by tests and non-default
 # deployments). When unset, the file lives beside proxy/.mode.
@@ -241,6 +253,12 @@ _PROVIDER_STATE_FILE_ENV = "LLAMA_PROXY_PROVIDER_STATE_FILE"
 # Top-level keys of the persisted document.
 _PROVIDER_STATE_COOLDOWNS_KEY = "provider_unavailable_until"
 _PROVIDER_STATE_QUARANTINE_KEY = "usage_reset_at"
+
+# Optional companion map (version 2+): account key -> the quota window whose
+# reset produced the quarantine. A version-1 payload has no such map, so its
+# entries carry no window metadata and are revalidated as legacy entries
+# (cleared by the first poll that shows no window exhausted).
+_PROVIDER_STATE_QUARANTINE_WINDOWS_KEY = "usage_reset_window"
 
 
 def default_provider_state_file() -> Path:
@@ -271,6 +289,12 @@ def save_provider_state(path: str | Path | None = None) -> None:
     concurrent reader never observes a partial file. Already-expired entries
     are excluded from the payload so the file does not grow with stale keys.
 
+    Version 2 additionally writes ``usage_reset_window`` — the quota window
+    each persisted quarantine was derived from — for the accounts that are
+    actually written, so a restarted proxy can still revalidate (and clear) a
+    window-derived quarantine as soon as that window is reported lifted
+    (LP-0MVPAE77Z002VGIA AC7/AC11).
+
     The write is synchronous: callers invoke it on the cold path (a provider
     failing or an upstream 429), where a small atomic write is inexpensive.
     A failure is raised to the caller, which is expected to persist
@@ -299,6 +323,11 @@ def save_provider_state(path: str | Path | None = None) -> None:
         _PROVIDER_STATE_QUARANTINE_KEY: _prune_expired_expiries(
             persistable_quarantine, now
         ),
+        _PROVIDER_STATE_QUARANTINE_WINDOWS_KEY: {
+            key: window
+            for key, window in _usage_reset_window.items()
+            if key in persistable_quarantine
+        },
     }
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -335,17 +364,43 @@ def _coerce_expiry_map(raw: Any) -> dict[str, float]:
     return result
 
 
+def _coerce_window_map(raw: Any) -> dict[str, str]:
+    """Coerce persisted quarantine-window metadata to ``{account: window}``.
+
+    Each value must identify one of the quota windows (case/whitespace
+    normalised via :func:`proxy.quota_state.window_for_limit_name`); unknown
+    or malformed values are dropped rather than raising, so a stale or foreign
+    entry never resurrects a wrong-window lockout.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        window = quota_state.window_for_limit_name(value)
+        if window is None:
+            continue
+        result[key] = window
+    return result
+
+
 def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
     """Restore provider cooldowns and usage-limit quarantine from disk.
 
     Reads the state file written by :func:`save_provider_state`, drops any
     entry whose absolute epoch expiry is at or before ``time.time()``, and
     installs the remainder into the module-level maps. Both maps are replaced
-    (not merged) so a reload is deterministic.
+    (not merged) so a reload is deterministic. The optional
+    ``usage_reset_window`` map (schema version 2, LP-0MVPAE77Z002VGIA) is
+    restored alongside the quarantine and pruned to the accounts that survived
+    the expiry check; a version-1 payload simply restores no window metadata,
+    leaving its entries revalidatable as legacy entries.
 
-    Corruption tolerance: a missing, unreadable, malformed, or non-dict file
-    leaves the maps empty and logs a warning; a malformed entry is skipped
-    while valid siblings survive. This function never raises.
+    Corruption tolerance: a missing, unreadable, malformed, non-dict, or
+    foreign-version file restores whatever valid entries it contains and logs a
+    warning; a malformed entry is skipped while valid siblings survive. This
+    function never raises.
 
     Args:
         path: Source state-file path (defaults to
@@ -359,6 +414,7 @@ def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
     now = time.time()
     cooldowns: dict[str, float] = {}
     quarantine: dict[str, float] = {}
+    windows: dict[str, str] = {}
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -391,11 +447,19 @@ def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
         quarantine = _prune_expired_expiries(
             _coerce_expiry_map(raw.get(_PROVIDER_STATE_QUARANTINE_KEY)), now
         )
+        # Window metadata is additive (schema v2): a version-1 payload has no
+        # such key, and each value must name a real window. Entries that do
+        # not survive the expiry prune are dropped from the window map too, so
+        # the two maps never disagree about which accounts are quarantined.
+        windows = _coerce_window_map(raw.get(_PROVIDER_STATE_QUARANTINE_WINDOWS_KEY))
+        windows = {key: w for key, w in windows.items() if key in quarantine}
 
     _provider_unavailable_until.clear()
     _provider_unavailable_until.update(cooldowns)
     _usage_reset_at.clear()
     _usage_reset_at.update(quarantine)
+    _usage_reset_window.clear()
+    _usage_reset_window.update(windows)
     # Loaded entries are always explicit/hard (guessed quarantines are never
     # persisted), so no stale guessed markers survive a reload.
     _usage_reset_guessed.clear()
@@ -3571,9 +3635,10 @@ def resolve_provider(
         if reset_remaining > 0:
             logger.info(
                 "Skipping provider=%s: usage_limit_reset_pending "
-                "(account=%s, reset_at=%s, reset_in=%ds)",
+                "(account=%s, window=%s, reset_at=%s, reset_in=%ds)",
                 name,
                 usage_key,
+                _usage_reset_window.get(usage_key, "unknown"),
                 datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
             )
@@ -4356,7 +4421,9 @@ def _quarantined_providers(model_config: dict) -> list[dict[str, Any]]:
     seconds and the true reason (quarantine before window/cooldown),
     (LP-0MU56ZFVD001LP0H).
 
-    Each entry contains ``name``, ``type``, ``account``, ``reset_in`` (whole
+    Each entry contains ``name``, ``type``, ``account``, ``window`` (the quota
+    window that produced the quarantine, or ``"unknown"`` for
+    message/header/legacy entries — LP-0MVPAE77Z002VGIA), ``reset_in`` (whole
     seconds) and ``reset_at`` (ISO-8601 UTC). Entries sharing a quarantined
     account are each returned; expired entries are pruned by
     ``_usage_reset_remaining``.
@@ -4373,6 +4440,7 @@ def _quarantined_providers(model_config: dict) -> list[dict[str, Any]]:
             "name": p.get("name", "unknown"),
             "type": p.get("type", "remote"),
             "account": account,
+            "window": _usage_reset_window.get(account, "unknown"),
             "reset_in": int(remaining),
             "reset_at": datetime.fromtimestamp(
                 _usage_reset_at[account], tz=UTC
@@ -4399,6 +4467,7 @@ def _record_quarantine_attempts(
             provider=q["name"],
             type=q["type"],
             status="usage_limit_reset",
+            window=q["window"],
             reset_in=q["reset_in"],
             reset_at=q["reset_at"],
         )
@@ -6972,9 +7041,10 @@ def _resolve_provider_with_exclusions(
         if reset_remaining > 0:
             logger.info(
                 "Skipping provider=%s: usage_limit_reset_pending "
-                "(account=%s, reset_at=%s, reset_in=%ds)",
+                "(account=%s, window=%s, reset_at=%s, reset_in=%ds)",
                 name,
                 usage_key,
+                _usage_reset_window.get(usage_key, "unknown"),
                 datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
             )
@@ -7165,15 +7235,39 @@ def _parse_resets_in(message: str) -> float | None:
 class _UsageLimitReset(NamedTuple):
     """Resolved usage-limit reset for a 429 response.
 
-    ``explicit`` is True only when the gateway message carried an actual
-    ``Resets in ...`` duration; a duration guessed from ``metadata.limitName``
-    is ``explicit=False`` and is capped and treated as soft/re-checkable
-    (LP-0MUQTCMW2001VXH8).
+    ``explicit`` is True only when the reset came from hard evidence — an
+    actual ``Resets in ...`` duration in the gateway message, or the
+    account's own quota-snapshot reset. A duration guessed from
+    ``metadata.limitName`` (or bounded because the named window's snapshot
+    data is contradictory) is ``explicit=False`` and is capped and treated as
+    soft/re-checkable (LP-0MUQTCMW2001VXH8).
+
+    ``window`` names the quota window (``rolling`` / ``weekly`` / ``monthly``)
+    whose own reset bounded the quarantine, or ``None`` when no window was
+    involved (message duration, stale/absent quota state, x-ratelimit
+    headers, legacy state). The window is what lets a later fresh poll clear
+    the quarantine as soon as that window is reported lifted
+    (LP-0MVPAE77Z002VGIA AC7/AC11).
     """
 
     seconds: float
     explicit: bool
     limit_name: str | None
+    window: str | None = None
+
+
+class _WindowResetChoice(NamedTuple):
+    """One window-aware quarantine duration, before the safety margin.
+
+    Internal to :func:`_usage_limit_reset_info`: ``source`` is the stable
+    ``source=`` code for the log line (``snapshot`` for hard snapshot
+    evidence, ``snapshot-bounded`` for a bounded/guessed snapshot derivation).
+    """
+
+    seconds: float
+    explicit: bool
+    window: str | None
+    source: str
 
 
 def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
@@ -7208,19 +7302,73 @@ def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
     return float(_USAGE_LIMIT_GUESS_MAX_SECONDS)
 
 
-def _quota_snapshot_reset_seconds(
+def _fresh_quota_snapshot(
     provider_cfg: dict | None, config: dict | None = None
-) -> float | None:
-    """Return the authoritative reset for *provider_cfg* from quota state.
+) -> quota_state.QuotaSnapshot | None:
+    """Return the fresh quota snapshot for *provider_cfg*, or ``None``.
 
-    Only ``opencode-*`` entries are quota-managed, and the value is honoured
-    only while the quota source is strictly **enabled** for routing
+    A snapshot is usable when the entry is quota-managed (``opencode-*``), a
+    snapshot exists and it is younger than
+    ``server.quota_state_max_age_seconds``. Deliberately **ignores** the surge
+    kill switch and dry-run: those switch quota-driven *routing* decisions
+    off, not the revalidation of an existing quarantine
+    (LP-0MVPAE77Z002VGIA AC7). Never blocks, never polls and never raises:
+    a pure cache read on the request path with a fail-safe exception guard.
+    """
+    if not isinstance(provider_cfg, dict):
+        return None
+    try:
+        if not quota_state.is_quota_provider(provider_cfg, config):
+            return None
+        snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+        if snapshot is None:
+            return None
+        if not snapshot.is_fresh(quota_state.quota_state_max_age_seconds(config)):
+            return None
+    except Exception:
+        logger.info(
+            "usage-limit snapshot unavailable; falling back to the "
+            "message/guess path",
+            exc_info=True,
+        )
+        return None
+    return snapshot
+
+
+def _quota_snapshot_for_reset(
+    provider_cfg: dict | None, config: dict | None = None
+) -> quota_state.QuotaSnapshot | None:
+    """The fresh snapshot an *opencode-* entry may resolve a 429 against.
+
+    Adds the routing-mode gate on top of :func:`_fresh_quota_snapshot`: the
+    value is honoured only while the quota source is strictly **enabled**
     (:func:`proxy.quota_state.quota_behaviour`): a disabled (kill switch),
     stale (suspended) or dry-run quota mode returns ``None`` so the reactive
     usage-limit handling keeps its pre-feature guessed/message behaviour for
-    every other case (LP-0MVF7MPZN009GOJB).
+    every other case (LP-0MVF7MPZN009GOJB). Never raises.
+    """
+    if not isinstance(provider_cfg, dict):
+        return None
+    try:
+        if not quota_state.quota_behaviour(config).applies:
+            return None
+    except Exception:
+        logger.info(
+            "usage-limit snapshot reset unavailable; falling back to the "
+            "message/guess path",
+            exc_info=True,
+        )
+        return None
+    return _fresh_quota_snapshot(provider_cfg, config)
 
-    The returned value is the account-level
+
+def _quota_snapshot_reset_seconds(
+    provider_cfg: dict | None, config: dict | None = None
+) -> float | None:
+    """Return the account-level authoritative reset for *provider_cfg*.
+
+    See :func:`_quota_snapshot_for_reset` for the gating; the returned value
+    is the account-level
     :attr:`~proxy.quota_state.QuotaSnapshot.seconds_to_reset` (the monthly
     allowance window, resolved per account from ``monthly.resetsAt`` — the
     same value surge and ``available_times`` treat as authoritative) rather
@@ -7229,28 +7377,192 @@ def _quota_snapshot_reset_seconds(
     non-positive value all return ``None`` (fail open to the existing
     message/guess cascade). Never blocks, never polls and never raises: a
     pure cache read on the request path with a fail-safe exception guard.
+
+    Window-aware reset resolution (which window the 429 actually named) is
+    handled by :func:`_usage_limit_reset_info`;
+    :func:`_quota_snapshot_window_reset_seconds` exposes a single window's
+    countdown for tests and callers that need it.
     """
-    if not isinstance(provider_cfg, dict):
+    snapshot = _quota_snapshot_for_reset(provider_cfg, config)
+    if snapshot is None:
+        return None
+    seconds = snapshot.seconds_to_reset
+    if seconds <= 0:
+        return None
+    return float(seconds)
+
+
+def _quota_snapshot_window_reset_seconds(
+    provider_cfg: dict | None,
+    config: dict | None = None,
+    window: str | None = None,
+) -> float | None:
+    """Return one window's own authoritative reset for *provider_cfg*.
+
+    Like :func:`_quota_snapshot_reset_seconds` but for a single named window
+    (``rolling`` / ``weekly`` / ``monthly``): the countdown for **that**
+    window's ``resetsAt``, or ``None`` when the window is unknown, the
+    snapshot is unusable or the countdown is non-positive (LP-0MVPAE77Z002VGIA
+    AC1-AC3). Never blocks, never polls and never raises.
+    """
+    if window is None:
+        return None
+    snapshot = _quota_snapshot_for_reset(provider_cfg, config)
+    if snapshot is None:
         return None
     try:
-        if not quota_state.is_quota_provider(provider_cfg, config):
-            return None
-        if not quota_state.quota_behaviour(config).applies:
-            return None
-        snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
-        if snapshot is None:
-            return None
-        seconds = snapshot.seconds_to_reset
+        seconds = snapshot.window(window).seconds_to_reset
     except Exception:
-        logger.info(
-            "usage-limit snapshot reset unavailable; falling back to the "
-            "message/guess path",
-            exc_info=True,
-        )
         return None
     if seconds <= 0:
         return None
     return float(seconds)
+
+
+def _window_reset_seconds(
+    snapshot: quota_state.QuotaSnapshot, window: str
+) -> float:
+    """Seconds until *window* resets according to *snapshot* (0 unusable)."""
+    try:
+        seconds = float(snapshot.window(window).seconds_to_reset)
+    except Exception:
+        return 0.0
+    return seconds if seconds > 0 else 0.0
+
+
+def _soonest_usable_window_reset(
+    snapshot: quota_state.QuotaSnapshot,
+) -> tuple[str, float] | None:
+    """The ``(name, seconds)`` of the soonest still-usable window, or ``None``.
+
+    A window is *usable* when it is present, healthy (not blocking) and has a
+    positive reset countdown. Used to bound a quarantine whose limit name does
+    not identify a window (absent/empty/unknown `limitName`, AC4), so the
+    quarantine can never outlive the shortest window that is genuinely still
+    open.
+    """
+    best: tuple[str, float] | None = None
+    for name in quota_state.WINDOW_NAMES:
+        window = snapshot.window(name)
+        if window.blocking:
+            continue
+        seconds = window.seconds_to_reset
+        if seconds <= 0:
+            continue
+        if best is None or seconds < best[1]:
+            best = (name, float(seconds))
+    return best
+
+
+#: A quota window reads as "effectively empty" (i.e. it has rolled over) at
+#: or below this consumption percentage. Used only by the window-quarantine
+#: revalidation as strong evidence that a window reset, so an account that is
+#: merely *near* its limit keeps its quarantine until the window actually
+#: resets (LP-0MVPAE77Z002VGIA AC7).
+_WINDOW_RESET_PERCENT = 1.0
+
+
+def _window_limit_lifted(
+    snapshot: quota_state.QuotaSnapshot,
+    window: str,
+    config: dict | None,
+    remaining_seconds: float = 0.0,
+) -> bool:
+    """True when *snapshot* proves *window*'s limit has been lifted (AC7).
+
+    Two signals, both requiring the window to be healthy (present, status ok)
+    and its consumption to be back below the quota hard-stop threshold:
+
+    - **rollover** — the window reads as effectively empty
+      (:data:`_WINDOW_RESET_PERCENT`), which is what a reset does; or
+    - **extended countdown** — the window now resets *later* than the
+      quarantine would expire (``remaining_seconds``), so it must have rolled
+      over since the quarantine was recorded.
+
+    A window still sitting near its limit therefore keeps the quarantine until
+    its own reset: over-quarantining is bounded by the window, whereas
+    clearing early would dispatch to a still-limited account and burn a 429
+    on every poll cycle.
+    """
+    try:
+        w = snapshot.window(window)
+    except Exception:
+        return False
+    if w.blocking:
+        return False
+    if w.percent >= quota_state.quota_exhaustion_percent(config):
+        return False
+    if w.percent <= _WINDOW_RESET_PERCENT:
+        return True
+    return w.seconds_to_reset > remaining_seconds
+
+
+def _snapshot_shows_exhaustion(
+    snapshot: quota_state.QuotaSnapshot, config: dict | None
+) -> bool:
+    """True when any window is blocking or at/above the hard-stop threshold.
+
+    The legacy/account-level answer to "is this account still exhausted": a
+    window that is missing, unhealthy, or consumed to the quota hard stop
+    keeps the quarantine. A poll showing no window anywhere near the limit
+    clears it (AC11).
+    """
+    threshold = quota_state.quota_exhaustion_percent(config)
+    for name in quota_state.WINDOW_NAMES:
+        w = snapshot.window(name)
+        if w.blocking or w.percent >= threshold:
+            return True
+    return False
+
+
+def _snapshot_reset_choice(
+    snapshot: quota_state.QuotaSnapshot,
+    config: dict | None,
+    named_window: str | None,
+) -> _WindowResetChoice | None:
+    """Choose the quarantine duration a fresh snapshot supports (AC1-AC4/AC8).
+
+    Resolution, in order:
+
+    1. The quota window the 429 named (``metadata.limitName``) and whose own
+       reset the snapshot reports as positive → quarantine for **that**
+       window's remaining time, hard/explicit (AC1-AC3, AC5). This replaces
+       the pre-fix behaviour of always using the monthly account-level reset.
+    2. The named window's reset is non-positive (contradictory, stale
+       snapshot) while upstream still 429s for it → bounded by the named
+       period capped at the guess cap, recorded *guessed* so the self-healing
+       probe revalidates it — never a multi-week explicit lockout (AC8).
+    3. No usable limit name (absent/empty/unknown) → bounded by the **soonest
+       usable window** reset, recorded *guessed*: never the monthly value
+       while a shorter window is still open (AC4).
+    4. No usable window at all → the account-level ``seconds_to_reset`` +
+       margin path is retained, unchanged (AC4 tail).
+
+    Returns ``None`` when nothing yields a positive duration (the caller then
+    falls through to the message/guess cascade). Never raises.
+    """
+    if named_window is not None:
+        seconds = _window_reset_seconds(snapshot, named_window)
+        if seconds > 0:
+            return _WindowResetChoice(seconds, True, named_window, "snapshot")
+        bounded = min(
+            float(
+                _PERIOD_DEFAULT_SECONDS.get(
+                    named_window, _USAGE_LIMIT_GUESS_MAX_SECONDS
+                )
+            ),
+            _usage_limit_guess_cap_seconds(config),
+        )
+        return _WindowResetChoice(bounded, False, named_window, "snapshot-bounded")
+
+    soonest = _soonest_usable_window_reset(snapshot)
+    if soonest is not None:
+        return _WindowResetChoice(soonest[1], False, soonest[0], "snapshot-bounded")
+
+    account_seconds = snapshot.seconds_to_reset
+    if account_seconds > 0:
+        return _WindowResetChoice(float(account_seconds), True, None, "snapshot")
+    return None
 
 
 def _usage_limit_reset_info(
@@ -7265,20 +7577,39 @@ def _usage_limit_reset_info(
     error variant that carries a reset duration in its message (including
     ``FreeUsageLimitError`` responses that include one).
 
-    Resolution order (LP-0MVF7MPZN009GOJB): for an ``opencode-*`` entry with a
-    **fresh** quota snapshot the snapshot's authoritative ``seconds_to_reset``
-    is used (monthly window, + the 2-minute margin) and returned as a hard
-    ``explicit=True`` quarantine -- the guessed cap path is unreachable for
-    that case. Otherwise (non-``opencode-*`` entry, or stale/absent/disabled
+    Resolution order, **window-aware** (LP-0MVPAE77Z002VGIA): for an
+    ``opencode-*`` entry with a **fresh** quota snapshot and quota behaviour
+    strictly enabled, the quarantine is derived from the quota window the 429
+    named in ``metadata.limitName``:
+
+    - a known window (``rolling`` / ``weekly`` / ``monthly``) with a positive
+      reset countdown quarantines for **that window's** remaining time + the
+      2-minute margin, as a hard ``explicit=True`` quarantine
+      (``source=snapshot``, AC1-AC3);
+    - a known window whose snapshot reset is non-positive (contradictory —
+      stale evidence) is bounded by the named period capped at
+      :func:`_usage_limit_guess_cap_seconds` and marked *guessed* so the
+      self-healing probe revalidates it (``source=snapshot-bounded``, AC8);
+    - an absent, empty or unknown ``limitName`` (e.g. the documentation-only
+      upstream ``daily``) is bounded by the **soonest usable window** reset and
+      marked *guessed*, so it can never outlive the shortest open window —
+      in particular never the monthly value (AC4);
+    - when no window yields a usable reset, the account-level
+      :attr:`~proxy.quota_state.QuotaSnapshot.seconds_to_reset` (monthly) path
+      is retained unchanged (AC4 tail).
+
+    Otherwise (non-``opencode-*`` entry, or stale/absent/disabled/dry-run
     quota state) the previous cascade is unchanged: an explicit
-    ``Resets in 22hr 43min`` duration is honoured in full; when the message
-    has no explicit duration, ``metadata.limitName`` (daily/weekly/monthly)
-    supplies a GUESSED period capped at
-    :func:`_usage_limit_guess_cap_seconds` (24h by default) — the full 30-day
-    period is never used without explicit evidence (LP-0MUQTCMW2001VXH8). The
-    2-minute safety margin is added to the returned duration. The guess path
-    is therefore retained purely as the stale/absent fallback, never for a
-    fresh-snapshot ``opencode-*`` account.
+    ``Resets in 22hr 43min`` duration is honoured in full; when the message has
+    no explicit duration, ``metadata.limitName`` supplies a GUESSED period
+    capped at :func:`_usage_limit_guess_cap_seconds` (24h by default) — the
+    full 30-day period is never used without explicit evidence
+    (LP-0MUQTCMW2001VXH8). The 2-minute safety margin is added to every
+    returned duration.
+
+    The chosen window (if any) is carried on the returned
+    :class:`_UsageLimitReset` so the quarantine can be persisted with it and
+    revalidated as soon as a fresh poll reports that window lifted (AC7).
 
     Returns ``None`` when the response is not a 429 usage-limit error or no
     reset duration can be computed — callers then fall back to the existing
@@ -7315,21 +7646,30 @@ def _usage_limit_reset_info(
         return None
 
     if provider_cfg is not None:
-        snapshot_seconds = _quota_snapshot_reset_seconds(provider_cfg, config)
-        if snapshot_seconds is not None:
-            logger.info(
-                "usage-limit reset source=snapshot provider=%s account=%s "
-                "seconds_to_reset=%.0f limit=%s",
-                provider_cfg.get("name", ""),
-                _usage_limit_account_key(provider_cfg),
-                snapshot_seconds,
-                limit_name or "",
+        snapshot = _quota_snapshot_for_reset(provider_cfg, config)
+        if snapshot is not None:
+            choice = _snapshot_reset_choice(
+                snapshot,
+                config,
+                quota_state.window_for_limit_name(limit_name),
             )
-            return _UsageLimitReset(
-                snapshot_seconds + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
-                True,
-                limit_name,
-            )
+            if choice is not None:
+                logger.info(
+                    "usage-limit reset source=%s provider=%s account=%s "
+                    "window=%s seconds_to_reset=%.0f limit=%s",
+                    choice.source,
+                    provider_cfg.get("name", ""),
+                    _usage_limit_account_key(provider_cfg),
+                    choice.window or "account",
+                    choice.seconds + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                    limit_name or "",
+                )
+                return _UsageLimitReset(
+                    choice.seconds + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                    choice.explicit,
+                    limit_name,
+                    choice.window,
+                )
 
     account = (
         _usage_limit_account_key(provider_cfg)
@@ -7393,13 +7733,21 @@ def _set_usage_limit_quarantine(
     Guessed (period-name-only) quarantines are tagged in
     ``_usage_reset_guessed`` so they are capped at read time, skipped by the
     persistence layer, and eligible for self-healing probes
-    (LP-0MUQTCMW2001VXH8).
+    (LP-0MUQTCMW2001VXH8). The quota window that bounded the quarantine (when
+    known) is recorded in ``_usage_reset_window`` so a later fresh poll can
+    clear it as soon as that window is reported lifted (LP-0MVPAE77Z002VGIA
+    AC7); entries without a window (message durations, x-ratelimit headers,
+    legacy state) carry no metadata and are revalidated as legacy entries.
     """
     _usage_reset_at[account] = time.time() + reset.seconds
     if reset.explicit:
         _usage_reset_guessed.discard(account)
     else:
         _usage_reset_guessed.add(account)
+    if reset.window:
+        _usage_reset_window[account] = reset.window
+    else:
+        _usage_reset_window.pop(account, None)
     _persist_provider_state_best_effort()
 
 
@@ -7417,10 +7765,12 @@ def clear_usage_limit_quarantine(account: str | None = None) -> list[str]:
         cleared = list(_usage_reset_at)
         _usage_reset_at.clear()
         _usage_reset_guessed.clear()
+        _usage_reset_window.clear()
         _usage_limit_last_probe.clear()
     elif account in _usage_reset_at:
         del _usage_reset_at[account]
         _usage_reset_guessed.discard(account)
+        _usage_reset_window.pop(account, None)
         _usage_limit_last_probe.pop(account, None)
         cleared = [account]
     else:
@@ -7445,6 +7795,7 @@ def _usage_reset_remaining(failure_domain: str) -> float:
     if remaining <= 0:
         del _usage_reset_at[failure_domain]
         _usage_reset_guessed.discard(failure_domain)
+        _usage_reset_window.pop(failure_domain, None)
         _usage_limit_last_probe.pop(failure_domain, None)
         return 0.0
     return remaining
@@ -7530,16 +7881,33 @@ async def _probe_usage_limit_account(provider_cfg: dict) -> bool:
         return False
 
 
-async def _maybe_probe_quarantined_accounts(model_config: dict) -> None:
-    """Self-heal guessed usage-limit quarantines before routing.
+async def _maybe_probe_quarantined_accounts(
+    model_config: dict,
+    config: dict | None = None,
+) -> None:
+    """Self-heal quotas before routing: probe guesses, revalidate windows.
 
-    For each provider whose account carries a GUESSED quarantine that is due
-    for a probe (interval-gated), issue a cheap probe and clear the
-    quarantine on success, so the recovered account is routed to within the
-    same request cycle. Hard (explicit-duration) quarantines are left alone.
+    Three revalidation paths, all on the existing cadence (never per-request
+    polling, no blocking I/O on the request path):
+
+    - **Guessed** quarantines (``_usage_reset_guessed``): the existing cheap
+      transport probe, interval-gated, clears on success
+      (LP-0MUQTCMW2001VXH8).
+    - **Window-derived** quarantines (window metadata in
+      ``_usage_reset_window``): revalidated from a fresh quota snapshot —
+      when the window that produced the quarantine is reported lifted, the
+      quarantine is cleared without any network call (AC7).
+    - **Legacy** entries (no window metadata): cleared by the first healthy
+      poll that shows no window exhausted, so a schema version-1 state file
+      can never survive as a multi-week lockout (AC11).
+
+    Hard explicit quarantines with a window are deliberately revalidated
+    rather than probed: the fast path reintroduces them without upstream
+    traffic the moment their own window rolls over.
+
     Never raises.
     """
-    if not _usage_reset_guessed:
+    if not _usage_reset_at:
         return
     now = time.time()
     seen: set[str] = set()
@@ -7547,23 +7915,64 @@ async def _maybe_probe_quarantined_accounts(model_config: dict) -> None:
         if not isinstance(provider_cfg, dict):
             continue
         account = _usage_limit_account_key(provider_cfg)
-        if account in seen or account not in _usage_reset_guessed:
+        if account in seen:
             continue
         seen.add(account)
         if account not in _usage_reset_at:
             _usage_reset_guessed.discard(account)
             continue
-        last = _usage_limit_last_probe.get(account, 0.0)
-        if now - last < _USAGE_LIMIT_PROBE_INTERVAL_SECONDS:
+        if account in _usage_reset_guessed:
+            # Soft guess: cheap transport probe, interval-gated.
+            last = _usage_limit_last_probe.get(account, 0.0)
+            if now - last < _USAGE_LIMIT_PROBE_INTERVAL_SECONDS:
+                continue
+            _usage_limit_last_probe[account] = now
+            if await _probe_usage_limit_account(provider_cfg):
+                logger.info(
+                    "usage-limit probe succeeded; clearing quarantine for "
+                    "account=%s",
+                    account,
+                )
+                clear_usage_limit_quarantine(account)
             continue
-        _usage_limit_last_probe[account] = now
-        if await _probe_usage_limit_account(provider_cfg):
-            logger.info(
-                "usage-limit probe succeeded; clearing quarantine for "
-                "account=%s",
-                account,
-            )
-            clear_usage_limit_quarantine(account)
+        # Hard window-derived / legacy entry: revalidate from a fresh snapshot.
+        _revalidate_quarantine_from_snapshot(account, provider_cfg, config)
+
+
+def _revalidate_quarantine_from_snapshot(
+    account: str, provider_cfg: dict, config: dict | None
+) -> bool:
+    """Clear a quarantined *account* when a fresh poll proves the limit lifted.
+
+    Window-derived entries are cleared when the window that produced them is
+    reported lifted (healthy and below the hard-stop threshold); legacy
+    entries (no window metadata — schema version 1, or the account-level
+    fallback) are cleared on the first poll showing no window exhausted. A
+    missing/stale snapshot, or a snapshot that still shows exhaustion, keeps
+    the quarantine.
+
+    Returns True when the quarantine was cleared. Never raises.
+    """
+    try:
+        snapshot = _fresh_quota_snapshot(provider_cfg, config)
+    except Exception:
+        return False
+    if snapshot is None:
+        return False
+    window = _usage_reset_window.get(account)
+    if window:
+        remaining = _usage_reset_at.get(account, 0.0) - time.time()
+        if not _window_limit_lifted(snapshot, window, config, remaining):
+            return False
+    elif _snapshot_shows_exhaustion(snapshot, config):
+        return False
+    logger.info(
+        "usage-limit quarantine lifted account=%s window=%s reason=window_reset",
+        account,
+        window or "unknown",
+    )
+    clear_usage_limit_quarantine(account)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -8954,10 +9363,10 @@ async def _proxy_with_remote_fallback_cycle(
         ChainExhaustedError: when all providers are exhausted (the carried
             response is the 503/429/error response the cycle would return).
     """
-    # Self-healing: re-validate guessed (period-name-only) usage-limit
-    # quarantines so a recovered account is reintroduced within this request
-    # cycle (LP-0MUQTCMW2001VXH8).
-    await _maybe_probe_quarantined_accounts(model_config)
+    # Self-healing: re-validate guessed (period-name-only) and window-derived
+    # usage-limit quarantines so a recovered account is reintroduced within
+    # this request cycle (LP-0MUQTCMW2001VXH8, LP-0MVPAE77Z002VGIA).
+    await _maybe_probe_quarantined_accounts(model_config, config)
     cooldown_seconds = _get_cooldown_seconds(config)
     all_slot_exhaustion = True
     any_provider_tried = False
@@ -9602,10 +10011,10 @@ async def _proxy_with_fallback_cycle(
         ChainExhaustedError: when all providers are exhausted (the carried
             response is the 503/429/error response the cycle would return).
     """
-    # Self-healing: re-validate guessed (period-name-only) usage-limit
-    # quarantines so a recovered account is reintroduced within this request
-    # cycle (LP-0MUQTCMW2001VXH8).
-    await _maybe_probe_quarantined_accounts(model_config)
+    # Self-healing: re-validate guessed (period-name-only) and window-derived
+    # usage-limit quarantines so a recovered account is reintroduced within
+    # this request cycle (LP-0MUQTCMW2001VXH8, LP-0MVPAE77Z002VGIA).
+    await _maybe_probe_quarantined_accounts(model_config, config)
     cooldown_seconds = _get_cooldown_seconds(config)
     local_slot_retry_attempts = _get_local_slot_retry_attempts(config)
     local_slot_retry_delay_seconds = _get_local_slot_retry_delay_seconds(config)

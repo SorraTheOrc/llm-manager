@@ -55,10 +55,12 @@ def _reset_provider_state():
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
     yield
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
 
 
 def _provider(
@@ -195,6 +197,25 @@ class TestExhaustionPayloadQuarantine:
         assert q1_diag["reset_in"] >= 3500
         assert body["retry_after"] > 0
         assert result.headers.get("retry-after") == str(body["retry_after"])
+
+    @pytest.mark.asyncio
+    async def test_quarantine_diagnostics_name_the_quota_window(self):
+        """AC9 (LP-0MVPAE77Z002VGIA): the exhaustion diagnostics tell an
+        operator WHICH quota window holds an account out."""
+        weekly = _provider("q1", api_key_env="K1")
+        legacy = _provider("q2", api_key_env="K2", endpoint="https://beta.example/v1")
+        _quarantine(weekly, 3600)
+        provider._usage_reset_window[
+            provider._usage_limit_account_key(weekly)
+        ] = "weekly"
+        _quarantine(legacy, 3600)  # no window metadata (message/header/legacy)
+
+        result = await _exhaust({"providers": [weekly, legacy]})
+
+        body = json.loads(result.body)
+        by_provider = {d["provider"]: d for d in body["diagnostics"]}
+        assert by_provider["q1"]["window"] == "weekly"
+        assert by_provider["q2"]["window"] == "unknown"
 
     @pytest.mark.asyncio
     async def test_quarantine_plus_window_reports_quarantine_once(self):
