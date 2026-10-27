@@ -70,6 +70,57 @@ threshold on this comparison, only a stated cost. For logs predating the
 dispatch-line instrumentation, the bucket falls back to the session's most
 recent `routing_check` line.
 
+**AC1 (parent LP-0MVK16GME007EYUW) — lease-gate shape attribution.** The idle
+override can decide to admit a request and then be refused one gate later by
+the **local dispatch lease gate** (`local_lease_active`), because another
+session merely *holds* a local lease. The tool reports how much of the idle
+capacity that gate costs, split by blocking shape, so the parent decision is
+made from counts rather than inference (LP-0MVK35HBI003SB3Z).
+
+| Log line | Field | Meaning |
+|---|---|---|
+| `local_dispatch_denied` | `cold_start=False` | the denial *is* a `local_lease_active` refusal (a `cold_start=True` denial is a warmup deferral and is counted separately) |
+| `local_dispatch_denied` | `owner=` | the foreign session holding the lease |
+| `local_dispatch_denied` | `active=` | occupancy count at refusal: `0` → shape A, `>= 1` → shape B |
+| `lease_released` | `reason=` | why the lease ended: `no_progress_watchdog`, `idle_timeout`/`prefill_deadline` (adaptive expiry), `explicit_release`, `client_disconnect`, `orphan_cleanup`, `session_evicted` |
+| `status_request` | `local_active_query=` / `local_owner_session_id=` / `local_owner_lease_remaining_seconds=` | whether the owning session actually had GPU work, and how long its lease had left |
+| `contention_queue_dispatch` / `contention_queue_fallback_after_queue` | `reason=local_lease_active` | whether the bounded (60 s) contention queue converted the refusal or fell through to remote |
+
+**Attribution rule** (stated in the report as `lease_gate.attribution_rule`):
+
+- **Shape A — inactive cooldown lease.** `active=0`: no *active* record exists,
+  so the pool is held only by inactive leases inside their base 30 s cooldown
+  (the owner finished; its record stays reserved for its session by the
+  no-preemption policy). Bounded and small — it can only convert the "frees in
+  a few seconds" cases.
+- **Shape B — `active` record with no GPU work behind it.** `active>=1`: an
+  active record exists, which is either a wedged/abandoned stream or a long
+  silent prefill. The sub-split is corroborated, never assumed — the owner's
+  earliest `lease_released` within 900 s of the refusal, plus any
+  `status_request` naming that owner, decides between `no work behind it`
+  (`no_progress_watchdog`, `orphan_cleanup`, `idle_timeout`, or
+  `local_active_query=false`), `silent prefill` (`prefill_deadline`),
+  `owner working` (a completion/disconnect reason — i.e. genuine contention,
+  not an idle lease) and `unconfirmed` (no evidence).
+
+Counts for both shapes, the shape-B evidence split, the `lease_released`
+reason groups, the contention-queue outcomes and the `status_request`
+aggregate are emitted per window in JSON (`lease_gate`, `lease_released`,
+`lease_status`) and as rows in `--markdown`.
+
+**Reading the answer for the parent AC1.** `shape_a` + `shape_b` = the
+attributable `local_lease_active` refusals in the window;
+`shape_b.no_work_behind_it` is the part that a verified-idle preemption
+predicate could take immediately, `shape_b.silent_prefill` is the part the
+180 s no-progress watchdog / adaptive expiry already reclaims, and
+`shape_b.owner_working` is the refusal the gate is *right* to enforce. Quote
+`refusals`/`samples` alongside any percentage: percentages are withheld
+(`null`) when the window holds fewer than `--min-lease-samples` (default 5)
+attributable refusals, and the run then ends as a WARN (exit 2) with an
+explicit "too few lease-gate samples" note so a thin window can never read as
+a confident split. Denials predating the `active=` field are counted in
+`unattributed_refusals` and are never silently folded into either shape.
+
 **AC3 — denials and mid-stream timeouts.** `local_dispatch_denied` is compared
 as a **rate per hour** (windows may differ in length); an increase beyond 5 %
 fails the check. Mid-stream timeouts (`ReadTimeout`, `empty_response`,
@@ -110,6 +161,7 @@ estimate, never as a measurement.
 | AC3 denials | per-hour `local_dispatch_denied` does not rise by more than 5 % |
 | AC3 timeouts | zero timeouts attributable to idle-admitted requests |
 | AC4 interactive | non-idle `high`-priority p50/p90 first byte within 10 % |
+| AC1 (LP-0MVK16GME007EYUW) lease gate | at least 5 attributable `local_lease_active` refusals in the post-deploy window (below it the split percentages are withheld and the run is a WARN) |
 
 The AC5 recommendation is deterministic:
 
@@ -199,6 +251,18 @@ The AC4 rows are unmeasurable in any window logged before the
 `priority=`/`estimated_tokens=` instrumentation is deployed; the tool says so
 explicitly instead of reporting a vacuous pass.
 
+**Lease-gate reading, 2026-10-25 → 2026-10-27 (illustration, not the decision).**
+A live run over the two most recent 24 h windows read: 338 and 291
+`local_lease_active` refusals respectively, **all shape B** (`active>=1`;
+shape A never appeared in either window). In the first window the shape-B
+split was 223 (66 %) with no work behind it (`no_progress_watchdog` /
+`idle_timeout` / `local_active_query=false`), 112 (33 %) silent prefills
+(`prefill_deadline`) and 3 (1 %) genuinely working owners; the second window
+was 134 (46 %), 84 (29 %), 1 (0.3 %) with 72 (25 %) unconfirmed. The bounded
+contention queue converted 73 of 177 and 26 of 60 of them to a local dispatch.
+That is the shape of the answer the parent AC1 asks for; the recorded decision
+and its window live with LP-0MVK35UX20081BIB.
+
 ## Tests
 
 `tests/test_idle_admit_impact.py` drives the CLI against synthetic logs and
@@ -206,6 +270,14 @@ asserts the metric contract above (aggregates, hold-cycle exclusion, session
 pairing and the correlation window, bucket comparison, three-way timeout
 attribution, the AC4 control distribution, the recommendation rules, the
 counterfactual, and the CLI's exit codes / JSON shape / markdown rendering).
+The lease-gate suite asserts the refusal count (cold-start denials excluded),
+the `active=`-field A/B split, the shape-B corroboration (`lease_released`
+reasons, `status_request` `local_active_query=false`, `prefill_deadline` =
+silent prefill, completion reasons = genuinely working), the `lease_released`
+reason groups, the `status_request` aggregates, the contention-queue
+outcomes, the too-few-samples WARN (percentages withheld, exit 2), and that a
+log with no lease-gate lines leaves every pre-existing output field
+unchanged.
 `proxy/tests/test_dispatch_log_measurement_fields.py` drives a real local
 stream through `proxy_to_local` and asserts the dispatch line carries
 `priority=` and `estimated_tokens=` without disturbing the pre-existing

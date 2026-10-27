@@ -21,12 +21,19 @@ written against:
   * AC5 — the recommendation is deterministic: ``measure`` without samples,
     ``enable_by_default`` when the fallback rate falls materially without harm,
     and ``tune`` with a concrete follow-up otherwise.
+
+The lease-gate attribution added for LP-0MVK35HBI003SB3Z (parent
+LP-0MVK16GME007EYUW AC1) is asserted separately: ``local_lease_active``
+refusals, ``lease_released`` reasons and the shape A (inactive cooldown
+lease) / shape B (``active`` record with no GPU work behind it) split, with an
+explicit WARN when the window holds too few lease-gate samples.
 """
 
 import json
 import os
 import subprocess
 from datetime import datetime, timedelta
+from itertools import chain
 
 SCRIPT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "scripts", "idle_admit_impact.py")
@@ -98,11 +105,75 @@ def _fallback(ts, reason="large_context_bypass"):
     )
 
 
-def _denied(ts, session="sess-denied"):
+def _denied(ts, session="sess-denied", owner="sess-owner", active=1,
+            cold_start=False):
     return (
-        f"{ts} - INFO - local_dispatch_denied session={session} owner=sess-owner "
-        f"active=1 cold_start=False\n"
+        f"{ts} - INFO - local_dispatch_denied session={session} owner={owner} "
+        f"active={active} cold_start={cold_start}\n"
     )
+
+
+def _lease_released(ts, session, reason="explicit_release",
+                    endpoint="http://localhost:8080"):
+    return (
+        f"{ts} - INFO - lease_released session={session} reason={reason} "
+        f"endpoint={endpoint}\n"
+    )
+
+
+def _status_request(ts, owner, *, active_query=True, remaining=19.049,
+                    idle=54.715, prefill_eta=None, in_flight=1):
+    """One ``/llama/local/status`` log line (the fields the tool corroborates)."""
+    flag = "true" if active_query else "false"
+    rem = "None" if remaining is None else str(remaining)
+    eta = "None" if prefill_eta is None else str(prefill_eta)
+    owner_field = "None" if owner is None else owner
+    return (
+        f"{ts} - INFO - status_request active_query={flag} available_slots=2 "
+        f"capacity_hint=prefill_bound local_active_query={flag} local_idle_seconds={idle} "
+        f"local_in_flight_requests={in_flight} "
+        f"local_owner_lease_remaining_seconds={rem} local_owner_session_id={owner_field} "
+        f"model_switch_in_progress=false prefill_eta_seconds={eta} "
+        f"queue_eta_seconds=None status_schema_version=3 total_slots=2\n"
+    )
+
+
+def _contention_outcome(ts, session, action="dispatch", queued=12.5, reason="local_lease_active"):
+    if action == "dispatch":
+        return (
+            f"{ts} - INFO - contention_queue_dispatch provider=local session={session} "
+            f"queued_duration={queued}s policy=queue depth=1 reason={reason}\n"
+        )
+    return (
+        f"{ts} - INFO - contention_queue_fallback_after_queue provider=local "
+        f"session={session} queued_duration={queued}s reason={reason}\n"
+    )
+
+
+def _lease_gate_episode(base, index, *, session=None, owner="lease-owner",
+                        active=1, release_reason="explicit_release",
+                        status_active_query=True, status_prefill_eta=None,
+                        with_status=True):
+    """A denial, its owner's release and a corroborating status snapshot.
+
+    Returns ``(lines, denial_ts)`` — the denial lands at ``base + index*120``
+    seconds, the release 100 s later and the status line 20 s after the
+    denial, which is the shape observed in the live proxy log.
+    """
+    denial_ts = _stamp(base, index * 120)
+    lines = [_denied(denial_ts, session or f"denied-{index}", owner=owner, active=active)]
+    if with_status:
+        lines.append(
+            _status_request(
+                _stamp(base, index * 120 + 20),
+                owner,
+                active_query=status_active_query,
+                prefill_eta=status_prefill_eta,
+            )
+        )
+    if release_reason is not None:
+        lines.append(_lease_released(_stamp(base, index * 120 + 100), owner, release_reason))
+    return lines, denial_ts
 
 
 def _stream_finished(ts, session, provider):
@@ -476,7 +547,20 @@ def test_ac5_recommends_measure_when_the_override_never_fired(tmp_path):
 
 
 def test_ac5_recommends_enable_by_default_when_fallbacks_fall_without_harm(tmp_path):
-    lines = _baseline_with_interactive() + _after_lines(fallbacks=2, denials=1)
+    # Both windows carry the same number of lease-gate refusals so the lease
+    # attribution gate is satisfied and the denial rate does not move.
+    before_lease, _ = zip(
+        *(_lease_gate_episode("2026-10-19 22:00", index) for index in range(6))
+    )
+    after_lease, _ = zip(
+        *(_lease_gate_episode("2026-10-20 22:00", index) for index in range(6))
+    )
+    lines = (
+        _baseline_with_interactive()
+        + list(chain.from_iterable(before_lease))
+        + _after_lines(fallbacks=2, denials=1)
+        + list(chain.from_iterable(after_lease))
+    )
     data, code = _result(_write_log(tmp_path, lines))
     recommendation = data["verdict"]["recommendation"]
     assert recommendation["decision"] == "enable_by_default"
@@ -510,6 +594,254 @@ def test_ac5_requires_enough_samples(tmp_path):
     recommendation = data["verdict"]["recommendation"]
     assert recommendation["decision"] == "measure"
     assert "idle-admitted dispatch" in recommendation["follow_up"]
+
+
+# ---------------------------------------------------------------------------
+# Lease-gate shape attribution (LP-0MVK35HBI003SB3Z — parent LP-0MVK16GME007EYUW AC1)
+# ---------------------------------------------------------------------------
+
+
+def _lease_gate_window(*episodes):
+    """Flatten ``(lines, denial_ts)`` episode tuples into a log line list."""
+    return list(chain.from_iterable(lines for lines, _ in episodes))
+
+
+def test_lease_gate_counts_lease_refusals_and_cold_starts(tmp_path):
+    """A denial is a lease-gate refusal only when it is not a cold start."""
+    lines = _after_lines() + [
+        _denied("2026-10-20 21:00:00,000", "s1", owner="own-1", active=0),
+    ]
+    data, _ = _result(_write_log(tmp_path, lines))
+    lease = data["windows"]["after"]["lease_gate"]
+    assert lease["refusals"] == 2  # the _after_lines denial + the active=0 one
+    assert lease["cold_start_refusals"] == 0
+
+    cold = _after_lines() + [
+        _denied("2026-10-20 21:30:00,000", "s2", owner="own-2", active=0, cold_start=True),
+    ]
+    data, _ = _result(_write_log(tmp_path, cold))
+    lease = data["windows"]["after"]["lease_gate"]
+    assert lease["refusals"] == 1
+    assert lease["cold_start_refusals"] == 1
+
+
+def test_lease_gate_attributes_shape_a_from_active_zero(tmp_path):
+    """`active=0` means only inactive cooldown leases occupy the pool."""
+    episodes = [_lease_gate_episode("2026-10-20 21:00", index, active=0) for index in range(5)]
+    data, code = _result(_write_log(tmp_path, _after_lines() + _lease_gate_window(*episodes)))
+    lease = data["windows"]["after"]["lease_gate"]
+    assert lease["refusals"] == 6  # 5 episodes + the _after_lines denial
+    assert lease["samples"] == 6
+    assert lease["attribution_status"] == "ok"
+    assert lease["refusals_by_active"] == {"active_0": 5, "active_positive": 1, "unknown": 0}
+    assert lease["shape_a"]["count"] == 5
+    assert lease["shape_a"]["pct"] == 83.3
+    assert lease["shape_a"]["owner_release_groups"] == {"explicit_release": 5}
+    assert lease["shape_b"]["count"] == 1
+    assert code == 2  # no idle-admit pairing problem; lease gate is satisfied
+
+
+def test_lease_gate_attributes_shape_b_from_active_field(tmp_path):
+    """`active>=1` is shape B by the `active=` field, split by corroboration."""
+    episodes = (
+        [_lease_gate_episode("2026-10-20 21:00", 0, owner="opaque-early",
+                             release_reason=None, with_status=False)]
+        + [_lease_gate_episode("2026-10-20 21:10", 0,
+                               owner="wedged", release_reason="no_progress_watchdog")]
+        + [_lease_gate_episode("2026-10-20 21:20", 0,
+                               owner="abandoned", release_reason="orphan_cleanup")]
+        + [_lease_gate_episode("2026-10-20 21:30", 0,
+                               owner="expired", release_reason="idle_timeout")]
+        + [_lease_gate_episode("2026-10-20 21:40", 0,
+                               owner="prefill", release_reason="prefill_deadline",
+                               status_active_query=True, status_prefill_eta=12.5)]
+        + [_lease_gate_episode("2026-10-20 21:50", 0, owner="idle-owner",
+                               status_active_query=False, release_reason=None)]
+        + [_lease_gate_episode("2026-10-20 22:00", 0,
+                               owner="working", release_reason="explicit_release",
+                               status_active_query=True)]
+        + [_lease_gate_episode("2026-10-20 22:10", 0, owner="opaque",
+                               with_status=False, release_reason=None)]
+    )
+    data, _ = _result(_write_log(tmp_path, _after_lines() + _lease_gate_window(*episodes)))
+    lease = data["windows"]["after"]["lease_gate"]
+    shape_b = lease["shape_b"]
+    assert lease["shape_a"]["count"] == 0
+    assert shape_b["count"] == 9  # 8 episodes + the _after_lines denial
+    assert shape_b["by_evidence"] == {
+        "no_progress_watchdog": 1,
+        "orphan_cleanup": 1,
+        "adaptive_expiry": 1,
+        "status_idle_owner": 1,
+        "prefill_deadline": 1,
+        "owner_working": 1,
+        "unconfirmed": 3,  # the _after_lines denial + the two opaque owners
+    }
+    assert shape_b["no_work_behind_it"] == 4
+    assert shape_b["silent_prefill"] == 1
+    assert shape_b["owner_working"] == 1
+    assert shape_b["unconfirmed"] == 3
+    assert (
+        shape_b["no_work_behind_it"] + shape_b["silent_prefill"]
+        + shape_b["owner_working"] + shape_b["unconfirmed"]
+    ) == shape_b["count"]
+
+
+def test_lease_gate_reports_lease_released_reason_groups(tmp_path):
+    lines = _after_lines() + _lease_gate_window(
+        *[
+            _lease_gate_episode("2026-10-20 21:00", index, release_reason=reason)
+            for index, reason in enumerate(
+                ["no_progress_watchdog", "idle_timeout", "prefill_deadline",
+                 "explicit_release", "client_disconnect", "orphan_cleanup",
+                 "session_evicted", "non_explicit"]
+            )
+        ]
+    )
+    data, _ = _result(_write_log(tmp_path, lines))
+    released = data["windows"]["after"]["lease_released"]
+    assert released["total"] == 8
+    assert released["by_reason"]["no_progress_watchdog"] == 1
+    assert released["by_group"] == {
+        "no_progress_watchdog": 1,
+        "adaptive_expiry": 2,
+        "explicit_release": 1,
+        "client_disconnect": 2,
+        "orphan_cleanup": 1,
+        "session_evicted": 1,
+    }
+    assert released["groups_documented"] == [
+        "no_progress_watchdog", "adaptive_expiry", "explicit_release",
+    ]
+
+
+def test_lease_gate_counts_boarded_contention_queue_outcomes(tmp_path):
+    """Queue outcomes say whether the 60 s budget converted a refusal."""
+    lines = _after_lines() + [
+        _contention_outcome("2026-10-20 21:00:00,000", "q1", "dispatch"),
+        _contention_outcome("2026-10-20 21:05:00,000", "q2", "fallback_after_queue"),
+        _contention_outcome("2026-10-20 21:10:00,000", "q3", "fallback_after_queue"),
+        # Not a lease-gate line — must not be counted.
+        _contention_outcome("2026-10-20 21:15:00,000", "q4", "dispatch", reason="slot_exhaustion"),
+    ]
+    data, _ = _result(_write_log(tmp_path, lines))
+    queue = data["windows"]["after"]["lease_gate"]["contention_queue"]
+    assert queue == {"dispatch": 1, "fallback_after_queue": 2}
+
+
+def test_lease_gate_insufficient_samples_warns_and_withholds_percentages(tmp_path):
+    """One refusal cannot be attributed — no percentages, WARN, exit 2."""
+    lines = _baseline_with_interactive() + _after_lines()
+    data, code = _result(_write_log(tmp_path, lines))
+    lease = data["windows"]["after"]["lease_gate"]
+    assert lease["samples"] == 1
+    assert lease["attribution_status"] == "insufficient_samples"
+    assert lease["shape_a"]["pct"] is None
+    assert lease["shape_b"]["pct"] is None
+    check = next(
+        check for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC1 (LP-0MVK16GME007EYUW): lease-gate")
+    )
+    assert check["pass"] is False
+    assert check["observed"] == 1
+    assert any("Too few lease-gate samples" in note for note in data["verdict"]["notes"])
+    assert code == 2
+
+
+def test_lease_gate_sufficient_samples_passes_and_states_the_answer(tmp_path):
+    episodes = [_lease_gate_episode("2026-10-20 21:00", index, active=0) for index in range(3)]
+    episodes += [_lease_gate_episode("2026-10-20 22:00", index,
+                                     release_reason="no_progress_watchdog") for index in range(3)]
+    data, _ = _result(_write_log(tmp_path, _after_lines() + _lease_gate_window(*episodes)))
+    lease = data["windows"]["after"]["lease_gate"]
+    assert lease["samples"] == 7
+    assert lease["attribution_status"] == "ok"
+    check = next(
+        check for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC1 (LP-0MVK16GME007EYUW): lease-gate")
+    )
+    assert check["pass"] is True
+    assert "shape A 3" in lease["headline"]
+    assert "shape B 4" in lease["headline"]
+    assert "no work behind it 3" in lease["headline"]
+    note = " ".join(data["verdict"]["notes"])
+    assert "Lease-gate refusals" in note
+
+
+def test_lease_gate_unattributable_refusals_are_counted(tmp_path):
+    """A denial line predating the `active=` field cannot be attributed."""
+    lines = [
+        "2026-10-20 21:00:00,000 - INFO - local_dispatch_denied session=s1 owner=o1\n"
+    ] * 6
+    data, _ = _result(_write_log(tmp_path, lines))
+    lease = data["windows"]["after"]["lease_gate"]
+    assert lease["refusals"] == 6
+    assert lease["samples"] == 0
+    assert lease["unattributed_refusals"] == 6
+    assert lease["attribution_status"] == "insufficient_samples"
+
+
+def test_lease_gate_absent_leaves_existing_output_unchanged(tmp_path):
+    """A log with no lease-gate lines must not move any pre-existing field."""
+    lines = [line for line in _baseline_lines() if "local_dispatch_denied" not in line]
+    data, _ = _result(_write_log(tmp_path, lines))
+    before = data["windows"]["before"]
+    assert before["ac1"] == {
+        "local_idle_admit": 0,
+        "local_streams": 1,
+        "remote_streams": 1,
+        "local_serve_share_pct": 50.0,
+        "large_context_bypass": 1,
+        "remote_fallback_events": 4,
+        "fallback_by_reason": {"large_context_bypass": 4},
+        "local_dispatch_denied": 0,
+        "local_dispatch_events": 1,
+        "local_prefill_slot_seconds": 39.9,
+        "timeout_events": 0,
+    }
+    assert before["ac2"]["idle_admitted_sample_counts"] == {
+        "idle_admit_events": 0,
+        "paired_local_dispatches": 0,
+        "unpaired_admits": 0,
+    }
+    assert before["ac3"]["timeout_events"] == 0
+    assert before["lease_gate"]["refusals"] == 0
+    assert before["lease_gate"]["samples"] == 0
+    assert before["lease_gate"]["attribution_status"] == "insufficient_samples"
+    assert before["lease_released"] == {
+        "total": 0,
+        "by_reason": {},
+        "by_group": {},
+        "groups_documented": [
+            "no_progress_watchdog", "adaptive_expiry", "explicit_release",
+        ],
+    }
+    assert before["lease_status"] == {
+        "samples": 0,
+        "local_active_query_true": 0,
+        "local_active_query_false": 0,
+        "owner_lease_remaining_seconds_p50": None,
+        "owner_lease_remaining_seconds_max": None,
+        "prefill_in_flight_samples": 0,
+    }
+
+
+def test_lease_gate_status_request_corroboration_is_aggregated(tmp_path):
+    lines = _after_lines() + [
+        _status_request("2026-10-20 21:00:00,000", "own-a", active_query=True, remaining=19.0),
+        _status_request("2026-10-20 21:01:00,000", "own-a", active_query=True, remaining=143.6),
+        _status_request("2026-10-20 21:02:00,000", "own-b", active_query=False, remaining=None),
+        _status_request("2026-10-20 21:03:00,000", "own-b", active_query=False, remaining=None,
+                       prefill_eta=8.0),
+    ]
+    data, _ = _result(_write_log(tmp_path, lines))
+    status = data["windows"]["after"]["lease_status"]
+    assert status["samples"] == 4
+    assert status["local_active_query_true"] == 2
+    assert status["local_active_query_false"] == 2
+    assert status["owner_lease_remaining_seconds_p50"] == 81.3
+    assert status["owner_lease_remaining_seconds_max"] == 143.6
+    assert status["prefill_in_flight_samples"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +936,27 @@ def test_cli_markdown_renders_the_report_table(tmp_path):
     assert "| Metric | Baseline | Post-deploy |" in proc.stdout
     assert "`local_idle_admit`" in proc.stdout
     assert "**Verdict:** `WARN`" in proc.stdout
+
+
+def test_cli_markdown_renders_the_lease_gate_rows(tmp_path):
+    episodes = [_lease_gate_episode("2026-10-20 21:00", index, active=0) for index in range(3)]
+    episodes += [_lease_gate_episode("2026-10-20 22:00", index,
+                                     release_reason="no_progress_watchdog") for index in range(3)]
+    log_dir = _write_log(tmp_path, _after_lines() + _lease_gate_window(*episodes))
+    proc = subprocess.run(
+        [
+            "python3", SCRIPT, "--log-dir", str(log_dir), "--markdown",
+            "--before-start", BEFORE_START, "--before-end", BEFORE_END,
+            "--after-start", AFTER_START, "--after-end", AFTER_END,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "`local_lease_active` refusals" in proc.stdout
+    assert "Shape A" in proc.stdout and "Shape B" in proc.stdout
+    assert "no_progress_watchdog" in proc.stdout
 
 
 def test_cli_survives_a_deployment_after_the_window_start(tmp_path):
