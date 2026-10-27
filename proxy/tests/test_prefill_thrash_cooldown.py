@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -226,6 +227,192 @@ def test_successful_first_byte_clears_the_cooldown(clock):
         helpers._prefill_thrash_cooldown_remaining(SESSION_A, _server_config(), now=clock.now)
         == 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Recovery-fraction gating of the clear path (LP-0MVQITN6P008DPLB)
+#
+# Measured 2026-10-26 09:06 -> 2026-10-27 09:06: 89 of 114 prefill-deadline
+# evictions were repeats inside 33 (session, prompt) clusters, and the repeats
+# violated the configured 600 s window (e.g. 01a178bd cancelled at 15:25:57,
+# 15:28:05 and 15:30:20 on the same 46,134-token prompt). The clear-on-any-
+# success rule let a small warm dispatch (first byte ~1.5 s) wipe the window
+# that the large doomed prompt had just armed.
+# ---------------------------------------------------------------------------
+
+ARMED_TOKENS = 46_134
+
+
+def test_small_success_does_not_clear_a_large_cancel_window(clock):
+    """The bug: a 6,000-token success must not release a 46k-token cooldown."""
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A, _server_config(), now=clock.now, tokens=ARMED_TOKENS
+    )
+    assert (
+        helpers._clear_prefill_thrash_cooldown(
+            SESSION_A, tokens=6_000, config=_server_config()
+        )
+        is False
+    )
+    assert (
+        helpers._prefill_thrash_cooldown_remaining(
+            SESSION_A, _server_config(), now=clock.now
+        )
+        == DEFAULT_COOLDOWN_SECONDS
+    )
+
+
+def test_comparable_success_clears_the_window(clock):
+    """A dispatch of the failing size proves recovery and releases the window."""
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A, _server_config(), now=clock.now, tokens=ARMED_TOKENS
+    )
+    assert (
+        helpers._clear_prefill_thrash_cooldown(
+            SESSION_A, tokens=ARMED_TOKENS, config=_server_config()
+        )
+        is True
+    )
+    assert (
+        helpers._prefill_thrash_cooldown_remaining(
+            SESSION_A, _server_config(), now=clock.now
+        )
+        == 0
+    )
+
+
+def test_success_just_below_the_fraction_does_not_clear(clock):
+    """Boundary: 89 % of the armed size is still below the 0.9 default."""
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A, _server_config(), now=clock.now, tokens=ARMED_TOKENS
+    )
+    assert (
+        helpers._clear_prefill_thrash_cooldown(
+            SESSION_A, tokens=int(ARMED_TOKENS * 0.89), config=_server_config()
+        )
+        is False
+    )
+
+
+def test_success_at_the_fraction_boundary_clears(clock):
+    """The comparison is inclusive at the configured fraction."""
+    threshold = math.ceil(ARMED_TOKENS * 0.9)
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A, _server_config(), now=clock.now, tokens=ARMED_TOKENS
+    )
+    assert (
+        helpers._clear_prefill_thrash_cooldown(
+            SESSION_A, tokens=threshold, config=_server_config()
+        )
+        is True
+    )
+
+
+def test_arming_without_a_size_keeps_clear_on_any_success(clock):
+    """Fail-open: an armed window with no recorded size cannot gate, so the
+    pre-change behaviour (clear on any success) is preserved."""
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A, _server_config(), now=clock.now
+    )
+    assert (
+        helpers._clear_prefill_thrash_cooldown(
+            SESSION_A, tokens=1_000, config=_server_config()
+        )
+        is True
+    )
+
+
+def test_clearing_without_a_size_keeps_todays_behaviour(clock):
+    """Fail-open: a caller that cannot supply the size is never worse off."""
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A, _server_config(), now=clock.now, tokens=ARMED_TOKENS
+    )
+    assert helpers._clear_prefill_thrash_cooldown(SESSION_A) is True
+
+
+def test_zero_recovery_fraction_restores_clear_on_any_success(clock):
+    """Rollback: fraction 0 restores the pre-fix clear-on-any-success rule."""
+    cfg = _server_config(local_prefill_thrash_recovery_fraction=0)
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A, cfg, now=clock.now, tokens=ARMED_TOKENS
+    )
+    assert (
+        helpers._clear_prefill_thrash_cooldown(
+            SESSION_A, tokens=100, config=cfg
+        )
+        is True
+    )
+
+
+def test_recovery_fraction_config_resolution():
+    """Default 0.9; a valid override wins; malformed falls back to the default."""
+    assert (
+        helpers._get_prefill_thrash_recovery_fraction({})
+        == helpers.DEFAULT_PREFILL_THRASH_RECOVERY_FRACTION
+    )
+    assert (
+        helpers._get_prefill_thrash_recovery_fraction(
+            _server_config(local_prefill_thrash_recovery_fraction=0.5)
+        )
+        == 0.5
+    )
+    assert (
+        helpers._get_prefill_thrash_recovery_fraction(
+            _server_config(local_prefill_thrash_recovery_fraction="nonsense")
+        )
+        == helpers.DEFAULT_PREFILL_THRASH_RECOVERY_FRACTION
+    )
+    # Disabled: 0 and negatives both resolve to 0, not to the default.
+    assert (
+        helpers._get_prefill_thrash_recovery_fraction(
+            _server_config(local_prefill_thrash_recovery_fraction=0)
+        )
+        == 0.0
+    )
+    assert (
+        helpers._get_prefill_thrash_recovery_fraction(
+            _server_config(local_prefill_thrash_recovery_fraction=-3)
+        )
+        == 0.0
+    )
+
+
+def test_recovery_fraction_above_one_is_clamped(clock):
+    """A fraction > 1 would make recovery impossible; clamp it to 1.0."""
+    assert (
+        helpers._get_prefill_thrash_recovery_fraction(
+            _server_config(local_prefill_thrash_recovery_fraction=5)
+        )
+        == 1.0
+    )
+
+
+def test_clear_is_cross_session_isolated(clock):
+    """Clearing session B never touches session A's armed window."""
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A, _server_config(), now=clock.now, tokens=ARMED_TOKENS
+    )
+    assert (
+        helpers._clear_prefill_thrash_cooldown(
+            SESSION_B, tokens=ARMED_TOKENS, config=_server_config()
+        )
+        is False
+    )
+    assert (
+        helpers._prefill_thrash_cooldown_remaining(
+            SESSION_A, _server_config(), now=clock.now
+        )
+        == DEFAULT_COOLDOWN_SECONDS
+    )
+
+
+def test_reset_clears_recorded_sizes(clock):
+    """Test isolation: the reset hook drops the armed sizes too."""
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A, _server_config(), now=clock.now, tokens=ARMED_TOKENS
+    )
+    helpers._reset_prefill_thrash_cooldowns()
+    assert helpers._prefill_thrash_cancel_tokens == {}
 
 
 # ═════════════════════════════════════════════════════════════════════════════

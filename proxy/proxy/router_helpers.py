@@ -1152,9 +1152,31 @@ def _get_prefill_deadline_seconds(srv) -> float:
 DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS = 600.0
 """Default post-deadline cooldown for a thrashing session (10 minutes)."""
 
+DEFAULT_PREFILL_THRASH_RECOVERY_FRACTION = 0.9
+"""Share of the cancelled prompt a success must reach to clear the window.
+
+A successful local dispatch clears a session's post-deadline cooldown only
+when it prefilled at least this fraction of the prompt that armed the window
+(LP-0MVQITN6P008DPLB). The window is cleared to restore local service once the
+failing case demonstrably works again — not because some *unrelated*, much
+smaller dispatch happened to succeed. Measured 2026-10-26 09:06→2026-10-27
+09:06: 89 of 114 ``prefill_deadline`` evictions were repeats inside 33
+``(session, prompt)`` clusters, re-admitted because a ~1.5 s warm dispatch had
+cleared the window the large doomed prompt had just armed (e.g. session
+``01a178bd…`` cancelled at 15:25:57, 15:28:05 and 15:30:20 on the same
+46,134-token prompt, against a 600 s cooldown).
+
+``0`` restores the pre-fix clear-on-any-success rule (documented rollback).
+"""
+
 #: Session id → monotonic deadline. In-process by design: a proxy restart
 #: resets the routing state, exactly like the dispatch leases it guards.
 _prefill_thrash_cooldowns: dict[str, float] = {}
+
+#: Session id → prompt size (tokens) that armed the current window. Recorded
+#: so the clear path can compare a success against the case that failed; an
+#: absent entry (unknown size) keeps the fail-open clear-on-any-success path.
+_prefill_thrash_cancel_tokens: dict[str, int] = {}
 
 
 def _prefill_thrash_config_section(config) -> Mapping:
@@ -1187,23 +1209,63 @@ def _get_prefill_thrash_cooldown_seconds(config) -> float:
     return max(0.0, seconds)
 
 
-def _record_prefill_thrash_cooldown(session_id, config, now=None) -> float:
+def _get_prefill_thrash_recovery_fraction(config) -> float:
+    """Resolve ``server.local_prefill_thrash_recovery_fraction`` (default 0.9).
+
+    Returns the share of the cancelled prompt size a successful local dispatch
+    must reach before it may clear the cooldown window. ``0`` (or a
+    non-positive / malformed-but-non-zero value) disables the gate, restoring
+    the pre-fix clear-on-any-success behaviour; a malformed *string* falls back
+    to the default so a config typo cannot silently switch the protection off.
+    A value above 1.0 is clamped to 1.0 — anything higher would make recovery
+    impossible and strand the session off local forever.
+    """
+    section = _prefill_thrash_config_section(config)
+    raw = section.get(
+        "local_prefill_thrash_recovery_fraction",
+        DEFAULT_PREFILL_THRASH_RECOVERY_FRACTION,
+    )
+    try:
+        fraction = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PREFILL_THRASH_RECOVERY_FRACTION
+    if fraction <= 0.0:
+        return 0.0
+    return min(1.0, fraction)
+
+
+def _record_prefill_thrash_cooldown(session_id, config, now=None, tokens=None) -> float:
     """Arm (or re-arm) *session_id*'s cooldown; return its deadline.
 
     Called by router.py when ``prefill_deadline_exceeded`` cancels a local
     dispatch. Returns the monotonic deadline, or 0 when the cooldown is
     disabled or no session id is known (a cooldown needs a session to scope
     to — an anonymous one-shot request has nothing to suppress).
+
+    *tokens* is the prompt size that failed. It is recorded so a later success
+    can be compared against it (see
+    :func:`_clear_prefill_thrash_cooldown`); when it is absent or not a
+    positive integer the window is still armed, but the clear path falls back
+    to the fail-open clear-on-any-success behaviour.
     """
     if not session_id:
         return 0.0
     seconds = _get_prefill_thrash_cooldown_seconds(config)
     if seconds <= 0:
         _prefill_thrash_cooldowns.pop(session_id, None)
+        _prefill_thrash_cancel_tokens.pop(session_id, None)
         return 0.0
     _now = time.monotonic() if now is None else now
     deadline = _now + seconds
     _prefill_thrash_cooldowns[session_id] = deadline
+    try:
+        size = int(tokens or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size > 0:
+        _prefill_thrash_cancel_tokens[session_id] = size
+    else:
+        _prefill_thrash_cancel_tokens.pop(session_id, None)
     return deadline
 
 
@@ -1229,21 +1291,41 @@ def _prefill_thrash_cooldown_remaining(session_id, config=None, now=None) -> flo
     return remaining
 
 
-def _clear_prefill_thrash_cooldown(session_id) -> bool:
+def _clear_prefill_thrash_cooldown(session_id, tokens=None, config=None) -> bool:
     """Clear *session_id*'s cooldown; return True when one was armed.
 
-    Called by router.py on a successful local first byte: a healthy dispatch
-    proves prefill works for this session again, so holding it off local would
-    only cost the local answer.
+    Called by router.py on a successful local first byte. A healthy dispatch
+    proves prefill works for this session again — but only for *that* size.
+    When the window was armed by a large prompt that the deadline cancelled, a
+    much smaller success is no evidence that the large prompt works now, and
+    clearing on it re-admits the doomed dispatch (LP-0MVQITN6P008DPLB).
+
+    The window is therefore cleared only when the successful dispatch prefilled
+    at least ``local_prefill_thrash_recovery_fraction`` (default 0.9) of the
+    size that armed it. Fail-open: when the armed size or the succeeding size
+    is unknown, or the fraction is 0, the pre-fix clear-on-any-success
+    behaviour is preserved rather than guessed at.
     """
     if not session_id:
         return False
+    armed = _prefill_thrash_cancel_tokens.get(session_id)
+    fraction = _get_prefill_thrash_recovery_fraction(config)
+    if fraction > 0.0 and armed:
+        try:
+            succeeded = int(tokens) if tokens is not None else 0
+        except (TypeError, ValueError):
+            succeeded = 0
+        if succeeded > 0 and succeeded < armed * fraction:
+            # Below the fraction: keep the window armed.
+            return False
+    _prefill_thrash_cancel_tokens.pop(session_id, None)
     return _prefill_thrash_cooldowns.pop(session_id, None) is not None
 
 
 def _reset_prefill_thrash_cooldowns() -> None:
     """Clear every cooldown window (test isolation / explicit reset)."""
     _prefill_thrash_cooldowns.clear()
+    _prefill_thrash_cancel_tokens.clear()
 
 
 #: Cached-token ratio at or above which a local dispatch counts as a

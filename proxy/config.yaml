@@ -2000,10 +2000,30 @@ server:
   # (``routing_skip_local reason=prefill_thrash_cooldown``,
   # ``cooldown_remaining=Ns``) and the chain reaches the next provider
   # immediately; OTHER sessions are unaffected (per-session key). The window
-  # clears early on a successful local first byte and expires lazily; this
-  # knob is the documented rollback — 0 restores the pre-fix behaviour
-  # (no cooldown, no skip).
+  # expires lazily, or clears early on a local first byte that is COMPARABLE IN
+  # SIZE to the prompt that armed it (see
+  # ``local_prefill_thrash_recovery_fraction`` below); this knob is the
+  # documented rollback — 0 restores the pre-fix behaviour (no cooldown, no
+  # skip).
   local_prefill_thrash_cooldown_seconds: 600
+  # Size gate on the cooldown's EARLY CLEAR (LP-0MVQITN6P008DPLB). A successful
+  # local first byte releases the window only when that dispatch prefilled at
+  # least this fraction (default 0.9 = 90 %) of the prompt size that armed it.
+  # Clearing on ANY success was the measured bug: a warm ~1.5 s dispatch 100x
+  # smaller than the cancelled prompt wiped the window and re-admitted the
+  # doomed one. Measured 2026-10-26 09:06 → 2026-10-27 09:06 (114
+  # ``local_eviction_after_acceptance reason=prefill_deadline`` events from
+  # only 43 sessions): 89 of 114 were repeats inside 33 ``(session, prompt)``
+  # clusters, e.g. session 01a178bd… cancelled at 15:25:57, 15:28:05 and
+  # 15:30:20 on the same 46,134-token prompt — all three inside one 600 s
+  # window — and 01a17a32… at 22:01:38, 22:03:39, 22:05:39 on the same
+  # 70,052-token prompt. Meanwhile the cooldown itself works: 715
+  # ``routing_skip_local reason=prefill_thrash_cooldown`` skips in that window.
+  # Fail-open: when either size is unknown the pre-fix clear-on-any-success
+  # behaviour is kept rather than guessed at, and a value above 1.0 is clamped
+  # to 1.0 (higher would make recovery impossible and strand the session off
+  # local). Rollback: 0 restores clear-on-any-success.
+  local_prefill_thrash_recovery_fraction: 0.9
 
   # -----------------------------------------------------------------------
   # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)

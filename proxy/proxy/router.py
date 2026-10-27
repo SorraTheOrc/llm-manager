@@ -1539,8 +1539,15 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # byte clears the session's post-deadline cooldown —
                         # this dispatch just proved prefill works again, so
                         # the next request may route local without waiting
-                        # out the window.
-                        _clear_prefill_thrash_cooldown(session_id)
+                        # out the window. LP-0MVQITN6P008DPLB: only when the
+                        # dispatch is comparable in size to the prompt that
+                        # armed the window — a small warm success says nothing
+                        # about the large prompt the deadline just cancelled.
+                        _clear_prefill_thrash_cooldown(
+                            session_id,
+                            tokens=_estimated_tokens,
+                            config=server_config,
+                        )
                         srv.backend_ready = True
                         # LP-0MUGQHPJ50046LV8: pin the stream context manager
                         # on the dispatch record so the watchdog can cancel the
@@ -1663,11 +1670,15 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     # local POSTs). Arm the session cooldown
                                     # so the next request from this session
                                     # skips local (provider.py) until it
-                                    # expires or a successful first byte
-                                    # clears it.
+                                    # expires or a comparable successful
+                                    # first byte clears it (LP-0MVQITN6P008DPLB:
+                                    # record the failing prompt size so a much
+                                    # smaller success cannot release it).
                                     _prefill_cooldown_deadline = (
                                         _record_prefill_thrash_cooldown(
-                                            session_id, server_config
+                                            session_id,
+                                            server_config,
+                                            tokens=_estimated_tokens,
                                         )
                                     )
                                     if _prefill_cooldown_deadline > 0:
