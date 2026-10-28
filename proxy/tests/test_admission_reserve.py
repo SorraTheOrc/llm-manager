@@ -847,3 +847,201 @@ def test_reserve_routes_are_registered():
     paths = {route.path for route in router.routes}
     assert "/llama/local/reserve" in paths
     assert "/llama/local/reserve/{reservation_id}" in paths
+
+
+# ---------------------------------------------------------------------------
+# Local-capacity verdict: ``deferrable`` vs ``too_large``
+# (LP-0MVSHX47F003XEIZ / LP-0MVSL7QJW006OYPB)
+# ---------------------------------------------------------------------------
+
+def _admission_decision(**overrides) -> prefill_eta.AdmissionDecision:
+    """Build an ``AdmissionDecision`` row without invoking the estimator.
+
+    Defaults reproduce the observed 2026-10-28 incident shape: the priced
+    own-ETA (31.7 s) fits the 60 s budget, the projection with one occupant
+    (63.4 s) does not, and the prompt (6 627 new tokens) is well inside the
+    25 000-token cold-prefill budget.
+    """
+    fields = {
+        "admit": False,
+        "reason": "eta_exceeds_budget",
+        "eta_prefill_seconds": 31.7,
+        "budget_seconds": 60.0,
+        "policy": "reject",
+        "calibrated": True,
+        "samples": 5,
+        "projected_wait_seconds": 63.4,
+        "new_tokens": 6627,
+        "budget_tokens": 25000,
+    }
+    fields.update(overrides)
+    return prefill_eta.AdmissionDecision(**fields)
+
+
+def test_capacity_verdict_incident_shape_is_deferrable():
+    """AC1: the observed incident shape is temporal, not a size refusal."""
+    decision = _admission_decision()
+
+    verdict = admission_reserve.local_capacity_verdict(decision)
+    assert verdict.verdict == admission_reserve.CAPACITY_DEFERRABLE
+    assert verdict.reason == "eta_exceeds_budget"
+
+    # The equivalent raw-input form (the direct free-slot guard path, which
+    # labels the same decision ``eta_exceeds_budget_direct``).
+    raw = admission_reserve.local_capacity_verdict(
+        reason="eta_exceeds_budget_direct",
+        new_tokens=6627,
+        budget_tokens=25000,
+    )
+    assert raw.verdict == admission_reserve.CAPACITY_DEFERRABLE
+    assert raw.reason == "eta_exceeds_budget_direct"
+
+
+#: Full classification table (AC3): ``(id, reason, new_tokens,
+#: budget_tokens, estimated_tokens, context_limit, expected_verdict)``.
+_CAPACITY_VERDICT_ROWS = [
+    # Guard temporal reasons — waiting can help.
+    ("guard-budget", "eta_exceeds_budget", 6627, 25000, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("guard-budget-direct", "eta_exceeds_budget_direct", 6627, 25000, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("guard-deadline", "prefill_eta_exceeds_deadline", 6627, 25000, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("guard-safety-budget", "prefill_eta_exceeds_safety_budget", 6627, 25000,
+     None, None, admission_reserve.CAPACITY_DEFERRABLE),
+    # Non-guard temporal exits (lease / cooldown / occupancy / queue / load).
+    ("lease-active", "local_lease_active", None, None, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("provider-cooldown", "local_provider_cooldown", None, None, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("busy-slots", "slot_exhaustion", None, None, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("queue-expiry", "fallback_after_queue", None, None, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("model-loading", "model_loading", None, None, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("stall-cooldown", "prefill_thrash_cooldown", None, None, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("guard-admitted", "within_budget", 6627, 25000, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    # Too large — a property of the request; waiting cannot help.
+    ("cold-prefill-cap", "prefill_budget_exceeded", 30000, 25000, None, None,
+     admission_reserve.CAPACITY_TOO_LARGE),
+    ("context-cap", "context_too_large", None, None, None, None,
+     admission_reserve.CAPACITY_TOO_LARGE),
+    ("tokens-over-budget", None, 25001, 25000, None, None,
+     admission_reserve.CAPACITY_TOO_LARGE),
+    ("tokens-over-budget-unknown-reason", "some_new_temporal_reason", 25001,
+     25000, None, None, admission_reserve.CAPACITY_TOO_LARGE),
+    ("context-over-limit", None, None, None, 40000, 32768,
+     admission_reserve.CAPACITY_TOO_LARGE),
+    # Disabled bounds never classify too_large (0 = cap/bound disabled).
+    ("token-cap-disabled", None, 99999, 0, None, None,
+     admission_reserve.CAPACITY_DEFERRABLE),
+    ("context-bound-disabled", None, None, None, 99999, 0,
+     admission_reserve.CAPACITY_DEFERRABLE),
+]
+
+
+@pytest.mark.parametrize(
+    "row",
+    _CAPACITY_VERDICT_ROWS,
+    ids=[row[0] for row in _CAPACITY_VERDICT_ROWS],
+)
+def test_capacity_verdict_classification_table(row):
+    """AC3: every table row asserts its own outcome and preserved reason."""
+    _row_id, reason, new_tokens, budget_tokens, estimated_tokens, context_limit, expected = row
+
+    verdict = admission_reserve.local_capacity_verdict(
+        reason=reason,
+        new_tokens=new_tokens,
+        budget_tokens=budget_tokens,
+        estimated_tokens=estimated_tokens,
+        context_limit=context_limit,
+    )
+
+    assert verdict.verdict == expected
+    assert verdict.reason == reason
+
+
+def test_capacity_verdict_decision_form_classifies_too_large():
+    """AC2: the guard decision alone classifies both too-large triggers."""
+    for reason in ("prefill_budget_exceeded", "context_too_large"):
+        verdict = admission_reserve.local_capacity_verdict(
+            _admission_decision(reason=reason)
+        )
+        assert verdict.verdict == admission_reserve.CAPACITY_TOO_LARGE
+        assert verdict.reason == reason
+
+
+def test_capacity_verdict_raw_inputs_override_decision_fields():
+    """AC2: raw values win over the decision they were derived from."""
+    too_large = admission_reserve.local_capacity_verdict(
+        _admission_decision(), new_tokens=30000
+    )
+    assert too_large.verdict == admission_reserve.CAPACITY_TOO_LARGE
+
+    # An explicit raw reason also wins over the decision's reason.
+    verdict = admission_reserve.local_capacity_verdict(
+        _admission_decision(), reason="context_too_large"
+    )
+    assert verdict.verdict == admission_reserve.CAPACITY_TOO_LARGE
+    assert verdict.reason == "context_too_large"
+
+
+def test_capacity_verdict_fail_safe_defaults_to_deferrable():
+    """AC4: unknown/absent reasons and missing inputs stay pin-local."""
+    empty = admission_reserve.local_capacity_verdict()
+    assert empty == admission_reserve.CapacityVerdict(
+        verdict=admission_reserve.CAPACITY_DEFERRABLE, reason=None
+    )
+
+    unknown = admission_reserve.local_capacity_verdict(reason="never_seen_before")
+    assert unknown.verdict == admission_reserve.CAPACITY_DEFERRABLE
+    assert unknown.reason == "never_seen_before"
+
+    # A value present without its bound cannot be compared: deferrable.
+    incomplete = admission_reserve.local_capacity_verdict(
+        new_tokens=30000, estimated_tokens=40000
+    )
+    assert incomplete.verdict == admission_reserve.CAPACITY_DEFERRABLE
+
+
+def test_capacity_verdict_is_pure_and_never_calls_the_estimator():
+    """AC5: pure helper — no estimator call, identical inputs ⇒ same verdict."""
+    with patch(
+        "proxy.admission_reserve.evaluate_admission",
+        side_effect=AssertionError("the verdict must not re-price the prompt"),
+    ):
+        first = admission_reserve.local_capacity_verdict(_admission_decision())
+        second = admission_reserve.local_capacity_verdict(_admission_decision())
+
+    assert first == second
+    assert first == admission_reserve.CapacityVerdict(
+        verdict=admission_reserve.CAPACITY_DEFERRABLE, reason="eta_exceeds_budget"
+    )
+
+
+def test_capacity_verdict_vocabulary_and_module_boundary():
+    """AC5: exactly two verdict values, and no import of ``provider``."""
+    assert admission_reserve.CAPACITY_DEFERRABLE == "deferrable"
+    assert admission_reserve.CAPACITY_TOO_LARGE == "too_large"
+    assert admission_reserve.CAPACITY_VERDICTS == frozenset(
+        {"deferrable", "too_large"}
+    )
+
+    source = Path(admission_reserve.__file__).read_text(encoding="utf-8")
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+            imported.update(
+                f"{node.module}.{alias.name}" for alias in node.names
+            )
+    providers = sorted(name for name in imported if name.split(".")[-1] == "provider")
+    assert providers == [], (
+        "admission_reserve must not import provider (import cycle); found "
+        f"{providers}"
+    )

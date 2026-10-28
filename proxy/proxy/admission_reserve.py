@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from proxy.prefill_eta import (
+    AdmissionDecision,
     evaluate_admission,
     suggested_retry_after_seconds,
 )
@@ -134,6 +135,168 @@ def canonical_local_fallback_reason(token: str) -> str:
             "admission_reserve.LOCAL_FALLBACK_REASON_TOKENS to canonicalise it"
         )
     return token
+
+
+# ---------------------------------------------------------------------------
+# Local-capacity verdict: ``deferrable`` vs ``too_large`` (LP-0MVSHX47F003XEIZ)
+#
+# One authoritative classification of *why* the local route cannot serve a
+# request right now, so chain selection can distinguish "wait, a slot is
+# coming" from "this prompt will never fit local".
+#
+# **Single-implementation contract.** Both dispatch cycles and the pin-local
+# refusal builder call :func:`local_capacity_verdict`; ``provider.py`` must
+# never re-derive this split. A second copy in the dispatcher would be a
+# defect, not a local optimisation.
+#
+# The inputs are *already computed* by the caller — the
+# :class:`proxy.prefill_eta.AdmissionDecision` and/or the raw values below.
+# The helper never re-prices a prompt: no ETA maths, no token estimation and
+# no second sizing model (parent assumption A1). The reason tokens themselves
+# stay owned by ``prefill_eta`` and ``provider``; this module only classifies
+# them (naming them locally would otherwise need a ``provider`` import, which
+# would create an import cycle).
+# ---------------------------------------------------------------------------
+
+#: Verdict vocabulary — exactly these two values.
+CAPACITY_DEFERRABLE = "deferrable"
+CAPACITY_TOO_LARGE = "too_large"
+
+CAPACITY_VERDICTS: frozenset[str] = frozenset(
+    {CAPACITY_DEFERRABLE, CAPACITY_TOO_LARGE}
+)
+
+#: Reason tokens that describe a property of the request size: waiting cannot
+#: help, so the caller may compact or fall through to a remote provider.
+CAPACITY_TOO_LARGE_REASONS: frozenset[str] = frozenset(
+    {
+        # ``prefill_eta`` cold-prefill cap (``new_tokens > budget_tokens``).
+        "prefill_budget_exceeded",
+        # Local context/size skip (router/priority and provider hard cap).
+        "context_too_large",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CapacityVerdict:
+    """Why the local route cannot serve a request right now.
+
+    Attributes:
+        verdict: :data:`CAPACITY_DEFERRABLE` when the blocking reason is
+            temporal (waiting can help, stay pinned to local) or
+            :data:`CAPACITY_TOO_LARGE` when the request exceeds the local
+            serving envelope (waiting cannot help).
+        reason: The underlying reason token, preserved verbatim so the
+            refusal body and log line can report *why*.
+    """
+
+    verdict: str
+    reason: str | None = None
+
+
+def _as_int(value: Any) -> int | None:
+    """Return *value* as an ``int``, or ``None`` when it is not numeric."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _exceeds(value: Any, limit: Any) -> bool:
+    """True when *value* is greater than an enabled (positive) *limit*.
+
+    A missing value or a non-positive limit means the bound is disabled
+    (``local_cold_prefill_budget_tokens: 0`` / unset context limit), so the
+    comparison cannot fire and the verdict stays fail-safe.
+    """
+    value_int = _as_int(value)
+    limit_int = _as_int(limit)
+    if value_int is None or limit_int is None or limit_int <= 0:
+        return False
+    return value_int > limit_int
+
+
+def local_capacity_verdict(
+    decision: AdmissionDecision | None = None,
+    *,
+    reason: str | None = None,
+    new_tokens: int | None = None,
+    budget_tokens: int | None = None,
+    estimated_tokens: int | None = None,
+    context_limit: int | None = None,
+) -> CapacityVerdict:
+    """Classify why the local route cannot serve this request right now.
+
+    Classification rule table:
+
+    =================== =====================================================
+    Verdict             Trigger
+    =================== =====================================================
+    ``too_large``       The reason is ``prefill_budget_exceeded`` (the guard's
+                        cold-prefill cap) or ``context_too_large`` (the local
+                        context/size skip).
+    ``too_large``       ``new_tokens > budget_tokens`` with ``budget_tokens >
+                        0`` — the raw form of the cold-prefill cap.
+    ``too_large``       ``estimated_tokens > context_limit`` with
+                        ``context_limit > 0`` — the raw form of the size skip.
+    ``deferrable``      A temporal reason: ``eta_exceeds_budget``,
+                        ``eta_exceeds_budget_direct``,
+                        ``prefill_eta_exceeds_deadline``,
+                        ``prefill_eta_exceeds_safety_budget``,
+                        ``local_lease_active``, ``local_provider_cooldown``,
+                        occupancy/busy-slot (``slot_exhaustion``), queue-expiry
+                        (``fallback_after_queue``), ``model_loading`` or
+                        stall/cooldown (``prefill_thrash_cooldown``). Waiting
+                        can help, so the request stays pinned to local.
+    ``deferrable``      Fail safe: an unknown or absent reason, or missing
+                        inputs. Never promotes a fits-local request.
+    =================== =====================================================
+
+    Args:
+        decision: The guard decision already computed by
+            :func:`proxy.prefill_eta.evaluate_admission` (read-only input).
+        reason: A reason token for exits that produced no guard decision
+            (non-guard temporal exits and routing/context skips). Overrides
+            ``decision.reason`` when supplied.
+        new_tokens: New (uncached) tokens priced by the caller. Overrides
+            ``decision.new_tokens`` when supplied.
+        budget_tokens: The configured cold-prefill budget
+            (``server.local_cold_prefill_budget_tokens``). Overrides
+            ``decision.budget_tokens`` when supplied.
+        estimated_tokens: The caller's prompt estimate for the local context
+            bound (the same number the size skip compared).
+        context_limit: The local model's context limit; ``0``/``None``
+            disables the bound.
+
+    Returns:
+        :class:`CapacityVerdict` carrying the verdict and the reason token
+        (verbatim, or ``None`` when no reason was supplied).
+    """
+    resolved_reason = reason
+    if resolved_reason is None and decision is not None:
+        resolved_reason = decision.reason
+
+    resolved_new_tokens = new_tokens
+    if resolved_new_tokens is None and decision is not None:
+        resolved_new_tokens = decision.new_tokens
+
+    resolved_budget_tokens = budget_tokens
+    if resolved_budget_tokens is None and decision is not None:
+        resolved_budget_tokens = decision.budget_tokens
+
+    too_large = (
+        resolved_reason in CAPACITY_TOO_LARGE_REASONS
+        or _exceeds(resolved_new_tokens, resolved_budget_tokens)
+        or _exceeds(estimated_tokens, context_limit)
+    )
+
+    return CapacityVerdict(
+        verdict=CAPACITY_TOO_LARGE if too_large else CAPACITY_DEFERRABLE,
+        reason=resolved_reason,
+    )
 
 
 @dataclass(frozen=True)
