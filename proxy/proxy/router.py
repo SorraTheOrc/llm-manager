@@ -56,6 +56,7 @@ def _log_local_stream_client_disconnect(srv, session_id, model_name):
 # Imports from sibling extracted modules
 import proxy.metrics as metrics  # noqa: E402
 from proxy import cold_start  # noqa: E402
+from proxy import measured_prefill as _measured_prefill  # noqa: E402
 from proxy.disconnect_reaper import client_disconnect_observed  # noqa: E402
 from proxy.lifecycle import (  # noqa: E402
     _compute_adaptive_timeout,
@@ -67,6 +68,7 @@ from proxy.observability import (  # noqa: E402
     _increment_tokens,
     _record_backend_signal,
 )
+from proxy.prompt_progress import PromptProgressCapture  # noqa: E402
 from proxy.session import (  # noqa: E402
     SessionSingleFlightDuplicateError,
     SessionSingleFlightRejectedError,
@@ -1146,6 +1148,44 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         # Fail-open: an estimate error must never break local routing.  The
         # provider smart-routing block re-estimates per attempt anyway.
         _estimated_tokens = 0
+
+    # ── Measured prefill capture (LP-0MVR7DAFF006HBRX) ──
+    # AC1: for local streaming dispatches, ask llama-server (b8782) to emit
+    # ``prompt_progress`` events inside the existing SSE stream so the proxy
+    # can measure the ACTUAL KV-cache reuse during prefill (parent Option D).
+    # The key is injected into a COPY of the parsed body (never rewritten):
+    # ``body_json`` remains the client-visible/recorded payload, so the
+    # internal key cannot leak into stored or recorded payloads. A client that
+    # asked for ``return_progress`` itself keeps its progress events (they are
+    # client-visible by its own request and are not re-injected).
+    #
+    # Purely additive here: capture never decides anything. The abort wiring
+    # (F4) consumes the measurement; the rollback key
+    # ``local_measured_cache_abort_enabled`` disables the whole feature
+    # (parent AC4).
+    _prompt_progress_capture_enabled = False
+    _suppress_progress_events = False
+    _priced_new_tokens = None
+    if isinstance(body_json, dict) and body_json.get("stream"):
+        try:
+            if _measured_prefill.capture_enabled(server_config):
+                _prompt_progress_capture_enabled = True
+                _injected_body = _measured_prefill.inject_return_progress(body_json)
+                if _injected_body is not None:
+                    body = _injected_body
+                    # The proxy asked for progress on its own behalf: the
+                    # progress chunks are internal and must not reach the
+                    # client (AC4).
+                    _suppress_progress_events = True
+                _priced_new_tokens = _measured_prefill.priced_new_tokens(
+                    getattr(request, "_local_admission_evidence", None),
+                    _estimated_tokens,
+                )
+        except Exception:
+            # Fail-open (AC5): an injection failure forwards the original body.
+            _prompt_progress_capture_enabled = False
+            _suppress_progress_events = False
+
     try:
         from proxy import priority as _priority_mod
 
@@ -1880,6 +1920,78 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # synthesised terminal events.
                         _reframer = SSEEventReframer()
 
+                        # LP-0MVR7DAFF006HBRX AC2: per-dispatch capture of the
+                        # measured ``prompt_progress`` events. ``None`` when the
+                        # feature is disabled, so the stream path is exactly
+                        # the pre-change code.
+                        _prompt_progress = (
+                            PromptProgressCapture()
+                            if _prompt_progress_capture_enabled
+                            else None
+                        )
+                        # A progress event split across two upstream reads is
+                        # still proxy-internal: this flag carries that state
+                        # between chunks so a split read is never counted as
+                        # client data (parent AC3: first-byte path unchanged).
+                        _progress_fragment_open = False
+
+                        async def _stamp_measured_prefill(_measured):
+                            """Expose the measurement on the dispatch record (AC3)."""
+                            try:
+                                _lock = getattr(
+                                    srv, "local_dispatch_records_lock", None
+                                )
+                                if _lock is None:
+                                    return
+                                _record_key = _dispatch_lease_key(
+                                    endpoint, session_id
+                                )
+                                async with _lock:
+                                    _record = getattr(
+                                        srv, "local_dispatch_records", {}
+                                    ).get(_record_key)
+                                    if isinstance(_record, dict):
+                                        _record[_measured_prefill.DISPATCH_RECORD_KEY] = (
+                                            _measured.as_dict()
+                                        )
+                            except Exception:
+                                pass
+
+                        async def _observe_prompt_progress(_event):
+                            """Capture one reframed event; True when it carried progress.
+
+                            Fail-open (AC5): neither a parse failure nor a
+                            bookkeeping failure escapes the stream loop or
+                            changes the bytes delivered to the client.
+                            """
+                            try:
+                                _progress = _prompt_progress.observe(_event)
+                            except Exception:
+                                return False
+                            if _progress is None:
+                                return False
+                            try:
+                                _measured = _measured_prefill.MeasuredPrefill.from_progress(
+                                    _progress,
+                                    priced_new_tokens=_priced_new_tokens,
+                                )
+                                _measured_prefill.set_measured_prefill(
+                                    model_name, session_id, _measured
+                                )
+                                if _prompt_progress.events_seen == 1:
+                                    # AC6: one attributable line per dispatch.
+                                    srv.logger.info(
+                                        "%s session=%s model=%s %s",
+                                        _measured_prefill.PREFILL_PROGRESS_EVENT,
+                                        session_id or "unknown",
+                                        model_name or "unknown",
+                                        _measured.log_fields(),
+                                    )
+                                    await _stamp_measured_prefill(_measured)
+                            except Exception:
+                                pass
+                            return True
+
                         # Log stream started with session context (LP-0MR90HJED005WI1Z)
                         try:
                             _request_preview = _get_request_preview(body_json)
@@ -2039,8 +2151,61 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     break
 
                                 # ── process this chunk ──────────────────────
+                                # Re-frame the raw backend read to SSE event
+                                # boundaries (LP-0MUOBUPBC002GYTL) BEFORE the
+                                # chunk-level accounting: complete events are
+                                # flushed immediately, a trailing partial is
+                                # held. Proxy-internal ``prompt_progress``
+                                # events are captured here and withheld from
+                                # both the client-visible stream and the
+                                # client-data accounting (LP-0MVR7DAFF006HBRX
+                                # AC2/AC4; parent AC3: first-byte path
+                                # unchanged).
+                                _client_events: list[bytes] = []
+                                _saw_progress_event = False
+                                for _event in _reframer.feed(chunk):
+                                    if _prompt_progress is not None:
+                                        _is_progress = (
+                                            await _observe_prompt_progress(
+                                                _event
+                                            )
+                                        )
+                                        if _is_progress:
+                                            _saw_progress_event = True
+                                            if _suppress_progress_events:
+                                                continue
+                                    _client_events.append(_event)
+
+                                if _saw_progress_event:
+                                    _progress_fragment_open = False
+                                if (
+                                    _prompt_progress is not None
+                                    and _suppress_progress_events
+                                ):
+                                    if (
+                                        _saw_progress_event
+                                        or _progress_fragment_open
+                                    ):
+                                        # Only internal progress bytes were
+                                        # seen in this read: classify on the
+                                        # client-visible remainder (empty for
+                                        # a progress-only read).
+                                        _classification_chunk = b"".join(
+                                            _client_events
+                                        )
+                                    elif b'"prompt_progress"' in chunk:
+                                        # Start of a progress event split
+                                        # across reads: nothing client-visible
+                                        # yet.
+                                        _progress_fragment_open = True
+                                        _classification_chunk = b""
+                                    else:
+                                        _classification_chunk = chunk
+                                else:
+                                    _classification_chunk = chunk
+
                                 try:
-                                    chunk_text = chunk.decode(
+                                    chunk_text = _classification_chunk.decode(
                                         "utf-8", errors="replace"
                                     )
                                 except Exception:
@@ -2096,8 +2261,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 # (as opposed to a keepalive comment ":").
                                 # Only actual data chunks reset the between-chunks
                                 # budget, preventing premature timeout on slow
-                                # upstream processing.
-                                txt = chunk.decode("utf-8", errors="replace")
+                                # upstream processing. ``chunk_text`` excludes
+                                # proxy-internal prompt_progress events, so a
+                                # progress read is never mistaken for a first
+                                # byte (LP-0MVR7DAFF006HBRX, parent AC3).
+                                txt = chunk_text
                                 _has_actual_data = bool(
                                     txt.strip()
                                     and not txt.strip().startswith(":")
@@ -2324,7 +2492,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 if session_id:
                                     try:
                                         collected_content.append(
-                                            chunk.decode("utf-8", errors="replace")
+                                            _classification_chunk.decode(
+                                                "utf-8", errors="replace"
+                                            )
                                         )
                                     except Exception:
                                         pass
@@ -2350,11 +2520,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     except Exception:
                                         pass
 
-                                # Re-frame the raw backend read to SSE event
-                                # boundaries (LP-0MUOBUPBC002GYTL): complete events
-                                # are flushed immediately; a trailing partial is
-                                # held until complete and dropped on any stop.
-                                for _event in _reframer.feed(chunk):
+                                # Forward this read's client-visible events.
+                                # Proxy-internal prompt_progress events were
+                                # already captured and withheld above
+                                # (LP-0MVR7DAFF006HBRX AC4).
+                                for _event in _client_events:
                                     if (
                                         _suppress_usage_chunk
                                         and b'"usage"' in _event
