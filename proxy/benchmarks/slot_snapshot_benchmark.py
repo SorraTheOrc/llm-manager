@@ -40,6 +40,30 @@ carries the timeout it was issued under and whether the operation finished
 inside it, because the whole question the parent asks is *where* that model
 stops describing reality.
 
+Wall clock vs server time
+-------------------------
+A wall-clock save/restore is the llama-server request round trip: it includes
+any queueing behind an in-flight task on another slot. The record therefore
+also carries llama-server's own ``timings.save_ms`` / ``timings.restore_ms``
+as ``save_server_ms`` / ``restore_server_ms``, so a timeout can be attributed
+to *server work* or to *time spent waiting for the server* instead of being
+blamed on the mechanism. ``snapshot_bytes`` is taken from the save response's
+``n_written`` (authoritative) with the on-disk stat kept alongside as
+``snapshot_bytes_on_disk``; statting alone could read a previous band's file.
+
+Populate, erase and slot pinning
+--------------------------------
+A band is only measurable if the slot holds *that band's* KV before the save:
+
+* ``--populate-slot`` prefills the band prompt into the measured slot (pinned
+  with llama-server's ``id_slot``), so the snapshot is prompt-sized;
+* each populated band first issues ``action=erase`` so the previous band's KV
+  cannot leak into the next band's snapshot or restore;
+* ``--verify-slot-id`` pins the post-restore verification completion to the
+  restored slot, which makes ``timings.prompt_n`` describe the restore;
+* ``--load-slot-id`` pins the ``--under-load`` stream to a *different* slot,
+  so "another slot is processing" is a real condition.
+
 Usage
 -----
 ::
@@ -136,11 +160,19 @@ MIB = 1024 * 1024
 # ---------------------------------------------------------------------------
 #: Character heuristic for prompt sizing. The harness emits numeric content
 #: (comma-separated integers, like ``slot_benchmark.build_varied_content``), for
-#: which llama tokenisers consume ~3.5 chars/token. Assuming 4.0 chars/token
-#: therefore *over-delivers* real tokens relative to the band floor. It is an
-#: estimate by design: the true total is recorded from ``usage.prompt_tokens``
-#: whenever ``--verify-chat`` runs (see the fidelity caveats in the docs).
-CHARS_PER_TOKEN = 4.0
+#: which the production tokeniser (Qwen3.6-35B-A3B) consumes **~1.0 chars per
+#: token**: every comma-separated integer is its own token. Measured on the
+#: production host 2026-10-28: a 40 125-character band prompt was 40 062 prompt
+#: tokens (``usage.prompt_tokens``), i.e. 1.0016 chars/token. Assuming 4.0
+#: over-delivered a nominal "10k" prompt to 40 039 tokens — outside its band and
+#: a 4x error against the timeout model. The value is an estimate by design: the
+#: true total is recorded from ``usage.prompt_tokens`` whenever ``--verify-chat``
+#: or ``--populate-slot`` runs (see the fidelity caveats in the docs).
+CHARS_PER_TOKEN = 1.0
+
+#: One digit group emitted per block. Commas delimit every integer, so each
+#: integer is one token and the prompt is sized in blocks rather than characters.
+NUMBERS_PER_BLOCK = 200
 
 #: Unique leading marker per (salt, band): band prompts must not share a
 #: prefix, otherwise the 40k band would restore the 10k band's KV prefix and
@@ -148,8 +180,6 @@ CHARS_PER_TOKEN = 4.0
 SALT_HEADER_TEMPLATE = "BENCHMARK SNAPSHOT SALT {salt} TARGET {target_tokens}\n"
 
 PROMPT_TAIL = "\nCount the numbers above and reply with the exact total.\n"
-
-NUMBERS_PER_BLOCK = 200
 
 
 @dataclass(frozen=True)
@@ -183,29 +213,54 @@ def _number_block(rng: random.Random, count: int = NUMBERS_PER_BLOCK) -> str:
     return ",".join(str(rng.randint(1, 999_999)) for _ in range(count)) + ",\n"
 
 
+def _block_tokens(block: str) -> int:
+    """Estimated tokens in one numeric block (one token per integer).
+
+    The production tokeniser splits ``1,234,567,`` into one token per integer
+    plus a punctuation token, so a block of *n* integers with *n* separators is
+    ``2n`` tokens. Uses the same 1.0-chars-per-token model as
+    :data:`CHARS_PER_TOKEN`, so :func:`estimated_prompt_tokens` stays consistent
+    with :func:`build_salted_prompt` for any prompt either of them produces.
+    """
+    return max(1, math.ceil(len(block) / CHARS_PER_TOKEN))
+
+
 def estimated_prompt_tokens(text: str) -> int:
     """Estimated token count of *text* (character heuristic, see module docs)."""
     return max(1, math.ceil(len(text) / CHARS_PER_TOKEN))
 
 
 def build_salted_prompt(target_tokens: int, salt: str) -> str:
-    """Deterministic prompt of at least *target_tokens* with a unique salt.
+    """Deterministic prompt of *target_tokens* (never more) with a unique salt.
 
     The salt is the *first* thing in the prompt so two bands (or two runs)
     never share a KV prefix: a shared prefix would let the shorter band's
     snapshot serve the longer band's restore and silently understate both.
+
+    Sizing is a token budget, not a character budget: the header and tail are
+    counted first and numeric blocks (one token per integer) fill the
+    remainder, so the result does not overshoot its band. Overshooting is not
+    harmless — it moves a prompt out of the band it is supposed to represent.
     """
     if target_tokens <= 0:
         raise ValueError("target_tokens must be positive")
     header = SALT_HEADER_TEMPLATE.format(salt=salt, target_tokens=target_tokens)
     rng = random.Random(_salt_seed(salt))
-    target_chars = int(math.ceil(target_tokens * CHARS_PER_TOKEN))
+    tokens_used = _block_tokens(header) + _block_tokens(PROMPT_TAIL)
     blocks: list[str] = []
-    length = len(header) + len(PROMPT_TAIL)
-    while length < target_chars:
+    while tokens_used < target_tokens:
         block = _number_block(rng)
+        cost = _block_tokens(block)
+        if tokens_used + cost > target_tokens:
+            # Trim the block to the remaining budget instead of overshooting:
+            # one integer (and its comma) is one token.
+            remaining = target_tokens - tokens_used
+            block = block[:remaining]
+            cost = _block_tokens(block)
+            if remaining <= 0:
+                break
         blocks.append(block)
-        length += len(block)
+        tokens_used += cost
     return header + "".join(blocks) + PROMPT_TAIL
 
 
@@ -470,12 +525,22 @@ class _HttpxStream:
 class HttpxBenchmarkClient:
     """Live client: one ``httpx.AsyncClient`` for saves/restores and the load."""
 
-    def __init__(self, timeout: float = 600.0) -> None:
+    def __init__(self, timeout: float | None = None) -> None:
         if httpx is None:  # pragma: no cover - live-only failure
             raise RuntimeError(
                 "httpx is required for a live run: pip install httpx"
             )
-        self._client = httpx.AsyncClient(timeout=timeout)
+        # The client default must not be *lower* than the largest per-request
+        # timeout, or the client silently clips a deliberately generous budget
+        # (a populate issued with POPULATE_TIMEOUT_SECONDS would still abort at
+        # the client default). One minute of margin keeps the per-request value
+        # the binding one.
+        effective = (
+            float(timeout)
+            if timeout is not None
+            else max(600.0, POPULATE_TIMEOUT_SECONDS + 60.0)
+        )
+        self._client = httpx.AsyncClient(timeout=effective)
 
     async def post(self, url: str, payload: dict, timeout: float) -> SlotResponse:
         response = await self._client.post(url, json=payload, timeout=timeout)
@@ -498,10 +563,64 @@ class HttpxBenchmarkClient:
 
 #: Outcomes a save/restore action can record. ``skipped`` means the harness
 #: deliberately did not issue the call (restore after a failed save);
-#: ``dry_run`` is a plan entry, never a measurement.
+#: ``dry_run`` is a plan entry, never a measurement. ``not_requested`` marks an
+#: optional step (the slot populate) the run did not ask for.
 OUTCOME_SUCCESS = "success"
 OUTCOME_FAILED = "failed"
 OUTCOME_SKIPPED = "skipped"
+OUTCOME_NOT_REQUESTED = "not_requested"
+
+#: Timeout for the *populate* completion (``--populate-slot``). It is a normal
+#: chat completion, not a save/restore, so it is deliberately generous: the
+#: adaptive slot timeout (60 s cap) would fail a 60k-token prefill that the
+#: production dispatch path happily waits minutes for. Sizing: the production
+#: host prefills this prompt shape at ~114 tokens/s (measured
+#: 2026-10-28T10:39Z: 9 942 tokens in 87.6 s), so a 60k band needs ~530 s.
+#: 900 leaves headroom for a host that is also serving live traffic.
+POPULATE_TIMEOUT_SECONDS = 900.0
+
+#: Timeout for the slot *erase* that precedes a populate. Administrative, not
+#: part of the measured pair, and measured itself at ~14 ms for 94 250 tokens of
+#: cached KV on an idle host — so anything above a second is queueing behind an
+#: in-flight task elsewhere. Bounding it by the band's adaptive save/restore
+#: timeout turned a 20 ms administrative step into a recorded ``failed`` erase
+#: (observed at 18.02 s against the 10k band's 18.0 s budget) and made band
+#: isolation look weaker than it was.
+#:
+#: It must nevertheless be generous, because abandoning an erase is *not*
+#: harmless: the request stays queued server-side and can be executed later,
+#: after the populate, wiping the very KV the band just wrote. A 120 s bound did
+#: exactly that on a loaded host (erase recorded ``failed`` at 120.10 s, the
+#: 60k+ populate then succeeded, and the save that followed captured
+#: ``n_saved: 0``). 600 s only abandons an erase on a genuinely stuck server,
+#: and the contention case is still visible as a large ``erase_seconds``.
+ERASE_TIMEOUT_SECONDS = 600.0
+
+#: How many times the *administrative* erase+populate phase may be attempted.
+#: The save/restore pair is deliberately single-shot (a retry would hide the
+#: timeout being measured), but the populate is not the measurement: it only
+#: puts the band's KV into the slot. On the production host the proxy's model
+#: health loop can recycle the llama-server instance during a long prefill
+#: (``/slots`` stops answering while the GPU prefills, the probe times out, and
+#: recovery unloads/reloads the model). The first full run lost two bands to
+#: exactly that — a populate that ended in ``HTTP 500: proxy error: Failed to
+#: read connection`` after 600 s. Retrying the populate cannot flatter the
+#: save/restore numbers; it only stops an unrelated reload from discarding the
+#: band.
+POPULATE_ATTEMPTS = 3
+
+#: Relative tolerance for "the snapshot holds this band's prompt". A saved KV
+#: whose ``n_saved`` is outside this band of the populated prompt size is not
+#: measuring the band: it describes whatever replaced the slot (a reload, or
+#: another session taking the slot). The first full run produced exactly this
+#: silently — one under-load band saved 3 878 KV cells for a 40k prompt and
+#: still reported a "success".
+SNAPSHOT_TOKEN_TOLERANCE = 0.10
+
+#: Completion tokens produced by the populate and verification completions.
+#: Kept tiny so the saved KV is dominated by the prompt itself.
+PROBE_MAX_TOKENS = 8
+
 
 #: The record schema (AC3): every field below is present in the JSON output.
 RECORD_FIELDS: tuple[str, ...] = (
@@ -515,19 +634,32 @@ RECORD_FIELDS: tuple[str, ...] = (
     "prompt_processed_tokens",
     "cached_tokens",
     "cached_ratio",
+    "populate_seconds",
+    "populate_outcome",
+    "populate_error",
+    "populate_prompt_total_tokens",
+    "populate_attempts",
+    "erase_seconds",
+    "erase_outcome",
     "timeout_seconds",
     "save_seconds",
     "save_outcome",
     "save_error",
     "save_within_timeout",
+    "save_server_ms",
+    "save_tokens",
     "restore_seconds",
     "restore_outcome",
     "restore_error",
     "restore_within_timeout",
+    "restore_server_ms",
+    "restore_tokens",
     "snapshot_bytes",
+    "snapshot_bytes_on_disk",
     "expected_snapshot_bytes",
     "snapshot_size_ratio",
     "snapshot_size_in_tolerance",
+    "snapshot_holds_band",
     "under_load",
     "verified",
 )
@@ -547,21 +679,34 @@ class SnapshotRecord:
     prompt_processed_tokens: int | None
     cached_tokens: int | None
     cached_ratio: float | None
+    populate_seconds: float | None
+    populate_outcome: str
+    populate_error: str | None
+    populate_prompt_total_tokens: int | None
     timeout_seconds: float
     save_seconds: float | None
     save_outcome: str
     save_error: str | None
     save_within_timeout: bool | None
+    save_server_ms: float | None
+    save_tokens: int | None
     restore_seconds: float | None
     restore_outcome: str
     restore_error: str | None
     restore_within_timeout: bool | None
+    restore_server_ms: float | None
+    restore_tokens: int | None
     snapshot_bytes: int | None
+    snapshot_bytes_on_disk: int | None
     expected_snapshot_bytes: int
     snapshot_size_ratio: float | None
     snapshot_size_in_tolerance: bool | None
-    under_load: bool
-    verified: bool
+    snapshot_holds_band: bool | None = None
+    under_load: bool = False
+    verified: bool = False
+    populate_attempts: int = 0
+    erase_seconds: float | None = None
+    erase_outcome: str = OUTCOME_NOT_REQUESTED
 
     def to_json(self) -> dict[str, Any]:
         """Serialise to the documented record schema."""
@@ -578,6 +723,19 @@ class SnapshotRecord:
             "cached_ratio": (
                 None if self.cached_ratio is None else round(self.cached_ratio, 4)
             ),
+            "populate_seconds": (
+                None
+                if self.populate_seconds is None
+                else round(self.populate_seconds, 3)
+            ),
+            "populate_outcome": self.populate_outcome,
+            "populate_error": self.populate_error,
+            "populate_prompt_total_tokens": self.populate_prompt_total_tokens,
+            "populate_attempts": self.populate_attempts,
+            "erase_seconds": (
+                None if self.erase_seconds is None else round(self.erase_seconds, 3)
+            ),
+            "erase_outcome": self.erase_outcome,
             "timeout_seconds": round(self.timeout_seconds, 3),
             "save_seconds": (
                 None if self.save_seconds is None else round(self.save_seconds, 3)
@@ -585,13 +743,24 @@ class SnapshotRecord:
             "save_outcome": self.save_outcome,
             "save_error": self.save_error,
             "save_within_timeout": self.save_within_timeout,
+            "save_server_ms": (
+                None if self.save_server_ms is None else round(self.save_server_ms, 3)
+            ),
+            "save_tokens": self.save_tokens,
             "restore_seconds": (
                 None if self.restore_seconds is None else round(self.restore_seconds, 3)
             ),
             "restore_outcome": self.restore_outcome,
             "restore_error": self.restore_error,
             "restore_within_timeout": self.restore_within_timeout,
+            "restore_server_ms": (
+                None
+                if self.restore_server_ms is None
+                else round(self.restore_server_ms, 3)
+            ),
+            "restore_tokens": self.restore_tokens,
             "snapshot_bytes": self.snapshot_bytes,
+            "snapshot_bytes_on_disk": self.snapshot_bytes_on_disk,
             "expected_snapshot_bytes": self.expected_snapshot_bytes,
             "snapshot_size_ratio": (
                 None
@@ -599,6 +768,7 @@ class SnapshotRecord:
                 else round(self.snapshot_size_ratio, 4)
             ),
             "snapshot_size_in_tolerance": self.snapshot_size_in_tolerance,
+            "snapshot_holds_band": self.snapshot_holds_band,
             "under_load": self.under_load,
             "verified": self.verified,
         }
@@ -638,6 +808,11 @@ class BenchmarkResult:
     plan: list[BandPlan] = field(default_factory=list)
     records: list[SnapshotRecord] = field(default_factory=list)
     generated_at: str = ""
+    populate_slot: bool = False
+    slot_id: int = 0
+    verify_slot_id: int | None = None
+    load_slot_id: int | None = None
+    populate_timeout_seconds: float = POPULATE_TIMEOUT_SECONDS
 
     def totals(self) -> dict[str, Any]:
         save_success = sum(
@@ -673,6 +848,12 @@ class BenchmarkResult:
                 for r in self.records
                 if r.snapshot_size_in_tolerance is False
             ),
+            "populated_bands": sum(
+                1 for r in self.records if r.populate_outcome == OUTCOME_SUCCESS
+            ),
+            "snapshots_not_holding_band": sum(
+                1 for r in self.records if r.snapshot_holds_band is False
+            ),
             "verified_bands": len(verified),
             "mean_cached_ratio": (
                 round(
@@ -686,12 +867,17 @@ class BenchmarkResult:
     def to_json(self) -> dict[str, Any]:
         return {
             "tool": "slot_snapshot_benchmark",
-            "schema_version": 1,
+            "schema_version": 3,
             "sentinel": SNAPSHOT_BENCHMARK_SENTINEL,
             "generated_at": self.generated_at,
             "dry_run": self.dry_run,
             "under_load": self.under_load,
             "verify_chat": self.verified,
+            "populate_slot": self.populate_slot,
+            "slot_id": self.slot_id,
+            "verify_slot_id": self.verify_slot_id,
+            "load_slot_id": self.load_slot_id,
+            "populate_timeout_seconds": self.populate_timeout_seconds,
             "base_url": self.base_url,
             "hit_definition": "cached_tokens = prompt_total_tokens - timings.prompt_n",
             "timeout_model": {
@@ -713,7 +899,13 @@ class BenchmarkResult:
 
 @dataclass(frozen=True)
 class LoadSpec:
-    """A second streaming session that keeps another slot processing."""
+    """A second streaming session that keeps another slot processing.
+
+    ``id_slot`` pins the load stream to a specific llama-server slot (the one
+    *not* being measured). Without it llama-server assigns by availability and
+    the stream can land on the measured slot, which stops being "another
+    slot" and turns the save into a same-slot contention test.
+    """
 
     messages: tuple[dict[str, Any], ...] = (
         {"role": "system", "content": "You are a helpful assistant."},
@@ -727,20 +919,79 @@ class LoadSpec:
     )
     model: str = "Qwen3"
     max_tokens: int = 512
+    id_slot: int | None = None
 
     def payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "model": self.model,
             "messages": [dict(m) for m in self.messages],
             "max_tokens": self.max_tokens,
             "temperature": 0.0,
             "stream": True,
         }
+        if self.id_slot is not None:
+            payload["id_slot"] = self.id_slot
+        return payload
 
 
 def _truncate(text: str, limit: int = 300) -> str:
     flattened = " ".join(str(text).split())
     return flattened if len(flattened) <= limit else flattened[:limit] + "…"
+
+
+def _retryable_populate_error(error: str | None) -> bool:
+    """Whether a failed populate is worth re-issuing.
+
+    A transport failure, a read timeout or a 5xx means the server never gave a
+    verdict on the request (typically because the proxy's model-health loop
+    recycled the instance during the long prefill). A 4xx is deterministic —
+    the same request would fail again — so it is reported, not retried.
+    """
+    if not error:
+        return False
+    if error.startswith("HTTP "):
+        return error.startswith("HTTP 5")
+    return True
+
+
+def _snapshot_holds_band(
+    save_tokens: int | None, band_tokens: int | None
+) -> bool | None:
+    """Whether the saved KV actually holds *band_tokens* of prompt.
+
+    ``n_saved`` is the number of KV cells the save wrote. Comparing it with the
+    populated prompt size is the only cheap way to tell "this snapshot is the "
+    "band" from "this snapshot is whatever replaced the slot": a reload, or a
+    concurrent session taking the slot, silently yields a *successful* save of
+    the wrong KV. Returns ``None`` when either number is unavailable.
+
+    ``n_saved == 0`` is a **failure**, not missing data: it means the slot was
+    empty when the save ran (observed when a timed-out erase executed late and
+    wiped the band).
+    """
+    if save_tokens is None or not band_tokens:
+        return None
+    return abs(int(save_tokens) - int(band_tokens)) <= max(
+        1, int(SNAPSHOT_TOKEN_TOLERANCE * int(band_tokens))
+    )
+
+
+def _numeric(body: dict[str, Any] | None, *path: str) -> float | None:
+    """Read a numeric value from a (possibly absent) nested response field."""
+    node: Any = body
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return float(node) if isinstance(node, (int, float)) else None
+
+
+def _integer(body: dict[str, Any] | None, key: str) -> int | None:
+    """Read an integer value from a (possibly absent) response field."""
+    if not isinstance(body, dict):
+        return None
+    value = body.get(key)
+    return int(value) if isinstance(value, (int, float)) else None
 
 
 def _slot_url(base_url: str, slot_id: int, action: str) -> str:
@@ -763,17 +1014,69 @@ async def _issue_slot_action(
     action: str,
     filename: str,
     timeout: float,
-) -> tuple[float, str, str | None]:
-    """Issue *action* exactly once; return ``(seconds, outcome, error)``.
+    model: str | None = None,
+) -> tuple[float, str, str | None, dict[str, Any] | None]:
+    """Issue *action* exactly once; return ``(seconds, outcome, error, body)``.
 
     Deliberately single-shot: a retry would mask the timeout this benchmark
     exists to measure (AC3: a failure is recorded, never retried away).
+    ``body`` is the decoded JSON response on success — llama-server reports
+    ``n_written`` (snapshot bytes) and ``timings.save_ms/restore_ms`` there,
+    which are more authoritative than a filesystem stat racing the write.
+
+    Passing *model* puts the model name in the request body, which the
+    llama-server router requires to forward the action to the loaded instance.
+    The router is the production path: the proxy issues its own saves through
+    ``http://localhost:{llama_server_port}/slots/{id}?action=…`` carrying
+    ``model`` (``proxy/proxy/session.py:_call_slot_endpoint``). It also makes
+    the measurement immune to instance port churn, since the router keeps
+    serving on its fixed port while the per-model instances are recycled onto
+    new ephemeral ports. A direct instance ignores the field.
     """
-    payload = {"filename": Path(filename).name}
+    payload: dict[str, Any] = {"filename": Path(filename).name}
+    if model:
+        payload["model"] = model
     started = time.monotonic()
     try:
         response = await client.post(
             _slot_url(base_url, slot_id, action), payload, timeout
+        )
+    except Exception as exc:
+        return time.monotonic() - started, OUTCOME_FAILED, _format_error(exc), None
+    elapsed = time.monotonic() - started
+    if getattr(response, "status_code", None) != 200:
+        return (
+            elapsed,
+            OUTCOME_FAILED,
+            f"HTTP {response.status_code}: {_truncate(response.text())}",
+            None,
+        )
+    return elapsed, OUTCOME_SUCCESS, None, response.json_body()
+
+
+async def _erase_slot(
+    client: BenchmarkHTTPClient,
+    base_url: str,
+    slot_id: int,
+    timeout: float,
+    model: str | None = None,
+) -> tuple[float, str, str | None]:
+    """Clear *slot_id*'s KV before a band populates it (best-effort).
+
+    The erase makes each band's save/restore describe only that band's KV:
+    without it a leftover prefix from the previous band can survive into the
+    next band's populate and its restore, silently coupling the measurements.
+
+    *model* is forwarded when set, so the erase reaches the instance behind
+    the router the same way the save/restore pair does.
+    """
+    payload: dict[str, Any] = {}
+    if model:
+        payload["model"] = model
+    started = time.monotonic()
+    try:
+        response = await client.post(
+            _slot_url(base_url, slot_id, "erase"), payload, timeout
         )
     except Exception as exc:
         return time.monotonic() - started, OUTCOME_FAILED, _format_error(exc)
@@ -787,31 +1090,51 @@ async def _issue_slot_action(
     return elapsed, OUTCOME_SUCCESS, None
 
 
-async def _verification_tokens(
+async def _completion_tokens(
     client: BenchmarkHTTPClient,
     base_url: str,
     prompt: str,
     model: str,
     timeout: float,
-) -> tuple[int | None, int | None]:
-    """One non-streaming completion; return ``(prompt_total, prompt_n)``.
+    id_slot: int | None = None,
+) -> tuple[
+    int | None, int | None, float, str, str | None
+]:
+    """One non-streaming completion; return the token and outcome detail.
 
+    Returns ``(prompt_total, prompt_n, seconds, outcome, error)`` where
     ``prompt_total`` is ``usage.prompt_tokens`` and ``prompt_n`` is
     llama-server's ``timings.prompt_n`` (prompt tokens actually processed).
     Both are ``None`` when the server does not report them.
+
+    ``id_slot`` pins the completion to a specific slot. That matters for the
+    measurement: a populate completion must fill the slot the save will
+    capture, and a verification completion can only report restored-prefix
+    reuse if it lands on the slot that was just restored (llama-server assigns
+    by availability otherwise).
     """
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 8,
+        "max_tokens": PROBE_MAX_TOKENS,
         "temperature": 0.0,
     }
+    if id_slot is not None:
+        payload["id_slot"] = id_slot
+    started = time.monotonic()
     try:
         response = await client.post(_chat_url(base_url), payload, timeout)
-    except Exception:
-        return None, None
+    except Exception as exc:
+        return None, None, time.monotonic() - started, OUTCOME_FAILED, _format_error(exc)
+    elapsed = time.monotonic() - started
     if getattr(response, "status_code", None) != 200:
-        return None, None
+        return (
+            None,
+            None,
+            elapsed,
+            OUTCOME_FAILED,
+            f"HTTP {response.status_code}: {_truncate(response.text())}",
+        )
     body = response.json_body() or {}
     usage = body.get("usage") or {}
     timings = body.get("timings") or {}
@@ -820,7 +1143,27 @@ async def _verification_tokens(
     return (
         int(total) if isinstance(total, (int, float)) else None,
         int(processed) if isinstance(processed, (int, float)) else None,
+        elapsed,
+        OUTCOME_SUCCESS,
+        None,
     )
+
+
+async def _verification_tokens(
+    client: BenchmarkHTTPClient,
+    base_url: str,
+    prompt: str,
+    model: str,
+    timeout: float,
+    id_slot: int | None = None,
+) -> tuple[int | None, int | None]:
+    """Verification completion: ``(prompt_total, prompt_n)``, ignoring outcome detail."""
+    total, processed, _seconds, outcome, _error = await _completion_tokens(
+        client, base_url, prompt, model, timeout, id_slot
+    )
+    if outcome != OUTCOME_SUCCESS:
+        return None, None
+    return total, processed
 
 
 async def _load_driver(
@@ -892,12 +1235,25 @@ async def measure_band(
     snapshot_dir: Path | None = None,
     verify_chat: bool = False,
     load: LoadSpec | None = None,
+    populate_slot: bool = False,
+    verify_slot_id: int | None = None,
 ) -> SnapshotRecord:
     """Measure one band's save/restore pair.
 
     With *load* set, a streaming completion is kept open on another slot for
     the whole save/restore window, so the saves issue while another slot is
     processing (the parent's AC1 "under load" clause).
+
+    With *populate_slot*, the band prompt is first prefilled **into the measured
+    slot** (one pinned completion). That is what makes the numbers production-
+    shaped: a save then captures a prompt-sized KV rather than an empty slot
+    (and a restore then has a prompt-sized snapshot to bring back). Without it
+    ``snapshot_bytes`` describes an almost-empty slot and ``cached_tokens``
+    cannot say anything about restore effectiveness.
+
+    *verify_slot_id* pins the verification completion (defaults to unpinned, the
+    historical best-effort behaviour; pinning it to the measured slot is what
+    makes ``timings.prompt_n`` authoritative).
     """
     prompt = band_prompt(band, salt)
     estimated = estimated_prompt_tokens(prompt)
@@ -906,6 +1262,48 @@ async def measure_band(
         f"snapshot-bench-{_safe_filename_token(band.name)}"
         f"-{_safe_filename_token(salt)}.bin"
     )
+
+    populate_total: int | None = None
+    populate_seconds: float | None = None
+    populate_outcome = OUTCOME_NOT_REQUESTED
+    populate_error: str | None = None
+    populate_attempts = 0
+    erase_seconds: float | None = None
+    erase_outcome = OUTCOME_NOT_REQUESTED
+    if populate_slot:
+        for attempt in range(1, POPULATE_ATTEMPTS + 1):
+            populate_attempts = attempt
+            # Clear the slot first: a leftover prefix from the previous band
+            # could otherwise survive into this band's populate and restore,
+            # coupling the bands together. Best-effort — a failed erase does
+            # not stop the measurement, it only means the isolation claim is
+            # weaker.
+            erase_seconds, erase_outcome, _erase_error = await _erase_slot(
+                client, base_url, slot_id, ERASE_TIMEOUT_SECONDS, model
+            )
+            (
+                populate_total,
+                _populate_processed,
+                populate_seconds,
+                populate_outcome,
+                populate_error,
+            ) = await _completion_tokens(
+                client,
+                base_url,
+                prompt,
+                model,
+                POPULATE_TIMEOUT_SECONDS,
+                slot_id,
+            )
+            if populate_outcome == OUTCOME_SUCCESS:
+                break
+            if not _retryable_populate_error(populate_error):
+                break
+            # A transport failure or a 5xx means the request never got a
+            # verdict, or the instance was recycled mid-prefill — retrying the
+            # *administrative* populate cannot flatter the save/restore numbers
+            # it prepares. A 4xx (e.g. context-too-large) is deterministic and
+            # is not retried.
 
     stop = asyncio.Event()
     opened = asyncio.Event()
@@ -926,22 +1324,43 @@ async def measure_band(
             pass
 
     try:
-        save_seconds, save_outcome, save_error = await _issue_slot_action(
-            client, base_url, slot_id, "save", filename, timeout
+        (
+            save_seconds,
+            save_outcome,
+            save_error,
+            save_body,
+        ) = await _issue_slot_action(
+            client, base_url, slot_id, "save", filename, timeout, model
         )
 
+        # llama-server reports the authoritative size and server-side time in
+        # the response body. The filesystem stat is kept as corroboration:
+        # statting late (the old behaviour) could read a *previous* band's file
+        # and mis-report the footprint.
+        save_server_ms = _numeric(save_body, "timings", "save_ms")
+        save_tokens = _integer(save_body, "n_saved")
         snapshot_file = _snapshot_path(snapshot_dir, filename)
-        snapshot_bytes = None
+        snapshot_bytes_on_disk = None
         if save_outcome == OUTCOME_SUCCESS and snapshot_file is not None:
             try:
-                snapshot_bytes = snapshot_file.stat().st_size
+                snapshot_bytes_on_disk = snapshot_file.stat().st_size
             except OSError:
-                snapshot_bytes = None
+                snapshot_bytes_on_disk = None
+        snapshot_bytes = _integer(save_body, "n_written") or snapshot_bytes_on_disk
 
+        restore_server_ms: float | None = None
+        restore_tokens: int | None = None
         if save_outcome == OUTCOME_SUCCESS:
-            restore_seconds, restore_outcome, restore_error = await _issue_slot_action(
-                client, base_url, slot_id, "restore", filename, timeout
+            (
+                restore_seconds,
+                restore_outcome,
+                restore_error,
+                restore_body,
+            ) = await _issue_slot_action(
+                client, base_url, slot_id, "restore", filename, timeout, model
             )
+            restore_server_ms = _numeric(restore_body, "timings", "restore_ms")
+            restore_tokens = _integer(restore_body, "n_restored")
         else:
             # No snapshot was written: issuing a restore would measure nothing
             # and would add a spurious failure to the record.
@@ -953,7 +1372,7 @@ async def measure_band(
         prompt_n: int | None = None
         if verify_chat and restore_outcome == OUTCOME_SUCCESS:
             prompt_total, prompt_n = await _verification_tokens(
-                client, base_url, prompt, model, timeout
+                client, base_url, prompt, model, timeout, verify_slot_id
             )
     finally:
         stop.set()
@@ -962,6 +1381,8 @@ async def measure_band(
             with contextlib.suppress(asyncio.CancelledError):
                 await driver
 
+    if prompt_total is None:
+        prompt_total = populate_total
     if prompt_total is None:
         prompt_total = estimated
     cached_tokens = None
@@ -985,6 +1406,11 @@ async def measure_band(
         prompt_processed_tokens=prompt_n,
         cached_tokens=cached_tokens,
         cached_ratio=cached_ratio,
+        populate_seconds=populate_seconds,
+        populate_outcome=populate_outcome,
+        populate_error=populate_error,
+        populate_prompt_total_tokens=populate_total,
+        populate_attempts=populate_attempts,
         timeout_seconds=timeout,
         save_seconds=save_seconds,
         save_outcome=save_outcome,
@@ -992,13 +1418,21 @@ async def measure_band(
         save_within_timeout=_within_timeout(
             save_outcome, save_seconds, timeout
         ),
+        save_server_ms=save_server_ms,
+        save_tokens=save_tokens,
         restore_seconds=restore_seconds,
         restore_outcome=restore_outcome,
         restore_error=restore_error,
         restore_within_timeout=_within_timeout(
             restore_outcome, restore_seconds, timeout
         ),
+        restore_server_ms=restore_server_ms,
+        restore_tokens=restore_tokens,
         snapshot_bytes=snapshot_bytes,
+        snapshot_bytes_on_disk=snapshot_bytes_on_disk,
+        snapshot_holds_band=_snapshot_holds_band(
+            save_tokens, populate_total or prompt_total
+        ),
         expected_snapshot_bytes=expected_bytes,
         snapshot_size_ratio=(
             None if snapshot_bytes is None else snapshot_bytes / expected_bytes
@@ -1010,6 +1444,8 @@ async def measure_band(
         ),
         under_load=load is not None,
         verified=prompt_n is not None,
+        erase_seconds=erase_seconds,
+        erase_outcome=erase_outcome,
     )
 
 
@@ -1057,6 +1493,8 @@ async def run_benchmark(
     verify_chat: bool = False,
     load: LoadSpec | None = None,
     client: BenchmarkHTTPClient | None = None,
+    populate_slot: bool = False,
+    verify_slot_id: int | None = None,
 ) -> BenchmarkResult:
     """Run (or plan, when *dry_run*) every band and return the result."""
     run_salt = salt or default_salt()
@@ -1070,6 +1508,10 @@ async def run_benchmark(
             bands, salt=run_salt, timeout_model=timeout_model, under_load=under_load
         ),
         generated_at=datetime.now(UTC).isoformat(),
+        populate_slot=populate_slot,
+        slot_id=slot_id,
+        verify_slot_id=verify_slot_id,
+        load_slot_id=load.id_slot if load is not None else None,
     )
     if dry_run:
         return result
@@ -1094,6 +1536,8 @@ async def run_benchmark(
                     snapshot_dir=snapshot_dir,
                     verify_chat=verify_chat,
                     load=load_spec,
+                    populate_slot=populate_slot,
+                    verify_slot_id=verify_slot_id,
                 )
             )
     finally:
@@ -1121,12 +1565,23 @@ def render_text(result: BenchmarkResult) -> str:
         f"— capped from {result.timeout_model.cap_tokens:.0f} tokens"
     )
     lines.append(f"under load: {'yes' if result.under_load else 'no'}")
+    lines.append(
+        "populate slot before save: "
+        f"{'yes' if result.populate_slot else 'no'}"
+        + (
+            f" (slot {result.slot_id}, verify pinned to "
+            f"{result.verify_slot_id if result.verify_slot_id is not None else 'any'})"
+            if result.populate_slot
+            else ""
+        )
+    )
     lines.append("")
     if result.dry_run:
         lines.append("DRY RUN — no HTTP issued")
     lines.append(
         f"{'band':<6} {'target':>8} {'prompt≈':>9} {'timeout':>8} "
-        f"{'save s':>8} {'restore s':>10} {'bytes':>12} {'cached':>8} outcome"
+        f"{'fill s':>8} {'save s':>8} {'restore s':>10} {'bytes':>12} "
+        f"{'cached':>8} outcome"
     )
     by_band = {r.band: r for r in result.records}
     for plan in result.plan:
@@ -1135,7 +1590,7 @@ def render_text(result: BenchmarkResult) -> str:
             lines.append(
                 f"{plan.band:<6} {plan.target_tokens:>8} "
                 f"{plan.prompt_tokens_estimated:>9} "
-                f"{plan.timeout_seconds:>8.1f} {'—':>8} {'—':>10} "
+                f"{plan.timeout_seconds:>8.1f} {'—':>8} {'—':>8} {'—':>10} "
                 f"{plan.expected_snapshot_bytes:>12} {'—':>8} planned"
             )
             continue
@@ -1143,6 +1598,7 @@ def render_text(result: BenchmarkResult) -> str:
             f"{record.band:<6} {record.target_tokens:>8} "
             f"{record.prompt_tokens_estimated:>9} "
             f"{record.timeout_seconds:>8.1f} "
+            f"{_fmt(record.populate_seconds):>8} "
             f"{_fmt(record.save_seconds):>8} "
             f"{_fmt(record.restore_seconds):>10} "
             f"{_fmt_bytes(record.snapshot_bytes):>12} "
@@ -1150,6 +1606,7 @@ def render_text(result: BenchmarkResult) -> str:
             f"{record.save_outcome}/{record.restore_outcome}"
         )
         for label, error in (
+            ("populate", record.populate_error),
             ("save", record.save_error),
             ("restore", record.restore_error),
         ):
@@ -1173,6 +1630,16 @@ def render_text(result: BenchmarkResult) -> str:
             f"(out of kv_memory_table tolerance: "
             f"{totals['snapshots_out_of_tolerance']})"
         )
+        lines.append(f"populated bands: {totals['populated_bands']}")
+        if totals["snapshots_not_holding_band"]:
+            lines.append(
+                "WARNING: {n} snapshot(s) do not hold the band's prompt "
+                "(n_saved far from the populated prompt size): the slot was "
+                "replaced between populate and save (a model reload, or "
+                "another session taking the slot). Those bands describe "
+                "something other than the band and must not be read as "
+                "measurements.".format(n=totals["snapshots_not_holding_band"])
+            )
     return "\n".join(lines)
 
 
@@ -1284,6 +1751,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--populate-slot",
+        action="store_true",
+        help=(
+            "Prefill the band prompt into the measured slot before saving it, "
+            "so the snapshot is prompt-sized and the restore has real KV to "
+            "bring back (required for meaningful bytes/cached_tokens)"
+        ),
+    )
+    parser.add_argument(
+        "--verify-slot-id",
+        type=int,
+        default=None,
+        help=(
+            "Pin the verification completion to this slot (normally the "
+            "measured --slot-id) so timings.prompt_n describes the restored slot"
+        ),
+    )
+    parser.add_argument(
+        "--load-slot-id",
+        type=int,
+        default=None,
+        help=(
+            "Pin the --under-load stream to this slot (normally a slot other "
+            "than --slot-id) so 'another slot' is a real condition"
+        ),
+    )
+    parser.add_argument(
         "--timeout-base",
         type=float,
         default=None,
@@ -1354,8 +1848,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=args.dry_run,
             under_load=args.under_load,
             verify_chat=args.verify_chat,
+            populate_slot=args.populate_slot,
+            verify_slot_id=args.verify_slot_id,
             load=(
-                LoadSpec(model=args.model, max_tokens=args.load_max_tokens)
+                LoadSpec(
+                    model=args.model,
+                    max_tokens=args.load_max_tokens,
+                    id_slot=args.load_slot_id,
+                )
                 if args.under_load
                 else None
             ),

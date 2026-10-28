@@ -97,18 +97,46 @@ class StubClient:
         save_error: BaseException | None = None,
         restore_error: BaseException | None = None,
         verification: dict | None = None,
+        populate: dict | None = None,
+        populate_status: int = 200,
+        populate_error: BaseException | None = None,
+        save_body: dict | None = None,
+        restore_body: dict | None = None,
+        erase_status: int = 200,
+        populate_failures: int = 0,
     ) -> None:
         self.save_status = save_status
         self.restore_status = restore_status
         self.save_error = save_error
         self.restore_error = restore_error
         self.verification = verification
+        self.save_body = save_body
+        self.restore_body = restore_body
+        self.erase_status = erase_status
+        self.populate = populate
+        self.populate_status = populate_status
+        self.populate_error = populate_error
+        # How many populate attempts to answer with a retryable 5xx before
+        # serving the real populate body.
+        self.populate_failures = populate_failures
+        self.populate_expected = (
+            populate is not None
+            or populate_error is not None
+            or populate_status != 200
+            or populate_failures > 0
+        )
+        self.populate_served = False
         self.calls: list[dict] = []  # every post/open_stream
         self.events: list[tuple[str, object]] = []
         self.stream_open = False
 
     async def post(self, url: str, payload: dict, timeout: float) -> m.SlotResponse:
-        assert "action=save" in url or "action=restore" in url or "completions" in url
+        assert (
+            "action=save" in url
+            or "action=restore" in url
+            or "action=erase" in url
+            or "completions" in url
+        )
         self.calls.append(
             {
                 "url": url,
@@ -121,11 +149,38 @@ class StubClient:
         if "action=save" in url:
             if self.save_error is not None:
                 raise self.save_error
-            return m.SlotResponse(status_code=self.save_status, body={"ok": True})
+            return m.SlotResponse(
+                status_code=self.save_status, body=dict(self.save_body or {"ok": True})
+            )
         if "action=restore" in url:
             if self.restore_error is not None:
                 raise self.restore_error
-            return m.SlotResponse(status_code=self.restore_status, body={"ok": True})
+            return m.SlotResponse(
+                status_code=self.restore_status,
+                body=dict(self.restore_body or {"ok": True}),
+            )
+        if "action=erase" in url:
+            return m.SlotResponse(
+                status_code=self.erase_status, body={"id_slot": 1, "n_erased": 0}
+            )
+        # Chat completions: the populate probe precedes the save, the
+        # verification probe follows the restore.
+        if self.populate_expected and not self.populate_served:
+            self.populate_calls = getattr(self, "populate_calls", 0) + 1
+            if self.populate_calls <= self.populate_failures:
+                # A retryable administrative failure (5xx): the instance was
+                # recycled mid-prefill, so the populate is re-issued.
+                return m.SlotResponse(
+                    status_code=500,
+                    body="proxy error: Failed to read connection",
+                )
+            self.populate_served = True
+            if self.populate_error is not None:
+                raise self.populate_error
+            return m.SlotResponse(
+                status_code=self.populate_status,
+                body=dict(self.populate) if self.populate is not None else {"choices": []},
+            )
         if self.verification is not None:
             return m.SlotResponse(status_code=200, body=dict(self.verification))
         return m.SlotResponse(status_code=200, body={"choices": []})
@@ -141,6 +196,9 @@ class StubClient:
 
     def restore_calls(self) -> list[dict]:
         return [c for c in self.calls if "action=restore" in c["url"]]
+
+    def completion_calls(self) -> list[dict]:
+        return [c for c in self.calls if "completions" in c["url"] and "stream" not in c]
 
 
 def _run(coro):
@@ -185,14 +243,20 @@ def test_parse_bands_accepts_names_and_token_counts():
         m.parse_bands("10k,10k")
 
 
-def test_every_band_prompt_meets_its_token_floor():
-    """Sizing is deterministic and reaches (at least) each band floor."""
+def test_every_band_prompt_stays_inside_its_band():
+    """Sizing is deterministic and lands *in* the band, never past it.
+
+    Overshooting is not harmless: the first measurement run inherited a 4.0
+    chars/token assumption and turned the 10k band into a 40k prompt, which
+    moved the measurement out of the band it was supposed to describe.
+    """
     for band in m.DEFAULT_BANDS:
         for salt in ("salt-a", "salt-b"):
             prompt = m.band_prompt(band, salt)
             estimated = m.estimated_prompt_tokens(prompt)
-            assert estimated >= band.target_tokens, (
-                f"{band.name} prompt only estimates {estimated} tokens"
+            assert band.target_tokens <= estimated <= band.target_tokens * 1.01, (
+                f"{band.name} prompt estimates {estimated} tokens, outside "
+                f"[{band.target_tokens}, {band.target_tokens * 1.01:.0f}]"
             )
             assert m.build_salted_prompt(band.target_tokens, salt) == prompt, (
                 "same salt must build the same prompt (determinism)"
@@ -347,6 +411,536 @@ def test_record_falls_back_to_the_estimate_without_verification():
     assert record.cached_tokens is None
     assert record.prompt_total_tokens == record.prompt_tokens_estimated
     assert record.prompt_tokens_estimated >= BAND_10K.target_tokens
+    # The optional populate step is off unless asked for: no completion ran.
+    assert record.populate_outcome == m.OUTCOME_NOT_REQUESTED
+    assert stub.completion_calls() == []
+
+
+# ---------------------------------------------------------------------------
+# Slot populate and slot pinning (what makes a band measurable at all)
+# ---------------------------------------------------------------------------
+
+
+def test_populate_prefills_the_measured_slot_before_the_save():
+    """The populate probe runs first, pinned, so the save captures real KV."""
+    stub = StubClient(
+        populate={
+            "usage": {"prompt_tokens": 25_100},
+            "timings": {"prompt_n": 25_100},
+        },
+        verification={
+            "usage": {"prompt_tokens": 25_037},
+            "timings": {"prompt_n": 37},
+        },
+    )
+    record = _run(
+        m.measure_band(
+            BAND_25K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=1,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+            verify_chat=True,
+            verify_slot_id=1,
+        )
+    )
+    # Ordering: erase → populate → save → restore → verification. The erase
+    # clears the previous band's KV so this band's snapshot is not coupled to it.
+    assert "action=erase" in stub.calls[0]["url"]
+    assert "completions" in stub.calls[1]["url"]
+    assert "action=save" in stub.calls[2]["url"]
+    assert "action=restore" in stub.calls[3]["url"]
+    assert record.erase_outcome == m.OUTCOME_SUCCESS
+    assert len(stub.completion_calls()) == 2
+    # The populate is pinned to the measured slot and is not bound by the
+    # adaptive save/restore timeout (a 60k prefill would exceed it).
+    populate_call = stub.completion_calls()[0]
+    assert populate_call["payload"]["id_slot"] == 1
+    assert populate_call["timeout"] == m.POPULATE_TIMEOUT_SECONDS
+    assert m.POPULATE_TIMEOUT_SECONDS > TIMEOUT_MODEL.cap_seconds
+
+    assert record.populate_outcome == m.OUTCOME_SUCCESS
+    assert record.populate_seconds is not None
+    assert record.populate_prompt_total_tokens == 25_100
+    # The verification completion's prompt size wins (it describes the
+    # restored slot); the populate size is kept as recorded context.
+    assert record.prompt_total_tokens == 25_037
+    assert record.cached_tokens == 25_037 - 37
+
+
+def test_populate_total_sizes_the_record_when_verification_is_off():
+    stub = StubClient(
+        populate={
+            "usage": {"prompt_tokens": 40_512},
+            "timings": {"prompt_n": 40_512},
+        }
+    )
+    record = _run(
+        m.measure_band(
+            BAND_40K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=0,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    assert record.verified is False
+    assert record.cached_tokens is None
+    assert record.prompt_total_tokens == 40_512
+    assert record.expected_snapshot_bytes == m.expected_snapshot_bytes(40_512)
+
+
+def test_deterministic_populate_failure_is_recorded_and_not_retried():
+    """A 4xx will fail identically, so it is reported once, not re-issued."""
+    stub = StubClient(populate_status=400)
+    record = _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=0,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    assert record.populate_outcome == m.OUTCOME_FAILED
+    assert record.populate_error is not None and "400" in record.populate_error
+    assert record.populate_attempts == 1, "a 4xx populate is deterministic"
+    # The save/restore still measure (a failed populate only weakens the claim).
+    assert record.save_outcome == m.OUTCOME_SUCCESS
+    assert record.restore_outcome == m.OUTCOME_SUCCESS
+    assert record.populate_prompt_total_tokens is None
+
+
+def test_a_recycled_instance_populate_failure_is_retried():
+    """An administrative 5xx (instance recycled mid-prefill) is re-issued.
+
+    Observed on the production host: a 40k populate ended in
+    ``HTTP 500: proxy error: Failed to read connection`` after 600 s because
+    the proxy's model-health loop reloaded the instance during the prefill.
+    Retrying the *administrative* populate cannot flatter the save/restore
+    numbers it prepares — it only stops an unrelated reload from discarding
+    the band.
+    """
+    stub = StubClient(
+        populate_failures=2,
+        populate={"usage": {"prompt_tokens": 10_010}, "timings": {"prompt_n": 10_010}},
+    )
+    record = _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=0,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    assert record.populate_outcome == m.OUTCOME_SUCCESS
+    assert record.populate_attempts == 3
+    # Each attempt re-erases, so the retried populate still starts from a
+    # cleared slot rather than layering onto a half-written prefix.
+    assert sum(1 for c in stub.calls if "action=erase" in c["url"]) == 3
+    assert record.populate_prompt_total_tokens == 10_010
+    assert record.save_outcome == m.OUTCOME_SUCCESS
+
+
+def test_populate_retries_are_bounded():
+    stub = StubClient(populate_failures=m.POPULATE_ATTEMPTS + 1)
+    record = _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=0,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    assert record.populate_outcome == m.OUTCOME_FAILED
+    assert record.populate_attempts == m.POPULATE_ATTEMPTS
+    assert len(stub.completion_calls()) == m.POPULATE_ATTEMPTS
+
+
+def test_slot_actions_carry_the_model_for_the_router_path():
+    """Save/restore/erase must reach the instance behind the router.
+
+    The proxy issues saves through ``localhost:{llama_server_port}/slots/..``
+    with a ``model`` body field (``proxy/proxy/session.py:_call_slot_endpoint``),
+    because the llama-server router refuses an action without a model name.
+    Measuring through the router is the only port-stable path on the
+    production host: instance ports churn as the router recycles them, while
+    the router port does not.
+    """
+    stub = StubClient()
+    _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=1,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    slot_calls = [
+        c for c in stub.calls if "action=" in c["url"]
+    ]
+    assert slot_calls, "expected erase/save/restore calls"
+    for call in slot_calls:
+        assert call["payload"].get("model") == MODEL, call["url"]
+
+
+def test_verify_slot_id_pins_the_verification_completion():
+    stub = StubClient(verification={"usage": {"prompt_tokens": 10_050}})
+    _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=2,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            verify_chat=True,
+            verify_slot_id=2,
+        )
+    )
+    verify_call = stub.completion_calls()[-1]
+    assert verify_call["payload"]["id_slot"] == 2
+
+
+def test_verification_is_unpinned_by_default():
+    stub = StubClient(verification={"usage": {"prompt_tokens": 10_050}})
+    _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=2,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            verify_chat=True,
+        )
+    )
+    assert "id_slot" not in stub.completion_calls()[-1]["payload"]
+
+
+def test_load_spec_pins_the_stream_to_another_slot():
+    """`--under-load` must stream on the *other* slot, not the measured one."""
+    stub = StubClient()
+    load = m.LoadSpec(model=MODEL, max_tokens=64, id_slot=0)
+    _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=1,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            load=load,
+        )
+    )
+    stream_call = [c for c in stub.calls if c.get("stream")][0]
+    assert stream_call["payload"]["id_slot"] == 0
+    assert load.payload()["stream"] is True
+    # Unpinned by default.
+    assert "id_slot" not in m.LoadSpec(model=MODEL).payload()
+
+
+# ---------------------------------------------------------------------------
+# Server-reported sizes / timings, and per-band slot isolation
+# ---------------------------------------------------------------------------
+
+
+def test_save_prefers_server_reported_bytes_and_keeps_the_disk_stat(tmp_path):
+    """`n_written` is authoritative; the on-disk stat is kept as corroboration.
+
+    Statting alone raced a late write in the first live run and reported a
+    previous band's file as this band's footprint.
+    """
+    snapshot_dir = tmp_path / "slot-cache"
+    snapshot_dir.mkdir()
+    # A stale file with the *next* band's deterministic name.
+    stale = snapshot_dir / "snapshot-bench-10k-x.bin"
+    stale.write_bytes(b"y" * 500)
+    stub = StubClient(
+        save_body={
+            "id_slot": 1,
+            "n_saved": 10_000,
+            "n_written": 999_999,
+            "timings": {"save_ms": 12.5},
+        },
+        restore_body={
+            "id_slot": 1,
+            "n_restored": 10_000,
+            "n_read": 999_999,
+            "timings": {"restore_ms": 3.5},
+        },
+    )
+    record = _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=0,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            snapshot_dir=snapshot_dir,
+        )
+    )
+    assert record.snapshot_bytes == 999_999
+    assert record.snapshot_bytes_on_disk == 500
+    assert record.save_server_ms == pytest.approx(12.5)
+    assert record.save_tokens == 10_000
+    assert record.restore_server_ms == pytest.approx(3.5)
+    assert record.restore_tokens == 10_000
+
+
+def test_snapshot_is_flagged_when_it_does_not_hold_the_band():
+    """A save of the wrong KV is a successful call but not a band measurement.
+
+    The first full run reported a 40k under-load band as ``success`` while
+    ``n_saved`` was 3 878 — the slot had been replaced between the populate and
+    the save (a model reload). Nothing in the record said so; only the absurd
+    0.25 snapshot-size ratio hinted at it.
+    """
+    stub = StubClient(
+        populate={"usage": {"prompt_tokens": 39_942}, "timings": {"prompt_n": 39_942}},
+        save_body={"id_slot": 1, "n_saved": 3_878, "n_written": 108_150_404},
+    )
+    record = _run(
+        m.measure_band(
+            BAND_40K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=1,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    assert record.save_outcome == m.OUTCOME_SUCCESS
+    assert record.save_tokens == 3_878
+    assert record.snapshot_holds_band is False
+
+
+def test_snapshot_holding_the_band_is_accepted_within_tolerance():
+    stub = StubClient(
+        populate={"usage": {"prompt_tokens": 39_942}, "timings": {"prompt_n": 39_942}},
+        save_body={"id_slot": 1, "n_saved": 39_949, "n_written": 719_548_588},
+    )
+    record = _run(
+        m.measure_band(
+            BAND_40K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=1,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    assert record.snapshot_holds_band is True
+
+
+def test_snapshot_fidelity_is_unknown_without_a_populate_or_server_count():
+    record = _run(
+        m.measure_band(
+            BAND_10K,
+            client=StubClient(),
+            base_url="http://localhost:8080",
+            slot_id=0,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+        )
+    )
+    assert record.snapshot_holds_band is None
+
+
+def test_an_empty_slot_at_save_time_is_a_failed_fidelity_check():
+    """``n_saved: 0`` means the slot was empty — a failure, not missing data.
+
+    Observed on a loaded host: the erase timed out client-side at 120 s but
+    still executed server-side after the populate, so the save that followed
+    captured an empty slot while reporting ``success`` and 756 bytes.
+    """
+    stub = StubClient(
+        populate={"usage": {"prompt_tokens": 59_942}, "timings": {"prompt_n": 59_942}},
+        save_body={"id_slot": 1, "n_saved": 0, "n_written": 756},
+        restore_body={"id_slot": 1, "n_restored": 0},
+    )
+    record = _run(
+        m.measure_band(
+            m.DEFAULT_BANDS[-1],
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=1,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    assert record.save_outcome == m.OUTCOME_SUCCESS
+    assert record.save_tokens == 0
+    assert record.snapshot_holds_band is False
+    assert m._snapshot_holds_band(0, 59_942) is False
+
+
+def test_server_timings_are_null_when_the_server_does_not_report_them():
+    record = _run(
+        m.measure_band(
+            BAND_10K,
+            client=StubClient(),
+            base_url="http://localhost:8080",
+            slot_id=0,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+        )
+    )
+    assert record.save_server_ms is None
+    assert record.restore_server_ms is None
+    assert record.save_tokens is None
+
+
+def test_erase_isolates_the_band_before_it_populates():
+    stub = StubClient(
+        populate={"usage": {"prompt_tokens": 10_010}, "timings": {"prompt_n": 10_010}}
+    )
+    record = _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=1,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    # erase → populate → save → restore
+    assert "action=erase" in stub.calls[0]["url"]
+    assert "completions" in stub.calls[1]["url"]
+    assert "action=save" in stub.calls[2]["url"]
+    assert record.erase_outcome == m.OUTCOME_SUCCESS
+    assert record.erase_seconds is not None
+
+
+def test_erase_and_populate_are_not_bound_by_the_adaptive_timeout():
+    """Administrative steps get their own budget, not the measured band's.
+
+    The 10k band's adaptive budget is 18 s, which the first live run spent
+    queueing for an erase the host answers in ~14 ms when idle — the erase was
+    recorded as ``failed`` purely because it was issued with the measurement
+    budget. Both preparatory calls must therefore use their own generous bound.
+    """
+    stub = StubClient(
+        populate={"usage": {"prompt_tokens": 10_010}, "timings": {"prompt_n": 10_010}}
+    )
+    _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=1,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    erase_call = [c for c in stub.calls if "action=erase" in c["url"]][0]
+    populate_call = stub.completion_calls()[0]
+    assert erase_call["timeout"] == m.ERASE_TIMEOUT_SECONDS
+    assert populate_call["timeout"] == m.POPULATE_TIMEOUT_SECONDS
+    # Both exceed the band's own budget, so neither can be mistaken for a
+    # save/restore timeout (the thing this benchmark exists to measure).
+    assert m.ERASE_TIMEOUT_SECONDS > TIMEOUT_MODEL.cap_seconds
+    assert m.POPULATE_TIMEOUT_SECONDS > TIMEOUT_MODEL.cap_seconds
+    band_budget = TIMEOUT_MODEL.timeout_for(BAND_10K.target_tokens)
+    assert m.ERASE_TIMEOUT_SECONDS > band_budget
+
+
+def test_erase_is_not_issued_without_populate():
+    stub = StubClient()
+    record = _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=0,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+        )
+    )
+    assert record.erase_outcome == m.OUTCOME_NOT_REQUESTED
+    assert not any("action=erase" in call["url"] for call in stub.calls)
+
+
+def test_failed_erase_is_recorded_and_the_measurement_proceeds():
+    stub = StubClient(
+        erase_status=500,
+        populate={"usage": {"prompt_tokens": 10_010}, "timings": {"prompt_n": 10_010}},
+    )
+    record = _run(
+        m.measure_band(
+            BAND_10K,
+            client=stub,
+            base_url="http://localhost:8080",
+            slot_id=0,
+            session_id="s",
+            salt="x",
+            model=MODEL,
+            timeout_model=TIMEOUT_MODEL,
+            populate_slot=True,
+        )
+    )
+    assert record.erase_outcome == m.OUTCOME_FAILED
+    assert record.populate_outcome == m.OUTCOME_SUCCESS
+    assert record.save_outcome == m.OUTCOME_SUCCESS
+
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +1231,31 @@ def test_dry_run_plan_timeouts_track_the_adaptive_model():
     assert all(p.under_load for p in plans)
     # The 60k+ band is capped at 60 s in this model.
     assert plans[-1].timeout_seconds == pytest.approx(60.0)
+
+
+def test_cli_wires_populate_and_slot_pinning_flags(capsys):
+    """`--populate-slot` / `--verify-slot-id` / `--load-slot-id` reach the run."""
+    exit_code = m.main(
+        [
+            "--dry-run",
+            "--json",
+            "--slot-id",
+            "1",
+            "--under-load",
+            "--populate-slot",
+            "--verify-slot-id",
+            "1",
+            "--load-slot-id",
+            "0",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["populate_slot"] is True
+    assert payload["slot_id"] == 1
+    assert payload["verify_slot_id"] == 1
+    assert payload["load_slot_id"] == 0
+    assert payload["schema_version"] == 3
 
 
 def test_cli_json_roundtrip_of_a_full_stub_run(capsys, tmp_path):
