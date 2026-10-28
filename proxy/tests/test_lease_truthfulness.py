@@ -110,7 +110,25 @@ def _record(now: float, **overrides) -> dict:
 
 
 def _log_lines(logger, level="info") -> list[str]:
-    return [str(call) for call in getattr(logger, level).call_args_list]
+    """Render ``logger.<level>`` calls back into their formatted lines.
+
+    Production logs use lazy ``%``-formatting (``logger.info("... %s", value)``)
+    and may pass structured ``extra=`` data, so rendering ``str(call)`` would
+    hide the message text. ``extra`` never forms part of the message, so it is
+    ignored here.
+    """
+    lines: list[str] = []
+    for call in getattr(logger, level).call_args_list:
+        template = str(call.args[0]) if call.args else ""
+        args = call.args[1:]
+        if args and "%" in template:
+            try:
+                lines.append(template % args)
+                continue
+            except (TypeError, ValueError):
+                pass
+        lines.append(template + (" " + " ".join(str(a) for a in args) if args else ""))
+    return lines
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

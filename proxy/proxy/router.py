@@ -1689,18 +1689,26 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         #
                         # Fail-open (AC5): any peek problem (exception, no progress,
                         # unreadable measurement) simply hands the already-read bytes
-                        # plus the same iterator/reframer to the normal loop, which is
-                        # then exactly the pre-change behaviour.
+                        # plus the same iterator to the normal loop, which is then
+                        # exactly the pre-change behaviour.
+                        #
+                        # The peek keeps its OWN reframer and the loop always
+                        # builds a fresh one: the peek's raw reads are replayed
+                        # through that fresh reframer in order, so the two never
+                        # share a partial-event buffer (a shared buffer double-
+                        # fed the bytes and corrupted a chunk that carried a
+                        # complete event plus the start of the next one —
+                        # LP-0MVR7IXAI002QXXD).
                         _prefetched_chunks: list[bytes] = []
-                        _prefetched_reframer = None
                         _prefetched_aiter = None
                         _prefetch_error = None
                         if (
                             _prompt_progress_capture_enabled
                             and _measured_abort_settings is not None
                         ):
+                            _peek_bound_is_deadline = True
                             try:
-                                _prefetched_reframer = SSEEventReframer()
+                                _peek_reframer = SSEEventReframer()
                                 _prefetched_aiter = response.aiter_bytes().__aiter__()
                                 # The prefill deadline (and the wedge ceiling it
                                 # tightens) still bounds the pre-first-byte wait: with
@@ -1708,25 +1716,72 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 # start, so this peek — not the first-byte monitor — is
                                 # where that bound now applies.
                                 _prefetch_timeout = _get_first_byte_timeout_seconds(srv)
-                                if _prefetch_timeout > 0:
-                                    if isinstance(_dispatch_start, float):
-                                        _prefetch_timeout -= max(
-                                            0.0,
-                                            time.monotonic() - _dispatch_start,
+                                if isinstance(_dispatch_start, float):
+                                    _peek_elapsed = max(
+                                        0.0, time.monotonic() - _dispatch_start
+                                    )
+                                    if _prefetch_timeout > 0:
+                                        _prefetch_timeout -= _peek_elapsed
+                                        if _prefetch_timeout <= 0:
+                                            # The ceiling already expired: run the
+                                            # deadline detour instead of an
+                                            # unbounded peek.
+                                            raise TimeoutError()
+                                    # The stream loop's runtime budget bounds the
+                                    # peek too: a completely hung upstream must keep
+                                    # today's heartbeats + synthesised termination
+                                    # instead of waiting out the (longer) prefill
+                                    # ceiling and returning a 503.
+                                    try:
+                                        _peek_runtime_budget = float(
+                                            server_config.get(
+                                                "session_guardrail_max_runtime_seconds",
+                                                1800,
+                                            )
+                                            or 1800
                                         )
-                                    if _prefetch_timeout <= 0:
-                                        # The ceiling already expired: run the
-                                        # deadline detour instead of an
-                                        # unbounded peek.
-                                        raise TimeoutError()
-                                _prefetch = await _prefetch_measured_cache_abort(
-                                    _prefetched_aiter,
-                                    _prefetched_reframer,
-                                    settings=_measured_abort_settings,
-                                    priced_new_tokens=_priced_new_tokens,
+                                    except (TypeError, ValueError):
+                                        _peek_runtime_budget = 1800.0
+                                    _peek_remaining_runtime = (
+                                        _peek_runtime_budget - _peek_elapsed
+                                    )
+                                    if _prefetch_timeout <= 0 or (
+                                        0 < _peek_remaining_runtime < _prefetch_timeout
+                                    ):
+                                        _prefetch_timeout = _peek_remaining_runtime
+                                        _peek_bound_is_deadline = False
+                                # Keep the pre-first-byte monitor's duties while
+                                # peeking (LP-0MVR7IXAI002QXXD): with
+                                # ``return_progress`` the headers arrive at prefill
+                                # start, so without this the dispatch lease is no
+                                # longer extended and a client that dies mid-peek is
+                                # no longer detected.
+                                _prefetch = await _await_first_byte_with_prefill_monitor(
+                                    srv,
+                                    _prefetch_measured_cache_abort(
+                                        _prefetched_aiter,
+                                        _peek_reframer,
+                                        settings=_measured_abort_settings,
+                                        priced_new_tokens=_priced_new_tokens,
+                                        # The monitor owns the bound.
+                                        timeout=0,
+                                        # Keep every raw read even if the
+                                        # monitor cancels the peek.
+                                        chunks_sink=_prefetched_chunks,
+                                    ),
                                     timeout=_prefetch_timeout,
+                                    poll_seconds=_first_byte_poll_seconds,
+                                    warn_seconds=_first_byte_warn_seconds,
+                                    session_id=(
+                                        session_id if session_explicit else None
+                                    ),
+                                    endpoint=endpoint,
+                                    llama_port=llama_port,
+                                    model_name=model_name,
+                                    slot_id=slot_id,
+                                    request=request,
+                                    dispatch_session_id=session_id,
                                 )
-                                _prefetched_chunks = list(_prefetch.chunks)
                                 _prefetch_error = _prefetch.error
                                 if _prefetch.abort:
                                     raise MeasuredCacheAbortDetourError(
@@ -1735,10 +1790,17 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             except MeasuredCacheAbortDetourError:
                                 raise
                             except TimeoutError:
-                                # The deadline expired while peeking: run TODAY'S
-                                # deadline detour (release + retryable 503) rather
-                                # than losing the bound to the early-abort feature.
-                                raise
+                                if _peek_bound_is_deadline:
+                                    # The deadline expired while peeking: run
+                                    # TODAY'S deadline detour (release +
+                                    # retryable 503) rather than losing the bound
+                                    # to the early-abort feature.
+                                    raise
+                                # Runtime budget exhausted while peeking (a
+                                # completely hung upstream): fail open. The
+                                # consumed reads are replayed and the stream loop
+                                # applies its own heartbeat + termination path.
+                                _prefetch_error = None
                             except Exception:
                                 # Fail-open (AC5): keep every byte already read.
                                 _prefetch_error = None
@@ -2164,14 +2226,12 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # Re-frame upstream bytes to SSE event boundaries
                         # (LP-0MUOBUPBC002GYTL): only complete events reach the
                         # client; a trailing partial is dropped before the
-                        # synthesised terminal events. When the early-abort
-                        # peek (LP-0MVR7IN0O000DPXN) already consumed bytes it
-                        # hands over ITS reframer so a split event is not lost.
-                        _reframer = (
-                            _prefetched_reframer
-                            if _prefetched_reframer is not None
-                            else SSEEventReframer()
-                        )
+                        # synthesised terminal events. The early-abort peek
+                        # (LP-0MVR7IN0O000DPXN) hands over the raw reads it
+                        # consumed; they are replayed first and re-framed here
+                        # from a FRESH reframer, so a partial event is never
+                        # double-fed (LP-0MVR7IXAI002QXXD).
+                        _reframer = SSEEventReframer()
 
                         # LP-0MVR7DAFF006HBRX AC2: per-dispatch capture of the
                         # measured ``prompt_progress`` events. ``None`` when the

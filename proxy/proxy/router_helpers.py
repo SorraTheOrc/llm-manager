@@ -3241,6 +3241,7 @@ async def _prefetch_measured_cache_abort(
     priced_new_tokens: float | None = None,
     timeout: float = 5.0,
     max_chunks: int = 1024,
+    chunks_sink: list[bytes] | None = None,
 ) -> MeasuredAbortPrefetch:
     """Peek the local SSE stream for the first ``prompt_progress`` measurement.
 
@@ -3271,6 +3272,12 @@ async def _prefetch_measured_cache_abort(
     raised error. ``settings``/``priced_new_tokens`` come from the router's
     fail-open-resolved configuration; ``None`` prices simply continue.
 
+    *chunks_sink* lets the caller see every raw read even when this coroutine
+    is cancelled (the router bounds the peek with the same pre-first-byte
+    monitor it uses for the header wait, LP-0MVR7IXAI002QXXD). The caller then
+    replays those bytes through a fresh ``SSEEventReframer``, so a cancelled
+    peek never loses or re-orders a byte.
+
     *aiter* is the dispatch's ``aiter_bytes()`` iterator and *reframer* its
     :class:`proxy.utils.SSEEventReframer`, both owned by the caller: the peek
     must consume the SAME cursor and event buffer the normal stream loop
@@ -3288,7 +3295,7 @@ async def _prefetch_measured_cache_abort(
     if not isinstance(effective, AbortSettings) or not effective.enabled:
         return MeasuredAbortPrefetch(chunks=[], abort=False)
 
-    chunks: list[bytes] = []
+    chunks: list[bytes] = [] if chunks_sink is None else chunks_sink
     capture = PromptProgressCapture()
     decided_measured = None
     deadline_at = time.monotonic() + timeout if timeout > 0 else None
