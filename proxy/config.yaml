@@ -2037,16 +2037,26 @@ server:
   # threshold_seconds=... estimated_tokens=... session=...`` and is counted as
   # ``local_idle_admit`` by the usage report.
   #
-  # MEASUREMENT WINDOW IN PROGRESS (LP-0MVJXGSEG0045IAF, approved by the
-  # producer 2026-10-22): the override is ON so the >= 24 h before/after
-  # measurement for LP-0MVGHXD59008UOUD can run. The window starts at the
-  # `POST /admin/reload-config` that made this flag live (recorded on the work
-  # item; no restart needed) and is analysed with
-  # ``scripts/idle_admit_impact.py --window-closed``.
+  # MEASUREMENT WINDOW (LP-0MVJXGSEG0045IAF, approved by the producer
+  # 2026-10-22): the override was turned ON so the >= 24 h before/after
+  # measurement for LP-0MVGHXD59008UOUD could run. Window
+  # 2026-10-22 21:48:05 -> 2026-10-23 21:48:05, started by the
+  # `POST /admin/reload-config` that made this flag live (no restart needed)
+  # and analysed with ``scripts/idle_admit_impact.py --window-closed``.
+  #
+  # MEASURED RESULT: 31 admissions, 0 conversions — 22 dispatched and were
+  # cancelled at ``local_prefill_deadline_seconds`` with zero prefill
+  # progress, 9 were refused by the ETA admission guard's queue budget, and
+  # **none** was refused by the local dispatch lease gate. The lease gate is
+  # therefore not what costs the override its win: it stays a no-preemption
+  # occupancy contract (decision LP-0MVK35UX20081BIB, see
+  # ``docs/dev/idle-window-measurements.md``), and the eligibility gap is
+  # LP-0MVRCLPVI0057116.
   #
   # ROLLBACK is this flag back to ``false`` + the same reload (no other state).
-  # Keep it on only if the measured window supports `enable_by_default`; if the
-  # tool says `tune`, apply the tuning it proposes before leaving it enabled.
+  # Keep it on only while an eligibility fix (LP-0MVRCLPVI0057116) or a
+  # re-measured window supports `enable_by_default`; the measured window did
+  # not, so leaving it on untuned spends slot time on doomed prefills.
   # A malformed or non-positive ``local_idle_admit_seconds`` also disables the
   # override rather than admitting on a guess.
   local_idle_admit_enabled: true

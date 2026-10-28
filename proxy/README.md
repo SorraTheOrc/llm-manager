@@ -1047,6 +1047,19 @@ so a request denied solely by the router's prefill-aware guard waits for the
 prefill to finish instead of re-dispatching immediately. Each wait logs
 `contention_queue_wait ... saturation=<generating|prefill|none>` so the two
 saturation kinds are distinguishable in observability.
+- **Idle admission does not preempt a lease** (LP-0MVK35UX20081BIB, measured
+  2026-10-22 21:48 → 2026-10-23 21:48): an idle-admitted request is *not*
+  granted a foreign session's lease, not even a verified-idle one. The window
+  measured 0/31 idle-admitted conversions and **zero** of them refused by
+  `local_lease_active` — the 1,731 lease refusals in that window (100 % shape
+  B: `active` records with no work behind them) block *other* sessions, and
+  preempting them would only turn refusals into aborted prefills while costing
+  the displaced owner a re-prefill. The override's real constraint is prefill
+  feasibility (`local_prefill_deadline_seconds` / the ETA guard's queue
+  budget), tracked as LP-0MVRCLPVI0057116. Lease occupancy is reclaimed only by
+  the no-progress watchdog, orphan cleanup, session eviction and adaptive
+  expiry. Numbers and rationale: `docs/dev/idle-window-measurements.md`;
+  design note: `docs/dev/slot-management-design.md` §9.2.
 
 Behavior:
 - **Streaming requests** (`stream: true`) receive periodic SSE comment lines

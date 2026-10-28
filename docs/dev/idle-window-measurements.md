@@ -9,8 +9,15 @@ instead of falling back to a paid remote provider. The override only fires
 while the GPU is demonstrably idle; the physical capacity cap
 (`context_too_large`) is never overridden.
 
-The override is **off by default** (`server.local_idle_admit_enabled: false`)
-until this measurement says whether the trade is worth it.
+The override is **off in the shipped default** (`server.local_idle_admit_enabled:
+false`). The ≥ 24 h window of record (2026-10-22 21:48:05 → 2026-10-23 21:48:05)
+ran with it enabled (LP-0MVJXGSEG0045IAF) and measured **31 admissions with 0
+conversions** — every admitted prompt was refused by the ETA admission guard or
+cancelled at the prefill deadline before a first byte. The numbers, the
+downstream lease-gate reading and the recorded decision are in
+[Lease-gate decision](#lease-gate-decision-lp-0mvk35ux20081bib-the-dispatch-lease-gate-stays-as-is)
+below; the machine artifact is
+`docs/dev/idle-window-measurement-2026-10-22-to-2026-10-23.json`.
 
 ## Tool
 
@@ -261,7 +268,138 @@ split was 223 (66 %) with no work behind it (`no_progress_watchdog` /
 was 134 (46 %), 84 (29 %), 1 (0.3 %) with 72 (25 %) unconfirmed. The bounded
 contention queue converted 73 of 177 and 26 of 60 of them to a local dispatch.
 That is the shape of the answer the parent AC1 asks for; the recorded decision
-and its window live with LP-0MVK35UX20081BIB.
+and its window live with LP-0MVK35UX20081BIB — see the next section.
+
+## Lease-gate decision (LP-0MVK35UX20081BIB): the dispatch lease gate stays as is
+
+**Decision window of record:** 2026-10-22 21:48:05 → 2026-10-23 21:48:05
+(24.0 h, `--window-closed`, `--deployed-at '2026-10-22 21:48'`) — the window
+opened by LP-0MVJXGSEG0045IAF. Machine artifact:
+`docs/dev/idle-window-measurement-2026-10-22-to-2026-10-23.json`. Reproduce
+with:
+
+```bash
+./scripts/idle_admit_impact.py \
+    --before-start '2026-10-21 21:48' --before-end '2026-10-22 21:48' \
+    --after-start '2026-10-22 21:48' --after-end '2026-10-23 21:48' \
+    --deployed-at '2026-10-22 21:48' --window-closed --json
+```
+
+### AC1 — the measured conversion rate, and what the lease gate costs it
+
+**31 `routing_idle_admit` events converted 0 times (0/31 local first bytes).**
+The tool's pairing (`ac2.idle_admitted_sample_counts` = 0 paired, 31 unpaired)
+and a per-event trace of the same window agree, so the zero is not a
+correlation-window artefact:
+
+| Outcome of the 31 admits | Count | Evidence |
+| --- | ---: | --- |
+| Converted (local first byte) | **0** | no `dispatch_first_byte_ms` line on any admitted session |
+| Dispatched, then cancelled at the prefill deadline | 22 | `prefill_deadline_exceeded ... deadline=90s → cancelling local dispatch and detouring to the next provider`, preceded by `lease_extended_during_prefill ... progress=None alive=False in_flight=True` (no observable prefill progress) |
+| Refused on arrival by the ETA admission guard | 9 | `local_admission_guard decision=reject reason=eta_exceeds_budget_direct enforced=true` (projected prefill 63–362 s vs the 60 s queue budget; e.g. 118,064 tokens → `eta_prefill_s=118.1`) |
+| Refused by the dispatch lease gate (`local_lease_active`) | **0** | no `local_dispatch_denied session=<admitted session>` line exists for any of the 31 |
+
+The deadline in force during the window was 90 s (the shipped knob is now 120 s);
+the direction is the same for both — the admitted prompts' projected prefills
+far exceed either value.
+
+**So the lease gate costs the override zero measured conversions: not one of the
+requests it admitted was refused by `local_lease_active`.** The constraint that
+actually eats the win is prefill feasibility — the 90 s prefill deadline (22) and
+the ETA guard's 60 s queue budget (9). The counterfactual's 75.9 % therefore
+over-estimates for a different reason than the lease gate: the admitted prompts
+(39 K–119 K tokens, all `cache_state=cold`) cannot reach a first byte inside the
+deadline at all.
+
+### AC1 — which blocking shape accounts for the refusals
+
+| Metric | before (10-21 21:48 → 10-22 21:48) | after / window (10-22 21:48 → 10-23 21:48) |
+| --- | ---: | ---: |
+| `local_lease_active` refusals (`cold_start=False`) | 1,451 | 1,731 |
+| **shape A** — inactive cooldown lease (`active=0`) | **0** | **0** |
+| **shape B** — `active` record (`active>=1`) | 1,451 (100 %) | 1,731 (100 %) |
+| — no work behind it | 1,147 | 1,674 (96.7 %) |
+| — silent prefill (`prefill_deadline`) | 0 | 0 |
+| — genuinely working owner | 0 | 0 |
+| — unconfirmed | 304 | 57 (3.3 %) |
+| `lease_released` (all reasons) | 590 | 348 |
+| — `idle_timeout` / `session_evicted` / `no_progress_watchdog` / `prefill_deadline` | 250 / 124 / 22 / **0** | 207 / 114 / 27 / **0** |
+| Contention queue: dispatched local / fell through | 235 / 487 | 100 / 522 |
+
+Shape A never occurs in either window, and **no** `lease_released` line carries
+`reason=prefill_deadline`. The refusals are entirely **shape B**: `active`
+records with no GPU work behind them — wedged/abandoned streams released by the
+no-progress watchdog (27 in the window) or expiring by adaptive idle timeout
+(207), corroborated by `status_request ... local_active_query=false` for 40.
+Silent prefills are not among the refusal causes in this window: the dominant
+shape-B evidence is `adaptive_expiry` (1,458 of 1,674) — the long adaptive
+lease on a record with no progress behind it — followed by
+`no_progress_watchdog` (176) and `status_idle_owner` (40).
+
+### AC2 — the decision and its rationale
+
+**Option 1 — leave the lease gate as is.** No gate change is activated, and the
+option-4 follow-up LP-0MVK368JZ000TDW7 is closed with this decision recorded on
+it. Shapes converted: **none** (no change) — and none of the alternatives has a
+measured shape to convert in this window.
+
+- **Option 3 (remaining-time gate)** converts shape A only; shape A is 0 in both
+  measured windows, so it would convert nothing.
+- **Option 4 (preempt verified-idle foreign lease)** is the only option whose
+  predicate targets what the window actually contains (1,674 shape-B
+  no-work-behind-it refusals). It is still not activated: the requests it would
+  release the gate for are exactly the admitted prompts that cannot reach a
+  first byte here, so it would turn refusals into *aborted* prefills — ~90 s of
+  slot time each for zero conversions — while charging the displaced owner a
+  re-prefill. The 42 refusals owned by already-admitted (then aborted) sessions
+  show the cost direction without buying any of the win.
+- **Option 2 (blanket preempt)** has the same zero-win economics without the
+  verified-idle predicate — strictly worse than option 4.
+- **Option 5 (prefill-aware idle clock)** has no support in the numbers: zero
+  refusals attribute to a silent prefill (`prefill_deadline` = 0 in both
+  windows' `lease_released` reasons and in shape-B corroboration). The prefill
+  blindness that matters is the override's own admission — it admits prompts
+  whose projected prefill exceeds the deadline/budget — and that is filed as a
+  follow-up rather than solved by a clock change.
+
+**Load caveat.** The after window was ~2× busier than the before window
+(`large_context_bypass` 1,790 → 3,702; remote fallbacks 6,953 → 12,888;
+denials 66.0 → 72.1 per hour), so 0/31 is a heavy-load measurement. The
+mechanism (admit → ETA refusal or deadline abort) does not depend on load, and
+no gate change is justified either way — the decision is "do not change the
+gate", not "the gate costs nothing under all loads".
+
+### AC5 — follow-ups filed rather than added to this scope
+
+The real blocker is filed as **LP-0MVRCLPVI0057116** (*Idle-admit eligibility
+must match prefill feasibility (measured 0/31 conversion)*), the AC5 tuning
+follow-up of LP-0MVGHXD59008UOUD, linked to LP-0MVNBJYE3003MF6J (ETA-guard /
+prefill-deadline interaction). Audit-session lease hygiene — why an `active`
+record with no work exists for minutes — stays with the existing wedge/orphan
+items (LP-0MVO8H7VQ003B12I, LP-0MUCEFB8E003YVFF); it is not re-filed here.
+
+### Appendix Q3 — the probe's ~705 s lease, settled
+
+The original probe's own refusal is inside this window:
+
+```
+2026-10-22 21:57:13 local_dispatch_denied session=idle-admit-verify-1792702147
+  owner=audit-AH-0MVIMPC11001F7WU-verdict_reask-11ea1acf active=1 cold_start=False
+2026-10-22 21:59:26 lease_released session=audit-AH-0MVIMPC11001F7WU-verdict_reask-11ea1acf
+  reason=no_progress_watchdog endpoint=http://localhost:8080
+2026-10-22 21:59:26 dispatch_cleanup removed 1 stale lease(s)
+```
+
+Shape B, and the owning record was reclaimed by the **no-progress watchdog** —
+a wedged `active` record with no work behind it, matching the adaptive-lease
+arithmetic (30 s base + 45,000 × 0.015 = 705 s). It was **not** a long silent
+prefill: the window's 348 `lease_released` lines carry zero
+`reason=prefill_deadline`, and zero shape-B refusals corroborate to
+`prefill_deadline`. **Q3 is settled from the window's `lease_released`
+reasons.** (The probe's next request, once the lease cleared, was then refused
+by the ETA guard — `eta_exceeds_budget_direct`, 53.6 s projected prefill vs the
+60 s budget — which is the same prefill-feasibility constraint described above,
+not a lease condition.)
 
 ## Tests
 
