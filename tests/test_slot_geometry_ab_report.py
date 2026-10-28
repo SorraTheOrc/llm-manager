@@ -385,15 +385,30 @@ def test_compare_keeps_two_slots_when_first_byte_p90_worsens_past_30pct(tmp_path
     assert criteria["first_byte_p90"]["met"] is False
 
 
-def test_compare_keeps_two_slots_when_busy_regresses_by_more_than_10_points(tmp_path):
+def test_compare_keeps_two_slots_on_any_busy_regression(tmp_path):
+    """Criterion (d) is zero-tolerance (producer decision 2026-10-28, answer 2):
+    "local busy must not regress at all" — even a 0.1-point dip fails."""
     data, _ = _compare(
         tmp_path,
         GATE_MET_ARM_A,
-        _with(GATE_MET_ARM_B, local_busy_pct=49.0),
+        _with(GATE_MET_ARM_B, local_busy_pct=59.9),
     )
     assert data["decision"] == "keep_2_slots"
     criteria = {c["name"]: c for c in data["criteria"]}
     assert criteria["local_busy_pct"]["met"] is False
+    assert "0-point tolerance" in criteria["local_busy_pct"]["detail"]
+
+
+def test_compare_adopts_when_busy_is_merely_unchanged(tmp_path):
+    """Zero tolerance must not mean "must improve": equal busy passes (d)."""
+    data, _ = _compare(
+        tmp_path,
+        GATE_MET_ARM_A,
+        _with(GATE_MET_ARM_B, local_busy_pct=GATE_MET_ARM_A["metrics"]["local_busy_pct"]),
+    )
+    criteria = {c["name"]: c for c in data["criteria"]}
+    assert criteria["local_busy_pct"]["met"] is True
+    assert data["decision"] == "adopt_1x262k"
 
 
 def test_compare_is_inconclusive_when_the_busy_evidence_gate_is_unmet(tmp_path):

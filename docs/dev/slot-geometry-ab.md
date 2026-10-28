@@ -186,6 +186,11 @@ python3 scripts/slot_geometry_ab_report.py capture --label arm-a-2x131k --arm A 
 
 ## 4. Pre-registered decision gate (written before any measurement)
 
+Ratified by the producer on 2026-10-28 (answers recorded on
+LP-0MVMHNUXW0061FGN): criteria (a)–(c) confirmed as proposed, criterion (d)
+**tightened** from the proposed 10-point tolerance to **zero tolerance**
+("local busy must not regress at all").
+
 `compare` applies exactly these four criteria to the two captured arms. They are
 constants in `scripts/slot_geometry_ab_report.py` and are **not** to be tuned
 after seeing the numbers:
@@ -195,7 +200,7 @@ after seeing the numbers:
 | (a) | `turns_served_locally` | candidate `>=` baseline (local volume must not shrink) |
 | (b) | `context_ceiling_diverts` | candidate diverts fall by **>= 50 %** vs baseline — the whole point of the extra context |
 | (c) | `first_byte_p90` | candidate p90 must not worsen by **> 30 %** (local `dispatch_to_first_byte_ms` p90; falls back to stream TTFT p90 when no local samples exist) |
-| (d) | `local_busy_pct` | candidate must not regress by **> 10 points** (local work must not stall behind one slot) |
+| (d) | `local_busy_pct` | candidate must **not regress at all** — zero tolerance (local work must not stall behind one slot) |
 
 Decision precedence:
 

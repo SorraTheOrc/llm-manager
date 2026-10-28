@@ -69,11 +69,20 @@ DEFAULT_OUT_ROOT = REPO_ROOT / "benchmark-results" / "slot-geometry"
 DEFAULT_CONFIG = REPO_ROOT / "proxy" / "config.yaml"
 
 # Pre-registered decision gate (written into docs/dev/slot-geometry-ab.md and
-# recorded on the parent BEFORE any arm window is measured).
+# recorded on the parent BEFORE any arm window is measured, then ratified by
+# the producer on 2026-10-28 — answers recorded on LP-0MVMHNUXW0061FGN).
 GATE_MIN_BUSY_PCT = 60.0          # AC0: evidence gate, not a criterion
 GATE_DIVERT_MIN_REDUCTION = 0.50  # (b) context_ceiling diverts must fall >= 50 %
 GATE_MAX_TTFT_WORSENING = 0.30    # (c) p90 first-byte must not worsen by > 30 %
-GATE_MAX_BUSY_REGRESSION_POINTS = 10.0  # (d) local busy % must not regress > 10 pts
+# (d) local busy % must not regress AT ALL. The plan proposed a 10-point
+# tolerance; the producer withdrew it on 2026-10-28 (answer 2 on
+# LP-0MVMHNUXW0061FGN): "local busy must not regress at all". Zero tolerance —
+# the extra per-slot context is only worth having if it does not cost local
+# throughput, so no regression budget exists.
+GATE_MAX_BUSY_REGRESSION_POINTS = 0.0
+#: Float slack for the zero-tolerance busy comparison: percentages arriving as
+#: identical inputs must never fail on binary-representation noise alone.
+_BUSY_EPSILON = 1e-9
 
 # Reasons counted in the (b) criterion — the cap/bypass pair the parent's
 # evidence singled out (2,064 ``context_too_large`` skips in 24 h).
@@ -402,7 +411,9 @@ def compare_reports(baseline: dict, candidate: dict) -> dict:
           by at least 50 %;
       (c) p90 dispatch→first byte must not worsen by more than 30 % (falls
           back to the stream TTFT p90 when no local dispatch samples exist);
-      (d) local busy % must not regress by more than 10 points.
+      (d) local busy % must not regress AT ALL (zero tolerance; the plan's
+          proposed 10-point tolerance was withdrawn by the producer on
+          2026-10-28).
     Decision precedence: any failed criterion means KEEP 2 slots (a measured
     regression is evidence of harm whether or not the window was contended);
     otherwise, the candidate wins only when the evidence gate is met — both
@@ -473,14 +484,15 @@ def compare_reports(baseline: dict, candidate: dict) -> dict:
     )
 
     b_busy, c_busy = b_m["local_busy_pct"], c_m["local_busy_pct"]
+    busies_regressed = c_busy < b_busy - GATE_MAX_BUSY_REGRESSION_POINTS - _BUSY_EPSILON
     criteria.append(
         _criterion(
             "local_busy_pct",
             b_busy,
             c_busy,
-            c_busy >= b_busy - GATE_MAX_BUSY_REGRESSION_POINTS,
-            f"{c_busy - b_busy:+.1f} pts busy (must not regress by > "
-            f"{GATE_MAX_BUSY_REGRESSION_POINTS:.0f} pts)",
+            not busies_regressed,
+            f"{c_busy - b_busy:+.2f} pts busy (must not regress at all: "
+            f"0-point tolerance, producer decision 2026-10-28)",
         )
     )
 
