@@ -13,6 +13,10 @@ Covered acceptance criteria:
   missing calibration ⇒ today's behaviour unchanged.
 - AC5: a 90 %-cached 100k prompt is still admitted (and queued) because its
   ``new_tokens`` term is small.
+
+Also pins the per-reason retry contract for ``reason=prefill_budget_exceeded``
+(LP-0MVQ239VQ001RXZ0, AC1 of LP-0MVNTT4X8009IO2X): a prompt that is
+permanently over the flat cold-prefill cap must NOT advertise ``Retry-After``.
 """
 
 from __future__ import annotations
@@ -33,9 +37,9 @@ from proxy import contention_queue, prefill_eta
 class _DummyRequest:
     """Minimal request stub (matches the contention-queue test helpers)."""
 
-    def __init__(self, body: bytes = b'{"model":"test"}'):
+    def __init__(self, body: bytes = b'{"model":"test"}', headers=None):
         self._body = body
-        self.headers = {}
+        self.headers = headers or {}
         self.method = "POST"
         self.url = type("U", (), {"path": "/v1/chat/completions"})()
 
@@ -708,3 +712,141 @@ async def test_direct_dispatch_logs_one_labelled_guard_line(mixed_model_config, 
         and "attempt=" in r.getMessage()
         for r in caplog.records
     ), "the chosen fallback provider must be logged"
+
+
+# ---------------------------------------------------------------------------
+# AC1 (LP-0MVNTT4X8009IO2X): ``prefill_budget_exceeded`` is NOT time-retryable
+#
+# Regression pin for the 2026-10-25 11:57:09 UTC refusal: a prompt of 31 246
+# new (uncached) tokens against the flat 25 000-token cold-prefill cap was
+# answered with ``Retry-After: 1`` / ``"retry_after": 1``. Waiting cannot help
+# — the prompt is permanently over a flat cap — so the client backed off seven
+# times (up to 2 m 8 s) and then reported the 429 as non-retryable. Both
+# refusal builders are covered because either can answer a refused client:
+# ``_build_local_only_refusal_response()`` (local-only intent, remote still
+# available) and ``_build_local_admission_reject_response()`` (the chain is
+# exhausted as well).
+#
+# TDD red phase (the repo convention of ``test_provider_context_limit.py``):
+# the two tests are marked ``xfail(strict=True)`` because neither builder is
+# reason-aware yet. LP-0MVQ23API001UOET (reason-aware retry timing) and
+# LP-0MVQ23AYQ000CGTW (token evidence) remove the markers, at which point a
+# regression fails loudly instead of silently xfailing.
+# ---------------------------------------------------------------------------
+
+#: The 2026-10-25 incident verdict, verbatim.
+INCIDENT_NEW_TOKENS = 31_246
+INCIDENT_BUDGET_TOKENS = 25_000
+
+
+def _cold_budget_cfg(**server_overrides) -> dict:
+    """Shipped post-incident admission config: flat 25k cold-prefill cap."""
+    return _queue_cfg(
+        local_cold_prefill_budget_tokens=INCIDENT_BUDGET_TOKENS,
+        **server_overrides,
+    )
+
+
+def _assert_prefill_budget_refusal_contract(result) -> dict:
+    """Assert the AC1 contract shared by both refusal paths; return the body.
+
+    A refusal whose cause is a permanent over-budget prompt must be explicit
+    about the fact that time does not heal it: no ``Retry-After``, an explicit
+    ``retryable: false`` / ``retry_after: null``, the token evidence the client
+    needs to size a compaction, and a remedy that names compaction.
+    """
+    assert result.status_code == 429
+    assert result.headers.get("Retry-After") is None, (
+        "an over-budget prompt is not time-retryable: advertising a delay "
+        "invites the retry storm observed on 2026-10-25"
+    )
+
+    body = json.loads(result.body)
+    assert body.get("retryable") is False
+    assert body.get("retry_after") is None
+    assert body.get("new_tokens") == INCIDENT_NEW_TOKENS, (
+        "the refusal must carry the token evidence the client compacts against"
+    )
+    assert body.get("budget_tokens") == INCIDENT_BUDGET_TOKENS
+    assert "compact" in str(body.get("suggested_action") or "").lower(), (
+        "the suggested action must name compaction as the remedy"
+    )
+    return body
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "red phase: refusal builders are not reason-aware yet — "
+        "LP-0MVQ23API001UOET / LP-0MVQ23AYQ000CGTW turn this green"
+    ),
+)
+@pytest.mark.asyncio
+async def test_prefill_budget_exceeded_local_only_refusal_is_not_time_retryable(
+    mixed_model_config,
+):
+    """Local-only client, remote still available: 429 without ``Retry-After``."""
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"x-local-preference": "local-only"}),
+            "v1/chat/completions",
+            mixed_model_config,
+            _cold_budget_cfg(),
+        )
+
+    assert calls == [], "a local-only client must never be moved remote"
+    body = _assert_prefill_budget_refusal_contract(result)
+    assert body["reason"] == "prefill_budget_exceeded"
+    assert result.headers.get("X-Local-Route") == "refused"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "red phase: refusal builders are not reason-aware yet — "
+        "LP-0MVQ23API001UOET / LP-0MVQ23AYQ000CGTW turn this green"
+    ),
+)
+@pytest.mark.asyncio
+async def test_prefill_budget_exceeded_exhaustion_refusal_is_not_time_retryable():
+    """The chain is exhausted too: same contract on the exhaustion refusal."""
+    local_only_chain = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"}
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+    async def _local(_req, _path):
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", local_only_chain,
+            _cold_budget_cfg(),
+        )
+
+    body = _assert_prefill_budget_refusal_contract(result)
+    assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+    assert body["error"] == "All providers exhausted"
