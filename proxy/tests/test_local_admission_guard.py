@@ -1330,17 +1330,14 @@ async def test_occupancy_refusal_advertises_a_truthful_retry_time(
 #
 # Non-admission skips: ``cooldown`` and ``context_too_large`` are pinned here
 # because their contract is already decided (a real cooldown remainder, and
-# "compact, do not wait"). The other two non-admission causes — a held dispatch
-# lease and a contention-queue expiry — are deliberately left to
-# LP-0MVQ23B80009OZ9V, which must first settle their advertised reason
-# vocabulary and expiry source; pinning a guess here would over-specify it.
+# "compact, do not wait"). The lease-held and contention-queue-expiry causes
+# are pinned by ``test_local_non_admission_retry_timing.py``
+# (LP-0MVQ23B80009OZ9V), which also pins this file's non-admission rows green.
 #
-# TDD red phase, as in the sections above: the AC1/AC2 rows are green since
-# LP-0MVQ23API001UOET (reason-aware timing) and LP-0MVQ23AYQ000CGTW (token
-# evidence). The two non-admission rows (``cooldown`` and ``context_too_large``)
-# are marked ``xfail(strict=True)`` per row
-# (:data:`_NON_ADMISSION_PENDING_REASONS`) until LP-0MVQ23B80009OZ9V
-# (non-admission retry timing) lands.
+# Every row is green: the AC1/AC2 rows since LP-0MVQ23API001UOET (reason-aware
+# timing) and LP-0MVQ23AYQ000CGTW (token evidence); the two non-admission rows
+# (``cooldown`` and ``context_too_large``) since LP-0MVQ23B80009OZ9V
+# (non-admission retry timing). A red row is a real regression.
 # ---------------------------------------------------------------------------
 
 #: Real cooldown remaining for the cooldown-refusal cases. Kept far enough above
@@ -1434,32 +1431,12 @@ _REFUSAL_CONTRACT_ROWS = [
     ),
 ]
 
-#: Rows whose refusal does not exist yet: a non-admission skip (cooldown,
-#: ``context_too_large``) still falls through to a remote provider behind a
-#: ``local-only`` client's back and advertises no real expiry, so those rows are
-#: pinned but expected to fail until LP-0MVQ23B80009OZ9V lands. Kept beside the
-#: table so the rows stay one table (the reasons and their expectations are not
-#: duplicated) while the red-phase expectation is expressed per row.
-_NON_ADMISSION_PENDING_REASONS = frozenset({"context_too_large", "cooldown"})
-
+#: Every row is asserted green: the choke point refuses every exit, the
+#: reason-token child records the per-branch tokens, and the non-admission
+#: rows (cooldown, ``context_too_large``) advertise their real expiry/no-timer
+#: contract since LP-0MVQ23B80009OZ9V. A future red row is a real failure.
 _REFUSAL_CONTRACT_PARAMS = [
-    pytest.param(
-        row,
-        id=row.reason,
-        marks=(
-            pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "red phase: a non-admission skip still falls through to "
-                    f"remote and advertises no real expiry ({row.reason}) — "
-                    "LP-0MVQ23B80009OZ9V turns this green"
-                ),
-            ),
-        )
-        if row.reason in _NON_ADMISSION_PENDING_REASONS
-        else (),
-    )
-    for row in _REFUSAL_CONTRACT_ROWS
+    pytest.param(row, id=row.reason) for row in _REFUSAL_CONTRACT_ROWS
 ]
 
 
@@ -1641,15 +1618,6 @@ async def test_refusal_reason_follows_the_contract_table(
     assert body.get("budget_tokens") == COLD_PREFILL_BUDGET_TOKENS
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "red phase: a cooldown skip still routes to the next remote provider "
-        "behind a local-only client's back and no refusal carries a real "
-        "cooldown remainder — LP-0MVQ23B80009OZ9V / LP-0MVNU2KTK009D4AG turn "
-        "this green"
-    ),
-)
 @pytest.mark.asyncio
 async def test_cooldown_refusal_advertises_the_cooldown_remainder(
     mixed_model_config,

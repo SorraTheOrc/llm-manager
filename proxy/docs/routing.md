@@ -1347,11 +1347,30 @@ derived from the *real* expiry state (the cooldown remainder, the lease
 remainder or the queue exit) — never from the ETA formula — so the hint tracks
 when local capacity actually returns.
 
-The real-expiry mapping is the contract of LP-0MVQ23B80009OZ9V (blocked by
-this work). On the structural `local-only` refusals — which cannot resolve a
-real expiry today — the shared timing has no measured wait, so the advertised
-`Retry-After` is the 1-second floor of the shared hint, honest for that
-refusal instance and replaced by the real-expiry value when that item lands.
+The real-expiry mapping is the contract of LP-0MVQ23B80009OZ9V. Every
+non-admission exit advertises the expiry of the state that actually blocked
+it, never the ETA formula:
+
+- a local entry **cooling down** → the cooldown remainder
+  (`_provider_unavailable_until`, the state behind `unavailable_providers`);
+- a **quarantined local account** → the usage-limit reset remainder
+  (`_usage_reset_at`);
+- a local entry **outside its `available_times` window** → the seconds until
+  the next window opens;
+- a **held local dispatch lease** → the lease remainder (the live dispatch
+  record's `expires_at`, else the configured
+  `local_dispatch_lease_timeout_seconds`);
+- a **contention-queue exit** → the queue's wait window
+  (`contention_queue_max_wait_seconds`);
+- a **post-deadline prefill-thrash cooldown** → the session's cooldown
+  remainder.
+
+A chain-resolution exit (cooldown / reset / window) records no expiry on the
+request, so it is recomputed from live local availability state at refusal
+time; an exit that measures its own expiry (lease, queue, thrash cooldown)
+records it as it falls through. Only the `local-only` refusal advertises these
+values — `prefer-local` keeps today's remote fall-through, and the ETA/occupancy
+reasons keep their `ceil(wait − budget)` timer.
 
 **Local-only means refuse, not fall through to remote — on every exit.** A
 `local-only` client's refusal is returned to it as a `429` even while remote

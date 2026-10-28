@@ -6437,17 +6437,54 @@ def _local_occupant_prefill_seconds(
         return 0.0
 
 
-def _note_local_fallback_reason(request, reason: str | None) -> None:
+#: Attribute holding the real expiry (seconds from now) behind the recorded
+#: local-route exit, and the routing token evidence a refusal advertises.
+LOCAL_FALLBACK_RETRY_AFTER_ATTR = "_local_fallback_retry_after_s"
+LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR = "_local_fallback_token_evidence"
+
+
+def _note_local_fallback_reason(
+    request, reason: str | None, retry_after_s: int | float | None = None
+) -> None:
     """Record why local was not used, for ``X-Local-Fallback-Reason``.
 
     LP-0MVIKPCSG002B0NL AC6: a client must be able to observe its loss at the
     moment it happens. The reason is stamped on the request as the routing
     cycle falls back and surfaced by ``_stamp_local_route_headers`` at the
     top-level return, so every fallback path is covered by one choke point.
-    Never raises: header bookkeeping must not break routing.
+
+    *retry_after_s* records the **real** expiry behind this exit — the cooldown
+    remainder, the lease remainder or the contention-queue window — so the
+    refusal can advertise when local capacity actually returns instead of the
+    ETA formula (LP-0MVQ23B80009OZ9V AC1–AC4). It is always overwritten, so a
+    later exit can never inherit a stale expiry; ``None`` clears it. Never
+    raises: header bookkeeping must not break routing.
     """
     try:
         setattr(request, "_local_fallback_reason", reason)
+        setattr(request, LOCAL_FALLBACK_RETRY_AFTER_ATTR, retry_after_s)
+    except Exception:
+        pass
+
+
+def _note_local_token_evidence(
+    request, *, new_tokens=None, budget_tokens=None
+) -> None:
+    """Record the token evidence a refused client needs to size a compaction.
+
+    The routing probe already priced the prompt (``new_tokens`` against the
+    flat cold-prefill cap), so a chain-resolution skip such as
+    ``context_too_large`` can carry the same evidence the admission guard
+    emits instead of forcing the client to guess (LP-0MVNTT4X8009IO2X AC4).
+    Missing values are omitted rather than reported as a misleading ``0``.
+    """
+    evidence: dict[str, int] = {}
+    try:
+        if new_tokens is not None:
+            evidence["new_tokens"] = int(new_tokens)
+        if budget_tokens is not None:
+            evidence["budget_tokens"] = int(budget_tokens)
+        setattr(request, LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR, evidence or None)
     except Exception:
         pass
 
@@ -6697,13 +6734,231 @@ SKIP_REASON_LOCAL_LEASE_ACTIVE = _canonical_local_fallback_reason(
     "local_lease_active"
 )
 
+#: Local-route exits whose retry hint is a *real* availability expiry rather
+#: than the ETA formula (LP-0MVQ23B80009OZ9V AC1–AC4). An exit records the
+#: expiry it measured via ``_note_local_fallback_reason(..., retry_after_s=)``;
+#: the chain-resolution reasons are recomputed from the live cooldown / reset /
+#: window state at refusal time because no expiry reaches the request through
+#: the ``reason_sink`` callback.
+REAL_EXPIRY_FALLBACK_REASONS = frozenset({
+    SKIP_REASON_LOCAL_PROVIDER_COOLDOWN,
+    SKIP_REASON_USAGE_LIMIT_RESET_PENDING,
+    SKIP_REASON_OUTSIDE_AVAILABLE_WINDOW,
+    SKIP_REASON_LOCAL_LEASE_ACTIVE,
+    "prefill_thrash_cooldown",
+    "fallback_after_queue",
+})
 
-def _build_local_only_refusal_for_remote(
+
+def _compute_local_retry_after(
+    model_config: dict | None,
+    config: dict | None = None,
+    now_utc: datetime | None = None,
+) -> int:
+    """Real seconds until a local entry is usable again (AC2).
+
+    The local-scoped counterpart of :func:`_compute_retry_after`: it reads the
+    same real state (entry cooldown ``_provider_unavailable_until``, usage-limit
+    quarantine ``_usage_reset_at``, ``available_times`` window edges) but only
+    for ``type: local`` entries, so a refusal never advertises a remote
+    provider's cooldown the client is forbidden from using. Returns ``0`` when
+    no local entry has a pending expiry (an unknown wait, not an instant one).
+    """
+    candidates: list[float] = []
+    for p in (model_config or {}).get("providers") or []:
+        if not isinstance(p, dict) or p.get("type") != "local":
+            continue
+        cooldown_key = _entry_cooldown_key(p)
+        if cooldown_key is not None:
+            remaining = _provider_cooldown_remaining(cooldown_key)
+            if remaining > 0:
+                candidates.append(float(remaining))
+        reset_remaining = _usage_reset_remaining(_usage_limit_account_key(p))
+        if reset_remaining > 0:
+            candidates.append(float(reset_remaining))
+        window = _seconds_until_next_window(p, now_utc=now_utc, config=config)
+        if window is not None and window > 0:
+            candidates.append(float(window))
+    if not candidates:
+        return 0
+    return int(max(candidates))
+
+
+def _local_lease_retry_after_seconds(
+    config: dict | None, endpoint: str | None = None
+) -> int:
+    """Real seconds until a held local dispatch lease is released (AC3).
+
+    The live dispatch record's ``expires_at`` is the truthful remainder; when
+    no record is visible (an anonymous/legacy dispatch, or a unit test) the
+    configured ``local_dispatch_lease_timeout_seconds`` — the same bound
+    :func:`proxy.router_helpers._get_lease_timeout_seconds` reports — is the
+    best available answer. ``0`` means no lease expiry could be resolved.
+    """
+    try:
+        import proxy.server as _srv
+        from proxy.router_helpers import _get_lease_timeout_seconds
+    except Exception:  # pragma: no cover - imports are always available
+        return 0
+    now = time.monotonic()
+    remaining: list[float] = []
+    try:
+        records = getattr(_srv, "local_dispatch_records", None) or {}
+        for key, record in list(records.items()):
+            if not isinstance(record, dict):
+                continue
+            # Endpoint-aware records are keyed (endpoint, session): a lease on
+            # ANOTHER local backend says nothing about this one.
+            if (
+                endpoint
+                and isinstance(key, tuple)
+                and key
+                and key[0]
+                and key[0] != endpoint
+            ):
+                continue
+            expires_at = float(record.get("expires_at") or 0.0)
+            if not record.get("active") and expires_at <= now:
+                continue
+            remaining.append(max(0.0, expires_at - now))
+    except Exception:  # pragma: no cover - defensive
+        remaining = []
+    if remaining:
+        return max(1, int(math.ceil(max(remaining))))
+    try:
+        configured = _get_lease_timeout_seconds(
+            type("_LeaseConfigView", (), {"config": config})()
+        )
+    except Exception:  # pragma: no cover - defensive
+        return 0
+    if configured <= 0:
+        return 0
+    return max(1, int(math.ceil(configured)))
+
+
+def _contention_queue_expiry_seconds(config: dict | None) -> int:
+    """The contention-queue wait window, in seconds (AC4).
+
+    A request that exits the queue has spent (or been refused) that window; a
+    retry that ignores it would spend the same window again, so the window is
+    the honest retry hint. Resolved through the router's own config helper so
+    the advertised value is the clamped value the queue actually used.
+    """
+    try:
+        from proxy.router import _get_contention_queue_config
+
+        server_cfg = (
+            config.get("server", config) if isinstance(config, dict) else {}
+        )
+        max_wait = float(_get_contention_queue_config(server_cfg)["max_wait_seconds"])
+    except Exception:  # pragma: no cover - defensive
+        return 0
+    if max_wait <= 0:
+        return 0
+    return max(1, int(math.ceil(max_wait)))
+
+
+def _cold_prefill_budget_tokens(config: dict | None) -> int:
+    """The flat cold-prefill token cap, for refusal token evidence (AC5)."""
+    try:
+        from proxy.prefill_eta import resolve_config
+
+        return int(resolve_config(config).cold_prefill_budget_tokens)
+    except Exception:  # pragma: no cover - defensive
+        return 0
+
+
+def _local_refusal_retry_after_s(
+    request, reason: str | None, model_config: dict | None, config: dict | None
+) -> int | None:
+    """Real expiry (seconds) behind a non-admission local-route exit (AC1).
+
+    The exit's own measurement wins (a lease remainder, a queue window, the
+    thrash-cooldown remainder). A chain-resolution exit records no expiry on
+    the request, so it is recomputed from live local availability state. Every
+    other reason — ETA/occupancy and the not-time-retryable causes — returns
+    ``None`` so the shared timing decision is left untouched.
+    """
+    recorded = getattr(request, LOCAL_FALLBACK_RETRY_AFTER_ATTR, None)
+    if recorded is not None:
+        try:
+            return max(1, int(recorded))
+        except (TypeError, ValueError):
+            pass
+    if reason in REAL_EXPIRY_FALLBACK_REASONS:
+        recomputed = _compute_local_retry_after(model_config, config)
+        if recomputed > 0:
+            return recomputed
+    return None
+
+
+async def _stamp_local_routing_token_evidence(
+    request, body_json, model_config, config, routing_estimate
+) -> None:
+    """Stamp routing token evidence for a local-only refusal (AC5).
+
+    Called only when a refusal is actually being built — the choke point has
+    already decided not to dispatch — so the tokenizer pass this may trigger
+    is paid at most once per refused request (never on the dispatch path).
+    The admission guard's own evidence is left alone when a decision exists:
+    it is the more specific record of what was compared.
+    """
+    if getattr(request, "_local_admission_decision", None) is not None:
+        return
+    if getattr(request, LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR, None):
+        return
+    if routing_estimate is None:
+        return
+    local_model = ""
+    for entry in (model_config.get("providers") or []):
+        if isinstance(entry, dict) and entry.get("type") == "local":
+            local_model = entry.get("llama_model", "") or ""
+            break
+    else:
+        # No local entry in the chain: the cold-prefill budget is meaningless
+        # evidence, and pricing the prompt would be wasted work.
+        return
+    try:
+        estimated = await routing_estimate.get()
+        if estimated <= 0:
+            return
+        try:
+            from proxy.session import _resolve_session_id_header
+
+            session_id, _ = _resolve_session_id_header(
+                getattr(request, "headers", {}) or {}
+            )
+        except Exception:
+            session_id = None
+        server_config = (
+            config.get("server", config) if isinstance(config, dict) else None
+        )
+        ratio = expected_cached_ratio(
+            local_model,
+            session_id,
+            estimated,
+            body_json.get("messages") if isinstance(body_json, dict) else None,
+            server_config=(
+                server_config if isinstance(server_config, dict) else None
+            ),
+        )
+        _note_local_token_evidence(
+            request,
+            new_tokens=int(estimated * (1 - ratio)),
+            budget_tokens=_cold_prefill_budget_tokens(config),
+        )
+    except Exception:  # pragma: no cover - evidence is best-effort
+        logger.debug("local refusal token evidence unavailable", exc_info=True)
+
+
+async def _build_local_only_refusal_for_remote(
     request,
     provider_cfg: dict,
     model_config: dict,
     config: dict,
     preference: str,
+    routing_estimate=None,
+    body_json: dict | None = None,
 ) -> Response | None:
     """The pin-local choke point: refuse before any non-local dispatch.
 
@@ -6734,6 +6989,13 @@ def _build_local_only_refusal_for_remote(
     is terminal for the request: no attempt/cooldown/budget state is written
     and the request is never enqueued, so the response is stamped exactly
     once and no contention-queue slot/lease is leaked.
+
+    The refusal's retry story is reason-driven: a non-admission exit advertises
+    the real expiry it recorded (or one recomputed from live local availability
+    state), the ETA/occupancy reasons keep the projected-wait timer, and the
+    not-time-retryable reasons carry no timer at all
+    (LP-0MVQ23B80009OZ9V AC1–AC5). Token evidence is added for a
+    chain-resolution refusal so the client can size a compaction.
     """
     if preference != PREF_LOCAL_PREFERRED:
         return None
@@ -6750,11 +7012,31 @@ def _build_local_only_refusal_for_remote(
             if not has_local_entry
             else LOCAL_ROUTE_UNAVAILABLE
         )
-    _note_local_fallback_reason(request, reason)
+    # Non-admission retry timing (AC1–AC4): resolve the real expiry BEFORE
+    # re-recording the reason — recording clears a stale expiry by default, so
+    # the exit's own measurement would otherwise be lost here.
+    retry_after_s = _local_refusal_retry_after_s(
+        request, reason, model_config, config
+    )
+    _note_local_fallback_reason(request, reason, retry_after_s)
+    # Token evidence (AC5/parent AC4) when no admission decision supplies it,
+    # e.g. a chain-resolution skip (cooldown) or ``context_too_large``.
+    await _stamp_local_routing_token_evidence(
+        request, body_json, model_config, config, routing_estimate
+    )
     attempt: dict[str, Any] = {"reason": reason}
+    # Routing token evidence (AC5): a chain-resolution skip such as
+    # ``context_too_large`` carries the numbers the routing probe actually used,
+    # so the client can size a compaction instead of waiting for a timer that
+    # cannot help.
+    token_evidence = getattr(request, LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR, None)
+    if isinstance(token_evidence, dict):
+        attempt.update(token_evidence)
     decision = getattr(request, "_local_admission_decision", None)
     if decision is not None:
         attempt.update(_local_admission_evidence(decision))
+    if retry_after_s is not None:
+        attempt["retry_after_s"] = retry_after_s
     return _build_local_only_refusal_response(attempt, config)
 
 
@@ -10072,8 +10354,9 @@ async def _proxy_with_remote_fallback_cycle(
         # local-only client to a non-local provider. The refusal is built from
         # the reason already recorded on the request; inert for every other
         # preference and for a local candidate.
-        _refusal = _build_local_only_refusal_for_remote(
-            request, provider_cfg, model_config, config, _preference
+        _refusal = await _build_local_only_refusal_for_remote(
+            request, provider_cfg, model_config, config, _preference,
+            routing_estimate=_routing_estimate, body_json=body_json,
         )
         if _refusal is not None:
             return _refusal
@@ -10757,8 +11040,9 @@ async def _proxy_with_fallback_cycle(
         # LP-0MVRMC1L3006F0F3: the local-only choke point (see
         # ``_build_local_only_refusal_for_remote``) — refuse before any
         # non-local dispatch, whatever reason the local route exited.
-        _refusal = _build_local_only_refusal_for_remote(
-            request, provider_cfg, model_config, config, _preference
+        _refusal = await _build_local_only_refusal_for_remote(
+            request, provider_cfg, model_config, config, _preference,
+            routing_estimate=_routing_estimate, body_json=body_json,
         )
         if _refusal is not None:
             return _refusal
@@ -10826,7 +11110,10 @@ async def _proxy_with_fallback_cycle(
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     _note_local_fallback_reason(
-                        request, "prefill_thrash_cooldown"
+                        request,
+                        "prefill_thrash_cooldown",
+                        # Real expiry: the session's cooldown remainder.
+                        _thrash_cooldown_remaining,
                     )
                     continue
                 # Local concurrency limit check (LP-0MR5MAJNM005R905):
@@ -10885,7 +11172,13 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = "fallback_after_queue"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
-                        _note_local_fallback_reason(request, fallback_reason)
+                        # Real expiry (AC4): a queue exit is bounded by the
+                        # queue's own wait window, not by the ETA formula.
+                        _note_local_fallback_reason(
+                            request,
+                            fallback_reason,
+                            _contention_queue_expiry_seconds(config),
+                        )
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
                             "session=%s queued_duration=%.2fs preference=%s",
@@ -11296,6 +11589,14 @@ async def _proxy_with_fallback_cycle(
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     _note_local_fallback_reason(request, _skip_reason)
+                    # Token evidence for a size-driven skip (AC5): the refusal
+                    # names how far over the flat cold-prefill cap the prompt
+                    # was, so the client can compact instead of retrying.
+                    _note_local_token_evidence(
+                        request,
+                        new_tokens=_routing_new_tokens,
+                        budget_tokens=_cold_prefill_budget_tokens(config),
+                    )
 
                     # Server-side compaction rescue (LP-0MU5ARWSP001BYYB).
                     # The bypass used to ``continue`` here, before any session
@@ -11889,7 +12190,12 @@ async def _proxy_with_fallback_cycle(
                             # fall-through of the 2026-10-25 incident.
                             all_slot_exhaustion = False
                             _note_local_fallback_reason(
-                                request, SKIP_REASON_LOCAL_LEASE_ACTIVE
+                                request,
+                                SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                                # Real expiry (AC3): the lease remainder.
+                                _local_lease_retry_after_seconds(
+                                    config, local_endpoint
+                                ),
                             )
                             continue
                         # Slot freed — evaluate the fresh response below.
@@ -11912,8 +12218,11 @@ async def _proxy_with_fallback_cycle(
                         )
                         all_slot_exhaustion = False
                         # The token matches the log's reason= field verbatim.
+                        # Real expiry (AC3): the lease remainder.
                         _note_local_fallback_reason(
-                            request, SKIP_REASON_LOCAL_LEASE_ACTIVE
+                            request,
+                            SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                            _local_lease_retry_after_seconds(config, local_endpoint),
                         )
                         continue
                     elif _lease_action == "context_bypass":
@@ -12037,8 +12346,13 @@ async def _proxy_with_fallback_cycle(
                             # LP-0MVRMC1W6003MV3Y: the retry loop ended on a
                             # lease-active answer — name that reason on the
                             # request so the refusal can report it.
+                            # Real expiry (AC3): the lease remainder.
                             _note_local_fallback_reason(
-                                request, SKIP_REASON_LOCAL_LEASE_ACTIVE
+                                request,
+                                SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                                _local_lease_retry_after_seconds(
+                                    config, local_endpoint
+                                ),
                             )
                             continue
 
