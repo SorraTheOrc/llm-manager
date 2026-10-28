@@ -35,6 +35,14 @@ without flipping the marker off with the behaviour. The choke point flipped
 all but two rows green; the reason-token child's per-branch tokens
 (LP-0MVRMC1W6003MV3Y) turned the remaining two (``quota_hard_stop``,
 ``chain_cooldown``) green, so no row is pending today.
+
+Capacity verdict (LP-0MVSMRT5R009EKP9, child of LP-0MVSMI7JK002FKUF): every row
+also states *what the refusal means* — ``too_large`` for the request-size exits
+(``context_too_large``) and ``deferrable`` for every temporal exit, including
+the fail-safe ``local_only_no_local_route`` default. The verdict assertions are
+the TDD red phase for the wiring child (LP-0MVSMINPR006SWT6): they start
+``xfail(strict=True)`` because today's 429 body has no ``verdict`` field, and
+that child flips them green in the same change that adds it.
 """
 
 from __future__ import annotations
@@ -50,7 +58,7 @@ import pytest
 from fastapi import Response
 from proxy.priority import apply_local_preference
 
-from proxy import contention_queue, prefill_eta
+from proxy import admission_reserve, contention_queue, prefill_eta
 
 #: Prompt size priced by the rows that need a known measurement.
 PROMPT_TOKENS = 20_000
@@ -123,13 +131,17 @@ class _ExitRow:
     """One exit from the local route.
 
     ``trigger`` names the mechanism that takes the exit (the fixture), ``token``
-    is the stable ``X-Local-Fallback-Reason`` the refusal must carry, and
+    is the stable ``X-Local-Fallback-Reason`` the refusal must carry,
+    ``expected_verdict`` is the capacity verdict the refusal body must report
+    (:data:`proxy.admission_reserve.CAPACITY_DEFERRABLE` or
+    :data:`proxy.admission_reserve.CAPACITY_TOO_LARGE`), and
     ``exit_description`` is the operator-facing name of the exit — used in
     failure messages so a red row says which route leaked.
     """
 
     trigger: str
     token: str
+    expected_verdict: str
     exit_description: str
     #: ``(active, max)`` local slots the row runs with — busy slots are what
     #: bring the contention queue into play.
@@ -149,6 +161,7 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
     _ExitRow(
         trigger="thrash_cooldown",
         token="prefill_thrash_cooldown",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description=(
             "session in post-deadline prefill-thrash cooldown "
             "(router_skip_local reason=prefill_thrash_cooldown)"
@@ -157,18 +170,21 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
     _ExitRow(
         trigger="router_skip_physical_cap",
         token="context_too_large",
+        expected_verdict=admission_reserve.CAPACITY_TOO_LARGE,
         exit_description="router skip: prompt cannot fit the KV slot",
         router_skip_reason="context_too_large",
     ),
     _ExitRow(
         trigger="router_skip_economic",
         token="large_context_bypass",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description="router skip: economic cold-prefill bypass",
         router_skip_reason="large_context_bypass",
     ),
     _ExitRow(
         trigger="router_skip_residency",
         token="resident_prefix_insufficient",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description=(
             "router skip: residency ladder found too little reusable prefix"
         ),
@@ -177,12 +193,14 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
     _ExitRow(
         trigger="router_skip_tenancy",
         token="tenant_limit",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description="router skip: per-tenant residency cap reached",
         router_skip_reason="tenant_limit",
     ),
     _ExitRow(
         trigger="queue_depth_cap",
         token="fallback_after_queue",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description="contention-queue depth cap reached (never queued)",
         concurrency=(1, 1),
         server={"contention_queue_max_depth": 1},
@@ -190,6 +208,7 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
     _ExitRow(
         trigger="queue_wait_expiry",
         token="fallback_after_queue",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description="contention-queue wait budget expired",
         concurrency=(1, 1),
         server={
@@ -200,6 +219,7 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
     _ExitRow(
         trigger="admission_guard_free_slot",
         token="eta_exceeds_budget_direct",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description=(
             "prefill-gate denial on the free-slot (direct dispatch) path"
         ),
@@ -207,6 +227,7 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
     _ExitRow(
         trigger="entry_context_cap",
         token="context_too_large",
+        expected_verdict=admission_reserve.CAPACITY_TOO_LARGE,
         exit_description="per-entry max_context_tokens ceiling",
         # The router gate is inert while the cold threshold is 0 ("large-context
         # bypass disabled"), so the row enables the gate and lets the entry cap
@@ -217,16 +238,19 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
     _ExitRow(
         trigger="quota_hard_stop",
         token="quota_hard_stop",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description="chain resolution skipped local on a quota hard stop",
     ),
     _ExitRow(
         trigger="chain_cooldown",
         token="local_provider_cooldown",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description="chain resolution skipped local while it cools down",
     ),
     _ExitRow(
         trigger="no_local_route",
         token="local_only_no_local_route",
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
         exit_description="the chain has no local entry at all",
         remote_only_chain=True,
     ),
@@ -469,6 +493,16 @@ def test_matrix_has_exactly_one_row_per_local_route_exit():
     for row in _EXIT_ROWS:
         assert row.token, f"{row.trigger}: every exit needs a stable reason token"
         assert row.exit_description, f"{row.trigger}: describe the exit it pins"
+        # Vocabulary guard: the wire contract documents exactly two verdicts,
+        # so a row naming a third value must fail here rather than surface as
+        # an unexplained body mismatch.
+        assert row.expected_verdict in {
+            admission_reserve.CAPACITY_DEFERRABLE,
+            admission_reserve.CAPACITY_TOO_LARGE,
+        }, (
+            f"{row.trigger}: expected_verdict must be one of the documented "
+            f"capacity verdicts, got {row.expected_verdict!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +544,52 @@ async def test_local_only_refuses_instead_of_dispatching_remote(row: _ExitRow):
     assert body.get("reason") == row.token, (
         f"{row.exit_description}: body reason and header must agree, got "
         f"{body.get('reason')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC1 (LP-0MVSMRT5R009EKP9): the refusal body reports the row's verdict
+# ---------------------------------------------------------------------------
+
+#: TDD red phase for the wiring child (LP-0MVSMINPR006SWT6): today's 429 body
+#: has no ``verdict`` field, so every row's verdict assertion is a genuine
+#: expected failure until that child adds it. ``strict=True`` means the marker
+#: must be removed in the same change that adds the behaviour.
+_VERDICT_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "capacity-verdict wiring pending (LP-0MVSMINPR006SWT6): the 429 "
+        "refusal body has no 'verdict' field"
+    ),
+)
+
+
+@_VERDICT_XFAIL
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", _LOCAL_ONLY_PARAMS)
+async def test_local_only_refusal_body_reports_the_row_verdict(row: _ExitRow):
+    """Every exit: the refusal body classifies why local could not serve.
+
+    ``too_large`` means waiting cannot help (the request exceeds the local
+    serving envelope); ``deferrable`` means the block is temporal, so a
+    ``local-only`` client should retry rather than re-size. The mapping is
+    pinned per row so a new exit cannot ship without stating its verdict.
+    """
+    result, calls = await _issue(row, LOCAL_ONLY)
+
+    assert calls == [], (
+        f"{row.exit_description}: a verdict assertion still assumes the "
+        f"refusal path (dispatched={calls})"
+    )
+    assert result.status_code == 429, (
+        f"{row.exit_description}: expected the local-only refusal, got "
+        f"{result.status_code}"
+    )
+    body = json.loads(result.body)
+    assert body.get("verdict") == row.expected_verdict, (
+        f"{row.exit_description}: refusal body verdict must be "
+        f"{row.expected_verdict!r} for reason {row.token!r}, got "
+        f"{body.get('verdict')!r}"
     )
 
 
