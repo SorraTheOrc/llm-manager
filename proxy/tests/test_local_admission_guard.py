@@ -825,6 +825,16 @@ def _assert_prefill_budget_refusal_contract(result) -> dict:
     body = json.loads(result.body)
     assert body.get("retryable") is False
     assert body.get("retry_after") is None
+    # AC4 / LP-0MVQ23AYQ000CGTW AC1: even a NOT-time-retryable refusal must
+    # carry the token evidence on headers AND body, so a client can decide to
+    # compact rather than hammer the proxy (LP-0MVNTT4X8009IO2X AC4 on both
+    # refusal builders).
+    assert (
+        int(result.headers["X-Local-Admission-New-Tokens"]) == INCIDENT_NEW_TOKENS
+    ), "the token headers must be present on the over-budget refusal too"
+    assert (
+        int(result.headers["X-Local-Admission-Budget-Tokens"]) == INCIDENT_BUDGET_TOKENS
+    )
     assert body.get("new_tokens") == INCIDENT_NEW_TOKENS, (
         "the refusal must carry the token evidence the client compacts against"
     )
@@ -877,6 +887,101 @@ async def test_prefill_budget_exceeded_exhaustion_refusal_is_not_time_retryable(
     body = _assert_prefill_budget_refusal_contract(result)
     assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
     assert body["error"] == "All providers exhausted"
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVQ23AYQ000CGTW: admission token evidence is threaded, never recomputed
+#
+# AC1 of this item: ``X-Local-Admission-New-Tokens`` /
+# ``X-Local-Admission-Budget-Tokens`` must appear on every refusal from both
+# builders, and their body equivalents too. AC3: those numbers must be the
+# guard decision's own (threaded verbatim from ``_local_admission_decision``
+# via ``_local_admission_evidence``), never recomputed by the refusal code.
+# The end-to-end cases above show the values equal the priced prompt, which a
+# recomputation could reproduce; these builder-level pins hand each builder an
+# attempt whose token evidence is deliberately unrelated to its ETA/budget
+# fields, so only a threaded value can be echoed — and an evidence-less
+# attempt must not fabricate fields (additive contract).
+# ---------------------------------------------------------------------------
+
+#: Token evidence deliberately unrelated to the attempt's ETA/budget/projected
+#: fields, so a refactor that "recomputed" from the refusal's own inputs could
+#: never reproduce it.
+_THREADED_NEW_TOKENS = 12_345
+_THREADED_BUDGET_TOKENS = 6_789
+
+
+def _evidence_attempt(
+    reason: str = "eta_exceeds_budget",
+    *,
+    new_tokens: int | None = _THREADED_NEW_TOKENS,
+    budget_tokens: int | None = _THREADED_BUDGET_TOKENS,
+) -> dict:
+    """An admission attempt record shaped like ``_local_admission_evidence``."""
+    attempt: dict = {
+        "status": "local_admission_reject",
+        "reason": reason,
+        "eta_prefill_seconds": 100.0,
+        "budget_seconds": 60.0,
+        "projected_wait_seconds": 150.0,
+    }
+    if new_tokens is not None:
+        attempt["new_tokens"] = new_tokens
+    if budget_tokens is not None:
+        attempt["budget_tokens"] = budget_tokens
+    return attempt
+
+
+def _assert_threaded_token_evidence(
+    result, new_tokens: int, budget_tokens: int
+) -> dict:
+    """The refusal advertises *exactly* the threaded numbers, headers and body."""
+    assert result.status_code == 429
+    body = json.loads(result.body)
+    assert int(result.headers["X-Local-Admission-New-Tokens"]) == new_tokens
+    assert int(result.headers["X-Local-Admission-Budget-Tokens"]) == budget_tokens
+    assert body.get("new_tokens") == new_tokens
+    assert body.get("budget_tokens") == budget_tokens
+    return body
+
+
+def test_local_admission_reject_refusal_echoes_the_threaded_evidence():
+    """Exhaustion-path builder returns the decision's numbers verbatim (AC3)."""
+    result = provider._build_local_admission_reject_response(
+        _evidence_attempt()
+    )
+    body = _assert_threaded_token_evidence(
+        result, _THREADED_NEW_TOKENS, _THREADED_BUDGET_TOKENS
+    )
+    # The values echo neither the ETA nor the budget seconds, proving the
+    # builder read the attempt's evidence rather than deriving a token count.
+    assert body["new_tokens"] not in (100, 60, 150)
+
+
+def test_local_only_refusal_echoes_the_threaded_evidence():
+    """Local-only builder returns the decision's numbers verbatim (AC3)."""
+    result = provider._build_local_only_refusal_response(_evidence_attempt())
+    _assert_threaded_token_evidence(
+        result, _THREADED_NEW_TOKENS, _THREADED_BUDGET_TOKENS
+    )
+
+
+def test_refusal_without_token_evidence_fabricates_none():
+    """No evidence in the thread ⇒ no token headers/fields on either builder.
+
+    Pins the additive contract: the builders must never invent a token count
+    when the admission decision carries none (AC3 — sourced, not computed).
+    """
+    for builder in (
+        provider._build_local_admission_reject_response,
+        provider._build_local_only_refusal_response,
+    ):
+        result = builder(_evidence_attempt(new_tokens=None, budget_tokens=None))
+        assert "X-Local-Admission-New-Tokens" not in result.headers
+        assert "X-Local-Admission-Budget-Tokens" not in result.headers
+        body = json.loads(result.body)
+        assert "new_tokens" not in body
+        assert "budget_tokens" not in body
 
 
 # ---------------------------------------------------------------------------
