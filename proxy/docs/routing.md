@@ -1043,10 +1043,15 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   `contention_queue_max_wait_seconds`.
 - **Refusal is immediate and visible**: the request falls through to the next
   provider without waiting. If the whole chain is exhausted, the client
-  receives a retryable `429` with `Retry-After` (how much longer the prefill
-  would need than the budget) and `X-Local-Admission: reject` /
-  `X-Local-Admission-Eta` / `X-Local-Admission-Budget` headers, plus the
-  machine-readable `code: local_admission_reject`.
+  receives a `429` with `X-Local-Admission: reject` /
+  `X-Local-Admission-Eta` / `X-Local-Admission-Budget` headers and the
+  machine-readable `code: local_admission_reject`. The retry story is
+  reason-aware: ETA/occupancy reasons carry `Retry-After` + `retry_at`
+  (how much longer the projected wait is than the budget), while
+  `reason=prefill_budget_exceeded` (a prompt permanently over the flat
+  cold-prefill token cap) carries **no** `Retry-After`, says
+  `"retryable": false` and points at compaction — see the
+  [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x).
 - **Observability**: each decision logs
   `local_admission_guard decision=admit|reject reason=… enforced=true|false
   eta_prefill_s=… eta_occupancy_s=… projected_wait_s=… budget_s=…
@@ -1155,7 +1160,7 @@ reserved dispatch does not consume queue depth.
 | Value | Behaviour |
 |-------|-----------|
 | `prefer-local` (default) | Today's behaviour: use local when it can serve within the budget, else fall through to the next provider |
-| `local-only` | Never fall back remote. If the request cannot be admitted within the budget the proxy returns the retryable `429` admission response **even when remote providers are available** |
+| `local-only` | Never fall back remote. If the request cannot be admitted locally the proxy returns the `429` admission refusal (`X-Local-Route: refused`) **even when remote providers are available** — a local-only refusal means *refuse*, never a silent fall-through. See the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
 | `remote-ok` | Skip the local route entirely (background / low-priority work). The local provider is removed from the chain |
 
 Unknown values (and an absent header) behave as `prefer-local`, so the header
@@ -1171,8 +1176,65 @@ Every response carries `X-Local-Route`:
   local was not used (`eta_exceeds_budget`, `local_concurrency_limit`,
   `cached_tokens_skip`/`large_context_bypass`, `remote_ok`, …).
 - `refused` — local-only refusal or exhausted chain; `X-Local-Fallback-Reason`
-  carries the refusal reason. Refusals also carry `Retry-After` and the
-  `X-Local-Admission*` estimate headers.
+  carries the refusal reason. Refusals also carry `Retry-After` (only when
+  waiting can help), `retry_at` (the same instant, RFC 3339 UTC) and the
+  `X-Local-Admission*` estimate and token headers — see the
+  [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x).
+
+### Per-reason retry contract (LP-0MVNTT4X8009IO2X)
+
+Every refusal is a `429` stamped `X-Local-Route: refused` that answers two
+questions a scheduler needs: **whether** waiting can help (`retryable`) and,
+when it can, **when** (`Retry-After` and an absolute `retry_at`).
+
+- `Retry-After` — relative seconds to wait before retrying. Present **only**
+  when waiting can help; absent when it cannot.
+- `retry_at` — the same instant as an absolute RFC 3339 UTC timestamp, so a
+  client need not trust its own clock. Present exactly when `Retry-After` is.
+- `retryable` — `false` when no amount of waiting can make this request fit
+  local capacity; the remedy is compaction, not a timer.
+- `suggested_action` — human-readable remediation: "compact and resend" when
+  `retryable: false`, "wait / reduce the size / route remote" when `true`.
+- Token evidence — `X-Local-Admission-New-Tokens` / body `new_tokens` and
+  `X-Local-Admission-Budget-Tokens` / body `budget_tokens` on **every**
+  refusal, so a client can size the compaction: how far over the flat
+  `server.local_cold_prefill_budget_tokens` cap the request was.
+
+| Reason | `Retry-After` | `retryable` | `retry_at` | Client action |
+|---|---|---|---|---|
+| `prefill_budget_exceeded` | absent | `false` | absent | compact the prompt |
+| `context_too_large` | absent | `false` | absent | compact the prompt |
+| `eta_exceeds_budget` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
+| `eta_exceeds_budget_direct` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
+| `prefill_eta_exceeds_deadline` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
+| `prefill_eta_exceeds_safety_budget` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
+| `cooldown` | real cooldown remainder | `true` | RFC 3339 UTC | wait, then retry |
+
+**Which reasons have no timer — and why.** `prefill_budget_exceeded` is a
+property of the *request*: the prompt is permanently over the flat
+`local_cold_prefill_budget_tokens` cap, so any advertised delay would invite
+exactly the futile retry storm observed on 2026-10-25 (the client backed off
+seven times on `Retry-After: 1` before reporting the 429 terminal).
+`context_too_large` is the same shape at the physical KV-slot cap: only
+compaction (shorten the session history) changes the verdict.
+
+**When waiting helps, the timer is real.** For the ETA/occupancy reasons it is
+`ceil(projected_wait_seconds − budget_seconds)`, at least 1 s and capped by
+`server.max_retry_after_seconds`; `retry_at` is that same delay from now, RFC
+3339 UTC. For `cooldown`/lease-held/contention-queue-expiry skips the timer is
+derived from the *real* expiry state (the cooldown remainder, the lease
+remainder or the queue exit) — never from the ETA formula — so the hint tracks
+when local capacity actually returns.
+
+**Local-only means refuse, not fall through to remote.** A `local-only`
+client's refusal is returned to it as a `429` even while remote providers are
+available; the request is never silently moved remote. This is enforced today
+at the admission decision (prefill-ETA guard, cold-prefill budget and context
+cap). The remaining non-admission skips (cooldown, lease held, contention-queue
+expiry) still fall through behind a `local-only` client and are being closed
+by LP-0MVNU2KTK009D4AG and LP-0MVQ23B80009OZ9V; under `prefer-local` (the
+default) a refusal instead falls through to the next provider, and waiting is
+the client's own choice.
 
 `/llama/local/status` publishes the reservation counters
 (`reserved_outstanding`, `reserved_issued`, `reserved_used`,
