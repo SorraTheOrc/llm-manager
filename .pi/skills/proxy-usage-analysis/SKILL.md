@@ -165,6 +165,50 @@ exposes the same numbers under `denial_attribution`, `prefill_eta_error` and
   per-line timestamps, so per-dispatch pairing is impossible — see
   REFERENCE.md Limitations).
 
+## Contended-pricing surface (LP-0MVS9YKHL007UBBZ)
+
+Since the contended-pricing fix (parent LP-0MVS8T6F4006DGG3: contended
+admissions priced against a contended rate bucket, uncalibrated contended
+window → `rate_bucket=solitary_fallback`), the report surfaces the decision
+fields instead of hiding them in raw log archaeology:
+
+- the parser carries `rate_bucket`, `contended_samples`, `eta_occupancy_s` and
+  the priced `new_tokens` on `local_admission_guard` events (all additive — a
+  pre-change line leaves each `None`);
+- the report renders an **Admission verdicts by rate bucket and prompt band**
+  section and `--json` exposes the same split as the additive keys
+  `local_admission_by_rate_bucket` and `local_admission_by_token_band` (with
+  per-band admission → local first-byte conversion counts; buckets/bands with
+  no verdict are omitted, and a high `solitary_fallback` share is the signal
+  that the contended window still needs samples) — see
+  [REFERENCE.md](REFERENCE.md#outputs).
+
+The banded conversion numbers are directly comparable with the
+admission-conversion harness (`scripts/prefill_admission_conversion.py`),
+which defines the bands both views share; a test pins the two band tables
+against drift.
+
+**Quick verification over a synthetic log slice** (a small window containing
+all three buckets and one banded admit → local first byte):
+
+```bash
+mkdir -p /tmp/rate-bucket-check && cat > /tmp/rate-bucket-check/proxy.log <<'EOF'
+2026-10-28 10:00:00,123 - INFO - local_admission_guard decision=reject reason=eta_exceeds_budget enforced=true eta_prefill_s=41.2 eta_occupancy_s=16.0 projected_wait_s=57.2 budget_s=60.0 deadline_s=120.0 deadline_budget_s=114.0 new_tokens=6659 budget_tokens=40000 rate_bucket=contended contended_samples=6 busy_slots=1 in_flight_prefills=1 free_slot=false priority=medium policy=reject model=Qwen3 samples=12 provider=local-qwen3 session=herdr-abc
+2026-10-28 10:00:30,123 - INFO - local_admission_guard decision=admit reason=within_budget enforced=true eta_prefill_s=91.8 eta_occupancy_s=0.0 projected_wait_s=91.8 budget_s=60.0 deadline_s=120.0 deadline_budget_s=114.0 new_tokens=25000 budget_tokens=40000 rate_bucket=solitary contended_samples=0 busy_slots=0 in_flight_prefills=0 free_slot=true priority=medium policy=reject model=Qwen3 samples=12 provider=local-qwen3 session=herdr-abc
+2026-10-28 10:01:00,123 - INFO - local_admission_guard decision=admit reason=within_budget enforced=true eta_prefill_s=3.1 eta_occupancy_s=2.0 projected_wait_s=5.1 budget_s=60.0 deadline_s=120.0 deadline_budget_s=114.0 new_tokens=12000 budget_tokens=40000 rate_bucket=solitary_fallback contended_samples=0 busy_slots=1 in_flight_prefills=0 free_slot=false priority=medium policy=reject model=Qwen3 samples=12 provider=local-qwen3 session=herdr-def
+2026-10-28 10:01:30,123 - INFO - dispatch_first_byte_ms=8123.4 dispatch_to_first_byte_ms=8120.1 cache_state=cold cached_ratio=0.000 queue_wait_ms=3.3 session=herdr-abc model=Qwen3 priority=high estimated_tokens=25000
+EOF
+python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+    --log-dir /tmp/rate-bucket-check \
+    --start "2026-10-28 09:00:00" --end "2026-10-28 12:00:00" \
+    --output-dir /tmp/rate-bucket-out --quiet \
+&& grep -A12 '## Admission verdicts by rate bucket and prompt band' /tmp/rate-bucket-out/report.md
+```
+
+The section should show `contended 0/1`, `solitary 1/0` (converted in `20k-32k`)
+and `solitary_fallback 1/0` rows, and the `--json` run returns the same split
+under `local_admission_by_rate_bucket` / `local_admission_by_token_band`.
+
 ## Further reference
 
 Report interpretation, root-cause taxonomy, implementation notes, and

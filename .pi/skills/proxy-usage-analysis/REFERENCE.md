@@ -166,6 +166,35 @@ Outputs written to:
     top-level key (`{idle: n, prefill_bound: n, saturated: n}`), so
     `jq .status_capacity_hint` answers "what did the payload claim while the
     denials happened?" without parsing Markdown.
+- **Contended-pricing split keys (LP-0MVS9YKHL007UBBZ, parent
+  LP-0MVS8T6F4006DGG3).** Two additive keys split the same
+  `local_admission_reject` / `local_admission_admit` verdicts, so a regression
+  to the optimistic rate is visible in the standard report instead of
+  requiring ad-hoc log archaeology. Both are **omitted-when-empty** maps (a
+  bucket/band with no verdict is absent, never zero-filled):
+  - `local_admission_by_rate_bucket` — `{rate_bucket: {"admit": n, "reject":
+    n}}` over the `rate_bucket=` the prefill ETA was calibrated from:
+    `contended` (priced against the contended window), `solitary` (the history
+    this parser always saw), `solitary_fallback` (the contended window was
+    uncalibrated, so the solitary window was used — the deliberately
+    residual-optimistic case) and `unknown` (a pre-change line with no
+    `rate_bucket` field at all). A high `solitary_fallback` share is the
+    signal that the contended window still needs samples.
+  - `local_admission_by_token_band` — `{band: {"admit": n, "reject": n,
+    "converted": n, "unconverted": n, "conversion_share": f|null}}` over the
+    **admission-conversion harness's** bands
+    (`scripts/prefill_admission_conversion.py`: `<8k`, `8k-20k`, `20k-32k`,
+    `32k-64k`, `>=64k`, plus `unknown` for a line with no priced
+    `new_tokens`), so the report's conversion numbers are directly comparable
+    with the harness's baseline/post-change measurement. `converted` /
+    `unconverted` are **session-level**: a session with `decision=admit` is
+    converted when a **local** first byte (`dispatch_first_byte_ms`) follows
+    it; a remote first byte never converts a local admission, and a band with
+    no admitted session reports `conversion_share: null` rather than `0.0`.
+  The parsed `local_admission_guard` fields behind these keys —
+  `rate_bucket`, `contended_samples`, `eta_occupancy_s` and the priced
+  `new_tokens` — are likewise additive: a pre-change line leaves every one of
+  them `None` and parses exactly as before.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
@@ -238,6 +267,12 @@ Outputs written to:
   prefill duration at p50/p90 with the signed and relative error; and one
   explicit matches/does-not-match-reality verdict for the denial signal and
   one for the prefill ETA), then
+  **Admission verdicts by rate bucket and prompt band** (LP-0MVS9YKHL007UBBZ,
+  when the window has any `local_admission_guard` decision): the admit/reject
+  verdicts split by the pricing `rate_bucket` (`contended` / `solitary` /
+  `solitary_fallback` / `unknown`) and by the conversion harness's new-token
+  bands, with per-band admission → local first-byte conversion counts
+  (buckets/bands with no verdict are omitted), then
   **Prefill vs decode** (phase slot-time split: prefill dispatch → first byte
   vs decode first byte → finish, each as slot-seconds and % of combined phase
   slot time summing to 100%, with p10/p50/p90/max per phase and unknown-stream

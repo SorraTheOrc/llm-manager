@@ -168,6 +168,32 @@ DENIAL_VERDICT_UNATTRIBUTED = "unattributed"
 # the remainder is reported as ``unattributed`` rather than guessed.
 DENIAL_GUARD_JOIN_WINDOW_SECONDS = 60.0
 
+# New-token bands for the admission-verdict split (LP-0MVS9YKHL007UBBZ AC2).
+# The band edges are the **conversion harness's** bands
+# (``scripts/prefill_admission_conversion.py``), because the report's per-band
+# admission → first-byte conversion counts are read against that harness's
+# baseline/post-change numbers. ``(label, lower_inclusive, upper_exclusive)``;
+# ``None`` upper = unbounded. ``tests/test_admission_rate_bucket_report.py``
+# pins the two definitions together so the contract cannot drift silently.
+ADMISSION_TOKEN_BANDS: tuple[tuple[str, int, int | None], ...] = (
+    ("<8k", 0, 8_000),
+    ("8k-20k", 8_000, 20_000),
+    ("20k-32k", 20_000, 32_000),
+    ("32k-64k", 32_000, 64_000),
+    (">=64k", 64_000, None),
+)
+#: Band for a guard line that carries no priced ``new_tokens`` (every
+#: pre-change line): counted so the verdicts still add up, never squashed into
+#: ``<8k`` as if it had been priced at zero.
+UNKNOWN_BAND_LABEL = "unknown"
+#: Rate-bucket key for a guard line with no ``rate_bucket`` field (pre-change
+#: logs). Distinct from a real bucket so ``solitary_fallback`` — the *declared*
+#: residual-optimism marker — is never confused with an unparsed line.
+UNKNOWN_RATE_BUCKET_LABEL = "unknown"
+#: Canonical display order for the known rate buckets; any other observed
+#: bucket follows alphabetically and the unknown key last.
+RATE_BUCKET_ORDER = ("contended", "solitary", "solitary_fallback")
+
 # Unit of the slot-seconds figures on :class:`SlotSecondsStats` (and its
 # :class:`PrefillStats` / :class:`DecodeStats` subclasses) and on
 # :attr:`BusyStats.prefill_stats` / :attr:`BusyStats.decode_stats`
@@ -308,6 +334,155 @@ def attribute_denials(
             )
         )
     return out
+
+
+@dataclass
+class AdmissionBandStats:
+    """Admission verdicts and conversion counts for one new-token band.
+
+    LP-0MVS9YKHL007UBBZ: ``admit``/``reject`` are event-level guard verdicts
+    (a session may make several requests); ``converted``/``unconverted`` are
+    **session-level**: a session with an admit is ``converted`` when a local
+    first byte follows it, ``unconverted`` when none does — the same join the
+    admission-conversion harness performs. A band with no admitted session
+    reports ``conversion_share=None`` (not ``0.0``), so "nothing admitted" is
+    never read as "nothing converted".
+    """
+
+    admit: int = 0
+    reject: int = 0
+    converted: int = 0
+    unconverted: int = 0
+
+    @property
+    def conversion_share(self) -> float | None:
+        """Converted share of admitted sessions, or ``None`` when none."""
+        total = self.converted + self.unconverted
+        return (self.converted / total) if total else None
+
+    def to_dict(self) -> dict:
+        share = self.conversion_share
+        return {
+            "admit": self.admit,
+            "reject": self.reject,
+            "converted": self.converted,
+            "unconverted": self.unconverted,
+            "conversion_share": round(share, 4) if share is not None else None,
+        }
+
+
+def admission_token_band(new_tokens: int | None) -> str:
+    """Return the conversion-harness band for *new_tokens*.
+
+    ``None`` (a pre-change line with no priced token count) maps to
+    :data:`UNKNOWN_BAND_LABEL`, matching the harness's own ``band_for``.
+    """
+    if new_tokens is None:
+        return UNKNOWN_BAND_LABEL
+    for label, lower, upper in ADMISSION_TOKEN_BANDS:
+        if new_tokens >= lower and (upper is None or new_tokens < upper):
+            return label
+    return UNKNOWN_BAND_LABEL
+
+
+def _ordered_band_keys(keys: Iterable[str]) -> list[str]:
+    """Canonical band order (harness order, ``unknown`` last)."""
+    present = set(keys)
+    ordered = [label for label, _, _ in ADMISSION_TOKEN_BANDS if label in present]
+    if UNKNOWN_BAND_LABEL in present:
+        ordered.append(UNKNOWN_BAND_LABEL)
+    # Defensive: a band label outside the table can only appear if the tables
+    # drift, but never drop data on the floor.
+    ordered.extend(sorted(present - set(ordered)))
+    return ordered
+
+
+def _ordered_rate_bucket_keys(keys: Iterable[str]) -> list[str]:
+    """Canonical rate-bucket order (known buckets, then extras, ``unknown``)."""
+    present = set(keys)
+    ordered = [bucket for bucket in RATE_BUCKET_ORDER if bucket in present]
+    extras = present - set(ordered) - {UNKNOWN_RATE_BUCKET_LABEL}
+    ordered.extend(sorted(extras))
+    if UNKNOWN_RATE_BUCKET_LABEL in present:
+        ordered.append(UNKNOWN_RATE_BUCKET_LABEL)
+    return ordered
+
+
+def admission_breakdown(summary: AnalysisResult) -> dict:
+    """Split the guard's verdicts by ``rate_bucket`` and by new-token band.
+
+    LP-0MVS9YKHL007UBBZ AC2: a regression to the optimistic rate bucket (or to
+    ``solitary_fallback``, the uncalibrated-contended fallback) has to be
+    visible in the standard report, not only by reading raw lines. The result
+    is a plain dict so the markdown report and the ``--json`` summary render
+    from one computation::
+
+        {
+          "by_rate_bucket": {bucket: {"admit": n, "reject": n}, ...},
+          "by_token_band": {band: AdmissionBandStats.to_dict(), ...},
+        }
+
+    Buckets and bands with no verdict are **omitted**, never zero-filled: an
+    absent ``contended`` bucket means the guard never priced a contended
+    admission in the window, which is itself the signal. Events whose
+    ``decision`` is neither ``admit`` nor ``reject`` are skipped so the splits
+    always sum to the pre-existing ``local_admission_admit`` /
+    ``local_admission_reject`` counters.
+    """
+    rate_buckets: dict[str, dict[str, int]] = {}
+    bands: dict[str, AdmissionBandStats] = {}
+    admits_by_session: dict[str, list[LogEvent]] = {}
+
+    for event in getattr(summary, "local_admission_events", []) or []:
+        decision = getattr(event, "decision", None)
+        if decision not in ("admit", "reject"):
+            continue
+        bucket = getattr(event, "rate_bucket", None) or UNKNOWN_RATE_BUCKET_LABEL
+        verdicts = rate_buckets.setdefault(bucket, {"admit": 0, "reject": 0})
+        verdicts[decision] += 1
+        band = bands.setdefault(
+            admission_token_band(getattr(event, "new_tokens", None)),
+            AdmissionBandStats(),
+        )
+        if decision == "admit":
+            band.admit += 1
+            if event.session:
+                admits_by_session.setdefault(event.session, []).append(event)
+        else:
+            band.reject += 1
+
+    # Session-level conversion join, mirroring the harness: the first *local*
+    # first byte for the session converts the admit that preceded it (else the
+    # earliest admit). Remote first bytes and sessions with no admit are not
+    # joined — a remote serve did not convert a local admission.
+    first_byte_ts: dict[str, datetime] = {}
+    for event in getattr(summary, "ttft_events", []) or []:
+        if not event.session or getattr(event, "ttft_source", None) != "local":
+            continue
+        seen = first_byte_ts.get(event.session)
+        if seen is None or event.ts < seen:
+            first_byte_ts[event.session] = event.ts
+
+    for session, admits in admits_by_session.items():
+        admits.sort(key=lambda e: e.ts)
+        first_ts = first_byte_ts.get(session)
+        if first_ts is None:
+            band = bands[admission_token_band(admits[0].new_tokens)]
+            band.unconverted += 1
+            continue
+        preceding = [event for event in admits if event.ts <= first_ts] or admits
+        band = bands[admission_token_band(preceding[-1].new_tokens)]
+        band.converted += 1
+
+    return {
+        "by_rate_bucket": {
+            bucket: rate_buckets[bucket]
+            for bucket in _ordered_rate_bucket_keys(rate_buckets)
+        },
+        "by_token_band": {
+            label: bands[label].to_dict() for label in _ordered_band_keys(bands)
+        },
+    }
 
 
 def _near_restart(ts: datetime, restart_signals: Iterable[datetime]) -> bool:

@@ -168,6 +168,21 @@ RE_LOCAL_ADMISSION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
 RE_GUARD_BUSY_SLOTS = re.compile(r"\bbusy_slots=(\d+)")
 RE_GUARD_IN_FLIGHT_PREFILLS = re.compile(r"\bin_flight_prefills=(\d+)")
 RE_GUARD_FREE_SLOT = re.compile(r"\bfree_slot=(true|false)")
+# Contended-pricing metadata on the guard record (LP-0MVS8T6F4006DGG3, surfaced
+# by LP-0MVS9YKHL007UBBZ): ``rate_bucket`` names the rate-calibration window the
+# prefill ETA was priced from (``contended``, ``solitary``, or
+# ``solitary_fallback`` when the contended window was uncalibrated and the
+# solitary window was used instead), ``contended_samples`` is that window's
+# sample count, ``eta_occupancy_s`` is the projection's occupancy term and
+# ``new_tokens`` the priced uncached token count. All four are absent on
+# pre-change lines and stay ``None`` (never a fabricated default).
+#: The bucket token is matched generically rather than against a fixed
+#: vocabulary, so a future bucket name stays observable instead of being
+#: silently dropped (the report's unknown bucket is for pre-change lines).
+RE_GUARD_RATE_BUCKET = re.compile(r"\brate_bucket=([A-Za-z_]+)")
+RE_GUARD_CONTENDED_SAMPLES = re.compile(r"\bcontended_samples=(\d+)")
+RE_GUARD_ETA_OCCUPANCY = re.compile(r"\beta_occupancy_s=([\d.]+)")
+RE_GUARD_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
 
 # Status-poll payload (LP-0MVGR2OXT0096OGK M3): ``status_request`` lines carry
 # the calibrated ``prefill_eta_seconds`` prediction and the truthful
@@ -571,6 +586,12 @@ class LogEvent:
     # logging (LP-0MTSSM5SO003PKU0). Populated by dispatch_first_byte_ms=
     # (local) or ttft_seconds= (remote) log lines.
     ttft_ms: float | None = None
+    #: Which first-byte path produced a ``ttft`` event: ``"local"`` for the
+    #: ``dispatch_first_byte_ms=`` line, ``"remote"`` for ``ttft_seconds=``.
+    #: ``None`` on pre-change logs and hand-built events. The admission →
+    #: first-byte conversion join counts ``"local"`` only
+    #: (LP-0MVS9YKHL007UBBZ).
+    ttft_source: str | None = None
     # Prefill breakdown carried by the local ``dispatch_first_byte_ms=`` line
     # (LP-0MVJN025B001I8AL): ``ttft_ms`` is the dispatch→first-byte *total*,
     # ``dispatch_to_first_byte_ms`` is the same interval minus the queued wait
@@ -595,6 +616,14 @@ class LogEvent:
     enforced: str | None = None
     eta_prefill_s: str | None = None
     budget_s: str | None = None
+    # Contended-pricing metadata on the same record (LP-0MVS8T6F4006DGG3): the
+    # rate-calibration bucket the ETA was priced from and that bucket's sample
+    # count, plus the occupancy term of the projection. ``new_tokens`` (a
+    # shared field — it means the same on every event kind) is the priced
+    # uncached token count the band split uses. ``None`` on pre-change lines.
+    rate_bucket: str | None = None
+    contended_samples: int | None = None
+    eta_occupancy_s: str | None = None
     # Measured pool state on the ``local_admission_guard`` record
     # (LP-0MVGR2OXT0096OGK M1, ``local_admission_guard`` kind): the number of
     # slots decoding, the number of prefills in flight, and whether a slot was
@@ -968,6 +997,12 @@ def parse_log_line(line: str) -> LogEvent | None:
             busy_slots=_int(RE_GUARD_BUSY_SLOTS, msg),
             in_flight_prefills=_int(RE_GUARD_IN_FLIGHT_PREFILLS, msg),
             free_slot=_first(RE_GUARD_FREE_SLOT, msg),
+            # Contended-pricing metadata (LP-0MVS9YKHL007UBBZ AC1): additive;
+            # absent on pre-change lines, where every field stays ``None``.
+            rate_bucket=_first(RE_GUARD_RATE_BUCKET, msg),
+            contended_samples=_int(RE_GUARD_CONTENDED_SAMPLES, msg),
+            eta_occupancy_s=_first(RE_GUARD_ETA_OCCUPANCY, msg),
+            new_tokens=_int(RE_GUARD_NEW_TOKENS, msg),
         )
     if msg.startswith(STATUS_REQUEST):
         # "status_request active_query=false available_slots=2
@@ -1328,6 +1363,7 @@ def parse_log_line(line: str) -> LogEvent | None:
                 model=_first(RE_MODEL, msg),
                 session=_session_from(msg),
                 ttft_ms=ttft_ms_val,
+                ttft_source="local" if dispatch_m else "remote",
                 dispatch_to_first_byte_ms=_float(RE_DISPATCH_TO_FIRST_BYTE, msg),
                 queue_wait_ms=_float(RE_QUEUE_WAIT_MS, msg),
                 cache_state=_first(RE_CACHE_STATE, msg),

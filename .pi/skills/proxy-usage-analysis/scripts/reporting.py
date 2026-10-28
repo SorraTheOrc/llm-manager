@@ -518,6 +518,12 @@ def build_report(
     # and agent-audit traffic.
     _append_prefill_regression_section(ap, summary)
 
+    # Contended-pricing observability (LP-0MVS9YKHL007UBBZ, parent AC1/AC4):
+    # admission verdicts split by the rate bucket the ETA was priced from and
+    # by the conversion harness's new-token bands, next to the other admission
+    # evidence.
+    _append_admission_bucket_section(ap, summary)
+
     # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3): surfaced
     # separately so a stuck hold is not read as repeated client retries.
     _append_hold_cycle_section(ap, summary)
@@ -1362,6 +1368,69 @@ def _append_prefill_regression_section(ap, summary: AnalysisResult) -> None:
             ev.reason or UNKNOWN_LABEL for ev in evictions
         ).most_common():
             ap(f"| {reason} | {count} |")
+
+
+def _append_admission_bucket_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Admission verdicts by rate bucket and prompt band`` section.
+
+    LP-0MVS9YKHL007UBBZ (parent LP-0MVS8T6F4006DGG3): the contended-pricing
+    fix prices a contended admission against the contended rate bucket and
+    falls back to the solitary window (logged ``rate_bucket=solitary_fallback``)
+    while that window is uncalibrated. Surfacing the split here makes a
+    regression to the optimistic rate visible in the standard report instead
+    of requiring ad-hoc log archaeology, and the per-band conversion counts
+    are read against the same bands the admission-conversion harness
+    (``scripts/prefill_admission_conversion.py``) reports.
+
+    Omitted entirely when the window holds no guard decision, like the
+    report's other conditional sections. Buckets/bands with no verdict are
+    omitted rather than zero-filled: an absent ``contended`` row means the
+    guard never priced a contended admission, which is itself the signal.
+    """
+    breakdown = aggregation.admission_breakdown(summary)
+    by_bucket = breakdown["by_rate_bucket"]
+    by_band = breakdown["by_token_band"]
+    if not by_bucket and not by_band:
+        return
+
+    ap("")
+    ap("## Admission verdicts by rate bucket and prompt band")
+    ap("")
+    ap("`local_admission_guard` decisions in the window, split by the pricing "
+       "bucket the prefill ETA was calibrated from (`rate_bucket`) and by the "
+       "new-token bands the admission-conversion harness "
+       "(`scripts/prefill_admission_conversion.py`) measures. `contended` "
+       "prices against the contended window; `solitary_fallback` means the "
+       "contended window was uncalibrated so the solitary window was used — "
+       "the deliberately-optimistic residual case, so a high "
+       "`solitary_fallback` share is the signal that the contended window "
+       "still needs samples. `unknown` is a pre-change line with no bucket "
+       "field (or a banded line with no priced `new_tokens`).")
+    ap("")
+    ap("### By pricing rate bucket")
+    ap("")
+    ap("| Rate bucket | Admitted | Refused | Refused share |")
+    ap("|---|---:|---:|---:|")
+    for bucket, verdicts in by_bucket.items():
+        total = verdicts["admit"] + verdicts["reject"]
+        ap(f"| {bucket} | {verdicts['admit']} | {verdicts['reject']} | "
+           f"{_pct(verdicts['reject'], total):.1f}% |")
+    ap("")
+    ap("### By new-token band (conversion-harness bands)")
+    ap("")
+    ap("| Band | Admitted | Refused | Conversions | Unconverted | Conversion share |")
+    ap("|---|---:|---:|---:|---:|---:|")
+    for band, entry in by_band.items():
+        share = entry["conversion_share"]
+        share_cell = f"{share * 100:.1f}%" if share is not None else "-"
+        ap(f"| {band} | {entry['admit']} | {entry['reject']} | "
+           f"{entry['converted']} | {entry['unconverted']} | {share_cell} |")
+    ap("")
+    ap("Conversions join a session's `decision=admit` to a later **local** "
+       "first byte (`dispatch_first_byte_ms`); an admitted session with no "
+       "local first byte counts as unconverted, and a remote first byte never "
+       "converts a local admission. A band with no admitted session shows `-` "
+       "rather than 0%.")
 
 
 def _append_hold_cycle_section(ap, summary: AnalysisResult) -> None:
@@ -2681,6 +2750,9 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
     # shared by the three keys so the attribution split never drifts between
     # ``denial_attribution`` and ``status_capacity_hint``.
     _contention = denial_attribution_json(summary)
+    # Contended-pricing split (LP-0MVS9YKHL007UBBZ AC2): the same computation
+    # feeds the markdown section, so the two views cannot disagree.
+    _admission = aggregation.admission_breakdown(summary)
     return {
         "window_start": _fmt_ts(summary.window_start),
         "window_end": _fmt_ts(summary.window_end),
@@ -2719,6 +2791,14 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
             for e in getattr(summary, "local_admission_events", []) or []
             if getattr(e, "decision", None) == "admit"
         ),
+        # Contended-pricing split (LP-0MVS9YKHL007UBBZ AC2): the admit/reject
+        # verdicts above, split by the pricing ``rate_bucket`` the ETA was
+        # calibrated from and by the admission-conversion harness's new-token
+        # bands (with per-band admission → local first-byte conversion). Both
+        # are ADDITIVE, and buckets/bands with no verdict are omitted rather
+        # than zero-filled.
+        "local_admission_by_rate_bucket": _admission["by_rate_bucket"],
+        "local_admission_by_token_band": _admission["by_token_band"],
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J AC3): economic
         # bypasses served locally because the GPU was idle.
         "local_idle_admit": len(getattr(summary, "idle_admit_events", []) or []),
