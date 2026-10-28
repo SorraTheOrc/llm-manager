@@ -5937,3 +5937,87 @@ def _schedule_traffic_recording(
             )
         except Exception:
             pass
+
+
+def _other_session_dispatch_active(
+    srv,
+    session_id: str | None,
+    endpoint: str | None = None,
+    now: float | None = None,
+) -> bool:
+    """True when *another* session holds a live dispatch in this endpoint.
+
+    LP-0MVS9Y76R004B5M8: co-residency evidence at first-byte time. Prefill is
+    serialised but prefill+decode batching is not, so an occupant that is
+    *generating* halves a newcomer's prefill throughput. This helper answers
+    "was another session's dispatch live while this prefill ran?" from the live
+    dispatch records, complementing the admission-time ``busy_slots`` snapshot
+    stamped on the request (the two are ORed by the sample recorder).
+
+    Scope matches the admission gate: only records in the same *endpoint*
+    scope count (endpoint-aware pools), and the requesting session's own
+    record never makes its own dispatch contended. A record is live when it is
+    ``active`` or holds an unexpired no-preemption lease — a released record is
+    not consuming the gate.
+
+    Fail-open: any error/missing state returns False (never blocks a stream
+    and never fabricates a contended sample).
+    """
+    try:
+        records = getattr(srv, "local_dispatch_records", None)
+        if not isinstance(records, dict) or not records:
+            return False
+        _now = time.monotonic() if now is None else float(now)
+        ep_scope = endpoint or ""
+        for key, record in list(records.items()):
+            if not isinstance(record, dict):
+                continue
+            key_endpoint = key[0] if isinstance(key, tuple) and key else ""
+            if key_endpoint != ep_scope:
+                continue
+            owner = _dispatch_key_session_id(key)
+            if not owner or owner == session_id:
+                continue
+            live = bool(record.get("active")) or float(
+                record.get("expires_at") or 0.0
+            ) > _now
+            if live:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def dispatch_sample_contended(
+    srv,
+    session_id: str | None,
+    *,
+    endpoint: str | None = None,
+    admission_busy_slots: int | None = None,
+    now: float | None = None,
+) -> bool:
+    """Co-residency flag for a first-byte calibration sample.
+
+    LP-0MVS9Y76R004B5M8: a prefill observed while the gate was contended
+    belongs in the contended calibration window. Two independent signals are
+    ORed (either marks the sample contended):
+
+    - the **admission-time** ``busy_slots`` snapshot stamped on the request
+      (``>= 1``), and
+    - a **first-byte-time live check** that *another* session's dispatch
+      record is still active for the same endpoint
+      (:func:`_other_session_dispatch_active`).
+
+    Fail-open: an unparseable/absent snapshot contributes 0 and a missing
+    record set contributes False, so a stream is never mis-tagged because
+    observability state is missing.
+    """
+    try:
+        busy = max(0, int(admission_busy_slots or 0))
+    except (TypeError, ValueError):
+        busy = 0
+    if busy >= 1:
+        return True
+    return _other_session_dispatch_active(
+        srv, session_id, endpoint=endpoint, now=now
+    )

@@ -6797,6 +6797,8 @@ def _stamp_local_admission_evidence(
     new_tokens: int | None,
     decision=None,
     model_name: str | None = None,
+    busy_slots: int | None = None,
+    in_flight_prefills: int | None = None,
 ) -> None:
     """Stamp the routing/admission decision's pricing values on the request.
 
@@ -6809,6 +6811,11 @@ def _stamp_local_admission_evidence(
     numbers verbatim (LP-0MVODJ3P6000AIUM AC1), so the post-acceptance
     eviction event can never claim an over-budget admission that the decision
     never priced (AC3).
+
+    *busy_slots* / *in_flight_prefills* (LP-0MVS9Y76R004B5M8) stamp the
+    admission-time co-residency snapshot: an occupied gate at admission marks
+    the dispatch's future calibration sample as contended, which the router
+    ORs with a first-byte-time live check before recording the sample.
 
     Best-effort: a non-request object or a stamping failure is a no-op — a
     routing decision must never break on observability instrumentation.
@@ -6847,6 +6854,10 @@ def _stamp_local_admission_evidence(
                 "new_tokens": max(0, int(new_tokens or 0))
                 if new_tokens is not None else None,
                 "eta_prefill_s": eta,
+                "busy_slots": max(0, int(busy_slots or 0))
+                if busy_slots is not None else None,
+                "in_flight_prefills": max(0, int(in_flight_prefills or 0))
+                if in_flight_prefills is not None else None,
             },
         )
     except Exception:
@@ -11270,6 +11281,21 @@ async def _proxy_with_fallback_cycle(
                     ):
                         _admission_snapshot_decision = _snapshot_candidate
                         break
+                # Co-residency snapshot (LP-0MVS9Y76R004B5M8): the admission-
+                # time occupancy, taken from the same governing decision so the
+                # contended tag on the future calibration sample matches the
+                # gate state that priced the admission (never re-queried at
+                # stamp time). Missing decision -> None markers, and the router
+                # falls back to its first-byte-time live check.
+                try:
+                    _snapshot_busy = getattr(
+                        _admission_snapshot_decision, "busy_slots", None
+                    ) if _admission_snapshot_decision is not None else None
+                    _snapshot_in_flight = getattr(
+                        _admission_snapshot_decision, "in_flight_prefills", None
+                    ) if _admission_snapshot_decision is not None else None
+                except Exception:
+                    _snapshot_busy, _snapshot_in_flight = None, None
                 try:
                     _stamp_local_admission_evidence(
                         request,
@@ -11278,6 +11304,8 @@ async def _proxy_with_fallback_cycle(
                         new_tokens=_routing_new_tokens,
                         decision=_admission_snapshot_decision,
                         model_name=_llama_model or provider_name,
+                        busy_slots=_snapshot_busy,
+                        in_flight_prefills=_snapshot_in_flight,
                     )
                 except Exception:
                     pass

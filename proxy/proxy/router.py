@@ -2694,16 +2694,39 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                 # time for this prompt/cache state becomes a
                                                 # sample of the per-(model, context-bucket)
                                                 # prefill cost. Never breaks the stream.
+                                                # Co-residency tag (LP-0MVS9Y76R004B5M8): the
+                                                # sample is marked contended when EITHER the
+                                                # admission-time busy_slots snapshot (>= 1) OR a
+                                                # live check at first-byte time shows another
+                                                # session's dispatch active for this endpoint.
                                                 try:
                                                     from proxy.prefill_eta import (
                                                         record_dispatch_sample,
                                                     )
+                                                    from proxy.router_helpers import (
+                                                        dispatch_sample_contended,
+                                                    )
 
+                                                    _admission_snapshot = getattr(
+                                                        request, "_local_admission_evidence", None
+                                                    )
+                                                    _admission_busy = None
+                                                    if isinstance(_admission_snapshot, dict):
+                                                        _admission_busy = _admission_snapshot.get(
+                                                            "busy_slots"
+                                                        )
+                                                    _is_contended = dispatch_sample_contended(
+                                                        srv,
+                                                        session_id,
+                                                        endpoint=endpoint,
+                                                        admission_busy_slots=_admission_busy,
+                                                    )
                                                     record_dispatch_sample(
                                                         model_name,
                                                         _estimated_tokens,
                                                         _cached_ratio,
                                                         _first_byte_service_ms,
+                                                        contended=_is_contended,
                                                     )
                                                 except Exception:
                                                     pass
