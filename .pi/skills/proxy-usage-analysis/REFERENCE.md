@@ -375,7 +375,11 @@ entry is a local runtime edit, not a committed artifact.
    `local_busy` — the definition marker `"definition": "dispatch_to_finish"`,
    `decode_busy_seconds` (retained decode-only union, the lower bound),
    `prefill_busy_seconds` (prefill span, derivable from the two unions),
-   `prefill_extended_streams` (how many streams carried a measured prefill)
+   `prefill_extended_streams` (how many of the in-window paired streams
+   carried a measured prefill — always ≤ `streams`, because the
+   margin-widened collection also carries pairs from earlier windows and
+   only pairs whose clipped busy interval is counted are included,
+   LP-0MVKN85WO007O00H)
    and the human labels `upper_bound_label` / `lower_bound_label` — so a
    machine consumer never has to infer the busy semantics
    (LP-0MVJNW6SN008AKH3). Every pre-change key is retained unchanged, and the

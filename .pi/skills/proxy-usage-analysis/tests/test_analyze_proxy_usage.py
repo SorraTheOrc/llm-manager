@@ -3751,6 +3751,68 @@ class TestDispatchToFinishBusy:
         assert busy.prefill_stats is not None
         assert list(busy.prefill_stats.samples) == pytest.approx([55.6565])
 
+    def test_out_of_window_pairs_do_not_count_as_prefill_extended(self):
+        """Regression (LP-0MVKN85WO007O00H): ``prefill_extended_streams``
+        counts only pairs whose clipped busy interval lands in the window.
+
+        The event stream handed to :func:`compute_busy_stats` is
+        margin-widened (48h collection), so it also carries pairs from earlier
+        windows. Those pairs contribute no busy interval and must not be
+        counted: counting them made the report note read ``1677 of 676``.
+        """
+        streams = [
+            # Two earlier-window pairs from the 48h collection margin, each
+            # fully finished before the window opens (empty clipped interval).
+            _local_event("stream_started", datetime(2026, 8, 2, 10, 0, 0), "old-a"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 10, 0, 30), "old-a"),
+            _local_event("stream_started", datetime(2026, 8, 2, 12, 0, 0), "old-b"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 12, 0, 30), "old-b"),
+            # The one in-window pair, with a measured prefill.
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 10, 0, 0), "old-a", 30000.0),
+            _ttft_event(datetime(2026, 8, 2, 12, 0, 0), "old-b", 30000.0),
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0),
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.streams == 1  # only the in-window pair has a busy interval
+        assert busy.prefill_extended_streams == 1
+        assert busy.prefill_extended_streams <= busy.streams
+
+    def test_prefill_extended_counts_only_in_window_pairs_in_aggregate(self):
+        """Regression end-to-end (LP-0MVKN85WO007O00H): the JSON/note counter
+        stays bounded by ``streams`` when real log lines from earlier windows
+        are present in the margin-widened collection."""
+        lines = [
+            # Earlier-window pair with a dispatch line (pre-window leftovers).
+            "2026-08-02 11:00:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=old request=[]",
+            "2026-08-02 11:00:30,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=old provider=local model=Qwen3 request=[]",
+            "2026-08-02 11:00:00,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=old model=Qwen3",
+            # In-window pair with a dispatch line.
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert summary.busy is not None
+        assert summary.busy.streams == 1
+        assert summary.busy.prefill_extended_streams == 1
+        # The ``Prefill vs decode`` population is separate: only the in-window
+        # first-byte sample counts, so the two counters stay distinct.
+        assert summary.busy.prefill_stats is not None
+        assert summary.busy.prefill_stats.count == 1
+
     def test_report_renders_definition_and_labelled_bounds(self):
         """AC2/AC3: the ``## Local model utilization`` section states the
         dispatch → finish definition, retains the decode-only row as the
@@ -3774,6 +3836,90 @@ class TestDispatchToFinishBusy:
         assert "1 of 1 stream(s) contributed a measured prefill" in section
         # Busy of 40 s over the 1h window.
         assert "40s (1.1%)" in section
+
+    def test_report_note_prefill_counter_bounded_by_streams_served(self):
+        """AC1 (LP-0MVKN85WO007O00H): the note's ``X of Y stream(s)``
+        numerator never exceeds the streams-served denominator, even when the
+        margin-widened collection carries pairs from earlier windows (the
+        ``1677 of 676`` symptom).
+
+        The note also keeps its population distinct from the ``Prefill vs
+        decode`` Samples column, which counts first-byte samples anchored in
+        the window including unfinished streams and may exceed Streams served.
+        """
+        lines = [
+            # Two earlier-window pairs, both with dispatch lines.
+            "2026-08-02 10:00:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=old-a request=[]",
+            "2026-08-02 10:00:20,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=old-a provider=local model=Qwen3 request=[]",
+            "2026-08-02 10:00:00,000 - INFO - dispatch_first_byte_ms=20000.0 "
+            "dispatch_to_first_byte_ms=19999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=old-a model=Qwen3",
+            "2026-08-02 12:00:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=old-b request=[]",
+            "2026-08-02 12:00:20,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=old-b provider=local model=Qwen3 request=[]",
+            "2026-08-02 12:00:00,000 - INFO - dispatch_first_byte_ms=20000.0 "
+            "dispatch_to_first_byte_ms=19999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=old-b model=Qwen3",
+            # The two in-window streams: one measured prefill, one without a
+            # first-byte line.
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+            "2026-08-02 14:10:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s2 request=[]",
+            "2026-08-02 14:10:15,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s2 provider=local model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert summary.busy is not None
+        assert summary.busy.streams == 2
+        report = reporting.build_report(summary, None)
+        section = report.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        # One of the two streams served in the window carried a first-byte
+        # line: the two earlier-window pairs must not inflate the numerator.
+        assert "1 of 2 stream(s) contributed a measured prefill" in section
+        assert "3 of 2" not in section
+        # The note names its population so it is never read as the (wider)
+        # ``Prefill vs decode`` Samples count.
+        assert "Prefill vs decode" in section
+        assert "Samples" in section
+
+    def test_report_note_is_deterministic_across_runs(self):
+        """AC3 (LP-0MVKN85WO007O00H): re-analysing the same logs renders a
+        byte-identical report, so the corrected note never drifts."""
+        lines = [
+            "2026-08-02 10:00:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=old request=[]",
+            "2026-08-02 10:00:20,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=old provider=local model=Qwen3 request=[]",
+            "2026-08-02 10:00:00,000 - INFO - dispatch_first_byte_ms=20000.0 "
+            "dispatch_to_first_byte_ms=19999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=old model=Qwen3",
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        first = reporting.build_report(
+            aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule()),
+            None,
+        )
+        second = reporting.build_report(
+            aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule()),
+            None,
+        )
+        assert first == second
+        assert "1 of 1 stream(s) contributed a measured prefill" in first
 
 
 class TestDecodeStats:

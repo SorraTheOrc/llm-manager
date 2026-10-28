@@ -761,9 +761,13 @@ class BusyStats:
     # The same decode-only union split across fast/cheap periods.
     decode_fast_busy_seconds: float = 0.0
     decode_cheap_busy_seconds: float = 0.0
-    # Number of paired streams whose busy interval was extended backwards to
-    # a measured dispatch time; the rest contribute their decode interval
-    # only (unknown prefill), which keeps the upper bound honest.
+    # Number of paired streams, **inside this window**, whose busy interval
+    # was extended backwards to a measured dispatch time; the rest contribute
+    # their decode interval only (unknown prefill), which keeps the upper bound
+    # honest. Only pairs whose clipped interval is actually counted are
+    # included, so this can never exceed :attr:`streams` — the event stream
+    # handed to :func:`compute_busy_stats` is margin-widened and also carries
+    # pairs from earlier windows (LP-0MVKN85WO007O00H).
     prefill_extended_streams: int = 0
 
     @property
@@ -1332,12 +1336,17 @@ def compute_busy_stats(
             measured_dispatch = dispatch_start.get(id(start_ev))
             if measured_dispatch is not None:
                 busy_start = measured_dispatch
-                prefill_extended += 1
             else:
                 busy_start = start_ev.ts
             b_lo, b_hi = max(busy_start, window_start), min(finish_ev.ts, window_end)
             if b_hi > b_lo:
                 intervals.append((b_lo, b_hi))
+                # Counted only alongside the interval it annotates: the event
+                # stream is margin-widened, so pairs from earlier windows (empty
+                # clipped intervals) must not inflate this counter past
+                # ``streams`` (LP-0MVKN85WO007O00H).
+                if measured_dispatch is not None:
+                    prefill_extended += 1
         # FIFO pairing: the earliest ``len(ff)`` starts pair with finishes;
         # the remaining starts are unpaired (no logged finish). Only starts
         # within the busy margin before the window (or inside it) count as

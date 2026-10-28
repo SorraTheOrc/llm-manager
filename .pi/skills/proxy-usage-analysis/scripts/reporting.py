@@ -1722,7 +1722,11 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
        f"{aggregation.BUSY_UPPER_BOUND_LABEL}. {b.prefill_extended_streams} of "
        f"{b.streams} stream(s) contributed a measured prefill (a first-byte line); "
        "the rest fall back to their decode interval, so the upper bound is never "
-       "overstated._")
+       "overstated. The count covers the paired streams whose busy interval "
+       "falls inside the window, so it never exceeds Streams served; the "
+       "`Prefill vs decode` Samples column counts first-byte samples anchored "
+       "in the window, unfinished streams included, and may legitimately exceed "
+       "Streams served._")
     if b.unfinished_streams or b.pre_window_unfinished:
         ap("")
         ap(f"_Note: {b.unfinished_streams} local stream(s) started inside the window "
