@@ -87,6 +87,16 @@ wrong-typed fields degrading to explicit `None`, derived
 `SSEEventReframer` byte splits, and `PromptProgressCapture` latest-wins
 semantics.
 
+`proxy/tests/test_measured_cache_abort_wiring.py` — the router wiring over a
+synthetic b8782 stream: a fake-warm first event releases the dispatch with
+`reason=measured_cache_deficit` in seconds (never the 120 s deadline), the
+client is then served by a remote provider, a genuinely warm stream is
+byte-for-byte unchanged, the rollback key restores pre-change behaviour, and
+missing/malformed/erroring measurements fail open. Also pins the parent AC2
+"first progress event" clause (LP-0MVR7K6CP000LW2F): only the first
+measurement decides, so a later event can neither block an abort nor trigger
+one after bytes have reached the client.
+
 ## Regression proof and window replay (F5, LP-0MVR7IXAI002QXXD)
 
 The no-regression guarantees are pinned against the parent's own reference

@@ -727,6 +727,59 @@ async def test_prefetch_decides_once_and_replays_every_consumed_chunk():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_aborts", [False, True], ids=["warm-first", "deficit-first"]
+)
+async def test_prefetch_first_progress_event_alone_decides_the_abort(first_aborts):
+    """AC2: only the FIRST ``prompt_progress`` measurement decides.
+
+    The first event's ``cache`` is the dispatch's final reused prefix, so no
+    later event may flip the verdict. Both directions are pinned because a
+    refactor that re-decided mid-stream would try to detour after the client
+    already received bytes — a release that can no longer fall through to a
+    remote provider.
+    """
+    from proxy.measured_cache_abort import AbortSettings
+    from proxy.utils import SSEEventReframer
+
+    first = _fake_warm_progress() if first_aborts else _warm_progress()
+    later = _warm_progress() if first_aborts else _fake_warm_progress()
+    chunks = [first, later, _CONTENT_CHUNK, _FINISH_CHUNK]
+    aiter = _FakeAiter(chunks)
+
+    prefetch = await helpers._prefetch_measured_cache_abort(
+        aiter,
+        SSEEventReframer(),
+        settings=AbortSettings(
+            enabled=True, bound_tokens=2_000, min_deficit_ratio=0.25
+        ),
+        priced_new_tokens=PRICED_NEW_TOKENS,
+        timeout=1.0,
+    )
+
+    # The reported measurement is always the first event's, never the later one.
+    assert prefetch.measured is not None
+    assert prefetch.measured.total == PROMPT_TOKENS
+    assert prefetch.measured.cache == (
+        200 if first_aborts else int(PROMPT_TOKENS * 0.999)
+    )
+    assert prefetch.abort is first_aborts
+
+    if first_aborts:
+        # The abort ends the peek at the deciding event: the contradicting
+        # later event is never consumed, so it can never be replayed either.
+        assert aiter.consumed == 1
+        assert prefetch.chunks == [first]
+        assert prefetch.decision.reason == "measured_cache_deficit"
+    else:
+        # A continuing peek reads on to the first client-visible event and
+        # replays every consumed chunk; the later fake-warm event is ignored.
+        assert aiter.consumed == 3
+        assert prefetch.chunks == [first, later, _CONTENT_CHUNK]
+        assert prefetch.decision is None
+
+
+@pytest.mark.asyncio
 async def test_prefetch_reports_the_abort_decision():
     """A qualifying fake-warm measurement returns the F3 decision."""
     from proxy.measured_cache_abort import (
