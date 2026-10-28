@@ -6401,8 +6401,10 @@ def _local_occupant_prefill_seconds(
     LP-0MVOFVCA2008DQVE: the symmetric ``eta * busy_slots`` occupancy floor
     prices an occupant at the newcomer's own prefill, which is wrong when a
     small warm prompt queues behind a large cold one. This projects each live
-    occupant from its own dispatch record (calibrated ETA minus elapsed) so the
-    deadline bound sees the real time to first byte.
+    occupant from its own dispatch record so the deadline bound sees the real
+    time to first byte; since LP-0MVS9YK9P006M1NQ the projection re-prices the
+    occupant's remaining uncached *new tokens* at the contended co-residency
+    rate instead of decaying its optimistic admission ETA.
 
     Never raises: a routing decision must not break on an observability gap
     (0.0 leaves the symmetric floor in charge).

@@ -64,11 +64,13 @@ seconds and admitted, then cancelled by ``local_prefill_deadline_seconds``
 with zero prefill progress (measured 2026-10-25: own ETA 7.1 s, elapsed
 120.1 s, ``progress=None alive=False in_flight=True``). The occupancy term
 therefore also accepts the **measured remaining service** of the in-flight
-prefills (each occupant's calibrated ETA minus its elapsed run time, from its
-live dispatch record) and both bounds — the queue wait budget *and* the
-prefill deadline — are evaluated against the projected time to first byte.
-Measured evidence can only raise the symmetric floor, never lower it, so a
-missing record keeps today's behaviour byte-for-byte.
+prefills (from each occupant's live dispatch record; since
+LP-0MVS9YK9P006M1NQ this is re-priced from the occupant's remaining uncached
+*new tokens* at the contended rate rather than decayed from its optimistic
+admission ETA) and both bounds — the queue wait budget *and* the prefill
+deadline — are evaluated against the projected time to first byte. Measured
+evidence can only raise the symmetric floor, never lower it, so a missing
+record keeps today's behaviour byte-for-byte.
 
 Calibration is data-driven: every local dispatch records a sample
 ``(coded_tokens, new_tokens, dispatch_to_first_byte_ms)`` from the existing
