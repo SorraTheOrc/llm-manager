@@ -78,3 +78,11 @@ leakage), capture over a synthetic b8782 stream, dispatch-record exposure,
 byte-for-byte client stream, client-requested progress passthrough, fail-open
 (missing/malformed/exception), the log grammar, the rollback key, and the
 remote path forwarding the client body verbatim.
+
+`proxy/tests/test_prompt_progress_contract.py` — the parse contract itself
+(parent AC1, LP-0MVR7K63C006O9ZL): all four fields extracted from the four real
+b8782 event shapes (initial 0%, in progress, fully warm, fake warm), absent or
+wrong-typed fields degrading to explicit `None`, derived
+`measured_cached_ratio` / `measured_new_tokens`, survival of arbitrary
+`SSEEventReframer` byte splits, and `PromptProgressCapture` latest-wins
+semantics.
