@@ -429,6 +429,12 @@ class SpeedStats:
     prompt_eval: dict[str, SpeedBucket]
     files_parsed: int
     files_skipped: int
+    # Raw observed prefill durations in seconds (``prompt eval time`` ms / 1000
+    # for every Qwen3 prompt-eval sample in the window — LP-0MVGR2OXT0096OGK
+    # M3). The percentile summaries above are tok/s (speed, not duration), so
+    # the wall-clock duration distribution is retained separately to compare
+    # against the proxy's ``prefill_eta_seconds`` prediction.
+    prompt_eval_seconds: list[float] = field(default_factory=list)
     log_dir: str | None = None
     files_discovered: list[str] = field(default_factory=list)
     file_diagnostics: list[FileDiagnostic] = field(default_factory=list)
@@ -499,6 +505,8 @@ def build_speed_stats(
         KIND_DECODE: {key: [] for key in _BUCKET_KEYS},
         KIND_PROMPT_EVAL: {key: [] for key in _BUCKET_KEYS},
     }
+    # Raw observed prefill durations (s) for M3 (LP-0MVGR2OXT0096OGK).
+    prompt_eval_seconds: list[float] = []
     files_parsed = 0
     files_skipped = 0
     diagnostics: list[FileDiagnostic] = []
@@ -649,6 +657,10 @@ def build_speed_stats(
             group = samples[ev.kind]
             group[TOTAL].append(ev.tok_s)
             group[bucket_key].append(ev.tok_s)
+            if ev.kind == KIND_PROMPT_EVAL:
+                # M3 observed durations (ms → s) for the predicted-vs-observed
+                # prefill ETA comparison.
+                prompt_eval_seconds.append(ev.ms / 1000.0)
         diagnostics.append(
             FileDiagnostic(
                 name=name,
@@ -672,6 +684,7 @@ def build_speed_stats(
         prompt_eval=_bucket_stats(samples[KIND_PROMPT_EVAL]),
         files_parsed=files_parsed,
         files_skipped=files_skipped,
+        prompt_eval_seconds=prompt_eval_seconds,
         log_dir=str(log_dir_p) if log_dir_p is not None else None,
         files_discovered=[p.name for p in candidates],
         file_diagnostics=diagnostics,

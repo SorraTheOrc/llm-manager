@@ -121,6 +121,35 @@ is therefore genuine evidence of an over-budget admission, never a re-pricing
 artefact. A record created without an admission snapshot reports `0`/`unknown`
 instead of a recomputed value.
 
+## Contention-prediction measurement (LP-0MVGR2OXT0096OGK)
+
+Since the payload change (per-slot `lease_state` / `phase` /
+`prefill_eta_seconds`, top-level `capacity_hint`; LP-0MVGDUVGE0024YAI), the CLI
+measures whether those signals predict **real** local contention. The report
+renders a **Local contention prediction vs reality** section and `--json`
+exposes the same numbers under `denial_attribution`, `prefill_eta_error` and
+`status_capacity_hint` whenever the window has a denial or a status poll:
+
+- **M1 (denial attribution).** `local_dispatch_denied` lines carry no
+  `lease_state`, so each denial is joined to its decision-block
+  `local_admission_guard` `reject` record (nearest within ±60 s, inclusive)
+  and the pool state at denial time is derived from the guard's measured
+  `busy_slots` / `in_flight_prefills` fields: `idle_leased` (no slot decoding,
+  no prefill in flight — the false-busy case), `prefill_bound` (≥1 prefill
+  running), `saturated` (slots decoding), `unknown` (legacy lines). Denials
+  with no guard in the block are reported `unattributed`, never guessed.
+- **M2 (local busy fraction vs denials).** The window's busy fraction and
+  per-hour busy% (from `BusyStats`) sit beside the denials, and the
+  window's denials-per-hour / busy fraction are compared with the pre-change
+  baseline (2,641 denials / 24 h at 29.3% busy).
+- **M3 (prefill ETA accuracy).** `prefill_eta_error` compares the
+  `prefill_eta_seconds` published on `status_request` polls against the
+  llama-server `prompt eval time` durations at matched p50/p90 quantiles,
+  with signed/relative error and a `matches_reality` / `over_predicts` /
+  `under_predicts` / `inconclusive` verdict (llama-server lines carry no
+  per-line timestamps, so per-dispatch pairing is impossible — see
+  REFERENCE.md Limitations).
+
 ## Further reference
 
 Report interpretation, root-cause taxonomy, implementation notes, and

@@ -59,6 +59,47 @@ CSV_COLUMNS = [
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
+# --- Contention-prediction measurement (LP-0MVGR2OXT0096OGK) --------------
+#
+# The item measures whether the payload's ``lease_state`` /
+# ``prefill_eta_seconds`` signals predict real local contention:
+#
+# * M1 — per-hour denial attribution by ``local_admission_guard`` reason plus
+#   the guard's measured ``busy_slots`` / ``in_flight_prefills`` / ``free_slot``
+#   (the denial line itself carries no ``lease_state``), reduced to an
+#   ``idle_leased`` / ``prefill_bound`` / ``saturated`` / ``unknown`` verdict.
+# * M2 — the window's local busy fraction beside those denials (already
+#   computed by :class:`aggregation.BusyStats`; rendered here for comparison).
+# * M3 — predicted-versus-observed prefill duration at p50/p90, comparing the
+#   ``prefill_eta_seconds`` published on ``status_request`` polls against the
+#   llama-server ``prompt eval time`` samples for dispatches that ran.
+#
+# The baseline these are compared against (measured before the payload change,
+# from this item's description):
+CONTENTION_BASELINE = {
+    "window": "2026-10-19 07:23 → 2026-10-20 07:23",
+    "denials": 2641,
+    "hours": 24.0,
+    "busy_pct": 29.3,
+    "worst_hour": "2026-10-20 04:00–05:00",
+    "worst_hour_denials": 187,
+    "worst_hour_busy_pct": 2.5,
+    "idle_lease_records": 2633,
+    "source": "LP-0MVGR2OXT0096OGK description (pre-change baseline)",
+}
+
+# M3 verdict tolerance: the predicted p50 prefill duration is called a match
+# when it is within this percentage of the observed p50. Wider than the 10%
+# band the calibration itself targets because this compares two differently
+# conditioned distributions (reference-prompt, cache-cold prediction vs the
+# prompt mix that actually ran) at a quantile, not per dispatch.
+PREFILL_ETA_MATCH_TOLERANCE_PCT = 25.0
+
+# M1 verdict threshold: the share of attributed denials whose decision block
+# measured zero local work (``idle_leased``) above which the lease/busy signal
+# is judged NOT to reflect reality.
+IDLE_LEASED_SHARE_THRESHOLD_PCT = 50.0
+
 
 @dataclass
 class AnalysisRun:
@@ -506,6 +547,7 @@ def build_report(
 
     _append_busy_section(ap, summary, schedule)
     _append_prefill_vs_decode_section(ap, summary)
+    _append_contention_prediction_section(ap, summary, speed)
 
     _append_mode_timeline_section(ap, summary, mode_map)
 
@@ -1882,6 +1924,164 @@ def _append_prefill_vs_decode_section(ap, summary: AnalysisResult) -> None:
         )
 
 
+def _append_contention_prediction_section(
+    ap, summary: AnalysisResult, speed: llama_log_parser.SpeedStats | None
+) -> None:
+    """Append the ``## Local contention prediction vs reality`` section (M1-M3).
+
+    LP-0MVGR2OXT0096OGK: measures whether the payload's ``lease_state`` /
+    ``prefill_eta_seconds`` signals predict real local contention. Rendered
+    after the busy sections so the M2 busy fractions are already on the page;
+    the three measurements and the explicit matches/does-not-match verdicts
+    follow (the same numbers are also in ``--json`` under
+    ``denial_attribution`` and ``prefill_eta_error``). Skipped when the window
+    carries neither a denial nor a status poll, so unchanged windows render
+    unchanged reports.
+    """
+    denials = int(summary.dispatch_denied_count)
+    statuses = getattr(summary, "status_request_events", []) or []
+    if not denials and not statuses:
+        return
+
+    att = denial_attribution_json(summary)
+    eta = prefill_eta_error_json(summary, speed)
+    hours = max((summary.window_end - summary.window_start).total_seconds() / 3600.0, 1e-9)
+    busy_pct = summary.busy.busy_pct if summary.busy else 0.0
+
+    ap("")
+    ap("## Local contention prediction vs reality")
+    ap("")
+    ap("Measures whether the payload's `lease_state` / `prefill_eta_seconds` "
+       "signals predict **real** local contention (LP-0MVGR2OXT0096OGK). "
+       "`local_dispatch_denied` lines carry no `lease_state`, so each denial is "
+       "joined to its decision-block `local_admission_guard` record "
+       f"(nearest within ±{aggregation.DENIAL_GUARD_JOIN_WINDOW_SECONDS:.0f}s) and "
+       "the pool state at denial time is derived from the guard's measured "
+       "`busy_slots` / `in_flight_prefills` / `free_slot` fields.")
+    ap("")
+    ap("### M1 — denial attribution (pool state at denial time)")
+    ap("")
+    ap("| Hour | Denials | idle_leased | prefill_bound | saturated | unknown | "
+       "unattributed | Local busy % |")
+    ap("|---|---|---:|---:|---:|---:|---:|---:|")
+    for row in att["per_hour"]:
+        ap(
+            f"| {row['hour']} | {row['denials']} | {row['idle_leased']} | "
+            f"{row['prefill_bound']} | {row['saturated']} | {row['unknown']} | "
+            f"{row['unattributed']} | {row['busy_pct']:.1f}% |"
+        )
+    total_row = att["by_verdict"]
+    ap(
+        f"| **Total** | **{att['denials']}** | **{total_row['idle_leased']}** | "
+        f"**{total_row['prefill_bound']}** | **{total_row['saturated']}** | "
+        f"**{total_row['unknown']}** | **{att['unattributed']}** | {busy_pct:.1f}% |"
+    )
+    ap("")
+    if att["by_guard_reason"]:
+        ap("**Guard reason split (attributed denials):** "
+           + ", ".join(f"{k} {v}" for k, v in att["by_guard_reason"].items())
+           + ".")
+    if att["capacity_hint"]:
+        hints = ", ".join(f"{k} {v}" for k, v in att["capacity_hint"].items())
+        ap(f"**Payload's own claim (`capacity_hint` over status polls):** {hints}.")
+    ap("")
+    ap("### M2 — local busy fraction vs denials")
+    ap("")
+    baseline = CONTENTION_BASELINE
+    now_dph = att["denials"] / hours
+    base_dph = baseline["denials"] / baseline["hours"]
+    ap("| Metric | This window | Baseline (pre-change) |")
+    ap("|---|---|---|")
+    ap(f"| Window | {_fmt_dt(summary.window_start)} → {_fmt_dt(summary.window_end)} "
+       f"({hours:.1f}h) | {baseline['window']} ({baseline['hours']:.0f}h) |")
+    ap(f"| Dispatch denials | {att['denials']} | **{baseline['denials']}** |")
+    ap(f"| Denials per hour | {now_dph:.1f} | {base_dph:.1f} |")
+    ap(f"| Local busy (dispatch → finish) | {busy_pct:.1f}% | {baseline['busy_pct']}% |")
+    if att["per_hour"]:
+        worst = max(att["per_hour"], key=lambda r: r["denials"])
+        worst_cell = (
+            f"{worst['hour']} ({worst['denials']} denials at {worst['busy_pct']:.1f}% busy)"
+        )
+    else:
+        worst_cell = "-"
+    ap(f"| Worst hour | {worst_cell} | "
+       f"{baseline['worst_hour']} ({baseline['worst_hour_denials']} denials at "
+       f"{baseline['worst_hour_busy_pct']}% busy) |")
+    ap("")
+    idle_share = att["idle_leased_share_pct"]
+    if idle_share is None:
+        denial_verdict_label = "inconclusive"
+        denial_sentence = (
+            "No denial could be attributed to a guard record — the split is "
+            "inconclusive."
+        )
+    elif idle_share >= IDLE_LEASED_SHARE_THRESHOLD_PCT:
+        denial_verdict_label = "does not match reality"
+        denial_sentence = (
+            f"{idle_share:.1f}% of attributed denials fired while the guard "
+            "measured **zero** local work (no slot decoding, no prefill in "
+            "flight) — the idle-lease false-busy pattern."
+        )
+    else:
+        denial_verdict_label = "matches reality"
+        denial_sentence = (
+            f"Only {idle_share:.1f}% of attributed denials fired with the pool "
+            "measured idle — most denials tracked genuine prefill/decode work."
+        )
+    if eta["verdict"] == "matches_reality":
+        eta_verdict_label = "matches reality"
+        eta_sentence = (
+            "the predicted prefill ETA is within tolerance of observed prefill "
+            "durations."
+        )
+    elif eta["verdict"] in ("over_predicts", "under_predicts"):
+        eta_verdict_label = "does not match reality"
+        eta_sentence = (
+            f"The predicted prefill ETA {eta['verdict']} observed prefill "
+            "durations."
+        )
+    else:
+        eta_verdict_label = "inconclusive"
+        eta_sentence = "the prefill ETA comparison is inconclusive."
+    ap(f"**Denial signal (`lease_state`): {denial_verdict_label}.** {denial_sentence}")
+    ap(f"**Prefill-ETA signal (`prefill_eta_seconds`): {eta_verdict_label}.** {eta_sentence}")
+    if "does not match reality" in (denial_verdict_label, eta_verdict_label):
+        overall_label = "do not unambiguously match reality"
+    else:
+        overall_label = "match reality"
+    ap(f"**Overall: the pre-change false-busy dispatch failures are driven by "
+       f"signals that {overall_label} (denial volume {att['denials']} vs baseline "
+       f"{baseline['denials']}, denials/hour {now_dph:.1f} vs {base_dph:.1f}, busy "
+       f"{busy_pct:.1f}% vs {baseline['busy_pct']}%).**")
+    ap("")
+    ap("### M3 — prefill_eta_seconds accuracy (predicted vs observed, p50/p90)")
+    ap("")
+    ap("| Quantile | Predicted (status polls) | Observed (prompt eval) | "
+       "Error (pred−obs) | Relative |")
+    ap("|---|---:|---:|---:|---:|")
+    pred = eta["predicted"]
+    obs = eta["observed"]
+    ap(f"| p50 | {pred['p50'] if pred['p50'] is not None else '-'} s "
+       f"(n={pred['samples']}) | {obs['p50'] if obs['p50'] is not None else '-'} s "
+       f"(n={obs['samples']}) | {eta['error_p50'] if eta['error_p50'] is not None else '-'} s | "
+       f"{eta['relative_error_p50_pct'] if eta['relative_error_p50_pct'] is not None else '-'}% |")
+    ap(f"| p90 | {pred['p90'] if pred['p90'] is not None else '-'} s | "
+       f"{obs['p90'] if obs['p90'] is not None else '-'} s | "
+       f"{eta['error_p90'] if eta['error_p90'] is not None else '-'} s | "
+       f"{eta['relative_error_p90_pct'] if eta['relative_error_p90_pct'] is not None else '-'}% |")
+    ap("")
+    ap("Predicted = the calibrated `prefill_eta_seconds` published on "
+       "`status_request` polls; observed = llama-server `prompt eval time` "
+       "durations for dispatches that ran. The two streams cannot be paired "
+       "1:1 (llama-server eval lines carry no per-line timestamps), so the "
+       "comparison is quantile-matched: the p50/p90 of each distribution and "
+       "the signed error at both quantiles. The prediction is the cache-cold "
+       "reference-prompt cost, so systematic over-prediction (high predicted "
+       "p50 vs low observed p50) means the ETA over-refuses servable work.")
+    ap(f"**(prefill ETA verdict: {eta['verdict']})**")
+    ap("")
+
+
 def _fmt_tokens(n: int) -> str:
     """Format a token count with comma separators."""
     return f"{n:,}"
@@ -2456,6 +2656,10 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
     fell_back = sum(1 for s in sessions if s.fell_back)
     remote_only = sum(1 for s in sessions if s.local_requests == 0 and s.remote_requests > 0)
     total = summary.total_requests
+    # Contention-prediction block (LP-0MVGR2OXT0096OGK): computed once here and
+    # shared by the three keys so the attribution split never drifts between
+    # ``denial_attribution`` and ``status_capacity_hint``.
+    _contention = denial_attribution_json(summary)
     return {
         "window_start": _fmt_ts(summary.window_start),
         "window_end": _fmt_ts(summary.window_end),
@@ -2565,6 +2769,13 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
             3,
         ),
         "dispatch_denied": summary.dispatch_denied_count,
+        # Contention-prediction measurements (LP-0MVGR2OXT0096OGK): M1 denial
+        # attribution by guard reason/pool state, the payload's own
+        # capacity_hint claim, and M3 predicted-vs-observed prefill ETA error.
+        # All ADDITIVE — no key above changes value or meaning.
+        "denial_attribution": _contention,
+        "prefill_eta_error": prefill_eta_error_json(summary, summary.speed),
+        "status_capacity_hint": _contention["capacity_hint"],
         "unattributed_events": summary.unattributed_events,
         # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): terminal lines with
         # measured token counts vs. terminal lines with none (unknown, not zero).
@@ -2804,6 +3015,170 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
         # Phase slot-time split (LP-0MVJNDOUU0059MMO): prefill vs decode as
         # slot-seconds and % of combined phase slot-time (sums to 100%).
         "prefill_vs_decode": _prefill_vs_decode_json(busy),
+    }
+
+
+def prefill_eta_error_json(
+    summary: AnalysisResult, speed: llama_log_parser.SpeedStats | None
+) -> dict:
+    """M3 (LP-0MVGR2OXT0096OGK): predicted-vs-observed prefill ETA error.
+
+    Predicted: every non-``None`` ``prefill_eta_seconds`` published on
+    ``status_request`` polls inside the window. Observed: the llama-server
+    ``prompt eval time`` durations (seconds) for the dispatches that ran.
+    The two streams cannot be joined 1:1 (llama-server eval lines carry no
+    per-line timestamps — see REFERENCE.md limitations), so the comparison is
+    quantile-matched: the p50/p90 of each distribution and the signed error at
+    both quantiles, plus the relative error against the observed value.
+
+    The verdict rescues the operator from reading the table:
+    ``matches_reality`` when the predicted p50 is within the tolerance of the
+    observed p50, ``over_predicts`` / ``under_predicts`` when it misses wide
+    in that direction (an over-prediction is the harmful direction — it
+    refuses work that would have been servable), ``inconclusive`` when either
+    side has no samples.
+    """
+    predicted = sorted(
+        float(e.prefill_eta_seconds)
+        for e in getattr(summary, "status_request_events", []) or []
+        if getattr(e, "prefill_eta_seconds", None) is not None
+    )
+    observed = sorted(float(v) for v in (getattr(speed, "prompt_eval_seconds", None) or []))
+    pred_p50 = _percentile(predicted, 50)
+    pred_p90 = _percentile(predicted, 90)
+    obs_p50 = _percentile(observed, 50)
+    obs_p90 = _percentile(observed, 90)
+    # Duration percentiles are reported to 2 dp (seconds) so JSON consumers
+    # never see float-representation dust like 8.600000000000001.
+    pred_p50 = round(pred_p50, 2) if pred_p50 is not None else None
+    pred_p90 = round(pred_p90, 2) if pred_p90 is not None else None
+    obs_p50 = round(obs_p50, 2) if obs_p50 is not None else None
+    obs_p90 = round(obs_p90, 2) if obs_p90 is not None else None
+
+    def _error(pred: float | None, obs: float | None) -> float | None:
+        if pred is None or obs is None:
+            return None
+        return round(pred - obs, 1)
+
+    def _relative(pred: float | None, obs: float | None) -> float | None:
+        if pred is None or obs is None or not obs:
+            return None
+        return round((pred - obs) / obs * 100.0, 1)
+
+    err_p50 = _error(pred_p50, obs_p50)
+    err_p90 = _error(pred_p90, obs_p90)
+    rel_p50 = _relative(pred_p50, obs_p50)
+    rel_p90 = _relative(pred_p90, obs_p90)
+    if not predicted or not observed or rel_p50 is None:
+        verdict = "inconclusive"
+    elif abs(rel_p50) <= PREFILL_ETA_MATCH_TOLERANCE_PCT:
+        verdict = "matches_reality"
+    elif rel_p50 > 0:
+        verdict = "over_predicts"
+    else:
+        verdict = "under_predicts"
+    return {
+        "predicted": {
+            "samples": len(predicted),
+            "p50": pred_p50,
+            "p90": pred_p90,
+        },
+        "observed": {
+            "samples": len(observed),
+            "p50": obs_p50,
+            "p90": obs_p90,
+        },
+        "error_p50": err_p50,
+        "error_p90": err_p90,
+        "relative_error_p50_pct": rel_p50,
+        "relative_error_p90_pct": rel_p90,
+        "tolerance_pct": PREFILL_ETA_MATCH_TOLERANCE_PCT,
+        "verdict": verdict,
+    }
+
+
+def denial_attribution_json(summary: AnalysisResult) -> dict:
+    """M1/M2 JSON surface (LP-0MVGR2OXT0096OGK): denial attribution split.
+
+    ``local_dispatch_denied`` lines carry no ``lease_state``; each is joined to
+    its decision-block ``local_admission_guard`` reject (nearest within
+    :data:`aggregation.DENIAL_GUARD_JOIN_WINDOW_SECONDS`, inclusive) and the
+    pool-state verdict is derived from the guard's measured fields. Denials
+    with no guard in the block are ``unattributed``. Per-hour rows pair the
+    attribution split with the hour's local busy fraction (M2 corroboration:
+    a denial hour whose busy% is ~0 is a false-busy hour).
+
+    ``capacity_hint`` — the payload field under test — is summarised from the
+    ``status_request`` polls so the payload's own claim is compared against
+    the measured reality (the same ``denials`` can coincide with an
+    ``idle``-claimed pool).
+    """
+    attrs = getattr(summary, "denial_attributions", []) or []
+    statuses = getattr(summary, "status_request_events", []) or []
+    denials_total = int(summary.dispatch_denied_count)
+    attributed = len(attrs)
+    by_verdict: Counter[str] = Counter(a.verdict for a in attrs)
+    by_reason: Counter[str] = Counter(a.guard_reason for a in attrs if a.guard_reason)
+    capacity: Counter[str] = Counter(e.capacity_hint for e in statuses if e.capacity_hint)
+
+    busy_hourly = dict(
+        getattr(getattr(summary, "busy", None), "hourly_busy", []) or []
+    )
+    denials_by_hour: Counter[datetime] = Counter(
+        e.ts.replace(minute=0, second=0, microsecond=0)
+        for e in getattr(summary, "dispatch_denied_events", []) or []
+    )
+    verdicts_by_hour: dict[datetime, Counter[str]] = {}
+    for a in attrs:
+        hk = a.ts.replace(minute=0, second=0, microsecond=0)
+        verdicts_by_hour.setdefault(hk, Counter())[a.verdict] += 1
+
+    per_hour: list[dict] = []
+    for hk in sorted(denials_by_hour):
+        window_seconds = max(
+            0.0,
+            (
+                min(summary.window_end, hk + timedelta(hours=1))
+                - max(summary.window_start, hk)
+            ).total_seconds(),
+        )
+        busy_seconds = float(busy_hourly.get(hk, 0.0))
+        vh = verdicts_by_hour.get(hk, Counter())
+        row: dict = {
+            "hour": _fmt_ts(hk),
+            "denials": denials_by_hour[hk],
+            "attributed": sum(vh.values()),
+            "unattributed": denials_by_hour[hk] - sum(vh.values()),
+            "busy_seconds": round(busy_seconds, 1),
+            "busy_pct": round(busy_seconds / window_seconds * 100.0, 1) if window_seconds else 0.0,
+        }
+        for verdict in aggregation.DENIAL_VERDICT_ORDER:
+            row[verdict] = vh.get(verdict, 0)
+        per_hour.append(row)
+
+    idle_share_pct = (
+        round(by_verdict.get(aggregation.DENIAL_VERDICT_IDLE_LEASED, 0) / attributed * 100.0, 1)
+        if attributed
+        else None
+    )
+    if not attributed:
+        verdict = "inconclusive"
+    elif idle_share_pct is not None and idle_share_pct >= IDLE_LEASED_SHARE_THRESHOLD_PCT:
+        verdict = "does_not_match_reality"
+    else:
+        verdict = "matches_reality"
+
+    return {
+        "denials": denials_total,
+        "attributed": attributed,
+        "unattributed": denials_total - attributed,
+        "join_window_seconds": aggregation.DENIAL_GUARD_JOIN_WINDOW_SECONDS,
+        "idle_leased_share_pct": idle_share_pct,
+        "by_verdict": {v: by_verdict.get(v, 0) for v in aggregation.DENIAL_VERDICT_ORDER},
+        "by_guard_reason": dict(sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "per_hour": per_hour,
+        "capacity_hint": dict(sorted(capacity.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "verdict": verdict,
     }
 
 

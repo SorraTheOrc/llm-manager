@@ -161,6 +161,24 @@ RE_LOCAL_ADMISSION_ENFORCED = re.compile(r"\benforced=(true|false)\b")
 RE_LOCAL_ADMISSION_ETA = re.compile(r"\beta_prefill_s=([\d.]+)")
 RE_LOCAL_ADMISSION_BUDGET = re.compile(r"\bbudget_s=([\d.]+)")
 RE_LOCAL_ADMISSION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
+# Measured pool state on the guard record (LP-0MVGR2OXT0096OGK M1): the
+# busy/decode slot count, in-flight prefill count and free-slot flag at
+# decision time — the fields the denial-attribution verdict is derived from
+# (``local_dispatch_denied`` itself carries no ``lease_state``).
+RE_GUARD_BUSY_SLOTS = re.compile(r"\bbusy_slots=(\d+)")
+RE_GUARD_IN_FLIGHT_PREFILLS = re.compile(r"\bin_flight_prefills=(\d+)")
+RE_GUARD_FREE_SLOT = re.compile(r"\bfree_slot=(true|false)")
+
+# Status-poll payload (LP-0MVGR2OXT0096OGK M3): ``status_request`` lines carry
+# the calibrated ``prefill_eta_seconds`` prediction and the truthful
+# ``capacity_hint`` (idle / prefill_bound / saturated) the payload change
+# (LP-0MVGDUVGE0024YAI) published. ETA is ``None`` when the estimate failed
+# fail-open; both fields are absent on pre-change schema lines.
+RE_STATUS_PREFILL_ETA = re.compile(r"\bprefill_eta_seconds=([\d.]+|None)")
+RE_STATUS_CAPACITY_HINT = re.compile(r"\bcapacity_hint=([a-z_]+)")
+RE_STATUS_SCHEMA_VERSION = re.compile(r"\bstatus_schema_version=(\d+)")
+RE_STATUS_AVAILABLE_SLOTS = re.compile(r"\bavailable_slots=(\d+)")
+RE_STATUS_TOTAL_SLOTS = re.compile(r"\btotal_slots=(\d+)")
 
 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): the proxy emits
 # ``routing_idle_admit provider=... model=... reason=economic_bypass_idle
@@ -227,6 +245,9 @@ ROUTING_SKIP = "routing_skip_local"
 # carries the session UUID, the provider, the estimate and the ceiling.
 ROUTING_SKIP_PROVIDER_CONTEXT = "routing_skip_provider_context"
 DISPATCH_DENIED = "local_dispatch_denied"
+# Status poll of the local capacity payload (LP-0MVGR2OXT0096OGK M3): carries
+# the predicted ``prefill_eta_seconds`` and ``capacity_hint`` per poll.
+STATUS_REQUEST = "status_request"
 # Local dispatch attempt marker (LP-0MVKUKG3F0035I85): the proxy logs one
 # ``[local] POST http://<backend>/... `` line for **every** attempt it makes at
 # the local llama-server, including attempts that never yield a first byte (a
@@ -574,6 +595,24 @@ class LogEvent:
     enforced: str | None = None
     eta_prefill_s: str | None = None
     budget_s: str | None = None
+    # Measured pool state on the ``local_admission_guard`` record
+    # (LP-0MVGR2OXT0096OGK M1, ``local_admission_guard`` kind): the number of
+    # slots decoding, the number of prefills in flight, and whether a slot was
+    # free at decision time. ``None`` on legacy guard lines that predate the
+    # fields, which is why the denial verdict is ``unknown`` rather than a
+    # fabricated ``idle_leased`` for them.
+    busy_slots: int | None = None
+    in_flight_prefills: int | None = None
+    free_slot: str | None = None
+    # Status-poll payload (LP-0MVGR2OXT0096OGK M3, ``status_request`` kind):
+    # the calibrated predicted prefill duration and the published capacity
+    # hint. ``prefill_eta_seconds`` is ``None`` when the estimate was
+    # unavailable (fail-open) or the line predates the field.
+    prefill_eta_seconds: float | None = None
+    capacity_hint: str | None = None
+    status_schema_version: int | None = None
+    available_slots: int | None = None
+    total_slots: int | None = None
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J, ``idle_admit`` kind):
     # the idle age at admission and the configured threshold. Populated on
     # ``idle_admit`` events only.
@@ -906,7 +945,12 @@ def parse_log_line(line: str) -> LogEvent | None:
         )
     if msg.startswith(LOCAL_ADMISSION_GUARD):
         # "local_admission_guard decision=reject reason=eta_exceeds_budget
-        #  enforced=true eta_prefill_s=468.0 budget_s=120.0 priority=low ..."
+        #  enforced=true eta_prefill_s=468.0 budget_s=120.0 priority=low
+        #  busy_slots=1 in_flight_prefills=1 free_slot=false ..."
+        #
+        # The pool-state fields (LP-0MVGR2OXT0096OGK M1) are what the
+        # denial-attribution verdict is derived from; they are absent on
+        # legacy lines and stay ``None`` so no verdict is fabricated.
         m2 = RE_LOCAL_ADMISSION_DECISION.search(msg)
         if m2 is None:
             return None
@@ -921,6 +965,27 @@ def parse_log_line(line: str) -> LogEvent | None:
             enforced=_first(RE_LOCAL_ADMISSION_ENFORCED, msg),
             eta_prefill_s=_first(RE_LOCAL_ADMISSION_ETA, msg),
             budget_s=_first(RE_LOCAL_ADMISSION_BUDGET, msg),
+            busy_slots=_int(RE_GUARD_BUSY_SLOTS, msg),
+            in_flight_prefills=_int(RE_GUARD_IN_FLIGHT_PREFILLS, msg),
+            free_slot=_first(RE_GUARD_FREE_SLOT, msg),
+        )
+    if msg.startswith(STATUS_REQUEST):
+        # "status_request active_query=false available_slots=2
+        #  capacity_hint=idle ... prefill_eta_seconds=91.6 queue_eta_seconds=183.2
+        #  ... status_schema_version=3 total_slots=2"
+        # The polled payload behind the contention measurement
+        # (LP-0MVGR2OXT0096OGK M3): the calibrated prefill prediction and the
+        # truthful capacity hint. ``prefill_eta_seconds=None`` is meaningful
+        # (estimate unavailable — fail-open), never a zero cost.
+        eta = _float(RE_STATUS_PREFILL_ETA, msg)
+        return LogEvent(
+            STATUS_REQUEST,
+            ts,
+            prefill_eta_seconds=eta,
+            capacity_hint=_first(RE_STATUS_CAPACITY_HINT, msg),
+            status_schema_version=_int(RE_STATUS_SCHEMA_VERSION, msg),
+            available_slots=_int(RE_STATUS_AVAILABLE_SLOTS, msg),
+            total_slots=_int(RE_STATUS_TOTAL_SLOTS, msg),
         )
     if msg.startswith(ROUTING_RESIDENT_PREFIX):
         # "routing_resident_prefix provider=local model=Qwen3 decision=admit

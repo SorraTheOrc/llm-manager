@@ -406,11 +406,19 @@ class TestLogLineParsing:
         )
         assert log_parser.parse_log_line(line) is None
 
-    def test_status_request_lines_ignored(self):
-        """status_request lines expose total_slots but are not parsed (they
-        are corroborating evidence only)."""
-        assert log_parser.parse_log_line(fixtures.STATUS_REQUEST_CHEAP) is None
-        assert log_parser.parse_log_line(fixtures.STATUS_REQUEST_FAST) is None
+    def test_status_request_lines_parsed_for_contention_measurement(self):
+        """status_request polls are parsed (LP-0MVGR2OXT0096OGK M3) so the
+        published ``prefill_eta_seconds`` prediction and ``capacity_hint`` can
+        be measured against real local work. Legacy schema lines (no ETA /
+        capacity fields) still parse, with those fields ``None``."""
+        ev = log_parser.parse_log_line(fixtures.STATUS_REQUEST_CHEAP)
+        assert ev is not None
+        assert ev.kind == "status_request"
+        assert ev.prefill_eta_seconds is None  # legacy line: no ETA field
+        assert ev.capacity_hint is None
+        ev_fast = log_parser.parse_log_line(fixtures.STATUS_REQUEST_FAST)
+        assert ev_fast is not None
+        assert ev_fast.kind == "status_request"
 
 
 class TestTtftParsing:
@@ -2136,8 +2144,10 @@ class TestModeTimelineBucketing:
         )
         # In-window structured lines: 2 mode switches (Aug 15 01:00/10:00;
         # the Aug 14 10:00 line lies in the margin, outside the window)
-        # + 3 stream starts + 3 stream finishes.
-        assert res.total_lines == 8
+        # + 3 stream starts + 3 stream finishes + 2 status_request polls
+        # (status polls are parsed for the contention measurement,
+        # LP-0MVGR2OXT0096OGK M3).
+        assert res.total_lines == 10
         assert res.lines_skipped == 0
 
 

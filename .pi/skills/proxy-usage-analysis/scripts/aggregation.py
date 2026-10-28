@@ -29,6 +29,7 @@ aggregated. A session is included iff it has at least one in-window
 
 from __future__ import annotations
 
+import bisect
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -40,6 +41,7 @@ from log_parser import (
     BUSY_WINDOW_MARGIN,
     FALLBACK_ATTRIBUTION_WINDOW_SECONDS,
     LOCAL_PROVIDER,
+    STATUS_REQUEST,
     LogEvent,
     PrefillMatch,
     pair_ttft_to_streams,
@@ -127,6 +129,45 @@ AVAILABILITY_COUNTERS = (
 
 UNKNOWN_LABEL = "(unknown)"
 
+# Denial-attribution verdicts (LP-0MVGR2OXT0096OGK M1). ``local_dispatch_denied``
+# lines carry no ``lease_state``, so the pool state at each denial is derived
+# from the adjacent ``local_admission_guard`` record's *measured* fields:
+# ``busy_slots`` (slots decoding), ``in_flight_prefills`` (prefills running)
+# and ``free_slot``. The verdict vocabulary is deliberately shallow:
+#
+# * ``idle_leased`` — no slot decoding and no prefill in flight: the pool
+#   reports leases held (``active`` on the denial line) but the GPU measured
+#   zero local work. This is the idle-lease false-busy case the item probes.
+# * ``prefill_bound`` — at least one prefill running: serialised prefills make
+#   this the gating resource, even when decode slots are also occupied.
+# * ``saturated`` — slots decoding and no prefill in flight.
+# * ``unknown`` — legacy guard line without the pool-state fields.
+DENIAL_VERDICT_IDLE_LEASED = "idle_leased"
+DENIAL_VERDICT_PREFILL_BOUND = "prefill_bound"
+DENIAL_VERDICT_SATURATED = "saturated"
+DENIAL_VERDICT_UNKNOWN = "unknown"
+DENIAL_VERDICT_ORDER = (
+    DENIAL_VERDICT_IDLE_LEASED,
+    DENIAL_VERDICT_PREFILL_BOUND,
+    DENIAL_VERDICT_SATURATED,
+    DENIAL_VERDICT_UNKNOWN,
+)
+# Marker for a denial whose 60s timestamp block holds no guard record; kept
+# out of :data:`DENIAL_VERDICT_ORDER` so it is visibly separate from a
+# measured ``unknown`` verdict.
+DENIAL_VERDICT_UNATTRIBUTED = "unattributed"
+
+# Seconds either side of a ``local_dispatch_denied`` within which the nearest
+# ``local_admission_guard`` reject record is treated as the denial's decision
+# block (LP-0MVGR2OXT0096OGK M1). Measured on the 2026-10-27 16:16 →
+# 2026-10-28 15:56 window (111 denials, 3,558 guard rejects): the nearest
+# guard sits 0-20ms away for the majority (the proxy logs the denial then the
+# routing decision), ±30s covers 68.5%, ±60s 73.9% and ±120s 82.9%. 60s is
+# the widest bound that still keeps the join inside one contention burst —
+# longer windows start attributing to the stale guard of a previous burst, so
+# the remainder is reported as ``unattributed`` rather than guessed.
+DENIAL_GUARD_JOIN_WINDOW_SECONDS = 60.0
+
 # Unit of the slot-seconds figures on :class:`SlotSecondsStats` (and its
 # :class:`PrefillStats` / :class:`DecodeStats` subclasses) and on
 # :attr:`BusyStats.prefill_stats` / :attr:`BusyStats.decode_stats`
@@ -180,6 +221,93 @@ RESTART_CORRELATION_WINDOW_SECONDS = 120
 # cause. Other error kinds (slot_save, backend_retry, upstream HTTP) are
 # infrastructure/informational signals and leave ``root_cause`` unset.
 STREAM_ERROR_KINDS = ("stream_finish_error", "stream_error")
+
+
+@dataclass(frozen=True)
+class DenialAttribution:
+    """One ``local_dispatch_denied`` joined to its decision-block guard record.
+
+    LP-0MVGR2OXT0096OGK M1: the denial line itself carries no pool state, so
+    ``ts`` is the denial time, ``guard_ts``/``guard_reason`` come from the
+    adjacent ``local_admission_guard`` reject record, and ``verdict`` is the
+    derived :func:`classify_denial_verdict` pool state. The raw measured
+    fields are kept so the report can corroborate the verdict
+    (``busy_slots=0`` / ``in_flight_prefills=0`` / ``free_slot``).
+    """
+
+    ts: datetime
+    guard_ts: datetime
+    guard_reason: str | None
+    verdict: str
+    busy_slots: int | None
+    in_flight_prefills: int | None
+    free_slot: str | None
+
+
+def classify_denial_verdict(guard: LogEvent) -> str:
+    """Derive the pool-state verdict for one guard record (M1).
+
+    Ordered so a running prefill wins over slot occupancy: prefills are
+    serialised (``local_max_concurrent_prefills: 1``), so an in-flight prefill
+    is the gating resource even when every slot is also decoding. A guard line
+    without the measured pool-state fields predates the payload change and
+    yields :data:`DENIAL_VERDICT_UNKNOWN` — never a fabricated ``idle_leased``.
+    """
+    busy = getattr(guard, "busy_slots", None)
+    prefills = getattr(guard, "in_flight_prefills", None)
+    if busy is None or prefills is None:
+        return DENIAL_VERDICT_UNKNOWN
+    if prefills >= 1:
+        return DENIAL_VERDICT_PREFILL_BOUND
+    if busy == 0:
+        return DENIAL_VERDICT_IDLE_LEASED
+    return DENIAL_VERDICT_SATURATED
+
+
+def attribute_denials(
+    denials: Iterable[LogEvent],
+    guards: Iterable[LogEvent],
+    window_seconds: float = DENIAL_GUARD_JOIN_WINDOW_SECONDS,
+) -> list[DenialAttribution]:
+    """Join each denial to its nearest guard reject within ``window_seconds``.
+
+    The proxy logs the ``local_dispatch_denied`` line and then the guard's
+    routing decision milliseconds apart, so the nearest guard (either side,
+    inclusive bound) inside the timestamp block is the decision that refused
+    the dispatch. A denial with no guard in the block is simply omitted: the
+    report counts it as ``unattributed`` instead of borrowing a stale record
+    from an earlier burst (LP-0MVGR2OXT0096OGK M1).
+
+    ``guards`` should be the ``local_admission_guard`` events with
+    ``decision=reject`` — an ``admit`` record did not refuse this dispatch.
+    """
+    guard_list = sorted(guards, key=lambda e: e.ts)
+    guard_ts = [g.ts for g in guard_list]
+    out: list[DenialAttribution] = []
+    for denial in sorted(denials, key=lambda e: e.ts):
+        i = bisect.bisect_left(guard_ts, denial.ts)
+        best: LogEvent | None = None
+        best_delta: float | None = None
+        for j in (i - 1, i):
+            if not (0 <= j < len(guard_list)):
+                continue
+            delta = abs((guard_list[j].ts - denial.ts).total_seconds())
+            if best_delta is None or delta < best_delta:
+                best, best_delta = guard_list[j], delta
+        if best is None or best_delta is None or best_delta > window_seconds:
+            continue
+        out.append(
+            DenialAttribution(
+                ts=denial.ts,
+                guard_ts=best.ts,
+                guard_reason=getattr(best, "reason", None),
+                verdict=classify_denial_verdict(best),
+                busy_slots=getattr(best, "busy_slots", None),
+                in_flight_prefills=getattr(best, "in_flight_prefills", None),
+                free_slot=getattr(best, "free_slot", None),
+            )
+        )
+    return out
 
 
 def _near_restart(ts: datetime, restart_signals: Iterable[datetime]) -> bool:
@@ -309,6 +437,15 @@ class AnalysisResult:
     # applied (``false`` in ``observe`` mode), and the projected prefill ETA /
     # wait budget in seconds.
     local_admission_events: list[LogEvent] = field(default_factory=list)
+    # Status-poll payload events (LP-0MVGR2OXT0096OGK M3): one event per
+    # ``status_request`` line inside the window, carrying the calibrated
+    # ``prefill_eta_seconds`` prediction and the published ``capacity_hint``.
+    status_request_events: list[LogEvent] = field(default_factory=list)
+    # Denial → guard attribution (LP-0MVGR2OXT0096OGK M1): each
+    # ``dispatch_denied`` joined to its decision-block guard reject, with the
+    # derived pool-state verdict. The join is lossless (unmatched denials are
+    # simply absent — the report counts them as ``unattributed``).
+    denial_attributions: list[DenialAttribution] = field(default_factory=list)
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): one event per economic
     # cold-cache bypass that was overridden because the GPU had been idle for
     # at least ``threshold_seconds`` (``idle_seconds`` = measured idle age).
@@ -1693,6 +1830,7 @@ def aggregate(
     contention_dispatch_events: list[LogEvent] = []
     contention_fallback_events: list[LogEvent] = []
     local_admission_events: list[LogEvent] = []
+    status_request_events: list[LogEvent] = []
     idle_admit_events: list[LogEvent] = []
     residency_events: list[LogEvent] = []
     eviction_events: list[LogEvent] = []
@@ -1875,6 +2013,9 @@ def aggregate(
         if ev.kind == "local_admission_guard":
             local_admission_events.append(ev)
             continue
+        if ev.kind == STATUS_REQUEST:
+            status_request_events.append(ev)
+            continue
         if ev.kind == "idle_admit":
             idle_admit_events.append(ev)
             continue
@@ -1947,6 +2088,14 @@ def aggregate(
         ttft_events=local_ttft_events,
     )
 
+    # M1 (LP-0MVGR2OXT0096OGK): attribute each in-window denial to its
+    # decision-block guard reject and derive the pool-state verdict. Only
+    # ``reject`` records can have refused a dispatch.
+    denial_attributions = attribute_denials(
+        dispatch_denied_events,
+        (e for e in local_admission_events if e.decision == "reject"),
+    )
+
     return AnalysisResult(
         window_start=window_start,
         window_end=window_end,
@@ -1962,6 +2111,8 @@ def aggregate(
         contention_dispatch_events=contention_dispatch_events,
         contention_fallback_events=contention_fallback_events,
         local_admission_events=local_admission_events,
+        status_request_events=status_request_events,
+        denial_attributions=denial_attributions,
         idle_admit_events=idle_admit_events,
         residency_events=residency_events,
         eviction_events=eviction_events,

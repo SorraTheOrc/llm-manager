@@ -82,11 +82,13 @@ class TestAggregationUsesServingProvider:
     def test_session_that_fell_back_splits_tokens_by_provider(self):
         result = _aggregate(fixtures.E2E_LINES)
         by_model = result.token_by_model
-        # S2 served one local turn (900/40) then one remote turn (950/200).
-        assert by_model[("local", "Qwen3")] == (900, 40, 940)
+        # In-window local streams: S1's 14:00 turn (1300/60) and S2's local
+        # turn (900/40). The 13:30 S1 stream (1200/50) is pre-window and
+        # excluded by the aggregation window filter.
+        assert by_model[("local", "Qwen3")] == (1300 + 900, 60 + 40, 1360 + 940)
         assert by_model[("opencode-go", "deepseek-v4-flash")] == (950, 200, 1150)
-        # S1 is local-only and keeps its own row.
-        assert by_model[("local", "Qwen3")][0] == 900 + 1200 + 1300
+        # S1 stays local-only in-window (its 1300-token turn only).
+        assert by_model[("local", "Qwen3")][0] == 1300 + 900
 
     def test_totals_match_by_model_totals(self):
         result = _aggregate(fixtures.E2E_LINES)
@@ -159,8 +161,9 @@ class TestReportRendering:
         report = self._report(fixtures.E2E_LINES)
         section = report.split("### Tokens — by model", 1)[1]
         assert "| local | Qwen3 |" in section
-        # 900 + 1200 + 1300 prompt tokens measured on local streams.
-        assert "| 3,400 |" in section
+        # In-window measured local prompt tokens: 1300 (S1) + 900 (S2); the
+        # pre-window 1200-token stream is excluded.
+        assert "| 2,200 |" in section
 
     def test_without_usage_streams_are_named_in_the_limitations(self):
         report = self._report(fixtures.E2E_LINES)

@@ -134,6 +134,38 @@ Outputs written to:
     `upstream_http_error` events with `status == 503` (provider-side 5xx).
     The two are separate on purpose: a provider can return 503 while another
     still serves the request.
+- **Contention-prediction keys (LP-0MVGR2OXT0096OGK).** Three additive keys
+  measure whether the payload's `lease_state` / `prefill_eta_seconds` signals
+  predict real local contention; the report renders the same figures in a
+  **Local contention prediction vs reality** section (M1/M2/M3).
+  - `denial_attribution` — M1: each `local_dispatch_denied` (which carries no
+    `lease_state`) is joined to its decision-block `local_admission_guard`
+    `reject` record (nearest within `join_window_seconds`, ±60 s, inclusive) and
+    the pool state at denial time is derived from the guard's measured
+    `busy_slots` / `in_flight_prefills` fields: **`idle_leased`** (no slot
+    decoding, no prefill in flight — the idle-lease false-busy case),
+    **`prefill_bound`** (≥1 prefill running; serialised prefills make it the
+    gating resource), **`saturated`** (slots decoding, no prefill), or
+    **`unknown`** (legacy guard line without the fields). Entries: `denials`,
+    `attributed`, `unattributed` (no guard in the 60 s block — never guessed),
+    `by_verdict`, `by_guard_reason`, `idle_leased_share_pct`, `per_hour`
+    (per absolute hour: `denials`, the four verdict columns,
+    `unattributed`, `busy_seconds`, `busy_pct`), `capacity_hint` (the payload's
+    own claim over `status_request` polls), and `verdict`
+    (`matches_reality` / `does_not_match_reality` / `inconclusive`: the signal
+    does not match when ≥50% of attributed denials fired with the pool measured
+    idle).
+  - `prefill_eta_error` — M3: predicted `prefill_eta_seconds` (from
+    `status_request` polls) vs observed llama-server `prompt eval time`
+    durations, quantile-matched: `predicted` / `observed` (`samples`, `p50`,
+    `p90`), `error_p50` / `error_p90` (predicted − observed, seconds),
+    `relative_error_p50_pct` / `relative_error_p90_pct`, `tolerance_pct` (25)
+    and `verdict` (`matches_reality` within tolerance, `over_predicts` /
+    `under_predicts`, `inconclusive` when either side has no samples).
+  - `status_capacity_hint` — the same `capacity_hint` distribution as a
+    top-level key (`{idle: n, prefill_bound: n, saturated: n}`), so
+    `jq .status_capacity_hint` answers "what did the payload claim while the
+    denials happened?" without parsing Markdown.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
@@ -196,6 +228,14 @@ Outputs written to:
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
   fast/cheap split — when the window has local traffic) followed by
+  **Local contention prediction vs reality** (LP-0MVGR2OXT0096OGK, when the
+  window has a denial or status poll): M1 per-hour denial attribution by
+  derived pool state plus the guard-reason and `capacity_hint` splits; M2 the
+  window's denials-per-hour and busy fraction compared with the pre-change
+  baseline (2,641 denials / 24 h at 29.3% busy); M3 predicted-vs-observed
+  prefill duration at p50/p90 with the signed and relative error; and one
+  explicit matches/does-not-match-reality verdict for the denial signal and
+  one for the prefill ETA), then
   **Prefill vs decode** (phase slot-time split: prefill dispatch → first byte
   vs decode first byte → finish, each as slot-seconds and % of combined phase
   slot time summing to 100%, with p10/p50/p90/max per phase and unknown-stream
@@ -833,6 +873,27 @@ large-context sessions permanently onto remote providers.
   string (WL-0MUQO8AEE003G1Z2, verified by LP-0MUQO862N002559W).
 
 ## Limitations
+
+- **Denial attribution is a timestamp-block join, not a session join
+  (LP-0MVGR2OXT0096OGK M1).** `local_dispatch_denied` carries no `lease_state`
+  and the guard record frequently logs `session=unknown`, so a denial is
+  attributed to the nearest `local_admission_guard` `reject` within ±60 s
+  (inclusive). Measured on the 2026-10-27 16:16 → 2026-10-28 15:56 window
+  (111 denials, 3,558 guard rejects): the nearest guard is 0–20 ms away for the
+  majority, ±30 s covers 68.5%, ±60 s 73.9%, ±120 s 82.9%. 60 s is the widest
+  bound that stays inside one contention burst; the remainder is reported as
+  `unattributed` rather than borrowed from a stale earlier burst.
+- **Prefill ETA is compared at matched quantiles, not per dispatch
+  (LP-0MVGR2OXT0096OGK M3).** llama-server eval-timing lines carry no per-line
+  timestamp (the parser assigns one file-mtime timestamp per log file), so a
+  `prefill_eta_seconds` poll cannot be paired with the specific `prompt eval`
+  it predicted. `prefill_eta_error` therefore compares the p50/p90 of the
+  prediction distribution against the p50/p90 of the observed durations. The
+  prediction is the cache-cold *reference-prompt* cost, so systematic
+  over-prediction is expected when the reference prompt is larger than the
+  median served prompt; read it as "does the published ETA reflect the typical
+  real prefill a dispatcher will face", not as a per-request calibration
+  score.
 
 - **Hold-cycle re-emissions are excluded from local-skip demand counters
   (LP-0MUIEO6IP0030CT3).** A held request re-emitted across chain-hold
