@@ -213,6 +213,24 @@ band-limited**: ship the pool-4 retention with a `session_slot_max_prompt_tokens
 upper bound at 40 k so the expensive band is never swapped. Any other partial pass is a
 **no-go**.
 
+### 4.4 Measured outcome (C4's replay, 2026-10-28)
+
+C4 `LP-0MVOG8TUM005705R` executed the §4 protocol offline against the checked-in
+fixture (`proxy/tests/pool_snapshot_bakeoff.py`, deterministic replay — no live
+config change). Machine-readable evidence: `proxy/benchmarks/results/pool_bakeoff_2026_10_24/summary.json`;
+human-readable report: `proxy/benchmarks/results/pool_bakeoff_2026_10_24/RESULTS_NOTE.md`.
+
+**Verdict: candidate B is a no-go on this window under C2's thresholds.** The retained
+pool of 4 measures **no reuse uplift** (aggregate 25.83 % vs the calibrated 26.1 %
+baseline; >20 k-token median 15.5 % vs the 31.2 % G1 threshold), so **G1 fails**. **G2
+fails** on the exclusion share: `skip_when_busy` suppresses 170 of 303 persistence
+decisions (56.1 % vs the 20 % ceiling), though every restore that was attempted
+succeeded (100 %). G3–G6 pass. Attribution (per-arm exclusion counts in
+`summary.json`): 687 of 1,016 unique attempts (67.6 %) exceed the pool-2 clamp and never
+reach the local slot at all; the diagnostic arm (busy gate relaxed) is the only
+same-geometry configuration that moves the >20 k median (+8.73 pp to 24.33 %, still
+below G1).
+
 ---
 
 ## 5. OPEN QUESTION for the producer (blocks C6/C7)
