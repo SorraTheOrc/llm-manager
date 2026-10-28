@@ -2175,6 +2175,16 @@ traverse the router and can 500 during giant prefills`, and increments
 (`llama_router_mode: false`) there is no child, so the fallback is expected:
 counted, logged at debug level only.
 
+**Measured effect (post-fix night, 2026-10-24 20:00 → 2026-10-25 07:00).** On
+stale per-slot detail the reconciled `capacity_hint` never claimed `saturated`
+without live local work: all 2,927 stale/no-work polls read `idle` (zero false
+`saturated` among 9,012 detail-stale polls) and `saturated` with
+`available_slots=0` fell from 82.3 % to 7.64 % of polls. `slots_stale` itself
+stayed at 79.61 %, because that build predated the child-port resolver
+(`f58e8964`) — the polling budget, not the capacity signal, drove that rate.
+Figures, per-poll attribution and the re-derivation commands are in the
+[per-slot status contract](docs/per-slot-status-verification.md).
+
 #### List Models
 ```bash
 curl http://localhost:8000/v1/models

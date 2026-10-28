@@ -1717,6 +1717,15 @@ def downgrade_stale_capacity_hint(
        ``STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS``) → ``saturated``.
     4. Stale detail with live in-flight work but no decode evidence →
        ``prefill_bound`` (busy, but never claimed as saturated on stale data).
+
+    Measured on the first post-fix night (2026-10-24 20:00 → 2026-10-25
+    07:00, LP-0MVOG7IP80003MLV): of 9,012 detail-stale polls the 2,927 with no
+    live local work all read ``idle`` and **none** read ``saturated``, so rules
+    1-4 held (figures and attribution in
+    ``docs/per-slot-status-verification.md``). The 247 fresh-detail
+    ``saturated``-without-live-work polls in that window were dispatches the
+    proxy had abandoned while llama-server kept finishing them — fresh
+    evidence, so outside these rules by construction.
     """
     if not stale:
         return hint

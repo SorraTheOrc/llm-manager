@@ -321,3 +321,88 @@ optional per-slot `owner_session_id`; extend them to also read:
 
 All of these are optional: the existing `is_processing` / `n_decoded` /
 `available_slots` reads keep working unchanged (AC1).
+
+## Post-fix measurement (2026-10-24 20:00 → 2026-10-25 07:00, Europe/Dublin)
+
+What the reconciliation above actually did on the first post-fix night
+(LP-0MVLNBCTN0084MT0, reported by LP-0MVOG7IX6006MZ23). The measured window is
+~12 real hours, not 11: Irish summer time ended at 02:00 on 2026-10-25, so the
+local label `01:00–01:59` occurs twice inside it. The deployed code was
+`56a3a28a`/`2d2b6b51` (live from 2026-10-24 10:35); the child-port resolver
+(`f58e8964`, 2026-10-26 12:51 UTC) post-dates the window, so **every** `/slots`
+poll measured here traversed the llama-server router.
+
+| Metric | Measured | Target |
+|---|---|---|
+| Status polls | 11,654 | — |
+| `slots_stale=true` | 9,278 (79.61 %) | < 5 % → **missed**, see (3) |
+| `capacity_hint` `idle` / `prefill_bound` / `saturated` | 4,577 (39.27 %) / 6,024 (51.69 %) / 1,053 (9.04 %) | — |
+| `saturated` with no live local work | 247 (2.12 %) | 0 → **missed**, all attributed — see (2) |
+| `saturated` with `available_slots=0` | 890 (7.64 %) | 82.3 % pre-fix control |
+| `slots_detail_stale=true` | 9,012 of the 9,278 stale polls | — |
+| `proxy_restart` events in window | 0 | — |
+
+What the numbers say about this contract:
+
+1. **Stale detail never produced a false `saturated`.** Of the 9,012
+   detail-stale polls, the 2,927 with no live local work were all reconciled to
+   `idle` (rule 2 of `downgrade_stale_capacity_hint`) and the rest read
+   `prefill_bound` (6,024) or `saturated` with live work (61). Zero polls
+   claimed saturation from a cached busy snapshot — the false-signal class that
+   starved herdr's downtime worker on 2026-10-22 is measured at zero.
+2. **The 247 `saturated`-without-live-work polls are fresh detail, not stale.**
+   llama-server kept finishing dispatches the proxy had already abandoned: 332
+   abandonments in the window (`prefill_deadline` 260, `session_evicted` 60,
+   `no_progress_watchdog` 11, `client_disconnect` 1). Every violating poll is
+   attributed to an abandonment within the preceding 600 s
+   (`prefill_deadline` 204, `session_evicted` 43, unattributed 0). That is a
+   dispatch-lifecycle issue (deadline vs. upstream cancellation), not a
+   capacity-signal one — the reconciliation rules do not apply to a genuine
+   fresh snapshot.
+3. **`slots_stale` is a polling-path metric, not a capacity-truthfulness
+   metric.** Its semantics are unchanged by the fix, and the rate tracks the
+   `/slots` round-trip: the handler budgets are 2.0 s for the counts query and
+   `STATUS_QUERY_TIMEOUT` (1.0 s) for the detail query, while router-serialised
+   polls took p50 3,029 ms (detail-cache-served) against 3 ms for a fresh poll.
+   The per-hour rate follows GPU load (44.3 % at 03:00, 96.0 % at 02:00), which
+   a truthfulness defect would not. The < 5 % target can only be judged on a
+   build that contains `f58e8964`; measured here it stays at the pre-fix level
+   (79.5 %) by construction.
+
+Re-derivation (LP-0MVOG6YRA000T9PK tool): the artifacts are in
+`~/proxy-usage-reports/2026-10-24_post-fix-night-measurement/` — `REPORT.md`,
+`measurement.json` / `measurement.txt`, one row per violating poll in
+`saturated_without_live_work_attribution.csv`, plus the hourly, crosstab and
+dispatch tables — and are regenerated with:
+
+```bash
+python3 scripts/capacity_signal_verification.py \
+  --since '2026-10-24 20:00' --until '2026-10-25 07:00' \
+  --window-closed --label post-fix-night --limit 250 \
+  --write-artifacts ~/proxy-usage-reports/2026-10-24_post-fix-night-measurement
+python3 ~/proxy-usage-reports/2026-10-24_post-fix-night-measurement/supplementary_derivations.py
+```
+
+**Cross-check against the nightly usage report.** The nightly report covering
+this window is `~/proxy-usage-reports/2026-10-25_2/report.md` (generated
+2026-10-25 05:00, window 2026-10-24 05:00 → 2026-10-25 05:00; the top-level
+`report.md` is overwritten by each 05:00 run, so the per-run directory is the
+durable surface). The two surfaces agree where they overlap:
+
+- **Local attempts.** The tool's `local_dispatches` (lines carrying
+  `dispatch_first_byte_ms=`, i.e. dispatches that reached a first byte) totals
+  **206** over the nightly window and **145** over the 20:00–05:00 overlap —
+  exactly the nightly report's `Local attempts` (local `Stream started`)
+  totals, 206 and 145.
+- **Restarts.** The nightly restart timeline ends at 2026-10-24 10:35:06
+  (before the window starts); the tool reports no `proxy_restart` events
+  inside it.
+- **`Local dispatch` is a different metric, not a disagreement.** The nightly
+  column counts every `[local] POST` attempt (1,427 over its window, 692 over
+  the overlap), including attempts that never delivered a first byte, so it is
+  ~4.8× the first-byte count on the overlap (692/145).
+- The nightly analyzer publishes neither `slots_stale` nor `capacity_hint`, so
+  those figures have no nightly counterpart to compare against. Adding them is
+  a change under `.pi/skills/proxy-usage-analysis/` (agent infrastructure, out
+  of scope here) and is recorded as a follow-up rather than made silently.
+
