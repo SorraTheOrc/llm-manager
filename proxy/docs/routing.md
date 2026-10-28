@@ -973,7 +973,9 @@ eta_prefill = coded_tokens * coded_ms_per_token + new_tokens * prefill_ms_per_to
   new_tokens   = est_tokens * (1 - cached_ratio)    # must actually be prefilled
 
 projected_wait = own_prefill_seconds + occupied_seconds
-  occupied_seconds = max(eta_prefill * busy_slots, sum(remaining occupant prefill))
+  occupied_seconds = max(eta_prefill * busy_slots, sum(remaining occupant service))
+    # remaining occupant service is re-priced from the occupant's remaining
+    # uncached new tokens at the contended co-residency rate (see below)
   busy_slots       = min(slot_pool, max(generating_concurrency, prefills_in_flight))
 
 admit  if projected_wait <= wait_budget
@@ -1003,15 +1005,54 @@ costed at ~14 s, admitted, then cancelled by
 2026-10-25: 22 `local_eviction_after_acceptance reason=prefill_deadline`
 events in 7.4 h, 12 of them user traffic; signature `eta_prefill_s=7.1
 elapsed_s=120.1 progress=None alive=False in_flight=True`). Each live
-dispatch record already carries the calibrated `eta_prefill_s` captured when
-it was admitted plus its `started_at`, so the guard adds the **measured
-remaining service** `sum(max(0, eta_prefill_s − (now − started_at)))` over the
-active, still-prefilling records of *other* sessions (a same-session re-entry
-never waits behind itself). Measured evidence can only raise the symmetric
-floor, never lower it, and a missing/invalid record contributes nothing —
-fail-open by construction. The deadline bound is evaluated against this same
-projected time to first byte, so admission and the deadline can no longer
-disagree about who the occupant is.
+dispatch record already carries the occupant's `new_tokens`, `cached_ratio`,
+`model_name`, its optimistic admission `eta_prefill_s` and its `started_at`.
+Since LP-0MVS9YK9P006M1NQ the guard no longer decays that optimistic ETA
+(`max(0, eta_prefill_s − (now − started_at))`, which under-priced the occupant
+by the measured 2-4x and converged to ~0 exactly when it passed its optimistic
+ETA). It instead re-prices the occupant's **remaining uncached new tokens** at
+the contended co-residency rate:
+
+```
+progress      = min(1, elapsed / contended_full_service)
+remaining_new = new_tokens * (1 - progress)
+remaining_s   = estimate_prefill_seconds(remaining_new, cached_ratio=0,
+                                         contended=True)
+```
+
+`contended_full_service` is the contended-rate cost of the occupant's whole
+new-token load, so an occupant past its *optimistic* ETA still reports the work
+it genuinely owes. Over the active, still-prefilling records of *other*
+sessions this remaining service is summed (a same-session re-entry never waits
+behind itself). Measured evidence can only raise the symmetric floor, never
+lower it; a missing/invalid `new_tokens`/`eta_prefill_s`/`started_at`, an
+inactive or already-served record, or an uncalibrated contended window
+contributes nothing — fail-open by construction, never a guessed multiplier.
+The deadline bound is evaluated against this same projected time to first byte,
+so admission and the deadline can no longer disagree about who the occupant is.
+
+**Contended (co-residency) rate selection** (LP-0MVS9Y76R004B5M8). Prefill is
+serialised but prefill+decode batching is not, so an occupant that is
+*generating* halves a newcomer's prefill throughput (measured 2-4x lower
+tok/s). A calibration sample is tagged **contended** when the gate was occupied
+at admission (`busy_slots >= 1`) **or** another session's dispatch record was
+live at first-byte time, and stored in its own per-(model, context bucket)
+window. A contended admission is priced from that window; when it is not yet
+calibrated the guard falls back to the solitary window and reports
+`rate_bucket=solitary_fallback` instead of guessing. Warm prompts
+(`cached_ratio >= 0.9`) stay on the solitary path byte-for-byte. Each decision
+line carries `rate_bucket=contended|solitary|solitary_fallback` and
+`contended_samples=<n>`.
+
+Ordering to keep (the guard does not change these values):
+`contention_queue_max_wait_seconds (60) < local_prefill_deadline_seconds (120)
+< local_dispatch_first_byte_timeout_seconds (840) <
+local_dispatch_max_prefill_seconds (900)` — an admitted request must never be
+cut off by the deadline, and the deadline must fire before the first-byte
+ceiling and the wedge bound. Rollback: `local_admission_guard_policy: observe`
+or `off` (or `local_prefill_deadline_seconds: 0` for the deadline bound only).
+Background, evidence and the per-child cross-reference: [Contended prefill
+pricing and rollback](../../docs/dev/contended-prefill-pricing.md).
 
 `projected_wait` is computed by a single function
 (`prefill_eta.projected_wait_seconds`) that also produces the published

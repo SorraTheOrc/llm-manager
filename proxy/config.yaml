@@ -1854,19 +1854,47 @@ server:
   # Fail-open: the change can only refuse further DOOMED admissions, never
   # admit more than before, and an uncalibrated bucket still admits.
   #
-  # OCCUPANT-EVIDENCE PRICING (LP-0MVOFVCA2008DQVE). The occupancy term is no
-  # longer only the symmetric ``own_eta * busy_slots`` floor: the guard also
-  # projects each in-flight prefill's remaining service from its own dispatch
-  # record (``eta_prefill_s`` minus elapsed since ``started_at``) and uses the
-  # larger of the two. The deadline bound is evaluated against that same
-  # projected time to first byte, closing the measured residual where a warm
-  # prompt's own 7 s prefill fitted the 120 s deadline but the occupant ahead
-  # of it needed ~120 s, so the dispatch was admitted and then cancelled with
-  # zero prefill progress (22 events / 7.4 h on 2026-10-25; the residual is
-  # tracked by LP-0MVO8H7VQ003B12I). No new knob: measured evidence can only
-  # raise the floor, and a missing/malformed record leaves today's verdict
-  # byte-for-byte unchanged. Rollback is the existing one — policy
-  # ``observe``/``off``, or ``local_prefill_deadline_seconds: 0``.
+  # OCCUPANT-EVIDENCE PRICING (LP-0MVOFVCA2008DQVE, revised by
+  # LP-0MVS9YK9P006M1NQ). The occupancy term is no longer only the symmetric
+  # ``own_eta * busy_slots`` floor: the guard also projects each in-flight
+  # prefill's remaining service from its own dispatch record and uses the
+  # larger of the two. Since LP-0MVS9YK9P006M1NQ that remaining service is
+  # re-priced from the occupant's remaining *uncached new tokens* at the
+  # CONTENDED co-residency rate, not decayed from its optimistic admission
+  # ETA: ``progress = min(1, elapsed / contended_full_service)``,
+  # ``remaining_new = new_tokens * (1 - progress)``,
+  # ``remaining_s = estimate_prefill_seconds(remaining_new, 0, contended=True)``.
+  # The old ``max(0, eta_prefill_s - elapsed)`` decay under-priced the occupant
+  # by the measured 2-4x and converged to ~0 exactly when the occupant passed
+  # its optimistic ETA — the 2026-10-28 00:28:55 case priced a cold
+  # 65-89k-token audit prompt at ``eta_occupancy_s=16.0``, the newcomer queued
+  # the full 60 s, the gate never freed and it fell back remote. Unchanged by
+  # this revision: measured evidence can only raise the symmetric floor, never
+  # lower it; a missing/invalid record or an uncalibrated contended window
+  # contributes nothing (never a guessed multiplier). The deadline bound is
+  # evaluated against the same projected time to first byte, so admission and
+  # the deadline cannot disagree about who the occupant is. No new knob:
+  # rollback is the existing ``local_admission_guard_policy: observe|off`` or
+  # ``local_prefill_deadline_seconds: 0``.
+  #
+  # CONTENDED (CO-RESIDENCY) RATE BUCKET (LP-0MVS9Y76R004B5M8). Prefill is
+  # serialised but prefill+decode batching is not: an occupant that is
+  # *generating* halves a newcomer's prefill throughput (measured 2-4x lower
+  # tok/s). A sample is therefore tagged CONTENDED when the gate was observed
+  # occupied at admission (``busy_slots >= 1``) OR another session's dispatch
+  # record was live at first-byte time (the OR is deliberate: both signals are
+  # deterministic). Contended samples land in their own per-(model, bucket)
+  # window and a contended admission is priced from it. When the contended
+  # window is not yet calibrated the guard falls back to the solitary window
+  # and logs ``rate_bucket=solitary_fallback`` rather than guessing a
+  # slowdown multiplier. Each decision line additionally carries
+  # ``rate_bucket=contended|solitary|solitary_fallback`` and
+  # ``contended_samples=<n>`` so the residual optimism is visible. Warm prompts
+  # (``cached_ratio >= 0.9``) stay on the solitary path byte-for-byte. Scope
+  # guardrails (UNCHANGED by this feature): ``contention_queue_max_wait_seconds``
+  # = 60 and ``local_prefill_deadline_seconds`` = 120; the ordering
+  # ``60 < 120 < local_dispatch_first_byte_timeout_seconds (840) <
+  # local_dispatch_max_prefill_seconds (900)`` must keep holding.
   #
   #   reject  — refuse admission when the projected wait exceeds the budget
   #             (default)
@@ -1879,7 +1907,8 @@ server:
   # observations, so it can never refuse on a guess. Decisions and their
   # ETAs are counted by the proxy-usage-analysis report; each logged decision
   # carries ``eta_prefill_s``, ``eta_occupancy_s``, ``projected_wait_s``,
-  # ``budget_s``, ``busy_slots`` and ``in_flight_prefills``.
+  # ``budget_s``, ``busy_slots``, ``in_flight_prefills`` and (since
+  # LP-0MVS9Y76R004B5M8) ``rate_bucket`` / ``contended_samples``.
   #
   # Local admission reservations + fallback intent
   # ----------------------------------------------

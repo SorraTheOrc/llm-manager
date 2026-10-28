@@ -456,6 +456,34 @@ local POSTs. Evidence, reproduction commands, and the outstanding 24 h sample:
 [docs/dev/prefill-recovery-verification.md](dev/prefill-recovery-verification.md);
 measurement tool: `scripts/prefill_recovery_verification.py`.
 
+## Contended prefill pricing (LP-0MVS8T6F4006DGG3)
+
+The prefill-ETA admission guard now prices a newcomer's own prefill from a
+separate **contended** calibration window when the gate is occupied
+(`busy_slots >= 1` or another session's dispatch record is live at first-byte
+time), because an occupant that is *generating* halves prefill throughput
+(measured 2-4x lower tok/s). When that window is uncalibrated the guard falls
+back to the solitary window and reports `rate_bucket=solitary_fallback` rather
+than guessing; each `local_admission_guard` line carries `rate_bucket` and
+`contended_samples`.
+
+The guard's occupant-remaining term is also re-priced from the occupant's
+remaining **uncached new tokens** at the contended rate, instead of decaying
+its optimistic admission ETA (`max(0, eta_prefill_s − elapsed)`), which used to
+converge to ~0 exactly when the occupant was most expensive. Fail-open is
+preserved: missing/malformed evidence or an uncalibrated window contributes
+nothing, and measured evidence can only raise the symmetric
+`eta * busy_slots` floor.
+
+The guardrail ordering is unchanged: `contention_queue_max_wait_seconds (60)
+< local_prefill_deadline_seconds (120) <
+local_dispatch_first_byte_timeout_seconds (840) <
+local_dispatch_max_prefill_seconds (900)`. Rollback is the existing
+`local_admission_guard_policy: observe|off` (or
+`local_prefill_deadline_seconds: 0` for the deadline bound only). Full detail,
+evidence and the per-child cross-reference:
+[docs/dev/contended-prefill-pricing.md](dev/contended-prefill-pricing.md).
+
 ## Client-dead mid-prefill recovery (LP-0MVLFVY6K003VYEL)
 
 A client that disappears while its local dispatch is still prefilling (agent
