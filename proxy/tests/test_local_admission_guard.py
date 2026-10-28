@@ -33,6 +33,13 @@ cooldown remainder rather than the ETA formula.
 Both builders resolve their retry story through the single reason→timing
 decision ``provider._refusal_retry_timing()`` (LP-0MVQ23API001UOET), so the two
 refusal paths cannot drift apart.
+
+The capacity-verdict slice (LP-0MVSMRSU5001JTMT, parent AC2/AC3/AC4) extends
+that contract to the *kind* of refusal: the 429 body and the single
+``local_only_refused`` line must both name the verdict from
+``admission_reserve.local_capacity_verdict`` — ``deferrable`` when waiting can
+help, ``too_large`` when the request exceeds the local serving envelope — while
+retry timing and every pre-existing field stay untouched.
 """
 
 from __future__ import annotations
@@ -40,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -1670,3 +1678,265 @@ async def test_cooldown_refusal_advertises_the_cooldown_remainder(
         f"{expected_at.isoformat()}"
     )
     assert body.get("retryable") is True, "a cooldown is a wait the client can outlast"
+
+
+# ---------------------------------------------------------------------------
+# Capacity verdict in the refusal body and the single verdict log line
+# (LP-0MVSMRSU5001JTMT, child of LP-0MVSMI7JK002FKUF)
+#
+# The pin-local refusal must say whether waiting can help: ``deferrable`` for a
+# temporal exit (stay local, retry later) or ``too_large`` when the request
+# itself exceeds the local serving envelope. Both surfaces are pinned here:
+#
+# - the 429 body gains exactly one field — ``verdict`` — beside ``reason``;
+# - the ``local_only_refused`` line gains exactly one key — ``verdict`` — and
+#   still names the parsed ``preference`` and the recorded ``reason``.
+#
+# TDD red phase: these assertions start ``xfail(strict=True)`` because the
+# wiring child (LP-0MVSMINPR006SWT6) has not landed yet. That child removes the
+# markers in the same change that adds the behaviour — removing them earlier
+# would silently lose the assertion.
+# ---------------------------------------------------------------------------
+
+#: Reused ``key=value`` parser shape (same as the log-grep tooling).
+_VERDICT_KV_RE = re.compile(r"(\w+)=(\S+)")
+
+
+def _parse_verdict_kv(line: str) -> dict[str, str]:
+    """Parse a log line's ``key=value`` pairs (the operator grep shape)."""
+    return {match.group(1): match.group(2) for match in _VERDICT_KV_RE.finditer(line)}
+
+
+def _local_only_refusal_lines(caplog) -> list[str]:
+    """Every ``local_only_refused`` line captured in *caplog*."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("local_only_refused ")
+    ]
+
+
+#: The observed 2026-10-28 incident shape: the priced own-ETA (31.7 s) fits the
+#: 60 s budget, the projection with one occupant (63.4 s) does not, and the
+#: prompt (6 627 new tokens) is far inside the 25 000-token cold-prefill cap.
+_INCIDENT_ATTEMPT: dict = {
+    "status": "local_admission_reject",
+    "reason": "eta_exceeds_budget_direct",
+    "eta_prefill_seconds": 31.7,
+    "budget_seconds": 60.0,
+    "projected_wait_seconds": 63.4,
+    "new_tokens": 6_627,
+    "budget_tokens": 25_000,
+}
+
+#: Body keys the local-only refusal carries today (before ``verdict``). Pinned
+#: literally so a rename or a silent removal fails the additive-only guard.
+_BODY_KEYS_BEFORE_VERDICT = frozenset(
+    {
+        "error",
+        "code",
+        "detail",
+        "reason",
+        "eta_prefill_seconds",
+        "budget_seconds",
+        "retryable",
+        "retry_after",
+        "suggested_action",
+        "projected_wait_seconds",
+        "retry_at",
+        "new_tokens",
+        "budget_tokens",
+    }
+)
+
+_VERDICT_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "capacity-verdict wiring pending (LP-0MVSMINPR006SWT6): the 429 body "
+        "has no 'verdict' field and local_only_refused has no verdict= key"
+    ),
+)
+
+
+@_VERDICT_XFAIL
+def test_incident_refusal_body_carries_the_deferrable_verdict():
+    """AC1: the incident shape is temporal, and nothing else about it moves."""
+    result = provider._build_local_only_refusal_response(dict(_INCIDENT_ATTEMPT))
+
+    assert result.status_code == 429
+    body = json.loads(result.body)
+    assert body["verdict"] == "deferrable"
+    assert body["reason"] == "eta_exceeds_budget_direct"
+
+    # The retry story stays exactly what ``_refusal_retry_timing`` produced —
+    # recomputed here so a timing change could never ride along with the
+    # verdict (re-specified, not re-implemented).
+    expected = provider._refusal_retry_timing(
+        "eta_exceeds_budget_direct",
+        eta_prefill_seconds=31.7,
+        budget_seconds=60.0,
+        projected_wait_seconds=63.4,
+    )
+    assert body["retryable"] is expected.retryable
+    assert body["retry_after"] == expected.retry_after
+    assert body["retry_at"] == expected.retry_at
+    assert result.headers["Retry-After"] == str(expected.retry_after)
+
+    # Existing fields and headers are untouched.
+    assert body["projected_wait_seconds"] == 63.4
+    assert body["new_tokens"] == 6_627
+    assert body["budget_tokens"] == 25_000
+    assert result.headers["X-Local-Route"] == "refused"
+    assert (
+        result.headers["X-Local-Fallback-Reason"] == "eta_exceeds_budget_direct"
+    )
+    assert result.headers["X-Local-Admission"] == "reject"
+
+
+@_VERDICT_XFAIL
+def test_refusal_body_keys_are_additive_only():
+    """AC6: exactly one new key — nothing renamed, nothing removed."""
+    result = provider._build_local_only_refusal_response(dict(_INCIDENT_ATTEMPT))
+    body = json.loads(result.body)
+
+    assert set(body) == _BODY_KEYS_BEFORE_VERDICT | {"verdict"}
+
+
+@_VERDICT_XFAIL
+@pytest.mark.parametrize(
+    "reason", ["prefill_budget_exceeded", "context_too_large"]
+)
+def test_too_large_refusals_carry_the_too_large_verdict(reason):
+    """AC2: both permanent size exits are ``too_large`` with no retry timer."""
+    result = provider._build_local_only_refusal_response(
+        {
+            "status": "local_admission_reject",
+            "reason": reason,
+            "eta_prefill_seconds": 0.0,
+            "budget_seconds": 60.0,
+            "new_tokens": 31_246,
+            "budget_tokens": 25_000,
+        }
+    )
+
+    assert result.status_code == 429
+    body = json.loads(result.body)
+    assert body["verdict"] == "too_large"
+    assert body["reason"] == reason
+    assert "Retry-After" not in result.headers
+    assert "retry_at" not in body
+    assert body["retryable"] is False
+
+
+@_VERDICT_XFAIL
+def test_one_verdict_log_line_per_refusal(caplog):
+    """AC3: one line per refusal, naming preference + verdict + reason."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    provider._build_local_only_refusal_response(dict(_INCIDENT_ATTEMPT))
+
+    lines = _local_only_refusal_lines(caplog)
+    assert len(lines) == 1, f"one line per refusal; got {lines!r}"
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("reason") == "eta_exceeds_budget_direct"
+    assert fields.get("verdict") == "deferrable"
+    assert fields.get("preference"), (
+        f"the line must name the intent that produced the refusal; got {fields!r}"
+    )
+
+
+async def _issue_guard_refusal(preference: str | None) -> tuple:
+    """Drive the end-to-end over-budget refusal for *preference*.
+
+    Returns ``(response, provider_calls)``; a ``prefer-local`` request falls
+    through to remote (no refusal), a pin-local one is refused locally.
+    """
+    model_config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {
+                "name": "remote-fallback",
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+            },
+        ],
+        "aliases": ["hybrid*"],
+    }
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    headers = {"x-local-preference": preference} if preference else {}
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers=headers),
+            "v1/chat/completions",
+            model_config,
+            _cold_budget_cfg(),
+        )
+    return result, calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preference", ["prefer-local", "remote-ok", None])
+async def test_non_refusal_paths_log_no_verdict_line(preference, caplog):
+    """AC3: only a refusal produces a verdict; fall-through logs none."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    result, calls = await _issue_guard_refusal(preference)
+
+    assert result.status_code == 200, "the default client keeps the remote answer"
+    assert calls == ["remote"]
+    assert _local_only_refusal_lines(caplog) == []
+
+
+@_VERDICT_XFAIL
+@pytest.mark.asyncio
+async def test_choke_point_refusal_logs_one_verdict_line(caplog):
+    """AC3: the chain-cooldown choke-point refusal logs exactly one line."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    provider._provider_unavailable_until["local-llama"] = time.time() + 60
+    try:
+        result, calls = await _issue_guard_refusal("local-only")
+    finally:
+        provider._provider_unavailable_until.pop("local-llama", None)
+
+    assert result.status_code == 429
+    assert calls == [], "a pin-local client must never be moved remote"
+    assert result.headers["X-Local-Fallback-Reason"] == "local_provider_cooldown"
+
+    lines = _local_only_refusal_lines(caplog)
+    assert len(lines) == 1, f"one line per refusal; got {lines!r}"
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("reason") == "local_provider_cooldown"
+    assert fields.get("verdict") == "deferrable"
+
+
+@_VERDICT_XFAIL
+@pytest.mark.asyncio
+async def test_pin_local_refusal_logs_exactly_one_verdict_line(caplog):
+    """AC3: the end-to-end pin-local refusal logs one line, never per exit."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    result, calls = await _issue_guard_refusal("local-only")
+
+    assert result.status_code == 429
+    assert calls == [], "a pin-local client must never be moved remote"
+    lines = _local_only_refusal_lines(caplog)
+    assert len(lines) == 1, f"one line per refusal; got {lines!r}"
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("verdict") == "too_large" or fields.get("verdict") == "deferrable"
+    assert fields.get("reason") == "prefill_budget_exceeded"
+    assert fields.get("preference") in {"local-only", "local-preferred"}
