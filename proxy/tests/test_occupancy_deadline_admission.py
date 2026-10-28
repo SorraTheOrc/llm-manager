@@ -16,8 +16,10 @@ Covered acceptance criteria:
   remaining occupant prefill) beyond it ⇒ ``reason=prefill_eta_exceeds_deadline``
   and the request falls through — the 2026-10-25 residual shape.
 - AC2: the remaining occupant service is projected from each occupant's own
-  dispatch record (``eta_prefill_s`` minus elapsed) and never raises on
-  malformed evidence.
+  dispatch record. Since LP-0MVS9YK9P006M1NQ the projection prices the
+  occupant's remaining *uncached new tokens* at the contended rate (the
+  optimistic ``eta_prefill_s - elapsed`` decay no longer determines the
+  result); it never raises on malformed evidence.
 - AC3: the symmetric floor is never lowered (no occupant evidence ⇒ the
   pre-change verdict, byte-for-byte).
 - AC4: both the queue and the direct free-slot admission paths carry the
@@ -67,14 +69,28 @@ def _clean_state():
 #: Small-prompt calibration → own ETA in the residual's ~7 s band.
 _WARM_TOKENS = 2_000
 _WARM_MS_PER_TOKEN = 3.5
+#: Measured contended prompt-eval median (~120 t/s) — the co-residency window
+#: the occupant-remaining re-pricing prices from (LP-0MVS9YK9P006M1NQ).
+_CONTENDED_MS_PER_TOKEN = 8.33
 
 
 def _seed_calibration(
     tokens: int = _WARM_TOKENS, ms_per_token: float = _WARM_MS_PER_TOKEN,
     count: int = 6,
 ) -> None:
+    """Seed a calibrated solitary window (newcomer ETA) plus a calibrated
+    contended window (co-residency pricing, LP-0MVS9YK9P006M1NQ)."""
     for _ in range(count):
         prefill_eta.record_dispatch_sample("Qwen3", tokens, 0.0, tokens * ms_per_token)
+    for _ in range(count):
+        prefill_eta.record_dispatch_sample(
+            "Qwen3", tokens, 0.0, tokens * _CONTENDED_MS_PER_TOKEN, contended=True
+        )
+
+
+#: New tokens whose contended re-pricing computes to the occupant's nominal
+#: ``eta_prefill_s`` (11 500 x 10 ms = 115 s: 8.33 ms fitted x 1.2 conservatism).
+_OCCUPANT_NEW_TOKENS = 11_500
 
 
 # ---------------------------------------------------------------------------
@@ -151,16 +167,24 @@ def test_occupancy_deadline_boundary_is_an_inclusive_refusal():
 def _occupant_record(
     eta: float = 115.0,
     *,
+    new_tokens: int = _OCCUPANT_NEW_TOKENS,
     started_ago: float = 2.0,
     active: bool = True,
     first_byte: bool = False,
     endpoint: str | None = None,
 ) -> dict:
+    """A live dispatch record shaped like ``_dispatch_evidence``: the
+    occupant's remaining service is now re-priced from ``new_tokens`` at the
+    contended rate (LP-0MVS9YK9P006M1NQ); ``eta_prefill_s`` is retained as the
+    record's optimistic admission ETA."""
     return {
         "active": active,
         "first_byte_seen": first_byte,
         "eta_prefill_s": eta,
         "started_at": time.monotonic() - started_ago,
+        "new_tokens": new_tokens,
+        "cached_ratio": 0.0,
+        "model_name": "Qwen3",
         "endpoint": endpoint,
         "backend": endpoint or "http://192.0.2.9:8080",
     }
@@ -169,10 +193,14 @@ def _occupant_record(
 def test_remaining_seconds_prices_each_occupant_from_its_own_evidence():
     from proxy.router_helpers import _live_prefill_remaining_seconds
 
+    _seed_calibration()
     srv = SimpleNamespace(
         local_dispatch_records={
+            # 11 500 new tokens at the contended rate ≈ 115 s, 2 s in → 113.
             "occ-a": _occupant_record(eta=115.0, started_ago=2.0),
-            "occ-b": _occupant_record(eta=30.0, started_ago=40.0),  # fully elapsed → 0
+            # Past its optimistic ETA (30 s) but only 200 s into a 115 s
+            # contended service — re-priced, the work is fully consumed → 0.
+            "occ-b": _occupant_record(eta=30.0, started_ago=200.0),
             "done": _occupant_record(eta=9.0, first_byte=True),
             "idle": _occupant_record(eta=9.0, active=False),
         }
@@ -183,11 +211,14 @@ def test_remaining_seconds_prices_each_occupant_from_its_own_evidence():
 def test_remaining_seconds_excludes_the_requesting_session():
     from proxy.router_helpers import _live_prefill_remaining_seconds
 
+    _seed_calibration()
     srv = SimpleNamespace(
         local_dispatch_records={
-            ("http://192.0.2.9:8080", "s-1"): _occupant_record(eta=60.0, started_ago=0.0),
-            "s-1": _occupant_record(eta=60.0, started_ago=0.0),
-            "other": _occupant_record(eta=12.0, started_ago=0.0),
+            ("http://192.0.2.9:8080", "s-1"): _occupant_record(
+                eta=60.0, new_tokens=6_000, started_ago=0.0
+            ),
+            "s-1": _occupant_record(eta=60.0, new_tokens=6_000, started_ago=0.0),
+            "other": _occupant_record(eta=12.0, new_tokens=1_200, started_ago=0.0),
         }
     )
     # ``abs`` tolerance: the helper subtracts the real monotonic elapsed time
@@ -202,11 +233,18 @@ def test_remaining_seconds_excludes_the_requesting_session():
 def test_remaining_seconds_scopes_to_endpoint_when_known():
     from proxy.router_helpers import _live_prefill_remaining_seconds
 
+    _seed_calibration()
     srv = SimpleNamespace(
         local_dispatch_records={
-            "a": _occupant_record(eta=10.0, started_ago=0.0, endpoint="http://a:8080"),
-            "b": _occupant_record(eta=99.0, started_ago=0.0, endpoint="http://b:8080"),
-            "legacy": _occupant_record(eta=5.0, started_ago=0.0, endpoint=None),
+            "a": _occupant_record(
+                eta=10.0, new_tokens=1_000, started_ago=0.0, endpoint="http://a:8080"
+            ),
+            "b": _occupant_record(
+                eta=99.0, new_tokens=9_900, started_ago=0.0, endpoint="http://b:8080"
+            ),
+            "legacy": _occupant_record(
+                eta=5.0, new_tokens=500, started_ago=0.0, endpoint=None
+            ),
         }
     )
     # 10 (scoped) + 5 (legacy, unscoped). ``abs`` tolerance because the helper
@@ -223,6 +261,7 @@ def test_remaining_seconds_scopes_to_endpoint_when_known():
 def test_remaining_seconds_fails_open_on_malformed_evidence():
     from proxy.router_helpers import _live_prefill_remaining_seconds
 
+    _seed_calibration()
     bad_records = {
         "no-eta": {"active": True, "first_byte_seen": False, "started_at": 0.0},
         "bad-eta": _occupant_record(eta="slow"),

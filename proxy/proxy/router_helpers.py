@@ -2123,29 +2123,48 @@ def _live_prefill_remaining_seconds(
     occupant at the *newcomer's* own prefill. Each dispatch record carries the
     calibrated prefill ETA captured when it was admitted
     (``_dispatch_evidence``: ``eta_prefill_s``) plus its ``started_at``
-    (``time.monotonic()``), so the service it still owes is
-    ``max(0, eta_prefill_s - (now - started_at))``. Summing that over the
-    in-flight prefills gives the wait a newcomer actually faces before its own
-    prefill can start.
+    (``time.monotonic()``).
+
+    LP-0MVS9YK9P006M1NQ: the remaining service is priced from the occupant's
+    remaining *uncached new tokens* at the contended co-residency rate instead
+    of ``max(0, eta_prefill_s - (now - started_at))``. The recorded
+    ``eta_prefill_s`` is the optimistic, uncontended admission ETA (measured
+    2-4x optimistic when the other slot is generating), so decaying it
+    under-priced the occupant and converged to ~0 the moment the occupant
+    passed its optimistic ETA -- exactly when it was most expensive
+    (2026-10-28 00:28:55: a cold 65-89k-token audit prompt priced
+    ``eta_occupancy_s=16.0`` and the queue never freed). Each record also
+    carries ``new_tokens`` / ``cached_ratio``/ ``model_name`` verbatim
+    (LP-0MVODJ3P6000AIUM), so the remaining work can be re-priced:
+
+    ``progress = min(1, elapsed / contended_full_service)`` -- progress is
+    measured against the *contended* full duration of the occupant's whole new
+    token load (``estimate_prefill_seconds(..., contended=True)``), never the
+    optimistic ``eta_prefill_s``; ``remaining_new = new_tokens * (1 - progress)``;
+    ``remaining_s = estimate_prefill_seconds(remaining_new, cached_ratio=0,
+    contended=True)``.
 
     Only records that are *genuinely prefilling* are priced: ``active`` (a
     released/inactive lease is not consuming the gate) and no first byte yet
-    (``first_byte_seen`` false — once a byte is served the prefill is done).
+    (``first_byte_seen`` false -- once a byte is served the prefill is done).
 
     The requesting session's own record is excluded via *exclude_session*: a
     same-session re-entry never waits behind itself. When *endpoint* is given,
     records belonging to another endpoint are ignored (endpoint-aware pools).
 
-    Fail-open by construction: a missing/invalid ``eta_prefill_s``, malformed
-    timestamps or a missing record set contribute nothing, leaving the
-    symmetric ``eta * busy_slots`` floor in charge. Never raises — a routing
-    decision must not break on an observability gap.
+    Fail-open by construction (LP-0MVS9YK9P006M1NQ AC3): a missing/invalid
+    ``new_tokens``, ``eta_prefill_s`` or ``started_at``, malformed timestamps,
+    a missing record set, or an uncalibrated contended window (where the
+    estimator would have to *guess* the slowdown) all contribute nothing,
+    leaving the symmetric ``eta * busy_slots`` floor in charge. Never raises --
+    a routing decision must not break on an observability gap.
     """
     try:
         records = getattr(srv, "local_dispatch_records", None) or {}
         if not isinstance(records, dict) or not records:
             return 0.0
         _now = time.monotonic() if now is None else float(now)
+        config = getattr(srv, "config", None)
         total = 0.0
         for key, record in list(records.items()):
             if not isinstance(record, dict):
@@ -2176,7 +2195,48 @@ def _live_prefill_remaining_seconds(
                 continue
             if not math.isfinite(started_at):
                 continue
-            total += max(0.0, eta - max(0.0, _now - started_at))
+            try:
+                new_tokens = int(record.get("new_tokens"))
+            except (TypeError, ValueError):
+                continue
+            if new_tokens <= 0:
+                continue
+            # Lazy import: keeps router_helpers free of proxy.* module-level
+            # dependencies (mirrors provider.py's lazy ``prefill_eta`` use).
+            from proxy.prefill_eta import estimate_prefill_seconds
+
+            elapsed = max(0.0, _now - started_at)
+            full_contended_s, coeffs = estimate_prefill_seconds(
+                record.get("model_name"),
+                new_tokens,
+                0.0,
+                config,
+                contended=True,
+            )
+            if not coeffs.calibrated:
+                # Never price from a guess: an uncalibrated contended window
+                # (with no calibrated solitary fallback either) leaves the
+                # symmetric floor in charge, byte-for-byte the old fail-open.
+                continue
+            if full_contended_s <= 0.0:
+                continue
+            # Progress is measured against the contended full service of the
+            # occupant's whole token load -- never the optimistic recorded
+            # ETA, which would cap progress at 1.0 the moment the occupant
+            # passed it and re-introduce the convergence-to-zero defect. The
+            # ``max(full, eta)`` guard also keeps a conservative occupant ETA
+            # from accelerating the decay.
+            reference = max(full_contended_s, eta)
+            progress = min(1.0, elapsed / reference) if reference > 0.0 else 1.0
+            remaining_new = new_tokens * (1.0 - progress)
+            remaining_s, _ = estimate_prefill_seconds(
+                record.get("model_name"),
+                int(round(remaining_new)),
+                0.0,
+                config,
+                contended=True,
+            )
+            total += max(0.0, remaining_s)
         return max(0.0, total)
     except Exception:
         return 0.0
