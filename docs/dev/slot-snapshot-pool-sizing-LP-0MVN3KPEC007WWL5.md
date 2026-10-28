@@ -29,7 +29,7 @@ match llama-server's `--parallel` (`proxy/config.yaml:1660-1679`).
 | 2 | **Per-slot physical context** — llama-server divides the total `-c` by the slot count, so per-slot ctx is *derived, never configured* | `local_model_ctx_size // slots` | `proxy/proxy/provider.py:1788` (`effective_per_slot_threshold`), headroom constant `provider.py:1779` (`_LOCAL_ROUTING_OUTPUT_HEADROOM = 4096`) |
 | 3 | **Large-context routing clamp (warm ceiling)** — prompts above the clamp bypass local | warm threshold is clamped to `min(configured_warm, effective_per_slot_threshold(ctx, slots))` | `proxy/proxy/provider.py:1900` (`_effective_large_context_thresholds`), used for skip decisions `provider.py:1943`, `provider.py:2107` |
 | 4 | **Persistence context cap** — a request larger than the clamp never attempts save/restore, so router and persistence agree | `session_slot_max_prompt_tokens` falls back to `compute_hard_routing_cap` and then to `effective_per_slot_threshold(ctx, slots)` | `proxy/proxy/session.py:1229-1235`, `proxy/proxy/provider.py:2064` (`compute_hard_routing_cap`) |
-| 5 | **Dispatch-lease concurrency cap** — how many sessions may hold a local lease at once | `max_local = session_slot_pool_size`, passed into the lease acquire, with the cold-start cap applied on top | `proxy/proxy/router.py:150-169` (`_get_local_max_concurrent_queries`), `router.py:1263-1264` (call site), `proxy/proxy/router_helpers.py:2697` (`_try_acquire_local_dispatch`), `provider.py:5989` (`max_local` for the saturation view) |
+| 5 | **Dispatch-lease concurrency cap** — how many sessions may hold a local lease at once | `max_local = session_slot_pool_size`, passed into the lease acquire, with the cold-start cap applied on top | `proxy/proxy/router.py:152-171` (`_get_local_max_concurrent_queries`), `router.py:1303-1304` (call site), `proxy/proxy/router_helpers.py:2697` (`_try_acquire_local_dispatch`), `provider.py:5989` (`max_local` for the saturation view) |
 | 6 | **Slot-ID space** — the numeric range a session may be assigned, and pool exhaustion | `_slot_id_for_session` returns the lowest free id in `[0, pool_size)`, `None` when the pool is full | `proxy/proxy/session.py:1000-1034` |
 | 7 | **Persistence on/off gate (global)** — pool size 0 disables all snapshotting | `_slot_persistence_enabled(slot_path, pool) = bool(slot_path and pool > 0)` | `proxy/proxy/session.py:488`, gate applied in `_build_slot_context` at `session.py:1185-1190` and in the eviction-save planner `session.py:848-871` |
 | 8 | **Tenancy default ("N tenants, N slots")** — the number of distinct sessions allowed to hold a large-prompt local reservation | `_default_tenants` uses the pool size when `local_session_tenants` is unset | `proxy/proxy/router_helpers.py:2370-2381`; config comment `proxy/config.yaml:1373` (live value `proxy/config.yaml:1381` = 2) |
@@ -258,8 +258,11 @@ This question is mirrored in the parent item's Appendix.
 - This document: `docs/dev/slot-snapshot-pool-sizing-LP-0MVN3KPEC007WWL5.md` (parent AC6
   links it from `LP-0MVN3KPEC007WWL5`).
 - Table verification: `proxy/tests/test_slot_pool_sizing_doc.py` — asserts the §2 table
-  equals `proxy.provider.effective_per_slot_threshold(262144, N)` for N = 2/3/4, and
-  asserts the clamp-vs-raw gap is exactly `_LOCAL_ROUTING_OUTPUT_HEADROOM`.
+  equals `proxy.provider.effective_per_slot_threshold(262144, N)` for N = 2/3/4, asserts
+  the clamp-vs-raw gap is exactly `_LOCAL_ROUTING_OUTPUT_HEADROOM`, and re-checks every
+  `file:line` citation in §1 against the current source (a 60-line drift tolerance keeps
+  unrelated commits on the shared `dev` branch from reddening the suite, while a moved or
+  removed symbol still fails).
 - Prior evidence: `docs/slot-count-verdict-lp-0mv9ungeb009xuz5.md` (N=2 verdict),
   `docs/slot-count-reevaluation-LP-0MVGCQ3QN009HRE8.md` (per-slot table at 95 % of
   per-slot, concurrency vs capacity), `docs/dev/slot-geometry-ab.md` (the 1 vs 2 live-slot

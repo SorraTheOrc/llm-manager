@@ -38,6 +38,14 @@ from proxy.provider import (
 #: Repo root (``proxy/tests/`` → ``proxy/`` → repo root).
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+#: How far a cited symbol may drift from the line the doc quotes before the
+#: citation is considered stale. ``dev`` is a shared branch: unrelated commits
+#: land under a doc's citations and shift them by a few dozen lines without the
+#: cited behaviour changing at all. A window keeps the check honest (a symbol
+#: that moves far away, or disappears, still fails) without reddening the suite
+#: for a refactor in another file.
+CITATION_DRIFT_TOLERANCE = 60
+
 DOC_PATH = REPO_ROOT / "docs/dev/slot-snapshot-pool-sizing-LP-0MVN3KPEC007WWL5.md"
 
 #: The doc's stated production geometry.
@@ -52,6 +60,22 @@ EXPECTED_CLAMP = {2: 126_976, 3: 83_285, 4: 61_440}
 def _doc_text() -> str:
     assert DOC_PATH.is_file(), f"sizing doc missing: {DOC_PATH}"
     return DOC_PATH.read_text(encoding="utf-8")
+
+
+def _resolve_citation(
+    path: Path, line_no: int, needle: str
+) -> tuple[int | None, int]:
+    """Locate *needle* in *path* and measure its distance from *line_no*.
+
+    Returns ``(nearest_line, drift)``, or ``(None, -1)`` when the needle does
+    not appear anywhere in the file (the cited behaviour was removed).
+    """
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    hits = [n for n, text in enumerate(lines, start=1) if needle in text]
+    if not hits:
+        return None, -1
+    nearest = min(hits, key=lambda hit: abs(hit - line_no))
+    return nearest, abs(nearest - line_no)
 
 
 def _table_rows() -> dict[int, tuple[int, int]]:
@@ -195,8 +219,8 @@ class TestCitationsStillResolve:
         ("proxy/proxy/provider.py", 2064, "def compute_hard_routing_cap"),
         ("proxy/proxy/session.py", 1229, "effective_per_slot_threshold"),
         # 5 — dispatch-lease cap
-        ("proxy/proxy/router.py", 150, "def _get_local_max_concurrent_queries"),
-        ("proxy/proxy/router.py", 1264, "_try_acquire_local_dispatch"),
+        ("proxy/proxy/router.py", 152, "def _get_local_max_concurrent_queries"),
+        ("proxy/proxy/router.py", 1304, "_try_acquire_local_dispatch"),
         ("proxy/proxy/router_helpers.py", 2697, "async def _try_acquire_local_dispatch"),
         ("proxy/proxy/provider.py", 5989, "session_slot_pool_size"),
         # 6 — slot-ID space
@@ -229,9 +253,48 @@ class TestCitationsStillResolve:
     def test_citation_resolves(self, rel_path: str, line_no: int, needle: str) -> None:
         path = REPO_ROOT / rel_path
         assert path.is_file(), f"cited file missing: {rel_path}"
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        assert line_no <= len(lines), f"{rel_path} has only {len(lines)} lines"
-        assert needle in lines[line_no - 1], (
-            f"{rel_path}:{line_no} no longer contains {needle!r}: "
-            f"{lines[line_no - 1].strip()!r} — update the sizing doc"
+        nearest, drift = _resolve_citation(path, line_no, needle)
+        assert nearest is not None, (
+            f"{rel_path} no longer contains {needle!r} — the sizing doc cites it at "
+            f"{rel_path}:{line_no}; update the doc (behaviour moved or removed)"
         )
+        assert drift <= CITATION_DRIFT_TOLERANCE, (
+            f"{rel_path}:{line_no} is stale: {needle!r} now lives at line {nearest} "
+            f"(drift {drift} > {CITATION_DRIFT_TOLERANCE}) — update the sizing doc"
+        )
+
+
+class TestCitationDriftGuard:
+    """The drift guard above must actually be able to fail.
+
+    A citation check nobody has seen fail is indistinguishable from a no-op;
+    these exercise it against synthetic sources so the tolerance window is a
+    tested property rather than a hopeful constant.
+    """
+
+    def test_exact_citation_has_zero_drift(self, tmp_path: Path) -> None:
+        src = tmp_path / "mod.py"
+        src.write_text("a = 1\ndef target():\n    pass\n", encoding="utf-8")
+        nearest, drift = _resolve_citation(src, 2, "def target")
+        assert (nearest, drift) == (2, 0)
+
+    def test_small_drift_is_tolerated(self, tmp_path: Path) -> None:
+        src = tmp_path / "mod.py"
+        src.write_text("\n" * 20 + "def target():\n    pass\n", encoding="utf-8")
+        nearest, drift = _resolve_citation(src, 2, "def target")
+        assert nearest == 21
+        assert drift <= CITATION_DRIFT_TOLERANCE
+
+    def test_large_drift_is_reported(self, tmp_path: Path) -> None:
+        src = tmp_path / "mod.py"
+        offset = CITATION_DRIFT_TOLERANCE + 10
+        src.write_text("\n" * offset + "def target():\n    pass\n", encoding="utf-8")
+        nearest, drift = _resolve_citation(src, 1, "def target")
+        assert nearest == offset + 1
+        assert drift > CITATION_DRIFT_TOLERANCE
+
+    def test_missing_symbol_is_reported(self, tmp_path: Path) -> None:
+        src = tmp_path / "mod.py"
+        src.write_text("a = 1\n", encoding="utf-8")
+        nearest, _ = _resolve_citation(src, 1, "def target")
+        assert nearest is None
