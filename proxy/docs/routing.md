@@ -1201,12 +1201,74 @@ reserved dispatch does not consume queue depth.
 | Value | Behaviour |
 |-------|-----------|
 | `prefer-local` (default) | Today's behaviour: use local when it can serve within the budget, else fall through to the next provider |
-| `local-only` | Never fall back remote. If the request cannot be admitted locally the proxy returns the `429` admission refusal (`X-Local-Route: refused`) **even when remote providers are available** — a local-only refusal means *refuse*, never a silent fall-through. See the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
+| `local-only` | Never fall back remote. The request either completes locally or is refused — the `429` admission refusal (`X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`) is returned **even when remote providers are available**. Enforcement is structural, on **every** exit from the local route, not only at the admission guard — see [Local-only is enforced on every exit from the local route](#local-only-is-enforced-on-every-exit-from-the-local-route) and the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
 | `remote-ok` | Skip the local route entirely (background / low-priority work). The local provider is removed from the chain |
 
 Unknown values (and an absent header) behave as `prefer-local`, so the header
 is purely additive. `high` priority keeps its "never queue" semantics under
 every preference.
+
+### Local-only is enforced on every exit from the local route
+
+`local-only` is enforced **structurally**, ahead of every non-local dispatch —
+not by patching each skip branch at the admission guard. Both dispatch cycles
+(`_proxy_with_fallback_cycle` and `_proxy_with_remote_fallback_cycle`) call
+`_build_local_only_refusal_for_remote()` at the head of the provider loop,
+immediately after the next candidate is resolved and **before** any attempt:
+whenever the candidate is not a local entry and the client is `local-only`, the
+request is refused with the `429` (`X-Local-Route: refused`) instead of ever
+reaching that candidate. It is the mirror of `remote-ok`: where `remote-ok`
+removes the local route from the chain *before* dispatch, `local-only` refuses
+*before* any remote entry is dispatched — so every exit from the local route
+is an exit into the refusal, and a `local-only` request is either completed
+locally or refused, never silently served by a paid provider
+(LP-0MVRMC1L3006F0F3). The admission guard is still there; it is simply no
+longer the only line of defence.
+
+The refusal's `X-Local-Fallback-Reason` names the exit. Each local-route exit
+records its reason on the request (`_note_local_fallback_reason`) as it falls
+through; the loop-head choke point turns that recorded reason into the refusal
+token, and the same token is what the routing log line carries as `reason=` —
+the header, the refusal body `reason` and `proxy.log` cannot drift. The
+vocabulary is canonicalised in `admission_reserve.LOCAL_FALLBACK_REASON_TOKENS`
+(LP-0MVRMC1W6003MV3Y); an exit that recorded nothing is attributed with a
+structural token, never a remote fall-through: a chain with **no local entry
+at all** refuses with `local_only_no_local_route` (a client that pinned local
+expected no remote spend for any reason), and any other unrecorded exit with
+`local_route_unavailable`.
+
+| Exit from the local route | `X-Local-Fallback-Reason` | Log line (`reason=` field) |
+|---|---|---|
+| Admission guard, queue path — projected prefill cannot finish inside the wait budget (`contention_queue_max_wait_seconds`) | `eta_exceeds_budget` | `local_admission_guard ... reason=eta_exceeds_budget ... enforced=true` |
+| Admission guard, queue path — projected first byte reaches `local_prefill_deadline_seconds` | `prefill_eta_exceeds_deadline` | `local_admission_guard ... reason=prefill_eta_exceeds_deadline ...` |
+| Admission guard, queue path — safety-budget bound of the deadline | `prefill_eta_exceeds_safety_budget` | `local_admission_guard ... reason=prefill_eta_exceeds_safety_budget ...` |
+| Admission guard, queue path — flat cold-prefill token cap (`local_cold_prefill_budget_tokens`) | `prefill_budget_exceeded` | `local_admission_guard ... reason=prefill_budget_exceeded ...` |
+| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` (the deadline/safety/budget reasons keep their own token) | `local_admission_guard ... free_slot=true ...` / `local_admission_guard_direct_fallback ... reason=...` |
+| Local entry in cooldown (chain resolution) | `local_provider_cooldown` | `Skipping provider=<local>: ... in cooldown (...s remaining) reason=local_provider_cooldown preference=...` |
+| Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap | `context_too_large` | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
+| Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | `routing_skip_local ... reason=large_context_bypass ...` |
+| Router skip: residency ladder found too little reusable prefix (an idle-admission denial keeps this token) | `resident_prefix_insufficient` | `routing_skip_local ... reason=resident_prefix_insufficient ...` |
+| Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | `routing_skip_local ... reason=tenant_limit ...` |
+| Router skip: session in post-deadline prefill-thrash cooldown | `prefill_thrash_cooldown` | `routing_skip_local ... reason=prefill_thrash_cooldown ...` |
+| Contention-queue depth cap reached (never queued), or the wait budget expired | `fallback_after_queue` | `contention_queue_fallback_after_queue ... preference=...` |
+| Local slots busy with the queue disabled (fast-mode fallback policy) | `local_concurrency_limit` | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
+| Prefill-gate / lease denial (a lease-active 503 after the retry window) | `local_lease_active` | `contention_queue_fallback_after_queue ... reason=local_lease_active` |
+| Quota hard stop (chain resolution) | `quota_hard_stop` | `Skipping provider=<local>: ... reason=quota_hard_stop preference=...` |
+| Usage-limit reset pending (chain resolution) | `usage_limit_reset_pending` | `Skipping provider=<local>: usage_limit_reset_pending ... reason=usage_limit_reset_pending ...` |
+| Outside the entry's `available_times` window (chain resolution) | `outside_available_window` | `Skipping provider=<local>: outside its available_times window (UTC) reason=outside_available_window ...` |
+| The chain has no local entry at all | `local_only_no_local_route` | `local_only_refused reason=local_only_no_local_route preference=local-only` |
+| Any exit that left no reason on the request (e.g. a plain post-dispatch slot-exhaustion 503) | `local_route_unavailable` | `local_only_refused reason=local_route_unavailable preference=local-only` |
+
+The table is pinned by `proxy/tests/test_local_only_refusal_matrix.py` (one row
+per exit: `local-only` ⇒ `429` + token + **no upstream call**; `prefer-local`
+and an absent header ⇒ today's remote fall-through, byte-compatible) and by
+`proxy/tests/test_local_fallback_reason_tokens.py` (per-branch tokens equal the
+log `reason=` verbatim). Every "not local" line also carries
+`preference=<parsed>` and `priority_routing ... session=<id>`
+(LP-0MVRMC275000R2W6), and each refused request emits exactly one
+`local_only_refused reason=<token> preference=local-only` line — so a
+`local-only` violation, or the exit that caused it, is attributable from
+`proxy.log` alone.
 
 ### Response headers
 
@@ -1214,13 +1276,25 @@ Every response carries `X-Local-Route`:
 
 - `local` — served by a local provider.
 - `remote` — served by a remote provider; `X-Local-Fallback-Reason` names why
-  local was not used (`eta_exceeds_budget`, `local_concurrency_limit`,
-  `cached_tokens_skip`/`large_context_bypass`, `remote_ok`, …).
-- `refused` — local-only refusal or exhausted chain; `X-Local-Fallback-Reason`
-  carries the refusal reason. Refusals also carry `Retry-After` (only when
-  waiting can help), `retry_at` (the same instant, RFC 3339 UTC) and the
+  local was not used — one of the exit tokens in the
+  [local-only section](#local-only-is-enforced-on-every-exit-from-the-local-route),
+  or `no_local_provider` when the local route was never attempted (a
+  `remote-ok` chain strip that removed every local entry, or a chain that
+  never had one).
+- `refused` — a refusal response: the `local-only` refusal, or the
+  admission-guard refusal after the rest of the chain is exhausted.
+  `X-Local-Fallback-Reason` carries the exit's reason token, byte-identical to
+  the body `reason`. Refusals also carry `Retry-After` (only when waiting can
+  help), `retry_at` (the same instant, RFC 3339 UTC) and the
   `X-Local-Admission*` estimate and token headers — see the
   [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x).
+
+`prefer-local` (the default) keeps today's behaviour unchanged: on every one
+of the exits above it falls through to the next provider exactly as before —
+enforcement adds the refusal only for `local-only`. `remote-ok`, by contrast,
+is enforced structurally: the local route is removed from the chain *before*
+dispatch (`apply_local_preference`), so a `remote-ok` request never reaches a
+local-route exit at all.
 
 ### Per-reason retry contract (LP-0MVNTT4X8009IO2X)
 
@@ -1267,15 +1341,20 @@ derived from the *real* expiry state (the cooldown remainder, the lease
 remainder or the queue exit) — never from the ETA formula — so the hint tracks
 when local capacity actually returns.
 
-**Local-only means refuse, not fall through to remote.** A `local-only`
-client's refusal is returned to it as a `429` even while remote providers are
-available; the request is never silently moved remote. This is enforced today
-at the admission decision (prefill-ETA guard, cold-prefill budget and context
-cap). The remaining non-admission skips (cooldown, lease held, contention-queue
-expiry) still fall through behind a `local-only` client and are being closed
-by LP-0MVNU2KTK009D4AG and LP-0MVQ23B80009OZ9V; under `prefer-local` (the
-default) a refusal instead falls through to the next provider, and waiting is
-the client's own choice.
+The real-expiry mapping is the contract of LP-0MVQ23B80009OZ9V (blocked by
+this work). On the structural `local-only` refusals — which cannot resolve a
+real expiry today — the shared timing has no measured wait, so the advertised
+`Retry-After` is the 1-second floor of the shared hint, honest for that
+refusal instance and replaced by the real-expiry value when that item lands.
+
+**Local-only means refuse, not fall through to remote — on every exit.** A
+`local-only` client's refusal is returned to it as a `429` even while remote
+providers are available; the request is never silently moved remote, whichever
+way the local route exited — the walk-through and the full exit→token table
+are in
+[Local-only is enforced on every exit from the local route](#local-only-is-enforced-on-every-exit-from-the-local-route).
+Under `prefer-local` (the default) a refusal instead falls through to the next
+provider, and waiting is the client's own choice.
 
 `/llama/local/status` publishes the reservation counters
 (`reserved_outstanding`, `reserved_issued`, `reserved_used`,
