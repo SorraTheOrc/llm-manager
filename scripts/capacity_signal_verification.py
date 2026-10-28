@@ -97,8 +97,54 @@ its name-encoded hour, ``scripts/lib/proxy_logs.py``).
     per-dispatch end marker, so overlapping dispatch windows cannot be
     reconstructed exactly. ``worst_timestamps`` lists the busiest
     whole-minute buckets (highest violating polls first) so an operator can go
-    straight to the log lines, and ``examples`` the first violating
-    timestamps in order.
+    straight to the log lines, ``examples`` the first violating
+    timestamps in order, and ``rows`` **every** violating poll as
+    ``{timestamp, latency_ms, slots_detail_stale, available_slots}`` — the
+    input to the attribution below (LP-0MVOG7IP80003MLV AC2/AC4).
+
+``slots_stale_attribution``
+    Every stale poll attributed to the cache that served it, plus the response
+    latency that shows *why*: ``by_source`` (``detail_cache`` /
+    ``counts_cache`` / ``unknown`` — the last for a poll that carries the
+    legacy union flag but no per-source flag), ``by_latency_band``
+    (``lt_1s``/``1s_to_2s``/``2s_to_5s``/``gte_5s``/``unknown``) and
+    ``unattributed``. A stale poll served in under a second is normally a
+    failure-backoff cache hit: ``_cached_slots_payload`` caches a non-200 for
+    ``SLOTS_POLL_FAILURE_BACKOFF_SECONDS`` (default 5 s), so the polls right
+    after a timeout are served instantly — and stale (LP-0MVOG7IP80003MLV
+    AC4).
+
+``abandonment_events``
+    Local dispatch abandonments inside the window, by reason: a
+    ``lease_released reason=<r>`` line where ``<r>`` is one of
+    ``prefill_deadline``, ``session_evicted``, ``no_progress_watchdog`` or
+    ``client_disconnect``. That records the proxy dropping an in-flight local
+    dispatch while llama-server may still be finishing the job — so a *fresh*
+    ``/slots`` snapshot can legitimately report the slot ``is_processing``
+    with no proxy-side record left. Proxy-restart markers are reported the
+    same way (``kind: proxy_restart``) so restart-bounded stale windows can be
+    attributed. ``idle_timeout`` is excluded: it is the normal end of a
+    *completed* stream, not the abandonment of an in-flight one.
+
+``attribution``
+    Each violating ``saturated`` poll attributed to the **nearest preceding**
+    abandonment/restart event within ``--attribution-lookback-seconds``
+    (default 600 s), as ``rows`` (``timestamp``, ``cause``,
+    ``evidence_timestamp``, ``seconds_since_evidence``, ...), ``by_cause``,
+    ``attributed_polls``, ``unattributed_polls`` and
+    ``unattributed_timestamps``. A poll with no preceding event inside the
+    lookback is reported unattributed — never guessed. The event scan reads up
+    to one lookback *before* ``--since`` so a window's first polls can still be
+    explained, while the reported ``abandonment_events`` tally stays scoped to
+    the window. Attribution **explains** a residual; it never turns a missed
+    target into a pass (the check still fails and the cause is stated beside
+    it).
+
+``--write-artifacts DIR``
+    Persist the raw evidence (LP-0MVOG7IP80003MLV AC5): ``measurement.json``
+    (this whole report), ``measurement.txt`` (the human rendering) and
+    ``saturated_without_live_work_attribution.csv`` (one row per violating
+    poll, so a reviewer can re-check every attribution against the log).
 
 ``saturated_without_available_slots``
     Status polls with ``capacity_hint=saturated`` **and**
@@ -194,11 +240,33 @@ records which run an artifact is.
 Related work: parent LP-0MVLNBCTN0084MT0; measurement children
 LP-0MVOG7IP80003MLV, LP-0MVOG7IX6006MZ23; discovery/coverage library
 ``scripts/lib/proxy_logs.py`` (LP-0MUIEK483002TZ54).
+
+Post-fix night measurement (LP-0MVOG7IP80003MLV)
+-----------------------------------------------
+The first application of this tool to a real post-fix window is recorded under
+``~/proxy-usage-reports/2026-10-24_post-fix-night-measurement/`` (``REPORT.md``
+plus the ``--write-artifacts`` output and the supplementary derivation tables).
+Two findings from it shape how the numbers should be read:
+
+* ``slots_stale`` is a **polling-path** health signal, not a
+  capacity-truthfulness one. On 2026-10-24/25 it sat at 79.6 % because every
+  proxy ``/slots`` query still went through the llama-server router (serialised
+  behind the busy child, 5-7 s) and blew the 2.0 s/1.0 s budgets; routing the
+  queries to the discovered child port only landed in f58e8964 (2026-10-26).
+  A stale-rate figure is only meaningful with the build it was measured on.
+* ``saturated``-without-live-work residuals split into two classes that must
+  not be conflated: stale-detail false saturation (what the capacity fix
+  eliminates — zero of 9,012 stale-detail polls in that window) and *fresh*
+  detail from a slot llama-server is still finishing after the proxy abandoned
+  the dispatch (``prefill_deadline``/``session_evicted`` — the attribution
+  rows).
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
+import csv
 import datetime as dt
 import json
 import re
@@ -265,8 +333,31 @@ _STATUS_POLL_RE = re.compile(r"\bstatus_request\b")
 _STATUS_FIELD_RE = re.compile(
     r"\b(?P<key>capacity_hint|slots_stale|slots_detail_stale|available_slots|"
     r"local_active_query|active_query|local_in_flight_requests|"
-    r"status_schema_version)=(?P<value>[^\s]+)"
+    r"status_schema_version|latency_ms)=(?P<value>[^\s]+)"
 )
+#: A local dispatch lease release (``proxy/proxy/handlers.py`` → the
+#: ``local_dispatch_records`` registry). ``reason=`` names why the proxy
+#: stopped tracking the dispatch.
+_LEASE_RELEASED_RE = re.compile(r"\blease_released\b.*\breason=(?P<reason>[a-z_]+)")
+#: Lease-release reasons that record an *abandoned* local dispatch — the proxy
+#: released the record while llama-server may still be finishing the job, so a
+#: later ``/slots`` snapshot can still report the slot as processing.
+#: ``idle_timeout`` is excluded (the normal end of a *completed* stream) and so
+#: is ``non_explicit`` (nothing is known about why it was released).
+_ABANDON_REASONS = frozenset(
+    {"prefill_deadline", "session_evicted", "no_progress_watchdog",
+     "client_disconnect"}
+)
+#: Proxy restart markers (the rotation line the proxy writes on startup, plus
+#: uvicorn lifecycle lines) so restart-bounded stale windows can be attributed.
+_PROXY_RESTART_RE = re.compile(
+    r"Rotated previous proxy log aside|application startup|Started server process|"
+    r"Uvicorn running"
+)
+#: ``latency_ms`` bands separating a fast fresh poll (< 1 s) from one that
+#: exhausted the ``/slots`` query budget (2.0 s counts / 1.0 s detail) and
+#: beyond.
+_LATENCY_BANDS = ("lt_1s", "1s_to_2s", "2s_to_5s", "gte_5s", "unknown")
 #: A completed local dispatch (emitted only on the local streaming path).
 _LOCAL_DISPATCH_RE = re.compile(
     r"\bdispatch_first_byte_ms=(?P<first_byte>[0-9.]+)\b"
@@ -309,6 +400,39 @@ def _status_fields(line: str) -> dict[str, str]:
         match.group("key"): match.group("value")
         for match in _STATUS_FIELD_RE.finditer(line)
     }
+
+
+def _parse_latency_ms(value: str | None) -> int | None:
+    """Parse the handler's ``latency_ms=`` field (``None`` when absent)."""
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_int(value: str | None) -> int | None:
+    """Parse a non-negative integer log field (``None`` when absent/bogus)."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _latency_band(latency_ms: int | None) -> str:
+    """Bucket a status-poll ``latency_ms`` (``unknown`` when absent)."""
+    if latency_ms is None:
+        return "unknown"
+    if latency_ms < 1000:
+        return "lt_1s"
+    if latency_ms < 2000:
+        return "1s_to_2s"
+    if latency_ms < 5000:
+        return "2s_to_5s"
+    return "gte_5s"
 
 
 def is_status_poll(line: str) -> bool:
@@ -373,12 +497,15 @@ def analyse_status_stream(
     polls = 0
     slots_stale = 0
     slots_stale_denominator = 0
+    stale_by_source = {"detail_cache": 0, "counts_cache": 0, "unknown": 0}
+    stale_by_latency_band: dict[str, int] = {band: 0 for band in _LATENCY_BANDS}
     hints: dict[str, int] = {}
     saturated = 0
     saturated_without_live_work = 0
     saturated_without_available_slots = 0
     violating_minutes: dict[str, int] = {}
     violating_examples: list[str] = []
+    violating_rows: list[dict] = []
     local_dispatches = 0
     dispatches_by_cache_state: dict[str, int] = {}
     dispatch_sessions: set[str] = set()
@@ -408,6 +535,18 @@ def analyse_status_stream(
                         slots_stale_denominator += 1
                         if stale == "true":
                             slots_stale += 1
+                            # Attribute the poll to the cache that served it
+                            # (counts vs per-slot detail) and to the response
+                            # latency that shows the upstream query failing.
+                            detail_flag = fields.get("slots_detail_stale")
+                            if detail_flag == "true":
+                                stale_by_source["detail_cache"] += 1
+                            elif detail_flag == "false":
+                                stale_by_source["counts_cache"] += 1
+                            else:
+                                stale_by_source["unknown"] += 1
+                            latency = _parse_latency_ms(fields.get("latency_ms"))
+                            stale_by_latency_band[_latency_band(latency)] += 1
                     if hint == "saturated":
                         saturated += 1
                         if fields.get("available_slots") == "0":
@@ -418,10 +557,23 @@ def analyse_status_stream(
                             violating_minutes[minute] = (
                                 violating_minutes.get(minute, 0) + 1
                             )
+                            timestamp = ts.strftime("%Y-%m-%d %H:%M:%S")
                             if len(violating_examples) < limit:
-                                violating_examples.append(
-                                    ts.strftime("%Y-%m-%d %H:%M:%S")
-                                )
+                                violating_examples.append(timestamp)
+                            violating_rows.append(
+                                {
+                                    "timestamp": timestamp,
+                                    "latency_ms": _parse_latency_ms(
+                                        fields.get("latency_ms")
+                                    ),
+                                    "slots_detail_stale": (
+                                        fields.get("slots_detail_stale") == "true"
+                                    ),
+                                    "available_slots": _parse_int(
+                                        fields.get("available_slots")
+                                    ),
+                                }
+                            )
                     continue
 
                 dispatch = _LOCAL_DISPATCH_RE.search(line)
@@ -454,6 +606,11 @@ def analyse_status_stream(
             "denominator": slots_stale_denominator,
             "rate": _rate(slots_stale, slots_stale_denominator),
         },
+        "slots_stale_attribution": {
+            "by_source": dict(stale_by_source),
+            "by_latency_band": dict(stale_by_latency_band),
+            "unattributed": stale_by_source["unknown"],
+        },
         "capacity_hint": {
             "histogram": dict(sorted(hints.items())),
             "rates": {
@@ -468,6 +625,7 @@ def analyse_status_stream(
                 {"minute": minute, "polls": count} for minute, count in worst
             ],
             "examples": violating_examples,
+            "rows": violating_rows,
         },
         "saturated_without_available_slots": {
             "count": saturated_without_available_slots,
@@ -479,6 +637,143 @@ def analyse_status_stream(
             "distinct_sessions": len(dispatch_sessions),
             "herdr_session_dispatches": len(herdr_dispatch_sessions),
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Abandonment events + violation attribution
+# ---------------------------------------------------------------------------
+
+
+def analyse_abandonment_events(
+    log_dir: Path,
+    *,
+    since: dt.datetime | None = None,
+    until: dt.datetime | None = None,
+) -> list[dict]:
+    """Local dispatch abandonments and proxy restarts inside the window.
+
+    Attribution evidence for the ``saturated``-without-live-work residuals
+    (and, historically, for restart-bounded stale windows). Two sources:
+
+    * ``lease_released reason=<abandonment>`` — the proxy stopped tracking a
+      local dispatch (prefill deadline exceeded, session evicted, watchdog,
+      client disconnect) while llama-server may still be finishing the job, so
+      a later fresh ``/slots`` snapshot can still report the slot processing;
+    * proxy-restart markers (the ``Rotated previous proxy log aside`` line
+      written on startup, plus uvicorn lifecycle lines).
+
+    ``idle_timeout`` lease releases are deliberately excluded: that is the
+    normal end of a completed stream, not the abandonment of an in-flight one.
+    """
+    log_dir = Path(log_dir)
+    events: list[dict] = []
+    # De-duplicate an identical line (same event, same session), never two
+    # sessions abandoned in the same second: a bulk eviction releases several
+    # leases with the same timestamp, and each is a real abandonment.
+    seen: set[tuple[str, str, str, str]] = set()
+    for path in discover_proxy_log_files(log_dir):
+        with open_proxy_log_text(path) as handle:
+            for line in handle:
+                ts = parse_line_timestamp(line)
+                if not _in_window(ts, since, until):
+                    continue
+                release = _LEASE_RELEASED_RE.search(line)
+                if release and release.group("reason") in _ABANDON_REASONS:
+                    session_match = _SESSION_RE.search(line)
+                    session = (
+                        session_match.group("session") if session_match else None
+                    )
+                    key = (
+                        ts.strftime("%Y-%m-%d %H:%M:%S"),
+                        "lease_released",
+                        release.group("reason"),
+                        session or "",
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    events.append(
+                        {
+                            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                            "kind": "lease_released",
+                            "reason": release.group("reason"),
+                            "session": session,
+                        }
+                    )
+                    continue
+                if _PROXY_RESTART_RE.search(line):
+                    key = (ts.strftime("%Y-%m-%d %H:%M:%S"), "proxy_restart", "", "")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    events.append(
+                        {
+                            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                            "kind": "proxy_restart",
+                            "reason": None,
+                            "session": None,
+                        }
+                    )
+    return sorted(events, key=lambda event: event["timestamp"])
+
+
+def attribute_violations(
+    violations: list[dict],
+    events: list[dict],
+    *,
+    lookback_seconds: float = 600.0,
+) -> dict:
+    """Attribute every violating ``saturated`` poll to a preceding event.
+
+    Each poll takes the **nearest preceding** abandonment/restart event inside
+    ``lookback_seconds`` (``None`` — never guessed — when there is none, or when
+    the only nearby event is *later* than the poll). Returns the full per-poll
+    rows (``rows``), the cause histogram (``by_cause``) and the unattributed
+    timestamps, so a reader can either accept the mechanism or go to the log.
+    """
+    events = sorted(events, key=lambda event: event["timestamp"])
+    event_times = [event["timestamp"] for event in events]
+    causes: dict[str, int] = {}
+    rows: list[dict] = []
+    unattributed: list[str] = []
+    for poll in violations:
+        row = {
+            "timestamp": poll["timestamp"],
+            "cause": None,
+            "evidence_timestamp": None,
+            "seconds_since_evidence": None,
+            "latency_ms": poll.get("latency_ms"),
+            "slots_detail_stale": poll.get("slots_detail_stale"),
+            "available_slots": poll.get("available_slots"),
+        }
+        index = bisect.bisect_right(event_times, row["timestamp"]) - 1
+        if index >= 0:
+            event = events[index]
+            seconds = (
+                dt.datetime.strptime(
+                    row["timestamp"], "%Y-%m-%d %H:%M:%S"
+                )
+                - dt.datetime.strptime(
+                    event["timestamp"], "%Y-%m-%d %H:%M:%S"
+                )
+            ).total_seconds()
+            if seconds <= lookback_seconds:
+                cause = event["reason"] or event["kind"]
+                row["cause"] = cause
+                row["evidence_timestamp"] = event["timestamp"]
+                row["seconds_since_evidence"] = int(seconds)
+                causes[cause] = causes.get(cause, 0) + 1
+        if row["cause"] is None:
+            unattributed.append(row["timestamp"])
+        rows.append(row)
+    return {
+        "lookback_seconds": lookback_seconds,
+        "attributed_polls": len(violations) - len(unattributed),
+        "unattributed_polls": len(unattributed),
+        "unattributed_timestamps": unattributed,
+        "by_cause": dict(sorted(causes.items())),
+        "rows": rows,
     }
 
 
@@ -729,6 +1024,7 @@ def evaluate(
     *,
     stale_rate_target: float = 0.05,
     min_downtime_dispatches: int = 10,
+    attribution: dict | None = None,
 ) -> dict:
     """Turn the measured figures into a verdict (never a silent pass)."""
     checks: list[dict] = [
@@ -791,6 +1087,32 @@ def evaluate(
             "every poll in the window reported capacity_hint=saturated — "
             "check the status surface before trusting the rate"
         )
+    if attribution is not None and violations:
+        # Attribution explains a residual; it never excuses it — the check
+        # above stays failed and the mechanism is stated alongside.
+        by_cause = ", ".join(
+            f"{cause}={count}"
+            for cause, count in attribution["by_cause"].items()
+        ) or "none"
+        notes.append(
+            f"{attribution['attributed_polls']} of {violations} violating polls "
+            f"attributed to a preceding abandoned local dispatch or proxy "
+            f"restart within {attribution['lookback_seconds']:.0f}s "
+            f"(by cause: {by_cause})"
+        )
+        if attribution["unattributed_polls"]:
+            notes.append(
+                f"{attribution['unattributed_polls']} violating polls are "
+                "unattributable from the proxy log (no preceding abandonment "
+                "or restart inside the lookback); see the attribution rows"
+            )
+    stale_attribution = metrics.get("slots_stale_attribution")
+    if stale_attribution and stale_attribution["unattributed"]:
+        notes.append(
+            f"{stale_attribution['unattributed']} stale polls carry no "
+            "per-source freshness flag, so the cache they were served from "
+            "is unknown"
+        )
     return {
         "verdict": (
             VERDICT_PASS
@@ -814,8 +1136,15 @@ def measure(
     limit: int = 10,
     stale_rate_target: float = 0.05,
     min_downtime_dispatches: int = 10,
+    attribution_lookback_seconds: float = 600.0,
 ) -> dict:
-    """Full measurement: meta + metrics + coverage + dispatch count + verdict."""
+    """Full measurement: meta + metrics + coverage + attribution + verdict.
+
+    The attribution block turns the violating ``saturated`` polls and the
+    stale-poll source split into evidence-backed explanations (AC4-style
+    attribution, LP-0MVOG7IP80003MLV), so a target miss ships with its cause
+    rather than a bare number.
+    """
     metrics = analyse_status_stream(
         log_dir, since=since, until=until, limit=limit
     )
@@ -829,12 +1158,47 @@ def measure(
         max_gap_seconds=max_gap_seconds,
         window_closed=window_closed,
     )
+    events = analyse_abandonment_events(
+        log_dir,
+        # Read the lookback *before* the window too: the first polls of a
+        # window are routinely explained by an abandonment moments earlier,
+        # so scanning only from ``since`` would mark them unattributable for
+        # an artificial reason.
+        since=(
+            since - dt.timedelta(seconds=attribution_lookback_seconds)
+            if since is not None
+            else None
+        ),
+        until=until,
+    )
+    attribution = attribute_violations(
+        metrics["saturated_without_live_work"]["rows"],
+        events,
+        lookback_seconds=attribution_lookback_seconds,
+    )
+    by_reason: dict[str, int] = {}
+    in_window = 0
+    for event in events:
+        # The reported event tally stays scoped to the measured window; only
+        # the attribution is allowed to look at the lead-in.
+        if since is not None and event["timestamp"] < since.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ):
+            continue
+        in_window += 1
+        reason = event["reason"] or event["kind"]
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    abandonment_events = {
+        "count": in_window,
+        "by_reason": dict(sorted(by_reason.items())),
+    }
     verdict = evaluate(
         metrics,
         coverage,
         dispatches,
         stale_rate_target=stale_rate_target,
         min_downtime_dispatches=min_downtime_dispatches,
+        attribution=attribution,
     )
     meta = {
         "tool": TOOL,
@@ -856,9 +1220,46 @@ def measure(
         "meta": meta,
         "coverage": coverage,
         "metrics": metrics,
+        "abandonment_events": abandonment_events,
+        "attribution": attribution,
         "herdr_downtime_dispatches": dispatches,
         "verdict": verdict,
     }
+
+
+def write_artifacts(report: dict, out_dir: Path) -> list[Path]:
+    """Persist the raw measurement and the per-poll attribution rows.
+
+    ``measurement.json`` is the full report (tool-``--json`` output, coverage
+    verdict, every derivation); ``measurement.txt`` the human rendering; the
+    CSV the per-violating-poll attribution rows a reviewer can re-check line
+    by line (AC5 artifact surface, LP-0MVOG7IP80003MLV).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "measurement.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    (out_dir / "measurement.txt").write_text(render(report) + "\n", encoding="utf-8")
+    csv_path = out_dir / "saturated_without_live_work_attribution.csv"
+    rows = report["attribution"]["rows"]
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "timestamp",
+                "cause",
+                "evidence_timestamp",
+                "seconds_since_evidence",
+                "latency_ms",
+                "slots_detail_stale",
+                "available_slots",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return [out_dir / "measurement.json", out_dir / "measurement.txt", csv_path]
 
 
 # ---------------------------------------------------------------------------
@@ -899,6 +1300,44 @@ def render(report: dict) -> str:
         "saturated without live work     : "
         f"{violations['count']} ({violations['rate_of_polls']:.2%} of polls)"
     )
+    stale_attribution = metrics.get("slots_stale_attribution") or {}
+    if stale_attribution:
+        by_source = stale_attribution["by_source"]
+        out.append(
+            "  stale by cache source         : "
+            + ", ".join(f"{key}={value}" for key, value in by_source.items())
+        )
+        bands = stale_attribution["by_latency_band"]
+        out.append(
+            "  stale by poll latency         : "
+            + ", ".join(f"{key}={value}" for key, value in bands.items())
+        )
+    attribution = report.get("attribution")
+    if attribution is not None and violations["count"]:
+        by_cause = ", ".join(
+            f"{cause}={count}"
+            for cause, count in attribution["by_cause"].items()
+        ) or "none"
+        out.append(
+            "  violating polls attributed    : "
+            f"{attribution['attributed_polls']}/{violations['count']} "
+            f"({by_cause}; lookback {attribution['lookback_seconds']:.0f}s)"
+        )
+        if attribution["unattributed_polls"]:
+            out.append(
+                "  unattributable violating polls: "
+                f"{attribution['unattributed_polls']} "
+                f"({', '.join(attribution['unattributed_timestamps'][:5])}"
+                + ("…" if attribution["unattributed_polls"] > 5 else "")
+                + ")"
+            )
+    abandonment = report.get("abandonment_events") or {}
+    if abandonment:
+        out.append(
+            "abandoned local dispatches      : "
+            f"{abandonment['count']} "
+            f"({', '.join(f'{key}={value}' for key, value in abandonment['by_reason'].items()) or 'none'})"
+        )
     no_slots = metrics["saturated_without_available_slots"]
     out.append(
         "saturated, available_slots=0    : "
@@ -1005,6 +1444,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--label", default=None, help="free-form label in meta")
     parser.add_argument(
+        "--attribution-lookback-seconds",
+        type=float,
+        default=600.0,
+        help=(
+            "how far before a violating poll an abandonment/restart event may "
+            "sit and still explain it (default 600)"
+        ),
+    )
+    parser.add_argument(
+        "--write-artifacts",
+        default=None,
+        metavar="DIR",
+        help=(
+            "write measurement.json, measurement.txt and the per-poll "
+            "attribution CSV into DIR"
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=10,
@@ -1039,7 +1496,12 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         stale_rate_target=args.stale_rate_target,
         min_downtime_dispatches=args.min_downtime_dispatches,
+        attribution_lookback_seconds=args.attribution_lookback_seconds,
     )
+
+    if args.write_artifacts:
+        for path in write_artifacts(report, Path(args.write_artifacts)):
+            print(f"artifact: {path}", file=sys.stderr)
 
     if args.json:
         print(json.dumps(report, indent=2))

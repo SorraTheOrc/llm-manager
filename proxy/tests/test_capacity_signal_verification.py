@@ -75,14 +75,22 @@ def status_line(
     active: str = "false",
     in_flight: int | None = None,
     schema: int = 3,
+    detail_stale: str | None = None,
+    latency_ms: int = 3,
 ) -> str:
-    """One ``status_request`` log line, as the proxy writes it."""
+    """One ``status_request`` log line, as the proxy writes it.
+
+    ``detail_stale`` emits the per-source freshness flag the v3 status surface
+    publishes next to the legacy ``slots_stale`` union; ``latency_ms`` is the
+    handler's own response latency, the evidence that separates a fast fresh
+    poll from one that exhausted the ``/slots`` query budget.
+    """
     fields = [
         f"active_query={active}",
         f"available_slots={available}",
         f"capacity_hint={hint}",
         "current_model=Qwen3",
-        "latency_ms=3",
+        f"latency_ms={latency_ms}",
         "llama_server_running=true",
         f"local_active_query={local_active}",
     ]
@@ -91,10 +99,32 @@ def status_line(
     fields += [
         "model_switch_in_progress=false",
         f"slots_stale={stale}",
+    ]
+    if detail_stale is not None:
+        fields.append(f"slots_detail_stale={detail_stale}")
+    fields += [
         f"status_schema_version={schema}",
         "total_slots=2",
     ]
     return f"{ts},000 - INFO - status_request " + " ".join(fields) + "\n"
+
+
+def lease_released_line(
+    ts: str, *, reason: str = "prefill_deadline", session: str = "s1"
+) -> str:
+    """A local dispatch lease release, the proxy's abandonment record."""
+    return (
+        f"{ts},000 - INFO - lease_released session={session} "
+        f"reason={reason} endpoint=http://localhost:8080\n"
+    )
+
+
+def restart_line(ts: str) -> str:
+    """The marker the proxy writes when it rotates the log aside on restart."""
+    return (
+        f"{ts},000 - INFO - Rotated previous proxy log aside: "
+        "proxy.log.2026-10-24_173748 (pre-restart window preserved)\n"
+    )
 
 
 def dispatch_line(
@@ -780,3 +810,370 @@ def test_fail_on_target_miss_exits_two(csv, tmp_path, capsys):
     assert csv.main(argv) == 0
     assert csv.main([*argv, "--fail-on-target-miss"]) == 2
     capsys.readouterr()
+
+
+# ---------------------------------------------------------------------------
+# Attribution: stale polls by cache source, violating polls by cause
+# ---------------------------------------------------------------------------
+
+
+def test_stale_polls_attributed_to_cache_source_and_latency_band(csv, tmp_path):
+    """Every stale poll is attributed to a served-from-cache source.
+
+    ``slots_stale`` is the union of the counts cache (LP-0MSVP7XJ6008QPKX) and
+    the per-slot detail cache (LP-0MUFSVXID0039ZAQ); a poll that carries the
+    union flag but neither per-source flag (a pre-v3 schema) cannot be
+    attributed and must be counted as such rather than silently folded in.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        status_line(
+            "2026-10-23 00:00:01",
+            hint="idle",
+            stale="true",
+            detail_stale="true",
+            latency_ms=3100,
+        )
+        # Fresh and fast: no upstream /slots budget was exhausted.
+        + status_line(
+            "2026-10-23 00:00:02",
+            hint="idle",
+            stale="false",
+            detail_stale="false",
+            latency_ms=4,
+        )
+        # Counts cached (detail fresh): the counts query timed out.
+        + status_line(
+            "2026-10-23 00:00:03",
+            hint="saturated",
+            stale="true",
+            detail_stale="false",
+            in_flight=1,
+            latency_ms=2400,
+        )
+        # Union flag only, and no latency field: no per-source and no latency
+        # evidence to attribute it with.
+        + "2026-10-23 00:00:04,000 - INFO - status_request "
+        "capacity_hint=idle slots_stale=true status_schema_version=3 "
+        "total_slots=2\n"
+        + status_line(
+            "2026-10-23 00:00:05",
+            hint="idle",
+            stale="true",
+            detail_stale="true",
+            latency_ms=6100,
+        ),
+    )
+
+    metrics = csv.analyse_status_stream(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 24, 0, 0),
+    )
+
+    attribution = metrics["slots_stale_attribution"]
+    assert attribution["by_source"] == {
+        "detail_cache": 2,
+        "counts_cache": 1,
+        "unknown": 1,
+    }
+    assert attribution["by_latency_band"] == {
+        "lt_1s": 0,
+        "1s_to_2s": 0,
+        "2s_to_5s": 2,
+        "gte_5s": 1,
+        "unknown": 1,
+    }
+    assert attribution["unattributed"] == 1
+
+
+def test_abandonment_events_are_local_lease_releases_and_restarts(csv, tmp_path):
+    """Only local abandonments are evidence; an idle timeout is not.
+
+    A ``lease_released`` with ``reason=prefill_deadline``/``session_evicted``/
+    ``no_progress_watchdog`` records that the proxy stopped tracking a local
+    dispatch while llama-server may still be finishing it. ``idle_timeout``
+    is the normal end of a completed stream and proves nothing about a slot
+    that a later ``/slots`` snapshot still reports as processing.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line(
+            "2026-10-23 00:10:00", reason="prefill_deadline", session="s1"
+        )
+        + lease_released_line(
+            "2026-10-23 00:20:00", reason="idle_timeout", session="s2"
+        )
+        + lease_released_line(
+            "2026-10-23 00:30:00", reason="session_evicted", session="s3"
+        )
+        + restart_line("2026-10-23 00:40:00")
+        # Outside the window -> not evidence for it.
+        + lease_released_line(
+            "2026-10-23 09:00:00", reason="prefill_deadline", session="s4"
+        ),
+    )
+
+    events = csv.analyse_abandonment_events(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+    )
+
+    assert [(event["timestamp"], event["kind"], event["reason"]) for event in events] == [
+        ("2026-10-23 00:10:00", "lease_released", "prefill_deadline"),
+        ("2026-10-23 00:30:00", "lease_released", "session_evicted"),
+        ("2026-10-23 00:40:00", "proxy_restart", None),
+    ]
+
+
+def test_violations_attributed_to_the_preceding_abandonment(csv):
+    """Each violating poll is attributed to the nearest preceding event.
+
+    A poll takes the most recent abandonment inside the lookback window and is
+    reported as unattributed (never guessed) when there is none — including a
+    violation whose only nearby event is *later* than the poll.
+    """
+    violations = [
+        {
+            "timestamp": "2026-10-23 00:11:00",
+            "latency_ms": 3100,
+            "slots_detail_stale": False,
+            "available_slots": 0,
+        },
+        {
+            "timestamp": "2026-10-23 00:12:30",
+            "latency_ms": 4200,
+            "slots_detail_stale": False,
+            "available_slots": 0,
+        },
+        {
+            "timestamp": "2026-10-23 00:30:00",
+            "latency_ms": 900,
+            "slots_detail_stale": False,
+            "available_slots": 0,
+        },
+    ]
+    events = [
+        {
+            "timestamp": "2026-10-23 00:10:00",
+            "kind": "lease_released",
+            "reason": "prefill_deadline",
+            "session": "s1",
+        },
+        {
+            "timestamp": "2026-10-23 01:00:00",
+            "kind": "lease_released",
+            "reason": "session_evicted",
+            "session": "s2",
+        },
+    ]
+
+    attribution = csv.attribute_violations(
+        violations, events, lookback_seconds=600
+    )
+
+    assert attribution["attributed_polls"] == 2
+    assert attribution["unattributed_polls"] == 1
+    assert attribution["by_cause"] == {"prefill_deadline": 2}
+    assert attribution["unattributed_timestamps"] == ["2026-10-23 00:30:00"]
+    assert attribution["rows"][0]["cause"] == "prefill_deadline"
+    assert attribution["rows"][0]["evidence_timestamp"] == "2026-10-23 00:10:00"
+    assert attribution["rows"][0]["seconds_since_evidence"] == 60
+    # The 01:00 event is *after* the 00:30 poll, so it cannot explain it.
+    assert attribution["rows"][2]["cause"] is None
+
+
+def test_measure_joins_abandonment_evidence_into_the_report(csv, tmp_path):
+    """``measure`` carries the attribution and the evidence it was built on."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:10:00", reason="prefill_deadline")
+        + status_line(
+            "2026-10-23 00:11:00",
+            hint="saturated",
+            stale="false",
+            detail_stale="false",
+            in_flight=0,
+            available="0",
+            latency_ms=3100,
+        ),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    assert report["metrics"]["saturated_without_live_work"]["count"] == 1
+    attribution = report["attribution"]
+    assert attribution["attributed_polls"] == 1
+    assert attribution["unattributed_polls"] == 0
+    assert attribution["by_cause"] == {"prefill_deadline": 1}
+    assert report["abandonment_events"]["count"] == 1
+    assert report["abandonment_events"]["by_reason"] == {"prefill_deadline": 1}
+    # The verdict still reports the violation; attribution explains it, it does
+    # not excuse it.
+    missed = [
+        check for check in report["verdict"]["checks"] if not check["pass"]
+    ]
+    assert any("saturated" in check["target"] for check in missed)
+    assert any("attributed" in note for note in report["verdict"]["notes"])
+
+
+def test_write_artifacts_emits_json_text_and_attribution_csv(csv, tmp_path):
+    """One command persists the raw measurement and the per-poll attribution."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:10:00", reason="session_evicted")
+        + status_line(
+            "2026-10-23 00:11:00",
+            hint="saturated",
+            stale="true",
+            detail_stale="false",
+            in_flight=0,
+            available="0",
+            latency_ms=3100,
+        )
+        + status_line("2026-10-23 00:12:00", hint="idle", stale="true",
+                      detail_stale="true", latency_ms=5100),
+    )
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    out_dir = tmp_path / "artifacts"
+    written = csv.write_artifacts(report, out_dir)
+
+    assert sorted(path.name for path in written) == [
+        "measurement.json",
+        "measurement.txt",
+        "saturated_without_live_work_attribution.csv",
+    ]
+    assert sorted(path.name for path in out_dir.iterdir()) == [
+        "measurement.json",
+        "measurement.txt",
+        "saturated_without_live_work_attribution.csv",
+    ]
+    payload = json.loads((out_dir / "measurement.json").read_text())
+    assert payload["attribution"]["by_cause"] == {"session_evicted": 1}
+    assert "VERDICT" in (out_dir / "measurement.txt").read_text()
+
+    rows = (out_dir / "saturated_without_live_work_attribution.csv").read_text(
+    ).splitlines()
+    assert rows[0] == (
+        "timestamp,cause,evidence_timestamp,seconds_since_evidence,"
+        "latency_ms,slots_detail_stale,available_slots"
+    )
+    assert rows[1].startswith("2026-10-23 00:11:00,session_evicted,"
+                             "2026-10-23 00:10:00,60,")
+
+
+def test_cli_write_artifacts_and_lookback(csv, tmp_path, capsys):
+    """The CLI persists the same artifacts and honours the lookback bound."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:10:00", reason="prefill_deadline")
+        + status_line(
+            "2026-10-23 00:30:00",
+            hint="saturated",
+            stale="true",
+            detail_stale="false",
+            in_flight=0,
+            available="0",
+        ),
+    )
+    out_dir = tmp_path / "artifacts"
+    argv = [
+        "--log-dir",
+        str(log_dir),
+        "--since",
+        "2026-10-23 00:00",
+        "--until",
+        "2026-10-23 07:00",
+        "--dispatch-log",
+        str(tmp_path / "absent.log"),
+        "--write-artifacts",
+        str(out_dir),
+        "--json",
+    ]
+
+    assert csv.main(argv) == 0
+    payload = json.loads(capsys.readouterr().out)
+    # 20 minutes after the abandonment, inside the 600 s default lookback?
+    # No: 1200 s > 600 s, so it must be reported unattributed.
+    assert payload["attribution"]["unattributed_polls"] == 1
+    assert (out_dir / "measurement.json").is_file()
+
+    assert csv.main([*argv, "--attribution-lookback-seconds", "1800"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["attribution"]["by_cause"] == {"prefill_deadline": 1}
+
+
+def test_window_lead_in_abandonment_attributes_the_first_poll(csv, tmp_path):
+    """The lookback may read *before* the window; the tally may not.
+
+    The first polls of a window are routinely explained by an abandonment
+    moments before it, so the attribution scan starts one lookback earlier —
+    but the reported abandonment tally stays scoped to the measured window.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-22 23:58:00", reason="prefill_deadline")
+        + status_line(
+            "2026-10-23 00:00:20",
+            hint="saturated",
+            stale="false",
+            detail_stale="false",
+            in_flight=0,
+            available="0",
+        ),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    assert report["attribution"]["attributed_polls"] == 1
+    assert report["attribution"]["rows"][0]["seconds_since_evidence"] == 140
+    assert report["abandonment_events"]["count"] == 0
+
+
+def test_bulk_eviction_keeps_one_event_per_session(csv, tmp_path):
+    """A bulk eviction releases several leases in the same second.
+
+    Each is a real abandonment (a distinct session lost its slot), so the tally
+    must count them all; only a genuinely identical line is de-duplicated.
+    """
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:10:00", reason="session_evicted",
+                            session="s1")
+        + lease_released_line("2026-10-23 00:10:00", reason="session_evicted",
+                              session="s2")
+        + lease_released_line("2026-10-23 00:10:00", reason="session_evicted",
+                              session="s3"),
+    )
+
+    events = csv.analyse_abandonment_events(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+    )
+
+    assert [event["session"] for event in events] == ["s1", "s2", "s3"]
