@@ -31,7 +31,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -4430,6 +4430,124 @@ def _max_retry_after_seconds(config: dict | None) -> int:
     return int(seconds)
 
 
+#: Reasons for which no amount of waiting can restore local service: the
+#: cause is a property of the *request* (a prompt permanently over the flat
+#: cold-prefill token cap, or one that cannot fit a KV slot), so a timer would
+#: only invite futile retries — the 2026-10-25 incident answered such a request
+#: with ``Retry-After: 1`` and the client backed off seven times before
+#: reporting the 429 as terminal (LP-0MVNTT4X8009IO2X AC1).
+NOT_TIME_RETRYABLE_REFUSAL_REASONS = frozenset(
+    {"prefill_budget_exceeded", "context_too_large"}
+)
+
+#: Remedy advertised for a refusal waiting cannot fix.
+_COMPACTION_GUIDANCE = (
+    "Do not retry: waiting cannot make this request fit. Compact the session "
+    "history (the refusal carries new_tokens/budget_tokens so the target size "
+    "is explicit) and resend, or send X-Local-Preference: prefer-local to "
+    "allow a remote fallback."
+)
+
+#: Remedy advertised for a refusal whose cause is a bounded wait.
+_RETRY_GUIDANCE = (
+    "Retry after the advertised delay (retry_at carries the same instant as an "
+    "RFC 3339 UTC timestamp), reduce the prompt size (compact the session) so "
+    "the prefill fits the local wait budget, or route the request to a remote "
+    "provider."
+)
+
+
+@dataclass(frozen=True)
+class RefusalRetryTiming:
+    """The retry story of one local-admission refusal.
+
+    ``retryable`` answers *whether* retrying can help; ``retry_after`` /
+    ``retry_at`` answer *when* — and are both ``None`` when it cannot
+    (LP-0MVNTT4X8009IO2X AC1/AC2).
+    """
+
+    retryable: bool
+    retry_after: int | None = None
+    retry_at: str | None = None
+
+
+def _retry_at_isoformat(seconds: int) -> str:
+    """Absolute instant *seconds* from now, RFC 3339 UTC.
+
+    Clients acting on ``Retry-After`` are forced to trust their own clock;
+    ``retry_at`` lets a scheduler compare against the proxy's (AC2).
+    """
+    return (datetime.now(UTC) + timedelta(seconds=int(seconds))).isoformat()
+
+
+def _refusal_retry_timing(
+    reason: str | None,
+    *,
+    eta_prefill_seconds: float | None = None,
+    budget_seconds: float | None = None,
+    projected_wait_seconds: float | None = None,
+    advertised_retry_after: int | float | None = None,
+    config: dict | None = None,
+) -> RefusalRetryTiming:
+    """Single reason→timing decision for every local-admission refusal.
+
+    Both refusal builders (``_build_local_admission_reject_response`` and
+    ``_build_local_only_refusal_response``) resolve their retry story here, so
+    a reason can never ship with a different timer on the two paths
+    (LP-0MVNTT4X8009IO2X AC1/AC2):
+
+    - ``prefill_budget_exceeded`` / ``context_too_large`` → **not**
+      time-retryable: no ``Retry-After``, no ``retry_at`` (AC1).
+    - ETA/occupancy reasons → ``ceil(projected_wait - budget)``, at least 1 s
+      and capped by ``server.max_retry_after_seconds``, plus ``retry_at``
+      (AC2). The *projected wait* (own prefill plus the occupied gate ahead of
+      it) is the wait the client actually faces, so it is preferred over the
+      own-prefill ETA when the guard measured it.
+    - *advertised_retry_after* lets a caller that already resolved a real
+      expiry (a cooldown/lease/queue-expiry remainder) own the number; the
+      1 s floor and the cap still apply (AC3).
+
+    Unknown reasons keep the historical ETA-derived behaviour, so a new
+    reason cannot silently lose its timer.
+    """
+    label = str(reason or "eta_exceeds_budget")
+    if label in NOT_TIME_RETRYABLE_REFUSAL_REASONS:
+        return RefusalRetryTiming(retryable=False)
+
+    maximum = _max_retry_after_seconds(config)
+    if advertised_retry_after is not None:
+        try:
+            seconds = int(advertised_retry_after)
+        except (TypeError, ValueError):
+            pass
+        else:
+            bounded = max(1, min(maximum, seconds))
+            return RefusalRetryTiming(
+                retryable=True,
+                retry_after=bounded,
+                retry_at=_retry_at_isoformat(bounded),
+            )
+
+    from proxy.prefill_eta import suggested_retry_after_seconds
+
+    wait = (
+        projected_wait_seconds
+        if projected_wait_seconds is not None
+        else eta_prefill_seconds
+    )
+    seconds = suggested_retry_after_seconds(wait, budget_seconds, maximum=maximum)
+    return RefusalRetryTiming(
+        retryable=True,
+        retry_after=seconds,
+        retry_at=_retry_at_isoformat(seconds),
+    )
+
+
+def _refusal_suggested_action(timing: RefusalRetryTiming) -> str:
+    """Remedy matching the refusal's retry story (AC1/AC2)."""
+    return _RETRY_GUIDANCE if timing.retryable else _COMPACTION_GUIDANCE
+
+
 def _quarantined_providers(model_config: dict) -> list[dict[str, Any]]:
     """Return provider entries quarantined by a pending usage-limit reset.
 
@@ -5546,17 +5664,33 @@ def _build_local_admission_reject_response(
     cannot finish inside the caller's wait budget, and the request normally
     falls through to a remote provider. When the rest of the chain is
     exhausted as well, the client gets this distinguishable 429 instead of the
-    generic exhaustion body: ``Retry-After`` carries how much longer the local
-    prefill would need than the caller was prepared to wait, and the
-    ``X-Local-Admission*`` headers expose the estimate so a dispatcher can pace
-    its next attempt (LP-0MVGDUV5E005UWBQ AC3).
-    """
-    from proxy.prefill_eta import suggested_retry_after_seconds
+    generic exhaustion body (LP-0MVGDUV5E005UWBQ AC3).
 
+    The retry story is reason-aware and shared with
+    ``_build_local_only_refusal_response`` via
+    :func:`_refusal_retry_timing` (LP-0MVNTT4X8009IO2X AC1/AC2): ETA/occupancy
+    reasons carry ``Retry-After`` (how much longer than the caller's budget the
+    projected wait is) plus ``retry_at``, while a request that waiting cannot
+    heal (``prefill_budget_exceeded``) carries **no** ``Retry-After`` and says
+    so with ``retryable: false`` and compaction guidance. The admission token
+    evidence is always attached so a client can size the compaction.
+    """
+    attempt = attempt or {}
     eta = float(attempt.get("eta_prefill_seconds") or 0.0)
     budget = float(attempt.get("budget_seconds") or 0.0)
-    retry_after = suggested_retry_after_seconds(
-        eta, budget, maximum=_max_retry_after_seconds(config)
+    projected = attempt.get("projected_wait_seconds")
+    reason = str(attempt.get("reason") or "eta_exceeds_budget")
+    new_tokens = _admission_token_evidence(attempt, "new_tokens")
+    budget_tokens = _admission_token_evidence(attempt, "budget_tokens")
+    timing = _refusal_retry_timing(
+        reason,
+        eta_prefill_seconds=eta,
+        budget_seconds=budget,
+        projected_wait_seconds=(
+            float(projected) if projected is not None else None
+        ),
+        advertised_retry_after=attempt.get("retry_after_s"),
+        config=config,
     )
     payload: dict[str, Any] = {
         "error": "All providers exhausted",
@@ -5565,21 +5699,26 @@ def _build_local_admission_reject_response(
             "local admission refused: projected prefill exceeds the wait budget "
             "and no remote provider is available"
         ),
+        "reason": reason,
         "eta_prefill_seconds": eta,
         "budget_seconds": budget,
-        "retry_after": retry_after,
-        "suggested_action": (
-            "Retry after the advertised delay, reduce the prompt size (compact "
-            "the session) so the prefill fits the local wait budget, or route "
-            "the request to a remote provider."
-        ),
+        "retryable": timing.retryable,
+        "retry_after": timing.retry_after,
+        "suggested_action": _refusal_suggested_action(timing),
     }
+    if timing.retry_at is not None:
+        payload["retry_at"] = timing.retry_at
+    if projected is not None:
+        payload["projected_wait_seconds"] = float(projected)
+    if new_tokens is not None:
+        payload["new_tokens"] = new_tokens
+    if budget_tokens is not None:
+        payload["budget_tokens"] = budget_tokens
     try:
         payload["diagnostics"] = [attempt]
     except Exception:
         pass
     headers = {
-        "Retry-After": str(retry_after),
         "Cache-Control": "no-store",
         "X-Local-Admission": "reject",
         "X-Local-Admission-Eta": f"{eta:.1f}",
@@ -5587,10 +5726,9 @@ def _build_local_admission_reject_response(
         # LP-0MVIKPCSG002B0NL AC6: the refusal is a routing outcome, not a
         # remote serve — say so on the response itself.
         "X-Local-Route": "refused",
-        "X-Local-Fallback-Reason": str(
-            attempt.get("reason") or "eta_exceeds_budget"
-        ),
+        "X-Local-Fallback-Reason": reason,
     }
+    headers.update(_refusal_timing_headers(timing, new_tokens, budget_tokens))
     return Response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=429,
@@ -6326,6 +6464,43 @@ def _request_local_preference(request) -> str:
     return preference
 
 
+def _admission_token_evidence(attempt: dict[str, Any], key: str) -> int | None:
+    """Read one admission token count from *attempt*, or ``None`` when absent.
+
+    The evidence is threaded from the guard's own decision (never recomputed
+    here — LP-0MVNTT4X8009IO2X Constraints), so a refusal advertises exactly
+    the numbers the guard compared.
+    """
+    raw = attempt.get(key)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _refusal_timing_headers(
+    timing: RefusalRetryTiming,
+    new_tokens: int | None,
+    budget_tokens: int | None,
+) -> dict[str, str]:
+    """Headers for *timing*: ``Retry-After`` only when a retry can help (AC1/AC2).
+
+    An over-budget prompt must carry **no** ``Retry-After`` at all — a delay
+    header is what invited the 2026-10-25 retry storm — while the token
+    evidence stays on every refusal so the client can compact instead.
+    """
+    headers: dict[str, str] = {}
+    if timing.retry_after is not None:
+        headers["Retry-After"] = str(timing.retry_after)
+    if new_tokens is not None:
+        headers["X-Local-Admission-New-Tokens"] = str(new_tokens)
+    if budget_tokens is not None:
+        headers["X-Local-Admission-Budget-Tokens"] = str(budget_tokens)
+    return headers
+
+
 def _build_local_only_refusal_response(
     attempt: dict[str, Any] | None, config: dict | None = None
 ) -> Response:
@@ -6333,22 +6508,39 @@ def _build_local_only_refusal_response(
 
     Unlike the exhaustion path, this response is produced **while remote
     providers are still available**: the client said local-only, so moving it
-    remote would silently violate its intent. It carries the same retryable
-    contract as the exhaustion refusal (``Retry-After``, ``X-Local-Admission*``)
-    plus ``X-Local-Route: refused``.
+    remote would silently violate its intent. The retry story is the shared
+    reason→timing decision (:func:`_refusal_retry_timing`), so this path can
+    never advertise a different timer from the exhaustion refusal: ETA/occupancy
+    reasons carry ``Retry-After`` + ``retry_at``, reasons waiting cannot heal
+    carry neither (LP-0MVNTT4X8009IO2X AC1/AC2). Adds
+    ``X-Local-Route: refused``.
     """
-    from proxy.prefill_eta import suggested_retry_after_seconds
-
     attempt = attempt or {}
     eta = float(attempt.get("eta_prefill_seconds") or 0.0)
     budget = float(attempt.get("budget_seconds") or 0.0)
-    projected = float(attempt.get("projected_wait_seconds") or eta)
+    measured_wait = attempt.get("projected_wait_seconds")
+    # An occupancy-aware measurement displaces the own-prefill ETA; without one
+    # the ETA is the best available wait, and with neither (a guard verdict
+    # that never costed a prefill, e.g. ``prefill_budget_exceeded``) the field
+    # is omitted rather than reported as a misleading 0 s.
+    projected = (
+        float(measured_wait)
+        if measured_wait is not None
+        else (eta if eta > 0.0 else None)
+    )
     reason = str(attempt.get("reason") or "eta_exceeds_budget")
-    retry_after = attempt.get("retry_after_s")
-    if retry_after is None:
-        retry_after = suggested_retry_after_seconds(
-            eta, budget, maximum=_max_retry_after_seconds(config)
-        )
+    new_tokens = _admission_token_evidence(attempt, "new_tokens")
+    budget_tokens = _admission_token_evidence(attempt, "budget_tokens")
+    timing = _refusal_retry_timing(
+        reason,
+        eta_prefill_seconds=eta,
+        budget_seconds=budget,
+        projected_wait_seconds=(
+            float(measured_wait) if measured_wait is not None else None
+        ),
+        advertised_retry_after=attempt.get("retry_after_s"),
+        config=config,
+    )
     payload: dict[str, Any] = {
         "error": "Local admission refused",
         "code": EXHAUSTION_CODE_LOCAL_ADMISSION,
@@ -6358,17 +6550,20 @@ def _build_local_only_refusal_response(
         ),
         "reason": reason,
         "eta_prefill_seconds": eta,
-        "projected_wait_seconds": projected,
         "budget_seconds": budget,
-        "retry_after": retry_after,
-        "suggested_action": (
-            "Retry after the advertised delay, reduce the prompt size so the "
-            "prefill fits the local wait budget, or send "
-            "X-Local-Preference: prefer-local to allow a remote fallback."
-        ),
+        "retryable": timing.retryable,
+        "retry_after": timing.retry_after,
+        "suggested_action": _refusal_suggested_action(timing),
     }
+    if projected is not None:
+        payload["projected_wait_seconds"] = projected
+    if timing.retry_at is not None:
+        payload["retry_at"] = timing.retry_at
+    if new_tokens is not None:
+        payload["new_tokens"] = new_tokens
+    if budget_tokens is not None:
+        payload["budget_tokens"] = budget_tokens
     headers = {
-        "Retry-After": str(retry_after),
         "Cache-Control": "no-store",
         "X-Local-Admission": "reject",
         "X-Local-Admission-Eta": f"{eta:.1f}",
@@ -6376,6 +6571,7 @@ def _build_local_only_refusal_response(
         "X-Local-Route": "refused",
         "X-Local-Fallback-Reason": reason,
     }
+    headers.update(_refusal_timing_headers(timing, new_tokens, budget_tokens))
     return Response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=429,
@@ -6522,6 +6718,37 @@ async def _prefill_admission_guard(
             "prefill-ETA admission guard failed; admitting as today", exc_info=True
         )
         return None
+
+
+def _local_admission_evidence(decision: Any) -> dict[str, Any]:
+    """Admission evidence fields for a refusal attempt record.
+
+    The evidence is read off the guard's own decision, so the refusal carries
+    the numbers the guard actually compared — ``new_tokens`` against
+    ``budget_tokens`` (LP-0MVN4LBZ500281Z7) and the occupancy-aware
+    ``projected_wait_seconds`` the retry timer is derived from
+    (LP-0MVNTT4X8009IO2X AC2). ``projected_wait_seconds`` keeps full precision:
+    it feeds ``ceil(wait - budget)``, so rounding it could move the advertised
+    delay. Missing attributes are omitted rather than guessed.
+    """
+    evidence: dict[str, Any] = {
+        "eta_prefill_seconds": round(
+            float(getattr(decision, "eta_prefill_seconds", 0.0) or 0.0), 1
+        ),
+        "budget_seconds": round(
+            float(getattr(decision, "budget_seconds", 0.0) or 0.0), 1
+        ),
+    }
+    projected = getattr(decision, "projected_wait_seconds", None)
+    if projected is not None:
+        evidence["projected_wait_seconds"] = float(projected)
+    new_tokens = getattr(decision, "new_tokens", None)
+    if new_tokens is not None:
+        evidence["new_tokens"] = int(new_tokens)
+    budget_tokens = getattr(decision, "budget_tokens", None)
+    if budget_tokens is not None:
+        evidence["budget_tokens"] = int(budget_tokens)
+    return evidence
 
 
 def _local_admission_reject_payload(attempts: list | None) -> dict | None:
@@ -10388,12 +10615,7 @@ async def _proxy_with_fallback_cycle(
                             type=provider_type,
                             status="local_admission_reject",
                             reason=_cq_reason,
-                            eta_prefill_seconds=round(
-                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
-                            ),
-                            budget_seconds=round(
-                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
-                            ),
+                            **_local_admission_evidence(_admission),
                         )
                         fallback_reason = "local_admission_guard"
                         prev_provider = provider_name
@@ -10413,15 +10635,7 @@ async def _proxy_with_fallback_cycle(
                         _refusal_attempt = {
                             "status": "local_admission_reject",
                             "reason": _cq_reason or "eta_exceeds_budget",
-                            "eta_prefill_seconds": round(
-                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
-                            ),
-                            "budget_seconds": round(
-                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
-                            ),
-                            "projected_wait_seconds": round(
-                                float(getattr(_admission, "projected_wait_seconds", 0.0) or 0.0), 1
-                            ),
+                            **_local_admission_evidence(_admission),
                         }
                         return _build_local_only_refusal_response(
                             _refusal_attempt, config
@@ -10969,10 +11183,19 @@ async def _proxy_with_fallback_cycle(
                 if _direct_admission is not None and not _direct_admission.admit:
                     # Deadline refusal (LP-0MVKUKEU80022C3U) keeps its own
                     # reason so the diagnostic says *why* local was refused.
+                    # The cold-prefill budget and its deadline-relative sibling
+                    # keep their own reasons too (LP-0MVNTT4X8009IO2X AC1): the
+                    # retry contract is reason-driven, so relabelling the
+                    # refusal as an ETA miss would advertise a timer for a
+                    # prompt that waiting cannot heal.
                     if str(_direct_admission.reason).startswith(
-                        "prefill_eta_exceeds_deadline"
+                        (
+                            "prefill_eta_exceeds_deadline",
+                            "prefill_eta_exceeds_safety_budget",
+                            "prefill_budget_exceeded",
+                        )
                     ):
-                        _direct_reason = "prefill_eta_exceeds_deadline"
+                        _direct_reason = str(_direct_admission.reason)
                     else:
                         _direct_reason = "eta_exceeds_budget_direct"
                     try:
@@ -10990,24 +11213,7 @@ async def _proxy_with_fallback_cycle(
                         type=provider_type,
                         status="local_admission_reject",
                         reason=_direct_reason,
-                        eta_prefill_seconds=round(
-                            float(
-                                getattr(
-                                    _direct_admission,
-                                    "eta_prefill_seconds",
-                                    0.0,
-                                )
-                                or 0.0
-                            ),
-                            1,
-                        ),
-                        budget_seconds=round(
-                            float(
-                                getattr(_direct_admission, "budget_seconds", 0.0)
-                                or 0.0
-                            ),
-                            1,
-                        ),
+                        **_local_admission_evidence(_direct_admission),
                     )
                     try:
                         logger.info(
@@ -11387,12 +11593,7 @@ async def _proxy_with_fallback_cycle(
                             type=provider_type,
                             status="local_admission_reject",
                             reason=_lease_reason,
-                            eta_prefill_seconds=round(
-                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
-                            ),
-                            budget_seconds=round(
-                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
-                            ),
+                            **_local_admission_evidence(_admission),
                         )
                         fallback_reason = "local_admission_guard"
                         all_slot_exhaustion = False
@@ -11409,15 +11610,7 @@ async def _proxy_with_fallback_cycle(
                         _refusal_attempt = {
                             "status": "local_admission_reject",
                             "reason": _lease_reason or "eta_exceeds_budget",
-                            "eta_prefill_seconds": round(
-                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
-                            ),
-                            "budget_seconds": round(
-                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
-                            ),
-                            "projected_wait_seconds": round(
-                                float(getattr(_admission, "projected_wait_seconds", 0.0) or 0.0), 1
-                            ),
+                            **_local_admission_evidence(_admission),
                         }
                         return _build_local_only_refusal_response(
                             _refusal_attempt, config

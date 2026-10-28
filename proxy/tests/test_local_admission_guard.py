@@ -29,6 +29,10 @@ the same contract as a single table across **every** refusal reason — status,
 ``Retry-After``/``retry_at`` presence-or-absence, reason naming and the token
 evidence — plus a dedicated cooldown case whose timer must come from the real
 cooldown remainder rather than the ETA formula.
+
+Both builders resolve their retry story through the single reason→timing
+decision ``provider._refusal_retry_timing()`` (LP-0MVQ23API001UOET), so the two
+refusal paths cannot drift apart.
 """
 
 from __future__ import annotations
@@ -752,11 +756,10 @@ async def test_direct_dispatch_logs_one_labelled_guard_line(mixed_model_config, 
 # available) and ``_build_local_admission_reject_response()`` (the chain is
 # exhausted as well).
 #
-# TDD red phase (the repo convention of ``test_provider_context_limit.py``):
-# the two tests are marked ``xfail(strict=True)`` because neither builder is
-# reason-aware yet. LP-0MVQ23API001UOET (reason-aware retry timing) and
-# LP-0MVQ23AYQ000CGTW (token evidence) remove the markers, at which point a
-# regression fails loudly instead of silently xfailing.
+# TDD red phase removed by LP-0MVQ23API001UOET (reason-aware retry timing) and
+# LP-0MVQ23AYQ000CGTW (token evidence): both builders now resolve their retry
+# story through ``provider._refusal_retry_timing()``, so these tests fail
+# loudly instead of silently xfailing.
 # ---------------------------------------------------------------------------
 
 #: The 2026-10-25 incident verdict, verbatim.
@@ -832,13 +835,6 @@ def _assert_prefill_budget_refusal_contract(result) -> dict:
     return body
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "red phase: refusal builders are not reason-aware yet — "
-        "LP-0MVQ23API001UOET / LP-0MVQ23AYQ000CGTW turn this green"
-    ),
-)
 @pytest.mark.asyncio
 async def test_prefill_budget_exceeded_local_only_refusal_is_not_time_retryable(
     mixed_model_config,
@@ -854,13 +850,6 @@ async def test_prefill_budget_exceeded_local_only_refusal_is_not_time_retryable(
     assert result.headers.get("X-Local-Route") == "refused"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "red phase: refusal builders are not reason-aware yet — "
-        "LP-0MVQ23API001UOET / LP-0MVQ23AYQ000CGTW turn this green"
-    ),
-)
 @pytest.mark.asyncio
 async def test_prefill_budget_exceeded_exhaustion_refusal_is_not_time_retryable():
     """The chain is exhausted too: same contract on the exhaustion refusal."""
@@ -912,12 +901,10 @@ async def test_prefill_budget_exceeded_exhaustion_refusal_is_not_time_retryable(
 # projected wait is pinned per case so the advertised arithmetic is exactly
 # checkable — the estimator itself is covered by ``test_prefill_eta_*``.
 #
-# TDD red phase (the repo convention used by ``test_provider_context_limit.py``
-# and this file's AC1 section): neither builder is reason-aware yet and neither
-# emits ``retry_at`` nor the token evidence, so the cases are
-# ``xfail(strict=True)``. LP-0MVQ23API001UOET (reason-aware retry timing) and
-# LP-0MVQ23AYQ000CGTW (token evidence) remove the markers, at which point a
-# regression fails loudly instead of silently xfailing.
+# TDD red phase removed by LP-0MVQ23API001UOET (reason-aware retry timing) and
+# LP-0MVQ23AYQ000CGTW (token evidence): both builders now derive
+# ``Retry-After``/``retry_at`` from the projected wait and emit the token
+# evidence, so the cases assert the real contract rather than xfailing.
 # ---------------------------------------------------------------------------
 
 #: Prompt size priced by every case. Unecached, so ``new_tokens`` == this.
@@ -1200,14 +1187,6 @@ async def _issue_occupancy_refusal(case: _OccupancyRefusalCase, mixed_model_conf
     return result, dispatched
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "red phase: neither refusal builder is reason-aware yet and neither "
-        "emits retry_at or the token evidence — LP-0MVQ23API001UOET / "
-        "LP-0MVQ23AYQ000CGTW turn this green"
-    ),
-)
 @pytest.mark.parametrize("case", _OCCUPANCY_REFUSAL_CASES)
 @pytest.mark.asyncio
 async def test_occupancy_refusal_advertises_a_truthful_retry_time(
@@ -1251,12 +1230,12 @@ async def test_occupancy_refusal_advertises_a_truthful_retry_time(
 # LP-0MVQ23B80009OZ9V, which must first settle their advertised reason
 # vocabulary and expiry source; pinning a guess here would over-specify it.
 #
-# TDD red phase, as in the sections above: the builders are not reason-aware
-# yet, neither emits ``retry_at`` nor the token evidence, and a cooldown skip
-# still falls through to remote, so the contract tests are
-# ``xfail(strict=True)`` until LP-0MVQ23API001UOET (reason-aware timing),
-# LP-0MVQ23AYQ000CGTW (token evidence) and LP-0MVQ23B80009OZ9V (non-admission
-# retry timing) land.
+# TDD red phase, as in the sections above: the AC1/AC2 rows are green since
+# LP-0MVQ23API001UOET (reason-aware timing) and LP-0MVQ23AYQ000CGTW (token
+# evidence). The two non-admission rows (``cooldown`` and ``context_too_large``)
+# are marked ``xfail(strict=True)`` per row
+# (:data:`_NON_ADMISSION_PENDING_REASONS`) until LP-0MVQ23B80009OZ9V
+# (non-admission retry timing) lands.
 # ---------------------------------------------------------------------------
 
 #: Real cooldown remaining for the cooldown-refusal cases. Kept far enough above
@@ -1304,6 +1283,10 @@ class _RefusalContractRow:
     time_retryable: bool
     #: The AC2 occupancy case that reaches this reason, when applicable.
     occupancy_case: _OccupancyRefusalCase | None = None
+    #: ``new_tokens`` the refusal must advertise. Defaults to the shared
+    #: ``PROMPT_NEW_TOKENS``; the ``prefill_budget_exceeded`` row reproduces the
+    #: 2026-10-25 incident verbatim, so it advertises that prompt's size.
+    expected_new_tokens: int = PROMPT_NEW_TOKENS
 
 
 def _occupancy_row(reason: str) -> _RefusalContractRow:
@@ -1331,7 +1314,10 @@ _REFUSAL_CONTRACT_ROWS = [
     _occupancy_row("prefill_eta_exceeds_safety_budget"),
     # Permanently over the flat cold-prefill cap: time cannot heal it.
     _RefusalContractRow(
-        reason="prefill_budget_exceeded", trigger="prefill_budget", time_retryable=False
+        reason="prefill_budget_exceeded",
+        trigger="prefill_budget",
+        time_retryable=False,
+        expected_new_tokens=INCIDENT_NEW_TOKENS,
     ),
     # Cannot fit a KV slot: the remedy is compaction, not a wait.
     _RefusalContractRow(
@@ -1341,6 +1327,34 @@ _REFUSAL_CONTRACT_ROWS = [
     _RefusalContractRow(
         reason="cooldown", trigger="cooldown", time_retryable=True
     ),
+]
+
+#: Rows whose refusal does not exist yet: a non-admission skip (cooldown,
+#: ``context_too_large``) still falls through to a remote provider behind a
+#: ``local-only`` client's back and advertises no real expiry, so those rows are
+#: pinned but expected to fail until LP-0MVQ23B80009OZ9V lands. Kept beside the
+#: table so the rows stay one table (the reasons and their expectations are not
+#: duplicated) while the red-phase expectation is expressed per row.
+_NON_ADMISSION_PENDING_REASONS = frozenset({"context_too_large", "cooldown"})
+
+_REFUSAL_CONTRACT_PARAMS = [
+    pytest.param(
+        row,
+        id=row.reason,
+        marks=(
+            pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "red phase: a non-admission skip still falls through to "
+                    f"remote and advertises no real expiry ({row.reason}) — "
+                    "LP-0MVQ23B80009OZ9V turns this green"
+                ),
+            ),
+        )
+        if row.reason in _NON_ADMISSION_PENDING_REASONS
+        else (),
+    )
+    for row in _REFUSAL_CONTRACT_ROWS
 ]
 
 
@@ -1457,17 +1471,10 @@ def test_refusal_contract_table_has_exactly_one_row_per_reason():
             )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "red phase: no refusal is reason-aware yet, none emits retry_at or the "
-        "admission token evidence, and a cooldown skip still falls through to "
-        "remote — LP-0MVQ23API001UOET / LP-0MVQ23AYQ000CGTW / "
-        "LP-0MVQ23B80009OZ9V turn this green"
-    ),
-)
 @pytest.mark.parametrize(
-    "row", _REFUSAL_CONTRACT_ROWS, ids=[row.reason for row in _REFUSAL_CONTRACT_ROWS]
+    "row",
+    _REFUSAL_CONTRACT_PARAMS,
+    ids=[row.reason for row in _REFUSAL_CONTRACT_ROWS],
 )
 @pytest.mark.asyncio
 async def test_refusal_reason_follows_the_contract_table(
@@ -1520,12 +1527,12 @@ async def test_refusal_reason_follows_the_contract_table(
 
     # AC2: the admission token evidence is present on *every* refusal.
     assert (
-        int(headers["X-Local-Admission-New-Tokens"]) == PROMPT_NEW_TOKENS
+        int(headers["X-Local-Admission-New-Tokens"]) == row.expected_new_tokens
     ), f"{row.reason}: the client needs the token evidence to size a compaction"
     assert (
         int(headers["X-Local-Admission-Budget-Tokens"]) == COLD_PREFILL_BUDGET_TOKENS
     )
-    assert body.get("new_tokens") == PROMPT_NEW_TOKENS
+    assert body.get("new_tokens") == row.expected_new_tokens
     assert body.get("budget_tokens") == COLD_PREFILL_BUDGET_TOKENS
 
 
