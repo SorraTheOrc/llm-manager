@@ -23,6 +23,12 @@ AC2/AC4 of LP-0MVNTT4X8009IO2X): waiting *does* help, so each refusal must
 advertise ``ceil(projected_wait_seconds - budget_seconds)`` (min 1 s, capped)
 as ``Retry-After`` together with an absolute ``retry_at`` and the admission
 token evidence.
+
+The final section (LP-0MVQ23AGI006JNH4, AC6/AC7 of LP-0MVNTT4X8009IO2X) pins
+the same contract as a single table across **every** refusal reason — status,
+``Retry-After``/``retry_at`` presence-or-absence, reason naming and the token
+evidence — plus a dedicated cooldown case whose timer must come from the real
+cooldown remainder rather than the ETA formula.
 """
 
 from __future__ import annotations
@@ -121,15 +127,25 @@ def _seed_calibration(tokens: int = 100_000, ms_per_token: float = 3.9) -> None:
 
 
 @contextmanager
-def _guard_patches(tokens: int, cached_ratio: float = 0.0):
-    """Patch the estimate pipeline so the guard costs a known prompt size."""
+def _guard_patches(
+    tokens: int, cached_ratio: float = 0.0, skip_reason: str | None = None
+):
+    """Patch the estimate pipeline so the guard costs a known prompt size.
+
+    *skip_reason* forces the local-eligibility gate to skip the local entry
+    with that reason (used to reach the non-admission skip paths), and leaves
+    today's ``(False, None)`` admission untouched when omitted.
+    """
     with (
         patch(
             "proxy.provider._estimate_effective_prompt_tokens_for_routing",
             new=AsyncMock(return_value=tokens),
         ),
         patch("proxy.provider._get_tokenizer_for_model", lambda *_: (None, 1.0)),
-        patch("proxy.provider._should_skip_local", lambda *a, **k: (False, None)),
+        patch(
+            "proxy.provider._should_skip_local",
+            lambda *a, **k: (skip_reason is not None, skip_reason),
+        ),
         patch("proxy.provider._get_cached_ratio", lambda *_: cached_ratio),
     ):
         yield
@@ -756,6 +772,39 @@ def _cold_budget_cfg(**server_overrides) -> dict:
     )
 
 
+async def _issue_local_only_prefill_budget_refusal(mixed_model_config) -> tuple:
+    """Issue the 2026-10-25 shape: a local-only client over the cold cap.
+
+    A remote provider is available, so falling through to it would silently
+    break the client's ``local-only`` intent. Returns ``(response, calls)``.
+    """
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"x-local-preference": "local-only"}),
+            "v1/chat/completions",
+            mixed_model_config,
+            _cold_budget_cfg(),
+        )
+
+    return result, calls
+
+
 def _assert_prefill_budget_refusal_contract(result) -> dict:
     """Assert the AC1 contract shared by both refusal paths; return the body.
 
@@ -795,29 +844,9 @@ async def test_prefill_budget_exceeded_local_only_refusal_is_not_time_retryable(
     mixed_model_config,
 ):
     """Local-only client, remote still available: 429 without ``Retry-After``."""
-    calls: list[str] = []
-
-    async def _local(_req, _path):
-        calls.append("local")
-        return _ok_response()
-
-    async def _remote(_req, _path, _pc):
-        calls.append("remote")
-        return _ok_response()
-
-    with (
-        patch("proxy.router.proxy_to_local", _local),
-        patch("proxy.server.proxy_to_remote", _remote),
-        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
-        patch("proxy.provider.request_priority", return_value="low"),
-        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
-    ):
-        result = await provider.proxy_with_fallback(
-            _DummyRequest(headers={"x-local-preference": "local-only"}),
-            "v1/chat/completions",
-            mixed_model_config,
-            _cold_budget_cfg(),
-        )
+    result, calls = await _issue_local_only_prefill_budget_refusal(
+        mixed_model_config
+    )
 
     assert calls == [], "a local-only client must never be moved remote"
     body = _assert_prefill_budget_refusal_contract(result)
@@ -1133,20 +1162,8 @@ def test_occupancy_refusal_case_table_matches_the_advertised_formula():
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "red phase: neither refusal builder is reason-aware yet and neither "
-        "emits retry_at or the token evidence — LP-0MVQ23API001UOET / "
-        "LP-0MVQ23AYQ000CGTW turn this green"
-    ),
-)
-@pytest.mark.parametrize("case", _OCCUPANCY_REFUSAL_CASES)
-@pytest.mark.asyncio
-async def test_occupancy_refusal_advertises_a_truthful_retry_time(
-    case: _OccupancyRefusalCase, mixed_model_config
-):
-    """Each ETA/occupancy reason → Retry-After + retry_at + token evidence."""
+async def _issue_occupancy_refusal(case: _OccupancyRefusalCase, mixed_model_config):
+    """Issue one ETA/occupancy-refused request; return ``(response, dispatches)``."""
     dispatched: list[str] = []
 
     async def _local(_req, _path):
@@ -1180,8 +1197,396 @@ async def test_occupancy_refusal_advertises_a_truthful_retry_time(
             _case_cfg(case),
         )
 
+    return result, dispatched
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "red phase: neither refusal builder is reason-aware yet and neither "
+        "emits retry_at or the token evidence — LP-0MVQ23API001UOET / "
+        "LP-0MVQ23AYQ000CGTW turn this green"
+    ),
+)
+@pytest.mark.parametrize("case", _OCCUPANCY_REFUSAL_CASES)
+@pytest.mark.asyncio
+async def test_occupancy_refusal_advertises_a_truthful_retry_time(
+    case: _OccupancyRefusalCase, mixed_model_config
+):
+    """Each ETA/occupancy reason → Retry-After + retry_at + token evidence."""
+    result, dispatched = await _issue_occupancy_refusal(case, mixed_model_config)
+
     assert dispatched == [], (
         "a refused ETA/occupancy request must never dispatch or move remote"
     )
     body = _assert_occupancy_refusal_contract(result, case)
     assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+
+
+# ---------------------------------------------------------------------------
+# AC6/AC7 (LP-0MVNTT4X8009IO2X): the refusal contract as ONE table
+#
+# The sections above pin each family in depth. This section pins the
+# *cross-reason* contract in a single table, so a refusal reason cannot ship
+# with an inconsistent retry story:
+#
+# - every refusal is a 429, is stamped ``X-Local-Route: refused`` and names the
+#   reason that refused it (AC6);
+# - ``Retry-After`` / ``retry_at`` are present exactly when waiting helps —
+#   the ETA/occupancy reasons and a real cooldown — and absent exactly when it
+#   cannot (``prefill_budget_exceeded``, ``context_too_large``) (AC2/AC6);
+# - the admission token evidence is present on *every* refusal (AC2);
+# - a refused request is never dispatched, and never moved to a remote provider
+#   behind a ``local-only`` client's back (AC6).
+#
+# ``reason=cooldown`` (the local entry cooling down while a remote provider is
+# available) is the one reason whose timer must come from *real* state instead
+# of the ETA formula, so it gets a dedicated test as well (AC7): the advertised
+# remainder is the cooldown's, not ``suggested_retry_after_seconds()``'s.
+#
+# Non-admission skips: ``cooldown`` and ``context_too_large`` are pinned here
+# because their contract is already decided (a real cooldown remainder, and
+# "compact, do not wait"). The other two non-admission causes — a held dispatch
+# lease and a contention-queue expiry — are deliberately left to
+# LP-0MVQ23B80009OZ9V, which must first settle their advertised reason
+# vocabulary and expiry source; pinning a guess here would over-specify it.
+#
+# TDD red phase, as in the sections above: the builders are not reason-aware
+# yet, neither emits ``retry_at`` nor the token evidence, and a cooldown skip
+# still falls through to remote, so the contract tests are
+# ``xfail(strict=True)`` until LP-0MVQ23API001UOET (reason-aware timing),
+# LP-0MVQ23AYQ000CGTW (token evidence) and LP-0MVQ23B80009OZ9V (non-admission
+# retry timing) land.
+# ---------------------------------------------------------------------------
+
+#: Real cooldown remaining for the cooldown-refusal cases. Kept far enough above
+#: the 1 s ``Retry-After`` floor that an ETA-formula answer is distinguishable.
+COOLDOWN_REMAINDER_SECONDS = 90
+#: What ``suggested_retry_after_seconds()`` is stubbed to return while the
+#: cooldown cases run, so an ETA-derived answer can never masquerade as (or be
+#: mistaken for) the cooldown remainder.
+ETA_FORMULA_SENTINEL_SECONDS = 999
+#: Local entry used by every case in this file.
+LOCAL_PROVIDER_NAME = "local-llama"
+
+
+@contextmanager
+def _local_entry_in_cooldown(seconds: float = COOLDOWN_REMAINDER_SECONDS):
+    """Put the local entry into a *real* cooldown for the current request.
+
+    The expiry is set half a second beyond *seconds* so ``int(remaining)`` —
+    what ``_provider_cooldown_remaining()`` reports and what a truthful
+    refusal must advertise — is exactly *seconds*.
+    """
+    previous = provider._provider_unavailable_until.get(LOCAL_PROVIDER_NAME)
+    provider._provider_unavailable_until[LOCAL_PROVIDER_NAME] = (
+        time.time() + seconds + 0.5
+    )
+    try:
+        yield
+    finally:
+        if previous is None:
+            provider._provider_unavailable_until.pop(LOCAL_PROVIDER_NAME, None)
+        else:
+            provider._provider_unavailable_until[LOCAL_PROVIDER_NAME] = previous
+
+
+@dataclass(frozen=True)
+class _RefusalContractRow:
+    """One reason row of the cross-reason refusal contract table."""
+
+    reason: str
+    #: How the row reaches its refusal: ``"occupancy"`` (guard refusal, case
+    #: taken from the AC2 table), ``"prefill_budget"`` (2026-10-25 shape),
+    #: ``"context_bypass"`` (physical context cap) or ``"cooldown"``.
+    trigger: str
+    #: ``True`` when waiting helps, so the refusal must advertise a timer.
+    time_retryable: bool
+    #: The AC2 occupancy case that reaches this reason, when applicable.
+    occupancy_case: _OccupancyRefusalCase | None = None
+
+
+def _occupancy_row(reason: str) -> _RefusalContractRow:
+    """Row for an ETA/occupancy reason, reusing the AC2 case table verbatim."""
+    case = next(
+        param.values[0]
+        for param in _OCCUPANCY_REFUSAL_CASES
+        if param.values[0].reason == reason and param.values[0].chain == "hybrid"
+    )
+    return _RefusalContractRow(
+        reason=reason,
+        trigger="occupancy",
+        time_retryable=True,
+        occupancy_case=case,
+    )
+
+
+#: The contract table: exactly one row per refusal reason, verbatim from the
+#: per-reason contract of LP-0MVNTT4X8009IO2X (AC1/AC2/AC3) and the docs item
+#: LP-0MVQ23BH7006HLKB (wait / compact / refuse).
+_REFUSAL_CONTRACT_ROWS = [
+    _occupancy_row("eta_exceeds_budget"),
+    _occupancy_row("eta_exceeds_budget_direct"),
+    _occupancy_row("prefill_eta_exceeds_deadline"),
+    _occupancy_row("prefill_eta_exceeds_safety_budget"),
+    # Permanently over the flat cold-prefill cap: time cannot heal it.
+    _RefusalContractRow(
+        reason="prefill_budget_exceeded", trigger="prefill_budget", time_retryable=False
+    ),
+    # Cannot fit a KV slot: the remedy is compaction, not a wait.
+    _RefusalContractRow(
+        reason="context_too_large", trigger="context_bypass", time_retryable=False
+    ),
+    # A real, finite unavailability: waiting helps, for the cooldown's length.
+    _RefusalContractRow(
+        reason="cooldown", trigger="cooldown", time_retryable=True
+    ),
+]
+
+
+async def _issue_cooldown_refusal(mixed_model_config) -> tuple:
+    """A local-only client while its local entry cools down; remote available.
+
+    Returns ``(response, dispatches)``. The ETA formula's answer is stubbed to
+    a sentinel so a test can prove the advertised timer is not derived from it.
+    """
+    dispatched: list[str] = []
+
+    async def _local(_req, _path):
+        dispatched.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        dispatched.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch(
+            "proxy.prefill_eta.suggested_retry_after_seconds",
+            lambda *a, **k: ETA_FORMULA_SENTINEL_SECONDS,
+        ),
+        _guard_patches(tokens=PROMPT_NEW_TOKENS),
+        _local_entry_in_cooldown(),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"x-local-preference": "local-only"}),
+            "v1/chat/completions",
+            mixed_model_config,
+            _cold_budget_cfg(),
+        )
+
+    return result, dispatched
+
+
+async def _issue_refusal(row: _RefusalContractRow, mixed_model_config) -> tuple:
+    """Issue the request that must be refused for *row*; ``(response, calls)``."""
+    if row.trigger == "occupancy":
+        assert row.occupancy_case is not None
+        return await _issue_occupancy_refusal(row.occupancy_case, mixed_model_config)
+    if row.trigger == "prefill_budget":
+        return await _issue_local_only_prefill_budget_refusal(mixed_model_config)
+    if row.trigger == "context_bypass":
+        calls: list[str] = []
+
+        async def _local(_req, _path):
+            calls.append("local")
+            return _ok_response()
+
+        async def _remote(_req, _path, _pc):
+            calls.append("remote")
+            return _ok_response()
+
+        with (
+            patch("proxy.router.proxy_to_local", _local),
+            patch("proxy.server.proxy_to_remote", _remote),
+            patch(
+                "proxy.provider._get_local_concurrency_info",
+                _MutableConcurrency(0, 1),
+            ),
+            patch("proxy.provider.request_priority", return_value="low"),
+            _guard_patches(tokens=PROMPT_NEW_TOKENS, skip_reason=row.reason),
+        ):
+            result = await provider.proxy_with_fallback(
+                _DummyRequest(headers={"x-local-preference": "local-only"}),
+                "v1/chat/completions",
+                mixed_model_config,
+                _cold_budget_cfg(),
+            )
+        return result, calls
+    if row.trigger == "cooldown":
+        return await _issue_cooldown_refusal(mixed_model_config)
+    raise AssertionError(f"unknown refusal trigger {row.trigger!r}")
+
+
+def test_refusal_contract_table_has_exactly_one_row_per_reason():
+    """The table is the contract: one row per reason, no silent drop.
+
+    A reason that disappears from the table would silently lose its retry
+    story, so the reason set is pinned here (and only here — the per-reason
+    expectations live in the rows themselves).
+    """
+    reasons = [row.reason for row in _REFUSAL_CONTRACT_ROWS]
+    assert len(reasons) == len(set(reasons)), f"duplicate reason rows: {reasons}"
+    assert set(reasons) == {
+        "eta_exceeds_budget",
+        "eta_exceeds_budget_direct",
+        "prefill_eta_exceeds_deadline",
+        "prefill_eta_exceeds_safety_budget",
+        "prefill_budget_exceeded",
+        "context_too_large",
+        "cooldown",
+    }, "a refusal reason is missing from (or unexpected in) the contract table"
+
+    not_time_retryable = {
+        row.reason for row in _REFUSAL_CONTRACT_ROWS if not row.time_retryable
+    }
+    assert not_time_retryable == {"prefill_budget_exceeded", "context_too_large"}, (
+        "only the causes waiting cannot fix may omit Retry-After/retry_at"
+    )
+
+    for row in _REFUSAL_CONTRACT_ROWS:
+        if row.trigger == "occupancy":
+            assert row.occupancy_case is not None
+            assert row.occupancy_case.reason == row.reason, (
+                "an occupancy row must reuse the AC2 case table, not restate "
+                "its numbers"
+            )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "red phase: no refusal is reason-aware yet, none emits retry_at or the "
+        "admission token evidence, and a cooldown skip still falls through to "
+        "remote — LP-0MVQ23API001UOET / LP-0MVQ23AYQ000CGTW / "
+        "LP-0MVQ23B80009OZ9V turn this green"
+    ),
+)
+@pytest.mark.parametrize(
+    "row", _REFUSAL_CONTRACT_ROWS, ids=[row.reason for row in _REFUSAL_CONTRACT_ROWS]
+)
+@pytest.mark.asyncio
+async def test_refusal_reason_follows_the_contract_table(
+    row: _RefusalContractRow, mixed_model_config
+):
+    """Per reason: status, timer presence/absence, reason naming, token evidence."""
+    result, dispatched = await _issue_refusal(row, mixed_model_config)
+
+    assert dispatched == [], (
+        f"{row.reason}: a refused request must never be dispatched locally or "
+        "moved to a remote provider"
+    )
+    assert result.status_code == 429, (
+        f"{row.reason}: every admission refusal answers 429"
+    )
+    headers = result.headers
+    body = json.loads(result.body)
+
+    assert headers.get("X-Local-Route") == "refused"
+    advertised = " ".join(
+        str(value or "")
+        for value in (headers.get("X-Local-Fallback-Reason"), body.get("reason"))
+    ).lower()
+    assert row.reason.lower() in advertised, (
+        f"{row.reason}: the refusal must name the reason that refused it, "
+        f"got header={headers.get('X-Local-Fallback-Reason')!r} "
+        f"body={body.get('reason')!r}"
+    )
+
+    # AC2/AC6: the timer is present exactly when waiting helps.
+    assert (headers.get("Retry-After") is not None) is row.time_retryable, (
+        f"{row.reason}: Retry-After must be "
+        f"{'present' if row.time_retryable else 'absent'}"
+    )
+    assert (bool(body.get("retry_at"))) is row.time_retryable, (
+        f"{row.reason}: retry_at must be "
+        f"{'an RFC 3339 UTC instant' if row.time_retryable else 'absent'}"
+    )
+    assert (body.get("retry_after") is not None) is row.time_retryable, (
+        f"{row.reason}: body retry_after must mirror the header presence"
+    )
+    assert body.get("retryable") is row.time_retryable, (
+        f"{row.reason}: the body must say whether a retry can help"
+    )
+    if row.time_retryable:
+        assert headers["Retry-After"] == str(body["retry_after"]), (
+            f"{row.reason}: the header and the body must advertise one delay"
+        )
+        _parse_rfc3339_utc(body["retry_at"])
+
+    # AC2: the admission token evidence is present on *every* refusal.
+    assert (
+        int(headers["X-Local-Admission-New-Tokens"]) == PROMPT_NEW_TOKENS
+    ), f"{row.reason}: the client needs the token evidence to size a compaction"
+    assert (
+        int(headers["X-Local-Admission-Budget-Tokens"]) == COLD_PREFILL_BUDGET_TOKENS
+    )
+    assert body.get("new_tokens") == PROMPT_NEW_TOKENS
+    assert body.get("budget_tokens") == COLD_PREFILL_BUDGET_TOKENS
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "red phase: a cooldown skip still routes to the next remote provider "
+        "behind a local-only client's back and no refusal carries a real "
+        "cooldown remainder — LP-0MVQ23B80009OZ9V / LP-0MVNU2KTK009D4AG turn "
+        "this green"
+    ),
+)
+@pytest.mark.asyncio
+async def test_cooldown_refusal_advertises_the_cooldown_remainder(
+    mixed_model_config,
+):
+    """AC7: a cooldown refusal advertises the cooldown, not the ETA formula.
+
+    The local entry is cooling down for :data:`COOLDOWN_REMAINDER_SECONDS` and
+    ``suggested_retry_after_seconds()`` is stubbed to
+    :data:`ETA_FORMULA_SENTINEL_SECONDS`, so the advertised delay can only be
+    the real cooldown remainder.
+    """
+    result, dispatched = await _issue_cooldown_refusal(mixed_model_config)
+
+    assert dispatched == [], (
+        "X-Local-Preference: local-only means refuse, not fall through to remote"
+    )
+    assert result.status_code == 429
+    assert result.headers.get("X-Local-Route") == "refused"
+
+    body = json.loads(result.body)
+    advertised_reason = " ".join(
+        str(value or "")
+        for value in (
+            result.headers.get("X-Local-Fallback-Reason"),
+            body.get("reason"),
+        )
+    ).lower()
+    assert "cooldown" in advertised_reason, (
+        "the refusal must attribute the refusal to the cooldown, got "
+        f"{advertised_reason!r}"
+    )
+
+    retry_after = int(result.headers["Retry-After"])
+    assert retry_after == body["retry_after"], (
+        "the Retry-After header and the body must advertise one delay"
+    )
+    assert retry_after != ETA_FORMULA_SENTINEL_SECONDS, (
+        "the cooldown remainder must come from real availability state, not "
+        "from the ETA formula"
+    )
+    assert COOLDOWN_REMAINDER_SECONDS - 2 <= retry_after <= COOLDOWN_REMAINDER_SECONDS, (
+        f"Retry-After must be the cooldown remainder "
+        f"(~{COOLDOWN_REMAINDER_SECONDS}s), got {retry_after}s"
+    )
+
+    retry_at = _parse_rfc3339_utc(body["retry_at"])
+    expected_at = datetime.now(UTC) + timedelta(seconds=retry_after)
+    assert abs((retry_at - expected_at).total_seconds()) <= RETRY_AT_TOLERANCE_SECONDS, (
+        f"retry_at {retry_at.isoformat()} must be the advertised instant, got "
+        f"{expected_at.isoformat()}"
+    )
+    assert body.get("retryable") is True, "a cooldown is a wait the client can outlast"
