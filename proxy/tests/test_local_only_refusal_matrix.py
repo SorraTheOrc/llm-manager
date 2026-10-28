@@ -31,7 +31,9 @@ untested branch.
 Test-first: the rows that a skip path still leaks are marked
 ``xfail(strict=True)`` — ``strict`` so that the implementing children
 (LP-0MVRMC1L3006F0F3 choke point, LP-0MVRMC1W6003MV3Y reason tokens) cannot land
-without flipping the marker off with the behaviour.
+without flipping the marker off with the behaviour. The choke point flipped
+all but two rows green; the remaining two (``quota_hard_stop``,
+``chain_cooldown``) await the reason-token child's per-branch tokens.
 """
 
 from __future__ import annotations
@@ -233,19 +235,16 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
 #: next remote provider behind a ``local-only`` client's back. Kept beside the
 #: table so the reasons and their expectations stay one table, while the
 #: red-phase expectation is expressed per row and dies with the behaviour.
+#:
+#: The structural choke point (LP-0MVRMC1L3006F0F3) already refuses every
+#: remaining exit; the two rows below stay red because the refusal still
+#: carries the generic ``local_route_unavailable`` fallback instead of the
+#: per-branch token — the reason-token child (LP-0MVRMC1W6003MV3Y) records
+#: the chain-resolution skips and turns them green.
 _PENDING_ROWS: frozenset[str] = frozenset(
     {
-        "thrash_cooldown",
-        "router_skip_physical_cap",
-        "router_skip_economic",
-        "router_skip_residency",
-        "router_skip_tenancy",
-        "queue_depth_cap",
-        "queue_wait_expiry",
-        "entry_context_cap",
         "quota_hard_stop",
         "chain_cooldown",
-        "no_local_route",
     }
 )
 
@@ -258,10 +257,11 @@ def _pending_mark(row: _ExitRow) -> tuple:
         pytest.mark.xfail(
             strict=True,
             reason=(
-                "red phase: this local-route exit still falls through to a "
-                "remote provider under X-Local-Preference: local-only, and "
-                f"records no {row.token} reason — LP-0MVRMC1L3006F0F3 (choke "
-                "point) / LP-0MVRMC1W6003MV3Y (reason tokens) turn it green"
+                "red phase: the local-only refusal exists (choke point, "
+                "LP-0MVRMC1L3006F0F3) but still carries the generic "
+                "local_route_unavailable fallback — LP-0MVRMC1W6003MV3Y "
+                f"(reason tokens) must record the {row.token} token on this "
+                "exit to turn it green"
             ),
         ),
     )
@@ -642,3 +642,142 @@ async def test_remote_ok_with_no_remote_entry_returns_todays_exhaustion():
         f"an empty chain exhausts as today, got {result.status_code}"
     )
     assert json.loads(result.body).get("code") == provider.EXHAUSTION_CODE_ALL
+
+
+# ---------------------------------------------------------------------------
+# AC6: the remote-fallback dispatch cycle carries the same choke point
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_remote_fallback_cycle_enforces_the_local_only_choke_point():
+    """The other dispatch cycle refuses too; prefer-local keeps its fall.
+
+    ``proxy_with_fallback`` always runs the local+remote cycle, so a remote-
+    only model takes ``proxy_with_remote_fallback`` — the second dispatch
+    cycle the choke point must cover (LP-0MVRMC1L3006F0F3 AC ``both dispatch
+    cycles are covered``). Its chain has no local entry, so ``local-only``
+    answers the ``local_only_no_local_route`` refusal before any remote
+    dispatch, while the default client still completes remotely with
+    ``X-Local-Route: remote``.
+    """
+    calls: list[str] = []
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    model_config = {
+        "providers": [
+            {"name": REMOTE_PROVIDER_NAME, "type": "remote",
+             "endpoint": "https://api.example.com/v1"}
+        ],
+        "aliases": ["hybrid*"],
+    }
+    config = {"provider_cooldown_seconds": 60,
+              "server": {"session_slot_pool_size": 1}}
+
+    async def _issue(preference: str | None):
+        headers = {} if preference is None else {"X-Local-Preference": preference}
+        with patch("proxy.server.proxy_to_remote", _remote):
+            return await provider.proxy_with_remote_fallback(
+                _DummyRequest(headers=headers),
+                "v1/chat/completions",
+                model_config,
+                config,
+            )
+
+    refused = await _issue(LOCAL_ONLY)
+    assert calls == [], (
+        "local-only must refuse before the first remote dispatch "
+        f"(dispatched={calls})"
+    )
+    assert refused.status_code == 429, f"got {refused.status_code}"
+    assert refused.headers.get("X-Local-Route") == "refused"
+    assert refused.headers.get("X-Local-Fallback-Reason") == (
+        "local_only_no_local_route"
+    ), "a remote-only chain has no local route; the refusal must say so"
+
+    served = await _issue(PREFER_LOCAL)
+    assert calls == ["remote"], (
+        "prefer-local keeps today's remote dispatch on the remote-only cycle "
+        f"(dispatched={calls})"
+    )
+    assert served.status_code == 200, f"got {served.status_code}"
+    assert served.headers.get("X-Local-Route") == "remote"
+
+
+# ---------------------------------------------------------------------------
+# AC: a genuine local success after a skip still wins (no masking refusal)
+# ---------------------------------------------------------------------------
+
+
+async def _compaction_rescue_outcome(_server, _result, _body_json, _server_config):
+    """Compaction applied: the bypassed session fits local again."""
+    return {
+        "evaluated": True,
+        "action": "apply",
+        "applied": True,
+        "estimated_before": 99999,
+        "estimated_after": 1_000,
+        "reason": "context_too_large",
+        "messages": [{"role": "user", "content": "compacted"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_local_only_still_serves_a_compaction_rescued_local_dispatch():
+    """AC4: a skip followed by a local rescue is NOT refused.
+
+    The choke point lives at the loop head only: once the local branch
+    rescues the request (server-side compaction success re-runs local
+    eligibility and re-admits), the same iteration dispatches local — the
+    refusal must not mask that later local success (LP-0MVRMC1L3006F0F3 AC).
+    """
+    calls: list[str] = []
+    skip_calls = {"n": 0}
+
+    def _skip_once_then_admit(*_a, **_k):
+        skip_calls["n"] += 1
+        if skip_calls["n"] == 1:
+            return (True, "context_too_large")
+        return (False, None)
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch(
+            "proxy.provider._get_local_concurrency_info",
+            _MutableConcurrency(0, 1),
+        ),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch("proxy.provider._should_skip_local", _skip_once_then_admit),
+        patch(
+            "proxy.router_helpers.evaluate_and_apply_compaction",
+            _compaction_rescue_outcome,
+        ),
+        _estimate_patches(PROMPT_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"X-Local-Preference": LOCAL_ONLY}),
+            "v1/chat/completions",
+            _model_config(_EXIT_ROWS[0]),
+            _config(_EXIT_ROWS[0]),
+        )
+
+    assert calls == ["local"], (
+        "a compaction-rescued request must still be served locally, got "
+        f"{calls}"
+    )
+    assert result.status_code == 200
+    assert result.headers.get("X-Local-Route") != "refused", (
+        "the refusal must not mask a later local success"
+    )

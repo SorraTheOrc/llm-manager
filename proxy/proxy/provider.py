@@ -6604,6 +6604,81 @@ def _stamp_local_route_headers(
         return response
 
 
+#: ``X-Local-Fallback-Reason`` tokens the local-only choke point emits when
+#: the request recorded no skip reason (LP-0MVRMC1L3006F0F3). ``_note_local_fallback_reason()``
+#: is the primary source; these two defaults keep the structural refusal
+#: attributable when an exit left no reason behind:
+#:
+#: - ``local_only_no_local_route`` — the model's chain has no local entry at
+#:   all, so there was no local route to skip (planned-AC1 reading made
+#:   explicit in LP-0MVRMC1W6003MV3Y).
+#: - ``local_route_unavailable`` — a local entry existed but was skipped
+#:   without recording a reason (a chain-resolution skip inside
+#:   ``_resolve_provider_with_exclusions``, e.g. cooldown/quota/window; the
+#:   sibling LP-0MVRMC1W6003MV3Y pins the per-branch vocabulary and narrows
+#:   this generic fallback).
+LOCAL_ONLY_NO_LOCAL_ROUTE = "local_only_no_local_route"
+LOCAL_ROUTE_UNAVAILABLE = "local_route_unavailable"
+
+
+def _build_local_only_refusal_for_remote(
+    request,
+    provider_cfg: dict,
+    model_config: dict,
+    config: dict,
+    preference: str,
+) -> Response | None:
+    """The local-only choke point: refuse before any non-local dispatch.
+
+    LP-0MVRMC1L3006F0F3 (parent AC1/AC2): with ``X-Local-Preference:
+    local-only`` the dispatch loop must NEVER hand the request to a non-local
+    provider, regardless of which skip branch the local route took — the
+    structural analogue of ``remote-ok`` being enforced by
+    ``apply_local_preference()`` (intent enforced by structure, not by
+    remembering to patch each ``continue``). Called at the head of both
+    dispatch cycles immediately after the next candidate provider is resolved;
+    when the candidate is not local and the client is local-only it returns
+    the refusal built from the skip reason already recorded on the request by
+    :func:`_note_local_fallback_reason`, so no existing ``continue`` path is
+    edited and the loop returns the refusal before the first remote dispatch.
+
+    The refusal's ``X-Local-Fallback-Reason`` is that recorded reason; when
+    the exit recorded none (a chain-resolution skip in
+    ``_resolve_provider_with_exclusions``, or a chain with no local entry at
+    all) the refusal is attributed with the stable fallback tokens above — the
+    sibling reason-token item (LP-0MVRMC1W6003MV3Y) pins the per-branch
+    vocabulary and narrows the generic fallback.
+
+    Inert for ``prefer-local`` / absent header / ``remote-ok`` clients and for
+    a local candidate (the request still completes locally), so AC3
+    byte-compatibility and the ``remote-ok`` strip are preserved. The refusal
+    is terminal for the request: no attempt/cooldown/budget state is written
+    and the request is never enqueued, so the response is stamped exactly
+    once and no contention-queue slot/lease is leaked.
+    """
+    if preference != _PREF_LOCAL_ONLY:
+        return None
+    if provider_cfg.get("type", "remote") == "local":
+        return None
+    reason = getattr(request, "_local_fallback_reason", None)
+    if not reason:
+        has_local_entry = any(
+            isinstance(entry, dict) and entry.get("type") == "local"
+            for entry in (model_config.get("providers") or [])
+        )
+        reason = (
+            LOCAL_ONLY_NO_LOCAL_ROUTE
+            if not has_local_entry
+            else LOCAL_ROUTE_UNAVAILABLE
+        )
+    _note_local_fallback_reason(request, reason)
+    attempt: dict[str, Any] = {"reason": reason}
+    decision = getattr(request, "_local_admission_decision", None)
+    if decision is not None:
+        attempt.update(_local_admission_evidence(decision))
+    return _build_local_only_refusal_response(attempt, config)
+
+
 async def _prefill_admission_guard(
     config: dict,
     provider_cfg: dict,
@@ -9799,6 +9874,16 @@ async def _proxy_with_remote_fallback_cycle(
         provider_name = provider_cfg.get("name", "unknown")
         attempted_provider_names.add(provider_name)
         provider_type = provider_cfg.get("type", "remote")
+        # LP-0MVRMC1L3006F0F3: the local-only choke point — one structural
+        # guard ahead of every ``continue``, so a skip can never hand a
+        # local-only client to a non-local provider. The refusal is built from
+        # the reason already recorded on the request; inert for every other
+        # preference and for a local candidate.
+        _refusal = _build_local_only_refusal_for_remote(
+            request, provider_cfg, model_config, config, _preference
+        )
+        if _refusal is not None:
+            return _refusal
         try:
             # Mark that we attempted this provider
             any_provider_tried = True
@@ -10466,6 +10551,14 @@ async def _proxy_with_fallback_cycle(
         provider_name = provider_cfg.get("name", "unknown")
         attempted_provider_names.add(provider_name)
         provider_type = provider_cfg.get("type", "remote")
+        # LP-0MVRMC1L3006F0F3: the local-only choke point (see
+        # ``_build_local_only_refusal_for_remote``) — refuse before any
+        # non-local dispatch, whatever reason the local route exited.
+        _refusal = _build_local_only_refusal_for_remote(
+            request, provider_cfg, model_config, config, _preference
+        )
+        if _refusal is not None:
+            return _refusal
 
         try:
             # Mark attempt
