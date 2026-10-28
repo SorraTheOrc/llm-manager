@@ -43,7 +43,7 @@ Options:
 | `--start` / `--end` | — | Explicit ISO window (`YYYY-MM-DD HH:MM:SS`); overrides `--hours` |
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `local_prefill`, and `local_busy.prefill_vs_decode`) |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — with `computing_fraction`, `busy_pct`, `smoothed_power` from Prometheus power data — `local_prefill`, and `local_busy.prefill_vs_decode`) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
 
 ## Daily cadence (05:00 cron)
@@ -76,6 +76,21 @@ figures as `provider_context_skips`.
 
 See [REFERENCE.md](REFERENCE.md#outputs) for the full schema of each
 artifact and the archival behaviour.
+
+## GPU busy time from power (Prometheus)
+
+When Prometheus is reachable, the **Local model utilization** section adds a
+**GPU busy — power-based (hardware)** row that measures when the GPU actually
+drew compute-level power (≥ 90 W), instead of relying on the proxy's
+stream-lifecycle logs. On this Strix Halo APU `gpu_busy_percent` is pinned at
+100 % and is unusable; power draw is the discriminating signal. The report
+queries `avg_over_time(gpu:computing:bool[Nh])` — evaluated by Prometheus over
+the raw **15-second** hwmon series (`monitoring/gpu_compute_rules.yaml`) —
+plus the 5-minute-smoothed power trace for context. Best-effort: if Prometheus
+is down the row is omitted and `--json`'s `gpu_busy` is `null` — the report
+never fails. Full pipeline and rationale:
+[monitoring/README.md](../../../monitoring/README.md) and
+[REFERENCE.md](REFERENCE.md#gpu-busy-time-from-power-prometheus).
 
 ## Post-acceptance evictions (alert threshold + triage rule)
 

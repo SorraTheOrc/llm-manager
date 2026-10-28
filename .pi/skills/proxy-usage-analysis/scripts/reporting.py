@@ -26,6 +26,7 @@ from pathlib import Path
 import aggregation
 import bucketing
 import config_loader
+import gpu_busy
 import llama_log_parser
 import log_parser
 import recommendations
@@ -1759,6 +1760,11 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap(f"| Total compute (slot-time) | {_fmt_duration(b.total_compute_seconds)} | - | - |")
     ap(f"| Avg concurrency (while busy) | {b.avg_concurrency:.2f} | - | - |")
     ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
+    # GPU-based busy time from Prometheus power consumption (hardware-side).
+    gpu = summary.gpu_busy
+    if gpu is not None:
+        ap(f"| GPU busy — power-based (hardware) | "
+           f"{_busy_cell(gpu.busy_seconds, gpu.total_seconds)} | - | - |")
     ap("")
     ap(f"_Bounds: lower = {aggregation.BUSY_LOWER_BOUND_LABEL}; upper = "
        f"{aggregation.BUSY_UPPER_BOUND_LABEL}. {b.prefill_extended_streams} of "
@@ -1789,6 +1795,15 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
        "started inside the window or within its 1h busy-pairing margin with no "
        "logged finish (earlier starts are pre-window leftovers); fast/cheap split "
        "follows the slot schedule.")
+    # GPU-based busy-time note (hardware signal, not log-derived).
+    if gpu is not None:
+        ap("")
+        ap("_The **GPU busy** row uses Prometheus power-consumption data "
+           "(`avg_over_time(gpu:computing:bool[Nh])`, evaluated every 15 s): "
+           "1 while the GPU draws ≥ 90 W (the recording-rule threshold), 0 "
+           "otherwise. It is the authoritative hardware-side busy measure, "
+           "complementary to the log-based slot-occupancy figures above, "
+           "and does not depend on the proxy's stream lifecycle logs._")
 
 
 def _phase_cell(value: float | None) -> str:
@@ -2601,6 +2616,12 @@ def run_analysis(
         llama_files, window_start, window_end, schedule, mode_map, log_dir=llama_log_dir
     )
 
+    # GPU busy-time from Prometheus power consumption (best-effort).
+    if summary.busy is not None:
+        ws = window_start.timestamp()
+        we = window_end.timestamp()
+        summary.gpu_busy = gpu_busy.compute_gpu_busy(ws, we)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     archived_to = _archive_existing_outputs(output_dir)
     write_csvs(summary, output_dir)
@@ -2795,6 +2816,7 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "compaction": compaction_json(summary),
         "recommendations": len(recommendations.generate_recommendations(summary, None, mode_map)),
         "local_busy": _busy_json(summary.busy),
+        "gpu_busy": _gpu_busy_json(summary.gpu_busy) if summary.gpu_busy else None,
         "local_prefill": _prefill_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
@@ -3015,6 +3037,30 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
         # Phase slot-time split (LP-0MVJNDOUU0059MMO): prefill vs decode as
         # slot-seconds and % of combined phase slot-time (sums to 100%).
         "prefill_vs_decode": _prefill_vs_decode_json(busy),
+    }
+
+
+def _gpu_busy_json(gpu: object | None) -> dict | None:
+    """JSON-friendly GPU busy-time from Prometheus power consumption.
+
+    Complement to ``local_busy``: measures the authoritative hardware-side
+    busy fraction from GPU power draw (``gpu:computing:bool``), independent
+    of proxy log events. Returns ``None`` when the query fails.
+    """
+    if gpu is None:
+        return None
+    return {
+        "computing_fraction": round(gpu.computing_fraction, 4),
+        "busy_seconds": round(gpu.busy_seconds, 1),
+        "idle_seconds": round(gpu.idle_seconds, 1),
+        "busy_pct": round(gpu.busy_pct, 1),
+        "idle_pct": round(gpu.idle_pct, 1),
+        "total_seconds": round(gpu.total_seconds, 1),
+        # Smoothed power trace (1-min samples, derived from 15-s raw).
+        "smoothed_power": [
+            {"timestamp": int(ts), "power_watts": round(w, 2)}
+            for ts, w in gpu.smoothed_power_values
+        ],
     }
 
 

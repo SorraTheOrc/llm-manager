@@ -227,7 +227,9 @@ Outputs written to:
   can audit the availability verdict instead of trusting it, **Local model
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
-  fast/cheap split — when the window has local traffic) followed by
+  fast/cheap split, plus the hardware-side **GPU busy — power-based** row when
+  Prometheus is reachable — see [GPU busy time from power](#gpu-busy-time-from-power-prometheus)
+  — when the window has local traffic) followed by
   **Local contention prediction vs reality** (LP-0MVGR2OXT0096OGK, when the
   window has a denial or status poll): M1 per-hour denial attribution by
   derived pool state plus the guard-reason and `capacity_hint` splits; M2 the
@@ -668,6 +670,42 @@ reading the logs:
 Measured usage makes the first limit honest: a turn whose measurement is
 missing is priced as fully cold (`cached_ratio = 0.0`), which is what pushed
 large-context sessions permanently onto remote providers.
+
+### GPU busy time from power (Prometheus)
+
+The **Local model utilization** table's primary busy figures are derived from
+proxy logs (the dispatch → finish slot union). Alongside them, when Prometheus
+is reachable, the report adds a **GPU busy — power-based (hardware)** row and
+exposes the same data under `--json`'s `gpu_busy` key. This is the
+**authoritative hardware-side** busy fraction and does **not** depend on the
+proxy's stream-lifecycle logging.
+
+Why power rather than `gpu_busy_percent`: on this Strix Halo APU the amdgpu
+driver reports `gpu_busy_percent` as pinned at 100 % regardless of GPU state, so
+it is not a utilisation signal (LP-0MS9GA6QL007XTBP). Power draw discriminates
+cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing:bool`
+recording rule (`gpu:power_watts:amdgpu >= bool 90`) is evaluated by Prometheus
+every **15 s** from the node_exporter hwmon series. The report queries
+`avg_over_time(gpu:computing:bool[Nh])` for the window, so the busy fraction is
+computed over the raw 15 s samples (see
+[monitoring/README.md](../../../monitoring/README.md) for the full pipeline).
+
+- The 15 s cadence is comfortably finer than the workload timescales (median
+decode 2.4 s, worst prefill 108 s), so sub-15-second sampling would add no
+accuracy.
+- The row is **best-effort**: if Prometheus is unreachable the query returns
+  `None`, the row is omitted from the report, and `--json`'s `gpu_busy` is
+  `null`. A report run never fails because monitoring is down.
+- The `gpu_busy` block carries `computing_fraction` (0–1), `busy_pct`,
+  `busy_seconds`, `idle_seconds`, `total_seconds`, and `smoothed_power` — the
+  `gpu:power_watts:avg5m` trace at 1-minute resolution, derived from the 15 s
+  raw series by a 5-minute rolling average, for warm-up/cooldown context.
+
+Reading it against the log-based figure: the log union measures *slot
+occupancy* (including queued time and excluding any work the proxy did not
+log); the power figure measures when the *hardware* actually computed. A
+persistent gap between them usually means log gaps, unfinished streams, or GPU
+work outside the proxy's slot accounting.
 
 ## Interpreting the report
 

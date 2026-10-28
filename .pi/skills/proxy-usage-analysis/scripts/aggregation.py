@@ -482,6 +482,10 @@ class AnalysisResult:
     speed: object | None = None
     # Local-model utilization (busy time etc.); None when no local traffic.
     busy: BusyStats | None = None
+    # GPU busy-time measured from power consumption via Prometheus (set by
+    # reporting.run_analysis). None when the query fails (best-effort) or
+    # when no local traffic exists (the log-based busy is the primary signal).
+    gpu_busy: object | None = None  # gpu_busy.GpuBusyResult | None
     # Per-hour activity counters for the report's ``## Summary by hour``
     # table (LP-0MTYAZFGN003BYQS): absolute top-of-hour datetime -> Counter
     # over ``requests_started`` / ``local_attempts`` / ``local_served`` /

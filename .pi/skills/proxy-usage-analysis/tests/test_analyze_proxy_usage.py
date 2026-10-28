@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import aggregation
 import bucketing
 import config_loader
+import gpu_busy
 import log_parser
 import recommendations
 import reporting
@@ -3930,6 +3931,59 @@ class TestDispatchToFinishBusy:
         )
         assert first == second
         assert "1 of 1 stream(s) contributed a measured prefill" in first
+
+    def test_report_renders_gpu_power_busy_row(self):
+        """The ``## Local model utilization`` table gains a hardware-side
+        GPU busy row when Prometheus power data is available, and omits it
+        when it is not. The row is the power-based busy fraction
+        (``gpu:computing:bool``), distinct from the log-derived slot union.
+        """
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert summary.busy is not None
+
+        # Without Prometheus data the row is absent.
+        assert summary.gpu_busy is None
+        no_gpu = reporting.build_report(summary, None)
+        assert "GPU busy — power-based" not in no_gpu
+
+        # With a GpuBusyResult the row appears with the hardware figure.
+        summary.gpu_busy = gpu_busy.GpuBusyResult(
+            computing_fraction=0.50,
+            total_seconds=3600.0,
+            busy_seconds=1800.0,
+            idle_seconds=1800.0,
+            smoothed_power_values=[],
+        )
+        with_gpu = reporting.build_report(summary, None)
+        section = with_gpu.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "GPU busy — power-based (hardware)" in section
+        # 1800 s of 3600 s = 30m 00s (50.0%) via _busy_cell.
+        assert "30m 00s (50.0%)" in section
+        # The hardware-method note is rendered too.
+        assert "avg_over_time(gpu:computing:bool" in section
+
+    def test_gpu_busy_json_round_trip(self):
+        """``summary_to_json`` exposes the GPU block under ``gpu_busy``."""
+        summary = aggregation.aggregate(
+            _events([]), WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert reporting.summary_to_json(summary)["gpu_busy"] is None
+        summary.gpu_busy = gpu_busy.GpuBusyResult(
+            computing_fraction=0.25,
+            total_seconds=3600.0,
+            busy_seconds=900.0,
+            idle_seconds=2700.0,
+            smoothed_power_values=[(1698766200, 93.2)],
+        )
+        block = reporting.summary_to_json(summary)["gpu_busy"]
+        assert block["computing_fraction"] == 0.25
+        assert block["busy_pct"] == 25.0
+        assert block["idle_pct"] == 75.0
+        assert block["smoothed_power"] == [{"timestamp": 1698766200, "power_watts": 93.2}]
 
 
 class TestDecodeStats:
