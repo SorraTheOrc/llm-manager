@@ -108,7 +108,27 @@ Outputs written to:
     and the dispatch record stored verbatim (LP-0MVODJ3P6000AIUM AC5): the
     budget's own numbers, never a recompute at eviction time. Records without
     an admission snapshot contribute 0 (explicit `unknown` marker), so the
-    figure cannot over-account a re-priced prompt.
+    figure cannot over-account a re-priced prompt. In particular
+    `measured_cache_deficit` (below) is **excluded**: that dispatch was
+    released early, so its tokens are not a deadline cancellation and would
+    over-state this figure.
+
+- **Measured-cache evictions (Option D, LP-0MVR7IN0O000DPXN / guardian
+  LP-0MVR7K74S001PBNI).** A dispatch whose *measured* `prompt_progress`
+  (`total`/`cache`) shows a re-prefill far above the admission-priced
+  `new_tokens` is released **before** the 120 s deadline and logged
+  `local_eviction_after_acceptance ... reason=measured_cache_deficit` with the
+  measured/priced token fields. It is attributable as its own reason, distinct
+  from `prefill_deadline`:
+  - parsed verbatim (never folded into the tenancy `local_eviction` kind nor
+    into the deadline class);
+  - counted in `local_evictions_after_acceptance_by_reason` under the
+    `measured_cache_deficit` key, so a post-deploy window can compare it with
+    the residual `prefill_deadline` count;
+  - listed as its own row in the report's **Post-acceptance evictions**
+    breakdown; the event's admission-priced `new_tokens` stays readable on the
+    event (and in the raw log line) for the wasted-token comparison, while
+    `wasted_prefill_tokens` continues to mean deadline cancellations only.
   - `provider_exhausted_errors` — `All providers exhausted` lines
     (client-visible chain failures); `upstream_status_503_errors` —
     `upstream_http_error` events with `status == 503` (provider-side 5xx).
