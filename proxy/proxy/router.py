@@ -53,6 +53,55 @@ def _log_local_stream_client_disconnect(srv, session_id, model_name):
     except Exception:
         pass
 
+
+class MeasuredCacheAbortDetourError(Exception):
+    """Raised when a dispatch is released early on a measured cache deficit.
+
+    Not a real error: the router uses it to unwind from the peek ahead to the
+    prefetch handler that releases the lease and returns the retryable 503 the
+    provider chain turns into a remote detour (LP-0MVR7IN0O000DPXN AC1/AC3).
+    """
+
+    def __init__(self, decision, measured) -> None:
+        self.decision = decision
+        self.measured = measured
+        super().__init__("measured_cache_deficit")
+
+
+def _log_measured_prefill(srv, session_id, model_name, measured) -> None:
+    """Emit the one-per-dispatch ``prefill_progress_measured`` line (F2 AC6).
+
+    Shared by the streaming capture loop and the early-abort path so an
+    aborted dispatch still reports the measured-vs-priced numbers (F4 AC6).
+    Never raises.
+    """
+    try:
+        srv.logger.info(
+            "%s session=%s model=%s %s",
+            _measured_prefill.PREFILL_PROGRESS_EVENT,
+            session_id or "unknown",
+            model_name or "unknown",
+            measured.log_fields(),
+        )
+    except Exception:
+        pass
+
+
+async def _stamp_measured_prefill_record(srv, endpoint, session_id, measured) -> None:
+    """Expose the measurement on the dispatch record (F2 AC3). Never raises."""
+    try:
+        _lock = getattr(srv, "local_dispatch_records_lock", None)
+        if _lock is None:
+            return
+        record_key = _dispatch_lease_key(endpoint, session_id)
+        async with _lock:
+            _record = getattr(srv, "local_dispatch_records", {}).get(record_key)
+            if isinstance(_record, dict):
+                _record[_measured_prefill.DISPATCH_RECORD_KEY] = measured.as_dict()
+    except Exception:
+        pass
+
+
 # Imports from sibling extracted modules
 import proxy.metrics as metrics  # noqa: E402
 from proxy import cold_start  # noqa: E402
@@ -63,6 +112,10 @@ from proxy.lifecycle import (  # noqa: E402
     _is_self_healing_active,
     _resolve_slot_model_name,
     _self_healing_response,
+)
+from proxy.measured_cache_abort import (  # noqa: E402
+    MEASURED_CACHE_DEFICIT_REASON,
+    AbortSettings,
 )
 from proxy.observability import (  # noqa: E402
     _increment_tokens,
@@ -130,8 +183,10 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_local_active_queries,
     _increment_per_model_query,
     _normalize_outgoing_headers,
+    _prefetch_measured_cache_abort,
     _record_prefill_thrash_cooldown,
     _release_client_disconnect_dispatch,
+    _release_measured_cache_abort_dispatch,
     _release_prefill_deadline_dispatch,
     _request_dedup_hash,
     _schedule_recv_token_increment,
@@ -1166,6 +1221,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     _prompt_progress_capture_enabled = False
     _suppress_progress_events = False
     _priced_new_tokens = None
+    # Resolved early-abort settings (LP-0MVR7IN0O000DPXN AC4). ``None`` means
+    # "no decision can fire": the feature is disabled, or the configuration
+    # was unreadable (``AbortSettings.from_config`` fails open to disabled).
+    _measured_abort_settings = None
     if isinstance(body_json, dict) and body_json.get("stream"):
         try:
             if _measured_prefill.capture_enabled(server_config):
@@ -1181,10 +1240,16 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     getattr(request, "_local_admission_evidence", None),
                     _estimated_tokens,
                 )
+                _resolved_abort_settings = AbortSettings.from_config(
+                    server_config
+                )
+                if _resolved_abort_settings.enabled:
+                    _measured_abort_settings = _resolved_abort_settings
         except Exception:
             # Fail-open (AC5): an injection failure forwards the original body.
             _prompt_progress_capture_enabled = False
             _suppress_progress_events = False
+            _measured_abort_settings = None
 
     try:
         from proxy import priority as _priority_mod
@@ -1599,16 +1664,85 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             async with srv.local_dispatch_records_lock:
                                 if _record_key in srv.local_dispatch_records:
                                     srv.local_dispatch_records[_record_key]["stream_cm"] = cm
-                                    # LP-0MVN4LCED00661MX AC3: the dispatch has
-                                    # now served its first byte, so any later
-                                    # release is normal churn, not an eviction
-                                    # error (classified by this flag, never by
-                                    # the release path).
-                                    srv.local_dispatch_records[_record_key][
-                                        "first_byte_seen"
-                                    ] = True
+                                    # NOTE (LP-0MVR7IN0O000DPXN): the
+                                    # ``first_byte_seen`` flag is NOT set here
+                                    # any more. With ``return_progress``
+                                    # injected (F2) the SSE headers arrive at
+                                    # prefill START, so this point no longer
+                                    # proves a byte was served — marking it
+                                    # would hide a later measured-deficit or
+                                    # deadline eviction (AC6). It is marked
+                                    # when the first client-visible data chunk
+                                    # is actually forwarded below.
                         except Exception:
                             pass
+                        # ── Measured cache-deficit early abort (LP-0MVR7IN0O000DPXN) ──
+                        # Option D's abort must be decided BEFORE this handler commits
+                        # the response: once SSE headers reach the client a local
+                        # dispatch can no longer fall through to a remote provider, so
+                        # the abort would be a hard client-visible cut instead of the
+                        # deadline's detour (AC3). The peek consumes raw upstream
+                        # chunks (replayed by ``stream_generator`` in order, so the
+                        # client-visible stream is byte-identical) until the first
+                        # ``prompt_progress`` measurement decides, or the first
+                        # client-visible event arrives.
+                        #
+                        # Fail-open (AC5): any peek problem (exception, no progress,
+                        # unreadable measurement) simply hands the already-read bytes
+                        # plus the same iterator/reframer to the normal loop, which is
+                        # then exactly the pre-change behaviour.
+                        _prefetched_chunks: list[bytes] = []
+                        _prefetched_reframer = None
+                        _prefetched_aiter = None
+                        _prefetch_error = None
+                        if (
+                            _prompt_progress_capture_enabled
+                            and _measured_abort_settings is not None
+                        ):
+                            try:
+                                _prefetched_reframer = SSEEventReframer()
+                                _prefetched_aiter = response.aiter_bytes().__aiter__()
+                                # The prefill deadline (and the wedge ceiling it
+                                # tightens) still bounds the pre-first-byte wait: with
+                                # ``return_progress`` the headers arrive at prefill
+                                # start, so this peek — not the first-byte monitor — is
+                                # where that bound now applies.
+                                _prefetch_timeout = _get_first_byte_timeout_seconds(srv)
+                                if _prefetch_timeout > 0:
+                                    if isinstance(_dispatch_start, float):
+                                        _prefetch_timeout -= max(
+                                            0.0,
+                                            time.monotonic() - _dispatch_start,
+                                        )
+                                    if _prefetch_timeout <= 0:
+                                        # The ceiling already expired: run the
+                                        # deadline detour instead of an
+                                        # unbounded peek.
+                                        raise TimeoutError()
+                                _prefetch = await _prefetch_measured_cache_abort(
+                                    _prefetched_aiter,
+                                    _prefetched_reframer,
+                                    settings=_measured_abort_settings,
+                                    priced_new_tokens=_priced_new_tokens,
+                                    timeout=_prefetch_timeout,
+                                )
+                                _prefetched_chunks = list(_prefetch.chunks)
+                                _prefetch_error = _prefetch.error
+                                if _prefetch.abort:
+                                    raise MeasuredCacheAbortDetourError(
+                                        _prefetch.decision, _prefetch.measured
+                                    )
+                            except MeasuredCacheAbortDetourError:
+                                raise
+                            except TimeoutError:
+                                # The deadline expired while peeking: run TODAY'S
+                                # deadline detour (release + retryable 503) rather
+                                # than losing the bound to the early-abort feature.
+                                raise
+                            except Exception:
+                                # Fail-open (AC5): keep every byte already read.
+                                _prefetch_error = None
+
                         restore_signal_detected = _has_explicit_restore_signal(
                             dict(response.headers), None
                         )
@@ -1679,6 +1813,119 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 )
                             )
                         raise
+                    except MeasuredCacheAbortDetourError as _abort_exc:
+                        # ── Option D early release (LP-0MVR7IN0O000DPXN) ──
+                        # The measured ``prompt_progress`` proved this dispatch is
+                        # re-prefilling far more than admission priced. Release
+                        # the accepted dispatch NOW (seconds, not the 120 s
+                        # deadline), log ``local_eviction_after_acceptance
+                        # reason=measured_cache_deficit`` with the measured
+                        # evidence, and return the same retryable 503 the
+                        # deadline returns so the provider chain detours to a
+                        # remote provider (AC1/AC3/AC6).
+                        _abort_measured = _abort_exc.measured
+                        _abort_decision = _abort_exc.decision
+                        try:
+                            _abort_elapsed = (
+                                max(0.0, time.monotonic() - _dispatch_start)
+                                if isinstance(_dispatch_start, float)
+                                else 0.0
+                            )
+                        except Exception:
+                            _abort_elapsed = 0.0
+                        # The measurement itself stays attributable exactly as
+                        # on a served dispatch (F2 AC6) — the aborted dispatch
+                        # never reaches the stream loop that would log it.
+                        _log_measured_prefill(
+                            srv, session_id, model_name, _abort_measured
+                        )
+                        await _stamp_measured_prefill_record(
+                            srv, endpoint, session_id, _abort_measured
+                        )
+                        try:
+                            srv.logger.warning(
+                                "measured_cache_abort session=%s model=%s "
+                                "reason=%s total=%s cache=%s "
+                                "measured_new_tokens=%s priced_new_tokens=%s "
+                                "deficit_ratio=%s bound_tokens=%s "
+                                "elapsed_s=%.1f → cancelling local dispatch "
+                                "early and detouring to the next provider",
+                                session_id or "unknown",
+                                model_name or "unknown",
+                                MEASURED_CACHE_DEFICIT_REASON,
+                                _abort_measured.total
+                                if _abort_measured is not None else "unknown",
+                                _abort_measured.cache
+                                if _abort_measured is not None else "unknown",
+                                _abort_decision.measured_new_tokens,
+                                _abort_decision.priced_new_tokens,
+                                _abort_decision.deficit_ratio,
+                                _abort_decision.bound_tokens,
+                                _abort_elapsed,
+                            )
+                        except Exception:
+                            pass
+                        # Cooldown machinery (AC7): the dispatch just proved
+                        # local cannot serve this prompt in time, so arm the
+                        # same per-session window the deadline arms — the next
+                        # request must not re-prefill the identical prompt.
+                        try:
+                            _abort_cooldown_deadline = _record_prefill_thrash_cooldown(
+                                session_id,
+                                server_config,
+                                tokens=_estimated_tokens,
+                            )
+                            if _abort_cooldown_deadline > 0:
+                                srv.logger.info(
+                                    "prefill_thrash_cooldown_started "
+                                    "session=%s cooldown_s=%.0f",
+                                    session_id if session_id else "unknown",
+                                    _get_prefill_thrash_cooldown_seconds(
+                                        server_config
+                                    ),
+                                )
+                        except Exception:
+                            pass
+                        # Release the lease/marker/counters exactly like the
+                        # deadline path (AC7) and close the upstream stream.
+                        try:
+                            await _release_measured_cache_abort_dispatch(
+                                srv,
+                                session_id,
+                                endpoint=endpoint,
+                                request=request,
+                                measured=_abort_measured,
+                                priced_new_tokens=_priced_new_tokens,
+                            )
+                        except Exception:
+                            pass
+                        _abort_cleanup_timeout = server_config.get(
+                            "disconnect_cleanup_timeout", 5.0
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                cm.__aexit__(None, None, None),
+                                timeout=_abort_cleanup_timeout,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            await asyncio.wait_for(
+                                client.aclose(), timeout=_abort_cleanup_timeout
+                            )
+                        except Exception:
+                            pass
+                        await _cleanup_after_request(
+                            srv, session_id,
+                            decrement_local=True,
+                            session_explicit=session_explicit,
+                            request=request,
+                            backend=endpoint,
+                        )
+                        return _build_backend_error_response(
+                            srv, path, session_id, session_created,
+                            is_delta_request, session_fallback_reason,
+                        )
                     except Exception as _exc:
                         # LP-0MUCEFB8E003YVFF: distinct, observable log line
                         # when the first-byte ceiling aborts a stuck prefill.
@@ -1917,8 +2164,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # Re-frame upstream bytes to SSE event boundaries
                         # (LP-0MUOBUPBC002GYTL): only complete events reach the
                         # client; a trailing partial is dropped before the
-                        # synthesised terminal events.
-                        _reframer = SSEEventReframer()
+                        # synthesised terminal events. When the early-abort
+                        # peek (LP-0MVR7IN0O000DPXN) already consumed bytes it
+                        # hands over ITS reframer so a split event is not lost.
+                        _reframer = (
+                            _prefetched_reframer
+                            if _prefetched_reframer is not None
+                            else SSEEventReframer()
+                        )
 
                         # LP-0MVR7DAFF006HBRX AC2: per-dispatch capture of the
                         # measured ``prompt_progress`` events. ``None`` when the
@@ -1937,25 +2190,9 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
                         async def _stamp_measured_prefill(_measured):
                             """Expose the measurement on the dispatch record (AC3)."""
-                            try:
-                                _lock = getattr(
-                                    srv, "local_dispatch_records_lock", None
-                                )
-                                if _lock is None:
-                                    return
-                                _record_key = _dispatch_lease_key(
-                                    endpoint, session_id
-                                )
-                                async with _lock:
-                                    _record = getattr(
-                                        srv, "local_dispatch_records", {}
-                                    ).get(_record_key)
-                                    if isinstance(_record, dict):
-                                        _record[_measured_prefill.DISPATCH_RECORD_KEY] = (
-                                            _measured.as_dict()
-                                        )
-                            except Exception:
-                                pass
+                            await _stamp_measured_prefill_record(
+                                srv, endpoint, session_id, _measured
+                            )
 
                         async def _observe_prompt_progress(_event):
                             """Capture one reframed event; True when it carried progress.
@@ -1980,12 +2217,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 )
                                 if _prompt_progress.events_seen == 1:
                                     # AC6: one attributable line per dispatch.
-                                    srv.logger.info(
-                                        "%s session=%s model=%s %s",
-                                        _measured_prefill.PREFILL_PROGRESS_EVENT,
-                                        session_id or "unknown",
-                                        model_name or "unknown",
-                                        _measured.log_fields(),
+                                    _log_measured_prefill(
+                                        srv, session_id, model_name, _measured
                                     )
                                     await _stamp_measured_prefill(_measured)
                             except Exception:
@@ -2035,9 +2268,30 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             _generating_slot_counted = False
                             # Dispatch→first-byte capture uses this stable per-stream scope
                             _first_byte_emitted = False
-                            _stream_aiter = response.aiter_bytes().__aiter__()
+                            _stream_aiter = (
+                                _prefetched_aiter
+                                if _prefetched_aiter is not None
+                                else response.aiter_bytes().__aiter__()
+                            )
+                            # LP-0MVR7IN0O000DPXN: raw reads the early-abort peek
+                            # already consumed are replayed FIRST (in order, byte
+                            # for byte) so the peek never loses or reorders
+                            # client-visible data. A read error the peek captured
+                            # is re-raised once the buffer is drained, so the
+                            # existing stream-error path still reports it.
+                            _pending_chunks = _prefetched_chunks
+                            _pending_error = _prefetch_error
+
+                            async def _next_stream_chunk():
+                                """Next upstream read: replayed peek bytes, then live."""
+                                if _pending_chunks:
+                                    return _pending_chunks.pop(0)
+                                if _pending_error is not None:
+                                    raise _pending_error
+                                return await _stream_aiter.__anext__()
+
                             _stream_iter = asyncio.ensure_future(
-                                _stream_aiter.__anext__()
+                                _next_stream_chunk()
                             )
                             _heartbeat_interval = stream_heartbeat_interval
                             remaining_budget = runtime_budget
@@ -2310,6 +2564,25 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     # generating phase and gives the distribution-relevant latency
                                     # without request-ID correlation (LP-0MTJET616005S7PN).
                                     if not _first_byte_emitted:
+                                        # LP-0MVN4LCED00661MX AC3: a real
+                                        # client-visible data chunk means the
+                                        # dispatch is served, so any LATER
+                                        # release is normal churn rather than a
+                                        # post-acceptance eviction. Stamped
+                                        # here (not at the SSE headers) because
+                                        # ``return_progress`` makes the headers
+                                        # arrive at prefill start
+                                        # (LP-0MVR7IN0O000DPXN).
+                                        try:
+                                            from proxy.router_helpers import (
+                                                mark_local_first_byte,
+                                            )
+
+                                            mark_local_first_byte(
+                                                srv, session_id, endpoint=endpoint
+                                            )
+                                        except Exception:
+                                            pass
                                         try:
                                             _now = time.monotonic()
                                             _delta = (_now - _dispatch_start) if isinstance(_dispatch_start, float) else None
@@ -2548,7 +2821,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
 
                                 # Prepare the next anext task
                                 _stream_iter = asyncio.ensure_future(
-                                    _stream_aiter.__anext__()
+                                    _next_stream_chunk()
                                 )
 
                             # Synthesize final SSE event if upstream closed without finish marker.

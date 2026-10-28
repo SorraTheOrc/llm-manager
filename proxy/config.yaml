@@ -2026,6 +2026,60 @@ server:
   local_prefill_thrash_recovery_fraction: 0.9
 
   # -----------------------------------------------------------------------
+  # Measured cache-deficit early abort (LP-0MVR7IN0O000DPXN, parent Option D)
+  # -----------------------------------------------------------------------
+  # Admission-time warmth is only a PREDICTION: ``routing_resident_prefix``
+  # decisions carry ``n_past_actual=none``, so a slot owner is admitted at
+  # ``reuse_ratio=1.0`` even when llama-server is about to re-prefill the prompt
+  # from scratch (measured 2026-10-26: 29 of 116 deadline evictions were ~56k
+  # prompts priced at 17-182 new tokens, cancelled at 120 s).
+  #
+  # With these keys enabled the proxy asks llama-server (b8782) for
+  # ``prompt_progress`` inside the SSE stream (``return_progress: true`` on a
+  # COPY of the client body — the key never reaches recorded payloads) and, at
+  # the first progress event, compares the MEASURED compute (``total - cache``)
+  # with the admission-priced ``new_tokens``. When the measurement proves the
+  # dispatch is re-prefilling far more than priced, the proxy releases the
+  # accepted dispatch in SECONDS (not at the 120 s deadline), logs
+  # ``local_eviction_after_acceptance reason=measured_cache_deficit`` with the
+  # measured evidence (``total``, ``measured_cache``, ``priced_new_tokens``,
+  # ``elapsed_s``) and returns the same retryable 503 the deadline returns, so
+  # the request detours to the next (remote) provider.
+  #
+  # The abort needs BOTH conditions, in this order:
+  #   1. measured deficit ratio ``(total - cache) / total`` >= the ratio floor.
+  #      A genuinely warm dispatch shows ``cache >= 0.99 * total`` (ratio
+  #      <= 0.01), so no prompt size and no token bound can ever trip it;
+  #   2. measured new tokens exceed the priced ``new_tokens`` by more than the
+  #      token bound.
+  # Both bounds are monotone in the safe direction (raising either only makes
+  # an abort less likely). Nothing in the path can raise: a missing/partial/
+  # malformed measurement, a capture or decision error, or a stream that never
+  # emits ``prompt_progress`` all degrade to today's behaviour, including the
+  # full 120 s deadline path (fail open — never a hard local outage).
+  #
+  # ROLLBACK: set ``local_measured_cache_abort_enabled: 0``. One value change
+  # restores the exact pre-change behaviour end to end (no ``return_progress``
+  # injection, no measurement capture, no early release; the full deadline
+  # path applies). No code change and no restart-ordering constraint beyond
+  # the usual process restart.
+  #
+  # Measurement window: the post-deploy attribution (parent F6) counts this
+  # reason separately from ``prefill_deadline`` so the wasted-token reduction
+  # can be quantified without touching the admission ladder.
+  local_measured_cache_abort_enabled: true
+  # Absolute token slack above the admission-priced ``new_tokens`` before an
+  # abort (default 2000). ``0`` means "abort as soon as the measurement
+  # exceeds the price" — still unreachable for a genuinely warm dispatch
+  # because the ratio floor is checked first.
+  local_measured_cache_abort_bound_tokens: 2000
+  # Minimum measured ``(total - cache) / total`` for an abort (default 0.25).
+  # This is what makes the warm path unreachable: a warm dispatch's deficit
+  # ratio is <= 0.01. Values above 1.0 (or malformed values) disable the
+  # early abort rather than admitting a guess.
+  local_measured_cache_abort_min_deficit_ratio: 0.25
+
+  # -----------------------------------------------------------------------
   # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
   # -----------------------------------------------------------------------
   # When the local backend has been idle for ``local_idle_admit_seconds`` and

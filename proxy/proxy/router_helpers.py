@@ -2677,18 +2677,25 @@ def _emit_eviction_after_acceptance(
     record: dict | None,
     *,
     endpoint: str | None = None,
+    extra_fields: Mapping[str, Any] | None = None,
 ) -> bool:
     """Report an accepted-and-unserved dispatch release (AC1/AC7).
 
     Thin wrapper over :func:`proxy.admission_events.record_eviction_after_acceptance`
-    so the six release paths share one call shape. Never raises: an eviction
-    path is already an exceptional path.
+    so the release paths share one call shape; *extra_fields* carries the
+    caller-specific measured evidence (LP-0MVR7IN0O000DPXN AC6). Never raises:
+    an eviction path is already an exceptional path.
     """
     try:
         from proxy.admission_events import record_eviction_after_acceptance
 
         return record_eviction_after_acceptance(
-            srv, session_key, reason, record, endpoint=endpoint
+            srv,
+            session_key,
+            reason,
+            record,
+            endpoint=endpoint,
+            extra_fields=extra_fields,
         )
     except Exception:
         return False
@@ -3022,31 +3029,37 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     return removed
 
 
-async def _release_prefill_deadline_dispatch(
+async def _release_unserved_dispatch(
     srv,
     session_key: str | None,
     endpoint: str | None = None,
     request: Request | None = None,
-) -> bool:
-    """Release the dispatch lease + in-flight marker of a deadline-cancelled dispatch.
+    *,
+    release_reason: str,
+    eviction_reason: str,
+    extra_eviction_fields: Mapping[str, Any] | None = None,
+) -> tuple[bool, dict | None]:
+    """Release an ACCEPTED-but-unserved dispatch lease and in-flight marker.
 
-    LP-0MVKUKFSO008GI6O AC1: when ``prefill_deadline_exceeded`` cancels a
-    local dispatch that never produced a first byte, the session's lease must
-    be released on the spot — the pre-fix cleanup only marked the record
-    inactive with a *future* ``expires_at`` (``lease_renewed``) and left the
-    ``local_prefill_in_flight`` marker in place, so a wedged session re-
-    acquired the lease for hours (2026-10-23 incident: ~4 h hold, 2,056
-    other-session denials, ``available_slots=0``).
+    Shared core of every "cancel the local dispatch before its first byte"
+    path — the prefill deadline (LP-0MVKUKFSO008GI6O) and the measured
+    cache-deficit early abort (LP-0MVR7IN0O000DPXN) — so the lease, marker,
+    eviction snapshot, counters and contention-queue wake stay identical
+    instead of drifting apart in two copies.
 
     Deletes the dispatch record (any key form — legacy string or per-endpoint
     tuple) and pops the marker for *session_key* (and only that session),
-    emitting ``lease_released session=... reason=prefill_deadline``. Returns
-    True when a record was removed. Fail-soft: the deadline path is already
-    an exceptional path and must never raise. Wakes the cross-session
-    contention queue when a lease was freed.
+    emitting ``lease_released session=... reason=<release_reason>``. Emits the
+    post-acceptance eviction snapshot with *eviction_reason* (and any extra
+    measured evidence) before the slot assignment is freed, so a returning
+    session restores its resident prefix warm.
+
+    Returns ``(removed, released_record)``. Fail-soft: these are exceptional
+    paths and must never raise. Wakes the cross-session contention queue when
+    state was released.
     """
     if not session_key:
-        return False
+        return (False, None)
     removed = False
     released_record = None
     record_key = _dispatch_lease_key(endpoint, session_key)
@@ -3065,9 +3078,10 @@ async def _release_prefill_deadline_dispatch(
             if removed:
                 try:
                     srv.logger.info(
-                        "lease_released session=%s reason=prefill_deadline "
+                        "lease_released session=%s reason=%s "
                         "endpoint=%s",
                         session_key if session_key else "unknown",
+                        release_reason,
                         endpoint or "default",
                         extra=_client_identity_extra(request),
                     )
@@ -3092,25 +3106,26 @@ async def _release_prefill_deadline_dispatch(
     except Exception:
         pass
     if removed or marker_popped:
-        # LP-0MVN1IQTF0037WTG AC6: a deadline-cancelled dispatch evicts the
-        # session's lease. Record it through the shared eviction event and
-        # plan the KV snapshot *before* the slot assignment is freed below, so
-        # the session that retries restores its resident prefix warm.
+        # LP-0MVN1IQTF0037WTG AC6: a cancelled dispatch evicts the session's
+        # lease. Record it through the shared eviction event and plan the KV
+        # snapshot *before* the slot assignment is freed below, so the
+        # session that retries restores its resident prefix warm.
         _record_local_eviction(
             srv,
             session_key,
             endpoint=endpoint,
             reason="lease_evicted",
         )
-        # LP-0MVN4LCED00661MX AC1: an ACCEPTED dispatch cancelled by the
-        # deadline before its first byte is the defect signal the whole
-        # budget/pricing model exists to prevent — reported at ERROR.
+        # LP-0MVN4LCED00661MX AC1: an ACCEPTED dispatch cancelled before its
+        # first byte is the defect signal the whole budget/pricing model
+        # exists to prevent — reported at ERROR.
         _emit_eviction_after_acceptance(
             srv,
             session_key,
-            "prefill_deadline",
+            eviction_reason,
             released_record,
             endpoint=endpoint,
+            extra_fields=extra_eviction_fields,
         )
         try:
             from proxy.contention_queue import wake
@@ -3118,7 +3133,234 @@ async def _release_prefill_deadline_dispatch(
             await wake(1)
         except Exception:
             pass
+    return (removed, released_record)
+
+
+async def _release_prefill_deadline_dispatch(
+    srv,
+    session_key: str | None,
+    endpoint: str | None = None,
+    request: Request | None = None,
+) -> bool:
+    """Release the dispatch lease + in-flight marker of a deadline-cancelled dispatch.
+
+    LP-0MVKUKFSO008GI6O AC1: when ``prefill_deadline_exceeded`` cancels a
+    local dispatch that never produced a first byte, the session's lease must
+    be released on the spot — the pre-fix cleanup only marked the record
+    inactive with a *future* ``expires_at`` (``lease_renewed``) and left the
+    ``local_prefill_in_flight`` marker in place, so a wedged session re-
+    acquired the lease for hours (2026-10-23 incident: ~4 h hold, 2,056
+    other-session denials, ``available_slots=0``).
+
+    Delegates to :func:`_release_unserved_dispatch` (shared with the measured
+    cache-deficit early abort), emitting ``lease_released session=...
+    reason=prefill_deadline`` and the ``local_eviction_after_acceptance
+    reason=prefill_deadline`` snapshot. Returns True when a record was
+    removed.
+    """
+    removed, _record = await _release_unserved_dispatch(
+        srv,
+        session_key,
+        endpoint=endpoint,
+        request=request,
+        release_reason="prefill_deadline",
+        eviction_reason="prefill_deadline",
+    )
     return removed
+
+
+async def _release_measured_cache_abort_dispatch(
+    srv,
+    session_key: str | None,
+    endpoint: str | None = None,
+    request: Request | None = None,
+    *,
+    measured: Any | None = None,
+    priced_new_tokens: float | None = None,
+) -> bool:
+    """Release the lease of a dispatch aborted on a measured cache deficit.
+
+    The early-abort twin of :func:`_release_prefill_deadline_dispatch`
+    (LP-0MVR7IN0O000DPXN AC1/AC6/AC7): identical lease + marker + counter
+    release, but logged as ``reason=measured_cache_deficit`` so the early
+    detour is attributable and never counted as a 120 s deadline eviction. The
+    eviction snapshot additionally carries the *measured* evidence
+    (``measured_cache`` / ``total`` / ``priced_new_tokens``) the decision used.
+
+    Returns True when a record was removed.
+    """
+    from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
+
+    extra_fields: dict[str, Any] = {}
+    try:
+        total = getattr(measured, "total", None)
+        cache = getattr(measured, "cache", None)
+        if total is not None:
+            extra_fields["total"] = total
+        if cache is not None:
+            extra_fields["measured_cache"] = cache
+        if priced_new_tokens is not None:
+            extra_fields["priced_new_tokens"] = priced_new_tokens
+    except Exception:
+        extra_fields = {}
+
+    removed, _record = await _release_unserved_dispatch(
+        srv,
+        session_key,
+        endpoint=endpoint,
+        request=request,
+        release_reason=MEASURED_CACHE_DEFICIT_REASON,
+        eviction_reason=MEASURED_CACHE_DEFICIT_REASON,
+        extra_eviction_fields=extra_fields or None,
+    )
+    return removed
+
+
+@dataclass
+class MeasuredAbortPrefetch:
+    """Outcome of :func:`_prefetch_measured_cache_abort` (LP-0MVR7IN0O000DPXN).
+
+    The router replays ``chunks`` (the raw upstream reads already consumed,
+    in order) through its normal stream loop before reading anything new, so
+    the peek never loses bytes and never changes the client-visible stream.
+    """
+
+    chunks: list[bytes]
+    abort: bool = False
+    decision: Any | None = None
+    measured: Any | None = None
+    complete: bool = False
+    error: BaseException | None = None
+
+
+async def _prefetch_measured_cache_abort(
+    aiter: Any,
+    reframer: Any,
+    *,
+    settings: Any | None = None,
+    priced_new_tokens: float | None = None,
+    timeout: float = 5.0,
+    max_chunks: int = 1024,
+) -> MeasuredAbortPrefetch:
+    """Peek the local SSE stream for the first ``prompt_progress`` measurement.
+
+    Option D (LP-0MVR7IN0O000DPXN AC1) needs the abort decision BEFORE the
+    response is committed to the client — once headers/bytes have been sent a
+    mid-stream failure can no longer detour the request to a remote provider.
+    This helper reads ahead of the stream reframer: it consumes raw chunks
+    (returned for byte-identical replay) until one of:
+
+    - a complete reframed event carries ``prompt_progress`` → run the F3
+      decision ONCE. Abort ⇒ ``abort=True`` with the decision and the
+      :class:`proxy.measured_prefill.MeasuredPrefill` measurement. No abort ⇒
+      keep peeking: the first event's ``cache`` is the final reused prefix, so
+      later progress events add no decision information (F1/F3), but staying
+      in the peek keeps ``local_prefill_deadline_seconds`` bounding the whole
+      pre-first-byte wait (with ``return_progress`` the SSE headers arrive at
+      prefill START, so no later code path enforces it);
+    - a complete reframed non-progress event arrives → stop peeking and replay
+      (that event is the first client-visible byte; the peek must not delay
+      it — this also reproduces the pre-change "headers at first token"
+      timing);
+    - the stream ends (``complete=True``), a read raises (``error``), the
+      deadline elapses (``asyncio.TimeoutError`` — the caller runs today's
+      deadline detour), or the *max_chunks* bound is hit (continue).
+
+    Fail-open by contract (AC5): an unexpected exception while observing an
+    event degrades to *continue* with the consumed chunks replayed, never a
+    raised error. ``settings``/``priced_new_tokens`` come from the router's
+    fail-open-resolved configuration; ``None`` prices simply continue.
+
+    *aiter* is the dispatch's ``aiter_bytes()`` iterator and *reframer* its
+    :class:`proxy.utils.SSEEventReframer`, both owned by the caller: the peek
+    must consume the SAME cursor and event buffer the normal stream loop
+    continues with, otherwise a split event would be lost (or the body
+    re-read). Neither is re-created here.
+    """
+    from proxy.measured_cache_abort import (
+        AbortSettings,
+        decide_measured_cache_abort,
+    )
+    from proxy.measured_prefill import MeasuredPrefill
+    from proxy.prompt_progress import PromptProgressCapture
+
+    effective = AbortSettings() if settings is None else settings
+    if not isinstance(effective, AbortSettings) or not effective.enabled:
+        return MeasuredAbortPrefetch(chunks=[], abort=False)
+
+    chunks: list[bytes] = []
+    capture = PromptProgressCapture()
+    decided_measured = None
+    deadline_at = time.monotonic() + timeout if timeout > 0 else None
+
+    while len(chunks) < max_chunks:
+        remaining = None
+        if deadline_at is not None:
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError()
+        read_task = asyncio.ensure_future(aiter.__anext__())
+        try:
+            done, _pending = await asyncio.wait({read_task}, timeout=remaining)
+        except BaseException:
+            read_task.cancel()
+            try:
+                await read_task
+            except BaseException:
+                pass
+            raise
+        if not done:
+            read_task.cancel()
+            try:
+                await read_task
+            except BaseException:
+                pass
+            raise TimeoutError()
+        try:
+            chunk = read_task.result()
+        except StopAsyncIteration:
+            return MeasuredAbortPrefetch(chunks=chunks, complete=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # read error — fail open, replay + raise later
+            return MeasuredAbortPrefetch(chunks=chunks, error=exc)
+        chunks.append(chunk)
+
+        try:
+            for event in reframer.feed(chunk):
+                progress = capture.observe(event)
+                if progress is None:
+                    # First complete client-visible event: stop peeking so the
+                    # replay releases it immediately (AC2 latency).
+                    return MeasuredAbortPrefetch(
+                        chunks=chunks, measured=decided_measured
+                    )
+                if decided_measured is not None:
+                    # Only the FIRST progress event decides (its ``cache`` is
+                    # the final reused prefix); later ones add no decision
+                    # information, so keep peeking for the deadline bound.
+                    continue
+                measured = MeasuredPrefill.from_progress(
+                    progress, priced_new_tokens=priced_new_tokens
+                )
+                decided_measured = measured
+                decision = decide_measured_cache_abort(
+                    progress, priced_new_tokens, effective
+                )
+                if decision.abort:
+                    return MeasuredAbortPrefetch(
+                        chunks=chunks, abort=True, decision=decision, measured=measured
+                    )
+                # No abort: keep peeking so ``local_prefill_deadline_seconds``
+                # keeps bounding the whole pre-first-byte wait.
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            raise
+        except Exception:  # AC5: an observation error degrades
+            return MeasuredAbortPrefetch(chunks=chunks, measured=decided_measured)
+        # No complete event yet (partial/empty read): keep reading.
+    return MeasuredAbortPrefetch(chunks=chunks, measured=decided_measured)
 
 
 class ClientDisconnectedDuringPrefillError(Exception):

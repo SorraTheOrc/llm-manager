@@ -475,28 +475,34 @@ async def test_rollback_key_disables_injection_and_capture():
 
 @pytest.mark.asyncio
 async def test_progress_events_are_captured_per_dispatch():
-    """AC2/AC3: the latest measurement is recorded and exposed."""
+    """AC2/AC3: the latest measurement is recorded and exposed.
+
+    The measurement is a WARM one (``cache ≈ total``) because the F4 wiring
+    (LP-0MVR7IN0O000DPXN) releases a dispatch whose measurement shows a real
+    cache deficit before its stream is committed — a fake-warm fixture here
+    would now (correctly) never reach the capture loop below.
+    """
     # b8782 fixes ``cache`` (``n_prompt_tokens_cache``) before prefill starts;
     # only ``processed``/``time_ms`` advance with later events.
-    first = _progress_event(56_000, 200, processed=0, time_ms=0)
-    later = _progress_event(56_000, 200, processed=8_192, time_ms=410)
+    first = _progress_event(56_000, 55_800, processed=0, time_ms=0)
+    later = _progress_event(56_000, 55_800, processed=8_192, time_ms=410)
     received, _sent, srv, _record = await _drive_local_stream(
         _stream_body(), [first, _CONTENT_CHUNK, later, _FINISH_CHUNK, _DONE]
     )
 
     measured = get_measured_prefill(MODEL, SESSION)
     assert measured is not None
-    assert (measured.total, measured.cache) == (56_000, 200)
+    assert (measured.total, measured.cache) == (56_000, 55_800)
     # The latest event wins in the store (progress advanced).
     assert measured.processed == 8_192
     assert measured.time_ms == 410.0
-    assert measured.measured_cached_ratio == pytest.approx(200 / 56_000)
-    assert measured.measured_new_tokens == 55_800
+    assert measured.measured_cached_ratio == pytest.approx(55_800 / 56_000)
+    assert measured.measured_new_tokens == 200
 
     # AC3: the dispatch record itself exposes the derived numbers.
     record = srv.local_dispatch_records[SESSION]["measured_prefill"]
-    assert record["measured_cached_ratio"] == pytest.approx(200 / 56_000)
-    assert record["measured_new_tokens"] == 55_800
+    assert record["measured_cached_ratio"] == pytest.approx(55_800 / 56_000)
+    assert record["measured_new_tokens"] == 200
     assert record["priced_new_tokens"] == 150.0
 
     # AC4: no progress chunk reached the client.
@@ -534,9 +540,9 @@ async def test_client_stream_is_unchanged_when_progress_is_injected():
     with_progress, _sent2, _srv2, _record2 = await _drive_local_stream(
         _stream_body(),
         [
-            _progress_event(56_000, 200, processed=0, time_ms=0),
+            _progress_event(56_000, 55_800, processed=0, time_ms=0),
             _CONTENT_CHUNK,
-            _progress_event(56_000, 54_000, processed=2_048, time_ms=120),
+            _progress_event(56_000, 55_800, processed=2_048, time_ms=120),
             _FINISH_CHUNK,
             _DONE,
         ],
@@ -548,10 +554,14 @@ async def test_client_stream_is_unchanged_when_progress_is_injected():
 
 @pytest.mark.asyncio
 async def test_client_requested_progress_is_forwarded_unchanged():
-    """A client that asked for ``return_progress`` keeps its own events."""
+    """A client that asked for ``return_progress`` keeps its own events.
+
+    Warm measurement: the F4 wiring only rewrites the dispatch when the
+    measurement proves a cache deficit (see the F4 suite).
+    """
     body = _stream_body()
     body["return_progress"] = True
-    progress = _progress_event(56_000, 200)
+    progress = _progress_event(56_000, 55_800)
     received, sent_body, _srv, _record = await _drive_local_stream(
         body, [progress, _CONTENT_CHUNK, _FINISH_CHUNK, _DONE]
     )
@@ -637,11 +647,16 @@ async def test_capture_exception_never_escapes_the_stream_loop():
 
 @pytest.mark.asyncio
 async def test_prefill_progress_measured_line_carries_attributable_fields():
-    """AC6: one structured line per dispatch with the measured/priced numbers."""
+    """AC6: one structured line per dispatch with the measured/priced numbers.
+
+    A WARM measurement: the F4 wiring (LP-0MVR7IN0O000DPXN) releases a
+    fake-warm dispatch before the stream loop logs this line (that path logs
+    it from the abort handler instead).
+    """
     received, _sent, srv, _record = await _drive_local_stream(
         _stream_body(),
         [
-            _progress_event(56_000, 200, processed=0, time_ms=0),
+            _progress_event(56_000, 55_800, processed=0, time_ms=0),
             _CONTENT_CHUNK,
             _FINISH_CHUNK,
             _DONE,
@@ -655,9 +670,9 @@ async def test_prefill_progress_measured_line_carries_attributable_fields():
     assert f"model={MODEL}" in line
     fields = dict(re.findall(r"(\w+)=(\S+)", line))
     assert fields["total"] == "56000"
-    assert fields["cache"] == "200"
+    assert fields["cache"] == "55800"
     assert fields["processed"] == "0"
-    assert fields["measured_cached_ratio"] == "0.0036"
+    assert fields["measured_cached_ratio"] == "0.9964"
     assert fields["priced_new_tokens"] == "150"
     assert _FINISH_CHUNK in received
 
