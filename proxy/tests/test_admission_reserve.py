@@ -21,6 +21,15 @@ Covers:
   same function — identical outcomes for identical inputs.
 - AC8: fail-open/backcompat — unknown preference values, missing fields and a
   missing ticket behave exactly as today; an uncalibrated reserve admits.
+
+The single-implementation contract (LP-0MVSMROLM005RO71, parent AC1) is pinned
+at the end of this module: ``provider.py`` must call
+``admission_reserve.local_capacity_verdict`` once per refusal — the remote-first
+cycle, the local-first cycle (choke point and ``refused_local_only`` branch)
+and the refusal builder all route through it — and must never re-derive the
+verdict. A spy replaces the helper with a sentinel-returning wrapper, so a
+second reason table in ``provider.py`` shows up as a missing call and a 429
+body that does not carry the sentinel.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -1045,3 +1055,243 @@ def test_capacity_verdict_vocabulary_and_module_boundary():
         "admission_reserve must not import provider (import cycle); found "
         f"{providers}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Single-implementation contract: one verdict call per refusal
+# (LP-0MVSMROLM005RO71, child of LP-0MVSMI7JK002FKUF — parent AC1)
+#
+# ``provider.py`` must consume ``admission_reserve.local_capacity_verdict`` and
+# never re-derive the capacity split. The spy below replaces the helper with a
+# recording wrapper returning a sentinel verdict, so a re-derived verdict (or a
+# second reason table in ``provider.py``) shows up as a missing call *and* a
+# 429 body that fails to carry the sentinel.
+#
+# TDD red phase: the wiring child (LP-0MVSMINPR006SWT6) has not landed, so the
+# call-site assertions start ``xfail(strict=True)`` and are flipped by that
+# child in the same change that adds the behaviour.
+# ---------------------------------------------------------------------------
+
+#: A verdict value from *outside* the vocabulary: only a verdict that actually
+#: travelled through the helper can carry it into the 429 body.
+_SPY_SENTINEL = "spy-sentinel-verdict"
+
+_LOCAL_PROVIDER_NAME = "local-llama"
+_REMOTE_PROVIDER_NAME = "remote-fallback"
+
+
+class _CapacityVerdictSpy:
+    """Recording stand-in for the single capacity-verdict helper."""
+
+    def __init__(self, sentinel: str = _SPY_SENTINEL) -> None:
+        self.sentinel = sentinel
+        self.calls: list[dict] = []
+
+    def __call__(self, *args, **kwargs) -> admission_reserve.CapacityVerdict:
+        self.calls.append({"args": args, "kwargs": kwargs})
+        return admission_reserve.CapacityVerdict(
+            verdict=self.sentinel,
+            reason=kwargs.get("reason"),
+        )
+
+
+def _spy_capacity_verdict(sentinel: str = _SPY_SENTINEL):
+    """Patch the helper; return ``(spy, patcher)``.
+
+    Patched at the module ``provider.py`` imports it from — never at the
+    refusal builder, which would let the contract break while the test passes.
+    """
+    spy = _CapacityVerdictSpy(sentinel)
+    return spy, patch("proxy.admission_reserve.local_capacity_verdict", new=spy)
+
+
+def _local_then_remote_chain() -> dict:
+    return {
+        "providers": [
+            {"name": _LOCAL_PROVIDER_NAME, "type": "local", "llama_model": "Qwen3"},
+            {
+                "name": _REMOTE_PROVIDER_NAME,
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+            },
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+
+def _remote_only_chain() -> dict:
+    return {
+        "providers": [
+            {
+                "name": _REMOTE_PROVIDER_NAME,
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+            },
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+
+def _verdict_xfail(reason: str) -> pytest.MarkDecorator:
+    return pytest.mark.xfail(
+        strict=True,
+        reason=(
+            f"capacity-verdict wiring pending (LP-0MVSMINPR006SWT6): {reason}"
+        ),
+    )
+
+
+_VERDICT_WIRING_XFAIL = _verdict_xfail(
+    "provider.py does not call local_capacity_verdict yet, so the spy records "
+    "zero calls and the refusal body carries no verdict"
+)
+
+
+async def _issue_local_first_cycle(
+    preference: str | None,
+    *,
+    tokens: int = _TOKENS,
+    cooldown: bool = False,
+) -> tuple:
+    """Drive ``proxy_with_fallback`` for *preference*; return ``(response, calls)``."""
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    headers = {} if preference is None else {"X-Local-Preference": preference}
+    if cooldown:
+        provider._provider_unavailable_until[_LOCAL_PROVIDER_NAME] = time.time() + 60
+    try:
+        with (
+            patch("proxy.router.proxy_to_local", _local),
+            patch("proxy.server.proxy_to_remote", _remote),
+            patch(
+                "proxy.provider._get_local_concurrency_info",
+                _MutableConcurrency(0, 1),
+            ),
+            patch("proxy.provider.request_priority", return_value="low"),
+            _estimate_patches(tokens),
+        ):
+            result = await provider.proxy_with_fallback(
+                _DummyRequest(headers=headers),
+                "v1/chat/completions",
+                _local_then_remote_chain(),
+                _cfg(),
+            )
+    finally:
+        provider._provider_unavailable_until.pop(_LOCAL_PROVIDER_NAME, None)
+    return result, calls
+
+
+@_VERDICT_WIRING_XFAIL
+@pytest.mark.asyncio
+async def test_remote_first_cycle_routes_through_the_helper_once():
+    """AC1: the remote-first cycle consults the helper once and echoes it."""
+    spy, patcher = _spy_capacity_verdict()
+    calls: list[str] = []
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with patcher, patch("proxy.server.proxy_to_remote", _remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(headers={"X-Local-Preference": "local-only"}),
+            "v1/chat/completions",
+            _remote_only_chain(),
+            _cfg(),
+        )
+
+    assert result.status_code == 429
+    assert calls == [], "the refusal must precede any remote dispatch"
+    assert len(spy.calls) == 1, f"exactly one helper call; got {spy.calls!r}"
+    assert json.loads(result.body)["verdict"] == spy.sentinel
+
+
+@_VERDICT_WIRING_XFAIL
+@pytest.mark.asyncio
+async def test_local_first_choke_point_refusal_routes_through_the_helper_once():
+    """AC1: the local-first choke point (chain cooldown) calls it once."""
+    spy, patcher = _spy_capacity_verdict()
+
+    with patcher:
+        result, calls = await _issue_local_first_cycle("local-only", cooldown=True)
+
+    assert result.status_code == 429
+    assert calls == [], "a pin-local client is never moved to remote"
+    assert result.headers["X-Local-Fallback-Reason"] == "local_provider_cooldown"
+    assert len(spy.calls) == 1, f"exactly one helper call; got {spy.calls!r}"
+    assert json.loads(result.body)["verdict"] == spy.sentinel
+
+
+@_VERDICT_WIRING_XFAIL
+@pytest.mark.asyncio
+async def test_refused_local_only_branch_routes_through_the_helper_once():
+    """AC1: the admission denial branch (``refused_local_only``) calls it once."""
+    spy, patcher = _spy_capacity_verdict()
+    _seed_calibration(100_000)
+
+    with patcher:
+        result, calls = await _issue_local_first_cycle(
+            "local-only", tokens=100_000
+        )
+
+    assert result.status_code == 429
+    assert calls == [], "a pin-local client is never moved to remote"
+    assert len(spy.calls) == 1, f"exactly one helper call; got {spy.calls!r}"
+    assert json.loads(result.body)["verdict"] == spy.sentinel
+
+
+@_VERDICT_WIRING_XFAIL
+def test_refusal_builder_routes_through_the_helper_once():
+    """AC1: the builder itself calls the helper exactly once."""
+    spy, patcher = _spy_capacity_verdict()
+
+    with patcher:
+        result = provider._build_local_only_refusal_response(
+            {
+                "reason": "eta_exceeds_budget_direct",
+                "eta_prefill_seconds": 31.7,
+                "budget_seconds": 60.0,
+            }
+        )
+
+    assert result.status_code == 429
+    assert len(spy.calls) == 1, f"exactly one helper call; got {spy.calls!r}"
+    assert json.loads(result.body)["verdict"] == spy.sentinel
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preference", ["prefer-local", "remote-ok", None])
+async def test_non_refusal_paths_never_call_the_helper(preference):
+    """AC4: no verdict is produced for a request that is not refused."""
+    spy, patcher = _spy_capacity_verdict()
+
+    with patcher:
+        result, calls = await _issue_local_first_cycle(preference)
+
+    assert result.status_code == 200
+    assert calls, "the request must be served, not refused"
+    assert spy.calls == [], f"no helper call on a served request; got {spy.calls!r}"
+
+
+@pytest.mark.asyncio
+async def test_fall_through_on_a_size_refusal_never_calls_the_helper():
+    """AC4: a fall-through (prefer-local over budget) is not a refusal verdict."""
+    spy, patcher = _spy_capacity_verdict()
+    _seed_calibration(100_000)
+
+    with patcher:
+        result, calls = await _issue_local_first_cycle(
+            "prefer-local", tokens=100_000
+        )
+
+    assert result.status_code == 200
+    assert calls == ["remote"]
+    assert spy.calls == [], f"no helper call on a fall-through; got {spy.calls!r}"
