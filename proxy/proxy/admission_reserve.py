@@ -64,6 +64,59 @@ HEADER_RESERVATION = "x-local-reservation"
 HEADER_ROUTE = "X-Local-Route"
 HEADER_FALLBACK_REASON = "X-Local-Fallback-Reason"
 
+# ---------------------------------------------------------------------------
+# Canonical local-route-exit reason tokens (LP-0MVRMC1W6003MV3Y AC1)
+#
+# One table is the single source of truth for the ``X-Local-Fallback-Reason``
+# header, the ``reason=`` fields of the routing log lines and the refusal body
+# ``reason``: an exit that records anything else (or a new exit that records
+# nothing) fails loudly through :func:`canonical_local_fallback_reason`
+# instead of silently drifting between the three observability surfaces.
+#
+# The 2026-10-25 incident was exactly that drift: chain-resolution skips
+# (cooldown / quota / usage-limit reset / ``available_times`` window) and the
+# lease-active ``continue`` left no reason on the request, so a ``local-only``
+# refusal reported the generic ``local_route_unavailable`` instead of why
+# local was unavailable.
+# ---------------------------------------------------------------------------
+
+#: Tokens a local-route exit may stamp on a request. Chain-resolution skips
+#: record the *local* token (a remote entry's cooldown must never mint a local
+#: fallback reason); the lease token names expected local contention; the last
+#: two are the structural refusals used when there was no local route at all
+#: or an exit left no reason behind.
+LOCAL_FALLBACK_REASON_TOKENS: frozenset[str] = frozenset(
+    {
+        # Chain resolution (``_resolve_provider_with_exclusions``).
+        "local_provider_cooldown",
+        "quota_hard_stop",
+        "usage_limit_reset_pending",
+        "outside_available_window",
+        # Lease-active continue: expected contention, not a provider failure.
+        "local_lease_active",
+        # Structural refusals.
+        "local_only_no_local_route",
+        "local_route_unavailable",
+    }
+)
+
+
+def canonical_local_fallback_reason(token: str) -> str:
+    """Return *token* when it belongs to the canonical reason-token table.
+
+    Raises:
+        ValueError: *token* is not a canonical reason token. Callers that add
+            a new local-route exit must canonicalise its token in
+            :data:`LOCAL_FALLBACK_REASON_TOKENS` first, so the header, the
+            ``reason=`` log field and the refusal body can never disagree.
+    """
+    if token not in LOCAL_FALLBACK_REASON_TOKENS:
+        raise ValueError(
+            f"unknown local-fallback reason token {token!r}; add it to "
+            "admission_reserve.LOCAL_FALLBACK_REASON_TOKENS to canonicalise it"
+        )
+    return token
+
 
 @dataclass(frozen=True)
 class Reservation:

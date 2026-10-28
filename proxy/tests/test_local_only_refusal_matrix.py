@@ -32,8 +32,9 @@ Test-first: the rows that a skip path still leaks are marked
 ``xfail(strict=True)`` — ``strict`` so that the implementing children
 (LP-0MVRMC1L3006F0F3 choke point, LP-0MVRMC1W6003MV3Y reason tokens) cannot land
 without flipping the marker off with the behaviour. The choke point flipped
-all but two rows green; the remaining two (``quota_hard_stop``,
-``chain_cooldown``) await the reason-token child's per-branch tokens.
+all but two rows green; the reason-token child's per-branch tokens
+(LP-0MVRMC1W6003MV3Y) turned the remaining two (``quota_hard_stop``,
+``chain_cooldown``) green, so no row is pending today.
 """
 
 from __future__ import annotations
@@ -231,44 +232,13 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
     ),
 )
 
-#: Rows whose refusal does not exist yet: today the skip falls through to the
-#: next remote provider behind a ``local-only`` client's back. Kept beside the
-#: table so the reasons and their expectations stay one table, while the
-#: red-phase expectation is expressed per row and dies with the behaviour.
-#:
-#: The structural choke point (LP-0MVRMC1L3006F0F3) already refuses every
-#: remaining exit; the two rows below stay red because the refusal still
-#: carries the generic ``local_route_unavailable`` fallback instead of the
-#: per-branch token — the reason-token child (LP-0MVRMC1W6003MV3Y) records
-#: the chain-resolution skips and turns them green.
-_PENDING_ROWS: frozenset[str] = frozenset(
-    {
-        "quota_hard_stop",
-        "chain_cooldown",
-    }
-)
-
-
-def _pending_mark(row: _ExitRow) -> tuple:
-    """``xfail(strict=True)`` for a row no implementation satisfies yet."""
-    if row.trigger not in _PENDING_ROWS:
-        return ()
-    return (
-        pytest.mark.xfail(
-            strict=True,
-            reason=(
-                "red phase: the local-only refusal exists (choke point, "
-                "LP-0MVRMC1L3006F0F3) but still carries the generic "
-                "local_route_unavailable fallback — LP-0MVRMC1W6003MV3Y "
-                f"(reason tokens) must record the {row.token} token on this "
-                "exit to turn it green"
-            ),
-        ),
-    )
-
+#: Every row is asserted green: the choke point (LP-0MVRMC1L3006F0F3)
+#: refuses every exit and the reason-token child (LP-0MVRMC1W6003MV3Y)
+#: records the per-branch chain tokens. A future red row is a real failure —
+#: the xfail marker machinery died with the behaviour it pinned.
 
 _LOCAL_ONLY_PARAMS = [
-    pytest.param(row, id=row.trigger, marks=_pending_mark(row)) for row in _EXIT_ROWS
+    pytest.param(row, id=row.trigger) for row in _EXIT_ROWS
 ]
 
 

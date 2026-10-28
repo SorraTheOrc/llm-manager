@@ -6619,8 +6619,45 @@ def _stamp_local_route_headers(
 #:   ``_resolve_provider_with_exclusions``, e.g. cooldown/quota/window; the
 #:   sibling LP-0MVRMC1W6003MV3Y pins the per-branch vocabulary and narrows
 #:   this generic fallback).
-LOCAL_ONLY_NO_LOCAL_ROUTE = "local_only_no_local_route"
-LOCAL_ROUTE_UNAVAILABLE = "local_route_unavailable"
+
+def _canonical_local_fallback_reason(token: str) -> str:
+    """Resolve *token* against the canonical reason-token table (AC1).
+
+    The table lives in :mod:`proxy.admission_reserve` (the module that owns
+    the header) so every surface draws from one place; importing it lazily
+    keeps this module's import graph free of a new module-level dependency
+    while still failing loudly on a token the table does not know.
+    """
+    from proxy import admission_reserve
+
+    return admission_reserve.canonical_local_fallback_reason(token)
+
+
+LOCAL_ONLY_NO_LOCAL_ROUTE = _canonical_local_fallback_reason(
+    "local_only_no_local_route"
+)
+LOCAL_ROUTE_UNAVAILABLE = _canonical_local_fallback_reason(
+    "local_route_unavailable"
+)
+
+#: Chain-resolution skip tokens (LP-0MVRMC1W6003MV3Y AC2): the same strings
+#: the ``reason=`` log fields carry, so a skip can be attributed verbatim.
+SKIP_REASON_LOCAL_PROVIDER_COOLDOWN = _canonical_local_fallback_reason(
+    "local_provider_cooldown"
+)
+SKIP_REASON_QUOTA_HARD_STOP = _canonical_local_fallback_reason("quota_hard_stop")
+SKIP_REASON_USAGE_LIMIT_RESET_PENDING = _canonical_local_fallback_reason(
+    "usage_limit_reset_pending"
+)
+SKIP_REASON_OUTSIDE_AVAILABLE_WINDOW = _canonical_local_fallback_reason(
+    "outside_available_window"
+)
+
+#: Lease-active continue token: expected local contention, which used to fall
+#: through to remote with no recorded reason at all.
+SKIP_REASON_LOCAL_LEASE_ACTIVE = _canonical_local_fallback_reason(
+    "local_lease_active"
+)
 
 
 def _build_local_only_refusal_for_remote(
@@ -7384,12 +7421,44 @@ def _usage_limit_account_key(provider_cfg: dict) -> str:
     return _failure_domain_key(provider_cfg)
 
 
+def _chain_skip_reason(
+    provider_cfg: dict,
+    reason_sink: Callable[[str | None], None] | None,
+    local_token: str,
+    generic_reason: str,
+) -> str:
+    """Return the ``reason=`` value a chain-resolution skip must log.
+
+    LP-0MVRMC1W6003MV3Y AC2/AC3: chain resolution walks every candidate, so a
+    skip reason belongs to the *local* route only when the skipped entry is
+    itself local — a remote entry's cooldown must never mint a local fallback
+    token. For a local entry the canonical token is recorded on the request
+    through *reason_sink* and returned verbatim, so the log field, the
+    ``X-Local-Fallback-Reason`` header and the refusal body cannot drift. For
+    any other entry the branch's generic name is returned and nothing is
+    recorded.
+
+    Never raises: observability must not break routing.
+    """
+    if not isinstance(provider_cfg, dict) or (
+        provider_cfg.get("type", "remote") != "local"
+    ):
+        return generic_reason
+    if reason_sink is not None:
+        try:
+            reason_sink(local_token)
+        except Exception:  # pragma: no cover - sinks are best-effort
+            logger.debug("chain-skip reason sink failed", exc_info=True)
+    return local_token
+
+
 def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
     excluded_domains: set[str] | None = None,
     *,
     config: dict | None = None,
+    reason_sink: Callable[[str | None], None] | None = None,
 ) -> dict | None:
     """Resolve next available provider while excluding names tried this request
     and any entry sharing an already-failed failure domain.
@@ -7404,6 +7473,15 @@ def _resolve_provider_with_exclusions(
     Quota-managed entries are walked in descending headroom urgency order
     (LP-0MVF7KIKE002DZVD); ``config`` supplies the ordering gates and defaults
     to the documented behaviour when omitted.
+
+    ``reason_sink`` is an optional callback that receives the stable reason
+    token of a chain-resolution skip **for a local entry only** (cooldown,
+    quota hard stop, pending usage-limit reset, ``available_times`` window).
+    The routing cycles pass ``_note_local_fallback_reason`` bound to their
+    request, which is how a ``local-only`` refusal learns *why* local was
+    unavailable instead of reporting the generic fallback
+    (LP-0MVRMC1W6003MV3Y AC3). The return contract is unchanged for every
+    other caller.
     """
     providers = _quota_ranked_providers(model_config, config)
     if not providers:
@@ -7446,14 +7524,21 @@ def _resolve_provider_with_exclusions(
             continue
         reset_remaining = _usage_reset_remaining(usage_key)
         if reset_remaining > 0:
+            _reason = _chain_skip_reason(
+                provider_cfg,
+                reason_sink,
+                SKIP_REASON_USAGE_LIMIT_RESET_PENDING,
+                "usage_limit_reset_pending",
+            )
             logger.info(
                 "Skipping provider=%s: usage_limit_reset_pending "
-                "(account=%s, window=%s, reset_at=%s, reset_in=%ds)",
+                "(account=%s, window=%s, reset_at=%s, reset_in=%ds) reason=%s",
                 name,
                 usage_key,
                 _usage_reset_window.get(usage_key, "unknown"),
                 datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
+                _reason,
             )
             continue
         # Quota hard stop (LP-0MVF7KO8C005NB59): at-or-near the monthly cap the
@@ -7466,22 +7551,48 @@ def _resolve_provider_with_exclusions(
             provider_cfg, config
         )
         if quota_hard_stop:
-            logger.info("Skipping provider=%s: %s", name, quota_stop_reason)
+            _reason = _chain_skip_reason(
+                provider_cfg,
+                reason_sink,
+                SKIP_REASON_QUOTA_HARD_STOP,
+                "quota_hard_stop",
+            )
+            logger.info(
+                "Skipping provider=%s: %s reason=%s",
+                name,
+                quota_stop_reason,
+                _reason,
+            )
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
         if cooldown_key is not None:
             remaining = _provider_cooldown_remaining(cooldown_key)
+            _reason = _chain_skip_reason(
+                provider_cfg,
+                reason_sink,
+                SKIP_REASON_LOCAL_PROVIDER_COOLDOWN,
+                "provider_cooldown",
+            )
             logger.info(
-                "Skipping provider=%s: %s in cooldown (%ds remaining)",
+                "Skipping provider=%s: %s in cooldown (%ds remaining) reason=%s",
                 name,
                 cooldown_key,
                 remaining,
+                _reason,
             )
             continue
         if not _provider_in_allowed_window(provider_cfg, config):
+            _reason = _chain_skip_reason(
+                provider_cfg,
+                reason_sink,
+                SKIP_REASON_OUTSIDE_AVAILABLE_WINDOW,
+                "outside_available_window",
+            )
             logger.info(
-                "Skipping provider=%s: outside its available_times window (UTC)",
+                "Skipping provider=%s: outside its available_times window (UTC) "
+                "reason=%s",
                 name,
+                _reason,
             )
             continue
         return provider_cfg
@@ -9869,6 +9980,12 @@ async def _proxy_with_remote_fallback_cycle(
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
             config=config,
+            # Chain-resolution skips (cooldown / quota / usage-limit reset /
+            # available_times window) record their stable token on THIS
+            # request, so a local-only refusal reports why local was
+            # unavailable instead of the generic fallback
+            # (LP-0MVRMC1W6003MV3Y AC3).
+            reason_sink=lambda token: _note_local_fallback_reason(request, token),
         )
         if provider_cfg is None:
             break
@@ -10526,6 +10643,10 @@ async def _proxy_with_fallback_cycle(
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
             config=config,
+            # Same per-request reason sink as the remote-only cycle: every
+            # chain-resolution skip is attributed on the request
+            # (LP-0MVRMC1W6003MV3Y AC3).
+            reason_sink=lambda token: _note_local_fallback_reason(request, token),
         )
         if provider_cfg is None and fallback_reason == "local_lease_active":
             # Local lease-active is expected contention, not provider failure.
@@ -11672,7 +11793,13 @@ async def _proxy_with_fallback_cycle(
                         ):
                             # Still denied after the wait: fall through to the
                             # remote chain (bounded, no further waiting).
+                            # LP-0MVRMC1W6003MV3Y: record WHY local was
+                            # unavailable — this continue was the silent
+                            # fall-through of the 2026-10-25 incident.
                             all_slot_exhaustion = False
+                            _note_local_fallback_reason(
+                                request, SKIP_REASON_LOCAL_LEASE_ACTIVE
+                            )
                             continue
                         # Slot freed — evaluate the fresh response below.
                     elif _lease_action == "fallback":
@@ -11692,6 +11819,10 @@ async def _proxy_with_fallback_cycle(
                             _lease_elapsed or 0.0,
                         )
                         all_slot_exhaustion = False
+                        # The token matches the log's reason= field verbatim.
+                        _note_local_fallback_reason(
+                            request, SKIP_REASON_LOCAL_LEASE_ACTIVE
+                        )
                         continue
                     elif _lease_action == "context_bypass":
                         _record_attempt(
@@ -11703,6 +11834,10 @@ async def _proxy_with_fallback_cycle(
                         )
                         fallback_reason = _lease_reason
                         all_slot_exhaustion = False
+                        # Contention-queue context bypass: the skip reason is
+                        # the router's own context token, recorded verbatim
+                        # (mirrors the first queue decision point).
+                        _note_local_fallback_reason(request, _lease_reason)
                         continue
                     elif _lease_action == "admission_reject":
                         # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ) on
@@ -11807,6 +11942,12 @@ async def _proxy_with_fallback_cycle(
                                 slot_info=slot_info,
                             )
                             all_slot_exhaustion = False
+                            # LP-0MVRMC1W6003MV3Y: the retry loop ended on a
+                            # lease-active answer — name that reason on the
+                            # request so the refusal can report it.
+                            _note_local_fallback_reason(
+                                request, SKIP_REASON_LOCAL_LEASE_ACTIVE
+                            )
                             continue
 
                         mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
