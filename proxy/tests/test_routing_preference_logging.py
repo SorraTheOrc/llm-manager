@@ -25,12 +25,16 @@ Two guards keep the change additive:
 - A request with no header logs ``preference=prefer-local`` — never an empty or
   absent value.
 
-Red phase (test-first): the ``preference=`` fields and the ``priority_routing``
-session attribution do not exist yet, so the cases asserting them are marked
-``xfail(strict=True)``. ``strict`` is deliberate — LP-0MVRMC275000R2W6 cannot
-land without flipping the marker off with the behaviour. The red evidence (the
-live assertions run unpinned through the test-skill runner, ``20 failed, 22
-passed``) is recorded on the work item.
+One more property lives here because it is the same observability contract:
+**the refusal logs itself** (``local_only_refused reason=<token>
+preference=local-only``), so a violated intent is visible in ``proxy.log``
+without correlating headers.
+
+Red phase (test-first): this module was written and demonstrated red before
+LP-0MVRMC275000R2W6 landed (the live assertions run unpinned through the
+test-skill runner, ``20 failed, 22 passed``). The ``xfail(strict=True)`` markers
+that pinned the missing behaviour were removed with the behaviour they pinned;
+the red evidence is recorded on the work item.
 
 Structural note — why ``remote-ok`` has no "not local" line row: ``remote-ok``
 is enforced by :func:`proxy.priority.apply_local_preference`, which strips every
@@ -174,6 +178,15 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
         existing_keys=("provider", "reason"),
         description="chain resolution skipped the local entry on a quota hard stop",
     ),
+    _NotLocalLineRow(
+        trigger="lease_fallback",
+        prefix="contention_queue_fallback_after_queue",
+        contains=("reason=local_lease_active",),
+        existing_keys=("provider", "session", "queued_duration", "reason"),
+        description=(
+            "lease denial fell back to the next provider after the queue budget"
+        ),
+    ),
 )
 
 #: Which ``priority_routing`` line each dispatch cycle emits.
@@ -182,13 +195,8 @@ _PRIORITY_ROUTING_CYCLES = (
     pytest.param("remote_only", id="remote-only-cycle"),
 )
 
-_RED_PHASE_REASON = (
-    "red phase: the line does not log preference=/session= yet — "
-    "LP-0MVRMC275000R2W6 adds it and flips this marker off"
-)
 
-
-def _preference_params(red_phase: bool) -> list:
+def _preference_params() -> list:
     """``X-Local-Preference`` cases: each parsed value plus the absent header.
 
     ``remote-ok`` is excluded by design — see the module docstring: it strips
@@ -200,8 +208,7 @@ def _preference_params(red_phase: bool) -> list:
         (PREFER_LOCAL, "prefer-local"),
         (None, "absent-header"),
     )
-    marks = (pytest.mark.xfail(strict=True, reason=_RED_PHASE_REASON),) if red_phase else ()
-    return [pytest.param(value, id=cid, marks=marks) for value, cid in cases]
+    return [pytest.param(value, id=cid) for value, cid in cases]
 
 
 class _DummyRequest:
@@ -309,6 +316,24 @@ def _occupy_the_only_queue_slot() -> None:
     contention_queue._waiters.append((0.0, None, "queue-holder", False, None))
 
 
+def _lease_active_response() -> Response:
+    """The synthetic 503 a held local dispatch lease returns (router)."""
+    return Response(
+        content=json.dumps({
+            "error": {
+                "code": "no_slots_available",
+                "type": "server_busy",
+                "message": "Local dispatch lease is held by another session",
+            },
+            "total_slots": 1,
+            "available_slots": 0,
+            "reason": "local_lease_active",
+        }).encode("utf-8"),
+        status_code=503,
+        media_type="application/json",
+    )
+
+
 def _model_config(cycle: str = "local_remote") -> dict:
     """The model chain for *cycle* (local + remote, or remote only)."""
     providers = [
@@ -379,14 +404,30 @@ def _row_patches(row: _NotLocalLineRow) -> list:
                 _quota_hard_stop_for_local(provider._quota_exhausted),
             )
         )
+    elif trigger == "lease_fallback":
+        # The lease is denied *after* the local dispatch, so the queue decision
+        # is what falls back: pin the budget-expiry verdict deterministically
+        # instead of waiting out a real queue budget.
+        patches.append(
+            patch(
+                "proxy.provider._maybe_queue_for_local_slot",
+                new=AsyncMock(return_value=("fallback", None, 300.0)),
+            )
+        )
     else:  # pragma: no cover - a new row must name its trigger
         raise AssertionError(f"unknown not-local line trigger {trigger!r}")
     return patches
 
 
-async def _issue(row: _NotLocalLineRow, preference: str | None) -> None:
+async def _issue(
+    row: _NotLocalLineRow,
+    preference: str | None,
+    model_config: dict | None = None,
+) -> Response:
     """Issue *row*'s request with *preference*; ``caplog`` captures the lines."""
     async def _local(_req, _path):
+        if row.trigger == "lease_fallback":
+            return _lease_active_response()
         return _ok_response()
 
     async def _remote(_req, _path, _pc):
@@ -411,10 +452,10 @@ async def _issue(row: _NotLocalLineRow, preference: str | None) -> None:
         )
         for ctx in _row_patches(row):
             stack.enter_context(ctx)
-        await provider.proxy_with_fallback(
+        return await provider.proxy_with_fallback(
             _DummyRequest(headers=headers),
             "v1/chat/completions",
-            _model_config(),
+            model_config if model_config is not None else _model_config(),
             _config(row),
         )
 
@@ -475,7 +516,7 @@ def _assert_line_present(messages: list[str], row: _NotLocalLineRow) -> str:
 @pytest.mark.parametrize(
     "row", _NOT_LOCAL_LINE_ROWS, ids=[r.trigger for r in _NOT_LOCAL_LINE_ROWS]
 )
-@pytest.mark.parametrize("preference", _preference_params(red_phase=False))
+@pytest.mark.parametrize("preference", _preference_params())
 async def test_not_local_line_keeps_every_pre_existing_key(row, preference, caplog):
     """An additive change must not drop a field log-grep tooling depends on.
 
@@ -503,7 +544,7 @@ async def test_not_local_line_keeps_every_pre_existing_key(row, preference, capl
 @pytest.mark.parametrize(
     "row", _NOT_LOCAL_LINE_ROWS, ids=[r.trigger for r in _NOT_LOCAL_LINE_ROWS]
 )
-@pytest.mark.parametrize("preference", _preference_params(red_phase=True))
+@pytest.mark.parametrize("preference", _preference_params())
 async def test_not_local_line_names_the_parsed_preference(row, preference, caplog):
     """Each exit line carries ``preference=<parsed value>``; absent ⇒ default.
 
@@ -607,7 +648,6 @@ async def test_priority_routing_keeps_its_existing_fields(cycle, caplog):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cycle", _PRIORITY_ROUTING_CYCLES)
-@pytest.mark.xfail(strict=True, reason=_RED_PHASE_REASON)
 async def test_priority_routing_carries_session_attribution(cycle, caplog):
     """AC5: the routing decision names the request's session.
 
@@ -676,3 +716,71 @@ async def test_remote_ok_preference_is_logged_and_takes_no_local_exit(caplog):
         "a remote-ok request never enters the local route, so no not-local "
         f"decision line can exist; got {emitted}. Lines:\n" + "\n".join(messages)
     )
+
+
+# ---------------------------------------------------------------------------
+# AC4: the refusal names itself in the log
+# ---------------------------------------------------------------------------
+
+
+def _row(trigger: str) -> _NotLocalLineRow:
+    """The table row named *trigger* (rows stay the single source of exits)."""
+    return next(row for row in _NOT_LOCAL_LINE_ROWS if row.trigger == trigger)
+
+
+@pytest.mark.asyncio
+async def test_local_only_refusal_logs_one_line_with_reason_and_preference(caplog):
+    """A refusal is visible without correlating headers.
+
+    The skip reason the chain recorded (here: the local entry's cooldown) must
+    appear on the refusal line together with ``preference=local-only``, so an
+    operator grepping ``proxy.log`` sees the violation and its cause instead of
+    joining the request's headers to a routing line.
+    """
+    result = await _issue(_row("chain_cooldown"), LOCAL_ONLY)
+    assert result.status_code == 429, "the local-only client is refused, not served"
+
+    lines = [m for m in _messages(caplog) if m.startswith("local_only_refused ")]
+    assert len(lines) == 1, (
+        f"the refusal must be logged exactly once per refused request; got {lines!r}"
+    )
+    kv = _parse_kv(lines[0])
+    assert kv.get("reason") == "local_provider_cooldown", (
+        f"the refusal line must name the recorded skip reason; got {kv!r}"
+    )
+    assert kv.get("preference") == LOCAL_ONLY, (
+        f"the refusal line must name the intent that caused it; got {kv!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_only_refusal_without_a_local_route_names_that_reason(caplog):
+    """No local entry at all ⇒ the refusal says so, still naming the intent."""
+    remote_only = {
+        **_model_config(),
+        "providers": [
+            p for p in _model_config()["providers"] if p["type"] != "local"
+        ],
+    }
+    result = await _issue(
+        _row("chain_cooldown"), LOCAL_ONLY, model_config=remote_only
+    )
+    assert result.status_code == 429
+
+    lines = [m for m in _messages(caplog) if m.startswith("local_only_refused ")]
+    assert len(lines) == 1, f"one line per refusal; got {lines!r}"
+    kv = _parse_kv(lines[0])
+    assert kv.get("reason") == "local_only_no_local_route", (
+        f"a chain with no local entry must say so; got {kv!r}"
+    )
+    assert kv.get("preference") == LOCAL_ONLY
+
+
+@pytest.mark.asyncio
+async def test_prefer_local_fall_through_logs_no_refusal_line(caplog):
+    """The additive half: the default client's fall-through claims no refusal."""
+    result = await _issue(_row("chain_cooldown"), PREFER_LOCAL)
+    assert result.status_code == 200, "the default client keeps the remote answer"
+    assert [
+        m for m in _messages(caplog) if m.startswith("local_only_refused ")
+    ] == [], "a prefer-local request is served remotely, never refused"

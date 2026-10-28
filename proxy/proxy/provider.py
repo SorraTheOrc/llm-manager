@@ -6503,6 +6503,26 @@ def _refusal_timing_headers(
     return headers
 
 
+def _log_local_only_refusal(reason: str | None) -> None:
+    """One attributable line per local-only refusal (parent AC4/AC5).
+
+    LP-0MVRMC275000R2W6: a ``local-only`` request that ends in the refusal
+    must be visible in ``proxy.log`` without correlating headers back to the
+    client, so the line names the refusal reason *and* the intent that caused
+    it. Emitted by the refusal paths (the shared builder below plus the
+    admission-reject refusal) so there is exactly one line per refused
+    request. Never raises: observability must not break a refusal.
+    """
+    try:
+        logger.info(
+            "local_only_refused reason=%s preference=%s",
+            reason or LOCAL_ROUTE_UNAVAILABLE,
+            _PREF_LOCAL_ONLY,
+        )
+    except Exception:  # pragma: no cover - observability is best-effort
+        pass
+
+
 def _build_local_only_refusal_response(
     attempt: dict[str, Any] | None, config: dict | None = None
 ) -> Response:
@@ -6574,6 +6594,9 @@ def _build_local_only_refusal_response(
         "X-Local-Fallback-Reason": reason,
     }
     headers.update(_refusal_timing_headers(timing, new_tokens, budget_tokens))
+    # One line per refusal, naming the reason the client is told about and the
+    # intent that produced it (LP-0MVRMC275000R2W6 AC4).
+    _log_local_only_refusal(reason)
     return Response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=429,
@@ -7452,6 +7475,19 @@ def _chain_skip_reason(
     return local_token
 
 
+def _preference_log_suffix(preference: str | None) -> str:
+    """The `` preference=<parsed>`` suffix for skip/fallback log lines.
+
+    LP-0MVRMC275000R2W6 (parent AC4): every line that decides "not local"
+    names the parsed ``X-Local-Preference`` so an intent violation is visible
+    in ``proxy.log``. The value comes from the request's single cached parse
+    (``_request_local_preference``) — never a second parse of the header. An
+    empty suffix is returned for callers that have no request at all (e.g. the
+    ``_has_next_provider`` predicate), so no line invents a preference.
+    """
+    return f" preference={preference}" if preference else ""
+
+
 def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
@@ -7459,6 +7495,7 @@ def _resolve_provider_with_exclusions(
     *,
     config: dict | None = None,
     reason_sink: Callable[[str | None], None] | None = None,
+    preference: str | None = None,
 ) -> dict | None:
     """Resolve next available provider while excluding names tried this request
     and any entry sharing an already-failed failure domain.
@@ -7482,6 +7519,13 @@ def _resolve_provider_with_exclusions(
     unavailable instead of reporting the generic fallback
     (LP-0MVRMC1W6003MV3Y AC3). The return contract is unchanged for every
     other caller.
+
+    ``preference`` carries the request's parsed ``X-Local-Preference`` so the
+    local-skip lines also log `` preference=<parsed>`` (LP-0MVRMC275000R2W6
+    AC4): a chain-resolution skip of the local entry becomes attributable to
+    the request that caused it. Optional: unfederated callers without a
+    request (e.g. the ``_has_next_provider`` predicate) omit it and the lines
+    are emitted unchanged.
     """
     providers = _quota_ranked_providers(model_config, config)
     if not providers:
@@ -7532,13 +7576,14 @@ def _resolve_provider_with_exclusions(
             )
             logger.info(
                 "Skipping provider=%s: usage_limit_reset_pending "
-                "(account=%s, window=%s, reset_at=%s, reset_in=%ds) reason=%s",
+                "(account=%s, window=%s, reset_at=%s, reset_in=%ds) reason=%s%s",
                 name,
                 usage_key,
                 _usage_reset_window.get(usage_key, "unknown"),
                 datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
                 _reason,
+                _preference_log_suffix(preference),
             )
             continue
         # Quota hard stop (LP-0MVF7KO8C005NB59): at-or-near the monthly cap the
@@ -7558,10 +7603,11 @@ def _resolve_provider_with_exclusions(
                 "quota_hard_stop",
             )
             logger.info(
-                "Skipping provider=%s: %s reason=%s",
+                "Skipping provider=%s: %s reason=%s%s",
                 name,
                 quota_stop_reason,
                 _reason,
+                _preference_log_suffix(preference),
             )
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
@@ -7574,11 +7620,12 @@ def _resolve_provider_with_exclusions(
                 "provider_cooldown",
             )
             logger.info(
-                "Skipping provider=%s: %s in cooldown (%ds remaining) reason=%s",
+                "Skipping provider=%s: %s in cooldown (%ds remaining) reason=%s%s",
                 name,
                 cooldown_key,
                 remaining,
                 _reason,
+                _preference_log_suffix(preference),
             )
             continue
         if not _provider_in_allowed_window(provider_cfg, config):
@@ -7590,9 +7637,10 @@ def _resolve_provider_with_exclusions(
             )
             logger.info(
                 "Skipping provider=%s: outside its available_times window (UTC) "
-                "reason=%s",
+                "reason=%s%s",
                 name,
                 _reason,
+                _preference_log_suffix(preference),
             )
             continue
         return provider_cfg
@@ -9950,11 +9998,17 @@ async def _proxy_with_remote_fallback_cycle(
         # (AC5).
         model_config = {**model_config, "providers": []}
     logger.info(
-        "priority_routing model=%s priority=%s providers=%d preference=%s",
+        "priority_routing model=%s priority=%s providers=%d preference=%s "
+        "session=%s",
         model_config.get("name") or "unknown",
         _priority,
         len(_chain or model_config.get("providers") or []),
         _preference,
+        # Already resolved once above for this cycle's gates — the same
+        # ``_resolve_session_id_header`` value names this line's session, so
+        # a preference can be tied to a request without correlation
+        # heuristics and the header is never parsed twice (parent AC5).
+        _budget_session_id or "unknown",
     )
 
     # Per-entry context ceiling (LP-0MVF9N2QL001CDA7): parse the body once so
@@ -9984,8 +10038,10 @@ async def _proxy_with_remote_fallback_cycle(
             # available_times window) record their stable token on THIS
             # request, so a local-only refusal reports why local was
             # unavailable instead of the generic fallback
-            # (LP-0MVRMC1W6003MV3Y AC3).
+            # (LP-0MVRMC1W6003MV3Y AC3). ``preference`` adds the parsed
+            # intent to those skip lines (LP-0MVRMC275000R2W6 AC4).
             reason_sink=lambda token: _note_local_fallback_reason(request, token),
+            preference=_preference,
         )
         if provider_cfg is None:
             break
@@ -10615,11 +10671,15 @@ async def _proxy_with_fallback_cycle(
         # (AC5).
         model_config = {**model_config, "providers": []}
     logger.info(
-        "priority_routing model=%s priority=%s providers=%d preference=%s",
+        "priority_routing model=%s priority=%s providers=%d preference=%s "
+        "session=%s",
         model_config.get("name") or "unknown",
         _priority,
         len(_chain or model_config.get("providers") or []),
         _preference,
+        # Already resolved once above for this cycle's routing gates — reuse
+        # it rather than parsing the header again (parent AC5).
+        _session_id or "unknown",
     )
 
     # Shared per-cycle routing estimate (LP-0MVF9N2QL001CDA7 AC4): computed
@@ -10645,8 +10705,10 @@ async def _proxy_with_fallback_cycle(
             config=config,
             # Same per-request reason sink as the remote-only cycle: every
             # chain-resolution skip is attributed on the request
-            # (LP-0MVRMC1W6003MV3Y AC3).
+            # (LP-0MVRMC1W6003MV3Y AC3), and the parsed preference rides
+            # along on those skip lines (LP-0MVRMC275000R2W6 AC4).
             reason_sink=lambda token: _note_local_fallback_reason(request, token),
+            preference=_preference,
         )
         if provider_cfg is None and fallback_reason == "local_lease_active":
             # Local lease-active is expected contention, not provider failure.
@@ -10723,12 +10785,13 @@ async def _proxy_with_fallback_cycle(
                 if _thrash_cooldown_remaining > 0:
                     logger.info(
                         "routing_skip_local provider=%s model=%s "
-                        "session=%s cooldown_remaining=%.0fs "
+                        "session=%s preference=%s cooldown_remaining=%.0fs "
                         "reason=prefill_thrash_cooldown → skipping local, "
                         "routing to next remote provider",
                         provider_name,
                         provider_cfg.get("llama_model") or "unknown",
                         _session_id or "unknown",
+                        _preference,
                         _thrash_cooldown_remaining,
                     )
                     _record_attempt(
@@ -10807,9 +10870,10 @@ async def _proxy_with_fallback_cycle(
                         _note_local_fallback_reason(request, fallback_reason)
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
-                            "session=%s queued_duration=%.2fs",
+                            "session=%s queued_duration=%.2fs preference=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
+                            _preference,
                         )
                         continue
                     elif _cq_action == "context_bypass":
@@ -10971,7 +11035,7 @@ async def _proxy_with_fallback_cycle(
                     "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
                     "new_tokens=%d cached_ratio=%.2f cache_state=%s "
                     "messages=%d session=%s "
-                    "chain_hold_cycle=%d",
+                    "chain_hold_cycle=%d preference=%s",
                     provider_name,
                     _llama_model or "unknown",
                     _estimated_tokens,
@@ -10983,6 +11047,7 @@ async def _proxy_with_fallback_cycle(
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
                     _session_id or "unknown",
                     _get_chain_hold_cycle(request),
+                    _preference,
                 )
                 # Context-pressure compaction signal (LP-0MSDCLQ2W001LGWC):
                 # KV reads scale linearly with context (20 KB/token at f16),
@@ -11180,6 +11245,7 @@ async def _proxy_with_fallback_cycle(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
                         "new_tokens=%d cached_ratio=%.2f cache_state=%s "
+                        "preference=%s "
                         "reason=%s → skipping local, routing to next remote provider "
                         "session=%s chain_hold_cycle=%d",
                         provider_name,
@@ -11190,6 +11256,7 @@ async def _proxy_with_fallback_cycle(
                         _routing_new_tokens,
                         _routing_cached_ratio,
                         _routing_cache_state,
+                        _preference,
                         _skip_reason,
                         _session_id or "unknown",
                         _get_chain_hold_cycle(request),
@@ -11445,11 +11512,12 @@ async def _proxy_with_fallback_cycle(
                     try:
                         logger.info(
                             "local_admission_guard_direct_fallback "
-                            "provider=%s model=%s session=%s "
+                            "provider=%s model=%s session=%s preference=%s "
                             "reason=%s free_slot=true → routing to next provider",
                             provider_name,
                             _llama_model or "unknown",
                             _session_id or "unknown",
+                            _preference,
                             _direct_reason,
                         )
                     except Exception:
@@ -11462,6 +11530,10 @@ async def _proxy_with_fallback_cycle(
                         prev_provider = provider_name
                         all_slot_exhaustion = False
                         _note_local_fallback_reason(request, fallback_reason)
+                        # The refusal the client receives names
+                        # ``_direct_reason``; log that same reason with the
+                        # intent that caused it (LP-0MVRMC275000R2W6 AC4).
+                        _log_local_only_refusal(_direct_reason)
                         return _build_exhausted_response(
                             all_local_slot_exhaustion=False,
                             unavailable_providers={},
@@ -11812,11 +11884,12 @@ async def _proxy_with_fallback_cycle(
                         )
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
-                            "session=%s queued_duration=%.2fs "
+                            "session=%s queued_duration=%.2fs preference=%s "
                             "reason=local_lease_active",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
+                            _preference,
                         )
                         all_slot_exhaustion = False
                         # The token matches the log's reason= field verbatim.
