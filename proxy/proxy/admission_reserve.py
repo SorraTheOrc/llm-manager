@@ -52,11 +52,29 @@ logger = logging.getLogger("llama-proxy")
 DEFAULT_RESERVE_TTL_SECONDS = 10
 MAX_RESERVE_TTL_SECONDS = 60
 
-#: ``X-Local-Preference`` values (AC2 of the work item).
-PREF_LOCAL_ONLY = "local-only"
+#: Canonical ``X-Local-Preference`` values (AC2 of the work item).
+#:
+#: ``local-preferred`` is the **canonical pin-local value**: the client asks
+#: that its request never be moved to a remote provider while local can serve
+#: it (the deferral/timing semantics live outside this vocabulary module).
+#: ``prefer-local`` (the default) may fall through; ``remote-ok`` strips the
+#: local route from the chain.
+PREF_LOCAL_PREFERRED = "local-preferred"
 PREF_PREFER_LOCAL = "prefer-local"
 PREF_REMOTE_OK = "remote-ok"
-VALID_PREFERENCES = (PREF_LOCAL_ONLY, PREF_PREFER_LOCAL, PREF_REMOTE_OK)
+
+#: Deployed wire value accepted as a **deprecated alias** of
+#: :data:`PREF_LOCAL_PREFERRED` (LP-0MVSHWYVE005MS16). It stays a first-class
+#: constant — never re-spelled at a call site — so the canonical set and the
+#: alias table cannot drift, and so an un-migrated client is normalised rather
+#: than demoted to ``prefer-local`` (which would let its request go remote).
+PREF_LOCAL_ONLY = "local-only"
+
+#: ``alias -> canonical value``. :func:`parse_preference` normalises through
+#: this table and logs one deprecation warning per request.
+LEGACY_PREFERENCE_ALIASES = {PREF_LOCAL_ONLY: PREF_LOCAL_PREFERRED}
+
+VALID_PREFERENCES = (PREF_LOCAL_PREFERRED, PREF_PREFER_LOCAL, PREF_REMOTE_OK)
 DEFAULT_PREFERENCE = PREF_PREFER_LOCAL
 
 HEADER_PREFERENCE = "x-local-preference"
@@ -470,6 +488,14 @@ def parse_preference(headers: Any) -> str:
 
     Missing or unknown values fall back to ``prefer-local`` — today's
     behaviour — so the header is purely additive (AC8).
+
+    The legacy wire value ``local-only`` is normalised to the canonical
+    ``local-preferred`` through :data:`LEGACY_PREFERENCE_ALIASES`, so a
+    deployed client keeps pin-local semantics instead of being demoted to
+    ``prefer-local`` (LP-0MVSHWYVE005MS16 AC1/AC5). Each normalisation logs one
+    ``WARNING`` naming both values; because both call sites cache the parsed
+    value on the request (``request._local_preference``), that is once per
+    request, not once per routing decision (AC2).
     """
     if not headers:
         return DEFAULT_PREFERENCE
@@ -482,8 +508,17 @@ def parse_preference(headers: Any) -> str:
         raw = None
     if not raw:
         return DEFAULT_PREFERENCE
-    value = str(raw).strip().lower()
+    requested = str(raw).strip().lower()
+    value = LEGACY_PREFERENCE_ALIASES.get(requested, requested)
     if value in VALID_PREFERENCES:
+        if value != requested:
+            logger.warning(
+                "deprecated X-Local-Preference=%r; treating it as %r — clients "
+                "should send %r",
+                requested,
+                value,
+                PREF_LOCAL_PREFERRED,
+            )
         return value
     logger.debug(
         "unknown X-Local-Preference=%r; using %r", raw, DEFAULT_PREFERENCE

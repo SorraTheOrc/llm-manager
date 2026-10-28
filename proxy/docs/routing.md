@@ -1201,8 +1201,14 @@ reserved dispatch does not consume queue depth.
 | Value | Behaviour |
 |-------|-----------|
 | `prefer-local` (default) | Today's behaviour: use local when it can serve within the budget, else fall through to the next provider |
-| `local-only` | Never fall back remote. The request either completes locally or is refused — the `429` admission refusal (`X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`) is returned **even when remote providers are available**. Enforcement is structural, on **every** exit from the local route, not only at the admission guard — see [Local-only is enforced on every exit from the local route](#local-only-is-enforced-on-every-exit-from-the-local-route) and the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
+| `local-preferred` | Pin local for this request: **never** fall back remote. The request either completes locally or is refused — the `429` admission refusal (`X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`) is returned **even when remote providers are available**. Enforcement is structural, on **every** exit from the local route, not only at the admission guard — see [Local-only is enforced on every exit from the local route](#local-only-is-enforced-on-every-exit-from-the-local-route) and the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
 | `remote-ok` | Skip the local route entirely (background / low-priority work). The local provider is removed from the chain |
+
+Wire compatibility (LP-0MVSHWYVE005MS16): `local-only` is the **deprecated**
+spelling of `local-preferred`. It is still accepted and normalised to
+`local-preferred` — a client that keeps sending it retains pin-local semantics
+and is never demoted to `prefer-local` — and it logs one `WARNING` deprecation
+line per request. No removal date is scheduled yet.
 
 Unknown values (and an absent header) behave as `prefer-local`, so the header
 is purely additive. `high` priority keeps its "never queue" semantics under

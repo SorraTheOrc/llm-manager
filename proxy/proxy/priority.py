@@ -394,12 +394,15 @@ def local_preference_for_request(request) -> str:
     cached = getattr(request, "_local_preference", None)
     if cached:
         return cached
-    try:
-        from proxy.admission_reserve import parse_preference
+    # One canonical parser and one fallback value: the vocabulary (and the
+    # legacy-alias normalisation) lives in ``admission_reserve`` only
+    # (LP-0MVSHWYVE005MS16 AC4).
+    from proxy.admission_reserve import DEFAULT_PREFERENCE, parse_preference
 
+    try:
         preference = parse_preference(getattr(request, "headers", {}) or {})
     except Exception:
-        preference = "prefer-local"
+        preference = DEFAULT_PREFERENCE
     try:
         setattr(request, "_local_preference", preference)
     except Exception:
@@ -412,14 +415,17 @@ def apply_local_preference(chain: list[dict], preference: str) -> list[dict]:
 
     Only ``remote-ok`` changes the chain: it removes every ``type: local``
     entry so the local route is never attempted (LP-0MVIKPCSG002B0NL AC5).
-    ``local-only`` and ``prefer-local`` keep the chain intact — their
-    difference is enforced at the admission decision (a ``local-only`` refusal
-    returns 429 instead of falling through).
+    ``local-preferred`` (and its normalised legacy alias ``local-only``) and
+    ``prefer-local`` keep the chain intact — their difference is enforced at
+    the admission decision (a pin-local refusal returns 429 instead of falling
+    through).
 
     A chain that becomes empty is returned as-is (empty) so the caller's
     exhaustion path reports the truth rather than silently re-adding local.
     """
-    if preference != "remote-ok":
+    from proxy.admission_reserve import PREF_REMOTE_OK
+
+    if preference != PREF_REMOTE_OK:
         return chain
     return [
         entry

@@ -25,16 +25,19 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import proxy.provider as provider
 import pytest
 from fastapi import Response
+from starlette.datastructures import Headers
 
-from proxy import admission_reserve, contention_queue, prefill_eta
+from proxy import admission_reserve, contention_queue, prefill_eta, priority
 
 #: Tokens whose calibrated own-ETA (~56.2 s) fits the 60 s budget while the
 #: projected wait with one occupant (~112.4 s) does not (same fixture as the
@@ -388,10 +391,178 @@ def test_unknown_preference_value_falls_back_to_prefer_local():
         admission_reserve.parse_preference({"X-Local-Preference": "purple"})
         == "prefer-local"
     )
+    assert (
+        admission_reserve.parse_preference({"X-Local-Preference": "PURPLE"})
+        == "prefer-local"
+    )
     assert admission_reserve.parse_preference({}) == "prefer-local"
     assert (
         admission_reserve.parse_preference({"X-Local-Preference": "remote-ok"})
         == "remote-ok"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Preference vocabulary: local-preferred is canonical, local-only is the alias
+# (LP-0MVSHWYVE005MS16)
+# ---------------------------------------------------------------------------
+
+def test_local_preferred_parses():
+    """AC1: the new canonical pin-local value parses to itself."""
+    assert admission_reserve.PREF_LOCAL_PREFERRED == "local-preferred"
+    assert (
+        admission_reserve.parse_preference(
+            {"x-local-preference": "local-preferred"}
+        )
+        == "local-preferred"
+    )
+    # AC3: the *value* is case-insensitive, exactly as before the rename.
+    assert (
+        admission_reserve.parse_preference(
+            {"X-Local-Preference": "LOCAL-PREFERRED"}
+        )
+        == "local-preferred"
+    )
+
+
+def test_legacy_local_only_alias_normalises():
+    """AC1/AC3: the deployed wire value normalises, in any header case."""
+    assert (
+        admission_reserve.parse_preference({"x-local-preference": "local-only"})
+        == "local-preferred"
+    )
+    assert (
+        admission_reserve.parse_preference({"X-Local-Preference": "Local-Only"})
+        == "local-preferred"
+    )
+    # Real requests carry Starlette's case-insensitive Headers: both the header
+    # name and the value case must keep working (AC3).
+    assert (
+        admission_reserve.parse_preference(
+            Headers({"X-LOCAL-PREFERENCE": "LOCAL-ONLY"})
+        )
+        == "local-preferred"
+    )
+
+
+def test_alias_table_and_canonical_set_cannot_drift():
+    """The alias is a table entry, not a stray literal (AC4)."""
+    assert admission_reserve.LEGACY_PREFERENCE_ALIASES == {
+        "local-only": "local-preferred"
+    }
+    assert "local-preferred" in admission_reserve.VALID_PREFERENCES
+    assert "local-only" not in admission_reserve.VALID_PREFERENCES, (
+        "local-only is a legacy alias, not a canonical value"
+    )
+    assert set(admission_reserve.LEGACY_PREFERENCE_ALIASES.values()) <= set(
+        admission_reserve.VALID_PREFERENCES
+    )
+
+
+def test_legacy_alias_logs_one_deprecation_per_request(caplog):
+    """AC2: one WARNING per request, naming both sides of the alias.
+
+    The deprecation is emitted by ``parse_preference()`` and latched by the
+    per-request ``_local_preference`` cache, so a request that is parsed for
+    the dispatch loop, the remote cycle and the refusal path still logs once.
+    """
+    request = _DummyRequest(headers={"x-local-preference": "local-only"})
+
+    with caplog.at_level(logging.WARNING, logger="llama-proxy"):
+        first = provider._request_local_preference(request)
+        second = provider._request_local_preference(request)
+        third = priority.local_preference_for_request(request)
+
+    assert first == second == third == "local-preferred"
+    deprecated = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert len(deprecated) == 1, (
+        "the legacy alias must log exactly one deprecation per request; got "
+        f"{deprecated!r}"
+    )
+    assert "local-only" in deprecated[0], (
+        f"the deprecation must name the legacy value; got {deprecated[0]!r}"
+    )
+    assert "local-preferred" in deprecated[0], (
+        f"the deprecation must name the canonical value; got {deprecated[0]!r}"
+    )
+
+
+def test_canonical_preference_logs_no_deprecation(caplog):
+    """AC2: only the legacy alias is deprecated — canonical values stay quiet."""
+    for value in ("local-preferred", "prefer-local", "remote-ok"):
+        request = _DummyRequest(headers={"x-local-preference": value})
+        with caplog.at_level(logging.WARNING, logger="llama-proxy"):
+            provider._request_local_preference(request)
+        deprecations = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert deprecations == [], (
+            f"{value!r} is canonical and must not log a deprecation; got "
+            f"{deprecations!r}"
+        )
+        caplog.clear()
+
+
+#: The preference vocabulary values that must exist in exactly one module.
+_PREFERENCE_LITERALS = {
+    "local-only",
+    "local-preferred",
+    "prefer-local",
+    "remote-ok",
+}
+
+_PROXY_PACKAGE = Path(__file__).resolve().parents[1] / "proxy"
+
+
+def test_single_preference_vocabulary_source():
+    """AC4: one module owns the vocabulary and the parser.
+
+    Every string constant that *is* a preference value (equality, not
+    substring — log and refusal messages legitimately mention the wire values)
+    must live in ``admission_reserve.py``, and no other module may define a
+    second ``parse_preference``. ``test_*.py`` modules inside the package are
+    fixtures, not production code (``test_home_page.py`` uses ``local-only`` as
+    a *provider name*).
+    """
+    sources = [
+        path
+        for path in sorted(_PROXY_PACKAGE.glob("*.py"))
+        if not path.name.startswith("test_")
+    ]
+    assert sources, f"no production modules found under {_PROXY_PACKAGE}"
+
+    stray_literals: list[str] = []
+    stray_parsers: list[str] = []
+    for source in sources:
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value in _PREFERENCE_LITERALS
+                and source.name != "admission_reserve.py"
+            ):
+                stray_literals.append(f"{source.name}:{node.lineno} {node.value!r}")
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "parse_preference"
+                and source.name != "admission_reserve.py"
+            ):
+                stray_parsers.append(f"{source.name}:{node.lineno}")
+
+    assert stray_literals == [], (
+        "preference literals must only exist in admission_reserve.py (import "
+        f"the constants instead); found {stray_literals}"
+    )
+    assert stray_parsers == [], (
+        "admission_reserve.parse_preference() is the only parser; found a "
+        f"second definition at {stray_parsers}"
     )
 
 
@@ -413,10 +584,20 @@ def test_dry_run_returns_verdict_without_claiming():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_local_only_refuses_429_when_guard_would_fall_back_remote(
-    caplog,
+@pytest.mark.parametrize(
+    "preference",
+    ["local-only", "local-preferred"],
+    ids=["legacy-alias", "canonical"],
+)
+async def test_pin_local_refuses_429_when_guard_would_fall_back_remote(
+    preference, caplog
 ):
-    """AC4: with remotes available, local-only still yields the 429."""
+    """AC4/AC5: with remotes available, either pin-local spelling yields 429.
+
+    ``local-only`` is the deployed legacy alias and must reach the *same*
+    choke point as the canonical ``local-preferred`` once normalised — no
+    demotion to ``prefer-local``, no silent remote fall-through.
+    """
     caplog.set_level(logging.INFO, logger="llama-proxy")
     _seed_calibration()
     calls: list[str] = []
@@ -437,7 +618,7 @@ async def test_local_only_refuses_429_when_guard_would_fall_back_remote(
         ],
         "aliases": ["hybrid*"],
     }
-    request = _DummyRequest(headers={"X-Local-Preference": "local-only"})
+    request = _DummyRequest(headers={"X-Local-Preference": preference})
     with (
         patch("proxy.router.proxy_to_local", _local),
         patch("proxy.server.proxy_to_remote", _remote),
@@ -449,8 +630,8 @@ async def test_local_only_refuses_429_when_guard_would_fall_back_remote(
             request, "v1/chat/completions", config, _cfg()
         )
 
-    # Occupied gate + 20k tokens ⇒ the guard refuses; local-only must NOT
-    # proceed to the remote provider.
+    # Occupied gate + 20k tokens ⇒ the guard refuses; a pin-local client must
+    # NOT proceed to the remote provider.
     assert calls == []
     assert result.status_code == 429
     assert result.headers.get("X-Local-Route") == "refused"

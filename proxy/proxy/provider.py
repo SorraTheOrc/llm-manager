@@ -42,6 +42,20 @@ from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy import cold_start, quota_pacing, quota_state
+
+#: The single source of truth for the ``X-Local-Preference`` vocabulary and its
+#: parser (LP-0MVSHWYVE005MS16 AC4). ``PREF_LOCAL_ONLY`` is imported only as the
+#: **observability** token the refusal log line keeps emitting (byte-identical
+#: log contract); every routing comparison uses the canonical pin-local value
+#: ``PREF_LOCAL_PREFERRED``, so an alias-normalised ``local-only`` request still
+#: hits the same choke points (AC5).
+from proxy.admission_reserve import (
+    DEFAULT_PREFERENCE,
+    PREF_LOCAL_ONLY,
+    PREF_LOCAL_PREFERRED,
+    PREF_REMOTE_OK,
+    parse_preference,
+)
 from proxy.observability import _record_backend_signal
 from proxy.priority import (
     PRIORITY_HIGH,
@@ -6438,27 +6452,22 @@ def _note_local_fallback_reason(request, reason: str | None) -> None:
         pass
 
 
-_PREF_LOCAL_ONLY = "local-only"
-_PREF_REMOTE_OK = "remote-ok"
-
-
 def _request_local_preference(request) -> str:
     """Return the request's ``X-Local-Preference`` (default ``prefer-local``).
 
     Unknown values fall back to today's behaviour (AC8). The parsed value is
-    cached on the request so both routing cycles and the refusal path agree.
+    cached on the request so both routing cycles and the refusal path agree —
+    which is also what makes the legacy-alias deprecation in
+    :func:`admission_reserve.parse_preference` once per *request* rather than
+    once per decision (LP-0MVSHWYVE005MS16 AC2).
     """
     cached = getattr(request, "_local_preference", None)
     if cached:
         return cached
     try:
-        from proxy import admission_reserve
-
-        preference = admission_reserve.parse_preference(
-            getattr(request, "headers", {}) or {}
-        )
+        preference = parse_preference(getattr(request, "headers", {}) or {})
     except Exception:
-        preference = "prefer-local"
+        preference = DEFAULT_PREFERENCE
     try:
         setattr(request, "_local_preference", preference)
     except Exception:
@@ -6504,20 +6513,26 @@ def _refusal_timing_headers(
 
 
 def _log_local_only_refusal(reason: str | None) -> None:
-    """One attributable line per local-only refusal (parent AC4/AC5).
+    """One attributable line per pin-local refusal (parent AC4/AC5).
 
-    LP-0MVRMC275000R2W6: a ``local-only`` request that ends in the refusal
-    must be visible in ``proxy.log`` without correlating headers back to the
-    client, so the line names the refusal reason *and* the intent that caused
-    it. Emitted by the refusal paths (the shared builder below plus the
-    admission-reject refusal) so there is exactly one line per refused
-    request. Never raises: observability must not break a refusal.
+    LP-0MVRMC275000R2W6: a pin-local request that ends in the refusal must be
+    visible in ``proxy.log`` without correlating headers back to the client, so
+    the line names the refusal reason *and* the intent that caused it. Emitted
+    by the refusal paths (the shared builder below plus the admission-reject
+    refusal) so there is exactly one line per refused request. Never raises:
+    observability must not break a refusal.
+
+    The ``preference=`` token stays the legacy wire spelling
+    (``PREF_LOCAL_ONLY``) so the log contract, the documented refusal line and
+    the tools that grep it are unchanged by the vocabulary rename
+    (LP-0MVSHWYVE005MS16 AC5); migrating this observability surface belongs to
+    the follow-up docs/observability item, not here.
     """
     try:
         logger.info(
             "local_only_refused reason=%s preference=%s",
             reason or LOCAL_ROUTE_UNAVAILABLE,
-            _PREF_LOCAL_ONLY,
+            PREF_LOCAL_ONLY,
         )
     except Exception:  # pragma: no cover - observability is best-effort
         pass
@@ -6690,16 +6705,18 @@ def _build_local_only_refusal_for_remote(
     config: dict,
     preference: str,
 ) -> Response | None:
-    """The local-only choke point: refuse before any non-local dispatch.
+    """The pin-local choke point: refuse before any non-local dispatch.
 
-    LP-0MVRMC1L3006F0F3 (parent AC1/AC2): with ``X-Local-Preference:
-    local-only`` the dispatch loop must NEVER hand the request to a non-local
-    provider, regardless of which skip branch the local route took — the
-    structural analogue of ``remote-ok`` being enforced by
+    LP-0MVRMC1L3006F0F3 (parent AC1/AC2): with a pin-local ``X-Local-Preference``
+    — the canonical ``local-preferred``, including a legacy ``local-only``
+    header normalised to it by :func:`admission_reserve.parse_preference`
+    (LP-0MVSHWYVE005MS16 AC5) — the dispatch loop must NEVER hand the request
+    to a non-local provider, regardless of which skip branch the local route
+    took — the structural analogue of ``remote-ok`` being enforced by
     ``apply_local_preference()`` (intent enforced by structure, not by
     remembering to patch each ``continue``). Called at the head of both
     dispatch cycles immediately after the next candidate provider is resolved;
-    when the candidate is not local and the client is local-only it returns
+    when the candidate is not local and the client is pin-local it returns
     the refusal built from the skip reason already recorded on the request by
     :func:`_note_local_fallback_reason`, so no existing ``continue`` path is
     edited and the loop returns the refusal before the first remote dispatch.
@@ -6718,7 +6735,7 @@ def _build_local_only_refusal_for_remote(
     and the request is never enqueued, so the response is stamped exactly
     once and no contention-queue slot/lease is leaked.
     """
-    if preference != _PREF_LOCAL_ONLY:
+    if preference != PREF_LOCAL_PREFERRED:
         return None
     if provider_cfg.get("type", "remote") == "local":
         return None
@@ -7121,12 +7138,13 @@ async def _maybe_queue_for_local_slot(
             setattr(request, "_local_admission_decision", _admission)
         except Exception:
             pass
-        # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): with
-        # ``X-Local-Preference: local-only`` the client must never be moved
+        # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): with a pin-local
+        # ``X-Local-Preference`` (``local-preferred``, incl. the normalised
+        # legacy ``local-only`` alias) the client must never be moved
         # remote. The caller turns this into the retryable 429 admission
         # response instead of falling through to the next provider.
         _preference = _request_local_preference(request)
-        if _preference == _PREF_LOCAL_ONLY:
+        if _preference == PREF_LOCAL_PREFERRED:
             return ("refused_local_only", _admission.reason, None)
         return ("admission_reject", _admission.reason, None)
 
@@ -9992,7 +10010,7 @@ async def _proxy_with_remote_fallback_cycle(
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
-    elif _preference == _PREF_REMOTE_OK:
+    elif _preference == PREF_REMOTE_OK:
         # ``remote-ok`` with no remote-capable provider in the chain: the
         # client asked for no local route, so the chain is genuinely empty
         # (AC5).
@@ -10665,7 +10683,7 @@ async def _proxy_with_fallback_cycle(
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
-    elif _preference == _PREF_REMOTE_OK:
+    elif _preference == PREF_REMOTE_OK:
         # ``remote-ok`` with no remote-capable provider in the chain: the
         # client asked for no local route, so the chain is genuinely empty
         # (AC5).
@@ -11523,9 +11541,10 @@ async def _proxy_with_fallback_cycle(
                     except Exception:
                         pass
                     # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): a
-                    # local-only client must never be moved remote — the
+                    # pin-local client (``local-preferred`` or its normalised
+                    # ``local-only`` alias) must never be moved remote — the
                     # caller turns the decision into the retryable 429.
-                    if _preference == _PREF_LOCAL_ONLY:
+                    if _preference == PREF_LOCAL_PREFERRED:
                         fallback_reason = "local_admission_guard"
                         prev_provider = provider_name
                         all_slot_exhaustion = False

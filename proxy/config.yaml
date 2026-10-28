@@ -1922,12 +1922,14 @@ server:
   # 10 s, capped at 60 s, cancellable via
   # ``DELETE /llama/local/reserve/<id>`` and pruned on expiry.
   #
-  # ``X-Local-Preference: prefer-local|local-only|remote-ok`` expresses intent
-  # per request: ``local-only`` returns the 429 admission response instead of
-  # falling back remote (even when remotes exist); ``remote-ok`` removes the
-  # local provider from the chain; unknown values and an absent header behave
-  # exactly as ``prefer-local`` (today). ``high`` priority keeps its
-  # never-queue semantics under every preference.
+  # ``X-Local-Preference: prefer-local|local-preferred|remote-ok`` expresses
+  # intent per request: ``local-preferred`` (the canonical pin-local value;
+  # the legacy spelling ``local-only`` is still accepted and normalised to it,
+  # logging one deprecation line per request) returns the 429 admission
+  # response instead of falling back remote (even when remotes exist);
+  # ``remote-ok`` removes the local provider from the chain; unknown values and
+  # an absent header behave exactly as ``prefer-local`` (today). ``high``
+  # priority keeps its never-queue semantics under every preference.
   #
   # Interaction with the queue: ``contention_queue_max_wait_seconds`` is the
   # wait budget both this guard and ``/reserve`` compare against, and

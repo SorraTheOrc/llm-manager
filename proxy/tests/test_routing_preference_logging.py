@@ -80,10 +80,20 @@ MODEL_NAME = "hybrid-log-model"
 SESSION_ID = "sess-log-attribution"
 
 LOCAL_ONLY = "local-only"
+LOCAL_PREFERRED = "local-preferred"
 PREFER_LOCAL = "prefer-local"
 REMOTE_OK = "remote-ok"
 #: What the canonical parser yields when the header is absent or unknown.
 DEFAULT_PREFERENCE = PREFER_LOCAL
+#: The value each wire value is logged as: the parser normalises the legacy
+#: ``local-only`` alias to the canonical ``local-preferred``
+#: (LP-0MVSHWYVE005MS16 AC1), so the exit lines name that canonical value.
+_PARSED_PREFERENCE = {
+    LOCAL_ONLY: LOCAL_PREFERRED,
+    LOCAL_PREFERRED: LOCAL_PREFERRED,
+    PREFER_LOCAL: PREFER_LOCAL,
+    None: DEFAULT_PREFERENCE,
+}
 
 #: ``key=value`` pairs in a log line. Values are non-space runs, matching the
 #: format every routing line already emits (``session=unknown``,
@@ -197,14 +207,17 @@ _PRIORITY_ROUTING_CYCLES = (
 
 
 def _preference_params() -> list:
-    """``X-Local-Preference`` cases: each parsed value plus the absent header.
+    """``X-Local-Preference`` cases: each accepted wire value plus no header.
 
     ``remote-ok`` is excluded by design — see the module docstring: it strips
     the local route before dispatch, so a local-route exit line cannot fire for
-    it. Its value coverage lives on ``priority_routing`` instead.
+    it. Its value coverage lives on ``priority_routing`` instead. The legacy
+    ``local-only`` case is kept deliberately: it is the deployed wire value and
+    must take exactly the same exits as the canonical ``local-preferred``.
     """
     cases = (
-        (LOCAL_ONLY, "local-only"),
+        (LOCAL_ONLY, "local-only-legacy-alias"),
+        (LOCAL_PREFERRED, "local-preferred"),
         (PREFER_LOCAL, "prefer-local"),
         (None, "absent-header"),
     )
@@ -549,13 +562,14 @@ async def test_not_local_line_names_the_parsed_preference(row, preference, caplo
     """Each exit line carries ``preference=<parsed value>``; absent ⇒ default.
 
     ``preference=`` must be the value the canonical parser produced (never a
-    re-parse, never blank): ``local-only`` for an explicit pin, and
-    ``prefer-local`` for the two cases that keep today's behaviour (explicit
-    ``prefer-local`` and no header at all).
+    re-parse, never blank): ``local-preferred`` for either pin-local spelling
+    (the legacy ``local-only`` alias is normalised to it), and ``prefer-local``
+    for the two cases that keep today's behaviour (explicit ``prefer-local``
+    and no header at all).
     """
     await _issue(row, preference)
     line = _assert_line_present(_messages(caplog), row)
-    expected = DEFAULT_PREFERENCE if preference is None else preference
+    expected = _PARSED_PREFERENCE[preference]
     kv = _parse_kv(line)
 
     assert kv.get("preference"), (
