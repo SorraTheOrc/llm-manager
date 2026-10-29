@@ -5305,7 +5305,7 @@ def validate_priority_config(config: dict) -> list[str]:
 
     Models that declare no ``priorities`` anywhere stay unlabelled: every
     provider remains eligible for every priority (the documented legacy
-    default used by ``embed`` / ``github`` / ``private``).
+    default used by ``embed`` / ``private``).
 
     Returns a list of human-readable problem descriptions (empty when the
     priority configuration is consistent).

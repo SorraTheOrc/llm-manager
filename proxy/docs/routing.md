@@ -323,8 +323,8 @@ Rules (all enforced at load by `validate_priority_config` → `ValueError`):
 - **No silent widening.** For a labelled model the filtered chain is used
   as-is; an empty result never falls back to the full `providers` list (which
   would leak the paid tiers during the nine cheap-window hours).
-- **Unlabelled models** (no `priorities` anywhere — `embed`, `github`,
-  `private`) keep the legacy behaviour: every provider is eligible for every
+- **Unlabelled models** (no `priorities` anywhere — `embed`, `private`)
+  keep the legacy behaviour: every provider is eligible for every
   priority.
 - **Per-priority ordering is not supported.** Chain order is always the
   `providers` order, so an entry that must come first for one priority and
@@ -375,10 +375,6 @@ Shipped values (each sourced in a comment next to the entry in
 | `opencode-go`, `opencode-go-2`, `opencode-go-3` | 1000000 | model-registry context window for `opencode-go/deepseek-v4.1-flash` (Go publishes plan quota as percentages, not per-minute tokens) |
 | `deepseek-flash` | 1048576 | `api.deepseek.com` `/models` `context_window` — largest window in the chain |
 | `compact` chain | 1048576 | model-registry / `api.deepseek.com` windows |
-
-`github-primary` is deliberately left ungated: it declares no `model`, so a
-per-entry ceiling cannot be sourced.
-
 
 Some gateways answer HTTP 429 with custom `x-ratelimit-*` headers instead of
 the standard `Retry-After` (MunitoAI sends none). The proxy can honour them so

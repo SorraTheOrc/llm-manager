@@ -169,8 +169,7 @@ def _prov(name, priorities=None, ptype="remote"):
 class TestProviderChains:
     def test_backward_compatible_default_returns_full_chain(self):
         # No provider declares ``priorities`` → every provider serves every
-        # priority (the documented legacy default for ``embed``/``github``/
-        # ``private``).
+        # priority (the documented legacy default for ``embed``/``private``).
         cfg = _model([_prov("a"), _prov("b")])
         assert provider_chain_for_priority(cfg, "high") == cfg["providers"]
         assert provider_chain_for_priority(cfg, "low") == cfg["providers"]

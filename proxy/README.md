@@ -1269,8 +1269,8 @@ Routing policy now lives **per request**, not per machine state:
   per-model `priority_routes` name map is **removed** — see
   [Migrating from `priority_routes`](#migrating-from-priority_routes).
   A model that declares no `priorities` anywhere keeps every provider eligible
-  for every priority (today's `medium` semantics: `embed`, `github`,
-  `private`), so an unlabelled config stays 100% backward compatible.
+  for every priority (today's `medium` semantics: `embed`, `private`), so an
+  unlabelled config stays 100% backward compatible.
 - **No tier implication** — `[medium, high]` never includes `low`; a provider
   serves exactly the priorities listed. Model-level opt-in is fail-closed: if
   any provider of a model declares `priorities`, every provider of that model
@@ -1477,13 +1477,13 @@ operator-configurable key.
 #### Session grandfathering across mode switches
 
 Since a mode switch restarts the proxy and re-selects the config profile, a
-session that was using a remote model (e.g. `github`, or the
+session that was using a remote model (e.g. the
 opencode/opencode-go/deepseek fallback tiers of `plan`/`author`/`code`)
 would normally lose that access mid-conversation if the new mode restricted
 it. The proxy therefore **grandfathers in-flight sessions**: sessions that
 made at least one request before the switch keep using their model —
-including its full provider chain (local-first, with the remote fallbacks;
-remote-only for `github`) — until the **earlier** of:
+including its full provider chain (local-first, with the remote fallbacks) —
+until the **earlier** of:
 
 - the next scheduled mode transition (per the active `mode_schedule`), or
 - the session going idle (no request for the session TTL, default 3h).

@@ -101,7 +101,7 @@
 #                declare it, and together they must cover every priority
 #                (validated at load; models that declare no ``priorities``
 #                anywhere keep every provider eligible for every priority,
-#                e.g. embed/github/private). No tier implications:
+#                e.g. embed/private). No tier implications:
 #                [medium, high] never includes ``low``.
 #                Example:
 #                  - name: munitoai
@@ -370,10 +370,8 @@ audit_model_fallbacks:
 #                            windows; the summariser prompt is small, so
 #                            these are documentation-consistency caps.
 #
-# Deliberately NOT gated (no single sourceable ceiling): ``github-primary``
-# declares no ``model`` — the client chooses the upstream model — so a
-# per-entry context limit cannot be sourced for it. The local entries are
-# already bounded by the local routing thresholds
+# The local entries stay ungated (no per-entry ``max_context_tokens``): they
+# are already bounded by the local routing thresholds
 # (local_large_context_*_threshold, local_model_ctx_size, hard routing cap).
 
 models:
@@ -392,14 +390,6 @@ models:
     aliases:
     - embeddings
     - embed
-  github:
-    providers:
-      - name: github-primary
-        type: remote
-        provider: github
-        endpoint: https://models.inference.ai.azure.com
-    aliases:
-    - github-*
   # Private model: local-only, no remote fallback at all.
   # Uses the Qwen3 llama_model. When the local slot is busy the request
   # is queued / deferred — it never falls through to a paid provider.

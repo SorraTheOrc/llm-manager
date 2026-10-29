@@ -365,7 +365,7 @@ def provider_chain_for_priority(
     A model whose providers declare no ``priorities`` anywhere is
     **unlabelled** and keeps the legacy behaviour: every provider eligible
     for every priority (the full ``providers`` list — what ``embed`` /
-    ``github`` / ``private`` use). A **labelled** model yields the filtered
+    ``private`` use). A **labelled** model yields the filtered
     chain as-is: an empty result is returned as ``[]`` and is **never**
     widened to the full list (LP-0MVGPZWY0001JD1D AC11); a config validator
     (``validate_priority_config``) rejects the shapes that would leave a
