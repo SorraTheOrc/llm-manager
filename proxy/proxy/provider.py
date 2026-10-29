@@ -11695,19 +11695,55 @@ async def _proxy_with_fallback_cycle(
                 # window is armed by router.py on the deadline event, cleared
                 # on expiry or a successful local first byte, and per-session
                 # (AC2 cross-session isolation).
+                #
+                # LP-0MVT2KSXY002O75C (parent LP-0MVRMI5HK00558TB AC2) narrows
+                # what this gate refuses, without weakening that it does
+                # engage on every dispatch entry:
+                #
+                # - the window is keyed by (session, prompt fingerprint), so an
+                #   unrelated — usually much smaller — prompt is no longer
+                #   vetoed by one doomed prompt (measured 2026-10-24 20:00 →
+                #   2026-10-25 07:00: 916 skips / 46 sessions, 241 of them for
+                #   21 ``herdr-*`` sessions);
+                # - when the proxy's own fresh snapshot proves the GPU free,
+                #   the window is released before the skip is taken (336 of
+                #   those 916 skips had ``local_in_flight_requests=0``, 308
+                #   with ``capacity_hint=idle``).
+                #
+                # A missing fingerprint falls back to the session-wide window,
+                # so a site that cannot fingerprint a request fails open to the
+                # pre-fix behaviour rather than losing the gate.
                 _thrash_cooldown_remaining = 0.0
                 try:
                     from proxy.router_helpers import (
                         _prefill_thrash_cooldown_remaining,
+                        _prefill_thrash_fingerprint,
+                        _release_prefill_thrash_cooldown_on_free_gpu,
                     )
 
+                    _thrash_fingerprint = _prefill_thrash_fingerprint(body_json)
                     _thrash_cooldown_remaining = (
                         _prefill_thrash_cooldown_remaining(
                             _session_id,
                             config,
+                            fingerprint=_thrash_fingerprint,
                         )
                         or 0.0
                     )
+                    if _thrash_cooldown_remaining > 0:
+                        # Release ONLY on positive free-GPU evidence
+                        # (fresh snapshot, no live dispatch, no
+                        # non-abandoned processing slot). The release is
+                        # logged with an attributable reason; when it fires
+                        # the request proceeds through the remaining gates
+                        # exactly as if no window had been armed.
+                        if _release_prefill_thrash_cooldown_on_free_gpu(
+                            _session_id,
+                            config,
+                            endpoint=local_endpoint,
+                            fingerprint=_thrash_fingerprint,
+                        ):
+                            _thrash_cooldown_remaining = 0.0
                 except Exception:
                     _thrash_cooldown_remaining = 0.0
                 if _thrash_cooldown_remaining > 0:

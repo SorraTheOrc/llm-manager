@@ -20,6 +20,7 @@ Includes:
 """
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -1188,14 +1189,115 @@ cleared the window the large doomed prompt had just armed (e.g. session
 ``0`` restores the pre-fix clear-on-any-success rule (documented rollback).
 """
 
-#: Session id → monotonic deadline. In-process by design: a proxy restart
-#: resets the routing state, exactly like the dispatch leases it guards.
-_prefill_thrash_cooldowns: dict[str, float] = {}
+#: ``(session id, prompt fingerprint)`` → monotonic deadline.
+#:
+#: The window is keyed by **(session, prompt fingerprint)**, not by session
+#: alone (LP-0MVT2KSXY002O75C, parent LP-0MVRMI5HK00558TB AC2). A session-wide
+#: veto armed by one doomed 60 k prompt also refused the next, unrelated (and
+#: usually much smaller) prompt for a full 600 s: measured 2026-10-24 20:00 →
+#: 2026-10-25 07:00, 916 ``routing_skip_local reason=prefill_thrash_cooldown``
+#: skips across 46 sessions, 241 of them for 21 ``herdr-*`` sessions and 336
+#: where the proxy's own nearest status poll reported the GPU free.
+#:
+#: The fingerprint is the empty string for a *session-wide* window — what a
+#: caller with no usable fingerprint arms, and what every gate consults as a
+#: fallback, so a site that cannot fingerprint a request fails open to the
+#: pre-fix behaviour instead of silently losing the gate (see
+#: :func:`_prefill_thrash_fingerprint`).
+#:
+#: In-process by design: a proxy restart resets the routing state, exactly
+#: like the dispatch leases it guards.
+_prefill_thrash_cooldowns: dict[tuple[str, str], float] = {}
 
-#: Session id → prompt size (tokens) that armed the current window. Recorded
-#: so the clear path can compare a success against the case that failed; an
-#: absent entry (unknown size) keeps the fail-open clear-on-any-success path.
-_prefill_thrash_cancel_tokens: dict[str, int] = {}
+#: ``(session id, prompt fingerprint)`` → prompt size (tokens) that armed the
+#: window. Recorded so the clear path can compare a success against the case
+#: that failed; an absent entry (unknown size) keeps the fail-open
+#: clear-on-any-success path.
+_prefill_thrash_cancel_tokens: dict[tuple[str, str], int] = {}
+
+#: Length of the prompt fingerprint prefix (hex chars). Bounded so the key
+#: cannot grow with the prompt: a 32-char SHA-256 prefix keeps collision risk
+#: negligible while staying readable in a log line.
+_PREFILL_THRASH_FINGERPRINT_HEX_CHARS = 32
+
+
+def _prefill_thrash_fingerprint(body_json) -> str | None:
+    """Return a stable, bounded fingerprint of the request's prompt.
+
+    Used to scope the post-deadline prefill-thrash cooldown to the prompt that
+    actually failed (LP-0MVT2KSXY002O75C). Derived only from ``messages`` —
+    the part that determines what gets prefilled — with sorted keys and
+    compact separators so the same payload always yields the same digest and
+    message order is significant.
+
+    Fail-open: returns ``None`` when the payload carries no usable messages
+    (streaming bookkeeping-only bodies, malformed JSON, a non-list
+    ``messages``). Callers then fall back to the session-wide window, so a
+    site that cannot fingerprint never stops engaging the gate.
+
+    Cost: one ``json.dumps`` + one ``sha256`` over the messages, at the arming
+    site (once per abandoned dispatch) and the gate site (once per local
+    candidate). No body re-read: the router and ``proxy_with_fallback``
+    already hold the parsed payload.
+    """
+    if not isinstance(body_json, Mapping):
+        return None
+    messages = body_json.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    try:
+        canonical = json.dumps(
+            messages,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception:
+        return None
+    try:
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+    return digest[:_PREFILL_THRASH_FINGERPRINT_HEX_CHARS]
+
+
+def _prefill_thrash_key(session_id, fingerprint) -> tuple[str, str] | None:
+    """Build the cooldown store key (``None`` when there is no session)."""
+    if not session_id:
+        return None
+    return (str(session_id), str(fingerprint or ""))
+
+
+def _prefill_thrash_keys_for(session_id, fingerprint) -> list[tuple[str, str]]:
+    """Keys a gate at ``(session, fingerprint)`` must consult, in order.
+
+    - With a fingerprint: the exact ``(session, fingerprint)`` window, then the
+      session-wide (empty-fingerprint) window — the latter is what a caller
+      that could not fingerprint *armed*, so it must still be consulted.
+    - Without one: every window of the session. A gate that cannot fingerprint
+      the request has to assume it might be the failing prompt, which is the
+      documented fail-open direction (the gate keeps engaging; it can never
+      silently stop refusing).
+    """
+    if not session_id:
+        return []
+    sid = str(session_id)
+    if not fingerprint:
+        return [key for key in _prefill_thrash_cooldowns if key[0] == sid] or [
+            (sid, "")
+        ]
+    return [(sid, str(fingerprint)), (sid, "")]
+
+
+def _drop_prefill_thrash_session(session_id) -> None:
+    """Forget every window (all fingerprints) belonging to *session_id*."""
+    if not session_id:
+        return
+    sid = str(session_id)
+    for store in (_prefill_thrash_cooldowns, _prefill_thrash_cancel_tokens):
+        for key in [k for k in store if k[0] == sid]:
+            store.pop(key, None)
 
 
 def _prefill_thrash_config_section(config) -> Mapping:
@@ -1253,13 +1355,23 @@ def _get_prefill_thrash_recovery_fraction(config) -> float:
     return min(1.0, fraction)
 
 
-def _record_prefill_thrash_cooldown(session_id, config, now=None, tokens=None) -> float:
-    """Arm (or re-arm) *session_id*'s cooldown; return its deadline.
+def _record_prefill_thrash_cooldown(
+    session_id, config, now=None, tokens=None, fingerprint=None
+) -> float:
+    """Arm (or re-arm) a cooldown window; return its monotonic deadline.
 
-    Called by router.py when ``prefill_deadline_exceeded`` cancels a local
-    dispatch. Returns the monotonic deadline, or 0 when the cooldown is
-    disabled or no session id is known (a cooldown needs a session to scope
-    to — an anonymous one-shot request has nothing to suppress).
+    Called by router.py when ``prefill_deadline_exceeded`` (or the measured
+    cache-deficit early abort) cancels a local dispatch. Returns the monotonic
+    deadline, or 0 when the cooldown is disabled or no session id is known (a
+    cooldown needs a session to scope to — an anonymous one-shot request has
+    nothing to suppress).
+
+    *fingerprint* scopes the window to the prompt that failed
+    (:func:`_prefill_thrash_fingerprint`, LP-0MVT2KSXY002O75C). Only that
+    prompt is then refused; an unrelated prompt from the same session is
+    admitted. ``None`` keeps the pre-fix **session-wide** window, which is the
+    documented fail-open behaviour when the arming site cannot fingerprint
+    the payload.
 
     *tokens* is the prompt size that failed. It is recorded so a later success
     can be compared against it (see
@@ -1271,47 +1383,65 @@ def _record_prefill_thrash_cooldown(session_id, config, now=None, tokens=None) -
         return 0.0
     seconds = _get_prefill_thrash_cooldown_seconds(config)
     if seconds <= 0:
-        _prefill_thrash_cooldowns.pop(session_id, None)
-        _prefill_thrash_cancel_tokens.pop(session_id, None)
+        _drop_prefill_thrash_session(session_id)
+        return 0.0
+    key = _prefill_thrash_key(session_id, fingerprint)
+    if key is None:  # pragma: no cover - guarded by the session check above
         return 0.0
     _now = time.monotonic() if now is None else now
     deadline = _now + seconds
-    _prefill_thrash_cooldowns[session_id] = deadline
+    _prefill_thrash_cooldowns[key] = deadline
     try:
         size = int(tokens or 0)
     except (TypeError, ValueError):
         size = 0
     if size > 0:
-        _prefill_thrash_cancel_tokens[session_id] = size
+        _prefill_thrash_cancel_tokens[key] = size
     else:
-        _prefill_thrash_cancel_tokens.pop(session_id, None)
+        _prefill_thrash_cancel_tokens.pop(key, None)
     return deadline
 
 
-def _prefill_thrash_cooldown_remaining(session_id, config=None, now=None) -> float:
-    """Return the seconds left in *session_id*'s cooldown (0 when clear).
+def _prefill_thrash_cooldown_remaining(
+    session_id, config=None, now=None, fingerprint=None
+) -> float:
+    """Return the seconds left in a cooldown window (0 when clear).
+
+    Consults the ``(session, fingerprint)`` window when *fingerprint* is
+    known, and always the session-wide window as the fail-open fallback, so a
+    gate site that cannot fingerprint a request still refuses what might be
+    the failing prompt (LP-0MVT2KSXY002O75C).
 
     Expired windows are pruned here, so expiry needs no timer. A live config
-    flip to 0 also clears the window (documented rollback).
+    flip to 0 also clears the session's windows (documented rollback).
     """
-    if not session_id:
-        return 0.0
-    deadline = _prefill_thrash_cooldowns.get(session_id)
-    if deadline is None:
+    keys = _prefill_thrash_keys_for(session_id, fingerprint)
+    if not keys:
         return 0.0
     if config is not None and _get_prefill_thrash_cooldown_seconds(config) <= 0:
-        _prefill_thrash_cooldowns.pop(session_id, None)
+        _drop_prefill_thrash_session(session_id)
         return 0.0
     _now = time.monotonic() if now is None else now
-    remaining = deadline - _now
-    if remaining <= 0:
-        _prefill_thrash_cooldowns.pop(session_id, None)
-        return 0.0
+    remaining = 0.0
+    for key in keys:
+        deadline = _prefill_thrash_cooldowns.get(key)
+        if deadline is None:
+            continue
+        left = deadline - _now
+        if left <= 0:
+            # Expired: prune the window (and its armed size) lazily.
+            _prefill_thrash_cooldowns.pop(key, None)
+            _prefill_thrash_cancel_tokens.pop(key, None)
+            continue
+        if left > remaining:
+            remaining = left
     return remaining
 
 
-def _clear_prefill_thrash_cooldown(session_id, tokens=None, config=None) -> bool:
-    """Clear *session_id*'s cooldown; return True when one was armed.
+def _clear_prefill_thrash_cooldown(
+    session_id, tokens=None, config=None, fingerprint=None
+) -> bool:
+    """Clear a cooldown window; return True when one was armed.
 
     Called by router.py on a successful local first byte. A healthy dispatch
     proves prefill works for this session again — but only for *that* size.
@@ -1324,21 +1454,134 @@ def _clear_prefill_thrash_cooldown(session_id, tokens=None, config=None) -> bool
     size that armed it. Fail-open: when the armed size or the succeeding size
     is unknown, or the fraction is 0, the pre-fix clear-on-any-success
     behaviour is preserved rather than guessed at.
+
+    *fingerprint* scopes the clear to the prompt that just succeeded
+    (LP-0MVT2KSXY002O75C): a comparable success on prompt P must not release
+    the window armed by prompt Q. When *fingerprint* is ``None`` the call is
+    treated as "the caller cannot tell which prompt succeeded" and every
+    window of the session is evaluated (pre-fix behaviour, fail-open).
     """
     if not session_id:
         return False
-    armed = _prefill_thrash_cancel_tokens.get(session_id)
+    if fingerprint:
+        keys = _prefill_thrash_keys_for(session_id, fingerprint)
+    else:
+        sid = str(session_id)
+        keys = [key for key in _prefill_thrash_cooldowns if key[0] == sid]
+    if not keys:
+        return False
     fraction = _get_prefill_thrash_recovery_fraction(config)
-    if fraction > 0.0 and armed:
-        try:
-            succeeded = int(tokens) if tokens is not None else 0
-        except (TypeError, ValueError):
-            succeeded = 0
-        if succeeded > 0 and succeeded < armed * fraction:
-            # Below the fraction: keep the window armed.
+    cleared = False
+    try:
+        succeeded = int(tokens) if tokens is not None else 0
+    except (TypeError, ValueError):
+        succeeded = 0
+    for key in keys:
+        armed = _prefill_thrash_cancel_tokens.get(key)
+        if fraction > 0.0 and armed:
+            if succeeded > 0 and succeeded < armed * fraction:
+                # Below the fraction: keep this window armed.
+                continue
+        _prefill_thrash_cancel_tokens.pop(key, None)
+        if _prefill_thrash_cooldowns.pop(key, None) is not None:
+            cleared = True
+    return cleared
+
+
+def _gpu_demonstrably_free(now=None, endpoint: str | None = None) -> bool:
+    """Return True only when the proxy's own fresh evidence proves the GPU free.
+
+    Evidence used — the same the admission path already reads, no extra poll
+    (LP-0MVT2KSXY002O75C AC2):
+
+    1. **No live local dispatch**: no dispatch record is ``active``. A record
+       is proxy-owned in-flight work, so its existence blocks the release.
+    2. **A fresh ``/slots`` snapshot**: :func:`proxy.residency.get_residency_view`
+       reports ``known`` (snapshot present and younger than
+       ``RESIDENCY_SNAPSHOT_MAX_AGE_SECONDS``). A stale or missing snapshot
+       proves nothing and never releases.
+    3. **No processing slot at all** — including a slot the proxy has
+       abandoned. While llama-server is still processing anything the GPU is
+       genuinely busy, so the window stays armed; that is precisely why AC2
+       had to be sequenced after AC1 (LP-0MVRMI5HK00558TB AC1 cancels the
+       abandoned upstream stream so the ghost window is short instead of
+       lasting the whole prefill).
+
+    Fail-closed by construction: every unknown (no snapshot, no dispatch
+    registry, unreadable entry) answers "not free", so the cooldown keeps
+    engaging rather than being released on a guess.
+    """
+    _now = time.monotonic() if now is None else now
+    # 1. Live local dispatch records.
+    try:
+        srv = _srv()
+        records = getattr(srv, "local_dispatch_records", None)
+        if records is not None:
+            for record in records.values():
+                if isinstance(record, dict) and record.get("active"):
+                    return False
+    except Exception:
+        return False
+    # 2 + 3. Fresh snapshot and nothing processing.
+    try:
+        from proxy.residency import get_residency_view
+
+        view = get_residency_view(now=_now, endpoint=endpoint)
+    except Exception:
+        return False
+    if not view.known:
+        return False
+    for slot in view.slots:
+        if slot.is_processing:
             return False
-    _prefill_thrash_cancel_tokens.pop(session_id, None)
-    return _prefill_thrash_cooldowns.pop(session_id, None) is not None
+    return True
+
+
+def _release_prefill_thrash_cooldown_on_free_gpu(
+    session_id, config=None, now=None, endpoint: str | None = None, fingerprint=None
+) -> bool:
+    """Release a cooldown window when a fresh snapshot proves the GPU free.
+
+    The second half of AC2 (LP-0MVT2KSXY002O75C): a window armed by one
+    abandonment must not veto local routing while the GPU is demonstrably
+    free. Measured baseline — 336 of 916 skips happened with the proxy's own
+    nearest status poll reporting no live dispatch — is what this removes.
+
+    The release is deliberately **not** a blanket disable: it requires the
+    freshness, liveness and ghost evidence of :func:`_gpu_demonstrably_free`,
+    so a stale snapshot, a live dispatch or a ghost still processing keeps the
+    window armed and the failing prompt refused.
+
+    When the evidence holds, every window of the session (all fingerprints) is
+    released: the justification for *all* of them ("the GPU could still be
+    finishing the abandoned prefill") is gone. Logged once, with an
+    attributable reason, so the release is measurable from logs alone.
+
+    Returns True when at least one window was released.
+    """
+    keys = _prefill_thrash_keys_for(session_id, fingerprint)
+    if not keys:
+        return False
+    remaining = _prefill_thrash_cooldown_remaining(
+        session_id, config, now=now, fingerprint=fingerprint
+    )
+    if remaining <= 0:
+        return False
+    if not _gpu_demonstrably_free(now=now, endpoint=endpoint):
+        return False
+    _drop_prefill_thrash_session(session_id)
+    try:
+        srv = _srv()
+        srv.logger.info(
+            "prefill_thrash_cooldown_released session=%s reason=free_gpu "
+            "cooldown_remaining=%.0fs endpoint=%s",
+            session_id if session_id else "unknown",
+            remaining,
+            endpoint or "default",
+        )
+    except Exception:
+        pass
+    return True
 
 
 def _reset_prefill_thrash_cooldowns() -> None:

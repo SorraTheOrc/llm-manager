@@ -184,6 +184,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_per_model_query,
     _normalize_outgoing_headers,
     _prefetch_measured_cache_abort,
+    _prefill_thrash_fingerprint,
     _record_prefill_thrash_cooldown,
     _release_client_disconnect_dispatch,
     _release_measured_cache_abort_dispatch,
@@ -1655,10 +1656,14 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # dispatch is comparable in size to the prompt that
                         # armed the window — a small warm success says nothing
                         # about the large prompt the deadline just cancelled.
+                        # LP-0MVT2KSXY002O75C: scoped to the prompt that just
+                        # succeeded, so a comparable success on prompt P never
+                        # releases a window armed by a different prompt Q.
                         _clear_prefill_thrash_cooldown(
                             session_id,
                             tokens=_estimated_tokens,
                             config=server_config,
+                            fingerprint=_prefill_thrash_fingerprint(body_json),
                         )
                         srv.backend_ready = True
                         # LP-0MUGQHPJ50046LV8: pin the stream context manager
@@ -1936,13 +1941,17 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             pass
                         # Cooldown machinery (AC7): the dispatch just proved
                         # local cannot serve this prompt in time, so arm the
-                        # same per-session window the deadline arms — the next
-                        # request must not re-prefill the identical prompt.
+                        # same window the deadline arms — the next request must
+                        # not re-prefill the identical prompt. LP-0MVT2KSXY002O75C:
+                        # the window is scoped to this prompt's fingerprint, so
+                        # only that prompt is refused (an unrelated, usually
+                        # smaller prompt from the same session is admitted).
                         try:
                             _abort_cooldown_deadline = _record_prefill_thrash_cooldown(
                                 session_id,
                                 server_config,
                                 tokens=_estimated_tokens,
+                                fingerprint=_prefill_thrash_fingerprint(body_json),
                             )
                             if _abort_cooldown_deadline > 0:
                                 srv.logger.info(
@@ -2030,11 +2039,19 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     # first byte clears it (LP-0MVQITN6P008DPLB:
                                     # record the failing prompt size so a much
                                     # smaller success cannot release it).
+                                    # LP-0MVT2KSXY002O75C: keyed by the
+                                    # prompt fingerprint (fail-open to the
+                                    # session-wide window when the payload
+                                    # cannot be fingerprinted), so the veto
+                                    # covers only the prompt that failed.
                                     _prefill_cooldown_deadline = (
                                         _record_prefill_thrash_cooldown(
                                             session_id,
                                             server_config,
                                             tokens=_estimated_tokens,
+                                            fingerprint=_prefill_thrash_fingerprint(
+                                                body_json
+                                            ),
                                         )
                                     )
                                     if _prefill_cooldown_deadline > 0:

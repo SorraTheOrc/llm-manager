@@ -873,13 +873,14 @@ async def test_router_successful_first_byte_clears_the_cooldown(monkeypatch, clo
 # so a marker cannot be forgotten).
 # ═════════════════════════════════════════════════════════════════════════════
 
-_SCOPE_DEFECT = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "cooldown is session-wide and has no free-GPU release (parent "
-        "LP-0MVRMI5HK00558TB AC2); green once LP-0MVT2KSXY002O75C lands"
-    ),
-)
+"""Red-first markers removed.
+
+The scope/free-GPU assertions were pinned with
+``pytest.mark.xfail(strict=True)`` by the prerequisite test item
+(LP-0MVT2KSC6004UZSD). LP-0MVT2KSXY002O75C removed every marker as it turned
+the assertions green; they now run unmarked, which is the only state that
+proves the fix.
+"""
 
 PROMPT_P = "x" * 40_000  # the doomed large prompt
 PROMPT_Q = "short unrelated prompt"
@@ -929,7 +930,6 @@ def gpu_free(monkeypatch, clock):
     monkeypatch.setattr(server, "local_dispatch_records", {})
     monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock())
     monkeypatch.setattr(server, "local_prefill_in_flight", {})
-    monkeypatch.setattr(server, "logger", MagicMock())
     with patch.dict("proxy.session._slot_owners", {}, clear=True):
         yield clock
 
@@ -949,7 +949,6 @@ def _mark_slot_processing():
 # ---------------------------------------------------------------------------
 
 
-@_SCOPE_DEFECT
 class TestPromptFingerprint:
     """AC2: the window is keyed by (session, prompt fingerprint)."""
 
@@ -988,7 +987,6 @@ class TestPromptFingerprint:
 # ---------------------------------------------------------------------------
 
 
-@_SCOPE_DEFECT
 class TestCooldownScope:
     """AC2: only the re-dispatch the window was armed for is refused."""
 
@@ -1160,7 +1158,6 @@ class TestCooldownScope:
 # ---------------------------------------------------------------------------
 
 
-@_SCOPE_DEFECT
 class TestFreeGpuRelease:
     """AC2: a window must never outlive the condition that justified it."""
 
@@ -1300,7 +1297,6 @@ class TestFreeGpuRelease:
 
 
 @pytest.mark.asyncio
-@_SCOPE_DEFECT
 async def test_different_prompt_is_dispatched_locally_on_a_free_gpu(
     fallback_harness, gpu_free, clock, caplog,
 ):
@@ -1323,7 +1319,6 @@ async def test_different_prompt_is_dispatched_locally_on_a_free_gpu(
 
 
 @pytest.mark.asyncio
-@_SCOPE_DEFECT
 async def test_same_prompt_is_still_refused_at_the_gate_on_a_busy_gpu(
     fallback_harness, gpu_free, monkeypatch, clock, caplog,
 ):
@@ -1353,12 +1348,16 @@ async def test_same_prompt_is_still_refused_at_the_gate_on_a_busy_gpu(
 
 
 @pytest.mark.asyncio
-@_SCOPE_DEFECT
-async def test_different_prompt_is_still_skipped_when_evidence_is_stale(
+async def test_failing_prompt_is_still_skipped_when_evidence_is_stale(
     fallback_harness, gpu_free, monkeypatch, clock,
 ):
-    """The release is not a blanket disable: with no fresh evidence the
-    session-wide window keeps engaging."""
+    """The release is not a blanket disable: with no fresh evidence the window
+    stays armed and the *failing* prompt is still refused.
+
+    (The unrelated-prompt case is asserted separately: LP-0MVT2KSXY002O75C
+    narrowed the veto to the failing prompt, so a different prompt is admitted
+    regardless of the evidence — that is AC2 (ii), not a release.)
+    """
     import proxy.observability as obs
 
     monkeypatch.setattr(obs, "_last_slot_details_at", clock.now - 120.0)
@@ -1368,7 +1367,7 @@ async def test_different_prompt_is_still_skipped_when_evidence_is_stale(
         fingerprint=_fingerprint(PROMPT_P),
     )
 
-    resp = await fallback_harness(_request_with_prompt(SESSION_A, PROMPT_Q), cfg)
+    resp = await fallback_harness(_request_with_prompt(SESSION_A, PROMPT_P), cfg)
 
     assert resp.status_code == 200
     assert fallback_harness.call_log == ["remote"]
