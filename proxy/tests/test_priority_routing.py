@@ -41,6 +41,7 @@ from proxy.priority import (
     set_request_priority,
 )
 
+from proxy import admission_reserve
 from proxy import priority as prio
 
 # ---------------------------------------------------------------------------
@@ -445,3 +446,84 @@ class TestCompactionGatePriority:
         body = json.loads(resp.body)
         assert body["priority"] == "low"
         assert "mode" not in body
+
+
+# ---------------------------------------------------------------------------
+# Verdict-aware chain filter (LP-0MVSM06LB001PRU4 AC4)
+#
+# The chain filter serves two stripping reasons — ``remote-ok`` by preference
+# and ``too_large`` by capacity — through ONE comprehension. These unit tests
+# pin the filter contract itself; the dispatch-cycle behaviour is asserted in
+# ``test_local_only_refusal_matrix.py``.
+# ---------------------------------------------------------------------------
+
+
+class TestVerdictAwareChainFilter:
+    CHAIN = [
+        {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+        {"name": "remote-a", "type": "remote", "endpoint": "https://a.example"},
+        {"name": "remote-b", "type": "remote", "endpoint": "https://b.example"},
+    ]
+
+    def test_too_large_strips_local_exactly_like_remote_ok(self):
+        """AC4: same input ⇒ the two stripping reasons produce one chain."""
+        capacity = prio.apply_local_preference(
+            self.CHAIN,
+            admission_reserve.PREF_LOCAL_PREFERRED,
+            verdict=admission_reserve.CAPACITY_TOO_LARGE,
+        )
+        preference = prio.apply_local_preference(
+            self.CHAIN, admission_reserve.PREF_REMOTE_OK
+        )
+        assert capacity == preference, (
+            "the verdict strip must reuse the remote-ok filter, not re-derive it"
+        )
+        assert [entry["name"] for entry in capacity] == ["remote-a", "remote-b"]
+
+    def test_a_deferrable_verdict_keeps_the_chain_intact(self):
+        """A fits-local request is never promoted: waiting can still help."""
+        assert (
+            prio.apply_local_preference(
+                self.CHAIN,
+                admission_reserve.PREF_LOCAL_PREFERRED,
+                verdict=admission_reserve.CAPACITY_DEFERRABLE,
+            )
+            is self.CHAIN
+        )
+
+    def test_no_verdict_keeps_todays_preference_behaviour(self):
+        """``effective_chain_for_request`` keeps calling the filter without one."""
+        assert (
+            prio.apply_local_preference(
+                self.CHAIN, admission_reserve.PREF_LOCAL_PREFERRED
+            )
+            is self.CHAIN
+        )
+        assert (
+            prio.apply_local_preference(
+                self.CHAIN, admission_reserve.PREF_PREFER_LOCAL
+            )
+            is self.CHAIN
+        )
+
+    def test_remote_less_chain_is_never_stripped_for_capacity(self):
+        """AC3 (parent A5): a ``private`` chain keeps deferring, never promotes."""
+        remote_less = [self.CHAIN[0]]
+        assert (
+            prio.apply_local_preference(
+                remote_less,
+                admission_reserve.PREF_LOCAL_PREFERRED,
+                verdict=admission_reserve.CAPACITY_TOO_LARGE,
+            )
+            is remote_less
+        ), "capacity stripping must never manufacture an empty chain"
+
+    def test_remote_ok_still_filters_a_remote_less_chain_to_empty(self):
+        """``remote-ok`` emptiness is the client's intent, not a strip artefact."""
+        remote_less = [self.CHAIN[0]]
+        assert (
+            prio.apply_local_preference(
+                remote_less, admission_reserve.PREF_REMOTE_OK
+            )
+            == []
+        )

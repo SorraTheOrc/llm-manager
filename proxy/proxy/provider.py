@@ -62,6 +62,7 @@ from proxy.priority import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
     VALID_PRIORITIES,
+    apply_local_preference,
     effective_chain_for_request,
     priority_routing_profile,
     request_priority,
@@ -6443,6 +6444,13 @@ def _local_occupant_prefill_seconds(
 LOCAL_FALLBACK_RETRY_AFTER_ATTR = "_local_fallback_retry_after_s"
 LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR = "_local_fallback_token_evidence"
 
+#: Outcome stamped on ``request._local_routing_outcome`` when the pre-loop
+#: capacity verdict removes the local entry from the effective chain
+#: (LP-0MVSM06LB001PRU4). The single per-request outcome line
+#: (LP-0MVSM06Z8003UQTM) consumes it; this slice only stamps — it emits no log
+#: line of its own.
+LOCAL_ROUTING_OUTCOME_PROMOTED = "promoted"
+
 
 def _note_local_fallback_reason(
     request, reason: str | None, retry_after_s: int | float | None = None
@@ -6585,6 +6593,124 @@ def _local_preference_pins_local(request, preference: str | None = None) -> bool
     if resolved != PREF_LOCAL_PREFERRED:
         return False
     return _local_capacity_verdict_for_request(request).verdict != CAPACITY_TOO_LARGE
+
+
+async def _promote_too_large_local_request(
+    request,
+    chain: list[dict],
+    preference: str | None,
+    config: dict,
+    body_json: dict | None,
+    routing_estimate,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Drop the local entry when a pin-local request is ``too_large`` (AC1).
+
+    Called once per cycle, after the authoritative routing estimate exists and
+    **before** the dispatch loop. A ``too_large`` verdict means the prompt
+    outgrows the local serving envelope, so waiting cannot help: the local
+    entry is removed from the chain at resolution time (the same filter
+    ``remote-ok`` uses, :func:`proxy.priority.apply_local_preference`) and the
+    remote tiers serve the request with no local attempt, no queue entry, no
+    lease and no local-capacity 429 (parent AC4). A ``deferrable`` verdict
+    leaves the chain untouched — a fits-local request stays pinned.
+
+    Inputs are the ones the cycle already built, never a second estimate:
+
+    * the shared :class:`_RoutingEstimateCache` for the prompt size,
+    * ``expected_cached_ratio`` for the *new* (uncached) tokens the cold-prefill
+      budget prices — the same ratio the in-loop gate uses, so a warm large
+      prompt is not mistaken for a cold one,
+    * ``server.local_cold_prefill_budget_tokens`` through
+      :func:`_cold_prefill_budget_tokens` (i.e.
+      :data:`proxy.prefill_eta.COLD_PREFILL_BUDGET_KEY`), and
+    * the local entry's own context ceiling
+      (:func:`_provider_context_limit`).
+
+    The classification itself is delegated to
+    :func:`admission_reserve.local_capacity_verdict` — the single verdict
+    source (parent AC1/AC3); no reason or size table is re-derived here.
+
+    Only a pin-local (``local-preferred``) request is eligible: ``prefer-local``
+    and ``remote-ok`` keep today's behaviour (parent AC5). A chain with no
+    non-local entry is left intact (the filter's remote-less carve-out):
+    stripping it would manufacture an empty-chain exhaustion, so the local
+    route keeps its existing deferral/refusal exits (parent A5/AC5).
+
+    The verdict is cached on the request (``request._local_capacity_verdict``)
+    and the outcome stamped (``request._local_routing_outcome``) so the pin
+    predicate and the observability slice reuse this one computation instead of
+    re-pricing the prompt (AC2). Only a verdict that actually stripped is
+    cached: a ``deferrable`` verdict is derived from live exit evidence by
+    :func:`_local_capacity_verdict_for_request`, because the recorded reason
+    changes as the cycle walks its exits and a stale value would silently
+    re-route the request.
+
+    Returns:
+        The chain to dispatch. When nothing was stripped the *same list object*
+        is returned, so the caller can skip re-stamping ``model_config``.
+    """
+    if preference != PREF_LOCAL_PREFERRED:
+        return chain
+    local_entry = next(
+        (
+            entry
+            for entry in chain
+            if isinstance(entry, dict) and entry.get("type") == "local"
+        ),
+        None,
+    )
+    if local_entry is None:
+        # No local route in the chain (e.g. a remote-only model): there is no
+        # local capacity to classify.
+        return chain
+    estimated = 0
+    if routing_estimate is not None:
+        try:
+            estimated = int(await routing_estimate.get())
+        except Exception:  # pragma: no cover - estimate is best-effort
+            logger.debug("too-large verdict: prompt estimate unavailable")
+            estimated = 0
+    try:
+        cached_ratio = expected_cached_ratio(
+            local_entry.get("llama_model") or "",
+            session_id,
+            estimated,
+            body_json.get("messages") if isinstance(body_json, dict) else None,
+            server_config=(
+                config.get("server", config) if isinstance(config, dict) else None
+            ),
+        )
+    except Exception:  # pragma: no cover - ratio is best-effort
+        cached_ratio = 0.0
+    try:
+        new_tokens = int(estimated * (1 - float(cached_ratio or 0.0)))
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        new_tokens = 0
+    from proxy import admission_reserve
+
+    verdict = admission_reserve.local_capacity_verdict(
+        new_tokens=new_tokens,
+        budget_tokens=_cold_prefill_budget_tokens(config),
+        estimated_tokens=estimated,
+        context_limit=_provider_context_limit(local_entry),
+    )
+    if verdict.verdict != CAPACITY_TOO_LARGE:
+        return chain
+    stripped = apply_local_preference(chain, preference, verdict=verdict.verdict)
+    if stripped is chain:
+        # Remote-less chain: the filter kept it intact so the existing local
+        # attempt/deferral/refusal behaviour applies. Nothing to cache — a
+        # cached ``too_large`` would change the pin decision.
+        return chain
+    try:
+        setattr(request, "_local_capacity_verdict", verdict)
+        setattr(request, "_local_routing_outcome", LOCAL_ROUTING_OUTCOME_PROMOTED)
+    except Exception:  # pragma: no cover - stamping is best-effort
+        pass
+    # No log line here: the single per-request outcome line
+    # (LP-0MVSM06Z8003UQTM) reports the stamped outcome.
+    return stripped
 
 
 def _admission_token_evidence(attempt: dict[str, Any], key: str) -> int | None:
@@ -10547,6 +10673,27 @@ async def _proxy_with_remote_fallback_cycle(
         request, body_json, model_config, config,
     )
 
+    # Too-large promotion (LP-0MVSM06LB001PRU4, parent AC4): a pin-local
+    # request whose capacity verdict is ``too_large`` never resolves, queues,
+    # leases or refuses the local entry — the local entry is removed from the
+    # chain here, before the dispatch loop, through the same filter
+    # ``remote-ok`` uses. The verdict is computed once and cached on the
+    # request for the pin predicate and the outcome line (AC2). A chain with
+    # no non-local entry is returned unchanged (remote-less carve-out), so a
+    # ``private`` model keeps its existing local exits.
+    _promoted_chain = await _promote_too_large_local_request(
+        request,
+        _chain,
+        _preference,
+        config,
+        body_json,
+        _routing_estimate,
+        session_id=_budget_session_id,
+    )
+    if _promoted_chain is not _chain:
+        _chain = _promoted_chain
+        model_config = {**model_config, "providers": _chain}
+
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
@@ -11207,6 +11354,24 @@ async def _proxy_with_fallback_cycle(
     _routing_estimate = _RoutingEstimateCache(
         request, body_json, model_config, config,
     )
+
+    # Too-large promotion (LP-0MVSM06LB001PRU4, parent AC4): with a
+    # ``too_large`` verdict the local entry leaves the chain before the
+    # dispatch loop — no local resolution, queue entry, lease or local-capacity
+    # 429 (the loop only ever sees the remote tiers). ``deferrable`` verdicts
+    # leave the chain intact, and a remote-less chain is never stripped.
+    _promoted_chain = await _promote_too_large_local_request(
+        request,
+        _chain,
+        _preference,
+        config,
+        body_json,
+        _routing_estimate,
+        session_id=_session_id,
+    )
+    if _promoted_chain is not _chain:
+        _chain = _promoted_chain
+        model_config = {**model_config, "providers": _chain}
 
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: list[dict[str, Any]] = []

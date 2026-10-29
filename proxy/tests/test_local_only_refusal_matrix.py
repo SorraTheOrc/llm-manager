@@ -460,7 +460,22 @@ async def _issue(row: _ExitRow, preference: str | None) -> tuple:
     attempt, so ``[]`` proves nothing was dispatched and ``["remote"]`` proves
     today's remote fall-through still happens.
     """
+    result, calls, _ = await _issue_with_request(row, preference)
+    return result, calls
+
+
+async def _issue_with_request(
+    row: _ExitRow, preference: str | None
+) -> tuple:
+    """Like :func:`_issue`, but also return the request the cycle saw.
+
+    The request carries the per-request routing state this suite asserts on
+    (the cached capacity verdict and the stamped outcome), which a response
+    cannot expose.
+    """
     calls: list[str] = []
+    headers = {} if preference is None else {"X-Local-Preference": preference}
+    request = _DummyRequest(headers=headers)
 
     async def _local(_req, _path):
         calls.append("local")
@@ -471,7 +486,6 @@ async def _issue(row: _ExitRow, preference: str | None) -> tuple:
         calls.append("remote")
         return _ok_response()
 
-    headers = {} if preference is None else {"X-Local-Preference": preference}
     with ExitStack() as stack:
         stack.enter_context(patch("proxy.router.proxy_to_local", _local))
         stack.enter_context(patch("proxy.server.proxy_to_remote", _remote))
@@ -493,12 +507,12 @@ async def _issue(row: _ExitRow, preference: str | None) -> tuple:
         for ctx in _row_patches(row):
             stack.enter_context(ctx)
         result = await provider.proxy_with_fallback(
-            _DummyRequest(headers=headers),
+            request,
             "v1/chat/completions",
             _model_config(row),
             _config(row),
         )
-    return result, calls
+    return result, calls, request
 
 
 @pytest.fixture(autouse=True)
@@ -684,6 +698,234 @@ async def test_too_large_exits_promote_instead_of_refusing(
     )
     assert contention_queue.queue_depth() == 0, (
         f"{row.exit_description}: a promoted request never enters the queue"
+    )
+
+
+
+
+# ---------------------------------------------------------------------------
+# Too-large promotion: local is stripped BEFORE the dispatch loop
+# (LP-0MVSM06LB001PRU4 — AC1/AC2/AC3/AC4/AC6)
+# ---------------------------------------------------------------------------
+
+
+class _VerdictRecording:
+    """Recording passthrough for the single capacity-verdict helper."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.results: list = []
+        self._original = admission_reserve.local_capacity_verdict
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append({"args": args, "kwargs": dict(kwargs)})
+        verdict = self._original(*args, **kwargs)
+        self.results.append(verdict)
+        return verdict
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preference", PIN_LOCAL_PREFERENCES)
+async def test_too_large_promotion_never_touches_the_local_route(preference: str):
+    """AC1/AC6: free local slot, yet the local dispatch stub is never invoked.
+
+    The row's ``(0, 1)`` slot state means a local slot is genuinely free, so
+    ``calls == ["remote"]`` cannot be explained by contention: the local entry
+    was removed from the chain before the loop ever resolved a provider. One
+    dispatch, one ``X-Local-Route`` header, nothing queued — the promoted path
+    takes no queue slot and no lease (a lease is only ever taken by a local
+    dispatch, which never happens).
+    """
+    row = _row("entry_context_cap")
+    assert row.concurrency == (0, 1), "this row must run with a free local slot"
+
+    result, calls, request = await _issue_with_request(row, preference)
+
+    assert calls == ["remote"], (
+        f"{row.exit_description}: the local entry must be stripped pre-loop, "
+        f"not skipped in-loop (dispatched={calls})"
+    )
+    assert len(calls) == 1, "the promoted request is dispatched exactly once"
+    assert result.status_code == 200, f"got {result.status_code}"
+    assert result.headers.getlist("x-local-route") == ["remote"], (
+        "exactly one X-Local-Route header is stamped on the promoted path"
+    )
+    assert contention_queue.queue_depth() == 0, (
+        "a promoted request engages no contention queue"
+    )
+    assert request._local_routing_outcome == provider.LOCAL_ROUTING_OUTCOME_PROMOTED, (
+        "the promotion outcome is stamped for the per-request outcome line"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preference", PIN_LOCAL_PREFERENCES)
+async def test_too_large_verdict_is_computed_once_and_cached(preference: str):
+    """AC2: one verdict per request before the loop, reused from the request.
+
+    The pre-loop computation prices the routing estimate against the local
+    entry's ceiling; the pin predicate then reuses the cached value (it never
+    re-prices the prompt), so the helper is consulted exactly once for a
+    promoted request.
+    """
+    row = _row("entry_context_cap")
+    spy = _VerdictRecording()
+
+    with patch("proxy.admission_reserve.local_capacity_verdict", new=spy):
+        result, calls, request = await _issue_with_request(row, preference)
+
+    assert calls == ["remote"]
+    assert result.status_code == 200
+    assert len(spy.calls) == 1, (
+        "the verdict is computed once per request per cycle; "
+        f"got {spy.calls!r}"
+    )
+    cached = request._local_capacity_verdict
+    assert cached is not None, "the verdict must be cached on the request"
+    assert cached.verdict == admission_reserve.CAPACITY_TOO_LARGE
+    priced = spy.calls[0]["kwargs"]
+    assert priced["estimated_tokens"] == PROMPT_TOKENS, (
+        "the verdict must price the shared routing estimate"
+    )
+    assert priced["context_limit"] == ENTRY_CONTEXT_CAP_TOKENS, (
+        "the verdict must use the local entry's own context ceiling"
+    )
+
+
+@pytest.mark.asyncio
+async def test_too_large_strip_reuses_the_single_chain_filter():
+    """AC4: the strip goes through ``priority.apply_local_preference``.
+
+    ``provider.py`` owns no second ``type == "local"`` filtering loop: the
+    verdict is handed to the one chain filter, which is the same call
+    ``remote-ok`` makes. A hand-rolled comprehension would leave this spy
+    empty while the request still promoted.
+    """
+    row = _row("entry_context_cap")
+    recorded: list[dict] = []
+    original = provider.apply_local_preference
+
+    def _spy(chain, preference, verdict=None):
+        recorded.append({"preference": preference, "verdict": verdict})
+        return original(chain, preference, verdict)
+
+    with patch.object(provider, "apply_local_preference", _spy):
+        result, calls, _ = await _issue_with_request(row, LOCAL_PREFERRED)
+
+    assert calls == ["remote"]
+    assert result.status_code == 200
+    assert len(recorded) == 1, (
+        f"exactly one verdict-aware filter call expected; got {recorded!r}"
+    )
+    assert recorded[0]["verdict"] == admission_reserve.CAPACITY_TOO_LARGE
+    assert recorded[0]["preference"] == admission_reserve.PREF_LOCAL_PREFERRED
+
+
+@pytest.mark.asyncio
+async def test_deferrable_verdict_never_applies_the_capacity_strip():
+    """AC4: a temporal verdict leaves the chain alone (never promoted).
+
+    The ``chain_cooldown`` row is plainly deferrable, so the filter must not be
+    called with a verdict at all — a fits-local request stays pinned and is
+    refused, exactly as the deferrable matrix rows assert.
+    """
+    row = _row("chain_cooldown")
+    recorded: list[dict] = []
+    original = provider.apply_local_preference
+
+    def _spy(chain, preference, verdict=None):
+        recorded.append({"preference": preference, "verdict": verdict})
+        return original(chain, preference, verdict)
+
+    with patch.object(provider, "apply_local_preference", _spy):
+        result, calls, request = await _issue_with_request(row, LOCAL_PREFERRED)
+
+    assert calls == [], "a deferrable pin-local request is refused, not promoted"
+    assert result.status_code == 429
+    assert recorded == [], f"no capacity strip for a deferrable verdict: {recorded!r}"
+    assert getattr(request, "_local_routing_outcome", None) is None, (
+        "a refused request is not stamped as promoted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_less_chain_is_never_stripped_by_a_too_large_verdict():
+    """AC3 (parent A5): a ``private`` chain keeps its local route.
+
+    Every entry is ``type: local``, so capacity stripping would leave nothing
+    to serve the request. The filter's carve-out keeps the chain intact: the
+    verdict is still ``too_large`` (asserted through the recording helper) but
+    it is not cached and the local route is dispatched as before — no empty
+    chain and therefore no "All providers exhausted" produced by the filter.
+    """
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):  # pragma: no cover - must never run
+        calls.append("remote")
+        return _ok_response()
+
+    request = _DummyRequest(headers={"X-Local-Preference": LOCAL_PREFERRED})
+    model_config = {
+        "providers": [
+            {"name": LOCAL_PROVIDER_NAME, "type": "local", "llama_model": "Qwen3"}
+        ],
+        "aliases": ["private*"],
+    }
+    config = {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "session_slot_pool_size": 1,
+            "local_model_ctx_size": 0,
+            "local_prefill_deadline_seconds": 0,
+            # A tight cold-prefill budget makes the *verdict* too_large, while
+            # the admission guard is off so this row proves the filter's
+            # carve-out rather than a guard refusal.
+            "local_cold_prefill_budget_tokens": 1_000,
+            "local_admission_guard_policy": "off",
+        },
+    }
+    spy = _VerdictRecording()
+
+    with (
+        patch("proxy.admission_reserve.local_capacity_verdict", new=spy),
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch(
+            "proxy.provider._get_local_concurrency_info",
+            _MutableConcurrency(0, 1),
+        ),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch(
+            "proxy.router_helpers.evaluate_and_apply_compaction",
+            _no_compaction,
+        ),
+        _estimate_patches(PROMPT_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            request, "v1/chat/completions", model_config, config
+        )
+
+    assert calls == ["local"], (
+        "a remote-less chain keeps its local route even when too_large "
+        f"(dispatched={calls})"
+    )
+    assert result.status_code == 200, f"got {result.status_code}"
+    assert result.headers.get("X-Local-Route") == "local"
+    assert spy.calls, "the verdict must still be computed before the loop"
+    assert any(
+        v.verdict == admission_reserve.CAPACITY_TOO_LARGE for v in spy.results
+    ), (
+        "the row must actually exercise a too_large verdict"
+    )
+    assert getattr(request, "_local_capacity_verdict", None) is None, (
+        "an unstripped chain must not cache a verdict that would flip the pin"
+    )
+    assert getattr(request, "_local_routing_outcome", None) is None, (
+        "a served-local request is not stamped as promoted"
     )
 
 
