@@ -104,7 +104,7 @@ value is sampled and refreshed every 10 s):
 | `gpu_gtt_used_bytes` | gauge | GTT (system RAM mapped for the GPU) in use — **the meaningful memory pool on this APU** |
 | `gpu_vram_used_bytes` | gauge | Used portion of the small BIOS VRAM carve-out (1 GiB here) |
 | `gpu_vram_total_bytes` | gauge | Size of the VRAM carve-out |
-| `gpu_busy_percent` | gauge | Driver-reported busy percentage. **Saturates at ~20 W on this APU — it reads ~100% for any draw above ~20 W, so it is not a utilisation signal** (measured 2026-10-28, LP-0MVSQQO910077LYL); scraped for continuity only |
+| `gpu_busy_percent` | gauge | Driver-reported busy percentage. **Saturates at ~20 W on this APU — it reads ~100% for any draw above ~20 W, so it is not a utilisation signal** (measured 2026-10-28, LP-0MVSQQO910077LYL); scraped for continuity only and **must not be used in any rule** — select the power-derived `gpu:computing:bool` instead |
 
 GPU power (from the hwmon collector):
 

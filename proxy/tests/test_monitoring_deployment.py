@@ -1188,6 +1188,23 @@ class TestGpuUtilisationSourceDecision:
             "monitoring/README.md must record the ~20 W saturation threshold"
         )
 
+    def test_node_exporter_unit_forbids_selecting_the_busy_counter(self):
+        """AC 3: the unit file carries the explicit rule-level prohibition.
+
+        `gpu_busy_percent` saturates at ~20 W on this APU, so a rule selecting
+        it fires while the GPU is idle. The prohibition has to sit next to the
+        series table a rule author copies from, not only in the README.
+        """
+        content = _norm((DOCS_SYSTEMD_DIR / "node_exporter.service").read_text())
+        assert "gpu_busy_percent" in content
+        assert "must not be used in any rule" in content, (
+            "node_exporter.service must explicitly forbid selecting "
+            "gpu_busy_percent in a rule, next to the series it describes"
+        )
+        assert "saturates at ~20 w" in content, (
+            "node_exporter.service must state the measured saturation threshold"
+        )
+
     def test_docs_replace_the_stale_pinned_claim_with_a_measurement(self):
         """AC 2/AC 3: no doc restates the unexplained 'pinned' premise."""
         for path in (
