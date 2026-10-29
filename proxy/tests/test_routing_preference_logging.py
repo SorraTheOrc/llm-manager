@@ -13,7 +13,11 @@ Two properties are pinned here:
    ``local_admission_guard_direct_fallback``, the chain-resolution
    ``Skipping provider=<local> … in cooldown`` line, the quota hard-stop skip
    and the per-entry ``routing_skip_provider_context`` ceiling skip
-   (LP-0MVTF2WLQ008BNYK).
+   (LP-0MVTF2WLQ008BNYK), and the remaining chain-resolution skips — same
+   failure domain, same usage-limit account and proactive quota state
+   (LP-0MVTI957W006KS0P). The last three are also pinned directly against
+   ``_resolve_provider_with_exclusions`` so all three parsed values (including
+   ``remote-ok``, whose local route never reaches a dispatch loop) are covered.
 2. **Attribution** (parent AC5): ``priority_routing`` on **both** dispatch
    cycles carries the request's session id, so a preference can be tied to a
    specific request without correlation heuristics.
@@ -89,6 +93,21 @@ REMOTE_PROVIDER_NAME = "remote-fallback"
 MODEL_NAME = "hybrid-log-model"
 #: Session id sent by the attribution tests; the resolved value must round-trip.
 SESSION_ID = "sess-log-attribution"
+#: Brand shared by both local entries in the ``same_failure_domain`` chain, so
+#: failing the first entry excludes the second through the brand-keyed domain
+#: key (a local entry has no ``endpoint`` to key on).
+CHAIN_SKIP_LOCAL_BRAND = "llama-local-brand"
+#: ``api_key_env`` of the chain-resolution local entry: makes its usage-limit
+#: ACCOUNT key differ from its failure-domain key, so only the account line can
+#: match it.
+CHAIN_SKIP_LOCAL_ACCOUNT_ENV = "LOCAL_CHAIN_SKIP_KEY"
+#: The reason ``_quota_unavailable_reason`` returns for a spent account, in the
+#: exact shape the real function formats (so the ``key=value`` contract the
+#: line must keep is faithful).
+CHAIN_SKIP_QUOTA_REASON = (
+    "quota_exhausted (account=chain-skip-account, "
+    "effective_headroom=0.0%, resets_in=3600s)"
+)
 
 LOCAL_ONLY = "local-only"
 LOCAL_PREFERRED = "local-preferred"
@@ -229,6 +248,51 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
             "lease denial fell back to the next provider after the queue budget"
         ),
     ),
+    _NotLocalLineRow(
+        trigger="same_failure_domain",
+        prefix="Skipping provider=",
+        contains=("same failure domain",),
+        existing_keys=("provider", "domain"),
+        description=(
+            "chain resolution skipped a local entry sharing the failed brand's "
+            "failure domain"
+        ),
+    ),
+)
+
+#: The chain-resolution skip rows that the dispatch loops can reach only in
+#: narrow circumstances (a second local entry, a 429 account event, a polled
+#: quota snapshot) — pinned directly against the resolver, which is where the
+#: lines are emitted. ``remote-ok`` is included here: it strips the local route
+#: before dispatch, so no end-to-end row can reach these lines with that value.
+_CHAIN_SKIP_ROWS: tuple[_NotLocalLineRow, ...] = (
+    _NotLocalLineRow(
+        trigger="failure_domain",
+        prefix="Skipping provider=",
+        contains=("same failure domain",),
+        existing_keys=("provider", "domain"),
+        description=(
+            "chain resolution skipped the entry on a shared failure domain"
+        ),
+    ),
+    _NotLocalLineRow(
+        trigger="usage_limit_account",
+        prefix="Skipping provider=",
+        contains=("same usage-limit account",),
+        existing_keys=("provider", "account"),
+        description=(
+            "chain resolution skipped the entry on a shared usage-limit account"
+        ),
+    ),
+    _NotLocalLineRow(
+        trigger="proactive_quota_state",
+        prefix="Skipping provider=",
+        contains=("quota_exhausted",),
+        existing_keys=("provider", "account", "effective_headroom", "resets_in"),
+        description=(
+            "chain resolution skipped the entry on proactive quota state"
+        ),
+    ),
 )
 
 #: Which ``priority_routing`` line each dispatch cycle emits.
@@ -284,6 +348,15 @@ def _ok_response() -> Response:
     return Response(
         content=json.dumps({"choices": [{"message": {"content": "ok"}}]}),
         status_code=200,
+        media_type="application/json",
+    )
+
+
+def _server_error_response() -> Response:
+    """A plain upstream 500: terminal for the entry, so its domain is poisoned."""
+    return Response(
+        content=json.dumps({"error": {"message": "upstream failed"}}),
+        status_code=500,
         media_type="application/json",
     )
 
@@ -385,7 +458,35 @@ def _row_model_config(row: _NotLocalLineRow) -> dict:
     Only the ``entry_context_cap`` row caps its entries: the ceiling is the
     trigger under test there and must not leak into any other row (the other
     exits are conditional on the entry being dispatchable).
+
+    The ``same_failure_domain`` row runs two local entries of the same brand:
+    a failure on the first excludes the second through the brand-keyed domain,
+    which is how a failed local dispatch drops the other local entries.
     """
+    if row.trigger == "same_failure_domain":
+        return {
+            "name": MODEL_NAME,
+            "providers": [
+                {
+                    "name": LOCAL_PROVIDER_NAME,
+                    "type": "local",
+                    "llama_model": "Qwen3",
+                    "provider": CHAIN_SKIP_LOCAL_BRAND,
+                },
+                {
+                    "name": "local-llama-sibling",
+                    "type": "local",
+                    "llama_model": "Qwen3",
+                    "provider": CHAIN_SKIP_LOCAL_BRAND,
+                },
+                {
+                    "name": REMOTE_PROVIDER_NAME,
+                    "type": "remote",
+                    "endpoint": "https://api.example.com/v1",
+                },
+            ],
+            "aliases": ["hybrid*"],
+        }
     model_config = _model_config()
     if row.trigger != "entry_context_cap":
         return model_config
@@ -490,6 +591,10 @@ def _row_patches(row: _NotLocalLineRow) -> list:
                 new=AsyncMock(return_value=("fallback", None, 300.0)),
             )
         )
+    elif trigger == "same_failure_domain":
+        # The first local entry's own 500 poisons the shared brand; no extra
+        # seam is needed (see ``_issue``'s local stub).
+        pass
     else:  # pragma: no cover - a new row must name its trigger
         raise AssertionError(f"unknown not-local line trigger {trigger!r}")
     return patches
@@ -504,6 +609,8 @@ async def _issue(
     async def _local(_req, _path):
         if row.trigger == "lease_fallback":
             return _lease_active_response()
+        if row.trigger == "same_failure_domain":
+            return _server_error_response()
         return _ok_response()
 
     async def _remote(_req, _path, _pc):
@@ -673,6 +780,203 @@ async def test_not_local_line_names_the_parsed_preference(row, preference, caplo
         f"{row.description}: parsed preference is {expected!r}; the line must "
         f"say preference={expected} — got preference={kv['preference']!r}. "
         f"Line: {line!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The remaining chain-resolution skips: same failure domain, same usage-limit
+# account, proactive quota state (LP-0MVTI957W006KS0P)
+#
+# These three lines live in ``_resolve_provider_with_exclusions`` and are
+# emitted for the entry they skip, so they are pinned against the resolver
+# itself. That is also the only way to cover ``remote-ok`` on them: the value
+# strips the local route before dispatch, so no request-scoped row can reach
+# them with it.
+# ---------------------------------------------------------------------------
+
+#: The three parsed values the parent AC names. ``remote-ok`` is included here
+#: (the end-to-end rows cannot reach these lines with it — see above).
+_CHAIN_SKIP_PREFERENCES = (
+    pytest.param(LOCAL_PREFERRED, id="local-preferred"),
+    pytest.param(PREFER_LOCAL, id="prefer-local"),
+    pytest.param(REMOTE_OK, id="remote-ok"),
+)
+
+
+def _chain_skip_local_entry() -> dict:
+    """The local entry the resolver skips in every chain-skip case.
+
+    It carries a brand (the local failure-domain key) and an ``api_key_env``
+    (so its usage-limit ACCOUNT key is distinct from that domain key) — which
+    is what lets each case poison exactly one of the two keys.
+    """
+    return {
+        "name": LOCAL_PROVIDER_NAME,
+        "type": "local",
+        "llama_model": "Qwen3",
+        "provider": CHAIN_SKIP_LOCAL_BRAND,
+        "api_key_env": CHAIN_SKIP_LOCAL_ACCOUNT_ENV,
+    }
+
+
+def _chain_skip_model_config() -> dict:
+    """Local entry first, remote fallback second."""
+    return {
+        "name": MODEL_NAME,
+        "providers": [
+            _chain_skip_local_entry(),
+            {
+                "name": REMOTE_PROVIDER_NAME,
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+            },
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+
+def _chain_skip_exclusions(row: _NotLocalLineRow) -> set[str]:
+    """The excluded-key set that makes *row*'s line fire for the local entry."""
+    local_entry = _chain_skip_local_entry()
+    if row.trigger == "failure_domain":
+        return {provider._failure_domain_key(local_entry)}
+    if row.trigger == "usage_limit_account":
+        return {provider._usage_limit_account_key(local_entry)}
+    return set()
+
+
+@contextmanager
+def _chain_skip_patches(row: _NotLocalLineRow):
+    """Row-specific seams: only the quota row needs one."""
+    if row.trigger != "proactive_quota_state":
+        yield
+        return
+
+    def _reason(provider_cfg: dict, _config) -> str | None:
+        if provider_cfg.get("name") == LOCAL_PROVIDER_NAME:
+            return CHAIN_SKIP_QUOTA_REASON
+        return None
+
+    with patch("proxy.provider._quota_unavailable_reason", _reason):
+        yield
+
+
+def _resolve_chain_skip(row: _NotLocalLineRow, preference: str | None) -> dict:
+    """Resolve *row*'s chain and return the provider that survived the skip."""
+    model_config = _chain_skip_model_config()
+    with _chain_skip_patches(row):
+        resolved = provider._resolve_provider_with_exclusions(
+            model_config,
+            set(),
+            _chain_skip_exclusions(row),
+            preference=preference,
+        )
+    assert resolved is not None, (
+        f"{row.description}: the remote fallback must stay eligible — the "
+        "change is log-only and must not alter chain resolution"
+    )
+    return resolved
+
+
+@pytest.mark.parametrize(
+    "row", _CHAIN_SKIP_ROWS, ids=[r.trigger for r in _CHAIN_SKIP_ROWS]
+)
+@pytest.mark.parametrize("preference", _CHAIN_SKIP_PREFERENCES)
+def test_chain_resolution_skip_names_the_parsed_preference(
+    row, preference, caplog
+):
+    """Each of the three remaining chain-resolution skips names the preference.
+
+    The value comes from the resolver's already-parsed ``preference``
+    parameter — the same value the dispatch cycles pass from
+    ``_request_local_preference`` (LP-0MVRMC275000R2W6); nothing is re-parsed
+    here. All three parsed values are covered, ``remote-ok`` included.
+    """
+    local_entry = _chain_skip_local_entry()
+    if row.trigger == "usage_limit_account":
+        # Precondition: only the account line can match — the account key is
+        # not the failure-domain key, so the domain check cannot shadow it.
+        assert provider._usage_limit_account_key(
+            local_entry
+        ) != provider._failure_domain_key(local_entry)
+
+    resolved = _resolve_chain_skip(row, preference)
+
+    assert resolved["name"] == REMOTE_PROVIDER_NAME, (
+        "the local entry must be skipped and the remote fallback served"
+    )
+    line = _assert_line_present(_messages(caplog), row)
+    kv = _parse_kv(line)
+
+    assert kv.get("provider", "").rstrip(":") == LOCAL_PROVIDER_NAME, (
+        f"{row.description}: the line must name the skipped local entry. "
+        f"Line: {line!r}"
+    )
+    assert kv.get("preference") == preference, (
+        f"{row.description}: the parsed preference is {preference!r}; the line "
+        f"must say preference={preference} — got "
+        f"preference={kv.get('preference')!r}. Line: {line!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "row", _CHAIN_SKIP_ROWS, ids=[r.trigger for r in _CHAIN_SKIP_ROWS]
+)
+@pytest.mark.parametrize("preference", _CHAIN_SKIP_PREFERENCES)
+def test_chain_resolution_skip_keeps_every_pre_existing_key(
+    row, preference, caplog
+):
+    """The ``preference=`` addition must not drop a key log-grep tooling parses."""
+    _resolve_chain_skip(row, preference)
+    line = _assert_line_present(_messages(caplog), row)
+    kv = _parse_kv(line)
+
+    missing = [key for key in row.existing_keys if key not in kv]
+    assert not missing, (
+        f"{row.description}: the line lost pre-existing key(s) {missing} — "
+        f"log-grep consumers break. Line: {line!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "row", _CHAIN_SKIP_ROWS, ids=[r.trigger for r in _CHAIN_SKIP_ROWS]
+)
+def test_preference_never_changes_the_resolved_provider(row):
+    """Log-only change: the routing decision is identical for every preference.
+
+    The same chain, the same excluded keys and the same skip must resolve to
+    the same provider whether the request pinned local, kept the default or
+    asked for remote — the parameter only reaches the log line.
+    """
+    resolved = {
+        (_resolve_chain_skip(row, preference) or {}).get("name")
+        for preference in (None, LOCAL_PREFERRED, PREFER_LOCAL, REMOTE_OK)
+    }
+
+    assert resolved == {REMOTE_PROVIDER_NAME}, (
+        f"{row.description}: the preference must not alter chain resolution; "
+        f"got providers {sorted(map(str, resolved))!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "row", _CHAIN_SKIP_ROWS, ids=[r.trigger for r in _CHAIN_SKIP_ROWS]
+)
+def test_chain_resolution_skip_without_a_request_invents_no_preference(
+    row, caplog
+):
+    """A caller with no request (no parsed preference) gets today's line back.
+
+    ``_has_next_provider`` and friends pass no ``preference``; the line must not
+    gain an empty ``preference=`` (which would read as a parsed blank value).
+    """
+    _resolve_chain_skip(row, None)
+    line = _assert_line_present(_messages(caplog), row)
+    kv = _parse_kv(line)
+
+    assert "preference" not in kv, (
+        f"{row.description}: no request ⇒ no preference field (never an empty "
+        f"value). Line: {line!r}"
     )
 
 

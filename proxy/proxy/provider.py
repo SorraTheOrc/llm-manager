@@ -8499,12 +8499,14 @@ def _resolve_provider_with_exclusions(
     (LP-0MVRMC1W6003MV3Y AC3). The return contract is unchanged for every
     other caller.
 
-    ``preference`` carries the request's parsed ``X-Local-Preference`` so the
-    local-skip lines also log `` preference=<parsed>`` (LP-0MVRMC275000R2W6
-    AC4): a chain-resolution skip of the local entry becomes attributable to
-    the request that caused it. Optional: unfederated callers without a
-    request (e.g. the ``_has_next_provider`` predicate) omit it and the lines
-    are emitted unchanged.
+    ``preference`` carries the request's parsed ``X-Local-Preference`` so EVERY
+    skip line emitted here also logs `` preference=<parsed>``
+    (LP-0MVRMC275000R2W6 AC4, completed for the failure-domain /
+    usage-limit-account / proactive-quota lines in LP-0MVTI957W006KS0P): a
+    chain-resolution skip of the local entry becomes attributable to the
+    request that caused it. Optional: unfederated callers without a request
+    (e.g. the ``_has_next_provider`` predicate) omit it and the lines are
+    emitted unchanged.
     """
     providers = _quota_ranked_providers(model_config, config)
     if not providers:
@@ -8520,9 +8522,10 @@ def _resolve_provider_with_exclusions(
         if matched_domain is not None:
             logger.info(
                 "Skipping provider=%s: same failure domain as an already-failed "
-                "entry (domain=%s)",
+                "entry (domain=%s)%s",
                 name,
                 matched_domain,
+                _preference_log_suffix(preference),
             )
             continue
         # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ): the ACCOUNT hit an
@@ -8534,16 +8537,22 @@ def _resolve_provider_with_exclusions(
         if usage_key in excluded_domains:
             logger.info(
                 "Skipping provider=%s: same usage-limit account as an "
-                "already-exhausted entry (account=%s)",
+                "already-exhausted entry (account=%s)%s",
                 name,
                 usage_key,
+                _preference_log_suffix(preference),
             )
             continue
         # Proactive quota state says this account has nothing left to spend
         # (LP-0MVF7KIKE002DZVD): treat it as unavailable.
         quota_reason = _quota_unavailable_reason(provider_cfg, config)
         if quota_reason is not None:
-            logger.info("Skipping provider=%s: %s", name, quota_reason)
+            logger.info(
+                "Skipping provider=%s: %s%s",
+                name,
+                quota_reason,
+                _preference_log_suffix(preference),
+            )
             continue
         reset_remaining = _usage_reset_remaining(usage_key)
         if reset_remaining > 0:
