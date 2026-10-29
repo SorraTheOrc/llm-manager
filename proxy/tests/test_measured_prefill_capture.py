@@ -49,8 +49,10 @@ from proxy.measured_prefill import (
     PREFILL_PROGRESS_EVENT,
     MeasuredPrefill,
     capture_enabled,
+    clear_measured_prefill,
     get_measured_prefill,
     inject_return_progress,
+    set_measured_prefill,
 )
 from proxy.prompt_progress import parse_prompt_progress_event
 
@@ -220,6 +222,75 @@ class TestMeasuredPrefillRecord:
         assert "total=unknown" in fields
         assert "measured_cached_ratio=unknown" in fields
         assert "priced_new_tokens=unknown" in fields
+
+
+class TestStoreSemantics:
+    """The ``(model, session)`` measurement store (LP-0MVT2PB6U007PKD1 AC3).
+
+    The admission-time rung reads this store to report a numeric reusable
+    prefix when the deployed llama.cpp build reports no ``context_tokens``, so
+    its lookup semantics are part of the observability contract: strictly
+    keyed, clearable per pair and never a raising failure mode on the
+    admission hot path.
+    """
+
+    @staticmethod
+    def _measurement(total: int) -> MeasuredPrefill:
+        return MeasuredPrefill(total=total, cache=0, processed=0, time_ms=1.0)
+
+    def test_round_trip_is_scoped_to_the_model_and_session_pair(self):
+        set_measured_prefill(MODEL, SESSION, self._measurement(40_000))
+
+        stored = get_measured_prefill(MODEL, SESSION)
+        assert stored is not None
+        assert stored.total == 40_000
+        # A different session (same model) and a different model (same
+        # session) are distinct keys: a measurement is one dispatch's prefix
+        # in one model's slot and must never leak across either boundary.
+        assert get_measured_prefill(MODEL, "sess-other") is None
+        assert get_measured_prefill("Qwen3-Next", SESSION) is None
+
+    def test_the_latest_measurement_wins(self):
+        set_measured_prefill(MODEL, SESSION, self._measurement(40_000))
+        set_measured_prefill(MODEL, SESSION, self._measurement(32_000))
+
+        stored = get_measured_prefill(MODEL, SESSION)
+        assert stored is not None
+        assert stored.total == 32_000
+
+    def test_clear_removes_only_the_named_pair(self):
+        set_measured_prefill(MODEL, SESSION, self._measurement(40_000))
+        set_measured_prefill(MODEL, "sess-other", self._measurement(20_000))
+
+        clear_measured_prefill(MODEL, SESSION)
+
+        assert get_measured_prefill(MODEL, SESSION) is None
+        other = get_measured_prefill(MODEL, "sess-other")
+        assert other is not None
+        assert other.total == 20_000
+
+    def test_empty_keys_are_no_ops_and_never_raise(self):
+        measurement = self._measurement(40_000)
+
+        set_measured_prefill("", SESSION, measurement)
+        set_measured_prefill(MODEL, "", measurement)
+        set_measured_prefill(None, SESSION, measurement)
+        set_measured_prefill(MODEL, None, measurement)
+
+        assert get_measured_prefill("", SESSION) is None
+        assert get_measured_prefill(MODEL, "") is None
+        assert get_measured_prefill(None, SESSION) is None
+        assert get_measured_prefill(MODEL, None) is None
+        # Clearing an absent/blank key is a no-op, not an error: invalidation
+        # runs from eviction paths that must never raise into a request.
+        clear_measured_prefill(MODEL, SESSION)
+        clear_measured_prefill("", "")
+        clear_measured_prefill(None, None)
+
+    def test_a_missing_measurement_is_not_stored(self):
+        set_measured_prefill(MODEL, SESSION, None)  # type: ignore[arg-type]
+
+        assert get_measured_prefill(MODEL, SESSION) is None
 
 
 # ---------------------------------------------------------------------------
