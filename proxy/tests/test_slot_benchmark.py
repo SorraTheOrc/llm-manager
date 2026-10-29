@@ -530,7 +530,8 @@ class TestBuildContentionMetrics:
             + _fallback_line(TS, 60.0) + "\n"
         )
         metrics = sb.build_contention_metrics(
-            [sb.RequestResult(0, "completed", 1.0, resolved_model="local/Qwen3")],
+            [sb.RequestResult(0, "completed", 1.0, resolved_model="local/Qwen3",
+                              started_at=100.0, ended_at=101.0)],
             log_files=[str(log)],
             start_ts=0.0,
             end_ts=2_000_000_000.0,
@@ -545,6 +546,7 @@ class TestBuildContentionMetrics:
         assert metrics.queue_timeout_rate == pytest.approx(1 / 3)
         assert metrics.local_stream_share == 1.0
         assert metrics.quarantine_episode_count == 0
+        assert metrics.max_concurrent_local_streams == 1
         assert metrics.unavailable == {}
 
     def test_missing_logs_reports_null_and_reason(self):

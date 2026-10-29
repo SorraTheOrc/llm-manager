@@ -66,6 +66,14 @@ REASONS = (
     "slot_assignment_freed",
 )
 
+#: Option D's reason (LP-0MVR7IN0O000DPXN, parent AC6): the dispatch was
+#: released because the *measured* ``prompt_progress`` showed a cache deficit
+#: far above the admission-priced new tokens. It shares the
+#: ``local_eviction_after_acceptance`` prefix but must be attributable in the
+#: report as its own reason — distinct from ``prefill_deadline`` — so the
+#: post-deploy window counts the two classes separately.
+MEASURED_CACHE_DEFICIT = "measured_cache_deficit"
+
 TS = "2026-10-25 10:00:00,123"
 
 
@@ -248,6 +256,83 @@ def test_report_section_is_absent_when_there_is_nothing_to_show():
     reporting._append_residency_section(out.append, summary)
 
     assert out == []
+
+
+# ---------------------------------------------------------------------------
+# AC6 — Option D's measured-cache reason is attributable (LP-0MVR7K74S001PBNI)
+# ---------------------------------------------------------------------------
+
+def test_measured_cache_deficit_parses_as_its_own_reason():
+    """The new reason is parsed verbatim, never folded into the deadline class."""
+    event = log_parser.parse_log_line(_line(MEASURED_CACHE_DEFICIT))
+
+    assert event is not None
+    assert event.kind == "local_eviction_after_acceptance"
+    assert event.reason == MEASURED_CACHE_DEFICIT
+
+
+def test_measured_cache_deficit_is_counted_separately_from_the_deadline():
+    """The post-deploy window can count the two eviction classes apart."""
+    payload = reporting.summary_to_json(
+        _analyse(
+            [
+                _line(MEASURED_CACHE_DEFICIT),
+                _line(MEASURED_CACHE_DEFICIT),
+                _line("prefill_deadline"),
+            ]
+        )
+    )
+
+    assert payload["local_evictions_after_acceptance"] == 3
+    assert payload["local_evictions_after_acceptance_by_reason"] == {
+        MEASURED_CACHE_DEFICIT: 2,
+        "prefill_deadline": 1,
+    }
+
+
+def test_measured_cache_deficit_keeps_the_deadline_waste_metric_distinct():
+    """``wasted_prefill_tokens`` stays a deadline metric; the deficit stays readable.
+
+    Option D releases a dispatch *before* the deadline, so its tokens are a
+    different quantity (measured re-prefill work, not a deadline
+    cancellation). It must not inflate the deadline-waste figure, and the
+    event's own admission-priced ``new_tokens`` must survive for the
+    post-deploy comparison.
+    """
+    summary = _analyse([_line(MEASURED_CACHE_DEFICIT, new_tokens=150)])
+
+    assert reporting._wasted_prefill_tokens(summary) == 0
+    assert [
+        event.new_tokens for event in summary.eviction_after_acceptance_events
+    ] == [150]
+
+
+def test_measured_cache_deficit_is_attributed_in_the_text_report():
+    """The rendered report lists the new reason as its own row."""
+    summary = _analyse(
+        [
+            _line(MEASURED_CACHE_DEFICIT),
+            _line(MEASURED_CACHE_DEFICIT),
+            _line("prefill_deadline"),
+        ]
+    )
+
+    out: list[str] = []
+    reporting._append_residency_section(out.append, summary)
+    text = "\n".join(out)
+
+    assert f"| {MEASURED_CACHE_DEFICIT} | 2 |" in text
+    assert "| prefill_deadline | 1 |" in text
+
+
+def test_reference_documents_the_measured_cache_reason():
+    """AC6: the reason and its metric split are documented for the operator."""
+    reference = (
+        Path(__file__).resolve().parents[1] / "REFERENCE.md"
+    ).read_text(encoding="utf-8")
+
+    assert MEASURED_CACHE_DEFICIT in reference
+    assert "wasted_prefill_tokens" in reference
 
 
 # ---------------------------------------------------------------------------

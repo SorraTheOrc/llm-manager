@@ -580,6 +580,37 @@ producer is behaviour-preserving.
 
 The record map itself stays tuple-keyed — only the emitted value changes.
 
+### 9.2 Idle admission vs the dispatch-lease gate: no preemption (LP-0MVK35UX20081BIB)
+
+The idle-admission override (`server.local_idle_admit_enabled`,
+LP-0MVGD9Z8Z0055Y5J) and the no-preemption dispatch-lease occupancy rule
+(`_try_acquire_local_dispatch`, `local_lease_active`, LP-0MU5BOMJM008F17C) are
+**left exactly as they are**. The recorded decision (window 2026-10-22 21:48:05
+→ 2026-10-23 21:48:05; numbers in `idle-window-measurements.md`) is that an
+idle-admitted request does **not** preempt a foreign local lease:
+
+- **31 idle-admitted requests converted 0 times** (0/31 local first bytes), and
+  **none** of them was refused by the lease gate — there is no
+  `local_dispatch_denied session=<admitted session>` line in the window. The
+  conversions were lost to prefill feasibility: 22 aborted at
+  `local_prefill_deadline_seconds` with zero prefill progress and 9 were
+  refused by the ETA admission guard's queue budget.
+- **1,731 `local_lease_active` refusals** in the window were 100 % shape B
+  (`active` record, `active>=1`): 96.7 % with no work behind it, 0 silent
+  prefills, 0 genuinely working owners. Freeing them (verified-idle
+  preemption, LP-0MVK368JZ000TDW7 — closed by this decision) buys **no**
+  measured conversion while the admitted prompts cannot prefill to a first
+  byte, and it charges the displaced owner a re-prefill. Shape A (inactive
+  cooldown lease) never occurred, so a remaining-time gate would convert
+  nothing either.
+- Occupancy is therefore still reclaimed **only** by the existing machinery:
+  the no-progress watchdog, orphan cleanup, session eviction and adaptive lease
+  expiry. Their semantics are unchanged and not duplicated for admission.
+- The override's own eligibility is the follow-up — it admits prompts whose
+  projected prefill exceeds the deadline/budget (LP-0MVRCLPVI0057116, linked to
+  LP-0MVNBJYE3003MF6J). Fixing that is what can make a gate change worth
+  reconsidering; no preemption knob is added now.
+
 ---
 
 ## 10. Open Questions

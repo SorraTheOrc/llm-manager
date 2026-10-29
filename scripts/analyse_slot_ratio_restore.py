@@ -23,7 +23,12 @@ comparison is reproducible instead of hand-grepped:
 * ``slot_ratio_restored`` seed events (the only direct evidence that the
   restored-prefix credit was applied),
 * ``slot_save`` success/failure and ``slot_restore failed`` rates (AC4
-  confound check), and
+  confound check),
+* the ``slot_ratio_seed outcome=…`` vocabulary tallied per window
+  (``missing_sidecar`` / ``missing_snapshot`` / ``expired`` / …), with the
+  per-session mix and the ``age_s`` / ``stored_messages`` distributions that
+  tell a writer-side gap apart from a guard (TTL / prefix) rejection
+  (LP-0MVK0E8C40035FG3), and
 * the ``slot_<session>.bin.ratio.json`` sidecar inventory on disk.
 
 Log files may be compressed (``.gz``); every matched file is read exactly once,
@@ -82,6 +87,34 @@ RE_CACHED_RATIO = re.compile(r"cached_ratio=([\d.]+)")
 RE_CACHE_STATE = re.compile(r"cache_state=(\w+)")
 RE_DISPATCH = re.compile(r"dispatch_first_byte_ms=([\d.]+)")
 RE_REASON = re.compile(r"reason=(\w+)")
+RE_SEED = re.compile(
+    r"slot_ratio_seed outcome=(?P<outcome>\w+) session=(?P<session>\S+) model=\S+ "
+    r"stored_messages=(?P<stored>\d+) incoming_messages=(?P<incoming>\d+) "
+    r"age_s=(?P<age>\d+)"
+)
+
+#: The documented ``slot_ratio_seed outcome=…`` vocabulary (proxy/docs/routing.md).
+SEED_OUTCOMES = (
+    "found",
+    "missing_sidecar",
+    "missing_snapshot",
+    "expired",
+    "model_mismatch",
+    "prefix_mismatch",
+    "empty_ratio",
+)
+
+#: Outcomes whose branch runs *after* a snapshot + sidecar pair was located and
+#: validated, i.e. the ones that can only appear when the guard (TTL / prefix /
+#: model / zero-credit) is genuinely reached.  When every one of these is zero
+#: the seed path never got past the *lookup*, so the guard cannot be the cause.
+SEED_GUARD_OUTCOMES = (
+    "expired",
+    "model_mismatch",
+    "prefix_mismatch",
+    "empty_ratio",
+    "found",
+)
 
 
 def read_log_lines(path: Path):
@@ -155,14 +188,51 @@ class WindowMetrics:
     dispatch_records: list[tuple] = field(default_factory=list)
     slot_save_ok: int = 0
     slot_save_failed: int = 0
+    slot_save_eviction_ok: int = 0
+    slot_save_eviction_failed: int = 0
     slot_restore_failed: int = 0
     slot_ratio_restored: int = 0
     restored_any: int = 0
+    # ``slot_ratio_seed outcome=…`` tallies (LP-0MVK0E8C40035FG3)
+    seed_outcomes: Counter = field(default_factory=Counter)
+    seed_sessions: dict[str, set] = field(default_factory=lambda: {o: set() for o in SEED_OUTCOMES})
+    seed_ages: dict[str, list[int]] = field(default_factory=dict)
+    seed_message_pairs: dict[str, Counter] = field(default_factory=dict)
+    eviction_save_sessions: set = field(default_factory=set)
+    persistence_skipped: Counter = field(default_factory=Counter)
     # session -> [(ts, estimated_tokens)] for the AC3 bucket pairing
     routing_estimates: dict[str, list[tuple[dt.datetime, int]]] = field(default_factory=dict)
 
     def add_line(self, line: str, ts: dt.datetime) -> None:
         self.lines += 1
+        if "slot_ratio_seed outcome=" in line:
+            seed = RE_SEED.search(line)
+            if seed:
+                outcome = seed.group("outcome")
+                self.seed_outcomes[outcome] += 1
+                self.seed_sessions.setdefault(outcome, set()).add(seed.group("session"))
+                self.seed_ages.setdefault(outcome, []).append(int(seed.group("age")))
+                pair = (int(seed.group("stored")), int(seed.group("incoming")))
+                self.seed_message_pairs.setdefault(outcome, Counter())[pair] += 1
+            return
+        if "source=eviction" in line:
+            # Eviction-path saves never write a sidecar, so they are counted
+            # separately: they explain a snapshot that exists with no sidecar
+            # to validate it (the ``missing_sidecar`` seed outcome).
+            saved = re.search(r"saved=(True|False)", line)
+            if saved and saved.group(1) == "True":
+                self.slot_save_eviction_ok += 1
+                session = RE_SESSION.search(line)
+                if session:
+                    self.eviction_save_sessions.add(session.group(1))
+            else:
+                self.slot_save_eviction_failed += 1
+            return
+        if "slot persistence skipped" in line:
+            reason = RE_REASON.search(line)
+            if reason:
+                self.persistence_skipped[reason.group(1)] += 1
+            return
         if "routing_check " in line:
             self.routing_check += 1
             ratio = RE_CACHED_RATIO.search(line)
@@ -277,6 +347,53 @@ class WindowMetrics:
                 "restore_failed": self.slot_restore_failed,
                 "ratio_restored_events": self.slot_ratio_restored,
                 "cache_state_restored_lines": self.restored_any,
+                "save_eviction_ok": self.slot_save_eviction_ok,
+                "save_eviction_failed": self.slot_save_eviction_failed,
+                "eviction_save_sessions": len(self.eviction_save_sessions),
+                "persistence_skipped_reasons": dict(self.persistence_skipped.most_common()),
+            },
+            "seed_outcomes": self.seed_outcome_summary(),
+        }
+
+    def seed_outcome_summary(self) -> dict:
+        """Tally the ``slot_ratio_seed outcome=…`` vocabulary for this window.
+
+        The outcome mix is the measurement LP-0MVJYZWWW005XGW7 exists for: it
+        says *which branch* of the seed path the traffic actually reaches. A
+        zero ``SEED_GUARD_OUTCOMES`` total means no snapshot + sidecar pair was
+        ever located and validated, so a guard (TTL / prefix / model / zero
+        credit) cannot be the failure mode — the gap is upstream of it.
+        """
+        total = sum(self.seed_outcomes.values())
+        by_outcome: dict[str, dict] = {}
+        for outcome in SEED_OUTCOMES:
+            count = self.seed_outcomes.get(outcome, 0)
+            entry: dict = {
+                "count": count,
+                "pct": round(100.0 * count / total, 2) if total else None,
+                "sessions": len(self.seed_sessions.get(outcome) or ()),
+            }
+            ages = self.seed_ages.get(outcome) or []
+            if ages:
+                entry["age_s"] = _percentiles([float(a) for a in ages])
+            pairs = self.seed_message_pairs.get(outcome)
+            if pairs:
+                entry["message_pairs"] = [
+                    {"stored": stored, "incoming": incoming, "count": count}
+                    for (stored, incoming), count in pairs.most_common(5)
+                ]
+            by_outcome[outcome] = entry
+        return {
+            "total": total,
+            "by_outcome": by_outcome,
+            "guard_outcomes_total": sum(self.seed_outcomes.get(o, 0) for o in SEED_GUARD_OUTCOMES),
+            "lookup_outcomes_total": sum(
+                self.seed_outcomes.get(o, 0) for o in ("missing_sidecar", "missing_snapshot")
+            ),
+            "sessions": {
+                outcome: sorted(self.seed_sessions.get(outcome) or ())
+                for outcome in SEED_OUTCOMES
+                if self.seed_sessions.get(outcome)
             },
         }
 
@@ -424,8 +541,35 @@ def render_markdown(results: list[dict]) -> str:
                 "`slot_restore failed`",
                 [_fmt(i["slots"]["restore_failed"]) for i in results],
             ),
+            (
+                "`slot_save` (eviction) ok / failed",
+                [
+                    f"{i['slots']['save_eviction_ok']} / {i['slots']['save_eviction_failed']} "
+                    f"(sessions={i['slots']['eviction_save_sessions']})"
+                    for i in results
+                ],
+            ),
         ]
     )
+    seeds = [i["seed_outcomes"] for i in results]
+    if any(s["total"] for s in seeds):
+        rows.append(("`slot_ratio_seed` decisions", [_fmt(s["total"]) for s in seeds]))
+        for outcome in SEED_OUTCOMES:
+            cells = []
+            for s in seeds:
+                entry = s["by_outcome"].get(outcome) or {}
+                count = entry.get("count", 0)
+                if not count:
+                    cells.append("—")
+                else:
+                    cells.append(f"{count} ({_pct(entry['pct'])}, {entry['sessions']} sess)")
+            rows.append((f"  `outcome={outcome}`", cells))
+        rows.append(
+            (
+                "  seed guard branches reached",
+                [_fmt(s["guard_outcomes_total"]) for s in seeds],
+            )
+        )
     width = max(len(label) for label, _ in rows) + 2
     widths = [max(len(h), *(len(row[i]) for _, row in rows)) for i, h in enumerate(headers)]
     out = [

@@ -40,10 +40,11 @@ def _srv():
 #
 # False-positive guard (LP-0MS9GA6QL007XTBP):
 #
-# On the Strix Halo APU (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is
-# pinned at 100% regardless of actual GPU state (30/30 samples read 100
+# On the Strix Halo APU (Radeon 8060S iGPU, gfx1151) gpu_busy_percent
+# saturates at ~20W: measured 2026-07-31, 30/30 samples read 100
 # while power draw showed the GPU idle at ~54W vs ~115W when genuinely
-# computing), so the busy+idle signature fired on every idle period and
+# computing (quantified 2026-10-28 as a ~20W latch in LP-0MVSQQO910077LYL),
+# so the busy+idle signature fired on every idle period and
 # caused constant unload/reload churn. Power draw (sysfs power1_average in
 # micro-watts, rocm-smi fallback) is now the discriminating signal:
 #
@@ -596,8 +597,8 @@ async def _router_model_health_loop() -> None:
             )
 
             # GPU-wedge detection configuration (LP-0MS91DHQ9003EGB0 /
-            # LP-0MS9GA6QL007XTBP). Disabled by default: gpu_busy_percent is
-            # pinned at 100% on the Strix Halo APU regardless of GPU state, so
+            # LP-0MS9GA6QL007XTBP). Disabled by default: gpu_busy_percent
+            # saturates at ~20W on the Strix Halo APU (LP-0MVSQQO910077LYL), so
             # the busy+idle signature false-positives on every idle period.
             gpu_wedge_enabled = bool(
                 server_cfg.get("llama_gpu_wedge_detection_enabled", False)

@@ -101,7 +101,7 @@
 #                declare it, and together they must cover every priority
 #                (validated at load; models that declare no ``priorities``
 #                anywhere keep every provider eligible for every priority,
-#                e.g. embed/github/private). No tier implications:
+#                e.g. embed/private). No tier implications:
 #                [medium, high] never includes ``low``.
 #                Example:
 #                  - name: munitoai
@@ -245,6 +245,37 @@ logging:
   verbose_chunks: false
 
 # ---------------------------------------------------------------------------
+# Prompt Log (LP-0MVP79OBP002G6Z1)
+# ---------------------------------------------------------------------------
+# Append-only JSONL record of every handled chat/completions and
+# /v1/completions request: time, first non-system message (prompt), session ID,
+# requested model and the model that actually served it after fallback routing
+# (read from the response's X-Resolved-Model header; ``error:<code>`` for
+# requests rejected before routing, e.g. ``error:startup_ramp``).
+#
+# Surfaced in the /logs Web UI as the "Prompt Log" tab (GET /logs/prompt-log).
+#
+# Fields:
+#   enabled:           write the log at all (default true). When false nothing
+#                      is written and the UI tab shows a "disabled" notice.
+#   path:              optional file path override. Default:
+#                      <logging.directory>/prompt-log.jsonl.
+#   max_prompt_chars:  prompt text cap; longer prompts are stored truncated
+#                      with ``truncated: true`` (default 2000).
+#   max_entries:       bounded recent window the UI reads/renders (default 500).
+#   max_file_bytes:    rotate to prompt-log.jsonl.1 once the file exceeds this
+#                      size (default 52428800 = 50 MiB; 0 disables rotation).
+#   max_rotated_files: how many .N backups to keep from rotation; older
+#                      backups are dropped, so total on-disk growth is bounded
+#                      by (1 + max_rotated_files) * max_file_bytes (default 3).
+prompt_log:
+  enabled: true
+  max_prompt_chars: 2000
+  max_entries: 500
+  max_file_bytes: 52428800
+  max_rotated_files: 3
+
+# ---------------------------------------------------------------------------
 # Session Recording
 # ---------------------------------------------------------------------------
 # Records raw client-proxy-provider message payloads to disk for later
@@ -339,10 +370,8 @@ audit_model_fallbacks:
 #                            windows; the summariser prompt is small, so
 #                            these are documentation-consistency caps.
 #
-# Deliberately NOT gated (no single sourceable ceiling): ``github-primary``
-# declares no ``model`` — the client chooses the upstream model — so a
-# per-entry context limit cannot be sourced for it. The local entries are
-# already bounded by the local routing thresholds
+# The local entries stay ungated (no per-entry ``max_context_tokens``): they
+# are already bounded by the local routing thresholds
 # (local_large_context_*_threshold, local_model_ctx_size, hard routing cap).
 
 models:
@@ -361,17 +390,13 @@ models:
     aliases:
     - embeddings
     - embed
-  github:
-    providers:
-      - name: github-primary
-        type: remote
-        provider: github
-        endpoint: https://models.inference.ai.azure.com
-    aliases:
-    - github-*
-  # Private model: local-only, no remote fallback at all.
-  # Uses the Qwen3 llama_model. When the local slot is busy the request
-  # is queued / deferred — it never falls through to a paid provider.
+  # Private model: the local route only — no remote tier, so nothing here can
+  # be promoted. Uses the Qwen3 llama_model. A request still DEFERS when the
+  # local slot is busy: it queues, and a ``local-preferred`` request that
+  # cannot fit the wait budget gets the retryable 429 with real retry timing
+  # (unchanged behaviour, never a paid fallback). ``local-preferred`` promotion
+  # of a too-large prompt needs remote tiers in the chain, so this model cannot
+  # promote: its prompts are bounded by the local capacity limits instead.
   private:
     providers:
       - name: local-qwen3
@@ -425,6 +450,16 @@ models:
         # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
         # the account key is api_key_env@endpoint:model, so same-gateway
         # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
+        #
+        # Daily free limit (LP-0MVT8SAZE00570J5): when MunitoAI answers 429
+        # ``insufficient_quota`` / ``free_daily_limit_exceeded`` with an
+        # ABSOLUTE reset ("It resets at 2026-10-30 00:00 UTC") the
+        # usage-limit reset path runs BEFORE the header cooldown above and
+        # quarantines this key's account until that instant (+ margin),
+        # bounded to the advertised daily period — so the tier is not
+        # re-probed every ~60 s for the rest of the UTC day. The paid
+        # ``munitoai`` entry below uses a different ``api_key_env`` and stays
+        # eligible in the same request.
         respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote
@@ -971,9 +1006,10 @@ server:
   # fallback; when neither is available detection is skipped.
   #
   # DISABLED BY DEFAULT (LP-0MS9GA6QL007XTBP): on this Strix Halo APU
-  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is pinned at 100% regardless
-  # of actual GPU state (30/30 samples read 100 while power draw showed the
-  # GPU idle at ~54W vs ~115W when computing). The busy+idle signature
+  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent saturates at ~20W - measured
+  # 2026-07-31, 30/30 samples read 100 while power draw showed the
+  # GPU idle at ~54W vs ~115W when computing (quantified 2026-10-28 as a ~20W
+  # latch in LP-0MVSQQO910077LYL). The busy+idle signature
   # therefore false-positives on every idle period, causing constant
   # unload/reload churn (144 unloads in one day, killing in-flight requests).
   # On this hardware class a wedged engine (LP-0MS91D782006XIR6, ~53W idle
@@ -1805,12 +1841,12 @@ server:
   # SECOND, INDEPENDENT BOUND — the prefill DEADLINE (LP-0MVKUKEU80022C3U).
   # The budget bound above only refuses when the projected wait exceeds the
   # queue budget, but nothing refused admission against the hard
-  # ``local_prefill_deadline_seconds`` (default 90 s) backstop. A prompt
-  # whose projected first-byte ETA >= the deadline is a guaranteed loss —
-  # the dispatch is cancelled by the deadline before its first byte
-  # (deterministic, measured 2026-10-23: 130-265 s prefills vs a 90 s
-  # deadline). The guard therefore ALSO refuses when
-  # ``eta_prefill >= local_prefill_deadline_seconds``, logging
+  # ``local_prefill_deadline_seconds`` backstop. A prompt whose projected
+  # TIME TO FIRST BYTE (its own prefill plus the occupied gate) reaches the
+  # deadline is a guaranteed loss — the dispatch is cancelled by the deadline
+  # before its first byte (deterministic, measured 2026-10-23: 130-265 s
+  # prefills vs a 90 s deadline). The guard therefore ALSO refuses when
+  # ``projected_wait >= local_prefill_deadline_seconds``, logging
   # ``reason=prefill_eta_exceeds_deadline`` on BOTH paths (the deadline is
   # the binding constraint — no second budget knob). Ordering to keep:
   # ``contention_queue_max_wait_seconds < local_prefill_deadline_seconds <
@@ -1823,6 +1859,48 @@ server:
   # Fail-open: the change can only refuse further DOOMED admissions, never
   # admit more than before, and an uncalibrated bucket still admits.
   #
+  # OCCUPANT-EVIDENCE PRICING (LP-0MVOFVCA2008DQVE, revised by
+  # LP-0MVS9YK9P006M1NQ). The occupancy term is no longer only the symmetric
+  # ``own_eta * busy_slots`` floor: the guard also projects each in-flight
+  # prefill's remaining service from its own dispatch record and uses the
+  # larger of the two. Since LP-0MVS9YK9P006M1NQ that remaining service is
+  # re-priced from the occupant's remaining *uncached new tokens* at the
+  # CONTENDED co-residency rate, not decayed from its optimistic admission
+  # ETA: ``progress = min(1, elapsed / contended_full_service)``,
+  # ``remaining_new = new_tokens * (1 - progress)``,
+  # ``remaining_s = estimate_prefill_seconds(remaining_new, 0, contended=True)``.
+  # The old ``max(0, eta_prefill_s - elapsed)`` decay under-priced the occupant
+  # by the measured 2-4x and converged to ~0 exactly when the occupant passed
+  # its optimistic ETA — the 2026-10-28 00:28:55 case priced a cold
+  # 65-89k-token audit prompt at ``eta_occupancy_s=16.0``, the newcomer queued
+  # the full 60 s, the gate never freed and it fell back remote. Unchanged by
+  # this revision: measured evidence can only raise the symmetric floor, never
+  # lower it; a missing/invalid record or an uncalibrated contended window
+  # contributes nothing (never a guessed multiplier). The deadline bound is
+  # evaluated against the same projected time to first byte, so admission and
+  # the deadline cannot disagree about who the occupant is. No new knob:
+  # rollback is the existing ``local_admission_guard_policy: observe|off`` or
+  # ``local_prefill_deadline_seconds: 0``.
+  #
+  # CONTENDED (CO-RESIDENCY) RATE BUCKET (LP-0MVS9Y76R004B5M8). Prefill is
+  # serialised but prefill+decode batching is not: an occupant that is
+  # *generating* halves a newcomer's prefill throughput (measured 2-4x lower
+  # tok/s). A sample is therefore tagged CONTENDED when the gate was observed
+  # occupied at admission (``busy_slots >= 1``) OR another session's dispatch
+  # record was live at first-byte time (the OR is deliberate: both signals are
+  # deterministic). Contended samples land in their own per-(model, bucket)
+  # window and a contended admission is priced from it. When the contended
+  # window is not yet calibrated the guard falls back to the solitary window
+  # and logs ``rate_bucket=solitary_fallback`` rather than guessing a
+  # slowdown multiplier. Each decision line additionally carries
+  # ``rate_bucket=contended|solitary|solitary_fallback`` and
+  # ``contended_samples=<n>`` so the residual optimism is visible. Warm prompts
+  # (``cached_ratio >= 0.9``) stay on the solitary path byte-for-byte. Scope
+  # guardrails (UNCHANGED by this feature): ``contention_queue_max_wait_seconds``
+  # = 60 and ``local_prefill_deadline_seconds`` = 120; the ordering
+  # ``60 < 120 < local_dispatch_first_byte_timeout_seconds (840) <
+  # local_dispatch_max_prefill_seconds (900)`` must keep holding.
+  #
   #   reject  — refuse admission when the projected wait exceeds the budget
   #             (default)
   #   observe — log the decision (``local_admission_guard decision=…``) but
@@ -1834,7 +1912,8 @@ server:
   # observations, so it can never refuse on a guess. Decisions and their
   # ETAs are counted by the proxy-usage-analysis report; each logged decision
   # carries ``eta_prefill_s``, ``eta_occupancy_s``, ``projected_wait_s``,
-  # ``budget_s``, ``busy_slots`` and ``in_flight_prefills``.
+  # ``budget_s``, ``busy_slots``, ``in_flight_prefills`` and (since
+  # LP-0MVS9Y76R004B5M8) ``rate_bucket`` / ``contended_samples``.
   #
   # Local admission reservations + fallback intent
   # ----------------------------------------------
@@ -1848,12 +1927,28 @@ server:
   # 10 s, capped at 60 s, cancellable via
   # ``DELETE /llama/local/reserve/<id>`` and pruned on expiry.
   #
-  # ``X-Local-Preference: prefer-local|local-only|remote-ok`` expresses intent
-  # per request: ``local-only`` returns the 429 admission response instead of
-  # falling back remote (even when remotes exist); ``remote-ok`` removes the
-  # local provider from the chain; unknown values and an absent header behave
-  # exactly as ``prefer-local`` (today). ``high`` priority keeps its
-  # never-queue semantics under every preference.
+  # ``X-Local-Preference: prefer-local|local-preferred|remote-ok`` expresses
+  # intent per request:
+  #   prefer-local (default) — today's behaviour: serve local when it fits the
+  #     wait budget, otherwise fall through to the next provider.
+  #   local-preferred — the CANONICAL pin-local value. The request's capacity
+  #     verdict splits it two ways. A DEFERRABLE request (the block is
+  #     temporal, so waiting can help) is never moved to a paid provider: it
+  #     waits for local capacity and, when the wait budget expires or no queue
+  #     slot can be taken, is answered with the retryable 429
+  #     (``Retry-After`` / ``retry_at``) telling the client when to retry. A
+  #     TOO-LARGE request (new tokens over ``local_cold_prefill_budget_tokens``,
+  #     or the prompt over the local context limit derived from
+  #     ``local_model_ctx_size``) is never deferred and never refused for local
+  #     capacity: the local entry leaves the chain and a remote tier serves it.
+  #   remote-ok — removes the local provider from the chain.
+  # The legacy spelling ``local-only`` is a DEPRECATED alias: it is still
+  # accepted and normalised to ``local-preferred`` at parse time (one
+  # deprecation line per request), so an un-migrated client keeps pin-local
+  # semantics — sending it is optional, and either spelling means the same
+  # request intent. Unknown values and an absent header behave exactly as
+  # ``prefer-local`` (today). ``high`` priority keeps its never-queue semantics
+  # under every preference.
   #
   # Interaction with the queue: ``contention_queue_max_wait_seconds`` is the
   # wait budget both this guard and ``/reserve`` compare against, and
@@ -1955,10 +2050,84 @@ server:
   # (``routing_skip_local reason=prefill_thrash_cooldown``,
   # ``cooldown_remaining=Ns``) and the chain reaches the next provider
   # immediately; OTHER sessions are unaffected (per-session key). The window
-  # clears early on a successful local first byte and expires lazily; this
-  # knob is the documented rollback — 0 restores the pre-fix behaviour
-  # (no cooldown, no skip).
+  # expires lazily, or clears early on a local first byte that is COMPARABLE IN
+  # SIZE to the prompt that armed it (see
+  # ``local_prefill_thrash_recovery_fraction`` below); this knob is the
+  # documented rollback — 0 restores the pre-fix behaviour (no cooldown, no
+  # skip).
   local_prefill_thrash_cooldown_seconds: 600
+  # Size gate on the cooldown's EARLY CLEAR (LP-0MVQITN6P008DPLB). A successful
+  # local first byte releases the window only when that dispatch prefilled at
+  # least this fraction (default 0.9 = 90 %) of the prompt size that armed it.
+  # Clearing on ANY success was the measured bug: a warm ~1.5 s dispatch 100x
+  # smaller than the cancelled prompt wiped the window and re-admitted the
+  # doomed one. Measured 2026-10-26 09:06 → 2026-10-27 09:06 (114
+  # ``local_eviction_after_acceptance reason=prefill_deadline`` events from
+  # only 43 sessions): 89 of 114 were repeats inside 33 ``(session, prompt)``
+  # clusters, e.g. session 01a178bd… cancelled at 15:25:57, 15:28:05 and
+  # 15:30:20 on the same 46,134-token prompt — all three inside one 600 s
+  # window — and 01a17a32… at 22:01:38, 22:03:39, 22:05:39 on the same
+  # 70,052-token prompt. Meanwhile the cooldown itself works: 715
+  # ``routing_skip_local reason=prefill_thrash_cooldown`` skips in that window.
+  # Fail-open: when either size is unknown the pre-fix clear-on-any-success
+  # behaviour is kept rather than guessed at, and a value above 1.0 is clamped
+  # to 1.0 (higher would make recovery impossible and strand the session off
+  # local). Rollback: 0 restores clear-on-any-success.
+  local_prefill_thrash_recovery_fraction: 0.9
+
+  # -----------------------------------------------------------------------
+  # Measured cache-deficit early abort (LP-0MVR7IN0O000DPXN, parent Option D)
+  # -----------------------------------------------------------------------
+  # Admission-time warmth is only a PREDICTION: ``routing_resident_prefix``
+  # decisions carry ``n_past_actual=none``, so a slot owner is admitted at
+  # ``reuse_ratio=1.0`` even when llama-server is about to re-prefill the prompt
+  # from scratch (measured 2026-10-26: 29 of 116 deadline evictions were ~56k
+  # prompts priced at 17-182 new tokens, cancelled at 120 s).
+  #
+  # With these keys enabled the proxy asks llama-server (b8782) for
+  # ``prompt_progress`` inside the SSE stream (``return_progress: true`` on a
+  # COPY of the client body — the key never reaches recorded payloads) and, at
+  # the first progress event, compares the MEASURED compute (``total - cache``)
+  # with the admission-priced ``new_tokens``. When the measurement proves the
+  # dispatch is re-prefilling far more than priced, the proxy releases the
+  # accepted dispatch in SECONDS (not at the 120 s deadline), logs
+  # ``local_eviction_after_acceptance reason=measured_cache_deficit`` with the
+  # measured evidence (``total``, ``measured_cache``, ``priced_new_tokens``,
+  # ``elapsed_s``) and returns the same retryable 503 the deadline returns, so
+  # the request detours to the next (remote) provider.
+  #
+  # The abort needs BOTH conditions, in this order:
+  #   1. measured deficit ratio ``(total - cache) / total`` >= the ratio floor.
+  #      A genuinely warm dispatch shows ``cache >= 0.99 * total`` (ratio
+  #      <= 0.01), so no prompt size and no token bound can ever trip it;
+  #   2. measured new tokens exceed the priced ``new_tokens`` by more than the
+  #      token bound.
+  # Both bounds are monotone in the safe direction (raising either only makes
+  # an abort less likely). Nothing in the path can raise: a missing/partial/
+  # malformed measurement, a capture or decision error, or a stream that never
+  # emits ``prompt_progress`` all degrade to today's behaviour, including the
+  # full 120 s deadline path (fail open — never a hard local outage).
+  #
+  # ROLLBACK: set ``local_measured_cache_abort_enabled: 0``. One value change
+  # restores the exact pre-change behaviour end to end (no ``return_progress``
+  # injection, no measurement capture, no early release; the full deadline
+  # path applies). No code change and no restart-ordering constraint beyond
+  # the usual process restart.
+  #
+  # Measurement window: the post-deploy attribution (parent F6) counts this
+  # reason separately from ``prefill_deadline`` so the wasted-token reduction
+  # can be quantified without touching the admission ladder.
+  local_measured_cache_abort_enabled: true
+  # Absolute token slack above the admission-priced ``new_tokens`` before an
+  # abort (default 2000). ``0`` means "abort as soon as the measurement
+  # exceeds the price" — still unreachable for a genuinely warm dispatch
+  # because the ratio floor is checked first.
+  local_measured_cache_abort_bound_tokens: 2000
+  # Minimum measured ``(total - cache) / total`` for an abort (default 0.25).
+  # This is what makes the warm path unreachable: a warm dispatch's deficit
+  # ratio is <= 0.01. Values above 1.0 (or malformed values) disable the
+  # early abort rather than admitting a guess.
+  local_measured_cache_abort_min_deficit_ratio: 0.25
 
   # -----------------------------------------------------------------------
   # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J)
@@ -1972,16 +2141,26 @@ server:
   # threshold_seconds=... estimated_tokens=... session=...`` and is counted as
   # ``local_idle_admit`` by the usage report.
   #
-  # MEASUREMENT WINDOW IN PROGRESS (LP-0MVJXGSEG0045IAF, approved by the
-  # producer 2026-10-22): the override is ON so the >= 24 h before/after
-  # measurement for LP-0MVGHXD59008UOUD can run. The window starts at the
-  # `POST /admin/reload-config` that made this flag live (recorded on the work
-  # item; no restart needed) and is analysed with
-  # ``scripts/idle_admit_impact.py --window-closed``.
+  # MEASUREMENT WINDOW (LP-0MVJXGSEG0045IAF, approved by the producer
+  # 2026-10-22): the override was turned ON so the >= 24 h before/after
+  # measurement for LP-0MVGHXD59008UOUD could run. Window
+  # 2026-10-22 21:48:05 -> 2026-10-23 21:48:05, started by the
+  # `POST /admin/reload-config` that made this flag live (no restart needed)
+  # and analysed with ``scripts/idle_admit_impact.py --window-closed``.
+  #
+  # MEASURED RESULT: 31 admissions, 0 conversions — 22 dispatched and were
+  # cancelled at ``local_prefill_deadline_seconds`` with zero prefill
+  # progress, 9 were refused by the ETA admission guard's queue budget, and
+  # **none** was refused by the local dispatch lease gate. The lease gate is
+  # therefore not what costs the override its win: it stays a no-preemption
+  # occupancy contract (decision LP-0MVK35UX20081BIB, see
+  # ``docs/dev/idle-window-measurements.md``), and the eligibility gap is
+  # LP-0MVRCLPVI0057116.
   #
   # ROLLBACK is this flag back to ``false`` + the same reload (no other state).
-  # Keep it on only if the measured window supports `enable_by_default`; if the
-  # tool says `tune`, apply the tuning it proposes before leaving it enabled.
+  # Keep it on only while an eligibility fix (LP-0MVRCLPVI0057116) or a
+  # re-measured window supports `enable_by_default`; the measured window did
+  # not, so leaving it on untuned spends slot time on doomed prefills.
   # A malformed or non-positive ``local_idle_admit_seconds`` also disables the
   # override rather than admitting on a guess.
   local_idle_admit_enabled: true

@@ -17,6 +17,11 @@ What this module provides
 - :class:`QuotaWindow` / :class:`QuotaSnapshot` — immutable window values and
   the derived account state (per-window ``headroom``, ``effective_headroom``,
   ``seconds_to_reset``, ``exhausted``, ``last_success_at``, ``last_status``).
+- :func:`window_for_limit_name` — maps an upstream ``metadata.limitName``
+  (normalised for case/whitespace) onto one of :data:`WINDOW_NAMES`, or
+  ``None`` for an unknown name, so a reactive caller can quarantine for the
+  window the 429 actually named instead of the monthly account-level reset
+  (LP-0MVPAE77Z002VGIA).
 - :func:`get_quota_snapshot` — a non-blocking cache read for routing callers.
 - :func:`quota_behaviour` / :class:`QuotaBehaviour` — the single predicate
   answering "may quota state influence routing right now?" (enabled /
@@ -118,6 +123,24 @@ MODE_DISABLED = "disabled"
 
 #: Only ``opencode-*`` entries are quota-managed by default.
 _OPENCODE_PROVIDER_PREFIX = "opencode"
+
+
+def window_for_limit_name(name: Any) -> str | None:
+    """Map an upstream ``metadata.limitName`` to one of :data:`WINDOW_NAMES`.
+
+    The 429 payload's ``limitName`` names the quota window that was exceeded
+    (``rolling`` / ``weekly`` / ``monthly``). It is normalised for case and
+    surrounding whitespace; an absent, empty, non-string or unknown name
+    (e.g. the documentation-only upstream ``daily``) returns ``None`` so the
+    caller applies its bounded fallback instead of guessing a window it cannot
+    verify against ``/v1/usage`` (LP-0MVPAE77Z002VGIA AC10).
+    """
+    if not isinstance(name, str):
+        return None
+    normalised = name.strip().lower()
+    if normalised in WINDOW_NAMES:
+        return normalised
+    return None
 
 
 class QuotaPollError(Exception):
@@ -262,6 +285,20 @@ class QuotaSnapshot:
     def seconds_to_reset(self) -> float:
         """Seconds until the account's monthly allowance resets (module clock)."""
         return self.seconds_to_reset_at(_now())
+
+    def is_fresh_at(self, now: datetime, max_age_seconds: float) -> bool:
+        """True when the last successful poll at *now* is within the horizon."""
+        return (now - self.last_success_at).total_seconds() <= max_age_seconds
+
+    def is_fresh(self, max_age_seconds: float) -> bool:
+        """True when the last successful poll is within *max_age_seconds*.
+
+        Uses the module clock (:func:`set_clock`), so tests freeze freshness
+        together with the poller. A snapshot is *fresh* when it was polled no
+        longer than the staleness horizon ago — the same horizon
+        :func:`quota_behaviour` suspends surge on.
+        """
+        return self.is_fresh_at(_now(), max_age_seconds)
 
 
 # ---------------------------------------------------------------------------

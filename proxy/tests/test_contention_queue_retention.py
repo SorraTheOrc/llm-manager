@@ -17,6 +17,11 @@ These tests cover:
 - AC3: a session whose prefix was evicted (no cache history) earns no
   retention and is not held ahead of a newcomer;
 - AC5: local↔remote transitions are counted per session (``routing_hop``).
+
+Ordering tests synchronise on ``contention_queue.queue_depth()`` (see
+``_await_queue_depth``) instead of fixed ``asyncio.sleep`` delays, so pass/fail
+does not depend on event-loop scheduler timing under full-suite load
+(LP-0MVT4SMIU0046OTB).
 """
 
 from __future__ import annotations
@@ -58,6 +63,26 @@ def _have_cache_history(session_id: str) -> None:
     update_cached_ratio(MODEL, session_id, cached_tokens=1000, prompt_tokens=4000)
 
 
+async def _await_queue_depth(expected: int, *, max_yields: int = 10_000) -> None:
+    """Yield until the contention queue holds exactly *expected* waiters.
+
+    These tests must order their coroutines without depending on scheduler
+    timing. A fixed ``asyncio.sleep`` delay lets a starved event loop (the
+    full-suite-load failure mode) run ``wake()`` before the returning
+    coroutine has reached ``_enqueue()``, so the newcomer gets woken and
+    legitimately wins the round. Synchronising on the observable
+    ``queue_depth()`` removes that race cooperatively.
+    """
+    for _ in range(max_yields):
+        if contention_queue.queue_depth() == expected:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(
+        f"contention queue did not reach depth {expected} after {max_yields} "
+        f"yields (depth={contention_queue.queue_depth()})"
+    )
+
+
 class TestRetentionOrdering:
     """AC1/AC2/AC3: retained waiters are ordered ahead of newcomers."""
 
@@ -81,9 +106,9 @@ class TestRetentionOrdering:
             return elapsed
 
         newcomer = asyncio.create_task(waiter("session-B-newcomer", retained=False))
-        await asyncio.sleep(0.01)
+        await _await_queue_depth(1)
         retained = asyncio.create_task(waiter("session-A-retained", retained=True))
-        await asyncio.sleep(0.01)
+        await _await_queue_depth(2)
 
         # One slot frees: the retained session must take it, not the newcomer.
         slot_free["value"] = True
@@ -94,7 +119,7 @@ class TestRetentionOrdering:
 
         # The newcomer keeps waiting (spurious wake after A claimed the slot).
         slot_free["value"] = False
-        await asyncio.sleep(0.01)
+        assert contention_queue.queue_depth() == 1
         newcomer.cancel()
         with pytest.raises(asyncio.CancelledError):
             await newcomer
@@ -120,9 +145,9 @@ class TestRetentionOrdering:
                 dispatched.append(session_id)
 
         first = asyncio.create_task(waiter("retained-1"))
-        await asyncio.sleep(0.01)
+        await _await_queue_depth(1)
         second = asyncio.create_task(waiter("retained-2"))
-        await asyncio.sleep(0.01)
+        await _await_queue_depth(2)
 
         slot_free["value"] = True
         await contention_queue.wake(1)
@@ -130,7 +155,7 @@ class TestRetentionOrdering:
         assert dispatched == ["retained-1"]
 
         slot_free["value"] = False
-        await asyncio.sleep(0.01)
+        assert contention_queue.queue_depth() == 1
         second.cancel()
         with pytest.raises(asyncio.CancelledError):
             await second
@@ -168,9 +193,9 @@ class TestRetentionOrdering:
         _have_cache_history("session-A")
 
         newcomer = asyncio.create_task(waiter("session-B"))
-        await asyncio.sleep(0.01)
+        await _await_queue_depth(1)
         returner = asyncio.create_task(waiter("session-A"))
-        await asyncio.sleep(0.01)
+        await _await_queue_depth(2)
 
         slot_free["value"] = True
         await contention_queue.wake(1)
@@ -179,7 +204,7 @@ class TestRetentionOrdering:
         assert dispatched == ["session-A"]
 
         slot_free["value"] = False
-        await asyncio.sleep(0.01)
+        assert contention_queue.queue_depth() == 1
         newcomer.cancel()
         with pytest.raises(asyncio.CancelledError):
             await newcomer
@@ -216,9 +241,9 @@ class TestRetentionOrdering:
         assert not retained_for("session-evicted")
 
         newcomer = asyncio.create_task(waiter("session-B"))
-        await asyncio.sleep(0.01)
+        await _await_queue_depth(1)
         evicted = asyncio.create_task(waiter("session-evicted"))
-        await asyncio.sleep(0.01)
+        await _await_queue_depth(2)
 
         slot_free["value"] = True
         await contention_queue.wake(1)
@@ -227,7 +252,7 @@ class TestRetentionOrdering:
         assert dispatched == ["session-B"], "evicted session must not jump the queue"
 
         slot_free["value"] = False
-        await asyncio.sleep(0.01)
+        assert contention_queue.queue_depth() == 1
         evicted.cancel()
         with pytest.raises(asyncio.CancelledError):
             await evicted
@@ -242,7 +267,7 @@ class TestRetentionOrdering:
                 5.0, 8, lambda: slot_free["value"], session_id="solo", retained=False
             )
         )
-        await asyncio.sleep(0.01)
+        await _await_queue_depth(1)
         slot_free["value"] = True
         await contention_queue.wake(1)
         assert await task is not None
@@ -307,6 +332,10 @@ class TestThrashReplay:
         With retention the returning session reclaims the slot every round, so
         it never hops to a remote provider (1 transition, local only). With
         retention disabled it loses every round — the observed thrash.
+
+        Each round synchronises on ``queue_depth()`` rather than fixed
+        ``asyncio.sleep`` delays, so the result reflects retention ordering
+        and not scheduler timing under full-suite load (LP-0MVT4SMIU0046OTB).
         """
         slot_free = {"value": False}
         local_wins = 0
@@ -328,9 +357,9 @@ class TestThrashReplay:
         for _ in range(7):
             slot_free["value"] = False
             newcomer = asyncio.create_task(waiter("session-B"))
-            await asyncio.sleep(0.005)
+            await _await_queue_depth(1)
             returner = asyncio.create_task(waiter("session-A"))
-            await asyncio.sleep(0.005)
+            await _await_queue_depth(2)
 
             slot_free["value"] = True
             await contention_queue.wake(1)
@@ -339,9 +368,9 @@ class TestThrashReplay:
                 local_wins += 1
 
             slot_free["value"] = False
-            await asyncio.sleep(0.005)
             newcomer.cancel()
             await asyncio.gather(newcomer, return_exceptions=True)
+            await _await_queue_depth(0)
 
         assert local_wins == expected_local_wins
 

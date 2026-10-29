@@ -177,12 +177,14 @@ def _isolate_provider_availability_state(tmp_path, monkeypatch):
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
     provider._usage_reset_guessed.clear()
+    provider._usage_reset_window.clear()
     provider._usage_limit_last_probe.clear()
     yield
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
     provider._usage_reset_guessed.clear()
+    provider._usage_reset_window.clear()
     provider._usage_limit_last_probe.clear()
 
 

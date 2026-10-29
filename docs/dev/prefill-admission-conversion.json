@@ -1,0 +1,197 @@
+{
+  "bands": {
+    "20k-32k": {
+      "abandoned_share": 0.0,
+      "admission_verdicts": {
+        "admit": 2,
+        "reject": 692
+      },
+      "conversion_share": 0.5,
+      "converted": 1,
+      "queue_abandoned": 0,
+      "queue_dispatched": 0,
+      "queue_wait_seconds": 0.0,
+      "queued_waits": 0,
+      "rate_buckets": {
+        "unknown": 694
+      },
+      "reject_reasons": {
+        "eta_exceeds_budget": 8,
+        "eta_exceeds_budget_direct": 83,
+        "prefill_budget_exceeded": 483,
+        "prefill_eta_exceeds_deadline": 118
+      },
+      "sessions_admitted": 2,
+      "unconverted": 1
+    },
+    "32k-64k": {
+      "abandoned_share": 0.0,
+      "admission_verdicts": {
+        "admit": 0,
+        "reject": 1091
+      },
+      "conversion_share": 0.0,
+      "converted": 0,
+      "queue_abandoned": 0,
+      "queue_dispatched": 0,
+      "queue_wait_seconds": 0.0,
+      "queued_waits": 0,
+      "rate_buckets": {
+        "unknown": 1091
+      },
+      "reject_reasons": {
+        "prefill_budget_exceeded": 1091
+      },
+      "sessions_admitted": 0,
+      "unconverted": 0
+    },
+    "8k-20k": {
+      "abandoned_share": 0.5,
+      "admission_verdicts": {
+        "admit": 24,
+        "reject": 152
+      },
+      "conversion_share": 0.6667,
+      "converted": 10,
+      "queue_abandoned": 4,
+      "queue_dispatched": 4,
+      "queue_wait_seconds": 408.92,
+      "queued_waits": 8,
+      "rate_buckets": {
+        "unknown": 176
+      },
+      "reject_reasons": {
+        "eta_exceeds_budget": 61,
+        "eta_exceeds_budget_direct": 25,
+        "prefill_eta_exceeds_deadline": 66
+      },
+      "sessions_admitted": 15,
+      "unconverted": 5
+    },
+    "<8k": {
+      "abandoned_share": 0.3509,
+      "admission_verdicts": {
+        "admit": 397,
+        "reject": 36
+      },
+      "conversion_share": 0.6429,
+      "converted": 27,
+      "queue_abandoned": 20,
+      "queue_dispatched": 37,
+      "queue_wait_seconds": 2236.77,
+      "queued_waits": 57,
+      "rate_buckets": {
+        "unknown": 433
+      },
+      "reject_reasons": {
+        "eta_exceeds_budget": 21,
+        "eta_exceeds_budget_direct": 15
+      },
+      "sessions_admitted": 42,
+      "unconverted": 15
+    },
+    ">=64k": {
+      "abandoned_share": 0.0,
+      "admission_verdicts": {
+        "admit": 0,
+        "reject": 1983
+      },
+      "conversion_share": 0.0,
+      "converted": 0,
+      "queue_abandoned": 0,
+      "queue_dispatched": 0,
+      "queue_wait_seconds": 0.0,
+      "queued_waits": 0,
+      "rate_buckets": {
+        "unknown": 1983
+      },
+      "reject_reasons": {
+        "prefill_budget_exceeded": 1983
+      },
+      "sessions_admitted": 0,
+      "unconverted": 0
+    }
+  },
+  "converted_sessions": 38,
+  "first_byte_without_admit": 6,
+  "log_dir": "/var/log/llama-proxy",
+  "log_files": [
+    "proxy.log",
+    "proxy.log-2026-10-28_00",
+    "proxy.log.2026-10-27_16",
+    "proxy.log.2026-10-27_22",
+    "proxy.log.2026-10-28_04",
+    "proxy.log.2026-10-28_10"
+  ],
+  "log_files_scanned": [
+    "proxy.log",
+    "proxy.log-2026-10-22_00.gz",
+    "proxy.log-2026-10-23_00.gz",
+    "proxy.log-2026-10-24_00.gz",
+    "proxy.log-2026-10-25_00.gz",
+    "proxy.log-2026-10-26_00.gz",
+    "proxy.log-2026-10-27_00.gz",
+    "proxy.log-2026-10-28_00",
+    "proxy.log.2026-10-20_15.gz",
+    "proxy.log.2026-10-20_21.gz",
+    "proxy.log.2026-10-21_07.gz",
+    "proxy.log.2026-10-21_14.gz",
+    "proxy.log.2026-10-21_21.gz",
+    "proxy.log.2026-10-22_07.gz",
+    "proxy.log.2026-10-22_13.gz",
+    "proxy.log.2026-10-23_00.gz",
+    "proxy.log.2026-10-23_06.gz",
+    "proxy.log.2026-10-23_12.gz",
+    "proxy.log.2026-10-23_234827.gz",
+    "proxy.log.2026-10-24_00.gz",
+    "proxy.log.2026-10-24_000838.gz",
+    "proxy.log.2026-10-24_003357.gz",
+    "proxy.log.2026-10-24_10.gz",
+    "proxy.log.2026-10-24_103459.gz",
+    "proxy.log.2026-10-24_17.gz",
+    "proxy.log.2026-10-24_173748.gz",
+    "proxy.log.2026-10-24_22.gz",
+    "proxy.log.2026-10-25_04.gz",
+    "proxy.log.2026-10-25_11.gz",
+    "proxy.log.2026-10-25_110154.gz",
+    "proxy.log.2026-10-25_112120.gz",
+    "proxy.log.2026-10-25_114648.gz",
+    "proxy.log.2026-10-25_185727.gz",
+    "proxy.log.2026-10-25_201658.gz",
+    "proxy.log.2026-10-25_211804.gz",
+    "proxy.log.2026-10-26_00.gz",
+    "proxy.log.2026-10-26_002432.gz",
+    "proxy.log.2026-10-26_102256",
+    "proxy.log.2026-10-26_131429",
+    "proxy.log.2026-10-26_171647",
+    "proxy.log.2026-10-26_21",
+    "proxy.log.2026-10-26_210137",
+    "proxy.log.2026-10-27_03",
+    "proxy.log.2026-10-27_093307",
+    "proxy.log.2026-10-27_10",
+    "proxy.log.2026-10-27_101607",
+    "proxy.log.2026-10-27_16",
+    "proxy.log.2026-10-27_22",
+    "proxy.log.2026-10-28_04",
+    "proxy.log.2026-10-28_10"
+  ],
+  "since": "2026-10-27 19:00:00",
+  "totals": {
+    "abandoned_share": 0.3692,
+    "admission_verdicts": {
+      "admit": 423,
+      "reject": 3954
+    },
+    "conversion_share": 0.6441,
+    "converted": 38,
+    "queue_abandoned": 24,
+    "queue_dispatched": 41,
+    "queue_wait_seconds": 2645.69,
+    "queued_waits": 65,
+    "rate_buckets": {},
+    "reject_reasons": {},
+    "sessions_admitted": 59,
+    "unconverted": 21
+  },
+  "until": "2026-10-28 19:00:00"
+}

@@ -655,8 +655,26 @@ def _validate_config(cfg: dict) -> None:
     _validate_chain_hold_config(cfg)
     # Validate compaction configuration (LP-0MTG6RW3L003X122)
     _validate_compaction_config(cfg)
+    # Validate prompt-log configuration (LP-0MVP79OBP002G6Z1)
+    _validate_prompt_log_config(cfg)
     # Validate per-provider priority labels (LP-0MVGPZWY0001JD1D AC5)
     _validate_priority_config(cfg)
+
+
+def _validate_prompt_log_config(cfg: dict) -> None:
+    """Validate the ``prompt_log:`` section (LP-0MVP79OBP002G6Z1).
+
+    Raises ValueError when the section carries an invalid value; mirrors the
+    ``_validate_compaction_config`` pattern (the section validator returns a
+    problem list, this hook turns it into a startup failure).
+    """
+    from proxy.prompt_log import validate_prompt_log_config as _vplc
+
+    problems = _vplc(cfg)
+    if problems:
+        raise ValueError(
+            "Prompt log config validation failed: " + "; ".join(problems)
+        )
 
 
 def _validate_priority_config(cfg: dict) -> None:

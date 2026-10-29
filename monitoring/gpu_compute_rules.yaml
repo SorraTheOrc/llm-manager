@@ -2,14 +2,24 @@
 #
 # WHY NOT gpu_busy_percent
 # -----------------------
-# On this host (Strix Halo APU, Radeon 8060S iGPU, gfx1151) the amdgpu driver
-# reports gpu_busy_percent as pinned at 100% regardless of the actual GPU state:
-# 30/30 samples read 100 while power draw showed the GPU idle (~54 W) versus
-# computing (~115 W). See proxy/proxy/backends/llama.py ("False-positive guard
-# (LP-0MS9GA6QL007XTBP)") and proxy/config.yaml (llama_gpu_wedge_* block).
-# gpu_busy_percent is therefore NOT a utilisation signal here and must not be
-# used in any rule; the proxy's own wedge detector had to be disabled because of
-# it.
+# On this host (Strix Halo APU, Radeon 8060S iGPU, gfx1151) the driver's busy
+# counter SATURATES at ~20 W: it responds to load within seconds, but reads
+# ~100% for any draw above ~20 W, so idle-with-context stretches report as
+# busy. Measured 2026-10-28 over 7 days of Prometheus history (904 paired
+# samples): mean 94.5% busy against 28.1% of samples at compute power
+# (>= 90 W); 45.2% of samples read >= 90% while power was < 40 W; the longest
+# continuous saturated run was 5.3 h; it never under-reports (0.8% of samples
+# read < 90% while power >= 90 W), which is why a live reading looks
+# convincing. Earlier evidence (2026-07-31, LP-0MS9GA6QL007XTBP, "False-positive
+# guard" in proxy/proxy/backends/llama.py and the llama_gpu_wedge_* block in
+# proxy/config.yaml) recorded 30/30 samples at 100 while power showed the GPU
+# idle (~54 W) and computing (~115 W); the saturation measured on 2026-10-28
+# (LP-0MVSQQO910077LYL) explains the same symptom with a threshold rather than
+# a stuck counter. gpu_busy_percent is NOT a utilisation signal here and must
+# not be used in any rule; the proxy's own wedge detector had to be disabled
+# because of it. `amd-smi` is not an alternative either: it reports N/A for
+# usage/power/clocks/energy on this APU, and `amdtop`/`rocm-smi` surface this
+# same counter (monitoring/README.md, "Why not amd-smi, rocm-smi or amdtop?").
 #
 # WHAT IS USED INSTEAD
 # --------------------

@@ -265,13 +265,19 @@ def _read_proxy_log_since(timestamp_iso: str) -> list[str]:
     return relevant_lines
 
 
+#: Per-turn correlation id (LP-0MVMBM467005BT4A) carried by every structured
+#: line one request emits; extracted so the live audit can group a request's
+#: lines by id instead of by nearest-timestamp or body-preview matching.
+_TURN_RE = re.compile(r"\bturn=([0-9a-f]{8})\b")
+
+
 def _find_routing_lines(
     log_lines: list[str],
     body_preview_substrings: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Extract routing_check and [local]/[remote] dispatch lines.
 
-    Returns a list of dicts with keys: timestamp, kind, details.
+    Returns a list of dicts with keys: timestamp, kind, details, turn.
     """
     results: list[dict[str, Any]] = []
 
@@ -340,6 +346,12 @@ def _find_routing_lines(
             details = m.group(2)
             results.append({"timestamp": ts, "kind": "dispatch_denied", "details": details})
             continue
+
+    # Per-turn correlation id (LP-0MVMBM467005BT4A): ``None`` on pre-change log
+    # lines, so the temporal fallback below still covers rotated logs.
+    for entry in results:
+        m_turn = _TURN_RE.search(entry.get("details", ""))
+        entry["turn"] = m_turn.group(1) if m_turn else None
 
     # If body_preview_substrings is provided, filter to lines whose body
     # preview contains at least one of the substrings.

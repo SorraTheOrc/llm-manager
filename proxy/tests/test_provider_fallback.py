@@ -43,6 +43,7 @@ def reset_cooldown_state():
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
     # Sibling-fallback breaker state (LP-0MTPMF03P0046MFG)
     provider._sibling_failure_count.clear()
     provider._sibling_failure_streak_start.clear()
@@ -1870,6 +1871,11 @@ async def test_fallback_logging(sample_model_config, caplog):
             assert "remote-primary" in record.getMessage()
             assert "remote-fallback" in record.getMessage()
             assert "HTTP 502" in record.getMessage()
+            # Per-turn correlation id (LP-0MVMBM467005BT4A): the fallback line
+            # carries the request's id so the hop is attributable by id.
+            assert re.search(r"\bturn=[0-9a-f]{8}\b", record.getMessage()), (
+                record.getMessage()
+            )
             break
     assert found, "Expected 'Fallback triggered' log message not found"
 
@@ -3670,6 +3676,7 @@ class TestSharedFallbackPrimitives:
         provider._provider_unavailable_until.clear()
         provider._provider_failure_count.clear()
         provider._usage_reset_at.clear()
+        provider._usage_reset_window.clear()
         attempts = []
         response = Response(status_code=502, content=b"Bad gateway")
         cooldown = provider._handle_http_error_with_cooldown(

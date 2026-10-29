@@ -2,80 +2,208 @@
 
 ## Overview
 
-This systemd unit file runs Prometheus for the LLM proxy stack monitoring
-infrastructure. It uses the host-first model (binary installation, no
-containers) and is designed to be deployed as a **user service**.
+This systemd unit runs Prometheus 3.15.1 for the LLM proxy stack monitoring
+infrastructure. It uses the host-first model (binary in `~/bin/prometheus/`,
+no containers) and is deployed as a **systemd user service** with
+`loginctl enable-linger`.
 
-## User Service (Recommended)
+The unit below is the configuration that is **running on this host** — it is
+not a template. It differs from the earlier wildcard-binding version of this
+document in three ways that matter, all of them deliberate:
+
+1. **Bind addresses are loopback plus the two tailnet addresses only** — never
+   the wildcard (`:9090`), which would publish an unauthenticated Prometheus to
+   the whole LAN and to `wlp195s0`.
+2. **Retention is 90 days** (`--storage.tsdb.retention.time=90d`), not 15 days.
+3. **`tailscaled.service` is ordered before the service**, so the tailnet
+   addresses exist when Prometheus binds. If `tailscale0` is not up yet the bind
+   fails and systemd retries every `RestartSec` until it is.
+
+## Exposure boundary
+
+Prometheus has **no authentication**. The exposure boundary is therefore the
+tailnet itself: a private WireGuard mesh where every peer is a device that has
+been authenticated to the tailnet. Anything that is on the tailnet — and only
+that — can reach the UI, the query API and the always-on `/-/quit` endpoint
+(a `POST` to it stops the process). See
+[monitoring/README.md § Exposure boundary](../../monitoring/README.md#exposure-boundary)
+for the full decision record and the verification commands.
+
+The two extra listen addresses exist for a reason worth keeping:
+
+- `100.79.231.101` — tailnet IPv4 (MagicDNS `sorra-agents-1.tail37f0c2.ts.net`).
+- `fd7a:115c:a1e0::9b33:e765` — tailnet IPv6, so IPv6-preferring tailnet
+  clients do not pay a happy-eyeballs fallback on every scrape or query.
+
+`--web.external-url` is set to the tailnet URL so that redirects and the links
+Prometheus generates (graph, targets, alerts) stay reachable from other tailnet
+devices instead of pointing at `localhost`.
+
+## User Service (recommended)
 
 **File location**: `~/.config/systemd/user/prometheus.service`
 
 ```ini
 [Unit]
 Description=Prometheus metrics server for LLM proxy stack
-After=network.target llama-proxy.service
-Wants=network.target
+After=network.target llama-proxy.service tailscaled.service
+Wants=network.target tailscaled.service
 
 [Service]
 Type=simple
+# Exposed on the Tailscale address only (plus loopback for local tooling), NOT on
+# the LAN or the wlan0 address. Prometheus has no authentication, so the tailnet
+# (private WireGuard mesh, device-authenticated) is the exposure boundary.
+#   tailnet IPv4 : 100.79.231.101   (MagicDNS: sorra-agents-1.tail37f0c2.ts.net)
+#   tailnet IPv6 : fd7a:115c:a1e0::9b33:e765 (so IPv6-preferring tailnet clients
+#                  do not pay a happy-eyeballs fallback)
+# If this node is ever re-registered in Tailscale it gets a new IPv4: update both
+# --web.listen-address and --web.external-url below. If tailscaled is not up yet
+# the bind fails and systemd retries every RestartSec until it is.
 ExecStart=/home/rgardler/bin/prometheus/prometheus \
   --config.file=/home/rgardler/projects/llm/monitoring/prometheus.yml \
   --storage.tsdb.path=/home/rgardler/.local/share/prometheus/data \
-  --storage.tsdb.retention.time=15d \
-  --web.listen-address=:9090
-
-# Restart policy
+  --storage.tsdb.retention.time=90d \
+  --web.listen-address=127.0.0.1:9090 \
+  --web.listen-address=100.79.231.101:9090 \
+  --web.listen-address=[fd7a:115c:a1e0::9b33:e765]:9090 \
+  --web.external-url=http://100.79.231.101:9090/
 Restart=always
-RestartSec=5
-
-# Logging
+RestartSec=10
 StandardOutput=append:/home/rgardler/.local/state/prometheus/logs/prometheus.log
 StandardError=append:/home/rgardler/.local/state/prometheus/logs/prometheus.log
-
-# Resource limits
 MemoryMax=4G
 
 [Install]
 WantedBy=default.target
 ```
 
-### Setup commands (user service)
+### What each flag does
+
+| Flag / directive | Value | Why |
+|---|---|---|
+| `--config.file` | `~/projects/llm/monitoring/prometheus.yml` | Scrapes the proxy and node_exporter, loads the alert rules. `rule_files` inside it are resolved relative to *this file's directory* — see [monitoring/README.md § Rule paths](../../monitoring/README.md#rule-paths-are-relative-to-the-config-file) |
+| `--storage.tsdb.path` | `~/.local/share/prometheus/data` | TSDB blocks, outside the repository |
+| `--storage.tsdb.retention.time` | `90d` | Three months of history; the blocks live in `~/.local/share/prometheus/data` (14 MiB after the first hour at this series count) |
+| `--web.listen-address` | `127.0.0.1:9090` | Local tooling (`curl`, `promtool`, the proxy's own checks) |
+| `--web.listen-address` | `100.79.231.101:9090` | Tailnet IPv4 |
+| `--web.listen-address` | `[fd7a:115c:a1e0::9b33:e765]:9090` | Tailnet IPv6 (bracketed form is required) |
+| `--web.external-url` | `http://100.79.231.101:9090/` | Correct absolute links for tailnet clients |
+| `After=` / `Wants=` `tailscaled.service` | — | The bind targets are tailnet addresses; they only exist once `tailscale0` is up |
+| `RestartSec=10` | — | Retry cadence until `tailscale0` appears |
+| `MemoryMax=4G` | — | Bound TSDB memory use |
+
+### Deliberately **not** enabled
+
+`--web.enable-lifecycle` and `--web.enable-admin-api` are absent, so
+`POST /-/reload` and the delete API (`/api/v1/admin/tsdb/delete_series`) are
+answered with an error rather than acted on. On a tailnet with several devices,
+either flag would put config reloads and destructive data deletion behind no
+authentication at all. Reload config with `systemctl --user reload prometheus`
+(nothing to configure — restart the unit) or `systemctl --user restart`.
+
+## Setup commands (user service)
 
 ```bash
-# Create directories
+# 1. Install the binary (see monitoring/README.md § 1 for the download), then
 mkdir -p ~/.local/share/prometheus/data
 mkdir -p ~/.local/state/prometheus/logs
 
-# Enable and start the service
+# 2. Install the unit. docs/systemd/*.service are documents that wrap the unit
+#    in an `ini` block, so the block is extracted — `cp` would install markdown.
+mkdir -p ~/.config/systemd/user
+awk '/^```ini$/{f=1;next} /^```$/{f=0} f' \
+  docs/systemd/prometheus.service \
+  > ~/.config/systemd/user/prometheus.service
+
+# 3. Enable and start
 systemctl --user daemon-reload
-systemctl --user enable prometheus.service
-systemctl --user start prometheus.service
+systemctl --user enable --now prometheus.service
 
-# Check status
+# 4. Check status and logs
 systemctl --user status prometheus.service
-
-# View logs
-journalctl --user -u prometheus.service -f
+journalctl --user -u prometheus.service -n 20
 ```
+
+If the unit restarts in a loop with `cannot assign requested address`, the
+Tailscale addresses are missing: `tailscale up` / `systemctl --user status
+tailscaled`, then `systemctl --user restart prometheus.service`.
+
+## If this node is re-registered in Tailscale
+
+Re-registration (leaving and rejoining the tailnet, or resetting the node
+identity) assigns a **new** tailnet IPv4 and, usually, a new tailnet IPv6. The
+unit then fails to bind and restart-loops. Recover by:
+
+```bash
+# 1. Read the current addresses
+tailscale ip -4
+tailscale ip -6
+
+# 2. Update BOTH the listen addresses and the external URL in
+#    docs/systemd/prometheus.service, then re-install the unit from the doc
+#    (the extraction command in § Setup commands) — do not hand-edit
+#    ~/.config/systemd/user/prometheus.service, or the repo will drift.
+systemctl --user daemon-reload
+systemctl --user restart prometheus.service
+```
+
+Both places must change together: `--web.listen-address` decides where the
+socket binds, `--web.external-url` decides what URLs Prometheus hands back to
+clients, and a mismatch produces redirects to an address that does not exist.
 
 ## Verification
 
+Commands and their expected results on this host (Prometheus 3.15.1):
+
 ```bash
-# Check Prometheus targets page
-curl http://localhost:9090/api/v1/targets
+# Ready, on every exposure path
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9090/-/ready
+curl -s -o /dev/null -w '%{http_code}\n' http://100.79.231.101:9090/-/ready
+curl -s -o /dev/null -w '%{http_code}\n' 'http://[fd7a:115c:a1e0::9b33:e765]:9090/-/ready'
+curl -s -o /dev/null -w '%{http_code}\n' http://sorra-agents-1.tail37f0c2.ts.net:9090/-/ready
+# expected: 200 200 200 200
 
-# Check metrics endpoint
-curl http://localhost:9090/api/v1/query?query=up
+# The LAN address must be refused (no listener on wlp195s0)
+ip -4 -o addr show wlp195s0 | awk '{print $4}'          # 192.168.0.199/24
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 4 http://192.168.0.199:9090/-/ready
+# expected: 000 (connection refused)
 
-# View Prometheus expression browser
-# Open http://localhost:9090 in a browser
+# Exactly the three intended listeners
+ss -tln | grep ':9090'
+# expected: 127.0.0.1:9090, 100.79.231.101:9090, [fd7a:115c:a1e0::9b33:e765]:9090
 
-# Query a specific metric
-curl 'http://localhost:9090/api/v1/query?query=llama_process_rss_bytes'
+# Effective flags (retention, binds, external URL)
+curl -s http://127.0.0.1:9090/api/v1/status/flags | jq -r '.data | {
+  "storage.tsdb.retention.time": .["storage.tsdb.retention.time"],
+  "web.listen-address": .["web.listen-address"],
+  "web.external-url": .["web.external-url"],
+  "web.enable-lifecycle": .["web.enable-lifecycle"],
+  "web.enable-admin-api": .["web.enable-admin-api"]}'
+# expected: retention 90d, the three listen addresses, the tailnet external URL,
+#           both enable-* flags "false"
+
+# Both scrape targets are up
+curl -s 'http://127.0.0.1:9090/api/v1/targets?state=active' \
+  | jq -r '.data.activeTargets[] | "\(.labels.job) \(.health) \(.scrapeUrl)"'
+# expected: llama-proxy up http://localhost:8000/metrics
+#           node-exporter up http://localhost:9100/metrics
+
+# Alert rules are loaded (5 groups / 10 rules)
+curl -s http://127.0.0.1:9090/api/v1/rules | jq -r '.data.groups[] | .name'
 ```
 
 ## Cross-references
 
-- See also: `docs/systemd/grafana-server.service` for the Grafana systemd unit.
-- See also: `monitoring/README.md` for full monitoring deployment documentation.
-- See also: `monitoring/prometheus.yml` for the Prometheus scrape configuration.
+- [monitoring/README.md](../../monitoring/README.md) — full deployment guide,
+  exposure decision record, query cookbook and troubleshooting.
+- [monitoring/prometheus.yml](../../monitoring/prometheus.yml) — scrape and
+  rule configuration.
+- [docs/systemd/node_exporter.service](node_exporter.service) — host and GPU
+  metric exporter scraped by this instance.
+- [docs/systemd/gpu-metrics.service](gpu-metrics.service) — the sysfs sampler
+  that feeds GPU series into node_exporter.
+- [docs/systemd/rocm-exporter.service](rocm-exporter.service) — **unavailable**
+  on this host; documented so the dead end is not retried.
+- [docs/systemd/grafana-server.service](grafana-server.service) — optional
+  dashboard front-end (not deployed on this host).

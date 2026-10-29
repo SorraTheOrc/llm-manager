@@ -55,6 +55,7 @@ def reset_state():
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
     provider._local_http_400_streaks.clear()
     yield
 

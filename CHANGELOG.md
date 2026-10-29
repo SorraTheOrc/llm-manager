@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.1.26 (2026-10-29)
+### Features
+- [test-failure] proxy/tests/test_contention_queue_retention.py::TestThrashReplay::test_returning_session_wins_the_slot_every_round[300.0-7] — failing test (LP-0MVT4SMIU0046OTB)
+- Quarantine MunitoAI free tier until its advertised daily reset (LP-0MVT8SAZE00570J5)
+- Wedged prefill lease loop holds the local dispatch gate ~4h (2026-10-23 02:00-06:00) and is reported as 0pct busy idle (LP-0MVKN9IRP003XJH6)
+- Prompt log: track the first message of each proxy request (time, prompt, session ID, routed model) in a log, with a Web UI tab (LP-0MVP79OBP002G6Z1)
+- Monitoring: deployable, tailnet-exposed Prometheus with honest GPU utilisation (LP-0MVO8CLCL00086NT)
+- Local slot scheduling: session-level tenancy and resident-prefix admission (stop cold-prefill thrash in 2 slots) (LP-0MVN1IQTF0037WTG)
+- local-only intent is only enforced at the admission guard — skip paths silently fall through to remote (LP-0MVNU2KTK009D4AG)
+- Add local-turn coverage report to proxy usage analysis skill (LP-0MVM93DE6009JGBU)
+- Proxy usage report: hardware power-based GPU busy time (15s sampling) (LP-0MVSN0OHG0024LH4)
+### Bug Fixes
+- Local-only refusal: truthful, reason-specific retry time (429 Retry-After / retry_at) (LP-0MVNTT4X8009IO2X)
+- Audit child screens cannot verify execution-dependent ACs (no green-run evidence in child prompts) (LP-0MVO35BF90021QY6)
+- Prefill thrash cooldown is cleared by any unrelated successful local first byte, so repeat deadline evictions are re-admitted (LP-0MVQITN6P008DPLB)
+- AC7 eviction event reports recomputed new_tokens/ETA, not the admission decision's values (false over-budget signal) (LP-0MVODJ3P6000AIUM)
+- Usage-limit quarantine uses the monthly reset for every window (rolling/weekly/monthly ignored) (LP-0MVPAE77Z002VGIA)
+- Residual router-proxied /slots 500s: audit remaining call sites and enforce direct child-port polling (LP-0MVP7525P008RXMF)
+- Report real token usage for local streams (cold-cap/unlock + measurable context) (LP-0MVMHNVKT003PRIK)
+### Other
+- Evaluate widening the session-slot snapshot pool (session_slot_pool_size 2 -> 4) before adding slots (LP-0MVN3KPEC007WWL5)
+- Re-measure capacity signal + dispatch recovery: 12h window 2026-10-28 09:30-21:30 (post-f58e8964 build) (LP-0MVRZDC3Y005JHQJ)
+- Post-deploy 24 h prefill regression verification (LP-0MVN4LD2F006B76I)
+- Proxy: replace local-only with local-preferred (defer while local-capable, remote-ok beyond local capacity) (LP-0MVSHWL47000EVJY)
+- Measure whether lease_state/prefill_eta predict real local contention (LP-0MVGR2OXT0096OGK)
+- Idle admission is gated by foreign idle local leases — decide preemption/eligibility (LP-0MVK16GME007EYUW)
+- Add per-turn correlation id to all structured log lines (LP-0MVMBM467005BT4A)
+- Emit explicit tokens=missing marker when upstream reports no usage (LP-0MVMBM6N400541EH)
+- Remove unused github-primary model chain from config (LP-0MVMAX4KA003JPE6)
+- Evaluate amd-smi as the GPU utilisation source for the usage report (record the decision) (LP-0MVSQQO910077LYL)
+
 ## v0.1.25 (2026-10-25)
 ### Features
 - routing_resident_prefix logs reuse_ratio=0.0000 for non-resident sessions, so the usage report counts a non-measurement as a measured prefix (LP-0MVNPZY22008B536)

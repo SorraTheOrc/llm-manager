@@ -414,18 +414,299 @@ def test_first_byte_flag_suppresses_a_later_release(caplog):
     assert key is not None and null_endpoint is None
 
 
-def test_dispatch_records_carry_the_evidence_at_creation():
-    """AC2: the evidence is captured once, at acceptance."""
+def test_dispatch_evidence_uses_the_threaded_admission_snapshot_verbatim():
+    """AC1/AC2: the record stores the admission decision's numbers verbatim.
+
+    The snapshot (stamped by provider before dispatch) wins even when a body
+    recompute at record creation would produce different values — the whole
+    point of the fix is that the drifted inputs must never re-price the
+    dispatch.
+    """
+    from proxy import router_helpers
+
+    snapshot = {
+        "estimated_tokens": 41_682,
+        "cached_ratio": 0.55,
+        "new_tokens": 18_034,
+        "eta_prefill_s": 86.0,
+    }
+    evidence = router_helpers._dispatch_evidence(
+        {"messages": [{"role": "user", "content": "hello world " * 8_000}]},
+        "Qwen3",
+        "sess-evidence",
+        admission_evidence=snapshot,
+    )
+
+    assert evidence["estimated_tokens"] == 41_682
+    assert evidence["cached_ratio"] == 0.55
+    assert evidence["new_tokens"] == 18_034
+    assert evidence["eta_prefill_s"] == 86.0
+    assert evidence["first_byte_seen"] is False
+    assert "slot_id" in evidence and "llama_task_id" in evidence
+
+
+def test_dispatch_evidence_never_recomputes_without_a_snapshot():
+    """AC4: no threaded snapshot -> explicit unknown markers, never a recompute.
+
+    A record created outside the guarded routing path must not be re-priced
+    from the body / a drifted cached-ratio sample: the budget's numbers and
+    the eviction event's numbers would diverge, producing a false over-budget
+    signal.
+    """
     from proxy import router_helpers
 
     evidence = router_helpers._dispatch_evidence(
-        {"messages": [{"role": "user", "content": "hello world " * 100}]},
+        {"messages": [{"role": "user", "content": "hello world " * 8_000}]},
         "Qwen3",
         "sess-evidence",
     )
 
-    assert evidence["estimated_tokens"] > 0
-    assert 0.0 <= evidence["cached_ratio"] <= 1.0
-    assert evidence["new_tokens"] <= evidence["estimated_tokens"]
+    assert evidence["estimated_tokens"] is None
+    assert evidence["cached_ratio"] is None
+    assert evidence["new_tokens"] is None
+    assert evidence["eta_prefill_s"] is None
     assert evidence["first_byte_seen"] is False
-    assert "slot_id" in evidence and "llama_task_id" in evidence
+
+
+@pytest.mark.asyncio
+async def test_dispatch_record_reports_the_admission_new_tokens_after_a_ratio_drop(caplog):
+    """AC2/AC3: the eviction event reports the admission decision's numbers.
+
+    A dispatch admitted with ``new_tokens=18_034`` (within the 25k cold-prefill
+    budget) whose cached ratio drops after admission must still report
+    ``new_tokens=18_034`` — never a re-priced value that claims an over-budget
+    admission. Exercises ``_try_acquire_local_dispatch`` (explicit-session
+    path) end-to-end to the emitter.
+    """
+    from types import SimpleNamespace
+
+    from proxy import admission_events, router_helpers
+
+    admission_events.reset_eviction_after_acceptance_counters()
+    cfg = {"server": {"session_slot_pool_size": 4}}
+    srv = SimpleNamespace(
+        config=cfg,
+        logger=logging.getLogger("llama-proxy"),
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+        local_generating_queries=0,
+        local_generating_sessions=set(),
+        local_generating_queries_lock=asyncio.Lock(),
+        local_prefill_in_flight={},
+        local_prefill_in_flight_lock=asyncio.Lock(),
+    )
+    snapshot = {
+        "estimated_tokens": 41_682,
+        "cached_ratio": 0.55,
+        "new_tokens": 18_034,
+        "eta_prefill_s": 86.0,
+    }
+
+    acquired, *_ = await router_helpers._try_acquire_local_dispatch(
+        srv, max_local=2, session_key="sess-admitted", backend="local",
+        model_name="Qwen3", admission_evidence=snapshot,
+    )
+    assert acquired is True
+
+    record = srv.local_dispatch_records[
+        router_helpers._dispatch_lease_key("local", "sess-admitted")
+    ]
+    assert record["new_tokens"] == 18_034
+    assert record["estimated_tokens"] == 41_682
+    assert record["cached_ratio"] == 0.55
+    assert record["eta_prefill_s"] == 86.0
+
+    # Simulate the drifted state the old code sampled at eviction time: the
+    # cache now looks cold, so a recompute would price 41_682 tokens (over the
+    # 25k budget). The record must not reflect that.
+    with caplog.at_level(logging.DEBUG, logger="llama-proxy"):
+        emitted = admission_events.record_eviction_after_acceptance(
+            srv, "sess-admitted", "prefill_deadline", record, endpoint="local"
+        )
+
+    assert emitted is True
+    message = _eviction_events(caplog)[0].getMessage()
+    assert "new_tokens=18034" in message
+    assert "estimated_tokens=41682" in message
+    assert "eta_prefill_s=86.0" in message
+    assert "reason=prefill_deadline" in message
+
+
+@pytest.mark.asyncio
+async def test_anonymous_path_record_carries_the_threaded_snapshot():
+    """AC1: the anonymous-session dispatch record inherits the snapshot too."""
+    from types import SimpleNamespace
+
+    from proxy import router_helpers
+
+    srv = SimpleNamespace(
+        config={"server": {}},
+        logger=logging.getLogger("llama-proxy"),
+        local_active_queries=0,
+        local_active_queries_lock=asyncio.Lock(),
+        local_dispatch_records={},
+        local_dispatch_records_lock=asyncio.Lock(),
+        local_prefill_in_flight={},
+    )
+    snapshot = {
+        "estimated_tokens": 60_000,
+        "cached_ratio": 0.2,
+        "new_tokens": 48_000,
+        "eta_prefill_s": 130.0,
+    }
+
+    await router_helpers._increment_local_active_queries(
+        srv, session_key="anon-1", backend="local",
+        body_json={"messages": [{"role": "user", "content": "x"}]},
+        model_name="Qwen3", admission_evidence=snapshot,
+    )
+
+    record = srv.local_dispatch_records[
+        router_helpers._dispatch_lease_key("local", "anon-1")
+    ]
+    assert record["new_tokens"] == 48_000
+    assert record["estimated_tokens"] == 60_000
+    assert record["cached_ratio"] == 0.2
+    assert record["eta_prefill_s"] == 130.0
+
+
+def test_fallback_eviction_event_renders_unknown_without_recompute(caplog):
+    """AC4/AC6: a no-snapshot eviction renders 0/unknown — never a recompute."""
+    from proxy import admission_events
+
+    record = _accepted_record(
+        estimated_tokens=None,
+        cached_ratio=None,
+        new_tokens=None,
+        eta_prefill_s=None,
+    )
+    with caplog.at_level(logging.DEBUG, logger="llama-proxy"):
+        admission_events.record_eviction_after_acceptance(
+            _Srv(), "sess-unknown", "prefill_deadline", record
+        )
+
+    message = _eviction_events(caplog)[0].getMessage()
+    assert "new_tokens=0" in message
+    assert "estimated_tokens=0" in message
+    assert "eta_prefill_s=unknown" in message
+    assert "reason=prefill_deadline" in message
+
+
+# ---------------------------------------------------------------------------
+# AC1 wiring — the provider cycle stamps the snapshot before the first dispatch
+# ---------------------------------------------------------------------------
+
+def test_provider_cycle_stamps_the_admission_snapshot_before_dispatch(monkeypatch):
+    """AC1: the local accept path stamps the decision's numbers on the request.
+
+    Drives the real ``_proxy_with_fallback_cycle`` to a local dispatch with a
+    stubbed estimate and local dispatcher: the request must carry the routing
+    values (estimated / cached / new tokens) plus the ETA the admission guard
+    costed — the values the dispatch record then stores verbatim. This is the
+    wiring that makes the idle-admit accept path (the measured 2026-10-23
+    sample) report admission-time numbers rather than a re-pricing.
+    """
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+
+    import proxy.provider as provider
+    import proxy.server as server
+    from fastapi import Response
+
+    captured: dict = {}
+
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
+    provider._sibling_failure_count.clear()
+    provider._sibling_failure_streak_start.clear()
+
+    _ok_body = json.dumps({"choices": [{"message": {"content": "ok"}}]})
+
+    async def _local_ptr(request, _path, endpoint=None):
+        captured["request"] = request
+        captured["endpoint"] = endpoint
+        return Response(content=_ok_body, status_code=200,
+                        media_type="application/json")
+
+    monkeypatch.setattr(provider, "_get_proxy_to_local", lambda: _local_ptr)
+    monkeypatch.setattr(provider, "_get_proxy_to_remote", lambda: _local_ptr)
+    monkeypatch.setattr(provider, "_get_tokenizer_for_model", MagicMock(return_value=(None, 1.0)))
+    monkeypatch.setattr(
+        provider, "_estimate_effective_prompt_tokens_for_routing",
+        AsyncMock(return_value=20_000),
+    )
+    monkeypatch.setattr(provider, "_get_cached_ratio", lambda *_: 0.0)
+    monkeypatch.setattr(
+        provider, "_effective_large_context_thresholds", lambda *_: (1_000_000, 100_000)
+    )
+    monkeypatch.setattr(provider, "_local_concurrency_info", lambda *a, **k: (0, 4))
+    monkeypatch.setattr(
+        provider, "_get_local_provider_endpoint", lambda *a, **k: "http://127.0.0.1:8080"
+    )
+    monkeypatch.setattr(
+        provider, "_evaluate_compaction_for_bypass",
+        AsyncMock(return_value={
+            "evaluated": True, "action": "noop", "applied": False,
+            "estimated_before": 0, "estimated_after": 0, "reason": None,
+        }),
+    )
+    monkeypatch.setattr(provider, "request_priority", lambda *a, **k: "medium")
+    monkeypatch.setattr("proxy.priority.request_priority", lambda *a, **k: "medium")
+    monkeypatch.setattr(server, "local_dispatch_records", {}, raising=False)
+    monkeypatch.setattr(server, "local_dispatch_records_lock", asyncio.Lock(), raising=False)
+    monkeypatch.setattr(server, "local_generating_queries", 0, raising=False)
+    monkeypatch.setattr(server, "local_generating_sessions", set(), raising=False)
+    monkeypatch.setattr(server, "local_prefill_in_flight", {}, raising=False)
+    monkeypatch.setattr(server, "local_active_queries", 0, raising=False)
+
+    class _Request:
+        def __init__(self):
+            self._body = json.dumps({
+                "model": "eviction-evidence-test",
+                "messages": [{"role": "user", "content": "hi"}],
+            }).encode()
+            self.headers = {
+                "content-type": "application/json",
+                "x-session-id": "sess-wiring",
+            }
+            self.method = "POST"
+            self.url = type("U", (), {"path": "/v1/chat/completions"})()
+
+        async def body(self):
+            return self._body
+
+    model_config = {
+        "name": "eviction-evidence-test",
+        "providers": [{"name": "local-qwen3", "type": "local", "llama_model": "Qwen3"}],
+    }
+    config = {
+        "server": {
+            "session_slot_pool_size": 2,
+            "contention_queue_max_wait_seconds": 60,
+            "local_prefill_deadline_seconds": 120,
+            "local_cold_prefill_budget_tokens": 25_000,
+            "local_admission_guard_budget_safety_fraction": 0.95,
+            "local_admission_guard_policy": "reject",
+            "local_idle_admit_enabled": True,
+            "local_idle_admit_seconds": 30,
+        },
+        "provider_cooldown_seconds": 60,
+    }
+
+    request = _Request()
+    response = asyncio.run(
+        provider._proxy_with_fallback_cycle(
+            request, "v1/chat/completions", model_config, config
+        )
+    )
+
+    assert response.status_code == 200
+    assert captured.get("request") is request, "the local dispatch ran"
+    snapshot = getattr(request, provider.LOCAL_ADMISSION_EVIDENCE_ATTR)
+    assert snapshot["estimated_tokens"] == 20_000
+    assert snapshot["new_tokens"] == 20_000
+    assert snapshot["cached_ratio"] == 0.0
+    assert snapshot["eta_prefill_s"] is not None and snapshot["eta_prefill_s"] > 0

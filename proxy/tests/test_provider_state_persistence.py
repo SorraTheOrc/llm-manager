@@ -44,10 +44,12 @@ def _isolate_provider_state(tmp_path, monkeypatch):
     )
     provider._provider_unavailable_until.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
     provider._provider_failure_count.clear()
     yield
     provider._provider_unavailable_until.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
     provider._provider_failure_count.clear()
 
 
@@ -93,6 +95,7 @@ class TestSaveLoadRoundTrip:
         # Wipe the in-memory maps to simulate a process restart.
         provider._provider_unavailable_until.clear()
         provider._usage_reset_at.clear()
+        provider._usage_reset_window.clear()
 
         restored = provider.load_provider_state(path)
 
@@ -129,6 +132,7 @@ class TestSaveLoadRoundTrip:
         assert path.exists()
 
         provider._usage_reset_at.clear()
+        provider._usage_reset_window.clear()
         assert provider.load_provider_state() == (0, 1)
         assert set(provider._usage_reset_at) == {"acct"}
 
@@ -368,6 +372,7 @@ class TestStartupRestore:
         provider.save_provider_state()
         # Wipe in-memory state to simulate a restart before restore.
         provider._usage_reset_at.clear()
+        provider._usage_reset_window.clear()
 
         restored = server._startup_restore_provider_state()
 
@@ -439,6 +444,7 @@ class TestStartupRestore:
         provider.save_provider_state()
         provider._provider_unavailable_until.clear()
         provider._usage_reset_at.clear()
+        provider._usage_reset_window.clear()
 
         with caplog.at_level("INFO"):
             server._startup_restore_provider_state()
@@ -494,6 +500,7 @@ class TestStartupRestore:
         provider._usage_reset_at["key@domain"] = time.time() + 600
         provider.save_provider_state()
         provider._usage_reset_at.clear()
+        provider._usage_reset_window.clear()
 
         # The real startup hook must reach the loader (no event loop here:
         # the task-spawning section is guarded by RuntimeError).
@@ -700,3 +707,117 @@ class TestPersistOnMutation:
             "failed to persist availability state" in r.message
             for r in caplog.records
         )
+
+
+# ---------------------------------------------------------------------------
+# Quarantine window metadata schema (LP-0MVPAE77Z002VGIA AC7/AC11)
+# ---------------------------------------------------------------------------
+#
+# Version 2 adds an optional ``usage_reset_window`` map (account → window
+# name). Version-1 payloads carry no such map; their entries load fine, carry
+# no window metadata, and are revalidated as legacy entries (cleared on the
+# first healthy poll) rather than surviving as multi-week lockouts.
+
+
+class TestQuarantineWindowMetadata:
+    def test_written_document_carries_window_metadata(self, tmp_path):
+        """AC7: the persisted payload names the window per quarantined account."""
+        path = tmp_path / "state.json"
+        provider._usage_reset_at["key@domain"] = time.time() + 600
+        provider._usage_reset_window["key@domain"] = "weekly"
+
+        provider.save_provider_state(path)
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["version"] == provider._PROVIDER_STATE_VERSION
+        assert raw["usage_reset_window"] == {"key@domain": "weekly"}
+
+    def test_window_metadata_round_trips_through_restart(self, tmp_path):
+        """AC7: window metadata restores with the quarantine, so a restarted
+        proxy can still revalidate the window."""
+        path = tmp_path / "state.json"
+        expiry = time.time() + 600
+        provider._usage_reset_at["acct@domain"] = expiry
+        provider._usage_reset_window["acct@domain"] = "weekly"
+        provider.save_provider_state(path)
+        provider._usage_reset_at.clear()
+        provider._usage_reset_window.clear()
+
+        restored = provider.load_provider_state(path)
+
+        assert restored == (0, 1)
+        assert provider._usage_reset_at == {"acct@domain": expiry}
+        assert provider._usage_reset_window == {"acct@domain": "weekly"}
+
+    def test_guessed_quarantine_writes_no_window_metadata(self, tmp_path):
+        """Guessed quarantines are not persisted — nor is their window map."""
+        path = tmp_path / "state.json"
+        account = "acct@domain"
+        provider._usage_reset_at[account] = time.time() + 600
+        provider._usage_reset_guessed.add(account)
+        provider._usage_reset_window[account] = "weekly"
+
+        provider.save_provider_state(path)
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert account not in raw["usage_reset_at"]
+        assert account not in raw["usage_reset_window"]
+
+    def test_window_map_prunes_expired_and_foreign_accounts(self, tmp_path):
+        """The window map never names an account that is not quarantined."""
+        path = tmp_path / "state.json"
+        now = time.time()
+        provider._usage_reset_window["ghost@domain"] = "weekly"
+        provider._usage_reset_at["keep@domain"] = now + 600
+        provider._usage_reset_window["keep@domain"] = "rolling"
+
+        provider.save_provider_state(path)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["usage_reset_window"] == {"keep@domain": "rolling"}
+
+    def test_version1_payload_restores_legacy_quarantine_with_no_window(self, tmp_path):
+        """AC11: a version-1 payload (the incident schema) loads — with no
+        window metadata, so the account is legacy-revalidatable."""
+        path = tmp_path / "state.json"
+        expiry = time.time() + 20 * 86400
+        account = "OPENCODE_3_API_KEY@https://opencode.ai/zen/go:deepseek-v4.1-flash"
+        _write_state(
+            path,
+            {
+                "version": 1,
+                "provider_unavailable_until": {},
+                "usage_reset_at": {account: expiry},
+            },
+        )
+
+        restored = provider.load_provider_state(path)
+
+        assert restored == (0, 1)
+        assert provider._usage_reset_at == {account: expiry}
+        assert provider._usage_reset_window == {}
+
+    def test_unknown_window_values_are_dropped_on_load(self, tmp_path):
+        """A foreign/malformed window name cannot resurrect a wrong window."""
+        path = tmp_path / "state.json"
+        now = time.time()
+        _write_state(
+            path,
+            {
+                "version": 2,
+                "provider_unavailable_until": {},
+                "usage_reset_at": {
+                    "a@d": now + 600,
+                    "b@d": now + 600,
+                    "c@d": now + 600,
+                },
+                "usage_reset_window": {
+                    "a@d": " weekly ",
+                    "b@d": "daily",  # unknown to the proxy
+                    "c@d": 42,      # malformed
+                },
+            },
+        )
+
+        provider.load_provider_state(path)
+
+        assert provider._usage_reset_window == {"a@d": "weekly"}

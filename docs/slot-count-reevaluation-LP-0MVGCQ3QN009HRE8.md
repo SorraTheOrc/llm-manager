@@ -294,11 +294,21 @@ admission cap**: each slot-count restart reloads the model, re-arming
 
 ### What would reopen this decision (AC4, verdict stays N=2)
 
-1. **A harness that can land requests locally under concurrency** (LP-0MVLHNEDO008FTBH):
-   staggered arrivals so the first prefill lifts the cold cap before the next request is
-   issued, a warm-start proof (`cold_start.is_cold() == False`) before the measured set, or
-   single-turn requests at production sizes. Evidence of success = `local_stream_share > 0`
-   with ≥2 concurrent local streams and per-request resolved models recorded.
+1. **A harness that can land requests locally under concurrency** (LP-0MVLHNEDO008FTBH).
+   **Implemented 2026-10-26:** `slot_benchmark.py` now ships a warm-start priming gate
+   (`--warm-start`, **ON by default for `--sweep`**) that sends one small single-turn
+   request after each slot-count restart and requires it to complete **locally**
+   (`X-Resolved-Model` local — the harness-visible `cold_start.is_cold() == False`
+   proof that `mark_warm()` lifted the admission cap) before the measured set
+   launches, with a bounded retry budget and fail-fast instead of remote fallback;
+   plus a configurable `--stagger-seconds N` (default 0 = all at once) replacing the
+   fixed 60 s `INTER_REQUEST_GAP_S`. Evidence of success for the re-run:
+   `contention.local_stream_share > 0` with `contention.max_concurrent_local_streams
+   >= 2` and per-request resolved models recorded in `slot_<N>.json` (`warm_start`
+   block proves the gate passed). Re-run command:
+   `python -m proxy.benchmarks.slot_benchmark --sweep --resume 2 --concurrency 3
+   --prompt-tokens 2000 --warm-start --stagger-seconds 0` (after
+   `scripts/slot_sweep_preflight.py`).
 2. **A warmed N=2-vs-N=3 comparison whose decode-throughput gain exceeds the warm-cache loss**
    from the 83,285 clamp (79,121 warm threshold vs 120,627 at N=2). Any move must re-decide the
    warm-threshold target in the same pass.

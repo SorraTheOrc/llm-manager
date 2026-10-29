@@ -131,6 +131,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"decode-only busy (lower bound) {busy['decode_busy_seconds']:.0f}s "
                 f"(prefill busy {busy['prefill_busy_seconds']:.0f}s)"
             )
+            gpu = data.get("gpu_busy")
+            if gpu:
+                busy_summary += (
+                    f", GPU busy (power-based, 15s sampling) {gpu['busy_pct']:.1f}% "
+                    f"({gpu['busy_seconds']:.0f}s)"
+                )
         print(
             f"Analyzed {len(run.files)} log file(s) from {args.log_dir}: "
             f"{data['sessions']} sessions, {data['total_requests']} requests "

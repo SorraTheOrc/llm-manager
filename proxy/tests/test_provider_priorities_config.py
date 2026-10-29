@@ -61,7 +61,6 @@ COMPACT_PROVIDER_ORDER = ["opencode-go-compact", "deepseek-flash-compact"]
 #: for every priority (the documented legacy default, Q3).
 UNLABELLED_MODELS = {
     "embed": ["local-embed"],
-    "github": ["github-primary"],
     "private": ["local-qwen3"],
 }
 

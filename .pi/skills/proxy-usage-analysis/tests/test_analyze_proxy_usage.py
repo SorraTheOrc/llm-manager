@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import aggregation
 import bucketing
 import config_loader
+import gpu_busy
 import log_parser
 import recommendations
 import reporting
@@ -406,11 +407,19 @@ class TestLogLineParsing:
         )
         assert log_parser.parse_log_line(line) is None
 
-    def test_status_request_lines_ignored(self):
-        """status_request lines expose total_slots but are not parsed (they
-        are corroborating evidence only)."""
-        assert log_parser.parse_log_line(fixtures.STATUS_REQUEST_CHEAP) is None
-        assert log_parser.parse_log_line(fixtures.STATUS_REQUEST_FAST) is None
+    def test_status_request_lines_parsed_for_contention_measurement(self):
+        """status_request polls are parsed (LP-0MVGR2OXT0096OGK M3) so the
+        published ``prefill_eta_seconds`` prediction and ``capacity_hint`` can
+        be measured against real local work. Legacy schema lines (no ETA /
+        capacity fields) still parse, with those fields ``None``."""
+        ev = log_parser.parse_log_line(fixtures.STATUS_REQUEST_CHEAP)
+        assert ev is not None
+        assert ev.kind == "status_request"
+        assert ev.prefill_eta_seconds is None  # legacy line: no ETA field
+        assert ev.capacity_hint is None
+        ev_fast = log_parser.parse_log_line(fixtures.STATUS_REQUEST_FAST)
+        assert ev_fast is not None
+        assert ev_fast.kind == "status_request"
 
 
 class TestTtftParsing:
@@ -2136,8 +2145,10 @@ class TestModeTimelineBucketing:
         )
         # In-window structured lines: 2 mode switches (Aug 15 01:00/10:00;
         # the Aug 14 10:00 line lies in the margin, outside the window)
-        # + 3 stream starts + 3 stream finishes.
-        assert res.total_lines == 8
+        # + 3 stream starts + 3 stream finishes + 2 status_request polls
+        # (status polls are parsed for the contention measurement,
+        # LP-0MVGR2OXT0096OGK M3).
+        assert res.total_lines == 10
         assert res.lines_skipped == 0
 
 
@@ -3751,6 +3762,68 @@ class TestDispatchToFinishBusy:
         assert busy.prefill_stats is not None
         assert list(busy.prefill_stats.samples) == pytest.approx([55.6565])
 
+    def test_out_of_window_pairs_do_not_count_as_prefill_extended(self):
+        """Regression (LP-0MVKN85WO007O00H): ``prefill_extended_streams``
+        counts only pairs whose clipped busy interval lands in the window.
+
+        The event stream handed to :func:`compute_busy_stats` is
+        margin-widened (48h collection), so it also carries pairs from earlier
+        windows. Those pairs contribute no busy interval and must not be
+        counted: counting them made the report note read ``1677 of 676``.
+        """
+        streams = [
+            # Two earlier-window pairs from the 48h collection margin, each
+            # fully finished before the window opens (empty clipped interval).
+            _local_event("stream_started", datetime(2026, 8, 2, 10, 0, 0), "old-a"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 10, 0, 30), "old-a"),
+            _local_event("stream_started", datetime(2026, 8, 2, 12, 0, 0), "old-b"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 12, 0, 30), "old-b"),
+            # The one in-window pair, with a measured prefill.
+            _local_event("stream_started", datetime(2026, 8, 2, 14, 0, 10), "s1"),
+            _local_event("stream_finished", datetime(2026, 8, 2, 14, 0, 20), "s1"),
+        ]
+        ttfts = [
+            _ttft_event(datetime(2026, 8, 2, 10, 0, 0), "old-a", 30000.0),
+            _ttft_event(datetime(2026, 8, 2, 12, 0, 0), "old-b", 30000.0),
+            _ttft_event(datetime(2026, 8, 2, 14, 0, 10), "s1", 5000.0),
+        ]
+        busy = self._busy(streams, ttfts)
+        assert busy is not None
+        assert busy.streams == 1  # only the in-window pair has a busy interval
+        assert busy.prefill_extended_streams == 1
+        assert busy.prefill_extended_streams <= busy.streams
+
+    def test_prefill_extended_counts_only_in_window_pairs_in_aggregate(self):
+        """Regression end-to-end (LP-0MVKN85WO007O00H): the JSON/note counter
+        stays bounded by ``streams`` when real log lines from earlier windows
+        are present in the margin-widened collection."""
+        lines = [
+            # Earlier-window pair with a dispatch line (pre-window leftovers).
+            "2026-08-02 11:00:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=old request=[]",
+            "2026-08-02 11:00:30,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=old provider=local model=Qwen3 request=[]",
+            "2026-08-02 11:00:00,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=old model=Qwen3",
+            # In-window pair with a dispatch line.
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert summary.busy is not None
+        assert summary.busy.streams == 1
+        assert summary.busy.prefill_extended_streams == 1
+        # The ``Prefill vs decode`` population is separate: only the in-window
+        # first-byte sample counts, so the two counters stay distinct.
+        assert summary.busy.prefill_stats is not None
+        assert summary.busy.prefill_stats.count == 1
+
     def test_report_renders_definition_and_labelled_bounds(self):
         """AC2/AC3: the ``## Local model utilization`` section states the
         dispatch → finish definition, retains the decode-only row as the
@@ -3774,6 +3847,143 @@ class TestDispatchToFinishBusy:
         assert "1 of 1 stream(s) contributed a measured prefill" in section
         # Busy of 40 s over the 1h window.
         assert "40s (1.1%)" in section
+
+    def test_report_note_prefill_counter_bounded_by_streams_served(self):
+        """AC1 (LP-0MVKN85WO007O00H): the note's ``X of Y stream(s)``
+        numerator never exceeds the streams-served denominator, even when the
+        margin-widened collection carries pairs from earlier windows (the
+        ``1677 of 676`` symptom).
+
+        The note also keeps its population distinct from the ``Prefill vs
+        decode`` Samples column, which counts first-byte samples anchored in
+        the window including unfinished streams and may exceed Streams served.
+        """
+        lines = [
+            # Two earlier-window pairs, both with dispatch lines.
+            "2026-08-02 10:00:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=old-a request=[]",
+            "2026-08-02 10:00:20,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=old-a provider=local model=Qwen3 request=[]",
+            "2026-08-02 10:00:00,000 - INFO - dispatch_first_byte_ms=20000.0 "
+            "dispatch_to_first_byte_ms=19999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=old-a model=Qwen3",
+            "2026-08-02 12:00:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=old-b request=[]",
+            "2026-08-02 12:00:20,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=old-b provider=local model=Qwen3 request=[]",
+            "2026-08-02 12:00:00,000 - INFO - dispatch_first_byte_ms=20000.0 "
+            "dispatch_to_first_byte_ms=19999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=old-b model=Qwen3",
+            # The two in-window streams: one measured prefill, one without a
+            # first-byte line.
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+            "2026-08-02 14:10:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s2 request=[]",
+            "2026-08-02 14:10:15,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s2 provider=local model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert summary.busy is not None
+        assert summary.busy.streams == 2
+        report = reporting.build_report(summary, None)
+        section = report.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        # One of the two streams served in the window carried a first-byte
+        # line: the two earlier-window pairs must not inflate the numerator.
+        assert "1 of 2 stream(s) contributed a measured prefill" in section
+        assert "3 of 2" not in section
+        # The note names its population so it is never read as the (wider)
+        # ``Prefill vs decode`` Samples count.
+        assert "Prefill vs decode" in section
+        assert "Samples" in section
+
+    def test_report_note_is_deterministic_across_runs(self):
+        """AC3 (LP-0MVKN85WO007O00H): re-analysing the same logs renders a
+        byte-identical report, so the corrected note never drifts."""
+        lines = [
+            "2026-08-02 10:00:00,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=old request=[]",
+            "2026-08-02 10:00:20,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=old provider=local model=Qwen3 request=[]",
+            "2026-08-02 10:00:00,000 - INFO - dispatch_first_byte_ms=20000.0 "
+            "dispatch_to_first_byte_ms=19999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=old model=Qwen3",
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+            "model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+            "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+            "2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms=30000.0 "
+            "dispatch_to_first_byte_ms=29999.0 cache_state=warm cached_ratio=0.900 "
+            "queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+        first = reporting.build_report(
+            aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule()),
+            None,
+        )
+        second = reporting.build_report(
+            aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule()),
+            None,
+        )
+        assert first == second
+        assert "1 of 1 stream(s) contributed a measured prefill" in first
+
+    def test_report_renders_gpu_power_busy_row(self):
+        """The ``## Local model utilization`` table gains a hardware-side
+        GPU busy row when Prometheus power data is available, and omits it
+        when it is not. The row is the power-based busy fraction
+        (``gpu:computing:bool``), distinct from the log-derived slot union.
+        """
+        lines = [
+            "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local model=Qwen3 session=s1 request=[]",
+            "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]",
+        ]
+        summary = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
+        assert summary.busy is not None
+
+        # Without Prometheus data the row is absent.
+        assert summary.gpu_busy is None
+        no_gpu = reporting.build_report(summary, None)
+        assert "GPU busy — power-based" not in no_gpu
+
+        # With a GpuBusyResult the row appears with the hardware figure.
+        summary.gpu_busy = gpu_busy.GpuBusyResult(
+            computing_fraction=0.50,
+            total_seconds=3600.0,
+            busy_seconds=1800.0,
+            idle_seconds=1800.0,
+            smoothed_power_values=[],
+        )
+        with_gpu = reporting.build_report(summary, None)
+        section = with_gpu.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "GPU busy — power-based (hardware)" in section
+        # 1800 s of 3600 s = 30m 00s (50.0%) via _busy_cell.
+        assert "30m 00s (50.0%)" in section
+        # The hardware-method note is rendered too.
+        assert "avg_over_time(gpu:computing:bool" in section
+
+    def test_gpu_busy_json_round_trip(self):
+        """``summary_to_json`` exposes the GPU block under ``gpu_busy``."""
+        summary = aggregation.aggregate(
+            _events([]), WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert reporting.summary_to_json(summary)["gpu_busy"] is None
+        summary.gpu_busy = gpu_busy.GpuBusyResult(
+            computing_fraction=0.25,
+            total_seconds=3600.0,
+            busy_seconds=900.0,
+            idle_seconds=2700.0,
+            smoothed_power_values=[(1698766200, 93.2)],
+        )
+        block = reporting.summary_to_json(summary)["gpu_busy"]
+        assert block["computing_fraction"] == 0.25
+        assert block["busy_pct"] == 25.0
+        assert block["idle_pct"] == 75.0
+        assert block["smoothed_power"] == [{"timestamp": 1698766200, "power_watts": 93.2}]
 
 
 class TestDecodeStats:
@@ -7792,3 +8002,214 @@ class TestResidencyAdmission:
         )
         md = reporting.build_report(summary, None)
         assert "## Residency-aware admission" not in md
+
+
+# ---------------------------------------------------------------------------
+# Explicit no-usage marker (LP-0MVMBM6N400541EH)
+# ---------------------------------------------------------------------------
+
+
+class TestTokensMissingMarker:
+    """``tokens=missing`` distinguishes "no data" from "zero tokens".
+
+    The proxy now writes ``tokens=missing`` on a ``Stream finished`` line whose
+    upstream reported no usage (aborted/errored stream, or a provider that omits
+    the block). The analyser must parse the marker onto the stream-finished
+    event, count those streams (window level and per session) instead of
+    silently emitting ``n/a``, and keep them out of every token total.
+    """
+
+    START_LOCAL = (
+        "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local "
+        "model=Qwen3 session=sess-mix request=x"
+    )
+
+    @staticmethod
+    def _aggregate(lines: list[str]) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events(lines),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+
+    def test_parser_records_the_marker_on_the_stream_finished_event(self):
+        ev = log_parser.parse_log_line(fixtures.STREAM_FINISHED_TOKENS_MISSING)
+        assert ev is not None
+        assert ev.kind == "stream_finished"
+        assert ev.usage_missing is True
+        # No fabricated zeroes: the counts stay unknown.
+        assert (ev.prompt, ev.completion, ev.total) == (None, None, None)
+
+    def test_parser_leaves_populated_lines_unchanged(self):
+        ev = log_parser.parse_log_line(fixtures.STREAM_FINISHED_LOCAL_MEASURED)
+        assert ev is not None
+        assert (ev.prompt, ev.completion, ev.total) == (30000, 200, 30200)
+        # Not marked missing, and not silently "False" either: pre-marker
+        # lines and populated lines both read ``None``.
+        assert ev.usage_missing is None
+
+    def test_marker_is_counted_and_excluded_from_token_totals(self):
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        # One populated stream, one marked missing.
+        assert result.streams_finished == 1
+        assert result.streams_without_usage == 1
+        assert dict(result.streams_without_usage_by_provider) == {"local": 1}
+        # The marked line contributes nothing to the totals / context sizes.
+        assert result.total_tokens == (30000, 200, 30200)
+        session = result.sessions["sess-mix"]
+        assert (session.input_tokens, session.output_tokens) == (30000, 200)
+        assert session.max_context_size == 30000
+
+    def test_per_session_counts_split_marked_and_populated_streams(self):
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        session = result.sessions["sess-mix"]
+        assert session.streams_with_usage == 1
+        assert session.streams_without_usage == 1
+
+    def test_remote_marked_stream_is_counted_per_provider(self):
+        result = self._aggregate(
+            [
+                "2026-08-02 14:00:00,000 - INFO - Stream started: "
+                "provider=opencode-go model=deepseek-v4-flash session=sess-r request=x",
+                fixtures.STREAM_FINISHED_TOKENS_MISSING_REMOTE.replace(
+                    "019fbfea-40b0-74a5-8cc9-bf3723f2b458", "sess-r"
+                ),
+            ]
+        )
+        assert result.streams_without_usage == 1
+        assert dict(result.streams_without_usage_by_provider) == {"opencode-go": 1}
+        assert result.sessions["sess-r"].streams_without_usage == 1
+        assert result.sessions["sess-r"].max_context_size is None
+
+    def test_window_level_count_names_the_marker(self):
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        md = reporting.build_report(result, None)
+        section = md.split("## Total tokens", 1)[1].split("### Tokens", 1)[0]
+        # Window-level count still rendered (unchanged line), now naming the
+        # marker as the cause.
+        assert "Streams without usage: **1**" in section
+        assert "tokens=missing" in section
+
+    def test_context_at_fallback_table_counts_missing_usage_per_session(self):
+        """AC3: the per-session context-at-fallback table carries the count."""
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        report = reporting.build_report(result, None)
+        section = report.split("## Local model usage by session", 1)[1]
+        per_session = section.split("### Per-session coverage", 1)[1]
+        assert "Streams without usage |" in per_session
+        row = next(
+            line for line in per_session.splitlines() if line.startswith("| sess-mix |")
+        )
+        assert row.rstrip().endswith("| 1 |")
+
+    def test_context_at_fallback_table_counts_zero_when_all_measured(self):
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        report = reporting.build_report(result, None)
+        per_session = report.split("### Per-session coverage", 1)[1]
+        row = next(
+            line for line in per_session.splitlines() if line.startswith("| sess-mix |")
+        )
+        assert row.rstrip().endswith("| 0 |")
+        # No usage-less stream, so the marker is never named as the cause.
+        section = report.split("## Local model usage by session", 1)[1]
+        assert "**Limitation:**" in section
+        limitation = section.split("**Limitation:**", 1)[1].split("\n", 1)[0]
+        assert "tokens=missing" not in limitation
+
+    def test_context_at_fallback_limitation_names_the_marker(self):
+        """AC4: the affected table's limitation text names the marker."""
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        section = reporting.build_report(result, None).split(
+            "## Local model usage by session", 1
+        )[1]
+        limitation = section.split("**Limitation:**", 1)[1].split("\n", 1)[0]
+        assert "`tokens=missing`" in limitation
+        assert "n/a" in limitation
+
+    def test_limitations_name_the_marker(self):
+        result = self._aggregate(
+            [self.START_LOCAL, fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+            )]
+        )
+        limitations = reporting.build_report(result, None).split(
+            "## Notes and limitations", 1
+        )[1]
+        assert "tokens=missing" in limitations
+
+    def test_csv_records_the_per_session_usage_coverage(self, tmp_path):
+        """The per-session record explains a blank context column."""
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        standard_path, low_path = reporting.write_csvs(result, tmp_path)
+        rows = []
+        for path in (standard_path, low_path):
+            with path.open(newline="", encoding="utf-8") as fh:
+                rows.extend(csv.DictReader(fh))
+        row = next(r for r in rows if r["session_id"] == "sess-mix")
+        assert row["streams_with_usage"] == "1"
+        assert row["streams_without_usage"] == "1"

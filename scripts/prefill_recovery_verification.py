@@ -6,19 +6,28 @@ Measurement for LP-0MVKUKGER000TW2W (part of LP-0MVKN9IRP003XJH6 — the
 dispatch cancelled by the prefill deadline must release the session's lease
 and in-flight marker within a bounded interval (bounded by
 ``local_prefill_deadline_seconds`` + overhead, verified against a
-``--recovery-bound-seconds`` default of 300 = the AC's <= 5 minutes), the
-post-fix hourly report must show no thrash hour (>= ``--min-attempts`` local
-dispatch attempts with zero local streams served) and zero
-``reason=local_lease_active`` fallbacks, and local serving must resume.
+``--recovery-bound-seconds`` default of 300 = the AC's <= 5 minutes), no
+denial may be caused by a lease owner that holds the gate without ever
+delivering a first byte (the wedge signature), and local serving must resume.
 
 What is measured and how (metric provenance):
 
-  * AC1 — thrash hours / ``local_lease_active`` fallbacks come from the
-    per-hour report figures of the proxy-usage-analysis pipeline (the report
-    is the reference the AC is written against). Pass them in with
-    ``--hour-records <json>`` (the pipeline's ``hourly_activity`` list, e.g.
-    from ``analyze_proxy_usage.py --json``), or let ``--measure`` shell out
-    to the pipeline with the same window and read them itself.
+  * AC1 — **wedge attribution** over ``local_dispatch_denied`` events (the
+    restatement agreed in LP-0MVLHMCN6003GAMD AC1). Each denial is classified
+    by the state of the named lease owner at that instant, measured on the
+    owner's continuous prefill-hold chain (``lease_extended_during_prefill``
+    every ~10 s, ended only by a genuine ``lease_released``; deadline /
+    ``lease_renewed`` churn does **not** end a chain — that is exactly the
+    incident shape). A denial is a *wedge denial* when the owner had held for
+    ``--wedge-bound-seconds`` (default: the recovery bound, 300 s) with no
+    client-visible first byte. The verdict is ``wedge_denials == 0``.
+    The per-hour thrash count and the ``reason=local_lease_active`` fallback
+    volume are still collected — from ``--hour-records <json>`` (the
+    pipeline's ``hourly_activity`` list, e.g. from
+    ``analyze_proxy_usage.py --json``) or by ``--measure`` shelling out to
+    the pipeline — but only as **diagnostics**: they are admission-side
+    signals (LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I /
+    LP-0MVOFVCA2008DQVE), not this fix's lease property.
   * AC2 — ``prefill_deadline_exceeded`` events are paired, per session, with
     the first following ``lease_released ... reason=prefill_deadline``; each
     pair's wall-clock delta is the lease-hold after cancellation. A deadline
@@ -73,6 +82,24 @@ _RELEASE_ANY_RE = re.compile(r"lease_released session=(\S+) reason=(\w+)")
 _DISPATCH_RE = re.compile(r"\[local\] POST .*session_id=(\S+)")
 _FINISH_LOCAL_RE = re.compile(r"Stream finished:.*provider=local")
 _FINISH_RE = re.compile(r"Stream finished:.*session=(\S+) provider=(\S+)")
+#: AC1 wedge attribution (LP-0MVLHMCN6003GAMD): the lease holder's continuous
+#: prefill-hold chain (``lease_extended_during_prefill`` every ~10 s), the
+#: denials it caused, and the first-byte events that make a holder productive.
+_LEASE_EXT_RE = re.compile(r"lease_extended_during_prefill session=(\S+)")
+_DENY_RE = re.compile(r"local_dispatch_denied session=(\S+) owner=(\S+)")
+_START_LOCAL_RE = re.compile(r"Stream started:.*provider=local.*session=(\S+)")
+_RELEASE_ANY_SESSION_RE = re.compile(r"lease_released session=(\S+) reason=(\w+)")
+_LOCAL_FINISH_SESSION_RE = re.compile(
+    r"Stream finished:.*session=(\S+) provider=local"
+)
+
+#: A gap between consecutive ``lease_extended_during_prefill`` events longer
+#: than this ends a hold chain: the extension cadence is ~10 s while a
+#: dispatch is in flight, so a 60 s gap means the owner was not holding.
+WEDGE_CHAIN_IDLE_GAP_SECONDS = 60.0
+
+#: Owner values that mean "no owner recorded" (never a wedge).
+_NO_OWNER_VALUES = {"", "-", "none", "null", "unknown", "n/a"}
 
 _TS_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")
 _WORDS = (
@@ -272,12 +299,38 @@ def stall_recovery_verdict(rec: SessionRecovery, bound_seconds: int | float = 30
 
 
 # --------------------------------------------------------------------------
-# AC1 — thrash hours / lease-active fallbacks (report figures)
+# AC1 — wedge attribution (restated) + report-figure diagnostics
 # --------------------------------------------------------------------------
+#
+# LP-0MVLHMCN6003GAMD AC1 (producer decision 2026-10-25) restated this AC.
+# As originally written it demanded "no thrash hour AND zero
+# ``reason=local_lease_active`` fallbacks", which conflates two different
+# conditions: (a) a *wedge* — a lease owner that holds the gate and never
+# delivers a first byte, starving every other session (the 2026-10-23
+# incident), and (b) a *productive* holder — a session legitimately prefilling
+# or decoding while others wait, which is normal on a 2-slot pool at
+# sustained multi-session demand. (b) can never be zero, so the literal AC
+# was unsatisfiable and told the operator nothing about the fix.
+#
+# The fix-attributable target is (a): a denial is a **wedge denial** when the
+# owner had been holding the gate with no client-visible first byte for at
+# least ``wedge_bound_seconds`` (default: the AC's own <= 5 min recovery
+# bound). Measured from the owner's continuous prefill-hold chain — a chain
+# is extended by ``lease_extended_during_prefill`` every ~10 s and ends only
+# when the lease is genuinely released (or after
+# ``WEDGE_CHAIN_IDLE_GAP_SECONDS`` of silence). ``prefill_deadline_exceeded``
+# deliberately does NOT end a chain: in the incident the deadline fired,
+# ``lease_renewed`` re-armed the lease and the same session re-dispatched, so
+# measuring hold time across that churn is exactly the point.
+#
+# The per-hour thrash count and the ``reason=local_lease_active`` fallback
+# volume are still reported (as diagnostics): they are the admission-side
+# signal tracked by LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I /
+# LP-0MVOFVCA2008DQVE, not this epic's lease-wedge property.
 
 def is_thrash_hour(record: dict, min_attempts: int = 10) -> bool:
-    """True when the hour attempted local >= ``min_attempts`` times and never
-    served a local stream — the 2026-10-23 wedge signature."""
+    """Diagnostic: the hour attempted local >= ``min_attempts`` times and
+    never served a local stream (admission-side thrash signal)."""
     return (
         int(record.get("local_dispatch_attempts") or 0) >= min_attempts
         and int(record.get("local_served") or 0) == 0
@@ -285,15 +338,177 @@ def is_thrash_hour(record: dict, min_attempts: int = 10) -> bool:
 
 
 @dataclass
+class WedgeDenialSummary:
+    """Denials classified by the state of the lease owner that caused them."""
+
+    #: Denials while an unproductive owner had held the gate >= the bound.
+    #: This is the verdict metric.
+    wedge_denials: int = 0
+    #: Denials while the owner had already delivered a local first byte
+    #: (fairness / monopoly shape, not a wedge).
+    productive_holder_denials: int = 0
+    #: Denials while an unproductive owner had held for less than the bound
+    #: (fresh prefill, admission-side).
+    short_hold_denials: int = 0
+    #: Denials naming an owner with no live hold chain (lease already
+    #: released or expired) — a race, neither wedge nor held.
+    stale_owner_denials: int = 0
+    #: Denials with no usable owner value (never attributable).
+    unleased_denials: int = 0
+    #: All denials examined inside the requested window.
+    denials_examined: int = 0
+    #: Longest unproductive hold chain observed while closing a chain.
+    max_unproductive_hold_seconds: float | None = None
+    #: Longest productive hold chain (context for the fairness question).
+    max_productive_hold_seconds: float | None = None
+    #: Bounded sample of the wedge denials, for the report.
+    wedge_examples: list[dict] = field(default_factory=list)
+
+    @property
+    def clean(self) -> bool:
+        return self.wedge_denials == 0
+
+    def as_dict(self) -> dict:
+        return {
+            "wedge_denials": self.wedge_denials,
+            "productive_holder_denials": self.productive_holder_denials,
+            "short_hold_denials": self.short_hold_denials,
+            "stale_owner_denials": self.stale_owner_denials,
+            "unleased_denials": self.unleased_denials,
+            "denials_examined": self.denials_examined,
+            "max_unproductive_hold_seconds": self.max_unproductive_hold_seconds,
+            "max_productive_hold_seconds": self.max_productive_hold_seconds,
+            "wedge_examples": self.wedge_examples,
+        }
+
+
+def measure_wedge_denials(
+    lines,
+    since: dt.datetime | None = None,
+    until: dt.datetime | None = None,
+    bound_seconds: int | float = 300,
+    idle_gap_seconds: float = WEDGE_CHAIN_IDLE_GAP_SECONDS,
+    max_examples: int = 5,
+) -> WedgeDenialSummary:
+    """Classify ``local_dispatch_denied`` events by the owner's hold state.
+
+    ``lines`` must be in chronological order (``run_measure`` sorts them).
+    Only denials inside ``[since, until]`` are classified; the hold chains are
+    built from the whole stream so a chain that started before ``since`` is
+    measured correctly.
+    """
+    summary = WedgeDenialSummary()
+    holds: dict[str, dict] = {}
+
+    def _close(owner: str, when: dt.datetime) -> None:
+        hold = holds.pop(owner, None)
+        if hold is None:
+            return
+        # A release arriving long after the last extension is not closing a
+        # live hold (the chain had already lapsed) — drop it instead of
+        # reporting a multi-hour "hold" that never existed.
+        if (when - hold["last"]).total_seconds() > idle_gap_seconds:
+            return
+        if since is not None and when < since:
+            return
+        if until is not None and hold["start"] > until:
+            return
+        duration = (when - hold["start"]).total_seconds()
+        if hold["productive"]:
+            current = summary.max_productive_hold_seconds
+            summary.max_productive_hold_seconds = (
+                duration if current is None else max(current, duration)
+            )
+        else:
+            current = summary.max_unproductive_hold_seconds
+            summary.max_unproductive_hold_seconds = (
+                duration if current is None else max(current, duration)
+            )
+
+    for line in lines:
+        ts = _parse_ts(line)
+        if ts is None:
+            continue
+
+        m = _LEASE_EXT_RE.search(line)
+        if m:
+            owner = m.group(1)
+            hold = holds.get(owner)
+            if (
+                hold is None
+                or (ts - hold["last"]).total_seconds() > idle_gap_seconds
+            ):
+                holds[owner] = {"start": ts, "last": ts, "productive": False}
+            else:
+                hold["last"] = ts
+            continue
+
+        m = _START_LOCAL_RE.search(line) or _LOCAL_FINISH_SESSION_RE.search(line)
+        if m:
+            hold = holds.get(m.group(1))
+            if hold is not None:
+                hold["productive"] = True
+            continue
+
+        m = _RELEASE_ANY_SESSION_RE.search(line)
+        if m:
+            _close(m.group(1), ts)
+            continue
+
+        m = _DENY_RE.search(line)
+        if not m:
+            continue
+        if since is not None and ts < since:
+            continue
+        if until is not None and ts > until:
+            continue
+
+        denied_session, owner = m.group(1), m.group(2)
+        summary.denials_examined += 1
+        if owner.strip().lower() in _NO_OWNER_VALUES:
+            summary.unleased_denials += 1
+            continue
+        hold = holds.get(owner)
+        if hold is None:
+            summary.stale_owner_denials += 1
+            continue
+        if hold["productive"]:
+            summary.productive_holder_denials += 1
+            continue
+        age = (ts - hold["start"]).total_seconds()
+        if age >= bound_seconds:
+            summary.wedge_denials += 1
+            if len(summary.wedge_examples) < max_examples:
+                summary.wedge_examples.append({
+                    "denied_session": denied_session,
+                    "owner": owner,
+                    "denied_at": ts.isoformat(sep=" "),
+                    "hold_seconds": round(age, 1),
+                })
+        else:
+            summary.short_hold_denials += 1
+
+    return summary
+
+
+@dataclass
 class Ac1Summary:
     thrash_hours: list[str]
     lease_active_fallbacks: int
-    clean: bool  # no thrash hour AND zero lease-active fallbacks
+    wedge: WedgeDenialSummary
+
+    @property
+    def clean(self) -> bool:
+        """The restated AC1 verdict: no wedge denial in the window."""
+        return self.wedge.wedge_denials == 0
 
 
-def measure_ac1(hour_records: list[dict], min_attempts: int = 10) -> Ac1Summary:
-    """AC1 from per-hour report figures (the analysis pipeline's
-    ``hourly_activity`` records)."""
+def measure_ac1(
+    hour_records: list[dict],
+    wedge: WedgeDenialSummary,
+    min_attempts: int = 10,
+) -> Ac1Summary:
+    """AC1: the wedge verdict plus the report-figure diagnostics."""
     thrash = [
         r["hour"] for r in hour_records if is_thrash_hour(r, min_attempts)
     ]
@@ -301,7 +516,7 @@ def measure_ac1(hour_records: list[dict], min_attempts: int = 10) -> Ac1Summary:
     return Ac1Summary(
         thrash_hours=thrash,
         lease_active_fallbacks=fallbacks,
-        clean=not thrash and fallbacks == 0,
+        wedge=wedge,
     )
 
 
@@ -582,6 +797,7 @@ def run_measure(
     recovery_bound: int,
     resume_window: int,
     max_log_gap_seconds: float = 3600.0,
+    wedge_bound: int | float | None = None,
 ) -> dict:
     lines: list[str] = []
     for path in discover_proxy_log_files(log_dir):
@@ -600,7 +816,15 @@ def run_measure(
         hour_records = _pipeline_hour_records(
             analysis_cmd, since, until, log_dir
         )
-    ac1 = measure_ac1(hour_records, min_attempts=min_attempts)
+    # AC1 (restated, LP-0MVLHMCN6003GAMD): attribute every denial to the
+    # lease owner's hold state and fail only on a wedge-shaped hold (owner
+    # with no first byte for >= the bound). The per-hour report figures stay
+    # as diagnostics. ``wedge_bound`` defaults to the AC's recovery bound.
+    wedge_bound = recovery_bound if wedge_bound is None else wedge_bound
+    wedge = measure_wedge_denials(
+        lines, since=since, until=until, bound_seconds=wedge_bound
+    )
+    ac1 = measure_ac1(hour_records, wedge, min_attempts=min_attempts)
 
     last_release = (
         max(r.release_ts for r in result.releases) if result.releases else None
@@ -659,10 +883,25 @@ def run_measure(
             "verdict_met": coverage.covered,
         },
         "ac1": {
-            "min_attempts": min_attempts,
-            "thrash_hours": ac1.thrash_hours,
-            "lease_active_fallbacks": ac1.lease_active_fallbacks,
-            "hours_checked": len(hour_records),
+            "verdict_basis": (
+                "wedge_attribution: a denial caused by a lease owner holding "
+                "the gate with no client-visible first byte for >= "
+                "wedge_bound_seconds (restated by LP-0MVLHMCN6003GAMD AC1)"
+            ),
+            "wedge_bound_seconds": wedge_bound,
+            **wedge.as_dict(),
+            "diagnostics": {
+                "min_attempts": min_attempts,
+                "thrash_hours": ac1.thrash_hours,
+                "lease_active_fallbacks": ac1.lease_active_fallbacks,
+                "hours_checked": len(hour_records),
+                "note": (
+                    "thrash hours and the lease-active fallback volume are "
+                    "admission-side signals (LP-0MVN1IQTF0037WTG / "
+                    "LP-0MVO8H7VQ003B12I / LP-0MVOFVCA2008DQVE); they no "
+                    "longer determine this verdict"
+                ),
+            },
             "verdict_met": ac1.clean,
         },
         "ac2": {
@@ -694,6 +933,11 @@ def run_measure(
     return report
 
 
+def _seconds_label(value: float | None) -> str:
+    """Format a duration for the text report (``n/a`` when not measured)."""
+    return "n/a" if value is None else f"{round(value, 1)}s"
+
+
 def _render(report: dict) -> str:
     a1, a2, a3 = report["ac1"], report["ac2"], report["ac3"]
     cov = report["coverage"]
@@ -718,11 +962,32 @@ def _render(report: dict) -> str:
         f"{'MET' if cov['verdict_met'] else 'NOT MET -- window has gaps'}"
     )
     out.append("")
-    out.append("AC1 (report figures):")
-    out.append(f"  hours checked                    : {a1['hours_checked']}")
-    out.append(f"  thrash hours (>= {a1['min_attempts']} attempts, 0 served): "
-               f"{a1['thrash_hours'] or '(none)'}")
-    out.append(f"  reason=local_lease_active fallbacks: {a1['lease_active_fallbacks']}")
+    out.append(f"AC1 (wedge attribution, bound {a1['wedge_bound_seconds']}s):")
+    for example in a1["wedge_examples"]:
+        out.append(
+            f"  !! wedge denial {example['denied_at']}: owner "
+            f"{example['owner']} held {example['hold_seconds']}s with no "
+            f"first byte (denied {example['denied_session']})"
+        )
+    out.append(f"  denials examined                 : {a1['denials_examined']}")
+    out.append(f"  wedge denials                    : {a1['wedge_denials']}")
+    out.append(f"  productive-holder denials        : {a1['productive_holder_denials']}")
+    out.append(f"  short-hold denials               : {a1['short_hold_denials']}")
+    out.append(f"  stale-owner denials              : {a1['stale_owner_denials']}")
+    out.append(
+        "  longest unproductive hold        : "
+        f"{_seconds_label(a1['max_unproductive_hold_seconds'])}"
+    )
+    out.append(
+        "  longest productive hold          : "
+        f"{_seconds_label(a1['max_productive_hold_seconds'])}"
+    )
+    diag = a1["diagnostics"]
+    out.append(f"  [diagnostics] thrash hours (>= {diag['min_attempts']} attempts, "
+               f"0 served): {diag['thrash_hours'] or '(none)'}")
+    out.append(f"  [diagnostics] reason=local_lease_active fallbacks: "
+               f"{diag['lease_active_fallbacks']}"
+               f" over {diag['hours_checked']} hour buckets")
     out.append(f"  verdict                          : {'MET' if a1['verdict_met'] else 'NOT MET'}")
     out.append("")
     out.append(f"AC2 (deadline -> lease release, bound {a2['recovery_bound_seconds']}s):")
@@ -765,6 +1030,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-attempts", type=int, default=10)
     parser.add_argument("--recovery-bound-seconds", type=int, default=300)
     parser.add_argument("--resume-window-seconds", type=int, default=3600)
+    parser.add_argument(
+        "--wedge-bound-seconds",
+        type=int,
+        default=None,
+        help="AC1 wedge-attribution bound (default: --recovery-bound-seconds)",
+    )
     parser.add_argument(
         "--max-log-gap-seconds", type=float, default=3600.0,
         help="adjacent-file coverage gap considered a lost window (default 3600)",
@@ -841,6 +1112,7 @@ def main(argv: list[str] | None = None) -> int:
                 recovery_bound=args.recovery_bound_seconds,
                 resume_window=args.resume_window_seconds,
                 max_log_gap_seconds=args.max_log_gap_seconds,
+                wedge_bound=args.wedge_bound_seconds,
             )
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
@@ -859,6 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
                 recovery_bound=args.recovery_bound_seconds,
                 resume_window=args.resume_window_seconds,
                 max_log_gap_seconds=args.max_log_gap_seconds,
+                wedge_bound=args.wedge_bound_seconds,
             )
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)

@@ -203,6 +203,53 @@ def test_is_quota_provider_scopes_to_opencode():
 
 
 # ---------------------------------------------------------------------------
+# AC10 — limitName ↔ quota window mapping (LP-0MVPAE77Z002VGIA)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("rolling", "rolling"),
+        ("weekly", "weekly"),
+        ("monthly", "monthly"),
+        ("WEEKLY", "weekly"),
+        ("  Monthly\t", "monthly"),
+        ("Rolling\n", "rolling"),
+    ],
+)
+def test_window_for_limit_name_maps_the_three_windows(raw, expected):
+    """AC10: the three window names map, normalised for case/whitespace."""
+    assert quota_state.window_for_limit_name(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [None, "", "   ", "daily", "yearly", "month", "week", "rolling-window"],
+)
+def test_window_for_limit_name_rejects_unknown_names(raw):
+    """AC10: absent/empty/unknown names return ``None`` (bounded fallback)."""
+    assert quota_state.window_for_limit_name(raw) is None
+
+
+def test_window_for_limit_name_rejects_non_strings():
+    """AC10: only strings are accepted — a numeric/None limitName is unknown."""
+    assert quota_state.window_for_limit_name(7) is None
+    assert quota_state.window_for_limit_name(["weekly"]) is None
+
+
+def test_snapshot_freshness_uses_the_module_clock(clock):
+    """A snapshot's freshness horizon is measured on the injectable clock."""
+    snapshot = snapshot_from_usage("acct", _usage_body(), fetched_at=NOW)
+    assert snapshot.is_fresh_at(NOW + timedelta(seconds=59), 60.0)
+    assert not snapshot.is_fresh_at(NOW + timedelta(seconds=61), 60.0)
+    # The clock-backed variant reads the injected clock, so it tracks it.
+    assert snapshot.is_fresh(60.0)
+    clock.now = NOW + timedelta(seconds=61)
+    assert not snapshot.is_fresh(60.0)
+
+
+# ---------------------------------------------------------------------------
 # AC1 — interval gating and single-flight coalescing
 # ---------------------------------------------------------------------------
 

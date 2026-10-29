@@ -38,25 +38,37 @@ class _FakeResponse:
 
 class TestDirectPollingPrefersChildPort:
     def test_broadcast_loop_uses_child_port_when_available(self):
-        """_periodic_broadcast_loop must query the child port (not 8080) when _discover_local_child_port returns one."""
+        """_periodic_broadcast_loop must resolve /slots via the shared child-port resolver.
+
+        Structural wiring guard: the loop is an infinite background task, so the
+        port-resolution *behaviour* is pinned in the dedicated call-site tests
+        (``test_slots_query_target_call_sites.py`` — SSH initial payload,
+        status handler, availability check, progress probes). This guard
+        asserts the broadcast path cannot regress to a router-only port or an
+        inline discovery call: it must consult
+        ``_resolve_local_slots_target`` (LP-0MVP7525P008RXMF AC2), which warns
+        and counts when no child port is known instead of silently using the
+        router (the 2026-10-26 regression).
+        """
         import inspect
 
         import proxy.observability as obs
         src = inspect.getsource(obs._periodic_broadcast_loop)
-        # After the fix the broadcast loop resolves llama_port via
-        # _discover_local_child_port, exactly like get_llama_local_status
-        # already does — otherwise the SSE path keeps hitting the router
-        # proxy and producing 500s during giant prefills.
-        assert "_discover_local_child_port" in src, (
-            "_periodic_broadcast_loop must prefer the discovered local child "
-            "port instead of the router port (see handlers.py fix for the "
-            "same issue — LP-0MTDGBRPU003Z7KU / LP-0MTIHZ8M5005ZAU8)."
+        assert "_resolve_local_slots_target" in src, (
+            "_periodic_broadcast_loop must route its /slots query through the "
+            "shared child-port resolver (LP-0MVP7525P008RXMF AC2) — the "
+            "previous inline `except Exception: pass` discovery fell back to "
+            "the router for weeks."
         )
-        # Both the observability broadcast path and the handlers status
-        # path should use the same helper — a portable guard against a
-        # future regression that reintroduces router-proxied /slots polls.
+        # The shared resolver must itself consult discovery (a portable guard
+        # against a future regression that drops the child-port lookup).
         import proxy.router_helpers as helpers
-        assert "_discover_local_child_port" in inspect.getsource(helpers._discover_local_child_port)
+        assert "_discover_local_child_port" in inspect.getsource(
+            helpers._resolve_local_slots_target
+        )
+        assert "_discover_local_child_port" in inspect.getsource(
+            helpers._discover_local_child_port
+        )
 
     def test_query_slots_helpers_use_supplied_port(self):
         """_query_slots / _query_slots_detail / _query_slots_progress honour the caller-supplied llama_port."""
