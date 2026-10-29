@@ -208,7 +208,8 @@ per-session CSVs.
 Interpretation notes the section prints itself when the data applies:
 context-size fallbacks are `estimated_tokens` threshold decisions (they fire
 only after a prompt grows past the cold/warm thresholds, not on a session's
-first message) and `rate_limited` is the proxy's own per-provider RPM budget
+first message) and `provider_budget_exhausted` is the proxy's own per-provider
+RPM budget
 pacing (`provider_budget.py`), **not** an upstream HTTP 429 — those surface as
 `upstream_http_error status=429` events.
 

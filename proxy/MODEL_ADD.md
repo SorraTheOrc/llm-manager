@@ -281,8 +281,8 @@ providers directly (LP-0MVFYYYXS0011T58).
 
 Skip decisions are logged as `Provider budget exhausted: skipping provider=…`
 (with limit, remaining and reason) and recorded in the request diagnostics as
-an attempt with `status=rate_limited`; an in-progress session that waited is
-recorded as `status=rate_limited_waited` with its `elapsed_wait_seconds`.
+an attempt with `status=provider_budget_exhausted`; an in-progress session that waited is
+recorded as `status=provider_budget_exhausted_waited` with its `elapsed_wait_seconds`.
 
 ### Multiple local backends (LP-0MRPILSMW004T4H8)
 

@@ -331,23 +331,23 @@ def test_ac1_window_aggregates(tmp_path):
 
 def test_ac1_fallback_reasons_are_attributed(tmp_path):
     lines = _baseline_lines() + [
-        _fallback("2026-10-19 09:00:00,000", reason="rate_limited"),
-        _fallback("2026-10-19 09:10:00,000", reason="rate_limited"),
+        _fallback("2026-10-19 09:00:00,000", reason="provider_budget_exhausted"),
+        _fallback("2026-10-19 09:10:00,000", reason="provider_budget_exhausted"),
     ]
     data, _ = _result(_write_log(tmp_path, lines))
     reasons = data["windows"]["before"]["ac1"]["fallback_by_reason"]
-    assert reasons["rate_limited"] == 2
+    assert reasons["provider_budget_exhausted"] == 2
     assert reasons["large_context_bypass"] == 4
 
 
 def test_ac1_session_bearing_fallback_lines_keep_their_reason(tmp_path):
     """LP-0MVMBMSWR0036RES appends ``session=``/``attempt=`` (plus budget
-    fields for ``rate_limited*``) after ``reason=``; the reason must still be
+    fields for ``provider_budget_exhausted*``) after ``reason=``; the reason must still be
     counted, and the session must be picked up by the timeout-attribution
     evidence."""
     lines = _baseline_lines() + [
         "2026-10-19 09:00:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-        "from=local-qwen3, to=munitoai-free, reason=rate_limited "
+        "from=local-qwen3, to=munitoai-free, reason=provider_budget_exhausted "
         "session=herdr-1792767061-1282111-17770 attempt=1 limit=60 remaining=0 waited=0.000\n",
         "2026-10-19 09:10:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
         "from=munitoai-free, to=opencode-go, reason=HTTP 502 "
@@ -355,7 +355,7 @@ def test_ac1_session_bearing_fallback_lines_keep_their_reason(tmp_path):
     ]
     data, _ = _result(_write_log(tmp_path, lines))
     reasons = data["windows"]["before"]["ac1"]["fallback_by_reason"]
-    assert reasons["rate_limited"] == 1
+    assert reasons["provider_budget_exhausted"] == 1
     assert reasons["HTTP 502"] == 1
     assert reasons["large_context_bypass"] == 4
 

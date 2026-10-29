@@ -190,9 +190,10 @@ STREAM_ERROR_ABORTED_LOCAL = (
 #
 # Lines from before LP-0MVMBMSWR0036RES carry no session UUID; lines emitted
 # since carry ``session=<uuid|unknown> attempt=<n>`` after ``reason=`` (plus
-# ``limit=``/``remaining=``/``waited=`` for budget-driven ``rate_limited*``
-# reasons). Both shapes must parse: the session-less ones keep the legacy
-# nearest-line attribution, the session-bearing ones are attributed directly.
+# ``limit=``/``remaining=``/``waited=`` for budget-driven
+# ``provider_budget_exhausted*`` reasons). Both shapes must parse: the
+# session-less ones keep the legacy nearest-line attribution, the
+# session-bearing ones are attributed directly.
 
 FALLBACK_CONCURRENCY = (
     "2026-08-02 13:58:04,301 - INFO - Fallback triggered for model=v1/chat/completions, "
@@ -226,7 +227,16 @@ FALLBACK_SESSION = (
 )
 
 # Budget-driven fallback: carries the budget snapshot the gate computed.
-FALLBACK_RATE_LIMITED_BUDGET = (
+FALLBACK_PROVIDER_BUDGET_EXHAUSTED = (
+    "2026-10-23 09:14:02,884 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
+    "session=herdr-1792767061-1282111-17770 attempt=4 limit=60 remaining=0 waited=12.500"
+)
+
+# Legacy reason value (pre-LP-0MVMBM8YS003Y2JG): rotated logs still carry the
+# pre-rename ``rate_limited`` spelling; the parser normalizes it to
+# ``provider_budget_exhausted`` (same pattern as ``warm_cache_bypass``).
+FALLBACK_LEGACY_BUDGET_EXHAUSTED = (
     "2026-10-23 09:14:02,884 - INFO - Fallback triggered for model=v1/chat/completions, "
     "from=munitoai-free, to=opencode-go, reason=rate_limited "
     "session=herdr-1792767061-1282111-17770 attempt=4 limit=60 remaining=0 waited=12.500"
@@ -237,7 +247,7 @@ FALLBACK_RATE_LIMITED_BUDGET = (
 # session A spilled, but B has no fallback line of its own.
 FALLBACK_OTHER_SESSION = (
     "2026-10-23 09:16:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-    "from=munitoai-free, to=opencode-go, reason=rate_limited "
+    "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
     "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000"
 )
 

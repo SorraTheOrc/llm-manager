@@ -100,9 +100,10 @@ RE_FALLBACK = re.compile(
 )
 # Fallback evidence appended after ``reason=`` (LP-0MVMBMSWR0036RES):
 # ``session=<uuid|unknown> attempt=<n>``, plus ``limit=``/``remaining=``/
-# ``waited=`` when the reason is budget-driven (``rate_limited*``). Absent on
-# pre-change rotated logs, in which case every field degrades to ``None`` and
-# the legacy nearest-line attribution heuristic still applies.
+# ``waited=`` when the reason is budget-driven
+# (``provider_budget_exhausted*``). Absent on pre-change rotated logs, in which
+# case every field degrades to ``None`` and the legacy nearest-line attribution
+# heuristic still applies.
 RE_FALLBACK_ATTEMPT = re.compile(r"\battempt=(\d+)")
 RE_FALLBACK_BUDGET_LIMIT = re.compile(r"\blimit=(\d+)")
 RE_FALLBACK_BUDGET_REMAINING = re.compile(r"\bremaining=(\d+)")
@@ -352,15 +353,48 @@ COMPACTION_CHURN = "compaction_churn"
 # ``context_too_large``. Rotated logs (6-hourly rotation, 90-day retention)
 # still contain the legacy value, so it is normalized here so downstream
 # analysis treats both spellings as the same reason.
+#
+# ``rate_limited*`` was the pre-LP-0MVMBM8YS003Y2JG name for the proxy's own
+# per-provider request-budget skip. It was renamed because operators and
+# tooling misread it as an upstream rate-limit rejection (an HTTP 429 from the
+# provider), when it is in fact a pre-flight budget decision made by
+# ``provider_budget.py`` on a healthy provider. The proxy still emits none of
+# the old spelling; rotated logs do, so every variant suffix
+# (``_after_wait`` / ``_waiters`` / ``_disconnect`` / ``_waited``) is
+# normalized by prefix so one window never reports both spellings.
 CONTEXT_TOO_LARGE = "context_too_large"
 LEGACY_WARM_CACHE_BYPASS = "warm_cache_bypass"
+PROVIDER_BUDGET_EXHAUSTED = "provider_budget_exhausted"
+LEGACY_RATE_LIMITED = "rate_limited"
+
+#: Prefix renames: legacy prefix -> current prefix. The suffix after the prefix
+#: is preserved, so variant names keep meaning.
+_LEGACY_REASON_PREFIX_RENAMES = {
+    LEGACY_RATE_LIMITED: PROVIDER_BUDGET_EXHAUSTED,
+}
 
 
 def _normalize_reason(reason: str | None) -> str | None:
     """Map legacy reason values to their current names."""
     if reason == LEGACY_WARM_CACHE_BYPASS:
         return CONTEXT_TOO_LARGE
+    if not reason:
+        return reason
+    for legacy, current in _LEGACY_REASON_PREFIX_RENAMES.items():
+        if reason == legacy or reason.startswith(f"{legacy}_"):
+            return current + reason[len(legacy):]
     return reason
+
+
+def is_provider_budget_reason(reason: str | None) -> bool:
+    """Whether *reason* is the proxy's own per-provider request-budget skip.
+
+    Covers every variant (``provider_budget_exhausted`` +
+    ``_after_wait`` / ``_waiters`` / ``_disconnect``) and is applied to
+    already-normalized reasons, so legacy ``rate_limited*`` logs match too
+    (LP-0MVMBM8YS003Y2JG AC3/AC4).
+    """
+    return bool(reason) and reason.startswith(PROVIDER_BUDGET_EXHAUSTED)
 
 # Error-line prefixes (WARNING level structured lines the parser recognizes).
 STREAM_ERROR = "Stream error:"
@@ -552,7 +586,8 @@ class LogEvent:
     # Fallback evidence (LP-0MVMBMSWR0036RES, ``fallback`` kind only):
     # ``attempt_index`` is the per-session fallback ordinal parsed from
     # ``attempt=``; ``budget_limit``/``budget_remaining``/``budget_waited``
-    # carry the budget snapshot emitted with a ``rate_limited*`` reason.
+    # carry the budget snapshot emitted with a ``provider_budget_exhausted*``
+    # reason (legacy ``rate_limited*`` lines are normalized at parse time).
     # All ``None`` on pre-change lines (and on every other kind).
     attempt_index: int | None = None
     budget_limit: int | None = None

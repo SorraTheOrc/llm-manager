@@ -151,11 +151,11 @@ failure-domain gates (which only react *after* a failure).
 | Situation | Behaviour |
 |-----------|-----------|
 | Window has capacity below the new-session cap | Entry is dispatched normally (slot reserved up front). |
-| Unreserved part spent — **new** session (no recorded affinity) | Skip immediately, log `Provider budget exhausted: … limit=<rpm-reserve> reserve=<n> reason=rate_limited`, record attempt `status=rate_limited` with `effective_limit`/`reserve_slots`, continue to the next provider. **No waiting.** |
+| Unreserved part spent — **new** session (no recorded affinity) | Skip immediately, log `Provider budget exhausted: … limit=<rpm-reserve> reserve=<n> reason=provider_budget_exhausted`, record attempt `status=provider_budget_exhausted` with `effective_limit`/`reserve_slots`, continue to the next provider. **No waiting.** |
 | Unreserved part spent, reserved slots free — **in-progress** session (affinity recorded on a 2xx dispatch) | Dispatch on the reserved slot: the reserve exists so established sessions keep their provider and prompt cache instead of queueing behind new traffic. |
-| Window completely full — **in-progress** session | Wait up to `server.provider_rate_limit_wait_max_seconds` (default **15**) for the window to drain, then dispatch on this entry (`status=rate_limited_waited`); if it never drains, pass through like a new session (`reason=rate_limited_after_wait`). |
-| Waiters already at `server.provider_rate_limit_wait_max_waiters` (default 8) | Pass through (`reason=rate_limited_waiters`) so waiters cannot pile up. |
-| Client disconnects during the wait | Wait aborts promptly (`reason=rate_limited_disconnect`). |
+| Window completely full — **in-progress** session | Wait up to `server.provider_rate_limit_wait_max_seconds` (default **15**) for the window to drain, then dispatch on this entry (`status=provider_budget_exhausted_waited`); if it never drains, pass through like a new session (`reason=provider_budget_exhausted_after_wait`). |
+| Waiters already at `server.provider_rate_limit_wait_max_waiters` (default 8) | Pass through (`reason=provider_budget_exhausted_waiters`) so waiters cannot pile up. |
+| Client disconnects during the wait | Wait aborts promptly (`reason=provider_budget_exhausted_disconnect`). |
 | `rate_limit_rpm` unset or `0` | Ungated: behaviour exactly as before; no affinity recorded. |
 
 **Per-model / per-entry knobs (`budget`, LP-0MVDVK5TM004TQQV).** Every

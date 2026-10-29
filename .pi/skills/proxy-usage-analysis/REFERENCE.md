@@ -91,7 +91,7 @@ Outputs written to:
   with `reason`, `context_at_fallback` and `context_at_fallback_source`…}],
   "notes": {"sessions_with_fallback": N,
   "declined_before_local_turn": N, "context_fallback_sessions": N,
-  "context_fallback_before_local_turn": N, "rate_limited_sessions": N}}`.
+  "context_fallback_before_local_turn": N, "provider_budget_exhausted_sessions": N}}`.
   A `% local turns` of 100 means the session never used remote; a null
   `context_at_fallback` means the logs carried no token evidence (the report
   renders `n/a`, never an estimate).
@@ -529,7 +529,7 @@ entry is a local runtime edit, not a committed artifact.
    - `limit=` / `remaining=` / `waited=` are the budget snapshot
      (`provider_budget.BudgetDecision`: `limit_rpm`, `remaining`,
      `waited_seconds`) and are emitted **only** when the reason is
-     budget-driven (`rate_limited*`). The decision itself is unchanged.
+     budget-driven (`provider_budget_exhausted*`). The decision itself is unchanged.
    - All evidence fields trail `reason=`, so pre-change rotated logs (no
      evidence fields) still parse: every evidence field degrades to `None`.
      Consumers that anchored `reason=` to end-of-line were updated in the same
@@ -893,6 +893,22 @@ log); the power figure measures when the *hardware* actually computed. A
 persistent gap between them usually means log gaps, unfinished streams, or GPU
 work outside the proxy's slot accounting.
 
+## Legacy reason normalisation
+
+The parser maps legacy reason spellings to their current names so historical and
+current windows report one label (``_normalize_reason`` in
+``log_parser.py``):
+
+| Legacy (rotated logs) | Current |
+|---|---|
+| `warm_cache_bypass` | `context_too_large` |
+| `rate_limited` (prefix) | `provider_budget_exhausted` (variant suffixes preserved: `_after_wait`, `_waiters`, `_disconnect`, `_waited`) |
+
+`rate_limited*` was renamed to `provider_budget_exhausted*`
+(LP-0MVMBM8YS003Y2JG) because operators and tooling misread it as an upstream
+rate-limit rejection; it is the proxy's own pre-flight request-budget skip on a
+healthy provider (see [Interpreting the report](#interpreting-the-report)).
+
 ## Interpreting the report
 
 - **Session classification**: local-only vs fell back (local → remote) vs
@@ -912,6 +928,12 @@ work outside the proxy's slot accounting.
     estimated context exceeds the per-slot hard cap → consider raising
     local ctx-size (`models.ini`) or
     `local_large_context_warm_cache_threshold`.
+  - `provider_budget_exhausted` (legacy `rate_limited*` in rotated logs
+    predating LP-0MVMBM8YS003Y2JG) → the proxy's own per-provider RPM
+    budget (`rate_limit_rpm`) was exhausted before dispatch, so the request
+    passed to the next provider. It is *pacing, not an upstream 429* → if
+    the volume is unwanted, raise that entry's `rate_limit_rpm` or reorder
+    the chain (raising `models.ini` ctx-size does NOT help).
   - `HTTP 4xx/5xx`, `empty_response`, timeouts → remote provider issues
     (credentials, rate limits) — not slot-related.
 - **Provider context skips** (`routing_skip_provider_context`): a remote
@@ -1147,7 +1169,7 @@ work outside the proxy's slot accounting.
   with no fallback line but `local_dispatch_denied` evidence is labelled
   `lease_denied` (`reason=local_lease_active`) — a lease/concurrency refusal,
   not an inherited spill. Before this change a session with no fallback line of
-  its own inherited an unrelated neighbour's `rate_limited` within the 60s
+  its own inherited an unrelated neighbour's `provider_budget_exhausted` within the 60s
   window (11 of 26 clean local-using sessions in the 2026-10-23/24 window were
   mislabelled that way).
 - **Per-turn attribution is exact where `turn=` ids exist
@@ -1244,9 +1266,14 @@ work outside the proxy's slot accounting.
   summary's context column is computed over the sessions that have a value,
   so its sample count can be smaller than the covered-session count — the
   section states both.
-- **`rate_limited` is budget pacing, not an upstream 429.** The reason comes
-  from `provider_budget.py`'s own per-provider RPM accounting: the configured
-  `rate_limit_rpm` window for that provider entry is exhausted, so the request
-  passes to the next provider immediately. Upstream HTTP 429 responses are a
-  different signal and surface as `upstream_http_error status=429` events, not
-  as `rate_limited` fallbacks.
+- **`provider_budget_exhausted` is budget pacing, not an upstream 429.** The
+  reason comes from `provider_budget.py`'s own per-provider RPM accounting:
+  the configured `rate_limit_rpm` window for that provider entry is exhausted,
+  so the request passes to the next provider immediately. Upstream HTTP 429
+  responses are a different signal and surface as `upstream_http_error
+  status=429` events, not as `provider_budget_exhausted` fallbacks. The name
+  was renamed from `rate_limited` (LP-0MVMBM8YS003Y2JG) precisely so the two
+  can never be conflated; rotated logs carrying the pre-rename spelling are
+  normalized to the new one by the parser (see the
+  [Legacy reason normalisation](#legacy-reason-normalisation) section), so a window spanning
+  the rename still reports one row.

@@ -333,7 +333,7 @@ async def test_kill_switch_and_dry_run_keep_the_window(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rate_limited_entry_still_skipped_under_surge(monkeypatch):
+async def test_provider_budget_exhausted_entry_still_skipped_under_surge(monkeypatch):
     """Surge + an exhausted ``rate_limit_rpm`` window: still skipped."""
     model_config = _single_entry_model()
     model_config["providers"][0]["rate_limit_rpm"] = 1
@@ -354,7 +354,7 @@ async def test_rate_limited_entry_still_skipped_under_surge(monkeypatch):
 
     assert calls == [], "a rate-limited entry must not be dispatched"
     payload = json.loads(exc_info.value.response.body)
-    assert any(a.get("status") == "rate_limited" for a in payload.get("diagnostics", []))
+    assert any(a.get("status") == "provider_budget_exhausted" for a in payload.get("diagnostics", []))
 
 
 @pytest.mark.asyncio

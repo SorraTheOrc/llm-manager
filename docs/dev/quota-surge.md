@@ -281,7 +281,7 @@ object, so "all quota behaviour off" is provable by construction
   relaxed: entry cooldown, `rate_limit_rpm` request budget, the sibling-failure
   circuit breaker, failure-domain grouping, usage-limit quarantine and
   stall/quarantine gates all keep running unchanged
-  (`test_rate_limited_entry_still_skipped_under_surge`,
+  (`test_provider_budget_exhausted_entry_still_skipped_under_surge`,
   `test_circuit_broken_entry_still_skipped_under_surge`,
   `test_usage_limit_quarantined_entry_still_skipped_under_surge`,
   `test_failure_domain_sibling_still_excluded_under_surge`). The quarantine

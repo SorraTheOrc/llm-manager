@@ -718,7 +718,7 @@ def _fallback_budget_evidence(budget: Any) -> dict[str, Any] | None:
 
     ``provider_budget.BudgetDecision`` already carries the numbers the budget
     gate used (``limit_rpm``/``remaining``/``waited_seconds``); the fallback
-    line re-emits them so a ``rate_limited`` fallback is auditable without
+    line re-emits them so a ``provider_budget_exhausted`` fallback is auditable without
     replaying the gate (LP-0MVMBMSWR0036RES AC3).
     """
     if budget is None:
@@ -741,7 +741,7 @@ def _fallback_evidence(
     """Build the trailing ``key=value`` evidence for a ``Fallback triggered`` line.
 
     Always carries ``session=`` (``unknown`` when the request had no session
-    UUID) and ``attempt=``. When *reason* is budget-driven (``rate_limited*``)
+    UUID) and ``attempt=``. When *reason* is budget-driven (``provider_budget_exhausted*``)
     and *budget* holds the snapshot, it also carries the budget evidence
     (``limit=``/``remaining=``/``waited=``). Appended **after** ``reason=``,
     which is why every end-anchored consumer regex was updated in the same
@@ -751,7 +751,7 @@ def _fallback_evidence(
         f"session={session_id or 'unknown'}",
         f"attempt={_next_fallback_attempt(session_id)}",
     ]
-    if budget and (reason or "").startswith("rate_limited"):
+    if budget and (reason or "").startswith("provider_budget_exhausted"):
         parts.append(f"limit={budget.get('limit', 0)}")
         parts.append(f"remaining={budget.get('remaining', 0)}")
         parts.append(f"waited={float(budget.get('waited', 0.0)):.3f}")
@@ -4351,7 +4351,7 @@ def _compute_retry_after(
 #: ``_compute_retry_after`` finds no candidate (returns 0) even though the
 #: provider comes back as soon as its rolling window drains
 #: (LP-0MVF0N9SA0071LWM).
-_BUDGET_SKIP_STATUSES = frozenset({"rate_limited"})
+_BUDGET_SKIP_STATUSES = frozenset({"provider_budget_exhausted"})
 
 
 def _budget_window_retry_after(
@@ -10040,7 +10040,7 @@ def _handle_streaming_success(
     return the augmented response.
 
     The ``Fallback triggered`` line carries ``session=``/``attempt=`` (and the
-    budget evidence for ``rate_limited*`` reasons) so per-session attribution
+    budget evidence for ``provider_budget_exhausted*`` reasons) so per-session attribution
     never has to guess (LP-0MVMBMSWR0036RES AC1-AC3).
 
     Returns ``None`` if *response* is **not** a streaming success (caller
@@ -10114,7 +10114,7 @@ def _build_fallback_success_response(
     This is the normal (non-streaming) success path used by both fallback
     entrypoints when a provider returns a successful response. The
     ``Fallback triggered`` line carries ``session=``/``attempt=`` plus the
-    budget evidence for ``rate_limited*`` reasons (LP-0MVMBMSWR0036RES).
+    budget evidence for ``provider_budget_exhausted*`` reasons (LP-0MVMBMSWR0036RES).
     """
     _record_attempt(
         attempts,
@@ -10534,7 +10534,7 @@ def _resolve_reasoning_content_promotion(
     augmented response.
 
     The ``Fallback triggered`` line carries ``session=``/``attempt=`` plus the
-    budget evidence for ``rate_limited*`` reasons (LP-0MVMBMSWR0036RES).
+    budget evidence for ``provider_budget_exhausted*`` reasons (LP-0MVMBMSWR0036RES).
 
     Returns ``None`` if the body does **not** contain ``reasoning_content``
     (caller should continue with empty-response cooldown logic).
@@ -11161,7 +11161,7 @@ async def _proxy_with_remote_fallback_cycle(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
-    # Budget snapshot behind a ``rate_limited`` fallback, re-emitted on the
+    # Budget snapshot behind a ``provider_budget_exhausted`` fallback, re-emitted on the
     # ``Fallback triggered`` line (LP-0MVMBMSWR0036RES AC3).
     _budget_evidence: dict[str, Any] | None = None
     # SSE comment emitted on the next successful streaming response after a
@@ -11346,7 +11346,7 @@ async def _proxy_with_remote_fallback_cycle(
                     attempts,
                     provider=provider_name,
                     type="remote",
-                    status="rate_limited",
+                    status="provider_budget_exhausted",
                     status_code=429,
                     reason=_budget.reason,
                     limit_rpm=_budget.limit_rpm,
@@ -11356,7 +11356,7 @@ async def _proxy_with_remote_fallback_cycle(
                     elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                     **_budget_diagnostics(_budget),
                 )
-                fallback_reason = "rate_limited"
+                fallback_reason = "provider_budget_exhausted"
                 _budget_evidence = _fallback_budget_evidence(_budget)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
@@ -11366,7 +11366,7 @@ async def _proxy_with_remote_fallback_cycle(
                     attempts,
                     provider=provider_name,
                     type="remote",
-                    status="rate_limited_waited",
+                    status="provider_budget_exhausted_waited",
                     reason=_budget.reason,
                     limit_rpm=_budget.limit_rpm,
                     effective_limit=_budget.effective_limit,
@@ -11860,7 +11860,7 @@ async def _proxy_with_fallback_cycle(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
-    # Budget snapshot behind a ``rate_limited`` fallback, re-emitted on the
+    # Budget snapshot behind a ``provider_budget_exhausted`` fallback, re-emitted on the
     # ``Fallback triggered`` line (LP-0MVMBMSWR0036RES AC3).
     _budget_evidence: dict[str, Any] | None = None
     # SSE comment emitted on the next successful streaming response after a
@@ -13018,7 +13018,7 @@ async def _proxy_with_fallback_cycle(
                         attempts,
                         provider=provider_name,
                         type="remote",
-                        status="rate_limited",
+                        status="provider_budget_exhausted",
                         status_code=429,
                         reason=_budget.reason,
                         limit_rpm=_budget.limit_rpm,
@@ -13028,7 +13028,7 @@ async def _proxy_with_fallback_cycle(
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                         **_budget_diagnostics(_budget),
                     )
-                    fallback_reason = "rate_limited"
+                    fallback_reason = "provider_budget_exhausted"
                     _budget_evidence = _fallback_budget_evidence(_budget)
                     prev_provider = provider_name
                     all_slot_exhaustion = False
@@ -13038,7 +13038,7 @@ async def _proxy_with_fallback_cycle(
                         attempts,
                         provider=provider_name,
                         type="remote",
-                        status="rate_limited_waited",
+                        status="provider_budget_exhausted_waited",
                         reason=_budget.reason,
                         limit_rpm=_budget.limit_rpm,
                         effective_limit=_budget.effective_limit,

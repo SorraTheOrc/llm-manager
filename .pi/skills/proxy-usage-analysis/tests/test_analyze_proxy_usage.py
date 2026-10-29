@@ -152,15 +152,42 @@ class TestLogLineParsing:
         assert ev.attempt_index == 3
         assert ev.budget_limit is None  # reason not budget-driven
 
-    def test_fallback_rate_limited_line_parses_budget_snapshot(self):
-        ev = log_parser.parse_log_line(fixtures.FALLBACK_RATE_LIMITED_BUDGET)
+    def test_fallback_provider_budget_exhausted_line_parses_budget_snapshot(self):
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_PROVIDER_BUDGET_EXHAUSTED)
         assert ev.kind == "fallback"
         assert ev.session == "herdr-1792767061-1282111-17770"
         assert ev.attempt_index == 4
-        assert ev.reason == "rate_limited"
+        assert ev.reason == "provider_budget_exhausted"
         assert ev.budget_limit == 60
         assert ev.budget_remaining == 0
         assert ev.budget_waited == pytest.approx(12.5)
+
+    def test_legacy_rate_limited_reason_is_normalised(self):
+        """Rotated logs predating the rename still carry ``rate_limited*``;
+        each variant normalises to ``provider_budget_exhausted*`` so one window
+        never reports both spellings (LP-0MVMBM8YS003Y2JG AC3)."""
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_LEGACY_BUDGET_EXHAUSTED)
+        assert ev.reason == "provider_budget_exhausted"
+        # The variant suffix is preserved, not flattened into the base name.
+        for legacy, expected in (
+            ("rate_limited_after_wait", "provider_budget_exhausted_after_wait"),
+            ("rate_limited_waiters", "provider_budget_exhausted_waiters"),
+            ("rate_limited_disconnect", "provider_budget_exhausted_disconnect"),
+        ):
+            line = (
+                "2026-10-23 09:14:02,884 - INFO - Fallback triggered for "
+                "model=v1/chat/completions, from=munitoai-free, to=opencode-go, "
+                f"reason={legacy} session=s-legacy attempt=1"
+            )
+            assert log_parser.parse_log_line(line).reason == expected
+
+    def test_current_reason_spelling_is_left_untouched(self):
+        """``_normalize_reason`` is a legacy mapping only: the current name (and
+        an unrelated reason that merely starts with another word) pass through."""
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_PROVIDER_BUDGET_EXHAUSTED)
+        assert ev.reason == "provider_budget_exhausted"
+        other = log_parser.parse_log_line(fixtures.FALLBACK_SESSION)
+        assert other.reason == "local_lease_active"
 
     def test_fallback_session_token_unknown_maps_to_none(self):
         """The proxy emits ``session=unknown`` when the request has no UUID;
@@ -1530,11 +1557,11 @@ class TestFallbackAttribution:
     def test_session_does_not_inherit_another_sessions_reason(self):
         """The regression this change fixes: session B reached remote seconds
         after session A's spill, but B has no fallback line of its own — it must
-        stay unattributed instead of inheriting A's ``rate_limited``."""
+        stay unattributed instead of inheriting A's ``provider_budget_exhausted``."""
         lines = [
             # A's session-bearing spill, just before B's remote move.
             "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
             "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
             *self._local_then_remote("session-b", "09:06", "09:06"),
         ]
@@ -1589,7 +1616,7 @@ class TestFallbackAttribution:
             *self._local_then_remote("herdr-1792767061-1282111-17770",
                                      "09:12", "09:13"),
             "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
             "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
             *self._local_then_remote("session-b", "09:06", "09:06"),
         ]
@@ -1602,7 +1629,7 @@ class TestFallbackAttribution:
     def test_report_exposes_attribution_states(self):
         lines = [
             "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
             "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
             *self._local_then_remote("session-b", "09:06", "09:06"),
             "2026-10-23 09:10:00,000 - INFO - Stream started: provider=local "
@@ -1629,7 +1656,7 @@ class TestFallbackAttribution:
     def test_csv_row_carries_attribution(self, tmp_path):
         lines = [
             "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
             "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
             *self._local_then_remote("session-b", "09:06", "09:06"),
         ]
@@ -2262,6 +2289,41 @@ class TestRecommendations:
         )
         recs = recommendations.generate_recommendations(res, config=None)
         assert any(r.severity == "info" and "remote" in r.title.lower() for r in recs)
+
+    def test_provider_budget_skip_is_not_a_remote_error(self):
+        """The renamed reason contains ``exhausted``, which the remote-error
+        token list also matches. A proxy budget skip is a pre-flight pacing
+        decision on a healthy provider, so it must never be reported as a
+        remote provider error (LP-0MVMBM8YS003Y2JG AC4)."""
+        res = _result_with_sessions(
+            [_session("a", remote_move=True, reason="provider_budget_exhausted")],
+            fallback_events=[
+                log_parser.LogEvent(
+                    "fallback", WINDOW_START, reason="provider_budget_exhausted"
+                )
+            ],
+        )
+        recs = recommendations.generate_recommendations(res, config=None)
+        titles = " | ".join(r.title for r in recs).lower()
+        assert "remote provider errors" not in titles
+
+    def test_provider_budget_skip_is_explained_as_pacing_not_a_429(self):
+        """Budget pacing gets its own advice that distinguishes it from an
+        upstream HTTP 429 (LP-0MVMBM8YS003Y2JG AC4/AC7)."""
+        res = _result_with_sessions(
+            [_session("a", remote_move=True, reason="provider_budget_exhausted_after_wait")],
+            fallback_events=[
+                log_parser.LogEvent(
+                    "fallback", WINDOW_START, reason="provider_budget_exhausted_after_wait"
+                )
+            ],
+        )
+        recs = recommendations.generate_recommendations(res, config=None)
+        budget = [r for r in recs if "budget" in r.title.lower()]
+        assert budget, "expected a request-budget recommendation"
+        detail = budget[0].detail.lower()
+        assert "rate_limit_rpm" in detail
+        assert "not an upstream" in detail
 
     def test_provider_context_skips_trigger_ceiling_advice(self):
         # AC4: provider-context skip events drive their own advice naming count,

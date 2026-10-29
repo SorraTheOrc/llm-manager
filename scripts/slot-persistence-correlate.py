@@ -77,7 +77,7 @@ _STREAM_RE = re.compile(
 )
 # 2026-08-06 01:55:13,618 - INFO - Fallback triggered ... reason=local_concurrency_limit
 # Trailing evidence fields (``session=``/``attempt=``, plus ``limit=``/
-# ``remaining=``/``waited=`` for ``rate_limited*``) were appended after
+# ``remaining=``/``waited=`` for ``provider_budget_exhausted*``) were appended after
 # ``reason=`` by LP-0MVMBMSWR0036RES, so the reason is bounded by the next
 # ``key=`` token instead of running to end-of-line.
 _FALLBACK_RE = re.compile(

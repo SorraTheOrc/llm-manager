@@ -586,9 +586,9 @@ retrying into it:
   after which the session counts as new again.
 
 Skips log `Provider budget exhausted: skipping provider=<p> limit=<n>
-remaining=<n> reason=rate_limited …` and appear in the exhaustion
-`diagnostics` as `status: "rate_limited"`; a waited dispatch records
-`status: "rate_limited_waited"` with `elapsed_wait_seconds`. An entry without
+remaining=<n> reason=provider_budget_exhausted …` and appear in the exhaustion
+`diagnostics` as `status: "provider_budget_exhausted"`; a waited dispatch records
+`status: "provider_budget_exhausted_waited"` with `elapsed_wait_seconds`. An entry without
 `rate_limit_rpm` is never gated (behaviour unchanged).
 
 ```yaml
@@ -992,7 +992,7 @@ hint.
 | Outside `available_times` window | `outside_time_window` | — (window-skipped) | `Skipping provider=<p>: outside its available_times window (UTC)` |
 | Usage-limit quarantine | `usage_limit_reset` (+ `reset_in`/`reset_at`) | `<provider>: <reset seconds>` | `Skipping provider=<p>: usage_limit_reset_pending (account=…, window=<rolling\|weekly\|monthly\|unknown>, …)` / `usage_limit_reset=` on the exhaustion line |
 | Local slot held by another session | `local_lease_active` / `fallback_after_queue` | — | `local_dispatch_denied session=… owner=… active=…` |
-| Free-tier request budget exhausted (`rate_limit_rpm`) | `rate_limited` / `rate_limited_waited` | — | `Provider budget exhausted: skipping provider=<p> limit=<n> remaining=<n> reason=rate_limited …` |
+| Free-tier request budget exhausted (`rate_limit_rpm`) | `provider_budget_exhausted` / `provider_budget_exhausted_waited` | — | `Provider budget exhausted: skipping provider=<p> limit=<n> remaining=<n> reason=provider_budget_exhausted …` |
 | Prompt context above the entry's `max_context_tokens` | `provider_context_exceeded` | — | `routing_skip_provider_context provider=<p> type=<t> status=provider_context_exceeded estimated_tokens=<n> limit=<limit> reason=provider_context_exceeded …` |
 | All local slots busy (slot exhaustion) | `slot_exhaustion` | — | `Model server busy: 0/N slots available` (429) |
 | Provider / brand cooldown | `http_exception` / `empty_response` / etc. | `<name or brand>: <seconds>` | `marking provider unavailable` / `unavailable={…}` on the exhaustion line |

@@ -243,7 +243,7 @@ class TestPercentileTable:
 
     def test_context_percentiles_ignore_sessions_without_token_data(self):
         lines = _turns("sess-a", 1, 1) + [
-            _skip("sess-a", 1.5, "rate_limited", estimated_tokens=52000)
+            _skip("sess-a", 1.5, "provider_budget_exhausted", estimated_tokens=52000)
         ]
         # sess-b fell back with no token evidence at all (no ``estimated_tokens``
         # on its skip line, no usage on either stream).
@@ -269,17 +269,17 @@ class TestPercentileTable:
 class TestFallbackAttribution:
     def test_reason_comes_from_the_sessions_own_skip_line(self):
         lines = _turns("sess-a", 1, 1) + [
-            _skip("sess-a", 1.5, "rate_limited", estimated_tokens=52310)
+            _skip("sess-a", 1.5, "provider_budget_exhausted", estimated_tokens=52310)
         ]
         result = _aggregate(lines)
         row = reporting.local_turn_rows(result.sessions)[0]
-        assert row.reason == "rate_limited"
+        assert row.reason == "provider_budget_exhausted"
         assert row.context_at_fallback == 52310
         assert row.context_source == aggregation.CONTEXT_AT_FALLBACK_ROUTING_SKIP
 
     def test_context_falls_back_to_first_remote_stream_prompt(self):
         lines = _turns("sess-a", 1, 0) + [
-            _skip("sess-a", 3.0, "rate_limited", estimated_tokens=None),
+            _skip("sess-a", 3.0, "provider_budget_exhausted", estimated_tokens=None),
             _started("sess-a", "opencode-go", 4),
             _finished("sess-a", "opencode-go", 5, prompt=45678),
         ]
@@ -294,13 +294,13 @@ class TestFallbackAttribution:
         lines = _turns("sess-a", 1, 0) + [
             "2026-10-23 10:05:02,000 - INFO - Fallback triggered for "
             "model=v1/chat/completions, from=local-qwen3, to=opencode-go, "
-            "reason=rate_limited session=sess-a attempt=1",
+            "reason=provider_budget_exhausted session=sess-a attempt=1",
             _started("sess-a", "opencode-go", 4),
             _finished("sess-a", "opencode-go", 5, prompt=None),
         ]
         result = _aggregate(lines)
         row = reporting.local_turn_rows(result.sessions)[0]
-        assert row.reason == "rate_limited"
+        assert row.reason == "provider_budget_exhausted"
         assert row.context_at_fallback == 1000
         assert row.context_source == aggregation.CONTEXT_AT_FALLBACK_SESSION_CONTEXT
 
@@ -326,7 +326,7 @@ class TestFallbackReasonTable:
         lines: list[str] = []
         offset = 0.0
         for i, reason in enumerate(
-            ["rate_limited", "rate_limited", "empty_response"]
+            ["provider_budget_exhausted", "provider_budget_exhausted", "empty_response"]
         ):
             lines += _turns(f"sess-{i}", 1, 1, start_s=offset)
             lines.append(_skip(f"sess-{i}", offset + 1.5, reason, estimated_tokens=None))
@@ -334,12 +334,37 @@ class TestFallbackReasonTable:
         lines += _turns("sess-local-only", 2, 0, start_s=offset)
         coverage = reporting.local_turn_coverage(_aggregate(lines))
         counts = {row["reason"]: row for row in coverage["reasons"]}
-        assert counts["rate_limited"]["sessions"] == 2
-        assert counts["rate_limited"]["pct_of_sessions_with_local"] == pytest.approx(
+        assert counts["provider_budget_exhausted"]["sessions"] == 2
+        assert counts["provider_budget_exhausted"]["pct_of_sessions_with_local"] == pytest.approx(
             50.0
         )
         assert counts["empty_response"]["sessions"] == 1
         assert counts["no_remote_fallback"]["sessions"] == 1
+
+    def test_legacy_spelling_folds_into_one_row(self):
+        """A window spanning the rename (rotated logs) must report ONE reason
+        row, not one per spelling: the parser normalises the pre-rename
+        ``rate_limited`` spelling to ``provider_budget_exhausted``
+        (LP-0MVMBM8YS003Y2JG AC3/AC4)."""
+        # Pre-rename line (legacy spelling) for sess-old, current for sess-new.
+        lines = _turns("sess-old", 1, 1) + [
+            _skip("sess-old", 1.5, "rate_limited", estimated_tokens=None)
+        ]
+        lines += _turns("sess-new", 1, 1, start_s=40) + [
+            _skip("sess-new", 41.5, "provider_budget_exhausted", estimated_tokens=None)
+        ]
+        coverage = reporting.local_turn_coverage(_aggregate(lines))
+        reasons = {row["reason"]: row["sessions"] for row in coverage["reasons"]}
+        assert reasons == {"provider_budget_exhausted": 2}
+        section = reporting.build_report(_aggregate(lines), None).split(
+            "## Local model usage by session", 1
+        )[1]
+        reasons_table = section.split("### Fallback reason distribution", 1)[1].split(
+            "### Per-session coverage", 1
+        )[0]
+        # One row for the reason, and no second row under the old spelling.
+        assert reasons_table.count("provider_budget_exhausted") == 1
+        assert "rate_limited" not in reasons_table
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +398,7 @@ class TestReportSection:
         return reporting.build_report(_aggregate(lines), None)
 
     def test_section_renders_the_three_tables(self):
-        lines = _turns("sess-a", 2, 1) + [_skip("sess-a", 3.5, "rate_limited")]
+        lines = _turns("sess-a", 2, 1) + [_skip("sess-a", 3.5, "provider_budget_exhausted")]
         report = self._report(lines)
         assert "## Local model usage by session" in report
         section = report.split("## Local model usage by session", 1)[1]
@@ -387,9 +412,9 @@ class TestReportSection:
         reasons_table = section.split("### Fallback reason distribution", 1)[1].split(
             "### Per-session coverage", 1
         )[0]
-        assert "| rate_limited | 1 | 100.0% |" in reasons_table
+        assert "| provider_budget_exhausted | 1 | 100.0% |" in reasons_table
         sessions_table = section.split("### Per-session coverage", 1)[1]
-        assert "| sess-a | 2 | 1 | 66.7% | rate_limited |" in sessions_table
+        assert "| sess-a | 2 | 1 | 66.7% | provider_budget_exhausted |" in sessions_table
 
     def test_section_renders_without_any_local_traffic(self):
         report = self._report(_turns("sess-remote", 0, 2))
@@ -407,8 +432,8 @@ class TestReportSection:
         assert "n/a" in section
         assert "no token evidence at their fallback" in section
 
-    def test_rate_limited_is_explained_as_budget_pacing(self):
-        lines = _turns("sess-a", 1, 1) + [_skip("sess-a", 1.5, "rate_limited")]
+    def test_provider_budget_exhausted_is_explained_as_budget_pacing(self):
+        lines = _turns("sess-a", 1, 1) + [_skip("sess-a", 1.5, "provider_budget_exhausted")]
         section = self._report(lines).split("## Local model usage by session", 1)[1]
         assert "per-provider RPM budget" in section
         assert "not an upstream HTTP 429" in section
@@ -417,7 +442,7 @@ class TestReportSection:
 class TestInterpretationNotes:
     def test_decision_first_note_counts_remote_only_sessions(self):
         lines = _turns("sess-local", 2, 1) + [
-            _skip("sess-local", 3.5, "rate_limited")
+            _skip("sess-local", 3.5, "provider_budget_exhausted")
         ]
         lines += _turns("sess-remote-only", 0, 3, start_s=40)
         result = _aggregate(lines)
@@ -449,7 +474,7 @@ class TestInterpretationNotes:
         assert "1 of 2 were declined before the session's first local turn" in section
         assert "never on a session's first message" in section
 
-    def test_rate_limited_note_is_omitted_without_that_reason(self):
+    def test_provider_budget_exhausted_note_is_omitted_without_that_reason(self):
         lines = _turns("sess-local", 1, 1) + [
             _skip("sess-local", 1.5, "empty_response")
         ]
@@ -467,16 +492,16 @@ class TestInterpretationNotes:
 
 class TestMachineReadableExposure:
     def test_json_summary_exposes_the_coverage(self):
-        lines = _turns("sess-a", 2, 1) + [_skip("sess-a", 3.5, "rate_limited")]
+        lines = _turns("sess-a", 2, 1) + [_skip("sess-a", 3.5, "provider_budget_exhausted")]
         data = reporting.summary_to_json(_aggregate(lines))
         coverage = data["local_turn_coverage"]
         assert coverage["sessions_with_local"] == 1
         assert coverage["total"]["local_turns"] == 2
         assert coverage["total"]["remote_turns"] == 1
-        assert coverage["reasons"][0]["reason"] == "rate_limited"
+        assert coverage["reasons"][0]["reason"] == "provider_budget_exhausted"
 
     def test_session_csv_carries_the_per_session_columns(self, tmp_path):
-        lines = _turns("sess-a", 2, 1) + [_skip("sess-a", 3.5, "rate_limited")]
+        lines = _turns("sess-a", 2, 1) + [_skip("sess-a", 3.5, "provider_budget_exhausted")]
         summary = _aggregate(lines)
         standard, _low = reporting.write_csvs(summary, tmp_path)
         with standard.open() as fh:

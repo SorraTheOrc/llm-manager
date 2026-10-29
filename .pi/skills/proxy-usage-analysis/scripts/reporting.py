@@ -541,8 +541,8 @@ def local_turn_coverage(summary: AnalysisResult) -> dict:
         if _fallback_reason_label(s) in aggregation.CONTEXT_FALLBACK_REASONS
     ]
     context_before_local = [s for s in context_fallbacks if s.local_requests == 0]
-    rate_limited = [
-        s for s in all_sessions if _fallback_reason_label(s) == "rate_limited"
+    budget_exhausted = [
+        s for s in all_sessions if log_parser.is_provider_budget_reason(_fallback_reason_label(s))
     ]
 
     return {
@@ -579,7 +579,7 @@ def local_turn_coverage(summary: AnalysisResult) -> dict:
             "declined_before_local_turn": len(declined_before_local),
             "context_fallback_sessions": len(context_fallbacks),
             "context_fallback_before_local_turn": len(context_before_local),
-            "rate_limited_sessions": len(rate_limited),
+            "provider_budget_exhausted_sessions": len(budget_exhausted),
         },
     }
 
@@ -732,13 +732,14 @@ def _append_local_turn_coverage_section(
                 "the configured cold/warm thresholds — never on a session's first "
                 "message."
             )
-        if notes["rate_limited_sessions"]:
+        if notes["provider_budget_exhausted_sessions"]:
             ap(
-                "- `rate_limited` is the proxy's own per-provider RPM budget "
-                "pacing (`provider_budget.py`: the configured `rate_limit_rpm` "
-                "window for that provider is exhausted, so the request passes to "
-                "the next provider immediately) — not an upstream HTTP 429; those "
-                "surface as `upstream_http_error status=429` events instead."
+                "- `provider_budget_exhausted` is the proxy's own per-provider "
+                "RPM budget pacing (`provider_budget.py`: the configured "
+                "`rate_limit_rpm` window for that provider is exhausted, so the "
+                "request passes to the next provider immediately) — not an "
+                "upstream HTTP 429; those surface as "
+                "`upstream_http_error status=429` events instead."
             )
 
     missing = coverage["sessions_with_local"] - coverage["total"]["context_samples"]
@@ -1038,7 +1039,8 @@ def build_report(
     )
     ap(
         "- `Fallback triggered` lines carry `session=`/`attempt=` plus budget evidence "
-        "(`limit=`/`remaining=`/`waited=`) when the reason is `rate_limited*`. A session's "
+        "(`limit=`/`remaining=`/`waited=`) when the reason is "
+        "`provider_budget_exhausted*`. A session's "
         "reason therefore comes from its own evidence (its `Fallback triggered` or "
         "`routing_skip_local` line); the nearest-line-within-60s heuristic applies only to "
         "session-less lines from rotated logs predating the session stamp, so a session never "
