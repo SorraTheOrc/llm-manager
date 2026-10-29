@@ -113,7 +113,8 @@ per-session standard/low CSVs and a Markdown report with data-backed
 configuration recommendations (fallback reasons, slot contention, context
 pressure, priority-window comparison). It parses the structured INFO lines the
 proxy emits — `Stream started`/`Stream finished` (with authoritative
-`tokens=prompt/completion/total`), `Fallback triggered`, `routing_skip_local`,
+`tokens=prompt/completion/total`, or the explicit `tokens=missing` marker when
+the upstream reported no usage), `Fallback triggered`, `routing_skip_local`,
 and `local_dispatch_denied` — streaming large logs line by line.
 
 The analysis pipeline is fully deterministic — no LLM is in the loop. The

@@ -61,6 +61,11 @@ CSV_COLUMNS = [
     "context_at_fallback_source",
     "dispatch_denied",
     "decode_tok_s",
+    # Measured-usage coverage per session (LP-0MVMBM6N400541EH AC3): the
+    # per-session record of how many terminal lines reported no usage, so a
+    # blank context column is explainable rather than looking like a bug.
+    "streams_with_usage",
+    "streams_without_usage",
 ]
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
@@ -159,6 +164,8 @@ def _session_row(s: SessionStats) -> dict:
         "context_at_fallback_source": s.context_at_fallback_source or "",
         "dispatch_denied": str(s.dispatch_denied),
         "decode_tok_s": f"{s.decode_tok_s:.1f}" if s.decode_tok_s is not None else "",
+        "streams_with_usage": str(getattr(s, "streams_with_usage", 0)),
+        "streams_without_usage": str(getattr(s, "streams_without_usage", 0)),
     }
 
 
@@ -396,6 +403,11 @@ class LocalTurnRow:
     reason: str
     context_at_fallback: int | None
     context_source: str | None
+    # Terminal streams in this session that reported no usage
+    # (LP-0MVMBM6N400541EH AC3): the concrete reason a session's
+    # ``context size at fallback`` can read ``n/a`` — those lines carry
+    # ``tokens=missing``, so they contribute no prompt tokens to any figure.
+    streams_without_usage: int = 0
 
 
 NO_LOCAL_TURNS_TEXT = "No session in the window used the local model."
@@ -441,6 +453,7 @@ def local_turn_rows(
             reason=_fallback_reason_label(s),
             context_at_fallback=s.context_at_fallback,
             context_source=s.context_at_fallback_source,
+            streams_without_usage=getattr(s, "streams_without_usage", 0),
         )
         for s in candidates
         if s.local_requests > 0
@@ -535,6 +548,12 @@ def local_turn_coverage(summary: AnalysisResult) -> dict:
     return {
         "sessions_in_window": len(summary.sessions),
         "sessions_with_local": with_local,
+        # Sessions whose terminal streams reported no usage
+        # (LP-0MVMBM6N400541EH): the concrete cause of a context-at-fallback
+        # figure that has to render ``n/a``.
+        "sessions_without_usage": sum(
+            1 for r in rows if r.streams_without_usage
+        ),
         "percentiles": percentiles,
         "total": total,
         "reasons": reasons,
@@ -549,6 +568,9 @@ def local_turn_coverage(summary: AnalysisResult) -> dict:
                 "reason": r.reason,
                 "context_at_fallback": r.context_at_fallback,
                 "context_at_fallback_source": r.context_source,
+                # Per-session no-usage count (LP-0MVMBM6N400541EH AC3): names
+                # why a session's context-at-fallback figure is ``n/a``.
+                "streams_without_usage": r.streams_without_usage,
             }
             for r in rows
         ],
@@ -661,9 +683,10 @@ def _append_local_turn_coverage_section(
     ap("")
     ap(
         "| Session ID | # turns local | # turns remote | % local turns | "
-        "Reason for remote fallback | Context size at fallback |"
+        "Reason for remote fallback | Context size at fallback | "
+        "Streams without usage |"
     )
-    ap("|---|---|---|---|---|---|")
+    ap("|---|---|---|---|---|---|---|")
     for row in coverage["sessions"]:
         local_cell = str(row["local_turns"])
         if row["unanswered_turns"]:
@@ -671,14 +694,18 @@ def _append_local_turn_coverage_section(
         ap(
             f"| {row['session_id']} | {local_cell} | {row['remote_turns']} | "
             f"{row['local_turn_pct']:.1f}% | {row['reason']} | "
-            f"{_fmt_fallback_tokens(row['context_at_fallback'])} |"
+            f"{_fmt_fallback_tokens(row['context_at_fallback'])} | "
+            f"{row.get('streams_without_usage', 0)} |"
         )
     ap("")
     ap(
         "Sorted by `# turns local` descending (more local turns is the goal), "
         "then by session id. `% local turns` = local / (local + remote) × 100 "
         "for that session; an unanswered local turn is counted and flagged in "
-        "the local column rather than dropped."
+        "the local column rather than dropped. `Streams without usage` counts "
+        "the session's terminal lines that reported no usage — they carry "
+        "`tokens=missing` (LP-0MVMBM6N400541EH) — which is why its context "
+        "figures can be `n/a`."
     )
 
     notes = coverage["notes"]
@@ -716,13 +743,27 @@ def _append_local_turn_coverage_section(
 
     missing = coverage["sessions_with_local"] - coverage["total"]["context_samples"]
     if missing:
+        # LP-0MVMBM6N400541EH AC4: when the affected sessions actually logged
+        # usage-less streams, name the marker as the cause. A session can also
+        # have no context figure simply because it never fell back (no
+        # ``routing_skip_local`` and no remote stream), so the marker is only
+        # named when the evidence shows it.
+        marker_note = ""
+        if coverage["sessions_without_usage"]:
+            marker_note = (
+                " Terminal streams that reported no usage carry the explicit "
+                "`tokens=missing` marker (LP-0MVMBM6N400541EH) and are counted "
+                "in the `Streams without usage` column, so their `n/a` is "
+                "explained by the logs rather than being an unexplained gap."
+            )
         ap("")
         ap(
             f"**Limitation:** {missing} of {coverage['sessions_with_local']} "
             "session(s) have no token evidence at their fallback — their "
             "`routing_skip_local` line carried no `estimated_tokens=`, no remote "
             "stream reported usage and the session itself logged no prompt "
-            "tokens. They render `n/a`; the report never fabricates an estimate."
+            "tokens." + marker_note + " They render `n/a`; the report never "
+            "fabricates an estimate."
         )
 
 
@@ -972,9 +1013,12 @@ def build_report(
         "(log-line payloads are truncated and are never used for sizes). Local streams report "
         "llama-server's measured usage since LP-0MVMHNVKT003PRIK (the proxy requests "
         "`stream_options.include_usage`), so local prompt sizes and per-model local tokens are "
-        "measured rather than inferred from the session's initial provider. Logs written before "
-        "that change carry no `tokens=` for local streams; the count of terminal lines without "
-        "usage is reported in the **Total tokens** section rather than silently treated as zero."
+        "measured rather than inferred from the session's initial provider. A terminal line "
+        "whose upstream reported no usage carries the explicit marker `tokens=missing` "
+        "(LP-0MVMBM6N400541EH) — that is the cause of any missing context/response figure, and "
+        "those lines are counted per session in the **Total tokens** section rather than "
+        "silently treated as zero. Logs written before that marker carry no `tokens=` at all and "
+        "are counted the same way."
     )
     ap(
         "- A session is included when it has at least one `Stream started` inside the window; "
@@ -2599,6 +2643,10 @@ def _append_total_tokens_section(ap, summary) -> None:
     # ``stream_options.include_usage``), so real local prompt sizes are
     # measurable. A non-zero count means some terminal lines still carry no
     # usage (older rotated logs, providers that omit it, aborted streams).
+    # Since LP-0MVMBM6N400541EH the proxy marks those lines explicitly with
+    # ``tokens=missing``, so "no data" is distinguishable from "zero tokens"
+    # and the per-session count is carried in the *Local model usage by
+    # session* coverage table and the per-session CSVs.
     without = getattr(summary, "streams_without_usage", 0)
     measured = getattr(summary, "streams_finished", 0)
     total_finished = measured + without
@@ -2616,9 +2664,11 @@ def _append_total_tokens_section(ap, summary) -> None:
         )
         ap("")
         ap(
-            f"Streams without usage: **{without:,}**{provider_part}. Their "
-            "context/response sizes are unknown (not zero) and are excluded "
-            "from the token totals and the local prompt-size figures."
+            f"Streams without usage: **{without:,}**{provider_part}. Those lines "
+            "carry ``tokens=missing`` (logs written before "
+            "LP-0MVMBM6N400541EH simply omit the field). Their context/response "
+            "sizes are unknown (not zero) and are excluded from the token "
+            "totals and the local prompt-size figures."
         )
         ap("")
     ap("| Kind | Count | % of total |")

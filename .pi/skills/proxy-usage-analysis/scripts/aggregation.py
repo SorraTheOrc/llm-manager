@@ -624,6 +624,15 @@ class SessionStats:
     # when the logs carry no token evidence — rendered ``n/a``).
     context_at_fallback: int | None = None
     context_at_fallback_source: str | None = None
+    # Per-session measured-usage coverage (LP-0MVMBM6N400541EH AC3): terminal
+    # ``Stream finished`` lines that carried counted ``tokens=`` vs. those that
+    # reported no usage at all — ``tokens=missing`` on new logs, an absent
+    # ``tokens=`` field on logs predating the marker. A session with
+    # ``streams_without_usage`` > 0 has *unknown* context/size figures (blank in
+    # the CSV, absent from the context averages) rather than zero ones, and the
+    # report names this count instead of leaving the figures unexplained.
+    streams_with_usage: int = 0
+    streams_without_usage: int = 0
 
     @property
     def fell_back(self) -> bool:
@@ -1199,6 +1208,10 @@ class _SessionBuilder:
         self.local_first: datetime | None = None
         self.local_last: datetime | None = None
         self.local_completion = 0
+        # Measured-usage coverage (LP-0MVMBM6N400541EH AC3): terminal lines with
+        # counted ``tokens=`` vs. terminal lines that reported no usage.
+        self.streams_with_usage = 0
+        self.streams_without_usage = 0
 
     def add(self, ev: LogEvent) -> None:
         self.last_seen = ev.ts
@@ -1215,6 +1228,12 @@ class _SessionBuilder:
             self.dispatch_denied += 1
         if ev.kind == "stream_finished":
             self._add_tokens_by_model(ev)
+            # Same rule as the window-level coverage counters: a terminal line
+            # with neither prompt nor completion counts reported no usage.
+            if ev.prompt is None and ev.completion is None:
+                self.streams_without_usage += 1
+            else:
+                self.streams_with_usage += 1
         if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
             if self.local_first is None or ev.ts < self.local_first:
                 self.local_first = ev.ts
@@ -1523,6 +1542,8 @@ def _build_session(
         local_turns_unanswered=local_unanswered,
         context_at_fallback=context_at_fallback,
         context_at_fallback_source=context_source,
+        streams_with_usage=builder.streams_with_usage,
+        streams_without_usage=builder.streams_without_usage,
     )
 
 
@@ -2247,7 +2268,10 @@ def aggregate(
         if ev.kind == "stream_finished":
             # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): count every
             # terminal line, and separately those whose payload carried no
-            # token counts ("unknown", not "zero").
+            # token counts ("unknown", not "zero"). Since
+            # LP-0MVMBM6N400541EH such lines carry an explicit
+            # ``tokens=missing`` marker; the token-presence test also covers
+            # rotated logs predating it.
             if ev.prompt is None and ev.completion is None:
                 streams_without_usage += 1
                 streams_without_usage_by_provider[

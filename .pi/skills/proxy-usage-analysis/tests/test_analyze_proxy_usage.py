@@ -8002,3 +8002,214 @@ class TestResidencyAdmission:
         )
         md = reporting.build_report(summary, None)
         assert "## Residency-aware admission" not in md
+
+
+# ---------------------------------------------------------------------------
+# Explicit no-usage marker (LP-0MVMBM6N400541EH)
+# ---------------------------------------------------------------------------
+
+
+class TestTokensMissingMarker:
+    """``tokens=missing`` distinguishes "no data" from "zero tokens".
+
+    The proxy now writes ``tokens=missing`` on a ``Stream finished`` line whose
+    upstream reported no usage (aborted/errored stream, or a provider that omits
+    the block). The analyser must parse the marker onto the stream-finished
+    event, count those streams (window level and per session) instead of
+    silently emitting ``n/a``, and keep them out of every token total.
+    """
+
+    START_LOCAL = (
+        "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local "
+        "model=Qwen3 session=sess-mix request=x"
+    )
+
+    @staticmethod
+    def _aggregate(lines: list[str]) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events(lines),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+
+    def test_parser_records_the_marker_on_the_stream_finished_event(self):
+        ev = log_parser.parse_log_line(fixtures.STREAM_FINISHED_TOKENS_MISSING)
+        assert ev is not None
+        assert ev.kind == "stream_finished"
+        assert ev.usage_missing is True
+        # No fabricated zeroes: the counts stay unknown.
+        assert (ev.prompt, ev.completion, ev.total) == (None, None, None)
+
+    def test_parser_leaves_populated_lines_unchanged(self):
+        ev = log_parser.parse_log_line(fixtures.STREAM_FINISHED_LOCAL_MEASURED)
+        assert ev is not None
+        assert (ev.prompt, ev.completion, ev.total) == (30000, 200, 30200)
+        # Not marked missing, and not silently "False" either: pre-marker
+        # lines and populated lines both read ``None``.
+        assert ev.usage_missing is None
+
+    def test_marker_is_counted_and_excluded_from_token_totals(self):
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        # One populated stream, one marked missing.
+        assert result.streams_finished == 1
+        assert result.streams_without_usage == 1
+        assert dict(result.streams_without_usage_by_provider) == {"local": 1}
+        # The marked line contributes nothing to the totals / context sizes.
+        assert result.total_tokens == (30000, 200, 30200)
+        session = result.sessions["sess-mix"]
+        assert (session.input_tokens, session.output_tokens) == (30000, 200)
+        assert session.max_context_size == 30000
+
+    def test_per_session_counts_split_marked_and_populated_streams(self):
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        session = result.sessions["sess-mix"]
+        assert session.streams_with_usage == 1
+        assert session.streams_without_usage == 1
+
+    def test_remote_marked_stream_is_counted_per_provider(self):
+        result = self._aggregate(
+            [
+                "2026-08-02 14:00:00,000 - INFO - Stream started: "
+                "provider=opencode-go model=deepseek-v4-flash session=sess-r request=x",
+                fixtures.STREAM_FINISHED_TOKENS_MISSING_REMOTE.replace(
+                    "019fbfea-40b0-74a5-8cc9-bf3723f2b458", "sess-r"
+                ),
+            ]
+        )
+        assert result.streams_without_usage == 1
+        assert dict(result.streams_without_usage_by_provider) == {"opencode-go": 1}
+        assert result.sessions["sess-r"].streams_without_usage == 1
+        assert result.sessions["sess-r"].max_context_size is None
+
+    def test_window_level_count_names_the_marker(self):
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        md = reporting.build_report(result, None)
+        section = md.split("## Total tokens", 1)[1].split("### Tokens", 1)[0]
+        # Window-level count still rendered (unchanged line), now naming the
+        # marker as the cause.
+        assert "Streams without usage: **1**" in section
+        assert "tokens=missing" in section
+
+    def test_context_at_fallback_table_counts_missing_usage_per_session(self):
+        """AC3: the per-session context-at-fallback table carries the count."""
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        report = reporting.build_report(result, None)
+        section = report.split("## Local model usage by session", 1)[1]
+        per_session = section.split("### Per-session coverage", 1)[1]
+        assert "Streams without usage |" in per_session
+        row = next(
+            line for line in per_session.splitlines() if line.startswith("| sess-mix |")
+        )
+        assert row.rstrip().endswith("| 1 |")
+
+    def test_context_at_fallback_table_counts_zero_when_all_measured(self):
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        report = reporting.build_report(result, None)
+        per_session = report.split("### Per-session coverage", 1)[1]
+        row = next(
+            line for line in per_session.splitlines() if line.startswith("| sess-mix |")
+        )
+        assert row.rstrip().endswith("| 0 |")
+        # No usage-less stream, so the marker is never named as the cause.
+        section = report.split("## Local model usage by session", 1)[1]
+        assert "**Limitation:**" in section
+        limitation = section.split("**Limitation:**", 1)[1].split("\n", 1)[0]
+        assert "tokens=missing" not in limitation
+
+    def test_context_at_fallback_limitation_names_the_marker(self):
+        """AC4: the affected table's limitation text names the marker."""
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        section = reporting.build_report(result, None).split(
+            "## Local model usage by session", 1
+        )[1]
+        limitation = section.split("**Limitation:**", 1)[1].split("\n", 1)[0]
+        assert "`tokens=missing`" in limitation
+        assert "n/a" in limitation
+
+    def test_limitations_name_the_marker(self):
+        result = self._aggregate(
+            [self.START_LOCAL, fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+            )]
+        )
+        limitations = reporting.build_report(result, None).split(
+            "## Notes and limitations", 1
+        )[1]
+        assert "tokens=missing" in limitations
+
+    def test_csv_records_the_per_session_usage_coverage(self, tmp_path):
+        """The per-session record explains a blank context column."""
+        result = self._aggregate(
+            [
+                self.START_LOCAL,
+                fixtures.STREAM_FINISHED_LOCAL_MEASURED.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+                fixtures.STREAM_FINISHED_TOKENS_MISSING.replace(
+                    "019fc284-dcb8-74ca-9a64-9306b6f9d286", "sess-mix"
+                ),
+            ]
+        )
+        standard_path, low_path = reporting.write_csvs(result, tmp_path)
+        rows = []
+        for path in (standard_path, low_path):
+            with path.open(newline="", encoding="utf-8") as fh:
+                rows.extend(csv.DictReader(fh))
+        row = next(r for r in rows if r["session_id"] == "sess-mix")
+        assert row["streams_with_usage"] == "1"
+        assert row["streams_without_usage"] == "1"

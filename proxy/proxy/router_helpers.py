@@ -335,8 +335,16 @@ def log_response(status_code: int, content: bytes) -> None:
 # the caller knows a usage chunk is expected (``expect_usage=True``), the
 # finish parts are deferred and emitted — with ``tokens=p/c/t`` — as soon as
 # the usage chunk arrives.  A stream that ends without a usage chunk (aborted,
-# old upstream) is flushed unchanged at ``[DONE]`` or by
-# :func:`flush_pending_stream_finish`, so no terminal line is ever lost.
+# old upstream) is flushed at ``[DONE]`` or by
+# :func:`flush_pending_stream_finish`, marked ``tokens=missing`` so "no data"
+# is distinguishable from "zero tokens" (LP-0MVMBM6N400541EH).
+
+#: Marker appended to a terminal ``Stream finished`` line whose upstream
+#: reported no usage (LP-0MVMBM6N400541EH AC1). It sits exactly where
+#: ``tokens=p/c/t`` sits, so every consumer that matches
+#: ``tokens=(\d+)/(\d+)/(\d+)`` simply does not match it — the "no data"
+#: case is explicitly visible in the line and never mistaken for a count.
+TOKENS_MISSING = "tokens=missing"
 
 #: Upper bound on deferred per-stream finish parts (aborted streams are
 #: flushed explicitly; the cap only guards against a leak if a caller never
@@ -360,8 +368,10 @@ def _stream_finish_key(
 def _usage_token_field(usage: Any) -> str | None:
     """Render a ``usage`` dict as ``tokens=prompt/completion/total``.
 
-    Returns ``None`` when *usage* is absent or carries no token counts, so a
-    line that genuinely has no usage keeps its historical shape.
+    Returns ``None`` when *usage* is absent or carries no token counts; the
+    caller then emits :data:`TOKENS_MISSING` instead, so a line that genuinely
+    has no usage says so rather than omitting the field
+    (LP-0MVMBM6N400541EH AC1).
     """
     if not isinstance(usage, dict):
         return None
@@ -390,15 +400,15 @@ def _flush_deferred_stream_finish(
 ) -> bool:
     """Emit a buffered ``Stream finished`` line, optionally with usage.
 
-    *token_field* is inserted directly after the ``reason=`` field so the
-    line keeps the historical ``Stream finished: reason=<r> tokens=p/c/t``
-    shape. Returns True when a deferred line was emitted.
+    The token field (or :data:`TOKENS_MISSING` when the stream never delivered
+    usage) is inserted directly after the ``reason=`` field so the line keeps
+    the historical ``Stream finished: reason=<r> tokens=p/c/t`` shape.
+    Returns True when a deferred line was emitted.
     """
     parts = _pending_stream_finish.pop(key, None)
     if parts is None:
         return False
-    if token_field and len(parts) > 1:
-        parts.insert(1, token_field)
+    parts.insert(1, token_field or TOKENS_MISSING)
     try:
         _srv().logger.info(" ".join(parts))
     except Exception:
@@ -415,7 +425,7 @@ def flush_pending_stream_finish(
     """Flush a deferred ``Stream finished`` line that never saw usage.
 
     Called at end-of-stream by the local streaming loop so an aborted or
-    usage-less stream still logs its terminal line (without ``tokens=``).
+    usage-less stream still logs its terminal line, marked ``tokens=missing``.
     """
     return _flush_deferred_stream_finish(
         _stream_finish_key(session_id, provider, model, entry), None
@@ -467,8 +477,10 @@ def log_non_stream_usage(
     Non-streaming local responses carry llama-server's ``usage`` block in the
     JSON body, so the measured token counts are logged here (AC1's
     non-streaming path) with ``stream=false`` marking it as a single buffered
-    response rather than a chunked stream. Nothing is logged when the body
-    carries no reportable usage.
+    response rather than a chunked stream. A completion-shaped body that
+    carries no reportable usage is marked ``tokens=missing`` rather than being
+    dropped silently (LP-0MVMBM6N400541EH AC1); a body that is not a
+    completion at all logs nothing.
     """
     if not content:
         return
@@ -483,16 +495,18 @@ def log_non_stream_usage(
         return
     if not isinstance(body, dict):
         return
+    choices = body.get("choices")
     token_field = _usage_token_field(body.get("usage"))
-    if token_field is None:
+    if token_field is None and not (isinstance(choices, list) and choices):
+        # Not a completion reply (e.g. an error body): there is no terminal
+        # stream line to annotate.
         return
     finish_reason = "stop"
-    choices = body.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         finish_reason = choices[0].get("finish_reason") or finish_reason
     parts = [
         f"Stream finished: reason={finish_reason}",
-        token_field,
+        token_field or TOKENS_MISSING,
         "stream=false",
     ]
     if session_id:
@@ -603,9 +617,14 @@ def log_response_chunk(
                     _flush_deferred_stream_finish(stream_key, token_field)
                 continue
             parts = [f"Stream finished: reason={finish_reason}"]
-            parts = [f"Stream finished: reason={finish_reason}"]
             if token_field is not None:
                 parts.append(token_field)
+            elif not expect_usage:
+                # No usage reported and none was requested: say so explicitly
+                # rather than omitting the field (LP-0MVMBM6N400541EH AC1).
+                # With ``expect_usage`` the line is deferred instead and gets
+                # the marker only if the usage chunk never arrives.
+                parts.append(TOKENS_MISSING)
             # LP-0MT60S55M000TK1H: when the error is a synthetic stream-error
             # event (LP-0MSETOTWY000SU0Z) carry the enriched error payload so
             # the proxy-usage analysis tool can classify it (previously the

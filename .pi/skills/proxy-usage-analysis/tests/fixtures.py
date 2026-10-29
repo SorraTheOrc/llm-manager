@@ -90,6 +90,24 @@ STREAM_FINISHED_LOCAL_NON_STREAM = (
     "session=019fc284-dcb8-74ca-9a64-9306b6f9d286 provider=local model=Qwen3"
 )
 
+# --- Explicit no-usage marker (LP-0MVMBM6N400541EH) -------------------------
+#
+# When an upstream reports no usage (aborted/errored stream, or a provider that
+# omits the block), the proxy now writes ``tokens=missing`` instead of omitting
+# ``tokens=`` entirely, so "no data" is distinguishable from "zero tokens".
+
+STREAM_FINISHED_TOKENS_MISSING = (
+    "2026-08-02 14:06:00,000 - INFO - Stream finished: reason=stop "
+    "tokens=missing session=019fc284-dcb8-74ca-9a64-9306b6f9d286 "
+    "provider=local model=Qwen3 request=[{'type': 'text', 'text': 'explain the router'}]"
+)
+
+STREAM_FINISHED_TOKENS_MISSING_REMOTE = (
+    "2026-08-02 14:07:00,000 - INFO - Stream finished: reason=length "
+    "tokens=missing session=019fbfea-40b0-74a5-8cc9-bf3723f2b458 "
+    "provider=opencode-go model=deepseek-v4-flash"
+)
+
 
 # --- Prefill TTFT lines (real /var/log/llama-proxy/proxy.log lines) --------
 #

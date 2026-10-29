@@ -72,6 +72,12 @@ RE_TTFT_SECONDS = re.compile(
     r"ttft_seconds=([\d.]+)"
 )
 RE_TOKENS = re.compile(r"\btokens=(\d+)/(\d+)/(\d+)")
+#: Explicit no-usage marker on a terminal ``Stream finished`` line
+#: (LP-0MVMBM6N400541EH): the proxy writes ``tokens=missing`` when the upstream
+#: reported no usage, so "no data" is distinguishable from "zero tokens".
+#: Deliberately NOT matched by ``RE_TOKENS``, so every token aggregate keeps
+#: ignoring these lines instead of reading a fabricated count.
+RE_TOKENS_MISSING = re.compile(r"\btokens=missing\b")
 RE_ENTRY = re.compile(r"\bentry=(\S+)")
 #: Buffered (non-streamed) reply marker on terminal ``Stream finished`` lines
 #: (LP-0MVMHNVKT003PRIK AC1 non-streaming path): such lines carry measured
@@ -682,6 +688,13 @@ class LogEvent:
     # consumers can keep it out of stream pairing while still using its measured
     # ``tokens=``. ``None`` on streaming lines and on pre-marker logs.
     streamed: bool | None = None
+    # Explicit no-usage marker on ``stream_finished`` events
+    # (LP-0MVMBM6N400541EH): ``True`` when the terminal line carried
+    # ``tokens=missing``, i.e. the upstream reported no usage at all. ``None``
+    # when the line carried counted ``tokens=`` and on pre-marker logs (a line
+    # with neither marker nor counts reads ``None`` too — that shape predates
+    # the marker and is still counted as "without usage" by token presence).
+    usage_missing: bool | None = None
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -873,6 +886,11 @@ def parse_log_line(line: str) -> LogEvent | None:
             # ``stream=false`` marks a buffered reply's terminal line
             # (LP-0MVMHNVKT003PRIK): measured tokens, no stream pairing.
             streamed=False if RE_STREAM_FALSE.search(msg) else None,
+            # ``tokens=missing`` marks a terminal line whose upstream reported
+            # no usage (LP-0MVMBM6N400541EH).
+            usage_missing=(
+                True if RE_TOKENS_MISSING.search(msg) else None
+            ),
         )
     if msg.startswith(FALLBACK):
         m2 = RE_FALLBACK.search(msg)

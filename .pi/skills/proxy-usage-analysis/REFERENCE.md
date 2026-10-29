@@ -665,7 +665,12 @@ entry is a local runtime edit, not a committed artifact.
    lines carried `tokens=` and how many did not, split by provider — so
    "size unknown" is visible instead of being silently counted as zero
    (`streams_with_usage` / `streams_without_usage` /
-   `streams_without_usage_by_provider` in the JSON summary).
+   `streams_without_usage_by_provider` in the JSON summary). Terminal lines
+   with no usage carry `tokens=missing` (LP-0MVMBM6N400541EH), and the
+   per-session counts also appear as the `Streams without usage` column of the
+   **Per-session coverage** table in *Local model usage by session* (next to
+   the `Context size at fallback` figure whose `n/a` it explains) and as
+   `streams_with_usage` / `streams_without_usage` in the per-session CSVs.
 7. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
 8. **Error taxonomy** — error events (`Stream finished: reason=error`,
@@ -756,7 +761,28 @@ reading the logs:
   chunk and emits it as
   `Stream finished: reason=<r> tokens=<p>/<c>/<t> session=<uuid> provider=local model=<m>`.
   A stream that never delivers usage (client disconnect, aborted prefill)
-  still logs exactly one terminal line, without `tokens=`.
+  still logs exactly one terminal line, marked `tokens=missing`.
+- **`tokens=missing` (LP-0MVMBM6N400541EH).** When a terminal stream reports no
+  usage at all, the `Stream finished` line carries `tokens=missing` in the
+  position where `tokens=<p>/<c>/<t>` sits — e.g. `Stream finished:
+  reason=stop tokens=missing session=<uuid> provider=local model=<m>`. The
+  marker is emitted from the same code path as the counted field
+  (`proxy/proxy/router_helpers.py`: the deferred-finish flush at `[DONE]` /
+  end-of-stream, the immediate finish-chunk emit for providers that never
+  report usage, and the buffered `stream=false` reply), so "no data" is
+  distinguishable from "zero tokens" instead of the field silently vanishing.
+  It never overrides real usage: a present `usage` block still logs
+  `tokens=<p>/<c>/<t>` unchanged. Consumers matching
+  `tokens=(\d+)/(\d+)/(\d+)` simply do not match the marker (verified for
+  `scripts/idle_admit_impact.py`, `scripts/slot-persistence-correlate.py`,
+  `proxy/scripts/analyze_context_distribution.py` and
+  `proxy/scripts/run_compaction_experiment.py`), and the analyser records it as
+  `usage_missing=True` on the stream-finished event. Those streams are counted
+  (`streams_without_usage`, window level and per session) and excluded from
+  every token/context figure rather than treated as zero — which is why a
+  session's `Context size at fallback` can render `n/a`, and the *Per-session
+  coverage* table carries its `Streams without usage` count so that `n/a` is
+  explained by the logs rather than being an unexplained gap.
 - When the client did not ask for usage itself, the usage-only chunk is not
   forwarded, so the client-visible SSE stream is unchanged. Buffered
   (non-streaming) local replies log the same terminal line with an extra

@@ -17,7 +17,10 @@ These tests cover:
 - AC1 (non-streaming): a buffered local reply logs the same line, marked
   ``stream=false``.
 - AC1 (no usage): a stream that never delivers a usage chunk still logs its
-  terminal line (no ``tokens=``), so no line is lost.
+  terminal line, marked ``tokens=missing`` so "no data" is distinguishable
+  from "zero tokens" (LP-0MVMBM6N400541EH).
+- AC2 (populated usage): a terminal line that does carry usage keeps exactly
+  today's ``tokens=p/c/t`` shape — the marker never overrides real counts.
 - AC2/AC3: measured usage feeds ``update_cached_ratio`` +
   ``record_prompt_prefix``, and the next turn (40K total / ~10K new) routes
   local — the cold cap applies to NEW, uncached tokens.
@@ -135,6 +138,8 @@ class TestStreamFinishLine:
         assert f"session={SESSION}" in lines[0]
         assert "provider=local" in lines[0]
         assert f"model={MODEL}" in lines[0]
+        # AC2: measured usage is never replaced by the missing marker.
+        assert "tokens=missing" not in lines[0]
 
     def test_stream_without_usage_chunk_still_logs_terminal_line(self):
         """An aborted/usage-less stream never loses its terminal line."""
@@ -161,7 +166,8 @@ class TestStreamFinishLine:
         lines = _finished_lines(logger)
         assert len(lines) == 1, lines
         assert "Stream finished: reason=stop" in lines[0]
-        assert "tokens=" not in lines[0]
+        # LP-0MVMBM6N400541EH AC1: an explicit marker, not a silent absence.
+        assert "tokens=missing" in lines[0]
 
     def test_end_of_stream_flush_covers_no_done_marker(self):
         """The finally-path flush emits a deferred line when ``[DONE]`` never came."""
@@ -209,7 +215,7 @@ class TestStreamFinishLine:
 
         lines = _finished_lines(logger)
         assert len(lines) == 1
-        assert "tokens=" not in lines[0]
+        assert "tokens=missing" in lines[0]
 
     def test_usage_in_finish_chunk_is_unchanged(self):
         """A provider that reports usage inline keeps today's exact format."""
@@ -236,6 +242,135 @@ class TestStreamFinishLine:
         lines = _finished_lines(logger)
         assert len(lines) == 1
         assert "tokens=10/2/12" in lines[0]
+        # LP-0MVMBM6N400541EH AC2: the marker never overrides real usage.
+        assert "tokens=missing" not in lines[0]
+
+
+class TestTokensMissingMarker:
+    """``tokens=missing`` marks a terminal line with no reportable usage.
+
+    LP-0MVMBM6N400541EH: a ``Stream finished`` line without usage used to omit
+    ``tokens=`` entirely, so "no data" was indistinguishable from "zero
+    tokens" and sessions with unknown context size were invisible.
+    """
+
+    def test_end_of_stream_flush_marks_missing_usage(self):
+        """The finally-path flush (no ``[DONE]``) carries the marker."""
+        from proxy.router_helpers import (
+            flush_pending_stream_finish,
+            log_response_chunk,
+        )
+
+        logger = MagicMock()
+        srv = MagicMock(logger=logger)
+        with patch("proxy.router_helpers._srv", return_value=srv):
+            log_response_chunk(
+                _finish_chunk("length"),
+                session_id=SESSION,
+                model=MODEL,
+                provider="local",
+                expect_usage=True,
+            )
+            assert _finished_lines(logger) == []
+            assert flush_pending_stream_finish(
+                SESSION, provider="local", model=MODEL
+            )
+
+        lines = _finished_lines(logger)
+        assert len(lines) == 1, lines
+        assert "Stream finished: reason=length tokens=missing" in lines[0]
+
+    def test_marker_is_never_duplicated_on_repeated_flush(self):
+        from proxy.router_helpers import (
+            flush_pending_stream_finish,
+            log_response_chunk,
+        )
+
+        logger = MagicMock()
+        srv = MagicMock(logger=logger)
+        with patch("proxy.router_helpers._srv", return_value=srv):
+            log_response_chunk(
+                _finish_chunk(),
+                session_id=SESSION,
+                model=MODEL,
+                provider="local",
+                expect_usage=True,
+            )
+            assert flush_pending_stream_finish(
+                SESSION, provider="local", model=MODEL
+            )
+            assert not flush_pending_stream_finish(
+                SESSION, provider="local", model=MODEL
+            )
+
+        lines = _finished_lines(logger)
+        assert len(lines) == 1, lines
+        assert lines[0].count("tokens=") == 1
+
+    def test_remote_stream_without_usage_is_marked(self):
+        """A provider that reports no usage logs the marker immediately."""
+        from proxy.router_helpers import log_response_chunk
+
+        logger = MagicMock()
+        srv = MagicMock(logger=logger)
+        with patch("proxy.router_helpers._srv", return_value=srv):
+            log_response_chunk(
+                _finish_chunk(),
+                session_id="remote-1",
+                model="deepseek",
+                provider="deepseek",
+            )
+
+        lines = _finished_lines(logger)
+        assert len(lines) == 1, lines
+        # The marker sits where ``tokens=p/c/t`` sits: straight after reason.
+        assert lines[0].startswith("Stream finished: reason=stop tokens=missing")
+        assert "session=remote-1" in lines[0]
+
+    def test_buffered_reply_without_usage_is_marked(self):
+        """A completion body with no usage block names the missing data."""
+        from proxy.router_helpers import log_non_stream_usage
+
+        logger = MagicMock()
+        srv = MagicMock(logger=logger)
+        with patch("proxy.router_helpers._srv", return_value=srv):
+            log_non_stream_usage(
+                b'{"choices":[{"finish_reason":"stop","index":0,',
+                session_id=SESSION,
+                provider="local",
+            )
+
+        # Truncated/invalid JSON stays silent (nothing to report).
+        assert _finished_lines(logger) == []
+
+        with patch("proxy.router_helpers._srv", return_value=srv):
+            log_non_stream_usage(
+                json.dumps(
+                    {"choices": [{"index": 0, "message": {"content": "hi"}}]}
+                ).encode(),
+                session_id=SESSION,
+                model=MODEL,
+                provider="local",
+            )
+
+        lines = _finished_lines(logger)
+        assert len(lines) == 1, lines
+        assert "Stream finished: reason=stop tokens=missing stream=false" in lines[0]
+
+    def test_non_completion_body_logs_nothing(self):
+        """A body that is not a completion is not turned into a fake stream."""
+        from proxy.router_helpers import log_non_stream_usage
+
+        logger = MagicMock()
+        srv = MagicMock(logger=logger)
+        with patch("proxy.router_helpers._srv", return_value=srv):
+            log_non_stream_usage(
+                b'{"error":{"message":"boom"}}',
+                session_id=SESSION,
+                provider="local",
+            )
+
+        assert _finished_lines(logger) == []
 
 
 class TestUsageOnlyChunkDetection:
@@ -287,7 +422,12 @@ class TestNonStreamingUsageLine:
         assert f"session={SESSION}" in line
         assert "provider=local" in line
 
-    def test_buffered_reply_without_usage_logs_nothing(self):
+    def test_buffered_reply_without_usage_is_marked_missing(self):
+        """LP-0MVMBM6N400541EH AC1: no usage block \u2192 explicit marker.
+
+        Only bodies that are not completions at all (``None``, unparseable
+        JSON) stay silent \u2014 there is no terminal line to annotate.
+        """
         from proxy.router_helpers import log_non_stream_usage
 
         logger = MagicMock()
@@ -302,7 +442,10 @@ class TestNonStreamingUsageLine:
             log_non_stream_usage(None, session_id=SESSION, provider="local")
             log_non_stream_usage(b"not json", session_id=SESSION, provider="local")
 
-        assert _finished_lines(logger) == []
+        lines = _finished_lines(logger)
+        assert len(lines) == 1, lines
+        assert "tokens=missing" in lines[0]
+        assert "stream=false" in lines[0]
 
 
 # ---------------------------------------------------------------------------
