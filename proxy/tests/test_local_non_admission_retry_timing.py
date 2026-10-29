@@ -490,13 +490,14 @@ async def test_non_admission_exit_never_uses_the_eta_formula(
 
 
 @pytest.mark.asyncio
-async def test_context_too_large_refusal_is_not_time_retryable():
-    """An unfittable prompt: no timer, ``retryable: false``, compaction remedy.
+async def test_context_too_large_pin_local_is_promoted_not_refused():
+    """An unfittable prompt: promoted to remote, never given a retry timer.
 
     The same shape as ``prefill_budget_exceeded`` (AC5): waiting cannot make
-    the prompt fit a KV slot, so any advertised delay would invite futile
-    retries. The refusal still carries the token evidence a client needs to
-    size a compaction.
+    the prompt fit a KV slot, so a delay header would invite futile retries.
+    Since the pin slice (LP-0MVSLZY470051ZB2 AC4) the request is not refused at
+    all — the pin is declined and the remote tiers serve it, which is the
+    strongest form of "no timer": there is no local-capacity 429 to retry.
     """
     with (
         patch(
@@ -521,7 +522,40 @@ async def test_context_too_large_refusal_is_not_time_retryable():
     ):
         result, dispatched = await _issue()
 
-    assert dispatched == [], "a refused request is never dispatched"
+    assert dispatched == ["remote"], (
+        f"an oversized prompt must be promoted to the remote tier; "
+        f"dispatched={dispatched}"
+    )
+    assert result.status_code == 200, f"got {result.status_code}"
+    assert result.headers.get("X-Local-Route") == "remote"
+    assert result.headers.get("Retry-After") is None, (
+        "waiting cannot make an oversized prompt fit: a promoted request must "
+        "not advertise a delay"
+    )
+    body = json.loads(result.body)
+    assert body.get("code") != provider.EXHAUSTION_CODE_LOCAL_ADMISSION, (
+        "a too-large request must not receive a local-capacity refusal"
+    )
+    assert body.get("retryable") is not True
+
+
+@pytest.mark.asyncio
+async def test_context_too_large_refusal_keeps_its_no_timer_contract():
+    """The refusal builder still refuses this reason with no timer and evidence.
+
+    Direct-builder contract (the routing path now promotes, but the builder is
+    still the single refusal implementation and must keep its AC5 shape for any
+    caller that does refuse an oversized prompt): no ``Retry-After`` /
+    ``retry_at``, ``retryable: false``, compaction guidance and the token
+    evidence a client needs to size the compaction.
+    """
+    attempt = {
+        "reason": "context_too_large",
+        "new_tokens": PROMPT_NEW_TOKENS,
+        "budget_tokens": COLD_PREFILL_BUDGET_TOKENS,
+    }
+    result = provider._build_local_only_refusal_response(attempt)
+
     assert result.status_code == 429
     assert result.headers.get("X-Local-Route") == "refused"
     assert result.headers.get("X-Local-Fallback-Reason") == "context_too_large"
@@ -537,6 +571,8 @@ async def test_context_too_large_refusal_is_not_time_retryable():
     assert "compact" in str(body.get("suggested_action") or "").lower(), (
         "the suggested action must name compaction as the remedy"
     )
+    # The verdict is the body's classification of the refusal (wiring slice).
+    assert body.get("verdict") == "too_large"
 
     # The token evidence lets the client size the compaction (parent AC4).
     assert (

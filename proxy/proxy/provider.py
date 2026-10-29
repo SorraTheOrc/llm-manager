@@ -50,6 +50,7 @@ from proxy import cold_start, quota_pacing, quota_state
 #: ``PREF_LOCAL_PREFERRED``, so an alias-normalised ``local-only`` request still
 #: hits the same choke points (AC5).
 from proxy.admission_reserve import (
+    CAPACITY_TOO_LARGE,
     DEFAULT_PREFERENCE,
     PREF_LOCAL_ONLY,
     PREF_LOCAL_PREFERRED,
@@ -6512,6 +6513,80 @@ def _request_local_preference(request) -> str:
     return preference
 
 
+def _local_capacity_verdict_for_request(request):
+    """Return this request's local-capacity verdict (one implementation).
+
+    The verdict answers *why* the local route cannot serve the request right
+    now: ``deferrable`` when waiting can help (stay pinned to local) or
+    ``too_large`` when waiting cannot help (the request may fall through to a
+    remote provider).
+
+    Single-implementation contract (LP-0MVSLZY470051ZB2 AC3): the
+    classification comes from
+    :func:`admission_reserve.local_capacity_verdict` and never from a reason or
+    size table re-derived here — ``provider.py`` must not own a second verdict.
+    The evidence is what the routing cycle already recorded: the guard's own
+    decision (``request._local_admission_decision``), the skip reason stamped
+    by :func:`_note_local_fallback_reason` and the token evidence stamped by
+    :func:`_note_local_token_evidence`, so nothing is re-priced.
+
+    A verdict computed once per request before the dispatch loop
+    (``request._local_capacity_verdict``) is reused verbatim; without one the
+    verdict is derived from the live evidence and deliberately **not** cached,
+    because the recorded reason changes as the cycle walks its exits and a
+    stale ``too_large`` (or ``deferrable``) would silently re-route the
+    request.
+    """
+    cached = getattr(request, "_local_capacity_verdict", None)
+    if cached is not None:
+        return cached
+    from proxy import admission_reserve
+
+    evidence = getattr(request, LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR, None) or {}
+    return admission_reserve.local_capacity_verdict(
+        getattr(request, "_local_admission_decision", None),
+        reason=getattr(request, "_local_fallback_reason", None),
+        new_tokens=evidence.get("new_tokens"),
+        budget_tokens=evidence.get("budget_tokens"),
+    )
+
+
+def _local_preference_pins_local(request, preference: str | None = None) -> bool:
+    """True when *preference* pins this request to the local route.
+
+    The single pin decision (LP-0MVSLZY470051ZB2 AC3): every local-route exit
+    that would otherwise hand the request to a non-local provider asks this
+    predicate instead of comparing the preference itself, so the choke point,
+    the admission refusal and the free-slot guard cannot drift apart.
+
+    ``True`` only when the *resolved* preference is the canonical pin-local
+    value (``local-preferred``, including a legacy ``local-only`` header
+    normalised upstream by :func:`admission_reserve.parse_preference`) **and**
+    the capacity verdict is not ``too_large``:
+
+    * ``deferrable`` — waiting can help, so the request is never moved to a
+      paid provider (parent assumption A2): it is deferred or refused.
+    * ``too_large`` — waiting cannot help, so the request must fall through to
+      the remote tiers and must **not** be refused for local capacity
+      (parent AC4). Chain-level stripping and the promoted outcome line belong
+      to LP-0MVSM06LB001PRU4; this predicate only declines the pin.
+    * ``prefer-local`` / ``remote-ok`` / absent header — never pinned, exactly
+      as today (parent AC5).
+
+    Fail-safe direction (parent constraints): an unclassifiable exit stays
+    pinned, because
+    :func:`admission_reserve.local_capacity_verdict` defaults an unknown (or
+    absent) reason to ``deferrable`` — an unknown reason can therefore never
+    promote a fits-local request to a paid provider.
+    """
+    resolved = (
+        preference if preference is not None else _request_local_preference(request)
+    )
+    if resolved != PREF_LOCAL_PREFERRED:
+        return False
+    return _local_capacity_verdict_for_request(request).verdict != CAPACITY_TOO_LARGE
+
+
 def _admission_token_evidence(attempt: dict[str, Any], key: str) -> int | None:
     """Read one admission token count from *attempt*, or ``None`` when absent.
 
@@ -7028,12 +7103,17 @@ async def _build_local_only_refusal_for_remote(
     sibling reason-token item (LP-0MVRMC1W6003MV3Y) pins the per-branch
     vocabulary and narrows the generic fallback.
 
-    Inert for ``prefer-local`` / absent header / ``remote-ok`` clients and for
-    a local candidate (the request still completes locally), so AC3
-    byte-compatibility and the ``remote-ok`` strip are preserved. The refusal
-    is terminal for the request: no attempt/cooldown/budget state is written
-    and the request is never enqueued, so the response is stamped exactly
-    once and no contention-queue slot/lease is leaked.
+    Inert for a local candidate (the request still completes locally) and,
+    through the single pin predicate
+    :func:`_local_preference_pins_local`, for ``prefer-local`` / absent header /
+    ``remote-ok`` clients, so AC3 byte-compatibility and the ``remote-ok``
+    strip are preserved. The predicate also declines the pin when the request's
+    capacity verdict is ``too_large`` (LP-0MVSLZY470051ZB2 AC4): a prompt that
+    outgrows the local serving envelope is never refused for local capacity —
+    it falls through to the remote tiers. The refusal is terminal for the
+    request: no attempt/cooldown/budget state is written and the request is
+    never enqueued, so the response is stamped exactly once and no
+    contention-queue slot/lease is leaked.
 
     The refusal's retry story is reason-driven: a non-admission exit advertises
     the real expiry it recorded (or one recomputed from live local availability
@@ -7049,7 +7129,7 @@ async def _build_local_only_refusal_for_remote(
     consults :func:`admission_reserve.local_capacity_verdict`. Both dispatch
     cycles therefore reach the same single verdict computation.
     """
-    if preference != PREF_LOCAL_PREFERRED:
+    if not _local_preference_pins_local(request, preference):
         return None
     if provider_cfg.get("type", "remote") == "local":
         return None
@@ -7475,13 +7555,16 @@ async def _maybe_queue_for_local_slot(
             setattr(request, "_local_admission_decision", _admission)
         except Exception:
             pass
-        # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): with a pin-local
-        # ``X-Local-Preference`` (``local-preferred``, incl. the normalised
-        # legacy ``local-only`` alias) the client must never be moved
-        # remote. The caller turns this into the retryable 429 admission
-        # response instead of falling through to the next provider.
+        # Explicit client intent (LP-0MVIKPCSG002B0NL AC4 / pin slice
+        # LP-0MVSLZY470051ZB2 AC1/AC2): the single pin predicate. With a
+        # pin-local preference (``local-preferred``, incl. the normalised
+        # legacy ``local-only`` alias) and a ``deferrable`` capacity verdict
+        # the client must never be moved remote; the caller turns this into
+        # the retryable 429 admission response instead of falling through to
+        # the next provider. A ``too_large`` verdict declines the pin, so the
+        # request keeps the ``admission_reject`` fall-through with no 429.
         _preference = _request_local_preference(request)
-        if _preference == PREF_LOCAL_PREFERRED:
+        if _local_preference_pins_local(request, _preference):
             return ("refused_local_only", _admission.reason, None)
         return ("admission_reject", _admission.reason, None)
 
@@ -11900,11 +11983,16 @@ async def _proxy_with_fallback_cycle(
                         )
                     except Exception:
                         pass
-                    # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): a
-                    # pin-local client (``local-preferred`` or its normalised
-                    # ``local-only`` alias) must never be moved remote — the
-                    # caller turns the decision into the retryable 429.
-                    if _preference == PREF_LOCAL_PREFERRED:
+                    # Explicit client intent (LP-0MVIKPCSG002B0NL AC4 / pin
+                    # slice LP-0MVSLZY470051ZB2 AC1/AC2): the single pin
+                    # predicate. A pin-local client (``local-preferred`` or
+                    # its normalized ``local-only`` alias) with a
+                    # ``deferrable`` capacity verdict must never be moved
+                    # remote — the caller turns the decision into the
+                    # retryable 429. A ``too_large`` verdict (e.g.
+                    # ``prefill_budget_exceeded``) declines the pin and keeps
+                    # the direct-guard fall-through to the next provider.
+                    if _local_preference_pins_local(request, _preference):
                         fallback_reason = "local_admission_guard"
                         prev_provider = provider_name
                         all_slot_exhaustion = False

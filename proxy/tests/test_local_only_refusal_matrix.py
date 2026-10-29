@@ -44,12 +44,21 @@ the TDD red phase for the wiring child (LP-0MVSMINPR006SWT6): they started
 ``xfail(strict=True)`` because the 429 body had no ``verdict`` field, and that
 child flipped them green in the same change that added it — a red row now means
 the verdict contract broke.
+
+Pin slice (LP-0MVSLZY470051ZB2): the verdict now decides *whether* the pin holds.
+A ``deferrable`` exit is refused (``calls == []``, 429, ``X-Local-Route:
+refused``); a ``too_large`` exit declines the pin and is served by the remote
+tiers (``calls == ["remote"]``, 200, no local-capacity 429) — the boundary that
+removed the incident's "All providers exhausted" dead end. Both wire spellings
+(the ``local-only`` alias and ``local-preferred``) are asserted per row, and the
+two post-dispatch rows prove the pin also holds *after* a local dispatch failed.
 """
 
 from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, patch
@@ -78,6 +87,7 @@ LOCAL_PROVIDER_NAME = "local-llama"
 REMOTE_PROVIDER_NAME = "remote-fallback"
 
 LOCAL_ONLY = "local-only"
+LOCAL_PREFERRED = "local-preferred"
 PREFER_LOCAL = "prefer-local"
 REMOTE_OK = "remote-ok"
 
@@ -156,6 +166,11 @@ class _ExitRow:
     local_entry: dict = field(default_factory=dict)
     #: Drop the local entry from the chain entirely (no local route at all).
     remote_only_chain: bool = False
+    #: A callable building the response the patched local stub returns. Used
+    #: by the post-dispatch rows, which prove the pin holds even after the
+    #: local route was genuinely attempted and then failed. ``None`` means
+    #: "serve like a healthy local" (the shared stub in :func:`_issue`).
+    local_response: Callable[[], Response] | None = None
 
 
 _EXIT_ROWS: tuple[_ExitRow, ...] = (
@@ -255,16 +270,40 @@ _EXIT_ROWS: tuple[_ExitRow, ...] = (
         exit_description="the chain has no local entry at all",
         remote_only_chain=True,
     ),
+    # Post-dispatch exits (LP-0MVSLZY470051ZB2 AC1): the local route is
+    # genuinely attempted once and then fails, so the refusal must come from
+    # the loop-head choke point on the next iteration — the structural proof
+    # that the pin holds *after* the local dispatch, not just before it.
+    _ExitRow(
+        trigger="local_error_status",
+        token=provider.LOCAL_ROUTE_UNAVAILABLE,
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
+        exit_description=(
+            "post-dispatch: the local provider returned an upstream 500 error"
+        ),
+        local_response=lambda: Response(
+            content=b'{"error":"internal"}',
+            status_code=500,
+            media_type="application/json",
+        ),
+    ),
+    _ExitRow(
+        trigger="local_empty_response",
+        token=provider.LOCAL_ROUTE_UNAVAILABLE,
+        expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
+        exit_description=(
+            "post-dispatch: the local provider returned an empty response"
+        ),
+        local_response=lambda: Response(content=b"", status_code=200),
+    ),
 )
 
 #: Every row is asserted green: the choke point (LP-0MVRMC1L3006F0F3)
-#: refuses every exit and the reason-token child (LP-0MVRMC1W6003MV3Y)
-#: records the per-branch chain tokens. A future red row is a real failure —
-#: the xfail marker machinery died with the behaviour it pinned.
-
-_LOCAL_ONLY_PARAMS = [
-    pytest.param(row, id=row.trigger) for row in _EXIT_ROWS
-]
+#: refuses every deferrable exit, the reason-token child
+#: (LP-0MVRMC1W6003MV3Y) records the per-branch chain tokens, and the pin
+#: slice (LP-0MVSLZY470051ZB2) declines the pin on the ``too_large`` rows.
+#: A future red row is a real failure — the xfail marker machinery died with
+#: the behaviour it pinned.
 
 
 def _model_config(row: _ExitRow) -> dict:
@@ -404,6 +443,10 @@ def _row_patches(row: _ExitRow) -> list:
         patches.append(_local_entry_in_cooldown())
     elif trigger == "no_local_route":
         pass
+    elif trigger in ("local_error_status", "local_empty_response"):
+        # Post-dispatch failures: the shared patches already leave a free slot
+        # so the loop discovers the failure at the dispatch itself.
+        pass
     else:  # pragma: no cover - a new row must name its trigger
         raise AssertionError(f"unknown local-route exit trigger {trigger!r}")
     return patches
@@ -420,7 +463,8 @@ async def _issue(row: _ExitRow, preference: str | None) -> tuple:
 
     async def _local(_req, _path):
         calls.append("local")
-        return _ok_response()
+        response_factory = row.local_response or _ok_response
+        return response_factory()
 
     async def _remote(_req, _path, _pc):
         calls.append("remote")
@@ -489,6 +533,8 @@ def test_matrix_has_exactly_one_row_per_local_route_exit():
         "quota_hard_stop",
         "chain_cooldown",
         "no_local_route",
+        "local_error_status",
+        "local_empty_response",
     }, "a local-route exit is missing from (or unexpected in) the matrix"
 
     for row in _EXIT_ROWS:
@@ -507,28 +553,66 @@ def test_matrix_has_exactly_one_row_per_local_route_exit():
 
 
 # ---------------------------------------------------------------------------
-# AC1 + AC2: local-only ⇒ refusal, on every exit, with no remote dispatch
+# AC1 + AC2: a pin-local client is NEVER moved to a paid provider
 # ---------------------------------------------------------------------------
+
+#: Both wire spellings of the pin-local intent. ``local-only`` is accepted as a
+#: deprecated alias and normalised to ``local-preferred`` by
+#: ``admission_reserve.parse_preference()``, so every row must behave
+#: identically for both — asserted, not assumed (parent AC5).
+PIN_LOCAL_PREFERENCES = (LOCAL_ONLY, LOCAL_PREFERRED)
+
+#: Rows whose exit is temporal (waiting can help): the pin holds and the
+#: request is refused instead of being promoted.
+_DEFERRABLE_ROWS = tuple(
+    row
+    for row in _EXIT_ROWS
+    if row.expected_verdict == admission_reserve.CAPACITY_DEFERRABLE
+)
+#: Rows whose exit is a request-size/context condition (waiting cannot help):
+#: the pin is declined and the remote tiers serve the request.
+_TOO_LARGE_ROWS = tuple(
+    row for row in _EXIT_ROWS if row.expected_verdict == admission_reserve.CAPACITY_TOO_LARGE
+)
+
+
+def _row(trigger: str) -> _ExitRow:
+    """Return the matrix row named *trigger* (single-selection helper)."""
+    for row in _EXIT_ROWS:
+        if row.trigger == trigger:
+            return row
+    raise AssertionError(f"no matrix row named {trigger!r}")  # pragma: no cover
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("row", _LOCAL_ONLY_PARAMS)
-async def test_local_only_refuses_instead_of_dispatching_remote(row: _ExitRow):
-    """Every exit: 429 refusal naming the reason, and nothing dispatched.
+@pytest.mark.parametrize("row", _DEFERRABLE_ROWS, ids=[r.trigger for r in _DEFERRABLE_ROWS])
+@pytest.mark.parametrize("preference", PIN_LOCAL_PREFERENCES)
+async def test_pin_local_refuses_instead_of_dispatching_remote(
+    row: _ExitRow, preference: str
+):
+    """Every deferrable exit: 429 refusal naming the reason, nothing dispatched.
 
-    The assertion that carries the incident is ``calls == []``: a
-    ``local-only`` client must be neither served locally *nor* handed to a
-    remote provider, whatever reason the local route was unavailable.
+    The assertion that carries the incident is ``calls == []``: a pin-local
+    client with a **deferrable** verdict must be neither served locally by a
+    remote provider's turn nor handed to one, whatever reason the local route
+    was unavailable (parent assumption A2 — a fits-local request is never
+    promoted to a paid provider).
+
+    The queue/lease invariants of AC6 ride along here: the refusal is terminal,
+    so no waiter survives it and ``X-Local-Route`` is stamped exactly once.
     """
-    result, calls = await _issue(row, LOCAL_ONLY)
+    depth_before = contention_queue.queue_depth()
+    result, calls = await _issue(row, preference)
 
-    assert calls == [], (
-        f"{row.exit_description}: a local-only request must never be dispatched "
-        f"(dispatched={calls}) — it is refused, not moved to a paid provider"
+    expected = ["local"] if row.local_response is not None else []
+    assert calls == expected, (
+        f"{row.exit_description}: a pin-local ({preference}) request must never "
+        f"reach a remote provider (dispatched={calls}); at most the single "
+        f"local attempt of a post-dispatch exit is expected {expected}"
     )
     assert result.status_code == 429, (
-        f"{row.exit_description}: local-only means the refusal, got "
-        f"{result.status_code}"
+        f"{row.exit_description}: a deferrable pin-local request means the "
+        f"refusal, got {result.status_code}"
     )
     assert result.headers.get("X-Local-Route") == "refused", (
         f"{row.exit_description}: the response must declare the refusal"
@@ -538,6 +622,10 @@ async def test_local_only_refuses_instead_of_dispatching_remote(row: _ExitRow):
         f"{row.token!r}, got "
         f"{result.headers.get('X-Local-Fallback-Reason')!r}"
     )
+    assert result.headers.getlist("x-local-route") == ["refused"], (
+        f"{row.exit_description}: X-Local-Route must be stamped exactly once, "
+        f"got {result.headers.getlist('x-local-route')!r}"
+    )
     # The refusal is the stable code/header contract, not prose: an
     # unparseable body or a 5xx would break clients that classify on it.
     body = json.loads(result.body)
@@ -546,7 +634,115 @@ async def test_local_only_refuses_instead_of_dispatching_remote(row: _ExitRow):
         f"{row.exit_description}: body reason and header must agree, got "
         f"{body.get('reason')!r}"
     )
+    # AC6: the refusal neither enqueues a new waiter nor leaks the queue —
+    # the depth is unchanged from before the request (the ``queue_depth_cap``
+    # row pre-seeds its single holder and must be excluded from the count).
+    seeded = 1 if row.trigger == "queue_depth_cap" else 0
+    assert contention_queue.queue_depth() == depth_before + seeded, (
+        f"{row.exit_description}: the refusal must leave the queue exactly as "
+        f"it found it (depth {depth_before} + {seeded} seeded -> "
+        f"{contention_queue.queue_depth()})"
+    )
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", _TOO_LARGE_ROWS, ids=[r.trigger for r in _TOO_LARGE_ROWS])
+@pytest.mark.parametrize("preference", PIN_LOCAL_PREFERENCES)
+async def test_too_large_exits_promote_instead_of_refusing(
+    row: _ExitRow, preference: str
+):
+    """Every request-size exit: the pin is declined, remote serves, no 429.
+
+    Parent AC4 / pin slice AC4: a prompt that outgrows the local serving
+    envelope cannot be helped by waiting, so it must reach the remote tiers
+    and must **not** receive a local-capacity 429 (the "All providers
+    exhausted" dead end the incident reported). Chain-level stripping of the
+    local entry and the promoted outcome line belong to LP-0MVSM06LB001PRU4;
+    this row pins the refusal boundary only.
+    """
+    result, calls = await _issue(row, preference)
+
+    assert calls == ["remote"], (
+        f"{row.exit_description}: a too-large pin-local request must fall "
+        f"through to the remote tiers (dispatched={calls})"
+    )
+    assert result.status_code == 200, (
+        f"{row.exit_description}: a too-large request must not be refused for "
+        f"local capacity, got {result.status_code}"
+    )
+    assert result.headers.get("X-Local-Route") == "remote", (
+        f"{row.exit_description}: the remote route must be reported, got "
+        f"{result.headers.get('X-Local-Route')!r}"
+    )
+    body = json.loads(result.body)
+    assert body.get("code") != provider.EXHAUSTION_CODE_LOCAL_ADMISSION, (
+        f"{row.exit_description}: no local-capacity refusal may be produced"
+    )
+    assert b"All providers exhausted" not in result.body, (
+        f"{row.exit_description}: promotion must not report chain exhaustion"
+    )
+    assert contention_queue.queue_depth() == 0, (
+        f"{row.exit_description}: a promoted request never enters the queue"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC3: one pin decision, one verdict source
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["chain_cooldown", "admission_guard_free_slot"])
+async def test_pin_predicate_is_the_only_pin_decision(trigger: str):
+    """Declining the predicate is enough to turn the refusal into a fall-through.
+
+    Both routes that can refuse a deferrable pin-local request are exercised —
+    the loop-head choke point (``chain_cooldown``) and the admission refusal
+    (``admission_guard_free_slot``) — so neither may carry its own preference
+    comparison: patching the one predicate changes both outcomes (parent AC3).
+    """
+    row = _row(trigger)
+    with patch.object(provider, "_local_preference_pins_local", lambda *a, **k: False):
+        result, calls = await _issue(row, LOCAL_PREFERRED)
+
+    assert calls == ["remote"], (
+        f"{row.exit_description}: the pin predicate alone must decide the "
+        f"refusal (dispatched={calls})"
+    )
+    assert result.status_code == 200, (
+        f"{row.exit_description}: a declined pin must fall through, got "
+        f"{result.status_code}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pin_verdict_comes_only_from_the_shared_capacity_helper():
+    """A spy verdict flips the routing decision — provider.py owns no table.
+
+    Forcing ``too_large`` out of
+    :func:`admission_reserve.local_capacity_verdict` promotes a row whose
+    reason is plainly temporal. Only a single verdict source can make that
+    happen, so any re-derived classification inside ``provider.py`` would fail
+    here (parent AC3).
+    """
+    row = _row("chain_cooldown")
+    forced = admission_reserve.CapacityVerdict(
+        verdict=admission_reserve.CAPACITY_TOO_LARGE, reason=row.token
+    )
+    with patch(
+        "proxy.admission_reserve.local_capacity_verdict", return_value=forced
+    ) as spy:
+        result, calls = await _issue(row, LOCAL_PREFERRED)
+
+    assert spy.called, (
+        "the pin decision must consult local_capacity_verdict(); re-deriving "
+        "the classification in provider.py is the defect this pins"
+    )
+    assert calls == ["remote"], (
+        f"{row.exit_description}: the helper's verdict must drive the pin "
+        f"(dispatched={calls})"
+    )
+    assert result.status_code == 200, f"got {result.status_code}"
 
 # ---------------------------------------------------------------------------
 # AC1 (LP-0MVSMRT5R009EKP9): the refusal body reports the row's verdict
@@ -561,19 +757,24 @@ async def test_local_only_refuses_instead_of_dispatching_remote(row: _ExitRow):
 #: deleting this entry.
 _VERDICT_NOT_APPLICABLE = frozenset({"admission_guard_free_slot"})
 
+#: Rows that no longer produce a refusal body at all: the pin slice
+#: (LP-0MVSLZY470051ZB2 AC4) declines the pin for a ``too_large`` verdict, so
+#: those requests are served remotely instead of being refused.
 _VERDICT_PARAMS = [
     pytest.param(
         row,
         id=row.trigger,
         marks=pytest.mark.skip(
             reason=(
-                "the 429 for the free-slot direct path is the admission-reject/"
-                "exhausted payload, which carries no verdict yet "
-                "(LP-0MVSMINPR006SWT6 boundary; follow-up LP-0MVSS435600370D6)"
+                "no refusal body on this row: the free-slot direct path uses "
+                "the admission-reject/exhausted payload (verdict wiring owned "
+                "by LP-0MVSS435600370D6), and a too-large exit is promoted to "
+                "the remote tiers instead of refused (LP-0MVSLZY470051ZB2 AC4)"
             )
         ),
     )
     if row.trigger in _VERDICT_NOT_APPLICABLE
+    or row.expected_verdict == admission_reserve.CAPACITY_TOO_LARGE
     else pytest.param(row, id=row.trigger)
     for row in _EXIT_ROWS
 ]
@@ -581,22 +782,24 @@ _VERDICT_PARAMS = [
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("row", _VERDICT_PARAMS)
-async def test_local_only_refusal_body_reports_the_row_verdict(row: _ExitRow):
-    """Every exit: the refusal body classifies why local could not serve.
+@pytest.mark.parametrize("preference", PIN_LOCAL_PREFERENCES)
+async def test_refusal_body_reports_the_row_verdict(row: _ExitRow, preference: str):
+    """Every refusing exit: the body classifies why local could not serve.
 
-    ``too_large`` means waiting cannot help (the request exceeds the local
-    serving envelope); ``deferrable`` means the block is temporal, so a
-    ``local-only`` client should retry rather than re-size. The mapping is
-    pinned per row so a new exit cannot ship without stating its verdict.
+    ``deferrable`` means the block is temporal, so a pin-local client should
+    retry rather than re-size. The mapping is pinned per row so a new exit
+    cannot ship without stating its verdict; both wire spellings are asserted
+    because the alias must not change the body (parent AC5).
     """
-    result, calls = await _issue(row, LOCAL_ONLY)
+    result, calls = await _issue(row, preference)
 
-    assert calls == [], (
+    expected = ["local"] if row.local_response is not None else []
+    assert calls == expected, (
         f"{row.exit_description}: a verdict assertion still assumes the "
-        f"refusal path (dispatched={calls})"
+        f"refusal path (dispatched={calls}, expected={expected})"
     )
     assert result.status_code == 429, (
-        f"{row.exit_description}: expected the local-only refusal, got "
+        f"{row.exit_description}: expected the pin-local refusal, got "
         f"{result.status_code}"
     )
     body = json.loads(result.body)
@@ -626,9 +829,10 @@ async def test_prefer_local_keeps_todays_remote_fall_through(
     """
     result, calls = await _issue(row, preference)
 
-    assert calls == ["remote"], (
+    expected = ["local", "remote"] if row.local_response is not None else ["remote"]
+    assert calls == expected, (
         f"{row.exit_description}: prefer-local must fall through to the next "
-        f"provider exactly as today (dispatched={calls})"
+        f"provider exactly as today (dispatched={calls}, expected={expected})"
     )
     assert result.status_code == 200, (
         f"{row.exit_description}: the default client keeps the remote answer, "

@@ -854,18 +854,35 @@ def _assert_prefill_budget_refusal_contract(result) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_prefill_budget_exceeded_local_only_refusal_is_not_time_retryable(
+async def test_prefill_budget_exceeded_pin_local_is_promoted_not_refused(
     mixed_model_config,
 ):
-    """Local-only client, remote still available: 429 without ``Retry-After``."""
+    """The 2026-10-25 shape: a too-large pin-local request is promoted.
+
+    The incident prompt outgrows the local serving envelope, so waiting cannot
+    help: the pin is declined and the remote tiers serve the request — no 429,
+    no ``Retry-After``, no local-capacity refusal body (LP-0MVSLZY470051ZB2
+    AC4; parent AC5). The no-timer contract for this reason still holds on the
+    exhaustion path, asserted by
+    ``test_prefill_budget_exceeded_exhaustion_refusal_is_not_time_retryable``.
+    """
     result, calls = await _issue_local_only_prefill_budget_refusal(
         mixed_model_config
     )
 
-    assert calls == [], "a local-only client must never be moved remote"
-    body = _assert_prefill_budget_refusal_contract(result)
-    assert body["reason"] == "prefill_budget_exceeded"
-    assert result.headers.get("X-Local-Route") == "refused"
+    assert calls == ["remote"], (
+        f"a too-large pin-local request must be served by the remote tier; "
+        f"got dispatches={calls}"
+    )
+    assert result.status_code == 200, f"got {result.status_code}"
+    assert result.headers.get("X-Local-Route") == "remote"
+    assert result.headers.get("Retry-After") is None, (
+        "waiting cannot help; the promoted response must not advertise a delay"
+    )
+    body = json.loads(result.body)
+    assert body.get("code") != provider.EXHAUSTION_CODE_LOCAL_ADMISSION, (
+        "promotion must not produce a local-capacity refusal"
+    )
 
 
 @pytest.mark.asyncio
@@ -1391,6 +1408,11 @@ class _RefusalContractRow:
     trigger: str
     #: ``True`` when waiting helps, so the refusal must advertise a timer.
     time_retryable: bool
+    #: ``True`` when the reason is ``too_large`` and the pin is therefore
+    #: declined (LP-0MVSLZY470051ZB2 AC4): the request is promoted to the
+    #: remote tiers rather than refused, so the row asserts the promotion
+    #: shape (no 429, no timer) instead of the refusal shape.
+    promoted: bool = False
     #: The AC2 occupancy case that reaches this reason, when applicable.
     occupancy_case: _OccupancyRefusalCase | None = None
     #: ``new_tokens`` the refusal must advertise. Defaults to the shared
@@ -1422,16 +1444,24 @@ _REFUSAL_CONTRACT_ROWS = [
     _occupancy_row("eta_exceeds_budget_direct"),
     _occupancy_row("prefill_eta_exceeds_deadline"),
     _occupancy_row("prefill_eta_exceeds_safety_budget"),
-    # Permanently over the flat cold-prefill cap: time cannot heal it.
+    # Permanently over the flat cold-prefill cap: time cannot heal it. The
+    # pin is declined for a too-large verdict (LP-0MVSLZY470051ZB2 AC4), so
+    # the row asserts promotion to the remote tiers — the no-timer contract
+    # still holds because waiting cannot help.
     _RefusalContractRow(
         reason="prefill_budget_exceeded",
         trigger="prefill_budget",
         time_retryable=False,
+        promoted=True,
         expected_new_tokens=INCIDENT_NEW_TOKENS,
     ),
-    # Cannot fit a KV slot: the remedy is compaction, not a wait.
+    # Cannot fit a KV slot: the remedy is compaction, not a wait. Same
+    # promotion boundary as the row above.
     _RefusalContractRow(
-        reason="context_too_large", trigger="context_bypass", time_retryable=False
+        reason="context_too_large",
+        trigger="context_bypass",
+        time_retryable=False,
+        promoted=True,
     ),
     # A real, finite unavailability: waiting helps, for the cooldown's length.
     _RefusalContractRow(
@@ -1570,8 +1600,40 @@ def test_refusal_contract_table_has_exactly_one_row_per_reason():
 async def test_refusal_reason_follows_the_contract_table(
     row: _RefusalContractRow, mixed_model_config
 ):
-    """Per reason: status, timer presence/absence, reason naming, token evidence."""
+    """Per reason: status, timer presence/absence, reason naming, token evidence.
+
+    A ``too_large`` row (``promoted=True``) asserts the promotion shape
+    instead: remote serves the request with no refusal and no timer, because
+    waiting cannot help and the pin is declined (LP-0MVSLZY470051ZB2 AC4).
+    """
     result, dispatched = await _issue_refusal(row, mixed_model_config)
+
+    if row.promoted:
+        assert dispatched == ["remote"], (
+            f"{row.reason}: a too-large pin-local request must reach the "
+            f"remote tiers (dispatched={dispatched})"
+        )
+        assert result.status_code == 200, (
+            f"{row.reason}: too-large must not be refused for local capacity, "
+            f"got {result.status_code}"
+        )
+        headers = result.headers
+        body = json.loads(result.body)
+        assert headers.get("X-Local-Route") == "remote", (
+            f"{row.reason}: promotion reports the remote route"
+        )
+        # Waiting cannot help: even a promoted request never advertises a
+        # delay header it would not honour (parent retry contract).
+        assert headers.get("Retry-After") is None, (
+            f"{row.reason}: waiting cannot help a too-large request"
+        )
+        assert body.get("retryable") is not True, (
+            f"{row.reason}: no retryable flag on a promoted request"
+        )
+        assert body.get("code") != provider.EXHAUSTION_CODE_LOCAL_ADMISSION, (
+            f"{row.reason}: promotion is not a local-capacity refusal"
+        )
+        return
 
     assert dispatched == [], (
         f"{row.reason}: a refused request must never be dispatched locally or "
@@ -1931,17 +1993,65 @@ async def test_choke_point_refusal_logs_one_verdict_line(caplog):
 
 
 @pytest.mark.asyncio
-async def test_pin_local_refusal_logs_exactly_one_verdict_line(caplog):
-    """AC3: the end-to-end pin-local refusal logs one line, never per exit."""
+async def test_too_large_pin_local_promotes_instead_of_refusing(caplog):
+    """Pin AC4: a too-large pin-local request must not be refused for capacity.
+
+    The incident shape (``prefill_budget_exceeded``) outgrows the local
+    serving envelope; waiting cannot help, so the pin is declined and the
+    remote tiers serve the request — no 429, no refusal line, no promotion of
+    a fits-local request either (LP-0MVSLZY470051ZB2 AC4; the chain-level
+    strip belongs to LP-0MVSM06LB001PRU4).
+    """
     caplog.set_level(logging.INFO, logger="llama-proxy")
 
     result, calls = await _issue_guard_refusal("local-only")
 
-    assert result.status_code == 429
-    assert calls == [], "a pin-local client must never be moved remote"
-    lines = _local_only_refusal_lines(caplog)
-    assert len(lines) == 1, f"one line per refusal; got {lines!r}"
-    fields = _parse_verdict_kv(lines[0])
-    assert fields.get("verdict") == "too_large" or fields.get("verdict") == "deferrable"
-    assert fields.get("reason") == "prefill_budget_exceeded"
-    assert fields.get("preference") in {"local-only", "local-preferred"}
+    assert result.status_code == 200, (
+        f"a too-large request must fall through to remote, got "
+        f"{result.status_code}"
+    )
+    assert calls == ["remote"], f"the remote tiers must serve; got {calls!r}"
+    assert _local_only_refusal_lines(caplog) == [], (
+        "a too-large request must not produce a pin-local refusal line"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preference", ["local-preferred", "local-only"])
+async def test_pin_local_with_a_free_slot_is_served_locally(
+    mixed_model_config, preference
+):
+    """Pin AC2: a pin-local request that fits and finds a slot is served locally.
+
+    The pin only ever removes the *remote* option; a request local can serve
+    right now must be served locally with no refusal, no queueing and a single
+    ``X-Local-Route: local`` stamp (parent AC2 / AC6). Both wire spellings are
+    asserted because the ``local-only`` alias must keep working.
+    """
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"x-local-preference": preference}),
+            "v1/chat/completions",
+            mixed_model_config,
+            _queue_cfg(),
+        )
+
+    assert result.status_code == 200, f"got {result.status_code}"
+    assert calls == ["local"], f"the local route must serve; got {calls!r}"
+    assert result.headers.get("X-Local-Route") == "local"
+    assert contention_queue.queue_depth() == 0
