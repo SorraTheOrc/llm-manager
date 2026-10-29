@@ -802,3 +802,566 @@ async def test_prefer_local_fall_through_logs_no_refusal_line(caplog):
     assert [
         m for m in _messages(caplog) if m.startswith("local_only_refused ")
     ] == [], "a prefer-local request is served remotely, never refused"
+
+
+# ---------------------------------------------------------------------------
+# The single per-request routing-outcome line (LP-0MVSM06Z8003UQTM)
+#
+# Every request emits exactly **one** ``local_preference_resolved`` line naming
+# the resolved preference, the outcome and the recorded reason token. The line
+# is emitted from ``_stamp_local_route_headers()`` — the top-level return choke
+# point both entries reach once, *after* ``_run_chain_cycles()`` — so neither a
+# per-skip branch nor a chain-hold retry cycle can duplicate it.
+#
+# The assertions here are deliberately per-outcome rather than one aggregate
+# check: the point of the line is that an operator can tell a deferral
+# (``outcome=deferred reason=fallback_after_queue``) from chain exhaustion
+# (``outcome=exhausted``) without correlating the per-skip lines, and that a
+# legacy ``local-only`` request is reported under its normalised value.
+# ---------------------------------------------------------------------------
+
+RESOLVED_LINE_PREFIX = "local_preference_resolved "
+
+
+def _resolved_lines(caplog) -> list[str]:
+    """Every ``local_preference_resolved`` line captured in *caplog*."""
+    return [
+        message
+        for message in _messages(caplog)
+        if message.startswith(RESOLVED_LINE_PREFIX)
+    ]
+
+
+def _one_resolved_line(caplog) -> dict[str, str]:
+    """The request's single outcome line, parsed; asserts ``count == 1``."""
+    lines = _resolved_lines(caplog)
+    assert len(lines) == 1, (
+        "exactly one local_preference_resolved line per request is required "
+        f"(AC1/AC5); got {len(lines)}: {lines!r}"
+    )
+    return _parse_kv(lines[0])
+
+
+def _assert_outcome(
+    caplog,
+    *,
+    outcome: str,
+    preference: str,
+    reason: str,
+    session: str = "unknown",
+) -> dict[str, str]:
+    """Assert the one line's outcome/preference/reason/session/model fields."""
+    fields = _one_resolved_line(caplog)
+    assert fields.get("outcome") == outcome, (
+        f"expected outcome={outcome}, got {fields.get('outcome')!r}: {fields!r}"
+    )
+    assert fields.get("preference") == preference, (
+        f"expected preference={preference}, got {fields.get('preference')!r}: "
+        f"{fields!r}"
+    )
+    assert fields.get("reason") == reason, (
+        f"expected reason={reason}, got {fields.get('reason')!r}: {fields!r}"
+    )
+    assert fields.get("session") == session, (
+        f"expected session={session}, got {fields.get('session')!r}: {fields!r}"
+    )
+    assert fields.get("model") == MODEL_NAME, (
+        f"the line must name the model it routed, got {fields.get('model')!r}"
+    )
+    return fields
+
+
+@pytest.mark.asyncio
+async def test_local_success_logs_the_local_outcome_once(caplog):
+    """AC1/AC2: a locally served request reports ``outcome=local``."""
+    result = await _issue(_row("clean"), None)
+
+    assert result.status_code == 200
+    _assert_outcome(
+        caplog,
+        outcome=provider.LOCAL_ROUTING_OUTCOME_LOCAL,
+        preference=DEFAULT_PREFERENCE,
+        reason="none",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preference", [LOCAL_PREFERRED, LOCAL_ONLY])
+async def test_pin_refusal_logs_the_pinned_outcome_once(preference, caplog):
+    """AC1/AC2: a refused pin-local request reports ``outcome=pinned``.
+
+    The reason token is the recorded skip reason, so the line says *why* the
+    request was pinned instead of forcing an operator to correlate the
+    ``local_only_refused`` line with the ``Skipping provider=…`` line.
+    """
+    result = await _issue(_row("chain_cooldown"), preference)
+
+    assert result.status_code == 429
+    _assert_outcome(
+        caplog,
+        outcome=provider.LOCAL_ROUTING_OUTCOME_PINNED,
+        preference=LOCAL_PREFERRED,
+        reason="local_provider_cooldown",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trigger", "expected_reason"),
+    [
+        pytest.param("queue_depth_cap", "fallback_after_queue", id="depth-cap"),
+        pytest.param("lease_fallback", "local_lease_active", id="lease-active"),
+    ],
+)
+async def test_deferral_logs_the_deferred_outcome_once(
+    trigger, expected_reason, caplog
+):
+    """AC2: a spent deferral is distinguishable from chain exhaustion.
+
+    ``outcome=deferred`` with the queue/lease reason token is the whole point of
+    the line: the incident's dead end reported "All providers exhausted" for a
+    request that was really waiting on local capacity, and an operator reading
+    only that could not tell the two apart.
+    """
+    result = await _issue(_row(trigger), LOCAL_PREFERRED)
+
+    assert result.status_code == 429
+    fields = _assert_outcome(
+        caplog,
+        outcome=provider.LOCAL_ROUTING_OUTCOME_DEFERRED,
+        preference=LOCAL_PREFERRED,
+        reason=expected_reason,
+    )
+    assert fields.get("outcome") != provider.LOCAL_ROUTING_OUTCOME_EXHAUSTED, (
+        "a deferral must never be reported as chain exhaustion"
+    )
+
+
+#: The matrix's ``entry_context_cap`` shape: a local entry whose own ceiling is
+#: below the priced prompt, so the pre-loop verdict strips local.
+PROMOTED_LOCAL_CAP_TOKENS = PROMPT_TOKENS // 2
+
+
+def _promoted_model_config() -> dict:
+    return {
+        "name": MODEL_NAME,
+        "providers": [
+            {
+                "name": LOCAL_PROVIDER_NAME,
+                "type": "local",
+                "llama_model": "Qwen3",
+                "max_context_tokens": PROMOTED_LOCAL_CAP_TOKENS,
+            },
+            {
+                "name": REMOTE_PROVIDER_NAME,
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+            },
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+
+def _promoted_config() -> dict:
+    return {
+        "provider_cooldown_seconds": 60,
+        "server": {
+            "session_slot_pool_size": 1,
+            "contention_queue_policy": "queue",
+            "contention_queue_max_wait_seconds": WAIT_BUDGET_SECONDS,
+            "contention_queue_max_depth": 4,
+            "local_model_ctx_size": 0,
+            "local_prefill_deadline_seconds": 0,
+            "local_large_context_cold_cache_threshold": 1_000,
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preference", [LOCAL_PREFERRED, LOCAL_ONLY])
+async def test_too_large_promotion_logs_the_promoted_outcome_once(
+    preference, caplog
+):
+    """AC1/AC2: a request stripped from the chain reports ``outcome=promoted``.
+
+    The request is *served* by a remote provider, but the outcome that explains
+    it is ``promoted``: reporting ``remote`` would hide the one fact an operator
+    needs (local was dropped because the prompt outgrew it).
+    """
+    async def _local(_req, _path):  # pragma: no cover - must never run
+        raise AssertionError("a promoted request never dispatches locally")
+
+    async def _remote(_req, _path, _pc):
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch("proxy.router_helpers.evaluate_and_apply_compaction", _no_compaction),
+        _estimate_patches(PROMPT_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"X-Local-Preference": preference}),
+            "v1/chat/completions",
+            _promoted_model_config(),
+            _promoted_config(),
+        )
+
+    assert result.status_code == 200
+    assert result.headers.get("X-Local-Route") == "remote"
+    _assert_outcome(
+        caplog,
+        outcome=provider.LOCAL_ROUTING_OUTCOME_PROMOTED,
+        preference=LOCAL_PREFERRED,
+        reason="none",
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefer_local_remote_fall_through_logs_the_remote_outcome(caplog):
+    """AC2: ``prefer-local`` reports its preference verbatim plus the real serve.
+
+    ``prefer-local`` is not a pin, so the request is served remotely as today —
+    the line must say exactly that instead of pretending local was used.
+    """
+    result = await _issue(_row("chain_cooldown"), PREFER_LOCAL)
+
+    assert result.status_code == 200
+    _assert_outcome(
+        caplog,
+        outcome=provider.LOCAL_ROUTING_OUTCOME_REMOTE,
+        preference=PREFER_LOCAL,
+        reason="local_provider_cooldown",
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_local_only_is_reported_under_its_normalised_value(caplog):
+    """AC3: ``local-only`` never appears as the resolved preference.
+
+    The alias is normalised by the canonical parser (and cached on the request),
+    so the line reports ``preference=local-preferred``. The deprecation warning
+    from LP-0MVSHWYVE005MS16 is separate and unchanged.
+    """
+    await _issue(_row("chain_cooldown"), LOCAL_ONLY)
+
+    lines = _resolved_lines(caplog)
+    assert len(lines) == 1, f"one line per request; got {lines!r}"
+    assert "local-only" not in lines[0].replace("local-preferred", ""), (
+        f"the legacy alias must never be presented as the resolved value: "
+        f"{lines[0]!r}"
+    )
+    fields = _parse_kv(lines[0])
+    assert fields.get("preference") == LOCAL_PREFERRED, (
+        f"expected the normalised value, got {fields.get('preference')!r}"
+    )
+
+
+def _always_failing_remote():
+    """A remote stub that always fails, so the chain exhausts."""
+    async def _remote(_req, _path, _pc):
+        return Response(status_code=502, content=b"Bad gateway")
+
+    return _remote
+
+
+@pytest.mark.asyncio
+async def test_chain_exhaustion_logs_the_exhausted_outcome_once(caplog):
+    """AC1/AC2: exhaustion reports ``outcome=exhausted`` with no reason token.
+
+    This is the shape the incident mislabelled: exhaustion is a genuine
+    terminal state, and the line now says so explicitly, so it can never be
+    confused with a deferral (which carries ``outcome=deferred`` and a reason).
+    """
+    model_config = {
+        "name": MODEL_NAME,
+        "providers": [
+            {
+                "name": REMOTE_PROVIDER_NAME,
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+            },
+        ],
+    }
+    with patch(
+        "proxy.provider._get_proxy_to_remote",
+        return_value=_always_failing_remote(),
+    ):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(),
+            "v1/chat/completions",
+            model_config,
+            {"provider_cooldown_seconds": 0},
+        )
+
+    assert result.status_code == 503, f"expected exhaustion, got {result.status_code}"
+    _assert_outcome(
+        caplog,
+        outcome=provider.LOCAL_ROUTING_OUTCOME_EXHAUSTED,
+        preference=DEFAULT_PREFERENCE,
+        reason="none",
+    )
+
+
+@pytest.mark.asyncio
+async def test_multi_cycle_chain_hold_still_logs_exactly_one_line(caplog):
+    """AC5: a chain-hold retry (several cycles) is still one request, one line.
+
+    The emission lives outside ``_run_chain_cycles()``: cycle 0 exhausts, the
+    request is held and cycle 1 succeeds, yet only one
+    ``local_preference_resolved`` line exists. Logging inside the cycle would
+    produce one line per attempt — the duplication this item removes.
+    """
+    model_config = {
+        "name": MODEL_NAME,
+        "providers": [
+            {"name": LOCAL_PROVIDER_NAME, "type": "local", "llama_model": "Qwen3"},
+            {
+                "name": REMOTE_PROVIDER_NAME,
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+            },
+        ],
+    }
+    config = {
+        "provider_cooldown_seconds": 0,
+        "chain_hold_seconds": 0.01,
+        "chain_hold_max_cycles": 3,
+    }
+    remote_calls: list[int] = []
+
+    async def _local(_req, _path):
+        return Response(status_code=400, content=b"bad request")
+
+    async def _remote(_req, _path, _pc):
+        remote_calls.append(1)
+        if len(remote_calls) == 1:
+            return Response(status_code=502, content=b"Bad gateway")
+        return _ok_response()
+
+    with (
+        patch("proxy.provider._get_proxy_to_local", return_value=_local),
+        patch("proxy.provider._get_proxy_to_remote", return_value=_remote),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", model_config, config
+        )
+
+    assert result.status_code == 200
+    assert len(remote_calls) == 2, "the request must have taken two cycles"
+    assert len(_resolved_lines(caplog)) == 1, (
+        "a chain-hold retry must not duplicate the per-request line: "
+        f"{_resolved_lines(caplog)!r}"
+    )
+    fields = _one_resolved_line(caplog)
+    assert fields.get("outcome") == provider.LOCAL_ROUTING_OUTCOME_REMOTE, (
+        f"the retried request was served remotely, got {fields.get('outcome')!r}"
+    )
+    assert fields.get("preference") == DEFAULT_PREFERENCE, (
+        f"expected preference={DEFAULT_PREFERENCE}, got {fields.get('preference')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_line_is_not_emitted_per_skip_branch(caplog):
+    """AC6: two skipped local entries still produce exactly one outcome line.
+
+    The existing per-skip lines (``Skipping provider=…``) stay exactly as they
+    are — one per skipped entry — while the outcome line stays one per request.
+    This is the structural difference between "log every skip" and "report the
+    request's resolution".
+    """
+    model_config = {
+        "name": MODEL_NAME,
+        "providers": [
+            {"name": "local-a", "type": "local", "llama_model": "Qwen3"},
+            {"name": "local-b", "type": "local", "llama_model": "Qwen3"},
+            {
+                "name": REMOTE_PROVIDER_NAME,
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+            },
+        ],
+    }
+
+    async def _local(_req, _path):  # pragma: no cover - both locals are skipped
+        raise AssertionError("both local entries are in cooldown")
+
+    async def _remote(_req, _path, _pc):
+        return _ok_response()
+
+    previous = {
+        name: provider._provider_unavailable_until.get(name)
+        for name in ("local-a", "local-b")
+    }
+    provider._provider_unavailable_until["local-a"] = time.time() + 60
+    provider._provider_unavailable_until["local-b"] = time.time() + 60
+    try:
+        with (
+            patch("proxy.router.proxy_to_local", _local),
+            patch("proxy.server.proxy_to_remote", _remote),
+            patch(
+                "proxy.provider._get_local_concurrency_info",
+                _MutableConcurrency(0, 1),
+            ),
+            patch("proxy.provider.request_priority", return_value="low"),
+            patch("proxy.router_helpers.evaluate_and_apply_compaction", _no_compaction),
+        ):
+            result = await provider.proxy_with_fallback(
+                _DummyRequest(),
+                "v1/chat/completions",
+                model_config,
+                {"provider_cooldown_seconds": 60, "server": {"local_model_ctx_size": 0}},
+            )
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                provider._provider_unavailable_until.pop(name, None)
+            else:
+                provider._provider_unavailable_until[name] = value
+
+    assert result.status_code == 200
+    skips = [m for m in _messages(caplog) if m.startswith("Skipping provider=")]
+    assert len(skips) >= 2, (
+        f"the existing per-skip lines stay as they are (one per skipped local "
+        f"entry, per resolution pass); got {skips!r}"
+    )
+    assert len(_resolved_lines(caplog)) == 1, (
+        "the outcome line is per request, never per skip: "
+        f"{_resolved_lines(caplog)!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC4: emission cannot change behaviour
+# ---------------------------------------------------------------------------
+
+
+#: Response headers whose value is a live clock reading, so two identical
+#: requests issued moments apart legitimately differ (``Retry-After`` /
+#: ``retry_at``). They are excluded from the AC4 response comparison: the
+#: property under test is that *the emission* changes nothing, not that two
+#: separate requests advertise the same instant.
+_VOLATILE_RESPONSE_HEADERS = frozenset({"date", "retry-after", "retry_at"})
+#: Body fields derived from the same live clock.
+_VOLATILE_BODY_FIELDS = ("retry_at", "retry_after")
+
+
+def _response_signature(result: Response) -> tuple:
+    """Everything a client can observe about *result*, minus live-clock values."""
+    headers = tuple(
+        sorted(
+            (key.lower(), value)
+            for key, value in result.headers.items()
+            if key.lower() not in _VOLATILE_RESPONSE_HEADERS
+        )
+    )
+    try:
+        body: object = json.loads(result.body)
+    except Exception:
+        body = result.body
+    if isinstance(body, dict):
+        for key in _VOLATILE_BODY_FIELDS:
+            body.pop(key, None)
+    return (
+        result.status_code,
+        headers,
+        tuple(result.headers.getlist("x-local-route")),
+        body,
+    )
+
+
+@contextmanager
+def _emission_suppressed():
+    """Suppress the outcome line entirely (the pre-change behaviour)."""
+    with patch.object(
+        provider, "_log_local_preference_resolved", lambda *a, **k: None
+    ):
+        yield
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trigger", "preference"),
+    [
+        pytest.param("clean", None, id="local-served"),
+        pytest.param("chain_cooldown", LOCAL_PREFERRED, id="pinned-refusal"),
+        pytest.param("chain_cooldown", PREFER_LOCAL, id="remote-served"),
+    ],
+)
+async def test_response_is_identical_with_the_line_suppressed(
+    trigger, preference, caplog
+):
+    """AC4: status, headers and body do not depend on the emission at all."""
+    with _emission_suppressed():
+        baseline = await _issue(_row(trigger), preference)
+    caplog.clear()
+    emitted = await _issue(_row(trigger), preference)
+
+    assert _response_signature(emitted) == _response_signature(baseline), (
+        "the observability line must not alter the response (status, headers, "
+        "body)"
+    )
+    assert len(_resolved_lines(caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_raising_logger_still_returns_the_response_unchanged(caplog):
+    """AC4: an exception inside the emission is swallowed, response intact.
+
+    Observability must never be able to break a request, so the emission is
+    best-effort. The logger is made to raise *only* for the outcome line so the
+    routing code's own logging is untouched.
+    """
+    with _emission_suppressed():
+        baseline = await _issue(_row("chain_cooldown"), LOCAL_PREFERRED)
+    caplog.clear()
+
+    real_info = provider.logger.info
+
+    def _raising_info(message, *args, **kwargs):
+        if isinstance(message, str) and message.startswith(RESOLVED_LINE_PREFIX):
+            raise RuntimeError("logger exploded")
+        return real_info(message, *args, **kwargs)
+
+    with patch.object(provider.logger, "info", _raising_info):
+        result = await _issue(_row("chain_cooldown"), LOCAL_PREFERRED)
+
+    assert _response_signature(result) == _response_signature(baseline), (
+        "a raising logger must not change the response"
+    )
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_of_a_non_pinned_client_is_not_reported_as_pinned(caplog):
+    """AC2: a refusal-shaped exhaustion is not a pin the client never asked for.
+
+    A ``prefer-local`` (or header-less) client whose admission refusal leaves no
+    provider to serve it receives the admission-refusal payload — which carries
+    ``X-Local-Route: refused`` — but it was never pinned: the chain exhausted.
+    The line must say ``outcome=exhausted``, so an operator never reads a pin
+    that did not happen, and the reason is still the token the client is told.
+    """
+    local_only_chain = {
+        "name": MODEL_NAME,
+        "providers": [
+            {"name": LOCAL_PROVIDER_NAME, "type": "local", "llama_model": "Qwen3"},
+        ],
+        "aliases": ["private*"],
+    }
+
+    result = await _issue(
+        _row("admission_guard_free_slot"), None, model_config=local_only_chain
+    )
+
+    assert result.status_code == 429
+    assert result.headers.get("X-Local-Route") == "refused"
+    assert json.loads(result.body).get("code") == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+    _assert_outcome(
+        caplog,
+        outcome=provider.LOCAL_ROUTING_OUTCOME_EXHAUSTED,
+        preference=DEFAULT_PREFERENCE,
+        reason="eta_exceeds_budget_direct",
+    )

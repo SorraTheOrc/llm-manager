@@ -6444,12 +6444,66 @@ def _local_occupant_prefill_seconds(
 LOCAL_FALLBACK_RETRY_AFTER_ATTR = "_local_fallback_retry_after_s"
 LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR = "_local_fallback_token_evidence"
 
-#: Outcome stamped on ``request._local_routing_outcome`` when the pre-loop
-#: capacity verdict removes the local entry from the effective chain
-#: (LP-0MVSM06LB001PRU4). The single per-request outcome line
-#: (LP-0MVSM06Z8003UQTM) consumes it; this slice only stamps — it emits no log
-#: line of its own.
+#: Outcome stamped on ``request._local_routing_outcome``: what the proxy
+#: actually did with the request's local-route intent. The closed vocabulary of
+#: the single per-request outcome line (LP-0MVSM06Z8003UQTM) — every decision
+#: point that ends the local route stamps one of these, and
+#: :func:`_stamp_local_route_headers` emits the one line that reports it.
+#:
+#: - ``pinned`` — a pin-local request was refused rather than moved to a paid
+#:   provider (the loop-head choke point,
+#:   :func:`_build_local_only_refusal_for_remote`).
+#: - ``deferred`` — a pin-local ``deferrable`` request spent its contention-queue
+#:   (or lease) budget and ended in the retryable 429
+#:   (:func:`_build_deferral_refusal_response`).
+#: - ``promoted`` — the pre-loop capacity verdict removed the local entry from
+#:   the effective chain (LP-0MVSM06LB001PRU4), so the remote tiers serve it.
+#: - ``local`` — the local route served the request.
+#: - ``remote`` — a non-local provider served the request.
+#: - ``exhausted`` — every provider in the chain was exhausted; no provider
+#:   served the request and it was not a pin refusal.
+LOCAL_ROUTING_OUTCOME_PINNED = "pinned"
+LOCAL_ROUTING_OUTCOME_DEFERRED = "deferred"
 LOCAL_ROUTING_OUTCOME_PROMOTED = "promoted"
+LOCAL_ROUTING_OUTCOME_LOCAL = "local"
+LOCAL_ROUTING_OUTCOME_REMOTE = "remote"
+LOCAL_ROUTING_OUTCOME_EXHAUSTED = "exhausted"
+
+#: The closed outcome set the per-request line may report (LP-0MVSM06Z8003UQTM
+#: Constraints: no new observability vocabulary).
+LOCAL_ROUTING_OUTCOMES = frozenset({
+    LOCAL_ROUTING_OUTCOME_PINNED,
+    LOCAL_ROUTING_OUTCOME_DEFERRED,
+    LOCAL_ROUTING_OUTCOME_PROMOTED,
+    LOCAL_ROUTING_OUTCOME_LOCAL,
+    LOCAL_ROUTING_OUTCOME_REMOTE,
+    LOCAL_ROUTING_OUTCOME_EXHAUSTED,
+})
+
+#: Stable ``code`` values that identify a chain-exhaustion response
+#: (:func:`_build_exhausted_response` and its admission-refusal variant). Used
+#: only to classify the outcome of the single per-request line — the response
+#: itself is never modified.
+_EXHAUSTION_RESPONSE_CODES = frozenset({
+    EXHAUSTION_CODE_ALL,
+    EXHAUSTION_CODE_SLOTS,
+    EXHAUSTION_CODE_TIME_WINDOW,
+    EXHAUSTION_CODE_LOCAL_ADMISSION,
+})
+
+
+def _stamp_local_routing_outcome(request, outcome: str) -> None:
+    """Stamp the request's terminal local-routing *outcome* (best-effort).
+
+    Called at the decision points that end the local route so the single
+    per-request line (:func:`_log_local_preference_resolved`) reports *why* the
+    request ended where it did instead of re-deriving it from response headers.
+    Never raises: observability must not be able to break routing.
+    """
+    try:
+        setattr(request, "_local_routing_outcome", outcome)
+    except Exception:  # pragma: no cover - stamping is best-effort
+        pass
 
 
 def _note_local_fallback_reason(
@@ -6903,28 +6957,175 @@ def _build_local_only_refusal_response(
     )
 
 
+def _response_is_chain_exhaustion(response: Any) -> bool:
+    """True when *response* is a chain-exhaustion response, not an upstream error.
+
+    Exhaustion responses are built by :func:`_build_exhausted_response` (and its
+    admission-refusal variant) and are the only error responses carrying one of
+    the stable :data:`_EXHAUSTION_RESPONSE_CODES`. Read-only: the response is
+    inspected, never modified. Never raises — a body that cannot be read simply
+    classifies as "not exhaustion".
+    """
+    try:
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return False
+        if headers.get("X-Provider"):
+            # A provider served (or answered) this response: whatever the body
+            # says, the chain did not exhaust.
+            return False
+        if int(getattr(response, "status_code", 200) or 200) < 400:
+            return False
+        body = getattr(response, "body", None)
+        if not body:
+            return False
+        payload = json.loads(body)
+        return (
+            isinstance(payload, dict)
+            and payload.get("code") in _EXHAUSTION_RESPONSE_CODES
+        )
+    except Exception:  # pragma: no cover - classification is best-effort
+        return False
+
+
+def _local_routing_outcome_for_response(response: Any, request) -> str:
+    """Resolve the outcome the per-request line reports (one closed value).
+
+    The stamped outcome wins: a pin refusal, deferral or promotion is known at
+    its decision point and is more specific than what the response alone shows
+    (a promoted request is *served* remotely but its outcome is ``promoted``).
+    Everything else is classified from the response the top-level return is
+    about to hand back, so ``local`` / ``remote`` / ``exhausted`` need no extra
+    stamping inside either dispatch loop — which is what keeps the line emitted
+    exactly once per request rather than once per cycle (AC5).
+    """
+    stamped = getattr(request, "_local_routing_outcome", None)
+    if stamped:
+        return stamped
+    headers = getattr(response, "headers", None) or {}
+    route = headers.get("X-Local-Route")
+    if route == "refused":
+        # A refusal that did not stamp an outcome is either a pin refusal (the
+        # client's intent was honoured) or the admission-refusal exhaustion
+        # variant reached by a client that never asked to be pinned — the one
+        # pin predicate decides, so the line never claims a pin that was not
+        # there.
+        if _local_preference_pins_local(request):
+            return LOCAL_ROUTING_OUTCOME_PINNED
+        return LOCAL_ROUTING_OUTCOME_EXHAUSTED
+    if _response_is_chain_exhaustion(response):
+        return LOCAL_ROUTING_OUTCOME_EXHAUSTED
+    if route == "local":
+        return LOCAL_ROUTING_OUTCOME_LOCAL
+    return LOCAL_ROUTING_OUTCOME_REMOTE
+
+
+def _local_routing_reason_for_response(response: Any, request) -> str:
+    """Resolve the reason token the per-request line reports (or ``none``).
+
+    A refusal already names the exact canonical token the client is told, so the
+    response header wins there — the request's own ``_local_fallback_reason``
+    can be a coarser interim token (``local_admission_guard``) than the reason
+    the refusal body and header carry (``eta_exceeds_budget_direct``), and the
+    line must agree with the refusal it describes (AC2). Every other outcome
+    reports the reason the request recorded, or ``none`` when it recorded none
+    (a promotion or a clean local serve has no skip reason).
+    """
+    headers = getattr(response, "headers", None) or {}
+    if headers.get("X-Local-Route") == "refused":
+        return (
+            headers.get("X-Local-Fallback-Reason")
+            or getattr(request, "_local_fallback_reason", None)
+            or "none"
+        )
+    return getattr(request, "_local_fallback_reason", None) or "none"
+
+
+def _log_local_preference_resolved(
+    response: Any, request, model_config: dict | None
+) -> None:
+    """Emit the single per-request routing-outcome line (best-effort).
+
+    One line per **request**, never per cycle, per skip branch or per refusal
+    builder: it is called only from :func:`_stamp_local_route_headers`, the
+    top-level return choke point both entries reach exactly once after
+    ``_run_chain_cycles()``, so a chain-hold retry that runs several cycles still
+    produces one line (AC5).
+
+    The line names the **resolved** preference (``request._local_preference``,
+    the value the canonical parser cached — so a legacy ``local-only`` header is
+    reported as ``local-preferred``, AC3), the outcome and the recorded reason
+    token (``none`` when the request recorded none), so an operator can tell a
+    deferral (``outcome=deferred reason=fallback_after_queue``) from chain
+    exhaustion (``outcome=exhausted``) without correlating per-skip lines
+    (AC2).
+
+    Side-effect free by contract (AC4): wrapped in ``try/except`` and it never
+    touches the response, so observability can never break or alter a request.
+    """
+    try:
+        preference = _request_local_preference(request)
+        outcome = _local_routing_outcome_for_response(response, request)
+        reason = _local_routing_reason_for_response(response, request)
+        session_id = "unknown"
+        try:
+            from proxy.session import _resolve_session_id_header
+
+            session_id, _ = _resolve_session_id_header(
+                getattr(request, "headers", {}) or {}
+            )
+        except Exception:
+            session_id = "unknown"
+        logger.info(
+            "local_preference_resolved preference=%s outcome=%s reason=%s "
+            "session=%s model=%s",
+            preference,
+            outcome,
+            reason,
+            session_id or "unknown",
+            (model_config or {}).get("name") or "unknown",
+        )
+    except Exception:  # pragma: no cover - emission is best-effort
+        logger.debug("local preference resolution line failed", exc_info=True)
+
+
 def _stamp_local_route_headers(
     response: Response, request, model_config: dict
 ) -> Response:
-    """Add ``X-Local-Route`` / ``X-Local-Fallback-Reason`` to *response*.
+    """Add ``X-Local-Route`` / ``X-Local-Fallback-Reason`` and log the outcome.
 
     Single choke point on the top-level return path so local success, remote
     success, refusal and exhaustion are all covered (LP-0MVIKPCSG002B0NL AC6).
     A response that already carries the route header (a local-only refusal) is
     left untouched; every other response is classified by the ``X-Provider``
     that served it.
+
+    This is also the single emission point for the per-request routing-outcome
+    line (LP-0MVSM06Z8003UQTM): both entries call this exactly once, *after*
+    ``_run_chain_cycles()``, so exactly one
+    ``local_preference_resolved preference=… outcome=… reason=…`` line is
+    emitted per request. The outcome is **stamped on the request at the decision
+    point that produced it** (pin refusal, deferral, promotion) and only
+    classified from the response for the three outcomes that have no branch of
+    their own (``local`` / ``remote`` / ``exhausted``) — logging at each branch
+    would emit one line per cycle, per skip and per refusal builder, which is
+    exactly the correlation work this line exists to remove. Emission is
+    best-effort and never mutates the response, so the line can never change
+    behaviour (AC4).
     """
     try:
         from proxy import admission_reserve
 
-        return admission_reserve.stamp_route_headers(
+        stamped = admission_reserve.stamp_route_headers(
             response,
             model_config,
             fallback_reason=getattr(request, "_local_fallback_reason", None),
         )
     except Exception:  # pragma: no cover - header stamping is best-effort
         logger.debug("route header stamping failed", exc_info=True)
-        return response
+        stamped = response
+    _log_local_preference_resolved(stamped, request, model_config)
+    return stamped
 
 
 #: ``X-Local-Fallback-Reason`` tokens the local-only choke point emits when
@@ -7271,9 +7472,15 @@ def _build_deferral_refusal_response(
         attempt["retry_after_s"] = retry_after_s
     if elapsed_wait_seconds is not None:
         attempt["elapsed_wait_seconds"] = round(float(elapsed_wait_seconds), 3)
-    return _build_local_only_refusal_response(
+    response = _build_local_only_refusal_response(
         attempt, config, preference=preference
     )
+    # The deferral outcome is stamped where the deferral ends, so the single
+    # per-request line can tell a spent deferral (``deferred``) from chain
+    # exhaustion (``exhausted``) without correlating per-skip lines
+    # (LP-0MVSM06Z8003UQTM AC2).
+    _stamp_local_routing_outcome(request, LOCAL_ROUTING_OUTCOME_DEFERRED)
+    return response
 
 
 async def _build_local_only_refusal_for_remote(
@@ -7377,7 +7584,13 @@ async def _build_local_only_refusal_for_remote(
     # The parsed intent is threaded through so the single refusal line names the
     # preference that actually caused the refusal (LP-0MVSMINPR006SWT6 AC4);
     # the builder computes the verdict exactly once and never re-derives it.
-    return _build_local_only_refusal_response(attempt, config, preference=preference)
+    response = _build_local_only_refusal_response(
+        attempt, config, preference=preference
+    )
+    # Pin refusal: the client's intent was honoured and the request was not
+    # promoted (LP-0MVSM06Z8003UQTM).
+    _stamp_local_routing_outcome(request, LOCAL_ROUTING_OUTCOME_PINNED)
+    return response
 
 
 async def _prefill_admission_guard(

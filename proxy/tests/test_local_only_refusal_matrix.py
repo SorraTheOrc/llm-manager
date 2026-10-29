@@ -57,6 +57,8 @@ two post-dispatch rows prove the pin also holds *after* a local dispatch failed.
 from __future__ import annotations
 
 import json
+import logging
+import re
 import time
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
@@ -843,8 +845,12 @@ async def test_deferrable_verdict_never_applies_the_capacity_strip():
     assert calls == [], "a deferrable pin-local request is refused, not promoted"
     assert result.status_code == 429
     assert recorded == [], f"no capacity strip for a deferrable verdict: {recorded!r}"
-    assert getattr(request, "_local_routing_outcome", None) is None, (
-        "a refused request is not stamped as promoted"
+    assert (
+        getattr(request, "_local_routing_outcome", None)
+        != provider.LOCAL_ROUTING_OUTCOME_PROMOTED
+    ), (
+        "a refused request is never stamped as promoted (it is stamped "
+        "``pinned`` by the per-request outcome line, LP-0MVSM06Z8003UQTM)"
     )
 
 
@@ -1501,4 +1507,106 @@ async def test_queue_exit_refusal_is_not_restamped(trigger: str):
     )
     assert result.headers.getlist("x-local-route") == ["refused"], (
         "the refusal must be stamped exactly once"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC5 (LP-0MVSM06Z8003UQTM): exactly one routing-outcome line per request
+#
+# Every row of the matrix is one request, and every row must produce exactly
+# **one** ``local_preference_resolved`` line — not one per skip branch, not one
+# per refusal builder. The line is emitted from the top-level stamp choke point
+# both entries call once, so the count assertion is the structural proof; the
+# outcome/reason assertions are what make a refusal distinguishable from chain
+# exhaustion for an operator reading ``proxy.log``.
+# ---------------------------------------------------------------------------
+
+#: Outcome the single line must report for each row whose outcome is *not*
+#: simply derived from the pin verdict: a spent deferral (``deferred``) and a
+#: pre-loop capacity strip (``promoted``) are stamped at their decision point.
+_ROW_EXPECTED_OUTCOME = {
+    "queue_depth_cap": provider.LOCAL_ROUTING_OUTCOME_DEFERRED,
+    "queue_wait_expiry": provider.LOCAL_ROUTING_OUTCOME_DEFERRED,
+    "entry_context_cap": provider.LOCAL_ROUTING_OUTCOME_PROMOTED,
+}
+
+
+def _resolved_lines(caplog) -> list[str]:
+    """Every ``local_preference_resolved`` line captured in *caplog*."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("local_preference_resolved ")
+    ]
+
+
+#: ``key=value`` pairs on the outcome line — the shape log-grep tooling parses.
+_RESOLVED_LINE_KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
+
+
+def _resolved_line_fields(line: str) -> dict[str, str]:
+    """Parse the ``key=value`` pairs of the outcome *line* into a dict."""
+    return {
+        match.group(1): match.group(2)
+        for match in _RESOLVED_LINE_KV_RE.finditer(line)
+    }
+
+
+def _expected_outcome(row: _ExitRow) -> str:
+    """The outcome *row* must report on its single per-request line."""
+    pinned = row.expected_verdict != admission_reserve.CAPACITY_TOO_LARGE
+    default = (
+        provider.LOCAL_ROUTING_OUTCOME_PINNED
+        if pinned
+        else provider.LOCAL_ROUTING_OUTCOME_REMOTE
+    )
+    return _ROW_EXPECTED_OUTCOME.get(row.trigger, default)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", _EXIT_ROWS, ids=[r.trigger for r in _EXIT_ROWS])
+@pytest.mark.parametrize("preference", PIN_LOCAL_PREFERENCES)
+async def test_every_row_logs_exactly_one_outcome_line(
+    row: _ExitRow, preference: str, caplog
+):
+    """One request, one line — whatever path the local route took (AC1/AC5).
+
+    The count is asserted per row, so a future per-branch log call (the
+    duplication this item exists to prevent) fails the row instead of quietly
+    doubling the operator's log volume. The line names the resolved preference
+    (the legacy ``local-only`` alias reports ``local-preferred``), the outcome
+    and the row's own reason token, so a deferral can never be mistaken for
+    chain exhaustion (AC2).
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+
+    await _issue(row, preference)
+
+    lines = _resolved_lines(caplog)
+    assert len(lines) == 1, (
+        f"{row.exit_description}: exactly one local_preference_resolved line per "
+        f"request is required; got {len(lines)}: {lines!r}"
+    )
+    fields = _resolved_line_fields(lines[0])
+    assert fields["preference"] == LOCAL_PREFERRED, (
+        f"{row.exit_description}: the resolved preference is always reported "
+        f"under its canonical spelling (legacy local-only normalises), got "
+        f"{fields.get('preference')!r}"
+    )
+    assert fields["outcome"] == _expected_outcome(row), (
+        f"{row.exit_description}: expected outcome={_expected_outcome(row)}, got "
+        f"{fields.get('outcome')!r}. Line: {lines[0]!r}"
+    )
+    assert fields["outcome"] in provider.LOCAL_ROUTING_OUTCOMES, (
+        f"{row.exit_description}: the outcome must come from the closed "
+        f"vocabulary, got {fields.get('outcome')!r}"
+    )
+    expected_reason = (
+        "none"
+        if fields["outcome"] == provider.LOCAL_ROUTING_OUTCOME_PROMOTED
+        else row.token
+    )
+    assert fields["reason"] == expected_reason, (
+        f"{row.exit_description}: expected reason={expected_reason}, got "
+        f"{fields.get('reason')!r}. Line: {lines[0]!r}"
     )
