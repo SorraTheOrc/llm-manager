@@ -58,9 +58,10 @@ class TestSlotsAllIdle:
 # _gpu_wedge_discriminate
 #
 # LP-0MS9GA6QL007XTBP: on the Strix Halo APU (Radeon 8060S iGPU, gfx1151)
-# gpu_busy_percent is pinned at 100% regardless of actual GPU state
-# (30/30 samples read 100 while power draw showed the GPU idle at ~54W vs
-# ~115W when genuinely computing). The old busy+idle signature therefore
+# gpu_busy_percent saturates at ~20W - measured 30/30 samples read 100 while
+# power draw showed the GPU idle at ~54W vs ~115W when genuinely computing
+# (quantified 2026-10-28 as a ~20W latch in LP-0MVSQQO910077LYL). The old
+# busy+idle signature therefore
 # fired on every idle period, causing constant unload/reload churn.
 #
 # Power draw is the discriminating signal: a busy counter with LOW power
@@ -93,8 +94,8 @@ class TestGpuWedgeDiscriminate:
         assert _gpu_wedge_discriminate(None, True, 54.0, 90.0, 90.0) == "none"
 
     def test_pinned_at_100_busy_low_power_is_pinned_not_wedge(self):
-        # Critical APU regression case: busy counter pinned at 100% with idle
-        # slots and low power draw must NOT be treated as a wedge.
+        # Critical APU regression case: a saturated busy counter (100%) with
+        # idle slots and low power draw must NOT be treated as a wedge.
         assert _gpu_wedge_discriminate(100.0, True, 54.0, 90.0, 90.0) == "pinned"
         assert _gpu_wedge_discriminate(100.0, True, 53.0, 90.0, 90.0) == "pinned"
 

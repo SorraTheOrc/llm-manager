@@ -1,9 +1,18 @@
 """Prometheus-based GPU busy-time measurement.
 
-On this Strix Halo APU ``gpu_busy_percent`` is pinned at 100 % and cannot
-serve as a utilisation signal.  GPU busy time is instead measured from power
-draw via the ``gpu:computing:bool`` recording rule (1 ≥ 90 W, 0 otherwise),
-evaluated every 15 s by Prometheus.
+GPU busy time is measured from power draw via the ``gpu:computing:bool``
+recording rule (1 ≥ 90 W, 0 otherwise), evaluated every 15 s by Prometheus.
+
+The driver's ``gpu_busy_percent`` cannot serve as a utilisation signal on this
+Strix Halo APU: it responds to load within seconds but **saturates at ~20 W**
+(reads ~100 % for any draw above ~20 W), so idle-with-context stretches report
+as busy. Measured 2026-10-28 over 7 days: 94.5 % mean busy against 28.1 % of
+samples at compute power, 45.2 % false-busy (LP-0MS9GA6QL007XTBP, quantified in
+LP-0MVSQQO910077LYL). AMD's own tooling offers no alternative here: ``amd-smi``
+reports ``N/A`` for every metric this module needs on this APU, and
+``amdtop``/``rocm-smi`` merely display the same saturating counter — so this
+module reads Prometheus and must never shell out to an AMD tool (see
+``monitoring/README.md``, "Why not amd-smi, rocm-smi or amdtop?").
 
 The recording rules live in monitoring/gpu_compute_rules.yaml and are
 evaluated at ``evaluation_interval = 15 s``.  The 15 s cadence is

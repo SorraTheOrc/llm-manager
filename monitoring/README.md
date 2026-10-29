@@ -201,8 +201,14 @@ and evaluates the alert rules in `monitoring/*.yaml`.
 
 > GPU utilisation is derived from **power draw**
 > (`node_hwmon_power_average_watt`), not `gpu_busy_percent`: on this Strix Halo
-> APU that counter is pinned at 100% regardless of GPU state
-> (LP-0MS9GA6QL007XTBP). GPU memory pressure is measured on **GTT**, not the
+> APU that counter **saturates at ~20 W** — it reads ~100 % once the GPU draws
+> more than ~20 W and only falls back below that, so it reports idle-with-
+> context stretches as busy (measured 2026-10-28 over 7 days: 94.5 % mean busy
+> against 28.1 % of samples at compute power; LP-0MS9GA6QL007XTBP,
+> quantified in LP-0MVSQQO910077LYL). `amd-smi`, `rocm-smi` and `amdtop` are
+> not alternatives — see *Why not `amd-smi`, `rocm-smi` or `amdtop`?* in the
+> query cookbook below.
+> GPU memory pressure is measured on **GTT**, not the
 > 1 GiB VRAM carve-out. See
 > [gpu_compute_rules.yaml](gpu_compute_rules.yaml) and
 > [gpu_memory_alerts.yaml](gpu_memory_alerts.yaml) for the reasoning.
@@ -270,8 +276,9 @@ systemctl --user enable --now node_exporter.service gpu-metrics.service
 ```
 
 Resulting GPU series: `gpu_gtt_used_bytes`, `gpu_vram_used_bytes`,
-`gpu_vram_total_bytes`, `gpu_busy_percent` (pinned at 100% on this APU — not a
-utilisation signal), plus `node_hwmon_power_average_watt{chip_name="amdgpu"}`.
+`gpu_vram_total_bytes`, `gpu_busy_percent` (scraped for continuity only — it
+saturates at ~20 W on this APU and is not a utilisation signal), plus
+`node_hwmon_power_average_watt{chip_name="amdgpu"}`.
 
 ## 4. Grafana (optional, not deployed here)
 
@@ -378,6 +385,47 @@ gpu:power_watts:amdgpu
 Sanity note: the sample values depend on the machine's state. Verified
 2026-10-25 on this host: `avg_over_time(gpu:computing:bool[2h])` → 0.5,
 `sum_over_time(...[24h:15s]) * 15` → 4605 s, `gpu:power_watts:avg5m` → 67.7 W.
+
+### Why not `amd-smi`, `rocm-smi` or `amdtop`?
+
+The report and the alert rules measure GPU use from **power draw** because the
+AMD tooling offers nothing better on this host (measured 2026-10-28,
+`amd-smi` 26.2.2 / ROCm 7.2.4, single `gfx1151` APU device):
+
+| Tool | What it gives here |
+|---|---|
+| `amd-smi` | `N/A` for engine usage, socket power, clocks, thermals and energy (`amd-smi metric`, `amd-smi monitor`); VRAM only (`0.3 / 1.0 GB`), which misdescribes an APU that serves from GTT |
+| `rocm-smi` | power (the same `hwmon` `power1_average` node this stack scrapes) and `GPU use 100%` from `gpu_busy_percent` |
+| `amdtop` | Linux “GPU usage” is literally `/sys/class/drm/card0/device/gpu_busy_percent` (`linux.go:151`, commit `5e500c3`); power/temp from the same `hwmon` files; VRAM (not GTT). Windows uses ADLX, a Windows-only driver library |
+
+So `amdtop` and `rocm-smi` display **the same counter** this stack samples for
+continuity only, and that counter **saturates at ~20 W**: it responds to load
+within seconds but reads ~100 % for any draw above ~20 W. Measured over 7 days
+of Prometheus history (904 paired 15 s samples, 2026-10-21 → 2026-10-28):
+
+| GPU power band | samples | mean `gpu_busy_percent` | share ≥ 90 % |
+|---|---|---|---|
+| 0–20 W | 44 | 2.3 % | 2 % |
+| 20–40 W | 414 | 98.9 % | 99 % |
+| 40–60 W | 90 | 100.0 % | 100 % |
+| 80–90 W | 96 | 100.0 % | 100 % |
+| 90–100 W | 175 | 99.1 % | 98 % |
+| 100–125 W | 78 | 95.7 % | 95 % |
+
+Window summary: mean 94.5 % busy against 28.1 % of samples at compute power
+(≥ 90 W); `r(busy, power) = 0.28`; false-busy (`busy ≥ 90 %` ∧ `power < 40 W`)
+45.2 % of samples, longest continuous run 5.3 h; false-idle
+(`busy < 90 %` ∧ `power ≥ 90 W`) 0.8 %, so it never *under*-reports — which is
+why a live reading looks convincing.
+
+Two structural points apply even if a tool did expose a usable number:
+`amd-smi` and friends are **instantaneous** (no history, so a 24 h window would
+need a new sampler), and where they work they read the **same** `hwmon` sensor
+node_exporter already scrapes. The retained source is therefore
+`hwmon` → Prometheus → `gpu:computing:bool` (see
+[gpu_compute_rules.yaml](gpu_compute_rules.yaml)).
+
+<!-- LP-0MVSQQO910077LYL -->
 
 ### GPU memory: GTT and VRAM
 
@@ -526,10 +574,12 @@ GPU, or the driver is not loaded) and exits without writing, by design — see
 
 ### `gpu_busy_percent` reads 100% while the machine is idle
 
-Expected on this APU: the counter is pinned at 100% regardless of GPU state. Use
+Expected on this APU: the counter latches to ~100 % as soon as the GPU draws
+more than ~20 W and only falls back below that, so an idle GPU holding a
+residual context still reads as busy. It is **not** a utilisation measure. Use
 the power-derived series (`gpu:computing:bool`, `gpu:power_watts:avg5m`)
 instead. No rule in this repository may select `gpu_busy_percent`
-(LP-0MS9GA6QL007XTBP).
+(LP-0MS9GA6QL007XTBP, quantified in LP-0MVSQQO910077LYL).
 
 ## Security notes
 
@@ -554,4 +604,8 @@ instead. No rule in this repository may select `gpu_busy_percent`
 - LP-0MVO8DOHP008FL48 — GPU utilisation must come from power; two alert groups
   were dead.
 - LP-0MVO8DORX004P05G — this document.
-- LP-0MS9GA6QL007XTBP — `gpu_busy_percent` pinned at 100% on this APU.
+- LP-0MS9GA6QL007XTBP — `gpu_busy_percent` is not a utilisation signal on this
+  APU.
+- LP-0MVSQQO910077LYL — why the GPU-utilisation source stays power draw
+  (`amd-smi` returns `N/A`; `amdtop`/`rocm-smi` surface the saturating
+  `gpu_busy_percent`; 7-day quantification).

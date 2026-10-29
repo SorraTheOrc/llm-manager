@@ -52,8 +52,10 @@ REQUIRED_RULE_FILES = {
 # Series that must never appear in a rule expression:
 # - rocm_vram_*: the AMD rocm-exporter publishes no release artifacts, so no
 #   exporter ever served these series and rules using them could never fire.
-# - gpu_busy_percent: pinned at 100% regardless of GPU state on this Strix Halo
-#   APU (LP-0MS9GA6QL007XTBP), so it is not a utilisation signal.
+# - gpu_busy_percent: saturates at ~20 W on this Strix Halo APU (it reads
+#   ~100% for any draw above ~20 W, so idle-with-context stretches report as
+#   busy), i.e. it is not a utilisation signal (LP-0MS9GA6QL007XTBP, quantified
+#   in LP-0MVSQQO910077LYL).
 # - llama_process_rss_bytes: published as 0 by the proxy (llama-server runs in a
 #   podman container, so there is no host process handle to read RSS from).
 FORBIDDEN_RULE_SERIES = [
@@ -1129,9 +1131,149 @@ class TestNodeExporterUnitDoc:
         """AC 2: the doc must not present gpu_busy_percent as utilisation."""
         content = _norm((DOCS_SYSTEMD_DIR / "node_exporter.service").read_text())
         assert "gpu_busy_percent" in content
-        assert "not a utilisation" in content or "pinned at 100%" in content, (
-            "node_exporter.service must warn that gpu_busy_percent is pinned at "
-            "100% on this APU and is not a utilisation signal"
+        assert "not a utilisation" in content, (
+            "node_exporter.service must warn that gpu_busy_percent saturates on "
+            "this APU and is not a utilisation signal"
+        )
+
+
+# Glyphs and prose that carry the measured GPU-utilisation-source decision
+# (LP-0MVSQQO910077LYL).  The counter saturates at ~20 W; `amd-smi` reports N/A;
+# `amdtop`/`rocm-smi` only surface the same counter.
+USAGE_ANALYSIS_SCRIPTS = (
+    PROJECT_ROOT / ".pi" / "skills" / "proxy-usage-analysis" / "scripts"
+)
+USAGE_ANALYSIS_SKILL_DIR = PROJECT_ROOT / ".pi" / "skills" / "proxy-usage-analysis"
+
+# The stale premise: "pinned at 100% regardless of GPU state".  Kernel 7.0.0-34
+# responds to load within seconds, so the claimed mechanism was wrong even
+# though the conclusion (not a utilisation measure) holds — the counter
+# saturates at ~20 W.  See LP-0MVSQQO910077LYL.
+STALE_PINNED_CLAIM = "pinned at 100% regardless"
+
+AMD_SHELLOUT_TOOLS = ("amd-smi", "amdsmi", "rocm-smi", "amdtop")
+
+
+class TestGpuUtilisationSourceDecision:
+    """The GPU-utilisation source decision is documented and not shelled out.
+
+    LP-0MVSQQO910077LYL: keep the power-derived `gpu:computing:bool` measure and
+    record, with measurement dates, that `amd-smi` returns N/A on this APU and
+    that `amdtop`/`rocm-smi` surface the same saturating `gpu_busy_percent`
+    counter the monitoring stack already samples for continuity only.
+    """
+
+    def _readme(self) -> str:
+        return _norm((MONITORING_DIR / "README.md").read_text())
+
+    def test_monitoring_readme_documents_the_amd_smi_finding(self):
+        """AC 2: the operator's question is answered where the measure lives."""
+        content = self._readme()
+        assert "amd-smi" in content, (
+            "monitoring/README.md must explain why amd-smi is not the source"
+        )
+        assert "amdtop" in content, (
+            "monitoring/README.md must record that amdtop surfaces the same "
+            "gpu_busy_percent counter"
+        )
+        assert "n/a" in content, (
+            "monitoring/README.md must state that amd-smi reports N/A for its "
+            "metrics on this APU"
+        )
+        assert "saturat" in content, (
+            "monitoring/README.md must describe the measured saturating "
+            "behaviour of gpu_busy_percent"
+        )
+        assert "20 w" in content, (
+            "monitoring/README.md must record the ~20 W saturation threshold"
+        )
+
+    def test_docs_replace_the_stale_pinned_claim_with_a_measurement(self):
+        """AC 2/AC 3: no doc restates the unexplained 'pinned' premise."""
+        for path in (
+            MONITORING_DIR / "README.md",
+            MONITORING_DIR / "gpu_compute_rules.yaml",
+            DOCS_SYSTEMD_DIR / "node_exporter.service",
+        ):
+            content = _norm(path.read_text())
+            assert STALE_PINNED_CLAIM not in content, (
+                f"{path.name} still asserts gpu_busy_percent is 'pinned at 100% "
+                "regardless' of GPU state; record the measured saturation "
+                "(measured 2026-10-28) instead"
+            )
+
+    def test_usage_analysis_docs_name_the_retained_power_source(self):
+        """AC 4: the report docs state the decision and cross-link monitoring."""
+        reference = _norm((USAGE_ANALYSIS_SKILL_DIR / "REFERENCE.md").read_text())
+        assert "amd-smi" in reference, (
+            "REFERENCE.md must state that amd-smi is not the source on this APU"
+        )
+        assert "n/a" in reference
+        assert "amdtop" in reference, (
+            "REFERENCE.md must record that amdtop surfaces the same counter"
+        )
+        assert "monitoring/readme.md" in reference, (
+            "REFERENCE.md must cross-link monitoring/README.md for the rationale"
+        )
+
+        skill = _norm((USAGE_ANALYSIS_SKILL_DIR / "SKILL.md").read_text())
+        assert "amd-smi" in skill
+        assert "monitoring/readme.md" in skill
+
+    def test_gpu_busy_module_reads_prometheus_not_amd_tools(self):
+        """AC 5: the report path must never shell out to an AMD tool.
+
+        AST-based rather than textual: comments and docstrings may mention the
+        tools (they explain why they are not used), while an import of
+        ``subprocess`` or a call passing an ``amd-smi``/``amdtop``/``rocm-smi``
+        argument would mean the decision had been reversed.
+        """
+        import ast
+
+        source = (USAGE_ANALYSIS_SCRIPTS / "gpu_busy.py").read_text()
+        tree = ast.parse(source)
+
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        assert "subprocess" not in imported, (
+            "gpu_busy.py must measure GPU busy time from Prometheus, never by "
+            "invoking an external tool"
+        )
+
+        # Docstrings legitimately name the tools (they explain why they are not
+        # used); only executable string literals are a reversal of the decision.
+        docstrings = set()
+        for node in ast.walk(tree):
+            if not isinstance(
+                node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                continue
+            body = getattr(node, "body", [])
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                docstrings.add(id(body[0].value))
+
+        literals = [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+        ]
+        for tool in AMD_SHELLOUT_TOOLS:
+            assert not any(tool in literal for literal in literals), (
+                f"gpu_busy.py carries a {tool!r} command string; the source "
+                "decision (LP-0MVSQQO910077LYL) is the Prometheus power signal"
+            )
+        assert "os.system" not in source, (
+            "gpu_busy.py must not spawn processes with os.system"
         )
 
 

@@ -29,7 +29,7 @@ Two things this unit is **not**:
 
 | Series | Labels | Type | Meaning |
 |---|---|---|---|
-| `gpu_busy_percent` | `gpu="card0"` | gauge | Driver-reported busy percentage — **pinned at 100% on this APU; not a utilisation measure** |
+| `gpu_busy_percent` | `gpu="card0"` | gauge | Driver-reported busy percentage — **saturates at ~20 W on this APU (reads ~100% for any draw above ~20 W), so it is not a utilisation measure** (measured 2026-10-28, LP-0MVSQQO910077LYL) |
 | `gpu_vram_used_bytes` | `gpu="card0"` | gauge | Used portion of the VRAM carve-out (`mem_info_vram_used`) |
 | `gpu_vram_total_bytes` | `gpu="card0"` | gauge | Size of the VRAM carve-out (`mem_info_vram_total`, 1 GiB here) |
 | `gpu_gtt_used_bytes` | `gpu="card0"` | gauge | GTT in use (`mem_info_gtt_used`) — the meaningful pool: models map most of their weights here (~36 GiB of a 128 GiB pool in normal operation) |

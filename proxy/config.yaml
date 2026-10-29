@@ -1002,9 +1002,10 @@ server:
   # fallback; when neither is available detection is skipped.
   #
   # DISABLED BY DEFAULT (LP-0MS9GA6QL007XTBP): on this Strix Halo APU
-  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent is pinned at 100% regardless
-  # of actual GPU state (30/30 samples read 100 while power draw showed the
-  # GPU idle at ~54W vs ~115W when computing). The busy+idle signature
+  # (Radeon 8060S iGPU, gfx1151) gpu_busy_percent saturates at ~20W - measured
+  # 2026-07-31, 30/30 samples read 100 while power draw showed the
+  # GPU idle at ~54W vs ~115W when computing (quantified 2026-10-28 as a ~20W
+  # latch in LP-0MVSQQO910077LYL). The busy+idle signature
   # therefore false-positives on every idle period, causing constant
   # unload/reload churn (144 unloads in one day, killing in-flight requests).
   # On this hardware class a wedged engine (LP-0MS91D782006XIR6, ~53W idle

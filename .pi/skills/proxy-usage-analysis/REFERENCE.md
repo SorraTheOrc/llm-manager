@@ -715,9 +715,16 @@ exposes the same data under `--json`'s `gpu_busy` key. This is the
 **authoritative hardware-side** busy fraction and does **not** depend on the
 proxy's stream-lifecycle logging.
 
-Why power rather than `gpu_busy_percent`: on this Strix Halo APU the amdgpu
-driver reports `gpu_busy_percent` as pinned at 100 % regardless of GPU state, so
-it is not a utilisation signal (LP-0MS9GA6QL007XTBP). Power draw discriminates
+Why power rather than `gpu_busy_percent`: on this Strix Halo APU that counter
+**saturates at ~20 W** — it responds to load within seconds but reads ~100 % for
+any draw above ~20 W, so it reports idle-with-context stretches as busy
+(LP-0MS9GA6QL007XTBP; measured 2026-10-28 over 7 days: 94.5 % mean busy against
+28.1 % of samples at compute power, 45.2 % false-busy; LP-0MVSQQO910077LYL). It
+is not a utilisation signal. AMD's own tooling is not an alternative either:
+`amd-smi` reports `N/A` for usage/power/clocks/energy on this APU, and
+`amdtop`/`rocm-smi` display the very same saturating counter (see
+[monitoring/README.md](../../../monitoring/README.md), *Why not `amd-smi`,
+`rocm-smi` or `amdtop`?*). Power draw discriminates
 cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing:bool`
 recording rule (`gpu:power_watts:amdgpu >= bool 90`) is evaluated by Prometheus
 every **15 s** from the node_exporter hwmon series. The report queries
