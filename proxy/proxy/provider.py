@@ -3316,6 +3316,7 @@ def _record_provider_context_skip(
     estimated_tokens: int,
     limit: int,
     session_id: str | None = None,
+    preference: str | None = None,
 ) -> None:
     """Record + log a per-entry context-ceiling skip (AC3).
 
@@ -3326,6 +3327,13 @@ def _record_provider_context_skip(
     affinity — so the entry stays eligible for later, smaller requests. The
     counter mirrors ``context_too_large`` (LP-0MVF9N3BV00155RI) and is exposed
     as ``backend_signals`` on ``/health`` and ``/admin/metrics``.
+
+    ``preference`` is the request's already-parsed ``X-Local-Preference``
+    (``_request_local_preference`` — never a second parse of the header),
+    logged as an additive `` preference=<parsed>`` suffix so every "not local"
+    line names the intent that made the decision (LP-0MVTF2WLQ008BNYK, parent
+    AC4). An absent value logs the parser's default rather than an empty or
+    missing field, so the invariant holds for header-less clients too.
     """
     _record_attempt(
         attempts,
@@ -3340,12 +3348,13 @@ def _record_provider_context_skip(
     logger.info(
         "routing_skip_provider_context provider=%s type=%s "
         "status=provider_context_exceeded estimated_tokens=%d limit=%d "
-        "reason=provider_context_exceeded session=%s",
+        "reason=provider_context_exceeded session=%s preference=%s",
         provider_name,
         provider_type,
         estimated_tokens,
         limit,
         str(session_id or "unknown"),
+        preference or DEFAULT_PREFERENCE,
     )
 
 
@@ -10957,6 +10966,7 @@ async def _proxy_with_remote_fallback_cycle(
                     _record_provider_context_skip(
                         attempts, provider_name, provider_type,
                         _entry_estimate, _context_limit, _budget_session_id,
+                        preference=_preference,
                     )
                     fallback_reason = "provider_context_exceeded"
                     prev_provider = provider_name
@@ -12591,6 +12601,7 @@ async def _proxy_with_fallback_cycle(
                         _record_provider_context_skip(
                             attempts, provider_name, provider_type,
                             _entry_estimate, _context_limit, _session_id,
+                            preference=_preference,
                         )
                         fallback_reason = "provider_context_exceeded"
                         prev_provider = provider_name

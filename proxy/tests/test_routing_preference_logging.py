@@ -11,7 +11,9 @@ Two properties are pinned here:
    ``routing_skip_local``, ``routing_check``,
    ``contention_queue_fallback_after_queue``,
    ``local_admission_guard_direct_fallback``, the chain-resolution
-   ``Skipping provider=<local> … in cooldown`` line and the quota hard-stop skip.
+   ``Skipping provider=<local> … in cooldown`` line, the quota hard-stop skip
+   and the per-entry ``routing_skip_provider_context`` ceiling skip
+   (LP-0MVTF2WLQ008BNYK).
 2. **Attribution** (parent AC5): ``priority_routing`` on **both** dispatch
    cycles carries the request's session id, so a preference can be tied to a
    specific request without correlation heuristics.
@@ -67,6 +69,13 @@ from proxy import contention_queue, prefill_eta
 
 #: Prompt size priced by the rows that need a known measurement.
 PROMPT_TOKENS = 20_000
+#: ``entry_context_cap`` row: the local entry's own ceiling, below the priced
+#: prompt so the request leaves the local route (a pin-local request is promoted,
+#: the default client takes the warm-context skip).
+ENTRY_CAP_LOCAL_TOKENS = PROMPT_TOKENS // 2
+#: ``entry_context_cap`` row: the remote entry's ceiling, also below the priced
+#: prompt, so the per-entry skip is taken on the remote entry too.
+ENTRY_CAP_REMOTE_TOKENS = PROMPT_TOKENS // 4
 #: Calibrated budget refusal: a cache-cold 100k prompt at ~3.9 ms/token is
 #: ~390 s of prefill against a 60 s wait budget.
 ADMISSION_PROMPT_TOKENS = 100_000
@@ -189,6 +198,23 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
         contains=("reason=quota_hard_stop",),
         existing_keys=("provider", "reason"),
         description="chain resolution skipped the local entry on a quota hard stop",
+    ),
+    _NotLocalLineRow(
+        trigger="entry_context_cap",
+        prefix="routing_skip_provider_context",
+        existing_keys=(
+            "provider",
+            "type",
+            "status",
+            "estimated_tokens",
+            "limit",
+            "reason",
+            "session",
+        ),
+        description=(
+            "per-entry max_context_tokens ceiling exceeded: the prompt leaves "
+            "the entry before the budget gate and dispatch"
+        ),
     ),
     _NotLocalLineRow(
         trigger="lease_fallback",
@@ -349,6 +375,27 @@ def _lease_active_response() -> Response:
     )
 
 
+def _row_model_config(row: _NotLocalLineRow) -> dict:
+    """The model chain *row* runs against.
+
+    Only the ``entry_context_cap`` row caps its entries: the ceiling is the
+    trigger under test there and must not leak into any other row (the other
+    exits are conditional on the entry being dispatchable).
+    """
+    model_config = _model_config()
+    if row.trigger != "entry_context_cap":
+        return model_config
+    capped = []
+    for entry in model_config["providers"]:
+        limit = (
+            ENTRY_CAP_LOCAL_TOKENS
+            if entry.get("type") == "local"
+            else ENTRY_CAP_REMOTE_TOKENS
+        )
+        capped.append({**entry, "max_context_tokens": limit})
+    return {**model_config, "providers": capped}
+
+
 def _model_config(cycle: str = "local_remote") -> dict:
     """The model chain for *cycle* (local + remote, or remote only)."""
     providers = [
@@ -384,6 +431,12 @@ def _config(row: _NotLocalLineRow) -> dict:
     }
     if row.trigger == "queue_depth_cap":
         server["contention_queue_max_depth"] = 1
+    if row.trigger == "entry_context_cap":
+        # The smart-routing gate short-circuits entirely at a cold threshold of
+        # 0, so the local entry's own ceiling would never bind. Enabling the
+        # cold term (kept above the priced prompt) makes Check 1 — the capped
+        # warm threshold — the binding limit for the default client.
+        server["local_large_context_cold_cache_threshold"] = PROMPT_TOKENS * 2
     return {"provider_cooldown_seconds": 60, "server": server}
 
 
@@ -397,6 +450,10 @@ def _row_patches(row: _NotLocalLineRow) -> list:
     trigger = row.trigger
     patches: list = []
     if trigger == "clean":
+        patches.append(_estimate_patches(PROMPT_TOKENS))
+    elif trigger == "entry_context_cap":
+        # The ceiling is compared against the routing estimate, so the prompt is
+        # priced deterministically above both capped entries.
         patches.append(_estimate_patches(PROMPT_TOKENS))
     elif trigger == "thrash_cooldown":
         patches.append(
@@ -470,7 +527,7 @@ async def _issue(
         return await provider.proxy_with_fallback(
             _DummyRequest(headers=headers),
             "v1/chat/completions",
-            model_config if model_config is not None else _model_config(),
+            model_config if model_config is not None else _row_model_config(row),
             _config(row),
         )
 
@@ -1365,3 +1422,138 @@ async def test_exhaustion_of_a_non_pinned_client_is_not_reported_as_pinned(caplo
         preference=DEFAULT_PREFERENCE,
         reason="eta_exceeds_budget_direct",
     )
+
+
+# ---------------------------------------------------------------------------
+# The per-entry context ceiling names the preference on BOTH dispatch cycles
+#
+# ``_record_provider_context_skip()`` (LP-0MVTF2WLQ008BNYK) logs
+# ``routing_skip_provider_context`` from two call sites: the remote-only cycle
+# (``_proxy_with_remote_fallback_cycle``) and the local+remote cycle
+# (``_proxy_with_fallback_cycle``). The ``entry_context_cap`` row in
+# ``_NOT_LOCAL_LINE_ROWS`` covers the second — where a pin-local request is
+# promoted away from its capped local entry and the default client takes the
+# warm-context skip, so all three parsed preferences reach the line. This block
+# covers the first: a lone remote entry above its ceiling.
+#
+# A pin-local request provably never reaches that loop: with no local entry in
+# the chain there is nothing to pin to, so the choke point refuses it before the
+# per-entry gate. Pinning that (rather than asserting a line that cannot exist)
+# is what keeps the three-value coverage honest.
+# ---------------------------------------------------------------------------
+
+
+def _capped_remote_only_chain() -> dict:
+    """One remote entry whose ceiling is below the priced prompt."""
+    return {
+        "name": MODEL_NAME,
+        "providers": [
+            {
+                "name": REMOTE_PROVIDER_NAME,
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+                "max_context_tokens": ENTRY_CAP_REMOTE_TOKENS,
+            },
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+
+def _never_dispatch_remote():
+    """A remote stub that fails loudly: the capped entry must never dispatch."""
+
+    async def _remote(_req, _path, _pc):  # pragma: no cover - must never run
+        raise AssertionError("an entry above its own ceiling must not dispatch")
+
+    return _remote
+
+
+async def _issue_remote_only(preference: str | None) -> Response:
+    """Issue one request on the remote-only cycle with *preference*."""
+    headers = {} if preference is None else {"X-Local-Preference": preference}
+    with (
+        patch(
+            "proxy.provider._get_proxy_to_remote",
+            return_value=_never_dispatch_remote(),
+        ),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch("proxy.router_helpers.evaluate_and_apply_compaction", _no_compaction),
+        _estimate_patches(PROMPT_TOKENS),
+    ):
+        return await provider.proxy_with_remote_fallback(
+            _DummyRequest(headers=headers),
+            "v1/chat/completions",
+            _capped_remote_only_chain(),
+            _config(_row("entry_context_cap")),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("preference", "expected"),
+    [
+        pytest.param(None, DEFAULT_PREFERENCE, id="absent-header"),
+        pytest.param(PREFER_LOCAL, PREFER_LOCAL, id="prefer-local"),
+        pytest.param(REMOTE_OK, REMOTE_OK, id="remote-ok"),
+    ],
+)
+async def test_remote_only_cycle_context_skip_names_the_preference(
+    preference, expected, caplog
+):
+    """The remote-only call site carries ``preference=`` too.
+
+    Same additive contract as the row test: every pre-existing key survives and
+    the parsed intent is appended, so an operator grepping ``proxy.log`` for
+    ``routing_skip_provider_context`` can attribute the skip to the request's
+    ``X-Local-Preference`` on either cycle.
+    """
+    result = await _issue_remote_only(preference)
+
+    assert result.status_code == 503, "the only entry was skipped, so the chain exhausted"
+    lines = [
+        message
+        for message in _messages(caplog)
+        if message.startswith("routing_skip_provider_context ")
+    ]
+    assert len(lines) == 1, (
+        "one line per skipped entry on the remote-only cycle; got "
+        f"{lines!r}\n" + "\n".join(_messages(caplog))
+    )
+    kv = _parse_kv(lines[0])
+    assert kv.get("type") == "remote", f"the line names the skipped entry: {lines[0]!r}"
+    for key in _row("entry_context_cap").existing_keys:
+        assert key in kv, f"pre-existing key {key!r} lost: {lines[0]!r}"
+    assert kv.get("preference") == expected, (
+        f"the remote-only skip must name preference={expected}; got "
+        f"{kv.get('preference')!r}. Line: {lines[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_only_cycle_refuses_a_pin_local_client_before_the_ceiling(caplog):
+    """Pinned intent wins over the per-entry gate: refusal, not a context skip.
+
+    A pin-local client on a chain with no local entry has nothing to pin to, so
+    the choke point refuses it (429, ``X-Local-Route: refused``) before the
+    per-entry ceiling is consulted. No ``routing_skip_provider_context`` line is
+    emitted, exactly as for the ``remote-ok`` strip: the line reports entries the
+    request actually walked past.
+    """
+    result = await _issue_remote_only(LOCAL_PREFERRED)
+
+    assert result.status_code == 429, "a pin-local request is refused, not served"
+    assert result.headers.get("X-Local-Route") == "refused"
+    assert [
+        message
+        for message in _messages(caplog)
+        if message.startswith("routing_skip_provider_context ")
+    ] == [], "the refused request never reached the per-entry gate"
+    refusal_lines = [
+        message
+        for message in _messages(caplog)
+        if message.startswith("local_only_refused ")
+    ]
+    assert len(refusal_lines) == 1, (
+        f"the refusal names itself once; got {refusal_lines!r}"
+    )
+    assert _parse_kv(refusal_lines[0]).get("preference") == LOCAL_PREFERRED
