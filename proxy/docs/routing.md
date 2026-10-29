@@ -656,6 +656,26 @@ A high `prefix_mismatch` share points at the guard (rewritten fronts); a high
 the writer or at slot-file churn; a high `found` with no `slot_ratio_restored`
 lines would indicate an error inside `set_cached_ratio`.
 
+**Prefer the tallying tool to hand-greps** (rotated and `.gz` logs, no double
+counting, windows handled once):
+
+```bash
+python3 scripts/analyse_slot_ratio_restore.py \
+  --log-dir /var/log/llama-proxy \
+  --slot-cache-dir ./slot-cache \
+  --window "last24h=2026-10-28T10:50:26,2026-10-29T10:50:26"
+```
+
+It splits the outcomes into the two **lookup** outcomes (`missing_sidecar`,
+`missing_snapshot`) and the **guard** outcomes (`expired`, `model_mismatch`,
+`prefix_mismatch`, `empty_ratio`, `found`) under `seed_outcomes`, because that
+split is what identifies the failure mode: guard outcomes are only reachable
+after a snapshot **and** a readable sidecar were found together, so a zero guard
+total across a window means the seed path never got past the lookup and the
+guard (prefix / TTL) cannot be the cause. The first such verdict, and the two
+writer-side gaps that produce it, are recorded in
+[`docs/dev/slot-ratio-seed-verdict-LP-0MVK0E8C40035FG3.md`](../../docs/dev/slot-ratio-seed-verdict-LP-0MVK0E8C40035FG3.md).
+
 ## Capacity-based local admission (LP-0MVGDUVS6003T2IX)
 
 The economic gate (`local_large_context_cold_cache_threshold`, 38 000 new

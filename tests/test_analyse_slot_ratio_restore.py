@@ -361,3 +361,123 @@ def test_context_bucket_pairing(tmp_path):
     assert buckets["<= 38,000"]["restored"]["count"] == 1
     # s4's cold dispatch has no preceding routing_check, so it is not paired.
     assert "cold" not in buckets.get("<= 38,000", {})
+
+
+# --- seed-outcome tally (LP-0MVK0E8C40035FG3) ------------------------------
+# The verdict on the restored-prefix seed failure mode is read from the
+# ``slot_ratio_seed outcome=…`` vocabulary, not from a hand-grep: the tool must
+# split lookup failures (a snapshot or its sidecar missing) from guard
+# rejections (TTL / prefix / model / zero credit), because a zero guard total
+# is what rules the guard out as the cause.
+SEED_LINES = {
+    "sidecar1": (
+        "{D1},920 - INFO - slot_ratio_seed outcome=missing_sidecar session=aaaa1111 "
+        "model=Qwen3 stored_messages=0 incoming_messages=4 age_s=0 cached_ratio=0.00"
+    ),
+    "sidecar2": (
+        "{D1},921 - INFO - slot_ratio_seed outcome=missing_sidecar session=aaaa1111 "
+        "model=Qwen3 stored_messages=0 incoming_messages=6 age_s=0 cached_ratio=0.00"
+    ),
+    "snapshot1": (
+        "{D1},922 - INFO - slot_ratio_seed outcome=missing_snapshot session=bbbb2222 "
+        "model=Qwen3 stored_messages=40 incoming_messages=119 age_s=100 cached_ratio=0.00"
+    ),
+    "snapshot2": (
+        "{D1},923 - INFO - slot_ratio_seed outcome=missing_snapshot session=bbbb2222 "
+        "model=Qwen3 stored_messages=40 incoming_messages=121 age_s=300 cached_ratio=0.00"
+    ),
+    "expired": (
+        "{D1},924 - INFO - slot_ratio_seed outcome=expired session=cccc3333 "
+        "model=Qwen3 stored_messages=40 incoming_messages=60 age_s=90000 cached_ratio=0.00"
+    ),
+    "found": (
+        "{D1},925 - INFO - slot_ratio_seed outcome=found session=dddd4444 "
+        "model=Qwen3 stored_messages=40 incoming_messages=44 age_s=60 cached_ratio=0.90"
+    ),
+    "prefix_out_of_window": (
+        "{D3} - INFO - slot_ratio_seed outcome=prefix_mismatch session=eeee5555 "
+        "model=Qwen3 stored_messages=80 incoming_messages=40 age_s=120 cached_ratio=0.00"
+    ),
+    "eviction_ok": (
+        "{D1},926 - INFO - slot_save session=aaaa1111 slot=1 "
+        "reason=lease_evicted saved=True source=eviction"
+    ),
+    "eviction_failed": (
+        "{D1},927 - INFO - slot_save session=aaaa1111 slot=1 "
+        "reason=lease_evicted saved=False source=eviction"
+    ),
+    "persistence_skipped": (
+        "{D1},928 - INFO - slot persistence skipped session=aaaa1111 slot=0 "
+        "reason=slot_busy active_sessions=1"
+    ),
+}
+
+
+def _write_seed_corpus(tmp_path):
+    lines = [_render(SEED_LINES[name]) for name in SEED_LINES]
+    (tmp_path / "proxy.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_seed_outcome_tally(tmp_path):
+    """Outcomes are tallied per window, with the lookup/guard split."""
+    _write_seed_corpus(tmp_path)
+    proc = _run(
+        [
+            "--log-dir",
+            str(tmp_path),
+            "--window",
+            "w=2026-05-01T09:05:00,2026-05-01T10:50:00",
+            "--json",
+        ],
+        tmp_path,
+    )
+    s = _summary(proc)
+    seeds = s["seed_outcomes"]
+
+    # 6 in-window seed decisions; the 11:05 prefix_mismatch is excluded.
+    assert seeds["total"] == 6
+    by = seeds["by_outcome"]
+    assert by["missing_sidecar"]["count"] == 2
+    assert by["missing_sidecar"]["pct"] == 33.33
+    assert by["missing_sidecar"]["sessions"] == 1
+    assert by["missing_snapshot"]["count"] == 2
+    assert by["missing_snapshot"]["sessions"] == 1
+    assert by["expired"]["count"] == 1
+    assert by["found"]["count"] == 1
+    assert by["prefix_mismatch"]["count"] == 0
+
+    # The split that decides a verdict: lookup failures vs guard rejections.
+    assert seeds["lookup_outcomes_total"] == 4
+    assert seeds["guard_outcomes_total"] == 2
+    assert seeds["sessions"]["missing_sidecar"] == ["aaaa1111"]
+
+    # age_s / stored-vs-incoming distributions are reported where meaningful.
+    assert by["missing_snapshot"]["age_s"]["count"] == 2
+    assert by["missing_snapshot"]["age_s"]["p50"] == 200.0
+    assert by["missing_snapshot"]["age_s"]["max"] == 300.0
+    assert by["missing_snapshot"]["message_pairs"] == [
+        {"stored": 40, "incoming": 119, "count": 1},
+        {"stored": 40, "incoming": 121, "count": 1},
+    ]
+
+    # Writer-side evidence: eviction saves are counted apart from the request
+    # path (they never write a sidecar), and the persistence gate is tallied.
+    slots = s["slots"]
+    assert slots["save_eviction_ok"] == 1
+    assert slots["save_eviction_failed"] == 1
+    assert slots["eviction_save_sessions"] == 1
+    assert slots["persistence_skipped_reasons"] == {"slot_busy": 1}
+
+
+def test_seed_outcome_markdown(tmp_path):
+    """The rendered table shows the outcome rows an operator reads."""
+    _write_seed_corpus(tmp_path)
+    proc = _run(
+        ["--log-dir", str(tmp_path), "--window", "w=2026-05-01T09:05:00,2026-05-01T10:50:00"],
+        tmp_path,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "`slot_ratio_seed` decisions" in proc.stdout
+    assert "`outcome=missing_sidecar`" in proc.stdout
+    assert "2 (33.3%, 1 sess)" in proc.stdout
+    assert "seed guard branches reached" in proc.stdout
