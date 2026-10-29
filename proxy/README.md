@@ -2121,11 +2121,12 @@ Response:
 | `llama_server_running`    | `bool`        | `true` when the llama-server process is running and responsive.            |
 | `available_slots`         | `int`         | Number of model-serving slots that are currently idle (not processing). When the served slot detail is stale and the proxy has no in-flight local work, reconciled upward to the pool size so a stale snapshot cannot close the dispatch gate. |
 | `total_slots`             | `int`         | Total number of model-serving slots configured on the llama-server.         |
-| `capacity_hint`           | `string`      | `idle` \| `prefill_bound` \| `saturated`, from the per-slot decision table; reconciled with live dispatch/activity state when slot detail is stale (LP-0MVGDUVGE0024YAI, LP-0MVKSXR4P001V0CM). |
+| `capacity_hint`           | `string`      | `idle` \| `prefill_bound` \| `saturated` \| `abandoned_busy`, from the per-slot decision table; reconciled with live dispatch/activity state when slot detail is stale (LP-0MVGDUVGE0024YAI, LP-0MVKSXR4P001V0CM). `abandoned_busy` means the pool is occupied only by work the proxy has abandoned — busy, not ours (LP-0MVRMI5HK00558TB); **treat any unrecognised value as busy**. |
 | `slots_stale`             | `bool`        | The served slot counts **or** per-slot detail came from the last-known cache. |
 | `slots_detail_stale`      | `bool`        | The per-slot detail (and therefore `capacity_hint` input) is cached.       |
 | `slot_counts_stale`       | `bool`        | The `available_slots` / `total_slots` pair is cached.                      |
-| `status_schema_version`   | `int`         | Payload schema version (currently `3`).                                    |
+| `local_abandoned_slots`   | `int`         | Slots annotated `abandoned` — dispatches the proxy gave up on that llama-server has not released yet (LP-0MVRMI5HK00558TB). |
+| `status_schema_version`   | `int`         | Payload schema version (currently `4`).                                    |
 
 **Performance:**
 
@@ -2134,6 +2135,17 @@ The endpoint is designed to remain responsive even under load. The underlying
 (default: 1 second, overridable via the `STATUS_QUERY_TIMEOUT` environment
 variable). If the query times out, safe defaults (mostly `false`/`null`) are
 returned and `llama_server_running` is set to `false`.
+
+Local dispatches the proxy abandons (prefill deadline, session eviction,
+no-progress watchdog, client disconnect) are cancelled upstream where a handle
+exists and otherwise reported per slot as `abandoned` with its reason and
+session, so a ghost llama-server is still finishing never reads as live work.
+The post-deadline prefill-thrash cooldown is scoped to the **(session, prompt
+fingerprint)** that actually failed and is released as soon as a fresh snapshot
+proves the GPU free, so it never vetoes an unrelated prompt on an idle GPU while
+still refusing the re-dispatch it was armed for
+(LP-0MVRMI5HK00558TB; details in
+[docs/routing.md](docs/routing.md#post-deadline-prefill-thrash-cooldown-lp-0mvkukfhh005udwl-rescoped-by-lp-0mvt2ksxy002o75c)).
 
 This endpoint requires no authentication (internal) and is rate-unlimited.
 

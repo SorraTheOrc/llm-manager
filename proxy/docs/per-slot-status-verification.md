@@ -152,17 +152,20 @@ change is additive and versioned (`status_schema_version: 3`); a client that
 ignores the new fields behaves exactly as before (contract test:
 `test_new_capacity_fields_are_additive_and_versioned`). v3
 (LP-0MVKSXR4P001V0CM) adds stale-detail reconciliation of `capacity_hint` and
-truthful in-flight accounting.
+truthful in-flight accounting. v4 (LP-0MVRMI5HK00558TB) adds the abandoned-work
+annotation, the `abandoned_busy` hint value and the top-level
+`local_abandoned_slots` count.
 
 ## Payload (new fields)
 
 ```json
 {
-  "status_schema_version": 3,
+  "status_schema_version": 4,
   "total_slots": 2,
   "available_slots": 0,
   "contention_queue_depth": 3,          // existing, elsewhere in the payload
   "capacity_hint": "prefill_bound",
+  "local_abandoned_slots": 0,
   "prefill_budget_seconds": 120.0,
   "queue_eta_seconds": 240.0,
   "slots_stale": false,
@@ -173,11 +176,15 @@ truthful in-flight accounting.
     {"slot_id": 0, "is_processing": true, "n_decoded": 0,
      "context_tokens": 102345, "owner_session_id": "…",
      "lease_state": "generating", "phase": "prefill",
-     "prefill_eta_seconds": 187.0},
-    {"slot_id": 1, "is_processing": false, "n_decoded": null,
-     "context_tokens": null, "owner_session_id": "…",
-     "lease_state": "idle_leased", "phase": null,
-     "prefill_eta_seconds": null}
+     "prefill_eta_seconds": 187.0, "abandoned": false,
+     "abandonment_reason": null, "abandoned_session_id": null,
+     "abandoned_at_seconds_ago": null},
+    {"slot_id": 1, "is_processing": true, "n_decoded": 41,
+     "context_tokens": 4096, "owner_session_id": null,
+     "lease_state": "generating", "phase": "decode",
+     "prefill_eta_seconds": null, "abandoned": true,
+     "abandonment_reason": "prefill_deadline",
+     "abandoned_session_id": "herdr-…", "abandoned_at_seconds_ago": 12.4}
   ]
 }
 ```
@@ -191,8 +198,13 @@ Per-slot fields (all additive):
 | `phase` | `"prefill" \| "decode" \| null` | Inferred proxy-side (see below); `null` when the slot is not processing. |
 | `context_tokens` | `int \| null` | Prompt progress (`max(n_past, n_prompt_tokens_processed)`) when the llama.cpp build reports it, else `null`. |
 | `prefill_eta_seconds` | `float \| null` | Shared calibrated prefill cost of the slot's loaded context, only for a slot in `prefill`; `null` otherwise or when not computable. |
+| `abandoned` | `bool` | `true` when the proxy gave up on the dispatch occupying this slot (see [Abandoned work](#abandoned-work-lp-0mvr5hk00558tb-ac1)) and llama-server has not released it yet. Always present. |
+| `abandonment_reason` | `str \| null` | Which abandonment gave the slot up: `prefill_deadline`, `session_evicted`, `no_progress_watchdog`, `client_disconnect` (also `orphan_cleanup` / `measured_cache_deficit` from the sweep and the early abort). `null` when `abandoned` is `false`. |
+| `abandoned_session_id` | `str \| null` | The session that was abandoned (the slot's own identity is already `slot_id`). `null` when `abandoned` is `false`. |
+| `abandoned_at_seconds_ago` | `float \| null` | Age of the abandonment, so a consumer can reason about how long a ghost may persist (the registry TTL is 900 s). |
 
 Top-level fields: `capacity_hint`, `prefill_budget_seconds`,
+`local_abandoned_slots` (count of `abandoned: true` slots),
 `status_schema_version` (plus the existing `prefill_eta_seconds` /
 `queue_eta_seconds`).
 
@@ -247,6 +259,9 @@ Every ETA comes from the shared calibration / admission guard in
 
 Evaluated **in order** (`compute_capacity_hint()`):
 
+0. `abandoned_busy` — no slot is free and **nothing** generating is live
+   (proxy-owned) work, i.e. every working slot belongs to a dispatch the proxy
+   abandoned (LP-0MVRMI5HK00558TB AC1). Busy, but not ours.
 1. `idle` — at least one slot is `free` **or** every occupied slot is
    `idle_leased` (nothing is actually generating).
 2. `prefill_bound` — no slot is free and at least one occupied slot is in
@@ -257,6 +272,43 @@ Two documented extensions: an empty `slots` array (server down / no model / no
 cached detail) is `idle` (fail-open — never claim saturation without evidence),
 and a pool with no free slot, no prefill and mixed `decode` / `idle_leased`
 occupancy is `saturated` (genuine decode work, nothing available to a newcomer).
+
+Rule 0 is conservative in one direction only: it fires **only** when no
+generating slot is live, so live work alongside an abandoned slot keeps the
+previous verdict. An abandonment never discounts real work, and slots without
+the `abandoned` annotation behave exactly as before.
+
+## Abandoned work (LP-0MVRMI5HK00558TB AC1)
+
+An *abandoned* dispatch is one the proxy stopped waiting for while
+llama-server still had it — the prefill deadline expired, the session was
+evicted, the no-progress watchdog fired, or the client disappeared. Before this
+fix the proxy only closed the *downstream* connection, which llama-server acts
+on at its next write, so the abandoned prefill ran to completion and a later
+fresh `/slots` poll reported the slot as `is_processing` with
+`local_in_flight_requests=0` — counted as `saturated`, i.e. live work nobody
+was waiting for. Measured 2026-10-24 20:00 → 2026-10-25 07:00: 332
+abandonments left **247** such polls (2.12 %).
+
+Two mechanisms now apply, per reason (details and the log lines are in
+[routing.md](routing.md#abandoned-local-dispatches-lp-0mvr5hk00558tb-ac1)):
+
+1. **Cancel the upstream task** wherever a handle exists (the deadline and
+   session-eviction paths now close the captured upstream stream, as the
+   watchdog and client-disconnect paths already did). llama-server aborts at
+   its next socket write, and `return_progress` guarantees writes during
+   prefill, so the ghost window is short rather than the whole prefill.
+2. **Annotate what remains.** The abandoned slot identity (endpoint, slot,
+   session, reason, timestamp) is recorded in-process with a 900 s TTL, and the
+   status payload publishes it. A slot the backend has not released yet is then
+   *busy, not ours*: `capacity_hint` is `abandoned_busy` — **never**
+   `saturated` (that must keep meaning live, proxy-owned decode work) and
+   **never** `idle` (a busy-but-abandoned pool folded into `idle` would admit a
+   newcomer behind the ghost and make the tail worse).
+
+The annotation is explicit and attributable (slot identity + reason + session),
+never a blanket discount of llama-server processing: a fresh snapshot whose
+slots are genuinely live still reports `saturated`.
 
 The table is authoritative only while the served `/slots` detail is **fresh**.
 When `slots_detail_stale` is true, the cached `is_processing`/`phase` describe
@@ -315,9 +367,23 @@ optional per-slot `owner_session_id`; extend them to also read:
   hold time: p50 61.8 s, p90 269.8 s).
 - `capacity_hint` — a one-field summary: `idle` (safe to dispatch),
   `prefill_bound` (a prefill is in flight), `saturated` (all occupied slots are
-  decoding).
+  decoding), `abandoned_busy` (the pool is occupied only by work the proxy has
+  abandoned — busy, not ours).
+- `slots[].abandoned` / `abandonment_reason` / `abandoned_session_id` and the
+  top-level `local_abandoned_slots` (LP-0MVRMI5HK00558TB) — for reporting and
+  for distinguishing a ghost from live work without re-deriving it.
 - `prefill_budget_seconds` — the admission guard's budget, so the dispatcher
   paces to the same number the proxy enforces.
+
+**Unknown hint values must be treated as busy.** The hint set is additive
+(`abandoned_busy` was added in `status_schema_version` 4 and more may follow),
+so a consumer must never assume the three values it knows are exhaustive: an
+unrecognised value means *do not dispatch* — the conservative direction. Because
+the herdr `downtime-worker.ts` contract admits **only** on `idle`, a new
+non-`idle` value is already conservative for it, so **no ContextHub change is
+required** for `abandoned_busy` (only the optional reporting reads above, if
+wanted). The alternative — folding abandoned work into `idle` — was rejected:
+it would admit a dispatch behind a ghost and lengthen the tail.
 
 All of these are optional: the existing `is_processing` / `n_decoded` /
 `available_slots` reads keep working unchanged (AC1).

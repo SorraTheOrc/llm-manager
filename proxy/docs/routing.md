@@ -1431,7 +1431,7 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
 | Router skip: residency ladder found too little reusable prefix (an idle-admission denial keeps this token) | `resident_prefix_insufficient` | refusing | `routing_skip_local ... reason=resident_prefix_insufficient ...` |
 | Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | refusing | `routing_skip_local ... reason=tenant_limit ...` |
-| Router skip: session in post-deadline prefill-thrash cooldown | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` |
+| Router skip: (session, prompt) in post-deadline prefill-thrash cooldown | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` |
 | Contention-queue depth cap reached (never queued), or the wait budget expired | `fallback_after_queue` | refusing | `contention_queue_fallback_after_queue ... preference=...` |
 | Local slots busy with the queue disabled (fast-mode fallback policy) | `local_concurrency_limit` | refusing | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
 | Prefill-gate / lease denial (a lease-active 503 after the retry window) | `local_lease_active` | refusing | `contention_queue_fallback_after_queue ... reason=local_lease_active` |
@@ -1783,35 +1783,65 @@ SSE headers arrive. Frames *before* the headers (the strict prefill window)
 need the local dispatch to return a streaming response before the upstream
 first byte; that gap is tracked separately.
 
-#### Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL)
+#### Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL, rescoped by LP-0MVT2KSXY002O75C)
 
 A deadline cancellation is *evidence that the prefill cannot complete* — the
-root cause of the thrash: the client re-dispatches the identical
-prompt and the whole prefill burns again (the incident's 41 local POSTs, 35
-inside 02:00-03:00, re-prefilling near-duplicates of the same 28k-124k-token
-prompts). To suppress that loop, the deadline event arms a **per-session
-cooldown** (`server.local_prefill_thrash_cooldown_seconds`, default **600 s**;
-0 disables):
+root cause of the thrash: the client re-dispatches the identical prompt and the
+whole prefill burns again (the incident's 41 local POSTs, 35 inside
+02:00-03:00, re-prefilling near-duplicates of the same 28k-124k-token prompts).
 
-1. On `prefill_deadline_exceeded` router.py logs
-   `prefill_thrash_cooldown_started session=… cooldown_s=…` and arms the
-   window for that session.
-2. While armed, the session's local routing skips once per request
-   (`routing_skip_local … session=… cooldown_remaining=Ns
-   reason=prefill_thrash_cooldown → skipping local`) — *before* the
-   concurrency/queue/smart-routing gates, so the request never queues for a
-   slot it would then be forbidden to use — and the chain reaches the next
-   provider immediately.
-3. The window clears on expiry (lazy, at the next request) and on a
-   successful local first byte (`_clear_prefill_thrash_cooldown` in the
-   router's success path), and is keyed per session, so other sessions are
-   unaffected. Setting the knob to 0 disables the arming and the skip
-   (documented rollback).
+**What it refuses.** The window is keyed by **(session, prompt fingerprint)**,
+not by session alone. The fingerprint is a 32-hex-char SHA-256 prefix over the
+request's `messages` (sorted keys, compact separators); message order is
+significant, and a body with no usable `messages` yields no fingerprint. So:
 
-The cooldown is in-process (a proxy restart resets routing state, matching
-its own leases) and lives in `proxy/proxy/router_helpers.py`
-(`_prefill_thrash_cooldowns` + the `_…_prefill_thrash…` helpers); unit and
-routing-level behaviour are pinned by `proxy/tests/test_prefill_thrash_cooldown.py`.
+- a re-dispatch of the **failing prompt** is still refused — on every local
+  dispatch entry, because the gate sits in `provider.py` *before* the
+  concurrency / queue / smart-routing gates, so a refused request never queues
+  for a slot it would be forbidden to use;
+- a **different prompt** from the same session — usually far smaller — is
+  admitted. That is the measured over-reach this fixes: 2026-10-24 20:00 →
+  2026-10-25 07:00, 916 `routing_skip_local … reason=prefill_thrash_cooldown`
+  skips across 46 sessions, **241 of them for 21 `herdr-*` sessions** (the
+  downtime dispatcher starving its own workload), 337 of them where the
+  proxy's own nearest status poll within 120 s reported
+  `local_in_flight_requests=0`.
+- a **fail-open fallback** keeps the gate engaged when a fingerprint cannot be
+  derived: an arming site without a fingerprint arms the session-wide
+  (empty-fingerprint) window, and a gate without one consults **every** window
+  of the session. The narrowing is lost, never the gate.
+
+**When it is released.** Besides expiry and a comparable-size successful first
+byte (`local_prefill_thrash_recovery_fraction`, LP-0MVQITN6P008DPLB), the
+window is released when the proxy's own evidence proves the GPU free
+(`_release_prefill_thrash_cooldown_on_free_gpu`):
+
+| Release trigger | Condition (all must hold) | Log line |
+|---|---|---|
+| `free_gpu` | no `active` dispatch record; a **fresh** `/slots` snapshot (`proxy.residency` view `known`); **no** processing slot (an abandoned ghost still processing blocks it) | `prefill_thrash_cooldown_released session=… reason=free_gpu cooldown_remaining=Ns endpoint=…` |
+| comparable first byte | a successful local dispatch prefilled ≥ `local_prefill_thrash_recovery_fraction` of the armed size, for the same fingerprint | (cleared silently on the success path) |
+| expiry | lazy prune at the next request | — |
+| knob 0 | `server.local_prefill_thrash_cooldown_seconds: 0` — disables arming, skipping and release | — |
+
+The `free_gpu` release is what removes the measured free-GPU skips; it is not a
+blanket disable (any of a stale snapshot, a live dispatch or a processing slot
+keeps the window armed), and it was sequenced after the abandoned-work fix
+below, because a ghost still computing legitimately blocks the release.
+
+**Wiring.** Arming: `router.py` on `prefill_deadline_exceeded` and on the
+measured-cache-deficit early abort (both log
+`prefill_thrash_cooldown_started session=… cooldown_s=…`), with the request's
+fingerprint and its prompt size. Gating: `provider.py`, which logs
+`routing_skip_local … session=… cooldown_remaining=Ns
+reason=prefill_thrash_cooldown → skipping local`. Clearing: the router's
+first-byte success path. The store is in-process (`_prefill_thrash_cooldowns`,
+keyed `(session, fingerprint)`; a proxy restart resets it with the routing
+state it guards) in `proxy/proxy/router_helpers.py`. Unit and routing-level
+behaviour are pinned by `proxy/tests/test_prefill_thrash_cooldown.py`; the skip
+counts are measured by `scripts/capacity_signal_verification.py`
+(`prefill_thrash_cooldown` block — both the strict "fresh poll" attribution and
+the relaxed "no live local work" population the 336-skip baseline was derived
+with).
 
 #### Abandoned local dispatches (LP-0MVRMI5HK00558TB AC1)
 
@@ -1847,16 +1877,24 @@ achievable and observable here. The sequence is always
 
 Because the backend can lag the close, the abandonment is also **recorded**
 (`_record_abandoned_slot`, `proxy/proxy/router_helpers.py`) with a bounded TTL
-(`DEFAULT_ABANDONED_SLOT_TTL_SECONDS`, 900 s) and published on
-`/llama/local/status`: each slot carries `abandoned`, `abandonment_reason`,
-`abandoned_session_id` and `abandoned_at_seconds_ago`, the top level carries
-`local_abandoned_slots`, and `capacity_hint` gains the additive value
-`abandoned_busy` for a pool occupied *only* by abandoned work. `saturated`
-therefore keeps meaning live, proxy-owned decode work, and a busy-but-abandoned
-pool is never reported `idle`. See
+(`DEFAULT_ABANDONED_SLOT_TTL_SECONDS`, 900 s — longer than the 600 s cooldown
+so the annotation outlives the window in which the ghost can still be seen
+processing), keyed by slot identity so the registry cannot grow past the pool,
+and pruned lazily on read. It is published on `/llama/local/status`:
+`status_schema_version` 4, each slot carrying `abandoned`,
+`abandonment_reason`, `abandoned_session_id` and `abandoned_at_seconds_ago`,
+the top level carrying `local_abandoned_slots`, and `capacity_hint` gaining the
+additive value `abandoned_busy` for a pool occupied *only* by abandoned work.
+`saturated` therefore keeps meaning live, proxy-owned decode work, and a
+busy-but-abandoned pool is never reported `idle`. See
 [per-slot-status-verification.md](per-slot-status-verification.md) for the
 status semantics and the consumer rule (any unrecognised hint value → treat as
 busy).
+
+Interaction with the cooldown above: the annotation is what makes the *skip*
+decision honest (a ghost no longer reads as live work), while the ghost itself
+keeps the *free-GPU release* from firing — the GPU really is busy until
+llama-server finishes the cancelled task.
 
 #### Regression coverage for the prefill-thrash wedge
 
