@@ -1311,11 +1311,11 @@ reserved dispatch does not consume queue depth.
 | Value | Behaviour |
 |-------|-----------|
 | `prefer-local` (default) | Today's behaviour: use local when it can serve within the budget, else fall through to the next provider |
-| `local-preferred` | Pin local **while the request can still fit**. A *deferrable* request — the block is temporal, so waiting can help — waits for local capacity and, when the wait budget runs out, receives the retryable `429` deferral (`X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`, `Retry-After` / `retry_at`) instead of being moved to a paid provider. A *too-large* request — one that outgrows the local serving envelope, so waiting cannot help — is **never deferred and never refused for local capacity**: the local entry leaves the chain and a remote tier serves it. See [`local-preferred`: pinned while deferrable, promoted when too large](#local-preferred-pinned-while-deferrable-promoted-when-too-large) and the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
+| `local-preferred` | **Local while the request fits local capacity, remote beyond it.** Pin local **while the request can still fit**. A *deferrable* request — the block is temporal, so waiting can help — waits for local capacity and, when the wait budget runs out, receives the retryable `429` deferral (`X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`, `Retry-After` / `retry_at`) instead of being moved to a paid provider. A *too-large* request — one that outgrows the local serving envelope, so waiting cannot help — is **never deferred and never refused for local capacity**: the local entry leaves the chain and a remote tier serves it (`200`, `X-Local-Route: remote`, no `Retry-After`). See [`local-preferred`: pinned while deferrable, promoted when too large](#local-preferred-pinned-while-deferrable-promoted-when-too-large) and the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
 | `remote-ok` | Skip the local route entirely (background / low-priority work). The local provider is removed from the chain |
 
-Wire compatibility (LP-0MVSHWYVE005MS16): `local-only` is the **deprecated**
-spelling of `local-preferred`. It is still accepted and normalised to
+Wire compatibility (LP-0MVSHWYVE005MS16): `local-only` is the **legacy,
+deprecated** alias of `local-preferred`. It is still accepted and normalised to
 `local-preferred` at parse time — a client that keeps sending it retains
 pin-local semantics and is never demoted to `prefer-local` — and it logs one
 `WARNING` deprecation line per request. No removal date is scheduled, so
@@ -1355,11 +1355,29 @@ normalised to it) **and** a non-`too_large` verdict — the request is answered
 with the `429` (`X-Local-Route: refused`) instead of ever reaching that
 candidate. It is the mirror of `remote-ok`: where `remote-ok` removes the local
 route from the chain *before* dispatch, a pinned request refuses *before* any
-remote entry is dispatched — so every exit from the local route is an exit into
-the deferral or the refusal, and a pinned request is either completed locally
-or told when to retry, never silently served by a paid provider
-(LP-0MVRMC1L3006F0F3). The admission guard is still there; it is simply no
-longer the only line of defence.
+remote entry is dispatched (LP-0MVRMC1L3006F0F3). The admission guard is still
+there; it is simply no longer the only line of defence.
+
+The pin is **not** one universal outcome per exit — it is a split decided by
+the request's capacity verdict (`admission_reserve.local_capacity_verdict()`, see
+the [verdict table](#local-preferred-pinned-while-deferrable-promoted-when-too-large)):
+
+- **Deferrable** (the block is temporal, so waiting helps): the request is
+  never dispatched to a non-local provider. Every exit from the local route
+  ends in the retryable `429` deferral — `X-Local-Route: refused`,
+  `X-Local-Fallback-Reason: <exit token>`, `Retry-After` / `retry_at` — or the
+  request is completed locally. `refusing` rows in the table below.
+- **Too large** (the request outgrows the local serving envelope, so waiting
+  cannot help): the exit is **not** a refusal. The local entry leaves the
+  chain before dispatch and a remote tier serves the request — `200`,
+  `X-Local-Route: remote`, the same token as `X-Local-Fallback-Reason`, no
+  `Retry-After` and no local-capacity `429`. `promoting` rows below; the
+  mechanism is [Promoted: a too-large request leaves the local chain](#promoted-a-too-large-request-leaves-the-local-chain).
+
+So a `local-preferred` request is completed locally, told when to retry
+(deferrable), or promoted to a remote tier with the capacity reason stated
+(too large) — and a client can tell the last two apart from the status code and
+`X-Local-Route` alone, without parsing prose.
 
 A deferral's time is spent in the contention queue. In `queue` mode a pinned
 `deferrable` request waits for a local slot up to
@@ -1389,27 +1407,35 @@ the chain and the same token is stamped as `X-Local-Fallback-Reason` on the
 for an in-loop `context_too_large` skip, exactly as the pre-loop promotion
 does for the cold-prefill and context-cap classification).
 
-| Exit from the local route | `X-Local-Fallback-Reason` | Log line (`reason=` field) |
-|---|---|---|
-| Admission guard, queue path — projected prefill cannot finish inside the wait budget (`contention_queue_max_wait_seconds`) | `eta_exceeds_budget` | `local_admission_guard ... reason=eta_exceeds_budget ... enforced=true` |
-| Admission guard, queue path — projected first byte reaches `local_prefill_deadline_seconds` | `prefill_eta_exceeds_deadline` | `local_admission_guard ... reason=prefill_eta_exceeds_deadline ...` |
-| Admission guard, queue path — safety-budget bound of the deadline | `prefill_eta_exceeds_safety_budget` | `local_admission_guard ... reason=prefill_eta_exceeds_safety_budget ...` |
-| Admission guard, queue path — flat cold-prefill token cap (`local_cold_prefill_budget_tokens`) | `prefill_budget_exceeded` | `local_admission_guard ... reason=prefill_budget_exceeded ...` |
-| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` (the deadline/safety/budget reasons keep their own token) | `local_admission_guard ... free_slot=true ...` / `local_admission_guard_direct_fallback ... reason=...` |
-| Local entry in cooldown (chain resolution) | `local_provider_cooldown` | `Skipping provider=<local>: ... in cooldown (...s remaining) reason=local_provider_cooldown preference=...` |
-| Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap | `context_too_large` | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
-| Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | `routing_skip_local ... reason=large_context_bypass ...` |
-| Router skip: residency ladder found too little reusable prefix (an idle-admission denial keeps this token) | `resident_prefix_insufficient` | `routing_skip_local ... reason=resident_prefix_insufficient ...` |
-| Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | `routing_skip_local ... reason=tenant_limit ...` |
-| Router skip: session in post-deadline prefill-thrash cooldown | `prefill_thrash_cooldown` | `routing_skip_local ... reason=prefill_thrash_cooldown ...` |
-| Contention-queue depth cap reached (never queued), or the wait budget expired | `fallback_after_queue` | `contention_queue_fallback_after_queue ... preference=...` |
-| Local slots busy with the queue disabled (fast-mode fallback policy) | `local_concurrency_limit` | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
-| Prefill-gate / lease denial (a lease-active 503 after the retry window) | `local_lease_active` | `contention_queue_fallback_after_queue ... reason=local_lease_active` |
-| Quota hard stop (chain resolution) | `quota_hard_stop` | `Skipping provider=<local>: ... reason=quota_hard_stop preference=...` |
-| Usage-limit reset pending (chain resolution) | `usage_limit_reset_pending` | `Skipping provider=<local>: usage_limit_reset_pending ... reason=usage_limit_reset_pending ...` |
-| Outside the entry's `available_times` window (chain resolution) | `outside_available_window` | `Skipping provider=<local>: outside its available_times window (UTC) reason=outside_available_window ...` |
-| The chain has no local entry at all | `local_only_no_local_route` | `local_only_refused reason=local_only_no_local_route preference=local-preferred verdict=deferrable` |
-| Any exit that left no reason on the request (e.g. a plain post-dispatch slot-exhaustion 503) | `local_route_unavailable` | `local_only_refused reason=local_route_unavailable preference=local-preferred verdict=deferrable` |
+Each row's **Outcome** column says what a pinned `local-preferred` request does
+with that exit: `refusing` rows end in the retryable `429` deferral, while
+`promoting` rows leave the local chain and are served remotely. The promoting
+set is exactly `admission_reserve.CAPACITY_TOO_LARGE_REASONS` —
+`prefill_budget_exceeded` and `context_too_large` (the latter also carrying the
+per-entry `max_context_tokens` ceiling, which composes into the same skip);
+every other row is a temporal (deferrable) exit and therefore refuses.
+
+| Exit from the local route | `X-Local-Fallback-Reason` | Outcome | Log line (`reason=` field) |
+|---|---|---|---|
+| Admission guard, queue path — projected prefill cannot finish inside the wait budget (`contention_queue_max_wait_seconds`) | `eta_exceeds_budget` | refusing | `local_admission_guard ... reason=eta_exceeds_budget ... enforced=true` |
+| Admission guard, queue path — projected first byte reaches `local_prefill_deadline_seconds` | `prefill_eta_exceeds_deadline` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_deadline ...` |
+| Admission guard, queue path — safety-budget bound of the deadline | `prefill_eta_exceeds_safety_budget` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_safety_budget ...` |
+| Admission guard, queue path — flat cold-prefill token cap (`local_cold_prefill_budget_tokens`): the prompt outgrows the local serving envelope | `prefill_budget_exceeded` | promoting | `local_admission_guard ... reason=prefill_budget_exceeded ...` |
+| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` (the deadline/safety/budget reasons keep their own token) | refusing | `local_admission_guard ... free_slot=true ...` / `local_admission_guard_direct_fallback ... reason=...` |
+| Local entry in cooldown (chain resolution) | `local_provider_cooldown` | refusing | `Skipping provider=<local>: ... in cooldown (...s remaining) reason=local_provider_cooldown preference=...` |
+| Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap — the prompt can never fit local, however long it waits | `context_too_large` | promoting | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
+| Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
+| Router skip: residency ladder found too little reusable prefix (an idle-admission denial keeps this token) | `resident_prefix_insufficient` | refusing | `routing_skip_local ... reason=resident_prefix_insufficient ...` |
+| Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | refusing | `routing_skip_local ... reason=tenant_limit ...` |
+| Router skip: session in post-deadline prefill-thrash cooldown | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` |
+| Contention-queue depth cap reached (never queued), or the wait budget expired | `fallback_after_queue` | refusing | `contention_queue_fallback_after_queue ... preference=...` |
+| Local slots busy with the queue disabled (fast-mode fallback policy) | `local_concurrency_limit` | refusing | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
+| Prefill-gate / lease denial (a lease-active 503 after the retry window) | `local_lease_active` | refusing | `contention_queue_fallback_after_queue ... reason=local_lease_active` |
+| Quota hard stop (chain resolution) | `quota_hard_stop` | refusing | `Skipping provider=<local>: ... reason=quota_hard_stop preference=...` |
+| Usage-limit reset pending (chain resolution) | `usage_limit_reset_pending` | refusing | `Skipping provider=<local>: usage_limit_reset_pending ... reason=usage_limit_reset_pending ...` |
+| Outside the entry's `available_times` window (chain resolution) | `outside_available_window` | refusing | `Skipping provider=<local>: outside its available_times window (UTC) reason=outside_available_window ...` |
+| The chain has no local entry at all | `local_only_no_local_route` | refusing | `local_only_refused reason=local_only_no_local_route preference=local-preferred verdict=deferrable` |
+| Any exit that left no reason on the request (e.g. a plain post-dispatch slot-exhaustion 503) | `local_route_unavailable` | refusing | `local_only_refused reason=local_route_unavailable preference=local-preferred verdict=deferrable` |
 
 The table is pinned by `proxy/tests/test_local_only_refusal_matrix.py` (one row
 per exit: a pinned `local-preferred` request ⇒ `429` + token + **no upstream
@@ -1529,7 +1555,11 @@ Every response carries `X-Local-Route`:
   or `no_local_provider` when the local route was never attempted (a
   `remote-ok` chain strip that removed every local entry, or a chain that
   never had one). A `local-preferred` request promoted because it is
-  `too_large` also lands here, with the capacity reason as its token.
+  `too_large` also lands here, with the capacity reason as its token: no
+  `Retry-After`, no local-capacity `429`. Promotion never manufactures an empty
+  chain — a chain with **no non-local entry** (the `private` model) is never
+  stripped, so it keeps deferring and refuses with `Retry-After` instead of
+  falling through to a provider that does not exist.
 - `refused` — a refusal response: the pin-local deferral or refusal, or the
   admission-guard refusal after the rest of the chain is exhausted.
   `X-Local-Fallback-Reason` carries the exit's reason token, byte-identical to
