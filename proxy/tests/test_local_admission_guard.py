@@ -49,7 +49,7 @@ import logging
 import math
 import re
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -2055,3 +2055,209 @@ async def test_pin_local_with_a_free_slot_is_served_locally(
     assert calls == ["local"], f"the local route must serve; got {calls!r}"
     assert result.headers.get("X-Local-Route") == "local"
     assert contention_queue.queue_depth() == 0
+
+
+# ---------------------------------------------------------------------------
+# AC4/AC5 (LP-0MVSM06BK008FZUE): queue invariants of the deferral refusal
+#
+# A deferral ends at a contention-queue exit: the wait budget expired, the
+# depth cap refused to enqueue the request, or the held lease outlived the
+# lease queue. For a ``local-preferred`` request whose verdict is
+# ``deferrable`` each of those exits must produce the retryable 429 exactly
+# once, without leaving queue or lease state behind:
+#
+# - enqueued at most once (one ``wait_for_local_slot()`` call per request);
+# - the queue depth back to its pre-request value (a seeded holder untouched);
+# - no dispatch/lease record and no lease grant registered for the session;
+# - ``X-Local-Route`` stamped exactly once by the refusal builder.
+#
+# The rows are driven through the real queue where the exit is a queue
+# decision (a seeded holder reaches the depth cap deterministically) and by a
+# stubbed expiry where the point is the bookkeeping, not the wait itself.
+# ---------------------------------------------------------------------------
+
+PIN_LOCAL = "local-preferred"
+
+
+def _lease_active_response() -> Response:
+    """The router's lease-held 503 (``no_slots_available``)."""
+    return Response(
+        content=json.dumps(
+            {
+                "error": {
+                    "type": "server_busy",
+                    "code": "no_slots_available",
+                    "message": "Local backend busy. Owner session holds the lease.",
+                },
+                "status": 503,
+                "reason": "local_lease_active",
+                "local_owner_session_id": "owner-session",
+            }
+        ),
+        status_code=503,
+        media_type="application/json",
+    )
+
+
+async def _issue_deferral_exit(
+    model_config: dict, trigger: str, extra_patches: list | None = None
+) -> tuple:
+    """Drive one deferral exit; return ``(response, dispatches, wait_calls)``.
+
+    ``wait_calls`` records every ``contention_queue.wait_for_local_slot()``
+    invocation, which is the enqueue-once invariant's observable evidence: a
+    refused request may enter the queue at most once.
+    """
+    dispatches: list[str] = []
+    wait_calls: list[int] = []
+    real_wait = contention_queue.wait_for_local_slot
+
+    async def _counting_wait(**kwargs):
+        wait_calls.append(1)
+        if trigger in ("queue_wait_expiry", "lease_active_fallback"):
+            # Budget already spent and no slot freed within it (no real
+            # sleeping in this test); the depth-cap row below exercises the
+            # real cap check instead.
+            return None
+        return await real_wait(**kwargs)
+
+    async def _local(_req, _path):
+        dispatches.append("local")
+        if trigger == "lease_active_fallback":
+            return _lease_active_response()
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):  # pragma: no cover - must never run
+        dispatches.append("remote")
+        return _ok_response()
+
+    if trigger == "queue_depth_cap":
+        # One concurrent waiter holds the queue's only depth slot.
+        contention_queue._waiters.append((0.0, None, "queue-holder", False, None))
+
+    config = _queue_cfg(
+        contention_queue_max_depth=1 if trigger == "queue_depth_cap" else 4,
+    )
+    concurrency = (1, 1) if trigger != "lease_active_fallback" else (0, 1)
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("proxy.router.proxy_to_local", _local))
+        stack.enter_context(patch("proxy.server.proxy_to_remote", _remote))
+        stack.enter_context(
+            patch(
+                "proxy.provider._get_local_concurrency_info",
+                _MutableConcurrency(*concurrency),
+            )
+        )
+        stack.enter_context(
+            patch("proxy.provider.request_priority", return_value="low")
+        )
+        stack.enter_context(
+            patch("proxy.contention_queue.wait_for_local_slot", _counting_wait)
+        )
+        for ctx in extra_patches or []:
+            stack.enter_context(ctx)
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"X-Local-Preference": PIN_LOCAL}),
+            "v1/chat/completions",
+            model_config,
+            config,
+        )
+    return result, dispatches, wait_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trigger", "expected_reason", "expected_dispatches", "seeded"),
+    [
+        ("queue_depth_cap", "fallback_after_queue", [], 1),
+        ("queue_wait_expiry", "fallback_after_queue", [], 0),
+        ("lease_active_fallback", "local_lease_active", ["local"], 0),
+    ],
+    ids=["queue_depth_cap", "queue_wait_expiry", "lease_active_fallback"],
+)
+async def test_deferral_exit_refusal_leaks_no_queue_slot_or_lease(
+    mixed_model_config, trigger, expected_reason, expected_dispatches, seeded
+):
+    """Every deferral exit: one enqueue attempt, no queue/lease leak, one stamp."""
+    import proxy.server as proxy_server
+
+    depth_before = contention_queue.queue_depth()
+    records_before = dict(proxy_server.local_dispatch_records)
+    grants_before = dict(contention_queue._local_grant_times)
+
+    result, dispatches, wait_calls = await _issue_deferral_exit(
+        mixed_model_config, trigger
+    )
+
+    assert dispatches == expected_dispatches, (
+        f"{trigger}: a deferred pin-local request is refused, never promoted "
+        f"(dispatched={dispatches})"
+    )
+    # Enqueue-once: the request is offered to the queue exactly once, never in
+    # a loop (a second attempt would mean the refusal re-entered the queue).
+    assert wait_calls == [1], (
+        f"{trigger}: expected exactly one queue attempt, got {len(wait_calls)}"
+    )
+    # Depth restored: only the deliberately seeded holder remains.
+    assert contention_queue.queue_depth() == depth_before + seeded, (
+        f"{trigger}: the refusal leaked a queue slot "
+        f"(depth {contention_queue.queue_depth()}, seeded {seeded})"
+    )
+    # No lease was taken for a request that is being refused.
+    assert proxy_server.local_dispatch_records == records_before, (
+        f"{trigger}: a refused request must not leave a dispatch/lease record"
+    )
+    assert contention_queue._local_grant_times == grants_before, (
+        f"{trigger}: a refused request must not be registered as a lease owner"
+    )
+
+    assert result.status_code == 429, f"{trigger}: got {result.status_code}"
+    assert result.headers.getlist("x-local-route") == ["refused"], (
+        f"{trigger}: X-Local-Route must be stamped exactly once, got "
+        f"{result.headers.getlist('x-local-route')!r}"
+    )
+    body = json.loads(result.body)
+    assert body.get("reason") == expected_reason, (
+        f"{trigger}: the refusal must name {expected_reason!r}, got "
+        f"{body.get('reason')!r}"
+    )
+    assert result.headers.get("X-Local-Fallback-Reason") == expected_reason
+    assert body.get("retryable") is True, (
+        f"{trigger}: a bounded local-capacity wait is retryable"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["queue_depth_cap", "queue_wait_expiry"])
+async def test_deferral_exit_refuses_before_resolving_a_remote_candidate(
+    mixed_model_config, trigger
+):
+    """The queue exit refuses *where it happens*, not after a remote lookup.
+
+    Deliverable: the refusal is returned before any other candidate is
+    resolved — so the chain is resolved exactly once (the local entry) and a
+    remote provider is never even considered for a request that is being
+    refused. A regression to the loop-head-only refusal would resolve twice.
+    """
+    resolutions: list = []
+    real_resolve = provider._resolve_provider_with_exclusions
+
+    def _spy(*args, **kwargs):
+        resolved = real_resolve(*args, **kwargs)
+        resolutions.append((resolved or {}).get("name"))
+        return resolved
+
+    result, _dispatches, _waits = await _issue_deferral_exit(
+        mixed_model_config,
+        trigger,
+        extra_patches=[
+            patch.object(provider, "_resolve_provider_with_exclusions", _spy)
+        ],
+    )
+
+    assert result.status_code == 429, f"{trigger}: got {result.status_code}"
+    assert resolutions == ["local-llama"], (
+        f"{trigger}: the refusal must come from the queue exit itself, before "
+        f"the next candidate is resolved (resolved={resolutions})"
+    )

@@ -6978,6 +6978,36 @@ def _contention_queue_expiry_seconds(config: dict | None) -> int:
     return max(1, int(math.ceil(max_wait)))
 
 
+def _contention_queue_remaining_seconds(
+    config: dict | None, elapsed_wait_seconds: float | None
+) -> int:
+    """Queue wait budget still measurable after a queue exit (AC6).
+
+    LP-0MVSM06BK008FZUE: a deferral ends when the contention queue hands the
+    request back — its wait budget expired, or the depth cap refused to
+    enqueue it. Both exits know *how much of the window they consumed*
+    (``elapsed_wait_seconds``), so the honest retry hint is the remainder of
+    that window rather than a re-derived estimate:
+
+    - a depth-cap exit never started the clock, so the whole window remains;
+    - a wait-budget expiry has consumed the window, so the 1 s floor is all
+      that is left (``_refusal_retry_timing`` clamps the same way).
+
+    The remainder is ceiling-rounded because the queue itself accounts in
+    whole seconds and a client must not retry a fraction of a second early.
+    ``_contention_queue_expiry_seconds`` supplies the clamped window the queue
+    actually used, so this can never advertise more than the configured bound.
+    """
+    window = _contention_queue_expiry_seconds(config)
+    try:
+        elapsed = max(0.0, float(elapsed_wait_seconds or 0.0))
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    if window <= 0:
+        return 1
+    return max(1, int(math.ceil(window - elapsed)))
+
+
 def _cold_prefill_budget_tokens(config: dict | None) -> int:
     """The flat cold-prefill token cap, for refusal token evidence (AC5)."""
     try:
@@ -7069,6 +7099,55 @@ async def _stamp_local_routing_token_evidence(
         )
     except Exception:  # pragma: no cover - evidence is best-effort
         logger.debug("local refusal token evidence unavailable", exc_info=True)
+
+
+def _build_deferral_refusal_response(
+    request,
+    config: dict | None,
+    preference: str | None,
+    reason: str,
+    *,
+    retry_after_s: int | float | None = None,
+    elapsed_wait_seconds: float | None = None,
+) -> Response | None:
+    """End a spent local deferral in the retryable 429 (parent AC3/AC6).
+
+    LP-0MVSM06BK008FZUE: with ``X-Local-Preference: local-preferred`` and a
+    ``deferrable`` capacity verdict the request *waited* in the contention
+    queue — so a queue exit is the end of that deferral, not a licence to
+    promote a fits-local request to a paid provider (parent assumption A2).
+    Both queue exits (wait budget expired, depth cap refusing to enqueue) and
+    the ``local_lease_active`` exit funnel through here, which
+
+    - refuses **before** the next candidate is resolved and before any
+      remote dispatch, attempt, cooldown or usage-limit state is written, so
+      the request is enqueued at most once and takes no lease it will not use;
+    - builds the single refusal payload in
+      :func:`_build_local_only_refusal_response` (the one place that
+      classifies a refusal), so the header and body agree on *reason* and the
+      verdict stays ``deferrable``;
+    - supplies the *measured* expiry through ``advertised_retry_after`` so
+      ``Retry-After`` / ``retry_at`` come from
+      :func:`_refusal_retry_timing` and name the real wait instead of a
+      re-derived estimate.
+
+    Returns ``None`` — leaving the caller's pre-existing ``continue`` exactly
+    as it was — when the request is not pinned to local (``prefer-local`` /
+    ``remote-ok`` / absent header keep today's fall-through) or when its
+    verdict is ``too_large`` (waiting cannot help; that request is promoted to
+    the remote tiers by the sibling chain-stripping slice, never refused for
+    local capacity).
+    """
+    if not _local_preference_pins_local(request, preference):
+        return None
+    attempt: dict[str, Any] = {"reason": reason}
+    if retry_after_s is not None:
+        attempt["retry_after_s"] = retry_after_s
+    if elapsed_wait_seconds is not None:
+        attempt["elapsed_wait_seconds"] = round(float(elapsed_wait_seconds), 3)
+    return _build_local_only_refusal_response(
+        attempt, config, preference=preference
+    )
 
 
 async def _build_local_only_refusal_for_remote(
@@ -11150,6 +11229,23 @@ async def _proxy_with_fallback_cycle(
             preference=_preference,
         )
         if provider_cfg is None and fallback_reason == "local_lease_active":
+            # Deferral backstop (LP-0MVSM06BK008FZUE): a pin-local
+            # ``deferrable`` request that ends on the lease-active exit must
+            # never run this remote-only walk — a fits-local request is not
+            # promoted. Its refusal names ``local_lease_active`` and carries
+            # the lease remainder; the walk below stays byte-identical for
+            # ``prefer-local`` / ``remote-ok`` / absent-header clients.
+            _lease_refusal = _build_deferral_refusal_response(
+                request,
+                config,
+                _preference,
+                SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                retry_after_s=_local_refusal_retry_after_s(
+                    request, SKIP_REASON_LOCAL_LEASE_ACTIVE, model_config, config
+                ),
+            )
+            if _lease_refusal is not None:
+                return _lease_refusal
             # Local lease-active is expected contention, not provider failure.
             # For transparent fallback, allow trying the next remote provider
             # even if it is currently in cooldown.
@@ -11295,9 +11391,11 @@ async def _proxy_with_fallback_cycle(
                             _cq_depth,
                         )
                     elif _cq_action == "fallback":
-                        # Caps exceeded — fall back to the next remote provider
-                        # exactly as today (fallback-after-queue recorded with
-                        # the elapsed queue wait, F4 AC2).
+                        # Caps exceeded — the request never got a local slot:
+                        # either the depth cap refused to enqueue it or its
+                        # wait budget expired. Both are the *end* of a
+                        # deferral, so the remainder of the queue window is
+                        # what a retry should honour (F4 AC2).
                         _record_attempt(
                             attempts,
                             provider=provider_name,
@@ -11310,12 +11408,15 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = "fallback_after_queue"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
-                        # Real expiry (AC4): a queue exit is bounded by the
-                        # queue's own wait window, not by the ETA formula.
+                        # Real expiry (AC4): the queue's *measured* remainder,
+                        # not the whole window and not the ETA formula.
+                        _cq_remaining_s = _contention_queue_remaining_seconds(
+                            config, _cq_elapsed
+                        )
                         _note_local_fallback_reason(
                             request,
                             fallback_reason,
-                            _contention_queue_expiry_seconds(config),
+                            _cq_remaining_s,
                         )
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
@@ -11324,6 +11425,20 @@ async def _proxy_with_fallback_cycle(
                             _cq_elapsed or 0.0,
                             _preference,
                         )
+                        # Deferral (LP-0MVSM06BK008FZUE): a pin-local
+                        # ``deferrable`` request must never be promoted — the
+                        # spent queue wait ends in the retryable 429, built by
+                        # the one refusal builder and timed from the measured
+                        # remainder. Returned here, before the next candidate
+                        # is resolved, so nothing is enqueued twice and no
+                        # lease/attempt state is written for a refusal.
+                        _deferral_refusal = _build_deferral_refusal_response(
+                            request, config, _preference, fallback_reason,
+                            retry_after_s=_cq_remaining_s,
+                            elapsed_wait_seconds=_cq_elapsed,
+                        )
+                        if _deferral_refusal is not None:
+                            return _deferral_refusal
                         continue
                     elif _cq_action == "context_bypass":
                         # Context bypasses never queue (AC4): fall back exactly
@@ -12365,12 +12480,32 @@ async def _proxy_with_fallback_cycle(
                         )
                         all_slot_exhaustion = False
                         # The token matches the log's reason= field verbatim.
-                        # Real expiry (AC3): the lease remainder.
+                        # Real expiry (AC3): the lease remainder, measured once
+                        # so the recorded expiry and the refusal timing below
+                        # cannot drift apart.
+                        _lease_remaining_s = _local_lease_retry_after_seconds(
+                            config, local_endpoint
+                        )
                         _note_local_fallback_reason(
                             request,
                             SKIP_REASON_LOCAL_LEASE_ACTIVE,
-                            _local_lease_retry_after_seconds(config, local_endpoint),
+                            _lease_remaining_s,
                         )
+                        # Deferral (LP-0MVSM06BK008FZUE): a pin-local
+                        # ``deferrable`` request that waited out the lease
+                        # queue is refused on the spot (naming
+                        # ``local_lease_active``) instead of walking to a
+                        # remote candidate below.
+                        _deferral_refusal = _build_deferral_refusal_response(
+                            request,
+                            config,
+                            _preference,
+                            SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                            retry_after_s=_lease_remaining_s,
+                            elapsed_wait_seconds=_lease_elapsed,
+                        )
+                        if _deferral_refusal is not None:
+                            return _deferral_refusal
                         continue
                     elif _lease_action == "context_bypass":
                         _record_attempt(

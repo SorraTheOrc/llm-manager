@@ -61,6 +61,7 @@ import time
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import proxy.provider as provider
@@ -1048,4 +1049,214 @@ async def test_local_only_still_serves_a_compaction_rescued_local_dispatch():
     assert result.status_code == 200
     assert result.headers.get("X-Local-Route") != "refused", (
         "the refusal must not mask a later local success"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deferral (LP-0MVSM06BK008FZUE): a queue exit ends the wait in a 429
+#
+# The pin (LP-0MVSLZY470051ZB2) already stops a local-preferred request from
+# being promoted once the loop resolves another candidate. This section pins
+# the *exit-time* contract instead: the two contention-queue exits — wait
+# budget expired, and the depth cap refusing to enqueue — must end the
+# deferral where it happened, with a retryable 429 built by the one refusal
+# builder and timed from the queue's own measured remainder. That is what makes
+# the same guarantee hold when no remote candidate exists at all (a private /
+# remote-less chain), where the loop-head choke point is never reached.
+# ---------------------------------------------------------------------------
+
+#: The two contention-queue exits (never-enqueued depth cap, and budget
+#: expiry). Both share the ``fallback_after_queue`` reason token.
+QUEUE_EXIT_TRIGGERS = ("queue_depth_cap", "queue_wait_expiry")
+#: Tolerance (seconds) on the absolute ``retry_at`` instant.
+RETRY_AT_TOLERANCE_SECONDS = 5
+
+
+def _parse_retry_at(value) -> datetime:
+    """Parse the refusal's RFC 3339 UTC ``retry_at``."""
+    assert value, "a retryable refusal must carry an absolute retry_at"
+    parsed = datetime.fromisoformat(str(value))
+    assert parsed.utcoffset() == timedelta(0), f"retry_at must be UTC, got {value!r}"
+    return parsed
+
+
+def _expected_queue_remainder(row: _ExitRow) -> int:
+    """The measured queue remainder a row's exit leaves (AC6).
+
+    The depth cap never starts the queue clock, so the whole window remains;
+    a wait-budget expiry has consumed it, so only the 1 s floor is left.
+    """
+    if row.trigger == "queue_depth_cap":
+        return provider._contention_queue_expiry_seconds(_config(row))
+    return 1
+
+
+async def _issue_with_chain(
+    row: _ExitRow, preference: str, model_config: dict
+) -> tuple:
+    """Issue *row*'s request against an explicit *model_config*.
+
+    Mirrors :func:`_issue` (same row fixtures/patches) so a row can be run
+    against a chain that has no remote entry at all.
+    """
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):  # pragma: no cover - never reached
+        calls.append("remote")
+        return _ok_response()
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("proxy.router.proxy_to_local", _local))
+        stack.enter_context(patch("proxy.server.proxy_to_remote", _remote))
+        stack.enter_context(
+            patch(
+                "proxy.provider._get_local_concurrency_info",
+                _MutableConcurrency(*row.concurrency),
+            )
+        )
+        stack.enter_context(patch("proxy.provider.request_priority", return_value="low"))
+        for ctx in _row_patches(row):
+            stack.enter_context(ctx)
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"X-Local-Preference": preference}),
+            "v1/chat/completions",
+            model_config,
+            _config(row),
+        )
+    return result, calls
+
+
+def _assert_queue_exit_refusal(row: _ExitRow, result, calls: list[str]) -> dict:
+    """The retryable-429 contract of a queue exit (AC1/AC2/AC3/AC6)."""
+    assert calls == [], (
+        f"{row.exit_description}: a deferred pin-local request must be refused, "
+        f"never dispatched anywhere (dispatched={calls})"
+    )
+    assert result.status_code == 429, (
+        f"{row.exit_description}: the queue exit must end in the retryable 429, "
+        f"got {result.status_code}"
+    )
+    assert result.headers.getlist("x-local-route") == ["refused"], (
+        f"{row.exit_description}: X-Local-Route must be stamped exactly once, "
+        f"got {result.headers.getlist('x-local-route')!r}"
+    )
+    body = json.loads(result.body)
+    # AC1: the header and the body agree on the canonical queue token.
+    assert body.get("reason") == "fallback_after_queue"
+    assert result.headers.get("X-Local-Fallback-Reason") == "fallback_after_queue"
+    assert body.get("verdict") == admission_reserve.CAPACITY_DEFERRABLE, (
+        f"{row.exit_description}: a queue exit is a bounded wait, so the "
+        f"verdict must be deferrable, got {body.get('verdict')!r}"
+    )
+    # AC1: retryable, with a coherent Retry-After / retry_at pair.
+    assert body.get("retryable") is True, "a bounded wait is retryable"
+    retry_after = body.get("retry_after")
+    assert isinstance(retry_after, int) and retry_after >= 1, (
+        f"retry_after must be a whole number of seconds, got {retry_after!r}"
+    )
+    assert result.headers.get("Retry-After") == str(retry_after), (
+        "Retry-After and body retry_after must agree"
+    )
+    expected_at = datetime.now(UTC) + timedelta(seconds=retry_after)
+    assert (
+        abs((_parse_retry_at(body.get("retry_at")) - expected_at).total_seconds())
+        <= RETRY_AT_TOLERANCE_SECONDS
+    ), "retry_at must be now + Retry-After"
+    # AC6: the timer is `_refusal_retry_timing` fed with the *measured*
+    # remainder — never a re-derived estimate of its own.
+    expected_timing = provider._refusal_retry_timing(
+        "fallback_after_queue",
+        advertised_retry_after=_expected_queue_remainder(row),
+        config=_config(row),
+    )
+    assert retry_after == expected_timing.retry_after, (
+        f"{row.exit_description}: the refusal's timing must be the shared "
+        f"decision fed with the measured remainder, got {retry_after} "
+        f"(expected {expected_timing.retry_after})"
+    )
+    # AC3: this is the deferral refusal, never chain exhaustion.
+    assert body.get("code") == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+    assert b"All providers exhausted" not in result.body
+    return body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", QUEUE_EXIT_TRIGGERS)
+async def test_queue_exit_refuses_with_a_retryable_429(trigger: str):
+    """Both queue exits: a local-preferred deferrable request gets the 429.
+
+    Explicit field assertions (not a shape smoke test): reason/verdict,
+    retryable + Retry-After/retry_at coherence, the shared timing decision, and
+    ``calls == []`` proving no remote provider was reached.
+    """
+    row = _row(trigger)
+    depth_before = contention_queue.queue_depth()
+
+    result, calls = await _issue(row, LOCAL_PREFERRED)
+
+    _assert_queue_exit_refusal(row, result, calls)
+    # AC2/AC4: the queue is left exactly as found — the depth-cap row's held
+    # waiter is untouched and nothing was enqueued twice.
+    seeded = 1 if trigger == "queue_depth_cap" else 0
+    assert contention_queue.queue_depth() == depth_before + seeded, (
+        f"{row.exit_description}: the refusal must not leak (or hold) a queue "
+        f"slot, got depth {contention_queue.queue_depth()}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", QUEUE_EXIT_TRIGGERS)
+async def test_queue_exit_refuses_on_a_remote_less_chain(trigger: str):
+    """A private (no remote entry) chain defers and refuses — never exhausts.
+
+    Parent assumption A5: a remote-less chain still defers and never promotes.
+    The loop therefore never resolves another candidate, so the refusal must
+    be produced at the queue exit itself rather than by the loop-head pin —
+    otherwise this request would report "All providers exhausted" for a purely
+    temporal condition (AC1/AC3).
+    """
+    row = _row(trigger)
+    local_only_chain = {
+        "providers": [
+            {"name": LOCAL_PROVIDER_NAME, "type": "local", "llama_model": "Qwen3"},
+        ],
+        "aliases": ["hybrid*"],
+    }
+
+    result, calls = await _issue_with_chain(row, LOCAL_PREFERRED, local_only_chain)
+
+    assert calls == [], "no local dispatch may happen on a queue exit"
+    _assert_queue_exit_refusal(row, result, calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", QUEUE_EXIT_TRIGGERS)
+async def test_queue_exit_refusal_is_not_restamped(trigger: str):
+    """AC5: the top-level stamp helper sees an already-stamped refusal once.
+
+    The refusal is stamped by its builder; the top-level
+    ``_stamp_local_route_headers()`` choke point must leave it alone (one
+    ``X-Local-Route`` value, one invocation) instead of adding a second stamp.
+    """
+    row = _row(trigger)
+    seen: list[list[str]] = []
+    real_stamp = provider._stamp_local_route_headers
+
+    def _spy(response, request, model_config):
+        seen.append(list(response.headers.getlist("x-local-route")))
+        return real_stamp(response, request, model_config)
+
+    with patch.object(provider, "_stamp_local_route_headers", _spy):
+        result, _calls = await _issue(row, LOCAL_PREFERRED)
+
+    assert seen == [["refused"]], (
+        f"{row.exit_description}: the refusal must reach the top-level stamp "
+        f"already stamped, got {seen!r}"
+    )
+    assert result.headers.getlist("x-local-route") == ["refused"], (
+        "the refusal must be stamped exactly once"
     )
