@@ -1106,6 +1106,28 @@ def _spy_capacity_verdict(sentinel: str = _SPY_SENTINEL):
     return spy, patch("proxy.admission_reserve.local_capacity_verdict", new=spy)
 
 
+def _refusal_builder_calls(spy: "_CapacityVerdictSpy") -> list[dict]:
+    """Return the spy calls made by the refusal builder (one per refusal).
+
+    LP-0MVSLZY470051ZB2 added a *pre-dispatch* consultation of the same helper
+    from the pin predicate (``_local_preference_pins_local``), so a pin-local
+    request may now consult the helper more than once. The invariant that still
+    holds — and that these tests pin — is one computation **per decision
+    point**: the 429 payload's verdict comes from exactly one builder call.
+
+    The builder's consultation is distinguishable structurally: it passes the
+    refusal evidence by keyword (``reason`` / ``new_tokens`` /
+    ``budget_tokens``), while the pin predicate passes the routing evidence
+    positionally (the guard decision) or as a sub-set of the same keywords.
+    """
+    return [
+        call
+        for call in spy.calls
+        if call["args"] == ()
+        and set(call["kwargs"]) == {"reason", "new_tokens", "budget_tokens"}
+    ]
+
+
 def _local_then_remote_chain() -> dict:
     return {
         "providers": [
@@ -1183,7 +1205,12 @@ async def _issue_local_first_cycle(
 
 @pytest.mark.asyncio
 async def test_remote_first_cycle_routes_through_the_helper_once():
-    """AC1: the remote-first cycle consults the helper once and echoes it."""
+    """AC1: the remote-first cycle's refusal consults the helper exactly once.
+
+    The pin predicate may consult the same helper pre-dispatch
+    (LP-0MVSLZY470051ZB2); what AC1 pins here is that the echoed verdict comes
+    from a single builder computation.
+    """
     spy, patcher = _spy_capacity_verdict()
     calls: list[str] = []
 
@@ -1201,13 +1228,17 @@ async def test_remote_first_cycle_routes_through_the_helper_once():
 
     assert result.status_code == 429
     assert calls == [], "the refusal must precede any remote dispatch"
-    assert len(spy.calls) == 1, f"exactly one helper call; got {spy.calls!r}"
+    assert spy.calls, "the pin predicate must consult the shared helper"
+    builder_calls = _refusal_builder_calls(spy)
+    assert len(builder_calls) == 1, (
+        f"the refusal verdict must be computed exactly once; got {spy.calls!r}"
+    )
     assert json.loads(result.body)["verdict"] == spy.sentinel
 
 
 @pytest.mark.asyncio
 async def test_local_first_choke_point_refusal_routes_through_the_helper_once():
-    """AC1: the local-first choke point (chain cooldown) calls it once."""
+    """AC1: the local-first choke point's refusal computes it exactly once."""
     spy, patcher = _spy_capacity_verdict()
 
     with patcher:
@@ -1216,13 +1247,17 @@ async def test_local_first_choke_point_refusal_routes_through_the_helper_once():
     assert result.status_code == 429
     assert calls == [], "a pin-local client is never moved to remote"
     assert result.headers["X-Local-Fallback-Reason"] == "local_provider_cooldown"
-    assert len(spy.calls) == 1, f"exactly one helper call; got {spy.calls!r}"
+    assert spy.calls, "the pin predicate must consult the shared helper"
+    builder_calls = _refusal_builder_calls(spy)
+    assert len(builder_calls) == 1, (
+        f"the refusal verdict must be computed exactly once; got {spy.calls!r}"
+    )
     assert json.loads(result.body)["verdict"] == spy.sentinel
 
 
 @pytest.mark.asyncio
 async def test_refused_local_only_branch_routes_through_the_helper_once():
-    """AC1: the admission denial branch (``refused_local_only``) calls it once."""
+    """AC1: the ``refused_local_only`` branch's refusal computes it once."""
     spy, patcher = _spy_capacity_verdict()
     _seed_calibration(100_000)
 
@@ -1236,7 +1271,11 @@ async def test_refused_local_only_branch_routes_through_the_helper_once():
 
     assert result.status_code == 429
     assert calls == [], "a pin-local client is never moved to remote"
-    assert len(spy.calls) == 1, f"exactly one helper call; got {spy.calls!r}"
+    assert spy.calls, "the pin predicate must consult the shared helper"
+    builder_calls = _refusal_builder_calls(spy)
+    assert len(builder_calls) == 1, (
+        f"the refusal verdict must be computed exactly once; got {spy.calls!r}"
+    )
     assert json.loads(result.body)["verdict"] == spy.sentinel
 
 
