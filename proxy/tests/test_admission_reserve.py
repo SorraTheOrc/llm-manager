@@ -1067,9 +1067,10 @@ def test_capacity_verdict_vocabulary_and_module_boundary():
 # second reason table in ``provider.py``) shows up as a missing call *and* a
 # 429 body that fails to carry the sentinel.
 #
-# TDD red phase: the wiring child (LP-0MVSMINPR006SWT6) has not landed, so the
-# call-site assertions start ``xfail(strict=True)`` and are flipped by that
-# child in the same change that adds the behaviour.
+# TDD red phase (LP-0MVSMROLM005RO71): the call-site assertions started
+# ``xfail(strict=True)`` while ``provider.py`` did not consume the helper. The
+# wiring child (LP-0MVSMINPR006SWT6) flipped them green in the same change that
+# added the behaviour, so a red assertion now means the contract broke.
 # ---------------------------------------------------------------------------
 
 #: A verdict value from *outside* the vocabulary: only a verdict that actually
@@ -1132,28 +1133,19 @@ def _remote_only_chain() -> dict:
     }
 
 
-def _verdict_xfail(reason: str) -> pytest.MarkDecorator:
-    return pytest.mark.xfail(
-        strict=True,
-        reason=(
-            f"capacity-verdict wiring pending (LP-0MVSMINPR006SWT6): {reason}"
-        ),
-    )
-
-
-_VERDICT_WIRING_XFAIL = _verdict_xfail(
-    "provider.py does not call local_capacity_verdict yet, so the spy records "
-    "zero calls and the refusal body carries no verdict"
-)
-
-
 async def _issue_local_first_cycle(
     preference: str | None,
     *,
     tokens: int = _TOKENS,
     cooldown: bool = False,
+    concurrency: tuple[int, int] = (0, 1),
 ) -> tuple:
-    """Drive ``proxy_with_fallback`` for *preference*; return ``(response, calls)``."""
+    """Drive ``proxy_with_fallback`` for *preference*; return ``(response, calls)``.
+
+    *concurrency* is the ``(active, max)`` local slot state: busy slots are what
+    route the request through the contention queue (and thus the
+    ``refused_local_only`` branch) instead of the free-slot direct path.
+    """
     calls: list[str] = []
 
     async def _local(_req, _path):
@@ -1173,7 +1165,7 @@ async def _issue_local_first_cycle(
             patch("proxy.server.proxy_to_remote", _remote),
             patch(
                 "proxy.provider._get_local_concurrency_info",
-                _MutableConcurrency(0, 1),
+                _MutableConcurrency(*concurrency),
             ),
             patch("proxy.provider.request_priority", return_value="low"),
             _estimate_patches(tokens),
@@ -1189,7 +1181,6 @@ async def _issue_local_first_cycle(
     return result, calls
 
 
-@_VERDICT_WIRING_XFAIL
 @pytest.mark.asyncio
 async def test_remote_first_cycle_routes_through_the_helper_once():
     """AC1: the remote-first cycle consults the helper once and echoes it."""
@@ -1214,7 +1205,6 @@ async def test_remote_first_cycle_routes_through_the_helper_once():
     assert json.loads(result.body)["verdict"] == spy.sentinel
 
 
-@_VERDICT_WIRING_XFAIL
 @pytest.mark.asyncio
 async def test_local_first_choke_point_refusal_routes_through_the_helper_once():
     """AC1: the local-first choke point (chain cooldown) calls it once."""
@@ -1230,7 +1220,6 @@ async def test_local_first_choke_point_refusal_routes_through_the_helper_once():
     assert json.loads(result.body)["verdict"] == spy.sentinel
 
 
-@_VERDICT_WIRING_XFAIL
 @pytest.mark.asyncio
 async def test_refused_local_only_branch_routes_through_the_helper_once():
     """AC1: the admission denial branch (``refused_local_only``) calls it once."""
@@ -1238,8 +1227,11 @@ async def test_refused_local_only_branch_routes_through_the_helper_once():
     _seed_calibration(100_000)
 
     with patcher:
+        # Busy slot + queue policy: this is the contention-queue admission
+        # denial (``refused_local_only``), not the free-slot direct path that
+        # deliberately keeps the exhausted response (out of scope here).
         result, calls = await _issue_local_first_cycle(
-            "local-only", tokens=100_000
+            "local-only", tokens=100_000, concurrency=(1, 1)
         )
 
     assert result.status_code == 429
@@ -1248,7 +1240,6 @@ async def test_refused_local_only_branch_routes_through_the_helper_once():
     assert json.loads(result.body)["verdict"] == spy.sentinel
 
 
-@_VERDICT_WIRING_XFAIL
 def test_refusal_builder_routes_through_the_helper_once():
     """AC1: the builder itself calls the helper exactly once."""
     spy, patcher = _spy_capacity_verdict()

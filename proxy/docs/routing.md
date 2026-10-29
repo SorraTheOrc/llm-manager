@@ -1262,8 +1262,8 @@ expected no remote spend for any reason), and any other unrecorded exit with
 | Quota hard stop (chain resolution) | `quota_hard_stop` | `Skipping provider=<local>: ... reason=quota_hard_stop preference=...` |
 | Usage-limit reset pending (chain resolution) | `usage_limit_reset_pending` | `Skipping provider=<local>: usage_limit_reset_pending ... reason=usage_limit_reset_pending ...` |
 | Outside the entry's `available_times` window (chain resolution) | `outside_available_window` | `Skipping provider=<local>: outside its available_times window (UTC) reason=outside_available_window ...` |
-| The chain has no local entry at all | `local_only_no_local_route` | `local_only_refused reason=local_only_no_local_route preference=local-only` |
-| Any exit that left no reason on the request (e.g. a plain post-dispatch slot-exhaustion 503) | `local_route_unavailable` | `local_only_refused reason=local_route_unavailable preference=local-only` |
+| The chain has no local entry at all | `local_only_no_local_route` | `local_only_refused reason=local_only_no_local_route preference=local-preferred verdict=deferrable` |
+| Any exit that left no reason on the request (e.g. a plain post-dispatch slot-exhaustion 503) | `local_route_unavailable` | `local_only_refused reason=local_route_unavailable preference=local-preferred verdict=deferrable` |
 
 The table is pinned by `proxy/tests/test_local_only_refusal_matrix.py` (one row
 per exit: `local-only` ⇒ `429` + token + **no upstream call**; `prefer-local`
@@ -1272,9 +1272,13 @@ and an absent header ⇒ today's remote fall-through, byte-compatible) and by
 log `reason=` verbatim). Every "not local" line also carries
 `preference=<parsed>` and `priority_routing ... session=<id>`
 (LP-0MVRMC275000R2W6), and each refused request emits exactly one
-`local_only_refused reason=<token> preference=local-only` line — so a
-`local-only` violation, or the exit that caused it, is attributable from
-`proxy.log` alone.
+`local_only_refused reason=<token> preference=<parsed> verdict=<verdict>` line
+— so a `local-only` violation, the exit that caused it, and whether waiting can
+help are attributable from `proxy.log` alone. `preference` is the parsed value
+(a legacy `local-only` header is normalised to `local-preferred`), and the
+`verdict` (`deferrable` / `too_large`) is the same classification the 429 body
+carries, computed once by `admission_reserve.local_capacity_verdict`
+(LP-0MVSMINPR006SWT6).
 
 ### Response headers
 
@@ -1316,6 +1320,14 @@ when it can, **when** (`Retry-After` and an absolute `retry_at`).
   local capacity; the remedy is compaction, not a timer.
 - `suggested_action` — human-readable remediation: "compact and resend" when
   `retryable: false`, "wait / reduce the size / route remote" when `true`.
+- `verdict` — `deferrable` when the block is temporal (waiting can help) or
+  `too_large` when the request itself exceeds the local serving envelope
+  (`prefill_budget_exceeded` / `context_too_large`). Additive: every other
+  field/header keeps its value. It is computed exactly once by
+  `admission_reserve.local_capacity_verdict` in the pin-local refusal builder,
+  which is the only verdict computation in `provider.py`
+  (LP-0MVSMINPR006SWT6). The direct free-slot admission-reject 429 does not
+  carry it yet (LP-0MVSS435600370D6).
 - Token evidence — `X-Local-Admission-New-Tokens` / body `new_tokens` and
   `X-Local-Admission-Budget-Tokens` / body `budget_tokens` on **every**
   refusal, so a client can size the compaction: how far over the flat

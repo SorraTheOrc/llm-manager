@@ -6549,7 +6549,11 @@ def _refusal_timing_headers(
     return headers
 
 
-def _log_local_only_refusal(reason: str | None) -> None:
+def _log_local_only_refusal(
+    reason: str | None,
+    preference: str | None = None,
+    verdict: str | None = None,
+) -> None:
     """One attributable line per pin-local refusal (parent AC4/AC5).
 
     LP-0MVRMC275000R2W6: a pin-local request that ends in the refusal must be
@@ -6559,24 +6563,39 @@ def _log_local_only_refusal(reason: str | None) -> None:
     refusal) so there is exactly one line per refused request. Never raises:
     observability must not break a refusal.
 
-    The ``preference=`` token stays the legacy wire spelling
-    (``PREF_LOCAL_ONLY``) so the log contract, the documented refusal line and
-    the tools that grep it are unchanged by the vocabulary rename
-    (LP-0MVSHWYVE005MS16 AC5); migrating this observability surface belongs to
-    the follow-up docs/observability item, not here.
+    LP-0MVSMINPR006SWT6: the refusal builder also passes the capacity
+    ``verdict`` (``deferrable`` / ``too_large``) computed once by
+    :func:`admission_reserve.local_capacity_verdict`, so the line reports the
+    same classification as the 429 body rather than a second guess. The key is
+    appended only when supplied: the free-slot/exhausted caller keeps its
+    two-key line byte-identical.
+
+    ``preference`` is the *parsed* intent threaded in by the call sites; it
+    defaults to ``PREF_LOCAL_ONLY`` so a direct builder caller (and the
+    pre-existing log contract) keeps its current spelling.
     """
     try:
-        logger.info(
-            "local_only_refused reason=%s preference=%s",
-            reason or LOCAL_ROUTE_UNAVAILABLE,
-            PREF_LOCAL_ONLY,
-        )
+        if verdict is None:
+            logger.info(
+                "local_only_refused reason=%s preference=%s",
+                reason or LOCAL_ROUTE_UNAVAILABLE,
+                preference or PREF_LOCAL_ONLY,
+            )
+        else:
+            logger.info(
+                "local_only_refused reason=%s preference=%s verdict=%s",
+                reason or LOCAL_ROUTE_UNAVAILABLE,
+                preference or PREF_LOCAL_ONLY,
+                verdict,
+            )
     except Exception:  # pragma: no cover - observability is best-effort
         pass
 
 
 def _build_local_only_refusal_response(
-    attempt: dict[str, Any] | None, config: dict | None = None
+    attempt: dict[str, Any] | None,
+    config: dict | None = None,
+    preference: str | None = None,
 ) -> Response:
     """429 for a ``local-only`` request the admission guard refused (AC4).
 
@@ -6588,6 +6607,17 @@ def _build_local_only_refusal_response(
     reasons carry ``Retry-After`` + ``retry_at``, reasons waiting cannot heal
     carry neither (LP-0MVNTT4X8009IO2X AC1/AC2). Adds
     ``X-Local-Route: refused``.
+
+    LP-0MVSMINPR006SWT6: this builder is the **only** place in ``provider.py``
+    that classifies a refusal, and it delegates that classification to
+    :func:`admission_reserve.local_capacity_verdict` — the shared helper is the
+    single implementation (parent AC1/AC3). The helper is called *once* here,
+    from evidence already on *attempt* (the guard's own ``reason`` /
+    ``new_tokens`` / ``budget_tokens``); the one resulting verdict feeds both
+    the additive 429 body field and the log line, so the two surfaces cannot
+    disagree and no reason table is re-derived here. *preference* is the parsed
+    ``X-Local-Preference`` intent, forwarded to the log line only; it defaults
+    to ``PREF_LOCAL_ONLY`` so direct unit-test callers keep today's line.
     """
     attempt = attempt or {}
     eta = float(attempt.get("eta_prefill_seconds") or 0.0)
@@ -6605,6 +6635,16 @@ def _build_local_only_refusal_response(
     reason = str(attempt.get("reason") or "eta_exceeds_budget")
     new_tokens = _admission_token_evidence(attempt, "new_tokens")
     budget_tokens = _admission_token_evidence(attempt, "budget_tokens")
+    from proxy import admission_reserve
+
+    # Single implementation (parent AC1/AC3): the only verdict computation in
+    # ``provider.py`` — a second table or estimator here would be the defect
+    # this contract forbids. Evidence comes from the attempt, never recomputed.
+    capacity = admission_reserve.local_capacity_verdict(
+        reason=reason,
+        new_tokens=new_tokens,
+        budget_tokens=budget_tokens,
+    )
     timing = _refusal_retry_timing(
         reason,
         eta_prefill_seconds=eta,
@@ -6623,6 +6663,9 @@ def _build_local_only_refusal_response(
             "budget and X-Local-Preference: local-only forbids remote fallback"
         ),
         "reason": reason,
+        # Additive only (parent AC2/AC3): every pre-existing field and header
+        # keeps its exact value; ``verdict`` is the one new key.
+        "verdict": capacity.verdict,
         "eta_prefill_seconds": eta,
         "budget_seconds": budget,
         "retryable": timing.retryable,
@@ -6646,9 +6689,11 @@ def _build_local_only_refusal_response(
         "X-Local-Fallback-Reason": reason,
     }
     headers.update(_refusal_timing_headers(timing, new_tokens, budget_tokens))
-    # One line per refusal, naming the reason the client is told about and the
-    # intent that produced it (LP-0MVRMC275000R2W6 AC4).
-    _log_local_only_refusal(reason)
+    # One line per refusal, naming the reason the client is told about, the
+    # intent that produced it and the verdict computed above (parent AC4).
+    _log_local_only_refusal(
+        reason, preference=preference, verdict=capacity.verdict
+    )
     return Response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=429,
@@ -6996,6 +7041,13 @@ async def _build_local_only_refusal_for_remote(
     not-time-retryable reasons carry no timer at all
     (LP-0MVQ23B80009OZ9V AC1–AC5). Token evidence is added for a
     chain-resolution refusal so the client can size a compaction.
+
+    Single-implementation contract (LP-0MVSMINPR006SWT6 AC1/AC6): this choke
+    point does **not** classify the refusal itself — it forwards the parsed
+    *preference* and the evidence it already gathered to
+    :func:`_build_local_only_refusal_response`, which is the one place that
+    consults :func:`admission_reserve.local_capacity_verdict`. Both dispatch
+    cycles therefore reach the same single verdict computation.
     """
     if preference != PREF_LOCAL_PREFERRED:
         return None
@@ -7037,7 +7089,10 @@ async def _build_local_only_refusal_for_remote(
         attempt.update(_local_admission_evidence(decision))
     if retry_after_s is not None:
         attempt["retry_after_s"] = retry_after_s
-    return _build_local_only_refusal_response(attempt, config)
+    # The parsed intent is threaded through so the single refusal line names the
+    # preference that actually caused the refusal (LP-0MVSMINPR006SWT6 AC4);
+    # the builder computes the verdict exactly once and never re-derives it.
+    return _build_local_only_refusal_response(attempt, config, preference=preference)
 
 
 async def _prefill_admission_guard(
@@ -11239,8 +11294,12 @@ async def _proxy_with_fallback_cycle(
                             "reason": _cq_reason or "eta_exceeds_budget",
                             **_local_admission_evidence(_admission),
                         }
+                        # The verdict and the preference named on the single
+                        # refusal line come from the shared builder / the parsed
+                        # intent (LP-0MVSMINPR006SWT6 AC1/AC4) — never re-derived
+                        # on this branch.
                         return _build_local_only_refusal_response(
-                            _refusal_attempt, config
+                            _refusal_attempt, config, preference=_preference
                         )
                     else:  # fallback_policy — fast mode unchanged
                         _record_attempt(
@@ -12271,8 +12330,12 @@ async def _proxy_with_fallback_cycle(
                             "reason": _lease_reason or "eta_exceeds_budget",
                             **_local_admission_evidence(_admission),
                         }
+                        # Same single-implementation contract as the queue
+                        # branch above: the builder classifies, the parsed
+                        # preference is only threaded for the log line
+                        # (LP-0MVSMINPR006SWT6 AC1/AC4).
                         return _build_local_only_refusal_response(
-                            _refusal_attempt, config
+                            _refusal_attempt, config, preference=_preference
                         )
                     else:
                         # Queue disabled / fallback policy: preserve the

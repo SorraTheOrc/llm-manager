@@ -39,10 +39,11 @@ all but two rows green; the reason-token child's per-branch tokens
 Capacity verdict (LP-0MVSMRT5R009EKP9, child of LP-0MVSMI7JK002FKUF): every row
 also states *what the refusal means* — ``too_large`` for the request-size exits
 (``context_too_large``) and ``deferrable`` for every temporal exit, including
-the fail-safe ``local_only_no_local_route`` default. The verdict assertions are
-the TDD red phase for the wiring child (LP-0MVSMINPR006SWT6): they start
-``xfail(strict=True)`` because today's 429 body has no ``verdict`` field, and
-that child flips them green in the same change that adds it.
+the fail-safe ``local_only_no_local_route`` default. The verdict assertions were
+the TDD red phase for the wiring child (LP-0MVSMINPR006SWT6): they started
+``xfail(strict=True)`` because the 429 body had no ``verdict`` field, and that
+child flipped them green in the same change that added it — a red row now means
+the verdict contract broke.
 """
 
 from __future__ import annotations
@@ -551,22 +552,35 @@ async def test_local_only_refuses_instead_of_dispatching_remote(row: _ExitRow):
 # AC1 (LP-0MVSMRT5R009EKP9): the refusal body reports the row's verdict
 # ---------------------------------------------------------------------------
 
-#: TDD red phase for the wiring child (LP-0MVSMINPR006SWT6): today's 429 body
-#: has no ``verdict`` field, so every row's verdict assertion is a genuine
-#: expected failure until that child adds it. ``strict=True`` means the marker
-#: must be removed in the same change that adds the behaviour.
-_VERDICT_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "capacity-verdict wiring pending (LP-0MVSMINPR006SWT6): the 429 "
-        "refusal body has no 'verdict' field"
-    ),
-)
+#: Exits whose 429 is the admission-reject/exhausted payload
+#: (``_build_local_admission_reject_response``) rather than the pin-local
+#: refusal builder. That payload is owned by LP-0MVNTJJGX00375VQ and is
+#: explicitly outside the wiring slice (LP-0MVSMINPR006SWT6 boundaries), so it
+#: carries no verdict yet. The row still states its verdict so the follow-up
+#: (LP-0MVSS435600370D6) that wires that payload can promote it here by
+#: deleting this entry.
+_VERDICT_NOT_APPLICABLE = frozenset({"admission_guard_free_slot"})
+
+_VERDICT_PARAMS = [
+    pytest.param(
+        row,
+        id=row.trigger,
+        marks=pytest.mark.skip(
+            reason=(
+                "the 429 for the free-slot direct path is the admission-reject/"
+                "exhausted payload, which carries no verdict yet "
+                "(LP-0MVSMINPR006SWT6 boundary; follow-up LP-0MVSS435600370D6)"
+            )
+        ),
+    )
+    if row.trigger in _VERDICT_NOT_APPLICABLE
+    else pytest.param(row, id=row.trigger)
+    for row in _EXIT_ROWS
+]
 
 
-@_VERDICT_XFAIL
 @pytest.mark.asyncio
-@pytest.mark.parametrize("row", _LOCAL_ONLY_PARAMS)
+@pytest.mark.parametrize("row", _VERDICT_PARAMS)
 async def test_local_only_refusal_body_reports_the_row_verdict(row: _ExitRow):
     """Every exit: the refusal body classifies why local could not serve.
 

@@ -27,8 +27,10 @@ Two guards keep the change additive:
 
 One more property lives here because it is the same observability contract:
 **the refusal logs itself** (``local_only_refused reason=<token>
-preference=local-only``), so a violated intent is visible in ``proxy.log``
-without correlating headers.
+preference=local-preferred verdict=<deferrable|too_large>``), so a violated
+intent and its capacity verdict are visible in ``proxy.log`` without correlating
+headers. ``preference`` is the *parsed* value, so the legacy ``local-only``
+header is logged under its canonical spelling (LP-0MVSMINPR006SWT6).
 
 Red phase (test-first): this module was written and demonstrated red before
 LP-0MVRMC275000R2W6 landed (the live assertions run unpinned through the
@@ -747,7 +749,8 @@ async def test_local_only_refusal_logs_one_line_with_reason_and_preference(caplo
     """A refusal is visible without correlating headers.
 
     The skip reason the chain recorded (here: the local entry's cooldown) must
-    appear on the refusal line together with ``preference=local-only``, so an
+    appear on the refusal line together with the *parsed* preference
+    (``preference=local-preferred`` for the legacy ``local-only`` header), so an
     operator grepping ``proxy.log`` sees the violation and its cause instead of
     joining the request's headers to a routing line.
     """
@@ -762,8 +765,9 @@ async def test_local_only_refusal_logs_one_line_with_reason_and_preference(caplo
     assert kv.get("reason") == "local_provider_cooldown", (
         f"the refusal line must name the recorded skip reason; got {kv!r}"
     )
-    assert kv.get("preference") == LOCAL_ONLY, (
-        f"the refusal line must name the intent that caused it; got {kv!r}"
+    assert kv.get("preference") == LOCAL_PREFERRED, (
+        "the refusal line names the parsed intent — the legacy ``local-only`` "
+        f"alias canonicalises to ``local-preferred``; got {kv!r}"
     )
 
 
@@ -787,7 +791,7 @@ async def test_local_only_refusal_without_a_local_route_names_that_reason(caplog
     assert kv.get("reason") == "local_only_no_local_route", (
         f"a chain with no local entry must say so; got {kv!r}"
     )
-    assert kv.get("preference") == LOCAL_ONLY
+    assert kv.get("preference") == LOCAL_PREFERRED
 
 
 @pytest.mark.asyncio

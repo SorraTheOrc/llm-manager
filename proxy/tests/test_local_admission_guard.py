@@ -1692,10 +1692,10 @@ async def test_cooldown_refusal_advertises_the_cooldown_remainder(
 # - the ``local_only_refused`` line gains exactly one key — ``verdict`` — and
 #   still names the parsed ``preference`` and the recorded ``reason``.
 #
-# TDD red phase: these assertions start ``xfail(strict=True)`` because the
-# wiring child (LP-0MVSMINPR006SWT6) has not landed yet. That child removes the
-# markers in the same change that adds the behaviour — removing them earlier
-# would silently lose the assertion.
+# TDD red phase: these assertions started ``xfail(strict=True)`` while the
+# wiring child (LP-0MVSMINPR006SWT6) had not landed. That child removed the
+# markers in the same change that added the behaviour, so a failure here now
+# means the contract broke rather than that the wiring is pending.
 # ---------------------------------------------------------------------------
 
 #: Reused ``key=value`` parser shape (same as the log-grep tooling).
@@ -1749,16 +1749,6 @@ _BODY_KEYS_BEFORE_VERDICT = frozenset(
     }
 )
 
-_VERDICT_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "capacity-verdict wiring pending (LP-0MVSMINPR006SWT6): the 429 body "
-        "has no 'verdict' field and local_only_refused has no verdict= key"
-    ),
-)
-
-
-@_VERDICT_XFAIL
 def test_incident_refusal_body_carries_the_deferrable_verdict():
     """AC1: the incident shape is temporal, and nothing else about it moves."""
     result = provider._build_local_only_refusal_response(dict(_INCIDENT_ATTEMPT))
@@ -1779,7 +1769,17 @@ def test_incident_refusal_body_carries_the_deferrable_verdict():
     )
     assert body["retryable"] is expected.retryable
     assert body["retry_after"] == expected.retry_after
-    assert body["retry_at"] == expected.retry_at
+    # ``retry_at`` is stamped from ``now`` inside the builder, so a recomputed
+    # expectation taken microseconds later cannot be string-equal — compare the
+    # absolute instants within a tolerance instead of re-specifying the value.
+    delta = abs(
+        _parse_rfc3339_utc(body["retry_at"])
+        - _parse_rfc3339_utc(expected.retry_at)
+    )
+    assert delta <= timedelta(seconds=2), (
+        f"retry_at must be the recomputed instant (now + retry_after); "
+        f"body={body['retry_at']!r} expected≈{expected.retry_at!r}"
+    )
     assert result.headers["Retry-After"] == str(expected.retry_after)
 
     # Existing fields and headers are untouched.
@@ -1793,7 +1793,6 @@ def test_incident_refusal_body_carries_the_deferrable_verdict():
     assert result.headers["X-Local-Admission"] == "reject"
 
 
-@_VERDICT_XFAIL
 def test_refusal_body_keys_are_additive_only():
     """AC6: exactly one new key — nothing renamed, nothing removed."""
     result = provider._build_local_only_refusal_response(dict(_INCIDENT_ATTEMPT))
@@ -1802,7 +1801,6 @@ def test_refusal_body_keys_are_additive_only():
     assert set(body) == _BODY_KEYS_BEFORE_VERDICT | {"verdict"}
 
 
-@_VERDICT_XFAIL
 @pytest.mark.parametrize(
     "reason", ["prefill_budget_exceeded", "context_too_large"]
 )
@@ -1828,7 +1826,6 @@ def test_too_large_refusals_carry_the_too_large_verdict(reason):
     assert body["retryable"] is False
 
 
-@_VERDICT_XFAIL
 def test_one_verdict_log_line_per_refusal(caplog):
     """AC3: one line per refusal, naming preference + verdict + reason."""
     caplog.set_level(logging.INFO, logger="llama-proxy")
@@ -1845,11 +1842,16 @@ def test_one_verdict_log_line_per_refusal(caplog):
     )
 
 
-async def _issue_guard_refusal(preference: str | None) -> tuple:
+async def _issue_guard_refusal(
+    preference: str | None, *, tokens: int = INCIDENT_NEW_TOKENS
+) -> tuple:
     """Drive the end-to-end over-budget refusal for *preference*.
 
     Returns ``(response, provider_calls)``; a ``prefer-local`` request falls
     through to remote (no refusal), a pin-local one is refused locally.
+    *tokens* is the priced prompt size — the default is the incident shape
+    (over the cold-prefill cap), a smaller one keeps the sole blocking signal
+    temporal so a temporal exit can be asserted as ``deferrable``.
     """
     model_config = {
         "providers": [
@@ -1878,7 +1880,7 @@ async def _issue_guard_refusal(preference: str | None) -> tuple:
         patch("proxy.server.proxy_to_remote", _remote),
         patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
         patch("proxy.provider.request_priority", return_value="low"),
-        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+        _guard_patches(tokens=tokens),
     ):
         result = await provider.proxy_with_fallback(
             _DummyRequest(headers=headers),
@@ -1902,14 +1904,18 @@ async def test_non_refusal_paths_log_no_verdict_line(preference, caplog):
     assert _local_only_refusal_lines(caplog) == []
 
 
-@_VERDICT_XFAIL
 @pytest.mark.asyncio
 async def test_choke_point_refusal_logs_one_verdict_line(caplog):
     """AC3: the chain-cooldown choke-point refusal logs exactly one line."""
     caplog.set_level(logging.INFO, logger="llama-proxy")
     provider._provider_unavailable_until["local-llama"] = time.time() + 60
     try:
-        result, calls = await _issue_guard_refusal("local-only")
+        # A prompt that fits the cold-prefill cap: the cooldown is then the
+        # *only* blocking signal, so the verdict must be ``deferrable``
+        # (waiting helps) rather than ``too_large`` (the prompt never fits).
+        result, calls = await _issue_guard_refusal(
+            "local-only", tokens=INCIDENT_BUDGET_TOKENS // 2
+        )
     finally:
         provider._provider_unavailable_until.pop("local-llama", None)
 
@@ -1924,7 +1930,6 @@ async def test_choke_point_refusal_logs_one_verdict_line(caplog):
     assert fields.get("verdict") == "deferrable"
 
 
-@_VERDICT_XFAIL
 @pytest.mark.asyncio
 async def test_pin_local_refusal_logs_exactly_one_verdict_line(caplog):
     """AC3: the end-to-end pin-local refusal logs one line, never per exit."""
