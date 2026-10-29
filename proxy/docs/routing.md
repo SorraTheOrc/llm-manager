@@ -291,7 +291,7 @@ Capacity vs resilience — the three entries are **not** interchangeable:
 
 | Failure | Quarantine key | Effect on the sibling entries |
 |---------|----------------|-------------------------------|
-| HTTP 429 / usage limit | `_usage_limit_account_key` = `api_key_env@endpoint` | Independent per API key: a 429 on `opencode-go-3` leaves `opencode-go-2` and `opencode-go` eligible → 3× rate-limit capacity (LP-0MSMBWB23009XYPW, LP-0MVCX0E2V001VB5N). |
+| HTTP 429 / usage limit | `_usage_limit_account_key` = `api_key_env@endpoint:model` | Independent per API key: a 429 on `opencode-go-3` leaves `opencode-go-2` and `opencode-go` eligible → 3× rate-limit capacity (LP-0MSMBWB23009XYPW, LP-0MVCX0E2V001VB5N). The key includes the **model**, so the same key on a different model is a separate account/limit (LP-0MVT8SAZE00570J5 corrected this row). |
 | 5xx / stall / terminal error | `_failure_domain_key` = `endpoint:model` | Shared domain: one failure skips all three for the rest of the request → **no** 3× outage resilience (LP-0MSG45I8Q0020N1F). |
 
 The fully paid `munitoai` and `deepseek-flash` entries declare exactly
@@ -429,13 +429,17 @@ A reset header on a **quota** 429 is applied to the failing ACCOUNT, not just
 the provider entry. This is the account-scoped half of the header support
 above; the entry-level cooldown described there is unchanged.
 
-- **Trigger:** an HTTP 429 whose body is a per-account rate-limit error
-  (`type: rate_limit_error` or `code: rate_limit_exceeded`, top-level or
-  nested under `error` — the observed MunitoAI body) **or** which carries
+- **Trigger:** an HTTP 429 whose body is a per-account quota error
+  (`type: rate_limit_error`, `code: rate_limit_exceeded`,
+  `type: insufficient_quota` or `code: free_daily_limit_exceeded`, top-level or
+  nested under `error` — the observed MunitoAI bodies) **or** which carries
   `x-ratelimit-over-limit: yes`, **and** which also yields a parseable
   `x-ratelimit-reset-*` duration. No reset signal (or a zero/absent value)
   means no account quarantine: the pre-existing short provider cooldown and
-  per-request account-key exclusion apply exactly as before.
+  per-request account-key exclusion apply exactly as before. A daily free-limit
+  429 is handled earlier by the usage-limit reset path instead, so its
+  advertised daily window wins over the rolling header window
+  (LP-0MVT8SAZE00570J5).
 - **Duration:** `parsed reset + _USAGE_LIMIT_RESET_MARGIN_SECONDS` (120 s).
   Two distinct margins apply on such a 429 and they are **not**
   interchangeable: the **2-second** `server.ratelimit_cooldown_margin_seconds`
@@ -1962,12 +1966,17 @@ still quenches normally. The window is re-armed per restart by
 `cold_start.note_model_loaded()`; router-level concurrent-dispatch gating
 (`local_cold_start_max_concurrent`) is unchanged.
 
-## Usage-limit reset quarantine (GoUsageLimitError)
+## Usage-limit reset quarantine (GoUsageLimitError, insufficient_quota)
 
 HTTP 429 responses whose error type is `GoUsageLimitError` (a usage-limit
-variant distinct from `FreeUsageLimitError`) are treated as usage-limit
-**reset** events rather than generic rate-limit events. The quarantine is
-**account-scoped** (`_usage_limit_account_key` = `api_key_env@endpoint`):
+variant distinct from `FreeUsageLimitError`), or which carry the
+`error.type == "insufficient_quota"` / `error.code ==
+"free_daily_limit_exceeded"` markers MunitoAI sends for its daily free limit,
+are treated as usage-limit **reset** events rather than generic rate-limit
+events. The markers are read **case-insensitively from the top level and from
+a nested `error` dict** (gateways disagree about the nesting, and the code
+alone is enough for payloads that omit `type`). The quarantine is
+**account-scoped** (`_usage_limit_account_key` = `api_key_env@endpoint:model`):
 distinct API keys on the same gateway keep independent limits
 (LP-0MSMBWB23009XYPW), and the 2-minute `_USAGE_LIMIT_RESET_MARGIN_SECONDS`
 safety margin is always added.
@@ -2005,12 +2014,32 @@ LP-0MVF7MPZN009GOJB):
    when the snapshot is stale/absent or the quota source is disabled
    (`quota_surge_enabled: false`) / dry-run, an explicit `Resets in 22hr
    43min` duration in the message is honoured in full (`source=message`).
-3. **Guessed period** — when there is no explicit duration, `metadata.limitName`
+3. **Absolute reset instant** — an absolute instant such as `It resets at
+   2026-10-30 00:00 UTC` (the observed MunitoAI free-tier daily-limit 429) is
+   parsed into seconds-until-reset and honoured as explicit evidence
+   (`source=timestamp`). Supported shapes are `YYYY-MM-DD HH:MM UTC`,
+   `YYYY-MM-DD HH:MM:SS UTC`, ISO-8601 with `Z`, and ISO-8601 with an explicit
+   `±HH:MM`/`±HHMM` offset; a bare timestamp with **no** timezone evidence is
+   treated as unparseable rather than guessed in local time. The resulting
+   quarantine is **bounded to the period the payload names**
+   (`free_daily_limit_exceeded` / "daily … limit" → 24 h) plus the margin, so
+   a malformed, far-future or clock-skewed timestamp cannot lock the account
+   out indefinitely (LP-0MVT8SAZE00570J5 AC4).
+4. **Guessed period** — when there is no explicit duration or usable
+   timestamp, `metadata.limitName` / the payload's period wording
    (daily/weekly/monthly) supplies a guessed period capped at
    `_usage_limit_guess_cap_seconds` (24 h by default), logged as
    `source=guess`. This guessed branch is **fallback-only**: it is unreachable
    for a fresh-snapshot `opencode-*` account, and the full 30-day period is
-   never used without explicit evidence (LP-0MUQTCMW2001VXH8).
+   never used without explicit evidence (LP-0MUQTCMW2001VXH8). A past or
+   unparseable absolute timestamp falls back here; an `insufficient_quota`
+   body with no reset information at all is quarantined *guessed* for the cap
+   (self-healing probe, never persisted) instead of being re-probed every
+   ~60 s.
+
+Because this check runs **before** `_handle_http_error_with_cooldown()` /
+`_apply_ratelimit_account_quarantine()`, an advertised daily reset always wins
+over a rolling `x-ratelimit-*` header window (LP-0MVT8SAZE00570J5 AC3).
 
 Routing decisions during the block log `usage_limit_reset_pending` with the
 reset time and the window that holds the account out (e.g.

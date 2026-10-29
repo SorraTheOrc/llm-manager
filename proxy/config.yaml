@@ -450,6 +450,16 @@ models:
         # cooldown of reset + the 2-second ratelimit_cooldown_margin_seconds;
         # the account key is api_key_env@endpoint:model, so same-gateway
         # paid siblings stay eligible (LP-0MVFA1VRT007T9HT).
+        #
+        # Daily free limit (LP-0MVT8SAZE00570J5): when MunitoAI answers 429
+        # ``insufficient_quota`` / ``free_daily_limit_exceeded`` with an
+        # ABSOLUTE reset ("It resets at 2026-10-30 00:00 UTC") the
+        # usage-limit reset path runs BEFORE the header cooldown above and
+        # quarantines this key's account until that instant (+ margin),
+        # bounded to the advertised daily period — so the tier is not
+        # re-probed every ~60 s for the rest of the UTC day. The paid
+        # ``munitoai`` entry below uses a different ``api_key_env`` and stays
+        # eligible in the same request.
         respect_ratelimit_headers: true
         display_name: MunitoAI Free
         type: remote

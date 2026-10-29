@@ -38,6 +38,7 @@ Covers (parent AC1-AC4 / F1 AC1-AC6, F4 AC1-AC3, F5 AC1-AC2):
 import json
 import logging
 import time
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import httpx
@@ -1762,3 +1763,81 @@ async def test_account_429_detection_helper():
             "error": {"type": "FreeUsageLimitError", "message": "Free limit reached"},
         }),
     ) is False
+
+
+def _munitoai_daily_limit_429() -> tuple[Response, str]:
+    """The observed MunitoAI free-tier daily-limit 429 body (LP-0MVT8SAZE00570J5).
+
+    ``error.type = insufficient_quota``, ``error.code =
+    free_daily_limit_exceeded`` and an ABSOLUTE reset instant, which is a
+    per-ACCOUNT event: the paid ``munitoai`` entry shares the endpoint AND the
+    model but uses its own API key, so it must stay eligible.
+    """
+    reset_at = datetime.now(UTC) + timedelta(hours=6)
+    body = json.dumps({
+        "error": {
+            "message": (
+                "The daily free limit of deepseek-ai/deepseek-v4-flash is "
+                "reached. It resets at "
+                f"{reset_at.strftime('%Y-%m-%d %H:%M UTC')}. Add credits to "
+                "continue now."
+            ),
+            "type": "insufficient_quota",
+            "param": None,
+            "code": "free_daily_limit_exceeded",
+        }
+    })
+    return (
+        Response(
+            content=body.encode("utf-8"),
+            status_code=429,
+            media_type="application/json",
+        ),
+        body,
+    )
+
+
+@pytest.mark.asyncio
+async def test_daily_limit_insufficient_quota_keeps_paid_sibling_eligible(
+    munitoai_free_paid_chain,
+):
+    """AC5 (LP-0MVT8SAZE00570J5): a free-tier ``insufficient_quota`` 429 must
+    not poison the shared ``api.munito.ai/inference:model`` failure domain — the
+    paid sibling on the same endpoint+model serves the same request."""
+    call_order: list[str] = []
+    daily_response, daily_body = _munitoai_daily_limit_429()
+
+    async def _mock_proxy_to_remote(_req, _path, provider_cfg):
+        name = provider_cfg["name"]
+        call_order.append(name)
+        if name == "munitoai-free":
+            return daily_response
+        if name == "opencode-go-3":
+            return _auth_error_401()
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(), "v1/chat/completions", munitoai_free_paid_chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    assert call_order == ["munitoai-free", "opencode-go-3", "munitoai"], (
+        "the paid sibling must remain eligible after an insufficient_quota 429, "
+        f"got {call_order}"
+    )
+    assert result.status_code == 200
+
+    free_entry, paid_entry = (
+        munitoai_free_paid_chain["providers"][0],
+        munitoai_free_paid_chain["providers"][2],
+    )
+    assert provider._failure_domain_key(free_entry) == provider._failure_domain_key(
+        paid_entry
+    )
+    assert provider._is_account_rate_limit_error(daily_response, daily_body) is True
+    free_account = provider._usage_limit_account_key(free_entry)
+    paid_account = provider._usage_limit_account_key(paid_entry)
+    assert free_account in provider._usage_reset_at
+    assert paid_account not in provider._usage_reset_at
+    assert provider._is_domain_excluded(paid_entry, {free_account}) is None

@@ -39,6 +39,7 @@ test in this module is now a plain assertion.
 
 import json
 import time
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import proxy.provider as provider
@@ -540,3 +541,119 @@ async def test_go_usage_limit_error_still_quarantines_account(free_paid_chain):
     assert paid_account not in provider._usage_reset_at
     assert not provider._is_provider_unavailable("munitoai-free")
     assert not provider._is_provider_unavailable("munitoai")
+
+
+# ===========================================================================
+# Daily free-limit 429 ("insufficient_quota" + absolute reset instant)
+# LP-0MVT8SAZE00570J5 AC3/AC5
+# ===========================================================================
+
+#: The verbatim MunitoAI free-tier daily-limit shape, with the advertised
+#: instant placed ``hours`` ahead of the real clock so the resulting quarantine
+#: duration can be asserted without freezing time.
+_DAILY_LIMIT_HOURS = 6
+_DAILY_LIMIT_MARGIN = provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+
+
+def _daily_limit_429(hours: float = _DAILY_LIMIT_HOURS):
+    """The observed MunitoAI daily-limit 429 plus its advertised reset instant.
+
+    Returns ``(response, body)``. MunitoAI also sends its per-minute
+    ``x-ratelimit-*`` headers on this response, so the headers are attached
+    too — the daily reset must win over the header-derived ~32 s window.
+    """
+    reset_at = datetime.now(UTC) + timedelta(hours=hours)
+    body = json.dumps({
+        "error": {
+            "message": (
+                "The daily free limit of deepseek-ai/deepseek-v4-flash is "
+                "reached. It resets at "
+                f"{reset_at.strftime('%Y-%m-%d %H:%M UTC')}. Add credits to "
+                "continue now."
+            ),
+            "type": "insufficient_quota",
+            "param": None,
+            "code": "free_daily_limit_exceeded",
+        }
+    })
+    return (
+        Response(
+            content=body.encode("utf-8"),
+            status_code=429,
+            media_type="application/json",
+            headers=_RESET_HEADERS,
+        ),
+        body,
+    )
+
+
+@pytest.mark.asyncio
+async def test_daily_limit_429_quarantines_for_the_daily_reset_not_the_header_window(
+    free_paid_chain,
+):
+    """AC3+AC5: the daily reset wins over the header-derived cooldown, the paid
+    sibling serves the SAME request, and no entry-level cooldown is applied."""
+    call_order: list[str] = []
+    daily_response, _body = _daily_limit_429()
+
+    async def _mock(_req, _path, provider_cfg):
+        name = provider_cfg.get("name")
+        call_order.append(name)
+        if name == "munitoai-free":
+            return daily_response
+        return _ok_json_response()
+
+    with patch("proxy.server.proxy_to_remote", _mock):
+        result = await provider.proxy_with_remote_fallback(
+            _DummyRequest(),
+            "v1/chat/completions",
+            free_paid_chain,
+            {"provider_cooldown_seconds": 60},
+        )
+
+    assert result.status_code == 200
+    assert call_order == ["munitoai-free", "munitoai"], (
+        "the paid sibling must stay eligible for the same request"
+    )
+
+    free_account, paid_account = _account_keys()
+    remaining = provider._usage_reset_remaining(free_account)
+    assert remaining > _ACCOUNT_QUARANTINE_SECONDS, (
+        "the daily reset must dominate the 32 s header-derived window"
+    )
+    assert remaining == pytest.approx(
+        _DAILY_LIMIT_HOURS * 3600 + _DAILY_LIMIT_MARGIN, abs=61
+    )
+    assert paid_account not in provider._usage_reset_at
+    assert free_account not in provider._usage_reset_guessed
+    assert not provider._is_provider_unavailable("munitoai-free"), (
+        "the usage-limit path runs before _handle_http_error_with_cooldown, so "
+        "no entry-level cooldown may be applied"
+    )
+
+
+def test_daily_limit_429_does_not_poison_the_shared_endpoint_domain():
+    """AC5: ``insufficient_quota`` is per-account, so the failing entry poisons
+    only ``_usage_limit_account_key`` — the paid sibling entry, which shares
+    the endpoint AND model, stays eligible."""
+    response, body = _daily_limit_429()
+    free_entry, paid_entry = _free_entry(), _paid_entry()
+    chain = {"providers": [free_entry, paid_entry]}
+
+    assert provider._is_account_rate_limit_error(response, body) is True
+    assert provider._failure_domain_key(free_entry) == provider._failure_domain_key(
+        paid_entry
+    ), "the fixture entries must share one failure domain for this test to bite"
+
+    free_account = provider._usage_limit_account_key(free_entry)
+    paid_account = provider._usage_limit_account_key(paid_entry)
+    assert provider._is_domain_excluded(paid_entry, {free_account}) is None
+
+    resolved = provider._resolve_provider_with_exclusions(
+        chain, set(), {free_account}
+    )
+    assert resolved is not None
+    assert resolved.get("name") == "munitoai", (
+        "the endpoint failure domain must not be excluded by an account 429"
+    )
+    assert paid_account not in provider._usage_reset_at

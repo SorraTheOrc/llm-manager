@@ -4965,7 +4965,9 @@ def _apply_ratelimit_account_quarantine(
 ) -> float | None:
     """Quarantine the failing API-key ACCOUNT for an upstream reset window.
 
-    A quota 429 (a per-account rate-limit error or an explicit
+    A quota 429 (a per-account rate-limit error — ``rate_limit_error`` /
+    ``rate_limit_exceeded`` / ``insufficient_quota`` /
+    ``free_daily_limit_exceeded`` — or an explicit
     ``x-ratelimit-over-limit`` flag) that also carries a parseable
     ``x-ratelimit-reset-*`` duration is evidence the upstream will not serve
     that ACCOUNT until the reported reset. The ENTRY-level cooldown applied by
@@ -4974,6 +4976,11 @@ def _apply_ratelimit_account_quarantine(
     recording the reset as an explicit ACCOUNT quarantine here makes the wait
     survive the request, feeds :func:`_compute_retry_after` and the chain-hold,
     and is persisted to ``provider-state.json`` (LP-0MVFA1VRT007T9HT).
+
+    Note: a daily free-limit 429 (``insufficient_quota`` with an absolute reset
+    instant) never reaches here — it takes the usage-limit reset path earlier
+    in the fallback cycle, so the daily window always wins over the rolling
+    ``x-ratelimit-*`` window (LP-0MVT8SAZE00570J5).
 
     The quarantine is keyed on :func:`_usage_limit_account_key`
     (``api_key_env@endpoint:model``), so a paid sibling on the same gateway
@@ -8690,25 +8697,45 @@ def _is_free_usage_limit_error(response: Response, body_text: str) -> bool:
     return False
 
 
+#: 429 body markers identifying a per-ACCOUNT quota / usage-limit event.
+#: ``rate_limit_error`` / ``rate_limit_exceeded`` are the observed api.munito.ai
+#: per-minute quota; ``insufficient_quota`` / ``free_daily_limit_exceeded`` are
+#: the out-of-credit and daily-capped shapes (LP-0MVT8SAZE00570J5). All are
+#: account-scoped: an independent API key on the same endpoint keeps serving.
+_ACCOUNT_QUOTA_ERROR_TYPES = frozenset({"rate_limit_error", "insufficient_quota"})
+_ACCOUNT_QUOTA_ERROR_CODES = frozenset(
+    {"rate_limit_exceeded", "free_daily_limit_exceeded"}
+)
+_ACCOUNT_QUOTA_MARKERS = tuple(
+    _ACCOUNT_QUOTA_ERROR_TYPES | _ACCOUNT_QUOTA_ERROR_CODES
+)
+
+
 def _is_account_rate_limit_error(response: Response, body_text: str) -> bool:
     """Return True when a 429 response is a per-ACCOUNT rate-limit error.
 
     Detects upstream responses whose JSON body identifies the rate limit as
-    bound to a specific API-key account -- ``type == "rate_limit_error"`` or
-    ``code == "rate_limit_exceeded"`` (case-insensitive), either top-level
-    (observed api.munito.ai body) or nested under an ``error`` dict.
+    bound to a specific API-key account -- ``type == "rate_limit_error"``,
+    ``code == "rate_limit_exceeded"``, ``type == "insufficient_quota"`` or
+    ``code == "free_daily_limit_exceeded"`` (case-insensitive), either
+    top-level (observed api.munito.ai body) or nested under an ``error`` dict.
 
-    A per-account rate limit is consumed by ONE API key: entries that share a
+    A per-account quota is consumed by ONE API key: entries that share a
     gateway but use different ``api_key_env`` values have independent quota
     (LP-0MSMBWB23009XYPW), so the failing entry must poison only its ACCOUNT
     key in the per-request exclusion set, NOT the shared endpoint failure
     domain -- otherwise paid sibling keys on the same gateway are skipped for
     the rest of the request despite having independent quota
-    (LP-0MVCX0E2V001VB5N).
+    (LP-0MVCX0E2V001VB5N). ``insufficient_quota`` / ``free_daily_limit_exceeded``
+    are the same shape of event: an out-of-credit or daily-capped KEY cannot
+    serve, while its paid sibling on the same endpoint/model still can
+    (LP-0MVT8SAZE00570J5 AC5).
 
-    Expected upstream format (observed from api.munito.ai):
+    Expected upstream formats (observed on api.munito.ai):
         HTTP 429
         Body: {"code": "rate_limit_exceeded", "type": "rate_limit_error"}
+        Body: {"error": {"type": "insufficient_quota",
+                         "code": "free_daily_limit_exceeded", "message": ...}}
     """
     status = int(getattr(response, "status_code", 0) or 0)
     if status != 429:
@@ -8730,12 +8757,15 @@ def _is_account_rate_limit_error(response: Response, body_text: str) -> bool:
         for cand in candidates:
             err_type = str(cand.get("type", "")).strip().lower()
             code = str(cand.get("code", "")).strip().lower()
-            if err_type == "rate_limit_error" or code == "rate_limit_exceeded":
+            if (
+                err_type in _ACCOUNT_QUOTA_ERROR_TYPES
+                or code in _ACCOUNT_QUOTA_ERROR_CODES
+            ):
                 return True
 
     # Fallback: check raw body text for the identifying markers
     lowered_body = (body_text or "").strip().lower()
-    return "rate_limit_error" in lowered_body or "rate_limit_exceeded" in lowered_body
+    return any(marker in lowered_body for marker in _ACCOUNT_QUOTA_MARKERS)
 
 
 def _parse_resets_in(message: str) -> float | None:
@@ -8770,15 +8800,129 @@ def _parse_resets_in(message: str) -> float | None:
     return total if found else None
 
 
+#: Absolute-timestamp shapes an upstream 429 message may advertise for the
+#: instant a quota resets. Only forms carrying explicit timezone evidence are
+#: matched (`` UTC`` suffix, ``Z``, or a ``±HH:MM``/``±HHMM`` offset): a bare
+#: local-time timestamp is deliberately NOT guessed, because assuming the
+#: wrong zone would quarantine for hours in the wrong direction
+#: (LP-0MVT8SAZE00570J5 AC2/AC4, assumption A3).
+_RESETS_AT_ISO_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)"
+    r"(Z|[+-]\d{2}:?\d{2})",
+    re.IGNORECASE,
+)
+_RESETS_AT_UTC_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s*UTC\b",
+    re.IGNORECASE,
+)
+
+#: Quota period names an upstream body may advertise; mirrors the keys of
+#: :data:`_PERIOD_DEFAULT_SECONDS`. Used to bound an absolute-timestamp
+#: quarantine to the period the payload itself names.
+_PERIOD_KEYWORD_RE = re.compile(r"\b(daily|weekly|monthly)\b", re.IGNORECASE)
+
+
+def _parse_resets_at_timestamp(
+    message: str, now: datetime | None = None
+) -> float | None:
+    """Parse an absolute ``resets at <timestamp>`` instant into seconds.
+
+    Returns the seconds from *now* until the advertised reset instant, or
+    ``None`` when the message carries no usable timestamp. Supported forms,
+    all with explicit timezone evidence::
+
+        … It resets at 2026-10-30 00:00 UTC.      (observed MunitoAI body)
+        … resets at 2026-10-30 00:00:30 UTC.
+        … resets at 2026-10-30T00:00:00Z.
+        … resets at 2026-10-30T02:00:00+02:00.
+
+    ``_parse_resets_in`` handles *relative* durations only (``Resets in 22hr
+    43min``), so a gateway advertising an absolute instant
+    (``error.code=free_daily_limit_exceeded``, observed api.munito.ai) was
+    previously unparseable and fell back to re-probing a dead account every
+    ~60 s (LP-0MVT8SAZE00570J5).
+
+    A timestamp in the past is not usable evidence and returns ``None`` (as
+    does anything unparseable), so the caller falls back to the guessed-period
+    rules rather than quarantining on stale data. ``now`` is injectable for
+    deterministic tests and defaults to ``datetime.now(timezone.utc)``.
+    """
+    text = message or ""
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+
+    target: datetime | None = None
+    match = _RESETS_AT_ISO_RE.search(text)
+    if match:
+        zone = match.group(3).upper()
+        if zone == "Z":
+            zone = "+00:00"
+        elif ":" not in zone:
+            zone = f"{zone[:3]}:{zone[3:]}"
+        try:
+            target = datetime.fromisoformat(
+                f"{match.group(1)}T{match.group(2)}{zone}"
+            )
+        except ValueError:
+            target = None
+    if target is None:
+        match = _RESETS_AT_UTC_RE.search(text)
+        if match:
+            try:
+                target = datetime.fromisoformat(
+                    f"{match.group(1)}T{match.group(2)}"
+                ).replace(tzinfo=UTC)
+            except ValueError:
+                target = None
+    if target is None:
+        return None
+
+    seconds = (target - now.astimezone(UTC)).total_seconds()
+    if seconds <= 0:
+        return None
+    return seconds
+
+
+def _usage_limit_period_name(
+    message: str | None,
+    limit_name: str | None,
+    codes: list[str] | None = None,
+) -> str | None:
+    """Name the quota period a 429 payload advertises, or ``None``.
+
+    ``metadata.limitName`` wins when it names a known period; otherwise the
+    payload's own wording is used — the observed MunitoAI free-tier body names
+    no ``limitName`` but says "The daily free limit of …" and carries
+    ``code=free_daily_limit_exceeded`` (LP-0MVT8SAZE00570J5). Only
+    ``daily``/``weekly``/``monthly`` are recognised; anything else is
+    unparseable and leaves the caller on its bounded fallback.
+    """
+    if limit_name in _PERIOD_DEFAULT_SECONDS:
+        return limit_name
+    if "free_daily_limit_exceeded" in (codes or ()):
+        return "daily"
+    match = _PERIOD_KEYWORD_RE.search(message or "")
+    return match.group(1).lower() if match else None
+
+
 class _UsageLimitReset(NamedTuple):
     """Resolved usage-limit reset for a 429 response.
 
     ``explicit`` is True only when the reset came from hard evidence — an
-    actual ``Resets in ...`` duration in the gateway message, or the
-    account's own quota-snapshot reset. A duration guessed from
-    ``metadata.limitName`` (or bounded because the named window's snapshot
-    data is contradictory) is ``explicit=False`` and is capped and treated as
+    actual ``Resets in ...`` duration in the gateway message, an absolute
+    ``resets at <timestamp>`` instant, or the account's own quota-snapshot
+    reset. A duration guessed from ``metadata.limitName`` / the payload's
+    period wording (or bounded because the named window's snapshot data is
+    contradictory) is ``explicit=False`` and is capped and treated as
     soft/re-checkable (LP-0MUQTCMW2001VXH8).
+
+    An explicit absolute-timestamp reset is still **bounded** by the period
+    the payload names (``free_daily_limit_exceeded`` / "daily … limit" → 24 h)
+    plus the safety margin, so a far-future or clock-skewed timestamp cannot
+    lock an account out indefinitely; a payload that names no period is
+    bounded by the guess cap instead (LP-0MVT8SAZE00570J5 AC4).
 
     ``window`` names the quota window (``rolling`` / ``weekly`` / ``monthly``)
     whose own reset bounded the quarantine, or ``None`` when no window was
@@ -9111,9 +9255,13 @@ def _usage_limit_reset_info(
 ) -> _UsageLimitReset | None:
     """Return the resolved usage-limit reset for a 429 error response.
 
-    Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ) and any usage-limit
+    Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ), any usage-limit
     error variant that carries a reset duration in its message (including
-    ``FreeUsageLimitError`` responses that include one).
+    ``FreeUsageLimitError`` responses that include one), and the
+    ``insufficient_quota`` / ``free_daily_limit_exceeded`` markers (the
+    observed MunitoAI free-tier daily-limit body, LP-0MVT8SAZE00570J5 AC1).
+    Those markers are read from the top level **and** from a nested ``error``
+    dict, because gateways disagree about the nesting.
 
     Resolution order, **window-aware** (LP-0MVPAE77Z002VGIA): for an
     ``opencode-*`` entry with a **fresh** quota snapshot and quota behaviour
@@ -9138,16 +9286,25 @@ def _usage_limit_reset_info(
 
     Otherwise (non-``opencode-*`` entry, or stale/absent/disabled/dry-run
     quota state) the previous cascade is unchanged: an explicit
-    ``Resets in 22hr 43min`` duration is honoured in full; when the message has
-    no explicit duration, ``metadata.limitName`` supplies a GUESSED period
-    capped at :func:`_usage_limit_guess_cap_seconds` (24h by default) — the
-    full 30-day period is never used without explicit evidence
-    (LP-0MUQTCMW2001VXH8). The 2-minute safety margin is added to every
-    returned duration.
+    ``Resets in 22hr 43min`` duration is honoured in full; an absolute
+    ``resets at 2026-10-30 00:00 UTC`` instant is parsed by
+    :func:`_parse_resets_at_timestamp` and honoured as explicit evidence,
+    **bounded** to the period the payload names (daily → 24 h, else the guess
+    cap) so a far-future or clock-skewed timestamp cannot lock the account out
+    indefinitely; when neither is present, ``metadata.limitName`` / the
+    payload's period wording supplies a GUESSED period capped at
+    :func:`_usage_limit_guess_cap_seconds` (24h by default) — the full 30-day
+    period is never used without explicit evidence (LP-0MUQTCMW2001VXH8). An
+    ``insufficient_quota`` 429 with no reset information of any kind is
+    quarantined *guessed* for the cap (self-healing probe, never persisted) so
+    an out-of-credit account is not re-probed every ~60 s. The 2-minute safety
+    margin is added to every returned duration.
 
     The chosen window (if any) is carried on the returned
     :class:`_UsageLimitReset` so the quarantine can be persisted with it and
     revalidated as soon as a fresh poll reports that window lifted (AC7).
+    An absolute-timestamp reset names no quota *window*, so it is recorded
+    without window metadata and revalidated as a legacy entry.
 
     Returns ``None`` when the response is not a 429 usage-limit error or no
     reset duration can be computed — callers then fall back to the existing
@@ -9158,6 +9315,14 @@ def _usage_limit_reset_info(
         Body: {"type": "error", "error": {"type": "GoUsageLimitError",
               "message": "Weekly usage limit reached. Resets in 22hr 43min."},
               "metadata": {"limitName": "weekly"}}
+
+    Expected daily-limit format (observed from api.munito.ai):
+        HTTP 429
+        Body: {"error": {"message": "The daily free limit of
+              deepseek-ai/deepseek-v4-flash is reached. It resets at
+              2026-10-30 00:00 UTC. Add credits to continue now.",
+              "type": "insufficient_quota", "code":
+              "free_daily_limit_exceeded"}}
     """
     status = int(getattr(response, "status_code", 0) or 0)
     if status != 429:
@@ -9168,19 +9333,41 @@ def _usage_limit_reset_info(
     except Exception:
         payload = None
 
-    err_type = None
+    err_types: list[str] = []
+    codes: list[str] = []
     message = None
     limit_name = None
     if isinstance(payload, dict):
+        # Two-candidate reading (payload then nested ``error``), matching
+        # ``_is_account_rate_limit_error``: some gateways put the markers at
+        # the top level (observed api.munito.ai), others nest them under
+        # ``error`` (OpenAI-style), and the top-level ``type`` may be a generic
+        # wrapper such as ``"error"`` — so every candidate is inspected
+        # instead of taking the first non-empty value.
+        candidates = [payload]
         error = payload.get("error")
         if isinstance(error, dict):
-            err_type = str(error.get("type", "")).strip().lower()
-            message = error.get("message")
+            candidates.append(error)
+        for cand in candidates:
+            cand_type = str(cand.get("type", "")).strip().lower()
+            cand_code = str(cand.get("code", "")).strip().lower()
+            if cand_type:
+                err_types.append(cand_type)
+            if cand_code:
+                codes.append(cand_code)
+            if message is None and isinstance(cand.get("message"), str):
+                message = cand["message"]
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
             limit_name = str(metadata.get("limitName", "")).strip().lower()
 
-    if err_type not in ("gousagelimiterror", "freeusagelimiterror"):
+    quota_marker = any(
+        err_type == "insufficient_quota" for err_type in err_types
+    ) or "free_daily_limit_exceeded" in codes
+    if not quota_marker and not any(
+        err_type in ("gousagelimiterror", "freeusagelimiterror")
+        for err_type in err_types
+    ):
         return None
 
     if provider_cfg is not None:
@@ -9214,6 +9401,7 @@ def _usage_limit_reset_info(
         if isinstance(provider_cfg, dict)
         else None
     )
+    period = _usage_limit_period_name(message, limit_name, codes)
     seconds = _parse_resets_in(message) if message else None
     if seconds is not None:
         if account is not None:
@@ -9228,9 +9416,37 @@ def _usage_limit_reset_info(
         return _UsageLimitReset(
             float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS, True, limit_name
         )
-    if limit_name in _PERIOD_DEFAULT_SECONDS:
+
+    timestamp_seconds = _parse_resets_at_timestamp(message) if message else None
+    if timestamp_seconds is not None:
+        # Explicit evidence, but bounded by the period the payload itself
+        # names (daily → 24h) so a malformed / far-future / clock-skewed
+        # timestamp cannot lock the account out indefinitely (AC4). A payload
+        # naming no period is bounded by the guessed-period cap instead.
+        bound = (
+            float(_PERIOD_DEFAULT_SECONDS[period])
+            if period is not None
+            else _usage_limit_guess_cap_seconds(config)
+        )
+        bounded = min(float(timestamp_seconds), bound)
+        if account is not None:
+            logger.info(
+                "usage-limit reset source=timestamp provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                account,
+                bounded + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                period or limit_name or "",
+            )
+        return _UsageLimitReset(
+            bounded + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+            True,
+            period or limit_name,
+        )
+
+    if period in _PERIOD_DEFAULT_SECONDS:
         guessed = min(
-            float(_PERIOD_DEFAULT_SECONDS[limit_name]),
+            float(_PERIOD_DEFAULT_SECONDS[period]),
             _usage_limit_guess_cap_seconds(config),
         )
         if account is not None:
@@ -9240,7 +9456,25 @@ def _usage_limit_reset_info(
                 provider_cfg.get("name", ""),
                 account,
                 guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
-                limit_name,
+                period,
+            )
+        return _UsageLimitReset(
+            guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, period
+        )
+
+    if quota_marker:
+        # An out-of-credit account with no reset information of any kind: a
+        # capped GUESS (self-healing probe, never persisted) instead of the
+        # generic ~60 s re-probe loop this item exists to remove (AC4).
+        guessed = _usage_limit_guess_cap_seconds(config)
+        if account is not None:
+            logger.info(
+                "usage-limit reset source=guess provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                account,
+                guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                limit_name or "",
             )
         return _UsageLimitReset(
             guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, limit_name
@@ -11250,10 +11484,11 @@ async def _proxy_with_remote_fallback_cycle(
                     continue
 
                 # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
-                # FreeUsageLimitError-with-reset-time quarantines the failing
-                # API-key ACCOUNT until the computed reset time + 2m margin.
-                # Not the whole endpoint: distinct api_key_env entries on the
-                # same gateway have independent limits (LP-0MSMBWB23009XYPW).
+                # FreeUsageLimitError-with-reset-time / insufficient_quota (the
+                # MunitoAI daily free limit, LP-0MVT8SAZE00570J5) quarantines the
+                # failing API-key ACCOUNT until the computed reset time + 2m
+                # margin. Not the whole endpoint: distinct api_key_env entries on
+                # the same gateway have independent limits (LP-0MSMBWB23009XYPW).
                 _reset_info = _usage_limit_reset_info(
                     response, body_text, config, provider_cfg=provider_cfg
                 )
@@ -13330,10 +13565,12 @@ async def _proxy_with_fallback_cycle(
                         continue
 
                     # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
-                    # FreeUsageLimitError-with-reset-time quarantines the failing
-                    # API-key ACCOUNT until the computed reset time + 2m margin.
-                    # Not the whole endpoint: distinct api_key_env entries on the
-                    # same gateway have independent limits (LP-0MSMBWB23009XYPW).
+                    # FreeUsageLimitError-with-reset-time / insufficient_quota (the
+                    # MunitoAI daily free limit, LP-0MVT8SAZE00570J5) quarantines
+                    # the failing API-key ACCOUNT until the computed reset time +
+                    # 2m margin. Not the whole endpoint: distinct api_key_env
+                    # entries on the same gateway have independent limits
+                    # (LP-0MSMBWB23009XYPW).
                     _reset_info = _usage_limit_reset_info(
                         response, body_text, config, provider_cfg=provider_cfg
                     )

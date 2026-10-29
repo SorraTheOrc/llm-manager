@@ -1320,3 +1320,325 @@ def test_skip_log_line_names_the_quarantine_window(opencode_usage_chain, caplog)
     ]
     assert pending
     assert "window=weekly" in pending[0]
+
+
+# ===========================================================================
+# Absolute "… It resets at <timestamp> UTC" daily limit (LP-0MVT8SAZE00570J5)
+#
+# MunitoAI's free tier answers HTTP 429 with an ABSOLUTE daily-reset instant
+# (`error.type = "insufficient_quota"`, `error.code =
+# "free_daily_limit_exceeded"`, "… It resets at 2026-10-30 00:00 UTC."). The
+# proxy recognized neither the markers nor the timestamp shape, so it fell
+# through to the generic per-entry cooldown and re-probed a dead account every
+# ~60 s for the rest of the UTC day. These tests pin the detection, the
+# absolute-timestamp parsing (fixed clock), the period bound and the
+# past/unparseable/no-reset fallbacks.
+# ===========================================================================
+
+#: Frozen clock for the absolute-timestamp parser: the 2026-10-29 09:39 log
+#: line that opened the incident.
+_RESET_NOW = datetime(2026, 10, 29, 9, 40, 0, tzinfo=UTC)
+
+#: Seconds from ``_RESET_NOW`` to the advertised ``2026-10-30 00:00 UTC``.
+_RESET_AT_SECONDS = 14 * 3600 + 20 * 60
+
+
+class _FrozenResetDateTime(datetime):
+    """``datetime`` with a frozen ``now`` (the parser's injectable clock)."""
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return _RESET_NOW
+        return _RESET_NOW.astimezone(tz)
+
+
+def _munitoai_free_entry() -> dict:
+    """The free-tier MunitoAI entry the incident was observed on."""
+    return {
+        "name": "munitoai-free",
+        "type": "remote",
+        "provider": "MunitoAI",
+        "endpoint": "https://api.munito.ai/inference",
+        "api_key_env": "MUNITOAI_FREE_API_KEY",
+        "model": "deepseek-ai/deepseek-v4-flash",
+        "respect_ratelimit_headers": True,
+    }
+
+
+def _munitoai_daily_limit_body(reset_at: str = "2026-10-30 00:00 UTC") -> str:
+    """The verbatim MunitoAI free-tier daily-limit 429 body (2026-10-29 log).
+
+    ``reset_at`` is substituted so a test can place the advertised instant in
+    the past or the far future.
+    """
+    return json.dumps({
+        "error": {
+            "message": (
+                "The daily free limit of deepseek-ai/deepseek-v4-flash is "
+                f"reached. It resets at {reset_at}. Add credits to continue "
+                "now."
+            ),
+            "type": "insufficient_quota",
+            "param": None,
+            "code": "free_daily_limit_exceeded",
+        }
+    })
+
+
+def _daily_limit_response(body: str) -> Response:
+    return Response(status_code=429, content=body.encode("utf-8"))
+
+
+def _daily_reset_info(body: str, provider_cfg: dict | None = None, config=None):
+    """``_usage_limit_reset_info`` under the frozen clock."""
+    with patch("proxy.provider.datetime", _FrozenResetDateTime):
+        return provider._usage_limit_reset_info(
+            _daily_limit_response(body),
+            body,
+            config,
+            provider_cfg=provider_cfg,
+        )
+
+
+def test_parse_resets_at_timestamp_formats():
+    """AC2: all four supported absolute-timestamp shapes parse to the same
+    seconds-until-reset against a fixed clock."""
+    cases = {
+        "It resets at 2026-10-30 00:00 UTC.": _RESET_AT_SECONDS,
+        "It resets at 2026-10-30 00:00:30 UTC.": _RESET_AT_SECONDS + 30,
+        "It resets at 2026-10-30T00:00:00Z.": _RESET_AT_SECONDS,
+        "It resets at 2026-10-30T02:00:00+02:00.": _RESET_AT_SECONDS,
+        "It resets at 2026-10-30T03:00:00+0300.": _RESET_AT_SECONDS,
+    }
+    for message, expected in cases.items():
+        assert provider._parse_resets_at_timestamp(
+            message, now=_RESET_NOW
+        ) == pytest.approx(expected), message
+
+
+def test_parse_resets_at_timestamp_rejects_unusable_values():
+    """AC4: past instants and timestamps without timezone evidence are not
+    usable evidence (the caller then falls back to the guessed period)."""
+    for message in (
+        "It resets at 2026-10-29 09:00 UTC.",   # in the past
+        "It resets at 2026-10-29 09:40 UTC.",   # exactly now
+        "It resets at 2026-10-30 00:00.",       # no timezone evidence
+        "It resets at tomorrow midnight.",
+        "",
+    ):
+        assert (
+            provider._parse_resets_at_timestamp(message, now=_RESET_NOW) is None
+        ), message
+
+
+def test_munitoai_daily_limit_429_uses_the_absolute_timestamp(caplog):
+    """AC1+AC2+AC3: the verbatim MunitoAI body takes the usage-limit reset
+    path with the timestamp + the 2-minute margin, logged as
+    ``source=timestamp``."""
+    body = _munitoai_daily_limit_body()
+    entry = _munitoai_free_entry()
+    with caplog.at_level("INFO", logger="llama-proxy.provider"):
+        info = _daily_reset_info(body, provider_cfg=entry)
+
+    assert info is not None
+    assert info.explicit is True
+    assert info.limit_name == "daily"
+    assert info.window is None
+    assert info.seconds == pytest.approx(
+        _RESET_AT_SECONDS + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+    )
+    with patch("proxy.provider.datetime", _FrozenResetDateTime):
+        assert provider._usage_limit_reset_seconds(
+            _daily_limit_response(body), body
+        ) == pytest.approx(info.seconds)
+
+    reset_lines = [
+        rec.message for rec in caplog.records if "usage-limit reset source=" in rec.message
+    ]
+    assert reset_lines, "the reset source must be logged"
+    assert "source=timestamp" in reset_lines[0]
+    assert "provider=munitoai-free" in reset_lines[0]
+    assert f"seconds_to_reset={info.seconds:.0f}" in reset_lines[0]
+    assert "limit=daily" in reset_lines[0]
+
+
+def test_insufficient_quota_markers_are_detected_top_level_and_nested():
+    """AC1: the markers are read from the top level AND from a nested ``error``
+    dict, and matching is case-insensitive — the code alone is enough for
+    gateways that omit ``type``."""
+    reset_at = "2026-10-30 00:00 UTC"
+    payloads = [
+        # top-level type (observed shape family)
+        {
+            "type": "insufficient_quota",
+            "message": f"Daily limit reached. It resets at {reset_at}.",
+        },
+        # nested type, upper-case
+        {
+            "error": {
+                "type": "INSUFFICIENT_QUOTA",
+                "message": f"Daily limit reached. It resets at {reset_at}.",
+            }
+        },
+        # code only, nested and upper-case (no type at all)
+        {
+            "error": {
+                "code": "FREE_DAILY_LIMIT_EXCEEDED",
+                "message": f"Daily limit reached. It resets at {reset_at}.",
+            }
+        },
+        # code only, top-level, with a generic wrapper type
+        {
+            "type": "error",
+            "code": "free_daily_limit_exceeded",
+            "message": f"Daily limit reached. It resets at {reset_at}.",
+        },
+    ]
+    for payload in payloads:
+        body = json.dumps(payload)
+        info = _daily_reset_info(body)
+        assert info is not None, payload
+        assert info.explicit is True, payload
+        assert info.seconds == pytest.approx(
+            _RESET_AT_SECONDS + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+        ), payload
+
+
+def test_explicit_duration_wins_over_the_absolute_timestamp():
+    """Constraint: an explicit ``Resets in …`` duration keeps precedence over
+    an absolute timestamp in the same message."""
+    body = json.dumps({
+        "error": {
+            "type": "insufficient_quota",
+            "message": (
+                "Daily free limit reached. Resets in 1 hour. "
+                "It resets at 2026-10-30 00:00 UTC."
+            ),
+        }
+    })
+    info = _daily_reset_info(body)
+    assert info is not None
+    assert info.seconds == pytest.approx(
+        3600 + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+    )
+
+
+def test_absolute_timestamp_is_bounded_to_the_named_daily_period():
+    """AC4: hard evidence is bounded by the period the payload names, so a
+    far-future timestamp cannot lock the account out for weeks."""
+    body = _munitoai_daily_limit_body("2026-11-30 00:00 UTC")  # ~32 days out
+    info = _daily_reset_info(body)
+    assert info is not None
+    assert info.explicit is True
+    assert info.limit_name == "daily"
+    assert info.seconds == pytest.approx(
+        provider._PERIOD_DEFAULT_SECONDS["daily"]
+        + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+    )
+    assert info.seconds < 31 * 24 * 3600
+
+
+def test_past_timestamp_falls_back_to_the_guessed_daily_period():
+    """AC4: a timestamp in the past is not evidence — the quarantine becomes
+    the bounded GUESS (probe-revalidated, never persisted)."""
+    body = _munitoai_daily_limit_body("2026-10-29 09:00 UTC")
+    info = _daily_reset_info(body)
+    assert info is not None
+    assert info.explicit is False
+    assert info.limit_name == "daily"
+    assert info.seconds == pytest.approx(
+        min(
+            provider._PERIOD_DEFAULT_SECONDS["daily"],
+            provider._USAGE_LIMIT_GUESS_MAX_SECONDS,
+        )
+        + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+    )
+
+    account = provider._usage_limit_account_key(_munitoai_free_entry())
+    provider._set_usage_limit_quarantine(account, info)
+    assert account in provider._usage_reset_guessed
+
+
+def test_unparseable_timestamp_falls_back_to_the_guessed_daily_period():
+    """AC4: an unparseable timestamp falls back to the guessed period."""
+    body = _munitoai_daily_limit_body("tomorrow at midnight")
+    info = _daily_reset_info(body)
+    assert info is not None
+    assert info.explicit is False
+    assert info.limit_name == "daily"
+    assert info.seconds == pytest.approx(
+        provider._PERIOD_DEFAULT_SECONDS["daily"]
+        + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+    )
+
+
+def test_insufficient_quota_without_any_reset_information_is_guessed():
+    """AC4: an out-of-credit body with no reset information at all is
+    quarantined as a bounded guess rather than re-probed every ~60 s."""
+    body = json.dumps({
+        "error": {
+            "type": "insufficient_quota",
+            "message": "You exceeded your current quota.",
+        }
+    })
+    info = _daily_reset_info(body)
+    assert info is not None
+    assert info.explicit is False
+    assert info.seconds == pytest.approx(
+        provider._usage_limit_guess_cap_seconds({})
+        + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+    )
+
+    account = provider._usage_limit_account_key(_munitoai_free_entry())
+    provider._set_usage_limit_quarantine(account, info)
+    assert account in provider._usage_reset_guessed
+
+
+def test_non_quota_responses_stay_out_of_the_usage_limit_path():
+    """AC6: a non-429 carrying ``insufficient_quota`` and a 429 carrying only
+    ``rate_limit_exceeded`` keep their pre-change handling."""
+    body = _munitoai_daily_limit_body()
+    # 200 with the quota body is not an error at all.
+    assert provider._usage_limit_reset_info(
+        Response(status_code=200, content=body.encode()), body
+    ) is None
+    # 429 with only the per-minute rate-limit marker is not a daily reset.
+    rate_body = json.dumps({
+        "error": {
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+            "message": "Too many requests. It resets at 2026-10-30 00:00 UTC.",
+        }
+    })
+    assert provider._usage_limit_reset_info(
+        Response(status_code=429, content=rate_body.encode()), rate_body
+    ) is None
+
+
+def test_absolute_timestamp_quarantine_survives_a_state_restore(tmp_path, monkeypatch):
+    """AC3: the reset is recorded through ``_set_usage_limit_quarantine`` and
+    survives a ``provider-state.json`` round trip as an explicit entry."""
+    monkeypatch.setenv(
+        provider._PROVIDER_STATE_FILE_ENV, str(tmp_path / "provider-state.json")
+    )
+    info = _daily_reset_info(_munitoai_daily_limit_body(), provider_cfg=_munitoai_free_entry())
+    assert info is not None
+    account = provider._usage_limit_account_key(_munitoai_free_entry())
+    provider._set_usage_limit_quarantine(account, info)
+
+    state_file = tmp_path / "provider-state.json"
+    assert state_file.exists(), "the quarantine must be persisted"
+
+    provider._usage_reset_at.clear()
+    provider._usage_reset_guessed.clear()
+    provider._usage_reset_window.clear()
+    restored_cooldowns, restored_quarantine = provider.load_provider_state(state_file)
+
+    assert restored_cooldowns == 0
+    assert restored_quarantine == 1
+    assert provider._usage_reset_remaining(account) == pytest.approx(
+        info.seconds, abs=5
+    )
+    assert account not in provider._usage_reset_guessed
+    assert account not in provider._usage_reset_window
