@@ -569,10 +569,13 @@ disk was still scored cold (82.8 % of routing decisions reported
 `proxy/proxy/slot_cache_ratio.py` closes that gap with a sidecar written next to
 each snapshot (`slot_<session>.bin` → `slot_<session>.bin.ratio.json`):
 
-- **Writer** — after a *successful* `slot_save`, the proxy records the measured
-  `prompt_tokens` from the upstream `usage` block (the whole served prompt is
-  now resident in the saved KV cache) plus a SHA-256 fingerprint of every
-  message in the request. No usage block → no sidecar (today's behaviour).
+- **Writer** — after a *successful* `slot_save`, the proxy records the
+  prompt-token count that is now resident in the saved KV cache plus a SHA-256
+  fingerprint of every message in the request. Both save paths write it: the
+  request-completion path and the session **eviction** path, and both couple
+  the sidecar's lifetime to the snapshot's (see
+  [Lifecycle coupling](#snapshot--sidecar-lifecycle-coupling-lp-0mvk0e80c009huqc)
+  below).
 - **Reader** — before the cold-cache gate reads the ratio, the snapshot's
   sidecar is validated and used to seed it:
 
@@ -592,8 +595,8 @@ each snapshot (`slot_<session>.bin` → `slot_<session>.bin.ratio.json`):
   cannot mask an expensive prefill.
 - **Fail-open** — missing/corrupt/expired sidecar, other model, absent
   `session_slot_save_path`, or any error degrades to the previous behaviour
-  (`cached_ratio = 0`, conservative). Session invalidation deletes both the
-  snapshot and its sidecar and clears the in-memory ratio.
+  (`cached_ratio = 0`, conservative). Session invalidation retires the snapshot
+  and its sidecar together and clears the in-memory ratio.
 - **Restart-safe (AC6)** — the sidecar lives on disk, so the first request of a
   session after a proxy restart is scored warm when the snapshot is present
   and valid.
@@ -671,6 +674,97 @@ total across a window means the seed path never got past the lookup and the
 guard (prefix / TTL) cannot be the cause. The first such verdict, and the two
 writer-side gaps that produce it, are recorded in
 [`docs/dev/slot-ratio-seed-verdict-LP-0MVK0E8C40035FG3.md`](../../docs/dev/slot-ratio-seed-verdict-LP-0MVK0E8C40035FG3.md).
+
+### Snapshot ↔ sidecar lifecycle coupling (LP-0MVK0E80C009HUQC)
+
+The verdict above showed the seed path never reached its guard at all: over
+4,488 decisions in 155 h, `missing_sidecar` (3,402; 75.8 %) and
+`missing_snapshot` (1,086; 24.2 %) accounted for **100 %** of outcomes, and
+`found` / `expired` / `model_mismatch` / `prefix_mismatch` / `empty_ratio` were
+**all exactly 0**. A guard branch is only reachable once a snapshot *and* a
+readable sidecar co-exist, so the defect was never the guard, the TTL or the
+credit arithmetic — it was **artefact pairing on the writer side**. Three gaps
+are now closed, and `prefix_matches()`, `ttl_seconds()` and
+`min(1.0, cached/estimated) × margin` are byte-for-byte unchanged.
+
+**What was fixed**
+
+| Failure mode | Before | Now |
+|---|---|---|
+| Eviction saves were unseedable | `session.save_evicted_session_snapshot()` wrote only `slot_<session>.bin` (98 saves across 32 sessions, overlapping 17 of the 31 `missing_sidecar` sessions) | the save writes the sidecar too, from the session's recorded prompt prefix |
+| Request saves without a measured usage block got no sidecar | the write was gated on `_measured_prompt_tokens > 0` | the write is unconditional; the token count falls back to the recorded prefix, then to the router's prompt estimate |
+| Sidecar lifetime was not coupled to the snapshot's | the sidecar was deleted only when a caller passed a filename; nothing else pruned it (139 orphans against 0 snapshots on disk) | every snapshot unlink goes through one retirement helper (root layout *and* `{host}-{port}` subdirectories), and `scripts/cleanup-slot-cache.sh` recurses, deletes the pair together and prunes orphan sidecars |
+
+**Which token count gets recorded.** The sidecar must not invent a
+measurement, so `provider.sidecar_cached_tokens()` resolves it in decreasing
+order of trustworthiness:
+
+1. the upstream `usage` block's `prompt_tokens` for this request (a direct
+   measurement — unchanged behaviour);
+2. else the prompt prefix recorded by `record_prompt_prefix()` on an earlier
+   *measured* local turn, but only when its fingerprints prefix-match the
+   saved messages (then it is a genuine lower bound for the saved KV);
+3. else `_estimate_prompt_tokens_for_routing()` — the same tokenizer the
+   routing decision uses, counting message text only (it ignores tool
+   definitions and per-message overhead, so it under-counts rather than
+   inflating credit);
+4. else **no sidecar at all** — a snapshot with no trustworthy count stays
+   unpaired rather than carrying an invented number (which would be reported
+   as `empty_ratio` or, worse, over-credit).
+
+The eviction path has no request body, so it only ever uses rule 2: a session
+that has never produced a measured local turn gets no sidecar from an eviction
+save.
+
+**What still earns nothing** (unchanged, deliberately):
+
+- a **changed prompt** — a rewritten system prompt or a front-truncated history
+  fails `prefix_matches()` and credits `0` (AC2 of LP-0MVGD9YXH008O304);
+- an **expired sidecar** — older than `session_slot_ratio_ttl_seconds`
+  (default 86 400 s);
+- a **mismatched model** — the sidecar was written for a different
+  `llama_model`;
+- a **weak partial credit** — still subject to the normal cold-cache gate, so
+  it cannot mask an expensive prefill;
+- the **in-memory expected-reuse credit** — `provider.expected_cached_ratio()`
+  keeps the same `prefix_matches()` rule for both call sites.
+
+**Expected post-fix signature** (the ≥24 h re-measurement,
+LP-0MVK0E8NH007XCV3):
+
+- `slot_ratio_seed outcome=missing_sidecar` ≈ 0 for sessions whose snapshot was
+  taken by the eviction path (they now carry a sidecar);
+- `slot_ratio_seed outcome=missing_snapshot` ≈ 0 (orphan sidecars are pruned
+  with their snapshots and by retention);
+- **`found` > 0** and `cache_state=restored` dispatches > 0 — the first real
+  evidence that the feature engages;
+- `prefix_mismatch` and `expired` become *possible* for the first time. A
+  non-zero `prefix_mismatch` count is a **success signal** (the guard is
+  finally running on real traffic), not a regression — do not "fix" the guard
+  in response to it. It is the next measurement's question, and only then is
+  the guard itself the binding constraint.
+
+Aggregate it with the same recipe as the other outcomes, adding the two
+derived counters:
+
+```bash
+# Orphan sidecars still on disk (should trend to 0 as retention prunes them):
+find "$SLOT_CACHE_DIR" -name '*.bin.ratio.json' | while read -r s; do
+  [ -f "${s%.ratio.json}" ] || echo "orphan: $s"
+done | wc -l
+# Pairs restored warm (should be > 0 after the fix):
+grep -c 'slot_ratio_restored ' llama-proxy.log
+```
+
+#### Retention and pairing in `scripts/cleanup-slot-cache.sh`
+
+The cleanup script now walks the legacy root **and** one level of
+`{host}-{port}` endpoint subdirectories, deletes a snapshot and its sidecar as
+one unit under both the age and size rules, and prunes `.ratio.json` files
+whose snapshot is gone (root and subdirectories alike, `--dry-run` honoured).
+Before this, it globbed `"$SLOT_CACHE_DIR"/slot_*.bin` only, so with every live
+snapshot in `localhost-8080/` it printed `No slot files found` and never touched
+an orphan.
 
 ## Capacity-based local admission (LP-0MVGDUVS6003T2IX)
 

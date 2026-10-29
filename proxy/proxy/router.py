@@ -697,27 +697,45 @@ async def _update_session_and_slot(
                 # survives a proxy restart (LP-0MVGD9YXH008O304 AC1/AC6): the
                 # served prompt's tokens are now resident in the saved KV
                 # cache, so a later request whose message list extends this
-                # one can be credited for them at routing time. Only MEASURED
-                # usage is recorded — without a usage block the sidecar is
-                # left untouched (conservative; today's behaviour).
-                if session_id and srv.current_model and _measured_prompt_tokens > 0:
+                # one can be credited for them at routing time.
+                #
+                # A missing usage block must NOT skip the write
+                # (LP-0MVK0E80C009HUQC AC2): before this, a snapshot saved from
+                # an unmeasured response got no sidecar and was structurally
+                # unseedable — one of the two writer-side gaps behind 3,402
+                # `slot_ratio_seed outcome=missing_sidecar` decisions in 155 h.
+                # `sidecar_cached_tokens()` falls back to the session's
+                # recorded measured prefix (prefix-matched) and then to the
+                # router's own prompt estimate, and returns 0 only when there
+                # is no trustworthy count at all — then we write nothing rather
+                # than invent a measurement.
+                if session_id and srv.current_model:
                     try:
+                        from proxy.provider import sidecar_cached_tokens
                         from proxy.slot_cache_ratio import (
                             write_slot_ratio_sidecar,
                         )
 
-                        write_slot_ratio_sidecar(
-                            slot_filename,
-                            session_id=session_id,
-                            model=srv.current_model,
-                            cached_tokens=_measured_prompt_tokens,
-                            prompt_tokens=_measured_prompt_tokens,
-                            messages=(
-                                body_json.get("messages")
-                                if isinstance(body_json, dict)
-                                else None
-                            ),
+                        _sidecar_messages = (
+                            body_json.get("messages")
+                            if isinstance(body_json, dict)
+                            else None
                         )
+                        _sidecar_tokens = sidecar_cached_tokens(
+                            srv.current_model,
+                            session_id,
+                            _sidecar_messages,
+                            measured_prompt_tokens=_measured_prompt_tokens,
+                        )
+                        if _sidecar_tokens > 0:
+                            write_slot_ratio_sidecar(
+                                slot_filename,
+                                session_id=session_id,
+                                model=srv.current_model,
+                                cached_tokens=_sidecar_tokens,
+                                prompt_tokens=_sidecar_tokens,
+                                messages=_sidecar_messages,
+                            )
                     except Exception:
                         srv.logger.debug(
                             "slot ratio sidecar write failed", exc_info=True

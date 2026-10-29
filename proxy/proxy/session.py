@@ -935,9 +935,52 @@ async def save_evicted_session_snapshot(
             )
         except Exception:
             pass
+        if saved:
+            _write_eviction_sidecar(session_id, model, filename)
     except Exception:
         report["reason"] = f"{reason}:snapshot_error"
     return report
+
+
+def _write_eviction_sidecar(
+    session_id: str | None,
+    model: str | None,
+    slot_filename: str | None,
+) -> None:
+    """Pair an eviction-saved snapshot with its routing-ratio sidecar.
+
+    LP-0MVK0E80C009HUQC AC1: ``save_evicted_session_snapshot()`` used to write
+    only the ``.bin``, so every eviction save was structurally unseedable (98
+    saves across 32 sessions, overlapping 17 of the 31 ``missing_sidecar``
+    sessions).
+
+    The eviction path has no request body, so the session's recorded prompt
+    prefix (``provider.record_prompt_prefix`` → ``_last_prompt_prefix``) is the
+    only trustworthy token count: it is a measurement of exactly the prompt the
+    slot held. A session with no recorded prefix gets no sidecar rather than an
+    invented count. Never raises — pairing is best effort and must not fail a
+    save that already succeeded.
+    """
+    if not session_id or not model or not slot_filename:
+        return
+    try:
+        from proxy.provider import get_recorded_prompt_prefix
+        from proxy.slot_cache_ratio import write_slot_ratio_sidecar
+
+        recorded = get_recorded_prompt_prefix(model, session_id)
+        if recorded is None:
+            return
+        cached_tokens, fingerprints = recorded
+        write_slot_ratio_sidecar(
+            slot_filename,
+            session_id=session_id,
+            model=model,
+            cached_tokens=cached_tokens,
+            prompt_tokens=cached_tokens,
+            fingerprints=fingerprints,
+        )
+    except Exception:
+        logger.debug("eviction sidecar write failed", exc_info=True)
 
 
 # ===================================================================
@@ -1361,19 +1404,93 @@ async def _invalidate_session_and_slot(
 
     if reason:
         _record_session_invalidation(reason)
-    if slot_filename:
-        try:
-            Path(slot_filename).unlink(missing_ok=True)
-        except Exception:
-            pass
-        # The routing cache-state sidecar describes the snapshot being
-        # discarded, so it must go too (LP-0MVGD9YXH008O304).
-        try:
-            from proxy.slot_cache_ratio import delete_slot_ratio_sidecar
+    # Every snapshot unlink goes through the coupling helper so a sidecar can
+    # never outlive (or precede the removal of) its snapshot.
+    # LP-0MVK0E80C009HUQC AC3.
+    _retire_session_slot_snapshots(
+        session_id, slot_filename, _session_slot_root()
+    )
 
-            delete_slot_ratio_sidecar(slot_filename)
-        except Exception:
-            pass
+
+def _session_slot_root() -> str | None:
+    """Return the configured slot-cache root (``None`` when unset)."""
+    try:
+        server_config = getattr(_srv(), "config", None) or {}
+        if isinstance(server_config, dict) and isinstance(
+            server_config.get("server"), dict
+        ):
+            server_config = server_config["server"]
+        root = server_config.get("session_slot_save_path")
+    except Exception:
+        return None
+    return str(root) if root else None
+
+
+def _session_slot_candidates(session_id: str, slot_root: str | Path) -> list[str]:
+    """Every snapshot path *session_id* could own: root plus endpoint dirs.
+
+    Mirrors ``slot_cache_ratio._candidate_slot_filenames`` but without knowing
+    which endpoint served the session, so the per-endpoint subdirectories
+    (``{host}-{port}``) are enumerated rather than resolved
+    (LP-0MRPILSMW004T4H8, LP-0MVK0E80C009HUQC).
+    """
+    name = f"slot_{_sanitize_session_id(session_id)}.bin"
+    root = Path(slot_root)
+    candidates = [str(root / name)]
+    try:
+        candidates.extend(str(child / name) for child in sorted(root.glob("*/")))
+    except Exception:
+        pass
+    return candidates
+
+
+def _retire_slot_snapshot(slot_filename: str | Path | None) -> None:
+    """Delete a snapshot together with its routing-ratio sidecar.
+
+    Never raises: retiring a slot file is best effort.
+    """
+    if not slot_filename:
+        return
+    try:
+        Path(slot_filename).unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        from proxy.slot_cache_ratio import delete_slot_ratio_sidecar
+
+        delete_slot_ratio_sidecar(slot_filename)
+    except Exception:
+        pass
+
+
+def _retire_session_slot_snapshots(
+    session_id: str | None,
+    slot_filename: str | Path | None,
+    slot_root: str | Path | None,
+) -> None:
+    """Retire a session's snapshot(s) and sidecar(s) as one unit.
+
+    The named snapshot is retired first; then every candidate path for
+    *session_id* (root layout plus endpoint subdirectories) is retired, which
+    also clears an orphan sidecar whose snapshot is already gone. Callers that
+    cannot resolve a filename (the router's history-mismatch path passes
+    ``None``) therefore still leave no orphan behind — previously the whole
+    block was skipped, which is how 139 sidecars accumulated against 0
+    snapshots (LP-0MVK0E80C009HUQC AC3). Never raises.
+    """
+    retired: set[str] = set()
+    try:
+        if slot_filename:
+            retired.add(str(slot_filename))
+            _retire_slot_snapshot(slot_filename)
+        if session_id and slot_root:
+            for candidate in _session_slot_candidates(session_id, slot_root):
+                if candidate in retired:
+                    continue
+                retired.add(candidate)
+                _retire_slot_snapshot(candidate)
+    except Exception:
+        pass
 
 
 # ===================================================================

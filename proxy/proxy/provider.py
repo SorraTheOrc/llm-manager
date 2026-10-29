@@ -6155,6 +6155,96 @@ def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tu
     return (cur_active, max_local)
 
 
+# ---------------------------------------------------------------------------
+# Snapshot sidecar measurement (LP-0MVK0E80C009HUQC)
+# ---------------------------------------------------------------------------
+# How much of the served prompt a saved slot snapshot can honestly claim as
+# KV-resident. Derived here (next to the slot-pool accounting) because both
+# the request-completion path and the eviction save path consume it, and the
+# recorded prefix it reads lives in ``_last_prompt_prefix`` above.
+
+
+def get_recorded_prompt_prefix(
+    model_name: str | None, session_id: str | None
+) -> tuple[int, list[str]] | None:
+    """Return the recorded ``(prompt_tokens, fingerprints)`` for a session.
+
+    ``None`` when this session has no measured local turn yet. Used by the slot
+    eviction save path, which has no request body of its own: the recorded
+    prefix is the only trustworthy token count describing what the slot holds
+    (LP-0MVK0E80C009HUQC).
+    """
+    if not model_name or not session_id:
+        return None
+    record = _last_prompt_prefix.get((model_name, session_id))
+    if record is None:
+        return None
+    try:
+        tokens, fingerprints = record
+        tokens = int(tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    if tokens <= 0 or not fingerprints:
+        return None
+    return tokens, list(fingerprints)
+
+
+def sidecar_cached_tokens(
+    model_name: str | None,
+    session_id: str | None,
+    messages: list | None,
+    *,
+    measured_prompt_tokens: int = 0,
+) -> int:
+    """Token count to record in a slot-snapshot sidecar (``0`` = write none).
+
+    The sidecar is written *after* the slot save, so ``cached_tokens`` is how
+    much of the served prompt is now resident in the saved KV cache. Three
+    sources, in decreasing order of trustworthiness:
+
+    1. the upstream usage block's ``prompt_tokens`` for *this* request
+       (unchanged behaviour — a direct measurement);
+    2. the recorded prompt prefix from a previous measured local turn, but
+       only when its fingerprints prefix-match *messages* — that makes it a
+       genuine lower bound for the saved KV rather than a stale guess;
+    3. the router's own prompt estimate (``_estimate_prompt_tokens_for_routing``,
+       the same tokenizer the routing decision uses, counting message text
+       only — it ignores tool definitions and per-message overhead, so it
+       under-counts and cannot inflate credit).
+
+    ``0`` when no trustworthy count exists: the caller then writes no sidecar
+    rather than inventing a measurement (AC5 risk note, LP-0MVK0E80C009HUQC).
+    """
+    try:
+        measured = int(measured_prompt_tokens or 0)
+    except (TypeError, ValueError):
+        measured = 0
+    if measured > 0:
+        return measured
+    try:
+        from proxy.slot_cache_ratio import message_fingerprints, prefix_matches
+
+        incoming = message_fingerprints(messages)
+    except Exception:
+        logger.debug("sidecar token resolution failed", exc_info=True)
+        return 0
+    if not incoming:
+        return 0
+    recorded = get_recorded_prompt_prefix(model_name, session_id)
+    if recorded is not None:
+        try:
+            if prefix_matches(recorded[1], incoming):
+                return recorded[0]
+        except Exception:
+            logger.debug("sidecar prefix check failed", exc_info=True)
+    try:
+        estimate = _estimate_prompt_tokens_for_routing({"messages": messages})
+        return max(0, int(estimate or 0))
+    except Exception:
+        logger.debug("sidecar prompt estimate failed", exc_info=True)
+        return 0
+
+
 def _local_slot_saturation(
     config: dict, max_local: int, endpoint: str | None = None
 ) -> str | None:

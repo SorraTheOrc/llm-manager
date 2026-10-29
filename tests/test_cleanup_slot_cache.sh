@@ -32,6 +32,15 @@ make_slot() {
     touch -d "$(date -d "$age_days days ago" +%Y-%m-%dT%H:%M:%S)" "$file"
 }
 
+# Create a sidecar next to a slot file (matching age)
+make_sidecar() {
+    local file="$1"
+    echo '{}' > "${file}.ratio.json"
+    if [ -f "$file" ]; then
+        touch -r "$file" "${file}.ratio.json"
+    fi
+}
+
 # ---------------------------------------------------------------
 # Test: --dry-run lists candidates without deleting anything
 # ---------------------------------------------------------------
@@ -149,6 +158,90 @@ test_noop_when_healthy() {
 }
 
 # ---------------------------------------------------------------
+# Test: a deleted snapshot takes its sidecar with it (no orphan)
+# ---------------------------------------------------------------
+test_pair_deleted_together() {
+    echo "Test: deleting a snapshot also deletes its .ratio.json sidecar"
+    TESTS_TMPDIR="$(mktemp -d)"
+    local cache="$TESTS_TMPDIR/cache"
+    make_slot "$cache" 10 1 "aaaaaaaa-0000-0000-0000-000000000000"   # old
+    make_sidecar "$cache/slot_aaaaaaaa-0000-0000-0000-000000000000.bin"
+    make_slot "$cache" 1 1 "bbbbbbbb-0000-0000-0000-000000000000"    # recent
+    make_sidecar "$cache/slot_bbbbbbbb-0000-0000-0000-000000000000.bin"
+
+    "$SCRIPT" --path "$cache" --max-age-days 7 --max-size-gb 100 >/dev/null 2>&1
+
+    if [ ! -f "$cache/slot_aaaaaaaa-0000-0000-0000-000000000000.bin.ratio.json" ]; then
+        pass "sidecar deleted with its snapshot"
+    else
+        fail "sidecar outlived its snapshot"
+    fi
+    if [ -f "$cache/slot_bbbbbbbb-0000-0000-0000-000000000000.bin.ratio.json" ]; then
+        pass "sidecar of the retained snapshot survived"
+    else
+        fail "sidecar of a retained snapshot was deleted"
+    fi
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
+# Test: endpoint subdirectories are pruned, not just the root
+# ---------------------------------------------------------------
+test_endpoint_subdirectories() {
+    echo "Test: per-endpoint subdirectories are included in the scan"
+    TESTS_TMPDIR="$(mktemp -d)"
+    local cache="$TESTS_TMPDIR/cache"
+    mkdir -p "$cache/localhost-8080"
+    make_slot "$cache/localhost-8080" 10 1 "aaaaaaaa-0000-0000-0000-000000000000"
+    make_sidecar "$cache/localhost-8080/slot_aaaaaaaa-0000-0000-0000-000000000000.bin"
+    make_slot "$cache/localhost-8080" 1 1 "bbbbbbbb-0000-0000-0000-000000000000"
+    make_sidecar "$cache/localhost-8080/slot_bbbbbbbb-0000-0000-0000-000000000000.bin"
+
+    "$SCRIPT" --path "$cache" --max-age-days 7 --max-size-gb 100 >/dev/null 2>&1
+
+    if [ ! -f "$cache/localhost-8080/slot_aaaaaaaa-0000-0000-0000-000000000000.bin" ]; then
+        pass "old snapshot in a subdirectory deleted"
+    else
+        fail "old snapshot in a subdirectory retained (root-only glob?)"
+    fi
+    if [ -f "$cache/localhost-8080/slot_bbbbbbbb-0000-0000-0000-000000000000.bin" ]; then
+        pass "recent snapshot in a subdirectory retained"
+    else
+        fail "recent snapshot in a subdirectory was deleted"
+    fi
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
+# Test: orphan sidecars are pruned even with no snapshots at all
+# ---------------------------------------------------------------
+test_orphan_sidecars_pruned() {
+    echo "Test: orphan .ratio.json files are pruned (root and subdirectories)"
+    TESTS_TMPDIR="$(mktemp -d)"
+    local cache="$TESTS_TMPDIR/cache"
+    mkdir -p "$cache/localhost-8080"
+    echo '{}' > "$cache/slot_root-orphan.bin.ratio.json"
+    echo '{}' > "$cache/localhost-8080/slot_nested-orphan.bin.ratio.json"
+
+    local rc
+    "$SCRIPT" --path "$cache" --max-age-days 7 --max-size-gb 100 >/dev/null 2>&1
+    rc=$?
+
+    if [ "$rc" = "0" ]; then pass "script exits 0 with only orphan sidecars"; else fail "script exited $rc"; fi
+    if [ ! -f "$cache/slot_root-orphan.bin.ratio.json" ]; then
+        pass "root orphan sidecar pruned"
+    else
+        fail "root orphan sidecar survived"
+    fi
+    if [ ! -f "$cache/localhost-8080/slot_nested-orphan.bin.ratio.json" ]; then
+        pass "nested orphan sidecar pruned"
+    else
+        fail "nested orphan sidecar survived"
+    fi
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
 # Test: missing directory exits non-zero
 # ---------------------------------------------------------------
 test_missing_dir() {
@@ -166,6 +259,9 @@ test_age_rule
 test_size_cap
 test_active_protection
 test_noop_when_healthy
+test_pair_deleted_together
+test_endpoint_subdirectories
+test_orphan_sidecars_pruned
 test_missing_dir
 
 echo ""

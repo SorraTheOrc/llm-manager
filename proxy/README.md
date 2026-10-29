@@ -3087,6 +3087,10 @@ to prevent disk-space exhaustion:
 - Remove slot files older than **7 days** (`--max-age-days`, default: `7`)
 - Retain the **3 most recently modified** files per unique slot prefix
   (`--keep-recent`, default: `3`)
+- Delete each snapshot's `.ratio.json` routing sidecar with the snapshot, and
+  prune orphan sidecars whose snapshot is gone — the scan covers the cache root
+  **and** the per-endpoint `{host}-{port}/` subdirectories
+  (LP-0MVK0E80C009HUQC)
 
 **Usage:**
 
