@@ -210,12 +210,48 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
                     )
         except Exception:
             released_records = []
+        # AC1 (LP-0MVRMI5HK00558TB): capture the slot identities the evicted
+        # session owns BEFORE the release frees the assignments (the release
+        # below pops the records, the markers and the slot registry entries).
+        from proxy.router_helpers import (
+            _abandoned_slot_lookup,
+            _close_stream_cm,
+            _record_abandoned_slot,
+            _spawn_detached_release,
+        )
+
+        abandoned_slots: list[tuple[int | None, str | None]] = []
+        for record_endpoint, _record in released_records:
+            abandoned_slots.append(
+                (_abandoned_slot_lookup(session_id, record_endpoint), record_endpoint)
+            )
+        # ``_release_local_dispatch`` holds no upstream handle (it pops the
+        # record off the registry), so the pinned ``stream_cm`` — the only
+        # thing that can abort the llama-server task — is captured here.
+        upstream_streams = [
+            record.get("stream_cm")
+            for _ep, record in released_records
+            if isinstance(record, dict) and record.get("stream_cm") is not None
+        ]
         # Release every record owned by the session: the legacy string key
         # first, then each per-endpoint record (AC1). ``_release_local_dispatch``
         # also frees the corresponding slot assignments and prefill markers.
         await _release_local_dispatch(_srv, session_id)
         for record_endpoint in {ep for ep, _ in released_records if ep}:
             await _release_local_dispatch(_srv, session_id, endpoint=record_endpoint)
+        # AC1 (LP-0MVRMI5HK00558TB): cancel the upstream streams so llama-server
+        # stops computing work for a session that no longer exists, and record
+        # the abandoned slots so a slot the backend has not released yet is
+        # annotated "busy, not ours" instead of reading as live work.
+        for stream_cm in upstream_streams:
+            _spawn_detached_release(_close_stream_cm(stream_cm))
+        for slot_id, record_endpoint in abandoned_slots:
+            _record_abandoned_slot(
+                slot_id,
+                session_id=session_id,
+                endpoint=record_endpoint,
+                reason="session_evicted",
+            )
         logger.info(
             "lease_released session=%s reason=session_evicted",
             session_id if session_id else "unknown",

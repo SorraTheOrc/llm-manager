@@ -1531,6 +1531,51 @@ its own leases) and lives in `proxy/proxy/router_helpers.py`
 (`_prefill_thrash_cooldowns` + the `_…_prefill_thrash…` helpers); unit and
 routing-level behaviour are pinned by `proxy/tests/test_prefill_thrash_cooldown.py`.
 
+#### Abandoned local dispatches (LP-0MVRMI5HK00558TB AC1)
+
+An *abandoned* dispatch is one the proxy stops waiting for while llama-server
+still has it: it produced no first byte and the proxy gave up on the
+deadline, the session, the client or the watchdog. Abandoned work is not live
+work, and it must not read as live work either.
+
+Measured before this change (LP-0MVOG7IP80003MLV, 2026-10-24 20:00 →
+2026-10-25 07:00): 332 abandonments (`prefill_deadline` 260,
+`session_evicted` 60, `no_progress_watchdog` 11, `client_disconnect` 1) left
+247 fresh `/slots` polls reporting `capacity_hint=saturated` with
+`local_in_flight_requests=0` — ghosts, counted as live.
+
+Two mechanisms, applied per reason:
+
+| Abandonment reason | Mechanism | Log line |
+|---|---|---|
+| `prefill_deadline` | **Cancel**: the captured upstream stream (`cm`) is closed by `_release_unserved_dispatch` (`LP-0MVT2KSN3007QYFK`); the slot is recorded as abandoned | `lease_released … reason=prefill_deadline`, `abandoned_slot_recorded …` |
+| `session_evicted` | **Cancel** the pinned `stream_cm` of each released record, then **annotate** what could not be cancelled | `lease_released … reason=session_evicted`, `abandoned_slot_recorded …` |
+| `no_progress_watchdog` | **Cancel** the record's `stream_cm` (existing, `LP-0MVIQ0FJC000YLX0`) + **annotate** | `lease_released … reason=no_progress_watchdog`, `abandoned_slot_recorded …` |
+| `client_disconnect` | **Cancel** the record's `stream_cm` (existing, `LP-0MVLFVY6K003VYEL`) + **annotate** | `lease_released … reason=client_disconnect`, `abandoned_slot_recorded …` |
+| `orphan_cleanup` / measured cache deficit | **Cancel** + **annotate** (same shared core) | `lease_released … reason=<that reason>` |
+
+The cancel is real on this build, not decoration. llama-server aborts at its
+next write to the socket, and `return_progress` guarantees such writes
+throughout prefill. Evidence (2026-10-28 `llama-server.log`, 82
+`Connection handling canceled` events): **42** of them cancelled a task that
+never reached `prompt processing done`, i.e. mid-prefill cancellation is
+achievable and observable here. The sequence is always
+`Connection handling canceled` → `stop: cancel task, id_task = N` →
+`slot release: … stop processing`.
+
+Because the backend can lag the close, the abandonment is also **recorded**
+(`_record_abandoned_slot`, `proxy/proxy/router_helpers.py`) with a bounded TTL
+(`DEFAULT_ABANDONED_SLOT_TTL_SECONDS`, 900 s) and published on
+`/llama/local/status`: each slot carries `abandoned`, `abandonment_reason`,
+`abandoned_session_id` and `abandoned_at_seconds_ago`, the top level carries
+`local_abandoned_slots`, and `capacity_hint` gains the additive value
+`abandoned_busy` for a pool occupied *only* by abandoned work. `saturated`
+therefore keeps meaning live, proxy-owned decode work, and a busy-but-abandoned
+pool is never reported `idle`. See
+[per-slot-status-verification.md](per-slot-status-verification.md) for the
+status semantics and the consumer rule (any unrecognised hint value → treat as
+busy).
+
 #### Regression coverage for the prefill-thrash wedge
 
 `proxy/tests/test_prefill_thrash_wedge.py` reproduces the 2026-10-23 02:00-

@@ -1618,6 +1618,13 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         )
                         or 30
                     )
+                    # AC1 (LP-0MVRMI5HK00558TB): the upstream stream context
+                    # manager is the only handle that can actually cancel this
+                    # dispatch on llama-server. Bind it to ``cm`` *before* the
+                    # first-byte wait so the deadline handler below can close
+                    # it even when the monitor raised (a partially entered
+                    # stream is closed best-effort by ``_close_stream_cm``).
+                    cm = None
                     try:
                         cm, response = await _await_first_byte_with_prefill_monitor(
                             srv,
@@ -2053,13 +2060,26 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # so its lease and in-flight marker must be released
                         # now — not retained as an inactive record with a
                         # future ``expires_at`` (the 2026-10-23 ~4 h wedge).
+                        # AC1 (LP-0MVRMI5HK00558TB): the deadline used to leave
+                        # the upstream prefill running (only ``client.aclose()``
+                        # reached llama-server, which acts on it only at its
+                        # next write), so 332 dispatches a night became ghosts.
+                        # Hand the captured upstream stream and the dispatched
+                        # slot to the release so the real task is cancelled and
+                        # the slot is recorded as abandoned for the status
+                        # annotation.
                         if _prefill_deadline_fired:
                             try:
                                 await _release_prefill_deadline_dispatch(
-                                    srv, session_id, endpoint=endpoint
+                                    srv,
+                                    session_id,
+                                    endpoint=endpoint,
+                                    abandoned_slot_id=slot_id,
+                                    upstream_stream_cm=cm,
                                 )
                             except Exception:
                                 pass
+                            cm = None
                         srv.backend_ready = False
                         await _cleanup_after_request(
                             srv, session_id,

@@ -453,6 +453,20 @@ async def get_llama_local_status(request: Request):
     httpx timeout bounded by the ``STATUS_QUERY_TIMEOUT`` window so a slow
     /slots response cannot blow the endpoint's response budget.
 
+    Abandoned work (LP-0MVRMI5HK00558TB AC1, ``status_schema_version: 4``):
+    a local dispatch the proxy has given up on (prefill deadline, session
+    eviction, no-progress watchdog, client disconnect) is recorded in-process
+    with its slot identity, so a slot llama-server has not released yet is
+    annotated instead of counted as live work. Each slot carries ``abandoned``
+    (bool), ``abandonment_reason`` and ``abandoned_session_id`` (both ``None``
+    when the slot is not abandoned) and ``abandoned_at_seconds_ago``; the
+    top-level payload carries ``local_abandoned_slots`` (count of annotated
+    slots). ``capacity_hint`` gains the additive value ``abandoned_busy`` —
+    occupied only by abandoned work — so ``saturated`` keeps meaning live,
+    proxy-owned decode work; a genuinely busy GPU is never reported ``idle``.
+    Consumers must treat any unrecognised hint value (this one included) as
+    busy, never as idle.
+
     Per-slot capacity (LP-0MVGDUVGE0024YAI, ``status_schema_version: 3``):
     each slot also carries ``owner_session_id`` and ``lease_state``
     (``generating`` | ``idle_leased`` | ``free``) so a dispatcher can tell a
@@ -836,6 +850,13 @@ async def get_llama_local_status(request: Request):
     except Exception:
         capacity_hint = "idle"
 
+    # AC1 (LP-0MVRMI5HK00558TB): count the slots annotated as abandoned so a
+    # poll can see the ghost occupancy without re-deriving it from the array.
+    abandoned_slots = 0
+    for _slot in slots:
+        if isinstance(_slot, dict) and _slot.get("abandoned") is True:
+            abandoned_slots += 1
+
     # -- prefill gate state (LP-0MVGDUUV3001XFRJ AC4) ----------------------
     # Prefills are serialised by default (``local_max_concurrent_prefills``),
     # so a dispatcher needs to see how many prefills are in flight, what the
@@ -897,8 +918,9 @@ async def get_llama_local_status(request: Request):
         "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
         "capacity_hint": capacity_hint,
         "local_in_flight_requests": live_local_requests,
+        "local_abandoned_slots": abandoned_slots,
         "slots_detail_stale": detail_stale,
-        "status_schema_version": 3,
+        "status_schema_version": 4,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -954,14 +976,21 @@ async def get_llama_local_status(request: Request):
         # (``None`` when unresolvable — never a fabricated 0).
         "prefill_budget_seconds": prefill_eta.get("prefill_budget_seconds"),
         # Whether the local pool is genuinely working (LP-0MVGDUVGE0024YAI
-        # AC4): ``idle`` | ``prefill_bound`` | ``saturated``.
+        # AC4): ``idle`` | ``prefill_bound`` | ``saturated`` | ``abandoned_busy``
+        # (LP-0MVRMI5HK00558TB AC1 — occupied only by work the proxy abandoned).
         "capacity_hint": capacity_hint,
+        # Abandoned local work (LP-0MVRMI5HK00558TB AC1): how many slots the
+        # proxy has given up on and llama-server has not released yet. Additive
+        # — a consumer that ignores it behaves exactly as before.
+        "local_abandoned_slots": abandoned_slots,
         # Additive payload version (AC1): bumped when per-slot/top-level
         # capacity fields change meaning. Consumers that ignore it behave
         # exactly as before. v3 (LP-0MVKSXR4P001V0CM): ``capacity_hint`` is
         # reconciled with live dispatch state when slot detail is stale, and
         # ``slots_detail_stale`` / ``local_in_flight_requests`` are added.
-        "status_schema_version": 3,
+        # v4 (LP-0MVRMI5HK00558TB): per-slot abandonment annotation, the
+        # additive ``abandoned_busy`` hint and ``local_abandoned_slots``.
+        "status_schema_version": 4,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local

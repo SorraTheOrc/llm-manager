@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -69,17 +70,13 @@ ABANDONMENT_REASONS = (
 
 REASON_ITEM = "LP-0MVT2KSN3007QYFK"
 
-_DEFECT = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "abandoned local dispatch is still reported as live saturated work "
-        "(parent LP-0MVRMI5HK00558TB AC1); green once " + REASON_ITEM + " lands"
-    ),
-)
-"""Marker for the red-first defect assertions.
+"""Note on the red-first markers.
 
-``strict=True`` so the paired implementation item cannot forget to remove it:
-unexpectedly passing fails the suite.
+The defect assertions were pinned with ``pytest.mark.xfail(strict=True)`` by
+the prerequisite test item (LP-0MVT2KS1R006P8E2) so a test-only change could
+land on ``dev`` with a green suite. The paired implementation
+(LP-0MVT2KSN3007QYFK) removed every marker as it turned the assertions green —
+these tests now run unmarked, which is the only state that proves the fix.
 """
 
 
@@ -203,7 +200,6 @@ def _ghost_slot(
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-@_DEFECT
 class TestAbandonedHintContract:
     """AC1: abandoned-only occupancy gets its own hint value."""
 
@@ -348,7 +344,6 @@ class TestTruthfulnessControls:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-@_DEFECT
 class TestAbandonedSlotRegistry:
     """AC1: the abandoned slot identity must be recorded and attributable."""
 
@@ -478,7 +473,6 @@ def _annotate(slots: list[dict], srv=None, *, model: str = "Qwen3") -> list[dict
     return annotate_slots_for_status(slots, srv, model, config={}, stale=False)
 
 
-@_DEFECT
 class TestStatusAnnotation:
     """AC1: the status payload annotates the ghost, with attribution."""
 
@@ -657,7 +651,6 @@ class _UnlockedLock:
 class TestStatusPayload:
     """AC1: the poll the measurement counted must stop saying ``saturated``."""
 
-    @_DEFECT
     @pytest.mark.parametrize("reason", ABANDONMENT_REASONS)
     def test_ghost_poll_is_not_saturated(self, reason):
         """Baseline defect (2.12 % of polls): fresh detail, no live dispatch,
@@ -721,7 +714,6 @@ class TestStatusPayload:
         assert payload["local_in_flight_requests"] == 1
         assert payload["slots"][0].get("abandoned") is not True
 
-    @_DEFECT
     def test_live_occupancy_is_not_counted_abandoned(self):
         """AC1: the additive top-level count only counts abandoned slots."""
         import time as _time
@@ -748,3 +740,268 @@ class TestStatusPayload:
             )
 
         assert payload["local_abandoned_slots"] == 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AC1 — upstream cancel + abandoned-slot recording on every abandonment path
+#
+# "Upstream cancel is applied on every path that holds a handle" and "a
+# bounded, read-only investigation decides whether a real abort is achievable
+# on this llama-server build". The investigation (2026-10-28 llama-server log,
+# 82 ``Connection handling canceled`` events) found the abort IS achievable and
+# observable during prefill: 42 of the 82 cancelled a task that never reached
+# ``prompt processing done``, because ``return_progress`` makes llama-server
+# write to the socket throughout the prefill and it acts on the closed socket
+# at that write. So every path that owns a handle must close it.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _fake_stream_cm() -> AsyncMock:  # noqa: F821 - annotation is documentation
+    """A stand-in upstream stream whose ``__aexit__`` is observable."""
+    from unittest.mock import AsyncMock
+
+    cm = AsyncMock()
+    cm.__aexit__ = AsyncMock(return_value=None)
+    return cm
+
+
+def _server_stub(records: dict | None = None, config: dict | None = None):
+    """Minimal server stub with the dispatch-record state the releases touch."""
+    import asyncio as _asyncio
+    from unittest.mock import MagicMock
+
+    return SimpleNamespace(
+        config=config
+        or {
+            "server": {
+                "session_slot_pool_size": 2,
+                "local_dispatch_lease_timeout_seconds": 60,
+                "local_dispatch_no_progress_timeout_seconds": 180,
+                "local_dispatch_max_prefill_seconds": 900,
+            }
+        },
+        local_active_queries=0,
+        local_active_queries_lock=_asyncio.Lock(),
+        local_dispatch_records=records if records is not None else {},
+        local_dispatch_records_lock=_asyncio.Lock(),
+        local_prefill_in_flight={},
+        local_prefill_in_flight_lock=_asyncio.Lock(),
+        logger=MagicMock(),
+    )
+
+
+def _bind_slot(session_id: str, slot_id: int) -> None:
+    """Bind *session_id* to a llama-server slot in the ownership registry."""
+    from proxy.session import _slot_registry_key
+
+    with patch.dict(
+        "proxy.session._slot_owners",
+        {_slot_registry_key(None, slot_id): session_id},
+        clear=True,
+    ):
+        pass  # patch.dict restores on exit, so callers re-enter it themselves
+
+
+class TestUpstreamCancel:
+    """AC1: the deadline path cancels the real upstream task."""
+
+    def test_deadline_release_closes_the_passed_stream(self, clock):
+        """``prefill_deadline`` gained the mechanism the watchdog already had:
+        the captured upstream stream is closed, aborting the prefill."""
+        from proxy.router_helpers import _release_prefill_deadline_dispatch
+
+        srv = _server_stub(
+            records={
+                "herdr-ghost": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                    "first_byte_seen": False,
+                }
+            }
+        )
+        srv.local_prefill_in_flight = {"herdr-ghost": True}
+        stream_cm = _fake_stream_cm()
+
+        asyncio.run(
+            _release_prefill_deadline_dispatch(
+                srv,
+                "herdr-ghost",
+                abandoned_slot_id=1,
+                upstream_stream_cm=stream_cm,
+            )
+        )
+
+        stream_cm.__aexit__.assert_awaited_once()
+        from proxy.router_helpers import _abandoned_slot_for
+
+        entry = _abandoned_slot_for(1, now=clock.now)
+        assert entry is not None
+        assert entry["reason"] == "prefill_deadline"
+        assert entry["session_id"] == "herdr-ghost"
+
+    def test_deadline_release_closes_the_records_pinned_stream(self, clock):
+        """When the caller cannot pass a handle, the record's pinned
+        ``stream_cm`` (set after the SSE headers) is closed instead."""
+        from proxy.router_helpers import _release_prefill_deadline_dispatch
+
+        stream_cm = _fake_stream_cm()
+        srv = _server_stub(
+            records={
+                "herdr-ghost": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                    "stream_cm": stream_cm,
+                }
+            }
+        )
+
+        asyncio.run(_release_prefill_deadline_dispatch(srv, "herdr-ghost"))
+
+        stream_cm.__aexit__.assert_awaited_once()
+
+    def test_measured_cache_abort_release_records_the_abandoned_slot(self, clock):
+        """The shared core (measured cache-deficit early abort) also records
+        the ghost, so the annotation covers every abandonment, not just the
+        four reasons the parent AC names."""
+        from proxy.router_helpers import (
+            _abandoned_slot_for,
+            _release_measured_cache_abort_dispatch,
+        )
+
+        srv = _server_stub(
+            records={
+                "sess-abort": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                }
+            }
+        )
+        with patch.dict(
+            "proxy.session._slot_owners",
+            {("", 0): "sess-abort"},
+            clear=True,
+        ):
+            asyncio.run(_release_measured_cache_abort_dispatch(srv, "sess-abort"))
+
+        entry = _abandoned_slot_for(0, now=clock.now)
+        assert entry is not None
+        assert entry["session_id"] == "sess-abort"
+
+
+class TestOtherAbandonmentPaths:
+    """AC1: client disconnect, watchdog and session eviction are covered too."""
+
+    def test_client_disconnect_records_the_abandoned_slot(self, clock):
+        from proxy.router_helpers import (
+            _abandoned_slot_for,
+            _release_client_disconnect_dispatch,
+        )
+
+        stream_cm = _fake_stream_cm()
+        srv = _server_stub(
+            records={
+                "sess-gone": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                    "stream_cm": stream_cm,
+                }
+            }
+        )
+        with patch.dict(
+            "proxy.session._slot_owners",
+            {("", 0): "sess-gone"},
+            clear=True,
+        ):
+            released = _release_client_disconnect_dispatch(srv, "sess-gone")
+
+        assert released is True
+        entry = _abandoned_slot_for(0, now=clock.now)
+        assert entry is not None
+        assert entry["reason"] == "client_disconnect"
+        assert entry["session_id"] == "sess-gone"
+
+    def test_no_progress_watchdog_records_the_abandoned_slot(self, monkeypatch, clock):
+        from proxy.router_helpers import _abandoned_slot_for
+
+        from proxy import router_helpers as helpers
+
+        # The autouse isolation fixture injects the clock into
+        # ``router_helpers.time``, so the watchdog's "now" and the record's
+        # timestamps must come from the same clock domain.
+        now = clock.now
+        stream_cm = _fake_stream_cm()
+        srv = _server_stub(
+            records={
+                "sess-wedged": {
+                    "backend": "local",
+                    "started_at": now - 300.0,
+                    "active": True,
+                    "expires_at": now + 600.0,
+                    "last_progress": 0,
+                    "last_progress_ts": now - 300.0,
+                    "stream_cm": stream_cm,
+                }
+            }
+        )
+        srv.local_prefill_in_flight = {"sess-wedged": True}
+        srv.local_active_queries = 1
+
+        # /slots unobservable: the watchdog falls back to the no-progress clock.
+        async def _no_slots(*_a, **_k):
+            return None
+
+        monkeypatch.setattr(
+            helpers, "_query_slots_progress", _no_slots, raising=False
+        )
+
+        with patch.dict(
+            "proxy.session._slot_owners",
+            {("", 1): "sess-wedged"},
+            clear=True,
+        ):
+            asyncio.run(helpers._cleanup_stale_local_dispatch(srv))
+
+        stream_cm.__aexit__.assert_awaited_once()
+        entry = _abandoned_slot_for(1, now=clock.now)
+        assert entry is not None
+        assert entry["reason"] == "no_progress_watchdog"
+
+    def test_session_eviction_cancels_and_records(self, clock):
+        """``session_evicted`` holds no handle through ``_release_local_dispatch``;
+        the eviction callback must cancel the pinned stream itself and record
+        the abandoned slot."""
+        from proxy.router_helpers import _abandoned_slot_for
+
+        from proxy import server as server_mod
+
+        stream_cm = _fake_stream_cm()
+        records = {
+            "sess-evicted": {
+                "active": True,
+                "expires_at": time.monotonic() + 60.0,
+                "stream_cm": stream_cm,
+                "endpoint": "local-llama",
+            }
+        }
+        with (
+            patch.object(server_mod, "local_dispatch_records", records),
+            patch.object(server_mod, "local_dispatch_records_lock", asyncio.Lock()),
+            patch.object(server_mod, "local_prefill_in_flight", {"sess-evicted": True}),
+            patch.object(
+                server_mod, "local_prefill_in_flight_lock", asyncio.Lock()
+            ),
+            patch.dict(
+                "proxy.session._slot_owners",
+                {("local-llama", 0): "sess-evicted"},
+                clear=True,
+            ),
+        ):
+            asyncio.run(server_mod._release_lease_on_session_eviction("sess-evicted"))
+            # Detached tasks close the stream on the loop the release ran on;
+            # ``asyncio.run`` drains them before returning.
+            entry = _abandoned_slot_for(0, endpoint="local-llama", now=clock.now)
+
+        stream_cm.__aexit__.assert_awaited_once()
+        assert entry is not None
+        assert entry["reason"] == "session_evicted"
+        assert entry["session_id"] == "sess-evicted"

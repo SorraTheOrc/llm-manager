@@ -1328,6 +1328,207 @@ def _reset_prefill_thrash_cooldowns() -> None:
     _prefill_thrash_cancel_tokens.clear()
 
 
+# ===================================================================
+# Abandoned local dispatch registry (LP-0MVRMI5HK00558TB AC1)
+#
+# Measured defect (LP-0MVOG7IP80003MLV, 2026-10-24 20:00 -> 2026-10-25
+# 07:00): 332 local dispatches were abandoned by the proxy while
+# llama-server kept computing them, so 247 fresh ``/slots`` polls reported
+# ``capacity_hint=saturated`` with ``local_in_flight_requests=0`` — work
+# nobody was waiting for, truthfully reported from a snapshot that cannot
+# tell who abandoned the slot.
+#
+# Two mechanisms carry AC1, and this registry is the second one:
+#
+# 1. **Cancel the upstream stream** on every path that holds a handle
+#    (deadline, session eviction — the watchdog and client-disconnect paths
+#    already did; LP-0MVIQ0FJC000YLX0 / LP-0MVLFVY6K003VYEL). llama-server
+#    aborts at its next write to the socket, which ``return_progress``
+#    guarantees happens during prefill, so the ghost window is short.
+# 2. **Record the abandoned slot identity** here, so the status payload can
+#    annotate a slot that is still processing as *busy, not ours* even when
+#    the backend has not noticed the cancel yet. The annotation is what makes
+#    the AC1 measurement (``saturated`` without live work ~ 0) hold
+#    regardless of how promptly the backend reacts.
+#
+# The registry is in-process by design: it resets with the routing state it
+# describes (a proxy restart ends every ghost it could have recorded).
+# ===================================================================
+
+#: Abandonment reasons the parent AC names (LP-0MVRMI5HK00558TB AC1).
+#: Every one of them must be recorded so the annotation is per-reason
+#: attributable. The set is documentation plus the assertion the regression
+#: harness makes — recording itself accepts any reason (the measured
+#: cache-deficit early abort is an abandonment too, and its own reason string
+#: is already attributable), it is never silently rewritten.
+ABANDONED_SLOT_REASONS = frozenset(
+    {
+        "prefill_deadline",
+        "session_evicted",
+        "no_progress_watchdog",
+        "client_disconnect",
+    }
+)
+
+#: How long an abandonment stays attributable. Bounded so a recycled slot id
+#: cannot inherit a ghost's annotation forever, and comfortably longer than
+#: the 180 s no-progress watchdog plus the 600 s prefill-thrash cooldown, so
+#: the annotation outlives the window in which the ghost can still be seen
+#: processing (the deadline is 90 s; a stuck prefill is capped far below this).
+DEFAULT_ABANDONED_SLOT_TTL_SECONDS = 900.0
+
+_abandoned_slots: dict[tuple[str, int], dict] = {}
+"""``{(endpoint_or_empty, slot_id): entry}`` for abandoned local dispatches.
+
+``entry`` carries ``slot_id``, ``endpoint``, ``session_id``, ``reason``,
+``abandoned_at`` and ``ttl_seconds`` — always attributable, never a bare
+boolean (LP-0MVRMI5HK00558TB AC1).
+
+Memory bound: the key is the slot identity, so the registry can never hold
+more entries than there are ``(endpoint, slot)`` pairs — re-abandoning the same
+slot overwrites its entry. Expiry is lazy (pruned on read and by the periodic
+sweep), so no timer task is needed.
+"""
+
+
+def _abandoned_slot_key(endpoint: str | None, slot_id: int) -> tuple[str, int]:
+    """Build the per-endpoint registry key (mirrors session._slot_registry_key)."""
+    return (endpoint or "", slot_id)
+
+
+def _prune_abandoned_slots(now: float | None = None) -> int:
+    """Drop expired entries; return how many were removed.
+
+    Expiry is lazy (evaluated on read and on this sweep) so the registry needs
+    no timer of its own.
+    """
+    _now = time.monotonic() if now is None else now
+    expired = [
+        key
+        for key, entry in _abandoned_slots.items()
+        if _now >= float(entry.get("abandoned_at", 0.0))
+        + float(entry.get("ttl_seconds", 0.0))
+    ]
+    for key in expired:
+        _abandoned_slots.pop(key, None)
+    return len(expired)
+
+
+def _record_abandoned_slot(
+    slot_id: int | None,
+    *,
+    session_id: str | None = None,
+    endpoint: str | None = None,
+    reason: str,
+    now: float | None = None,
+    ttl: float | None = None,
+) -> dict | None:
+    """Record that the proxy gave up on *slot_id* for *reason*.
+
+    Called from every abandonment path (deadline, session eviction, watchdog,
+    client disconnect) AFTER the upstream cancel has been attempted, so the
+    status payload can annotate a slot that is still processing as
+    "abandoned" rather than as live proxy-owned work
+    (LP-0MVRMI5HK00558TB AC1). Re-recording the same slot refreshes the
+    window (a slot abandoned twice must not expire from the first event).
+
+    Returns the stored entry, or ``None`` when no slot identity is known (the
+    cancel attempt then carries AC1 alone — an unattributable entry would be
+    indistinguishable from a bare boolean, which the AC forbids).
+    """
+    if not isinstance(slot_id, int):
+        return None
+    _now = time.monotonic() if now is None else now
+    try:
+        _ttl = float(ttl) if ttl is not None else DEFAULT_ABANDONED_SLOT_TTL_SECONDS
+    except (TypeError, ValueError):
+        _ttl = DEFAULT_ABANDONED_SLOT_TTL_SECONDS
+    if _ttl <= 0:
+        _ttl = DEFAULT_ABANDONED_SLOT_TTL_SECONDS
+    entry = {
+        "slot_id": slot_id,
+        "endpoint": endpoint or "",
+        "session_id": session_id,
+        "reason": str(reason),
+        "abandoned_at": _now,
+        "ttl_seconds": _ttl,
+    }
+    _abandoned_slots[_abandoned_slot_key(endpoint, slot_id)] = entry
+    return entry
+
+
+def _abandoned_slot_for(
+    slot_id: int | None,
+    *,
+    endpoint: str | None = None,
+    now: float | None = None,
+) -> dict | None:
+    """Return the live abandonment entry for *slot_id* (``None`` when none).
+
+    Matches the exact endpoint first, then the legacy/default endpoint entry,
+    then any endpoint carrying that slot id — so an entry written by a path
+    that could not resolve the endpoint still annotates the slot the status
+    payload reads (the annotation must never silently vanish because two call
+    sites disagree about the endpoint spelling).
+    """
+    if not isinstance(slot_id, int):
+        return None
+    _now = time.monotonic() if now is None else now
+    _prune_abandoned_slots(now=_now)
+    keys = [_abandoned_slot_key(endpoint, slot_id)]
+    fallback = _abandoned_slot_key(None, slot_id)
+    if fallback not in keys:
+        keys.append(fallback)
+    for key in keys:
+        entry = _abandoned_slots.get(key)
+        if entry is not None:
+            return entry
+    # Last resort: the same slot id recorded under a different endpoint label
+    # (multi-backend deployments; the local status payload describes the
+    # current local child, which may or may not carry an explicit label).
+    for (ep, sid), entry in _abandoned_slots.items():
+        if sid == slot_id:
+            return entry
+    return None
+
+
+def _abandoned_slot_count(
+    *, endpoint: str | None = None, now: float | None = None
+) -> int:
+    """Count live abandonment entries (top-level status payload field)."""
+    _now = time.monotonic() if now is None else now
+    _prune_abandoned_slots(now=_now)
+    if endpoint is None:
+        return len(_abandoned_slots)
+    want = endpoint or ""
+    return sum(1 for key in _abandoned_slots if key[0] == want)
+
+
+def _reset_abandoned_slots() -> None:
+    """Clear the registry (test isolation / explicit reset)."""
+    _abandoned_slots.clear()
+
+
+def _abandoned_slot_lookup(
+    session_id: str | None, endpoint: str | None = None
+) -> int | None:
+    """Return the llama-server slot *session_id* is assigned, if any.
+
+    Read-only (never assigns): the abandonment paths call this *before* the
+    slot assignment is freed, so the registry entry can name the slot the
+    ghost actually occupies. Best-effort — an unknown slot means the
+    cancellation attempt carries AC1 alone.
+    """
+    if not session_id:
+        return None
+    try:
+        from proxy.session import _assigned_slot_for_session
+
+        return _assigned_slot_for_session(session_id, endpoint=endpoint)
+    except Exception:
+        return None
+
+
 #: Cached-token ratio at or above which a local dispatch counts as a
 #: warm-cache request for the re-scoped AC2 first-byte metric
 #: (LP-0MV6CFMU9005WU2E). Matching the routing intent: a request whose prompt
@@ -3098,6 +3299,8 @@ async def _release_unserved_dispatch(
     release_reason: str,
     eviction_reason: str,
     extra_eviction_fields: Mapping[str, Any] | None = None,
+    abandoned_slot_id: int | None = None,
+    upstream_stream_cm: Any | None = None,
 ) -> tuple[bool, dict | None]:
     """Release an ACCEPTED-but-unserved dispatch lease and in-flight marker.
 
@@ -3114,6 +3317,21 @@ async def _release_unserved_dispatch(
     measured evidence) before the slot assignment is freed, so a returning
     session restores its resident prefix warm.
 
+    AC1 (LP-0MVRMI5HK00558TB): an abandoned dispatch must stop consuming the
+    GPU and stop being reported as live work.
+
+    - **Cancel the upstream stream** (*upstream_stream_cm*, or the released
+      record's own pinned ``stream_cm``) exactly as the watchdog and
+      client-disconnect releases do (LP-0MVIQ0FJC000YLX0). This build aborts
+      at llama-server's next socket write — ``return_progress`` guarantees one
+      during prefill — so the abort is prompt (evidence: 42 of 82
+      ``Connection handling canceled`` events on 2026-10-28 cancelled a task
+      that never reached ``prompt processing done``).
+    - **Record the abandoned slot identity** (*abandoned_slot_id*, falling
+      back to the session's slot assignment) so a slot the backend has not
+      released yet is annotated "busy, not ours" in the status payload and
+      its ``capacity_hint`` is never ``saturated`` (never ``idle`` either).
+
     Returns ``(removed, released_record)``. Fail-soft: these are exceptional
     paths and must never raise. Wakes the cross-session contention queue when
     state was released.
@@ -3122,6 +3340,12 @@ async def _release_unserved_dispatch(
         return (False, None)
     removed = False
     released_record = None
+    # Capture the abandoned slot identity BEFORE the release frees it: the
+    # slot assignment is the only link from the session to the llama-server
+    # slot, and the status annotation matches on exactly that pair.
+    slot_id = abandoned_slot_id
+    if slot_id is None:
+        slot_id = _abandoned_slot_lookup(session_key, endpoint)
     record_key = _dispatch_lease_key(endpoint, session_key)
     try:
         async with srv.local_dispatch_records_lock:
@@ -3193,7 +3417,58 @@ async def _release_unserved_dispatch(
             await wake(1)
         except Exception:
             pass
+    # ── AC1 (LP-0MVRMI5HK00558TB): end the ghost, then make it attributable ──
+    # 1. Cancel the upstream stream so llama-server stops computing work nobody
+    #    is waiting for. The watchdog and client-disconnect paths already do
+    #    this (LP-0MVIQ0FJC000YLX0); the deadline and measured-cache-deficit
+    #    paths reach it through this shared core. The record's pinned
+    #    ``stream_cm`` (set after the SSE headers arrive, LP-0MUGQHPJ50046LV8)
+    #    is the fallback handle when the caller did not pass one.
+    stream_cm = upstream_stream_cm
+    if stream_cm is None and isinstance(released_record, dict):
+        stream_cm = released_record.get("stream_cm")
+    if stream_cm is not None:
+        try:
+            await asyncio.wait_for(
+                _close_stream_cm(stream_cm),
+                timeout=_abandoned_stream_close_timeout(),
+            )
+        except BaseException:
+            pass
+    # 2. Record the abandoned slot identity (bounded TTL) so the status payload
+    #    can annotate a slot the backend has not released yet as "busy, not
+    #    ours". The reason recorded is the eviction/release reason the caller
+    #    already publishes, keeping logs and payload attributable to one word.
+    if removed or marker_popped:
+        try:
+            entry = _record_abandoned_slot(
+                slot_id,
+                session_id=session_key,
+                endpoint=endpoint,
+                reason=release_reason,
+            )
+            if entry is not None:
+                srv.logger.info(
+                    "abandoned_slot_recorded session=%s endpoint=%s slot=%s "
+                    "reason=%s ttl_s=%.0f",
+                    session_key if session_key else "unknown",
+                    endpoint or "default",
+                    slot_id,
+                    release_reason,
+                    entry.get("ttl_seconds", 0.0),
+                )
+        except Exception:
+            pass
     return (removed, released_record)
+
+
+def _abandoned_stream_close_timeout() -> float:
+    """Bound on closing an abandoned upstream stream (never wedge a request).
+
+    Best effort by construction: a stream that will not close must not delay
+    the release path, so the ghost is annotated instead of awaited forever.
+    """
+    return 5.0
 
 
 async def _release_prefill_deadline_dispatch(
@@ -3201,6 +3476,9 @@ async def _release_prefill_deadline_dispatch(
     session_key: str | None,
     endpoint: str | None = None,
     request: Request | None = None,
+    *,
+    abandoned_slot_id: int | None = None,
+    upstream_stream_cm: Any | None = None,
 ) -> bool:
     """Release the dispatch lease + in-flight marker of a deadline-cancelled dispatch.
 
@@ -3217,6 +3495,13 @@ async def _release_prefill_deadline_dispatch(
     reason=prefill_deadline`` and the ``local_eviction_after_acceptance
     reason=prefill_deadline`` snapshot. Returns True when a record was
     removed.
+
+    AC1 (LP-0MVRMI5HK00558TB): the deadline used to only ``client.aclose()``
+    the downstream connection, which llama-server does not act on until it
+    next writes — so the prefill ran to completion as a ghost. The caller
+    passes the captured upstream stream (*upstream_stream_cm*) and the slot id
+    it dispatched to (*abandoned_slot_id*), so the shared core cancels the
+    real task and records the abandoned slot for the status annotation.
     """
     removed, _record = await _release_unserved_dispatch(
         srv,
@@ -3225,6 +3510,8 @@ async def _release_prefill_deadline_dispatch(
         request=request,
         release_reason="prefill_deadline",
         eviction_reason="prefill_deadline",
+        abandoned_slot_id=abandoned_slot_id,
+        upstream_stream_cm=upstream_stream_cm,
     )
     return removed
 
@@ -3571,6 +3858,9 @@ def _release_client_disconnect_dispatch(
     removed = False
     stream_cm = None
     released_record = None
+    # AC1 (LP-0MVRMI5HK00558TB): resolve the slot identity before the release
+    # frees the assignment, so the abandonment is attributable to a slot.
+    abandoned_slot_id = _abandoned_slot_lookup(session_key, endpoint)
     records = getattr(srv, "local_dispatch_records", None)
     if records is not None:
         try:
@@ -3639,6 +3929,18 @@ def _release_client_disconnect_dispatch(
 
     if stream_cm is not None:
         _spawn_detached_release(_close_stream_cm(stream_cm))
+
+    # AC1 (LP-0MVRMI5HK00558TB): a client that vanished mid-prefill abandoned
+    # this dispatch. The slot identity is captured before the assignment was
+    # freed above; recording it lets the status payload annotate a slot the
+    # backend has not released yet as "busy, not ours".
+    if removed or marker_popped:
+        _record_abandoned_slot(
+            abandoned_slot_id,
+            session_id=session_key,
+            endpoint=endpoint,
+            reason="client_disconnect",
+        )
 
     if removed or marker_popped:
         try:
@@ -4011,6 +4313,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                     # Capture stream_cm before deleting so we can cancel
                     # the upstream request and actually free the llama-server slot.
                     stream_cm = current.pop("stream_cm", None)
+                    # AC1 (LP-0MVRMI5HK00558TB): resolve the slot identity while
+                    # the assignment still exists, so the abandonment recorded
+                    # after the release below is attributable to a slot.
+                    orphan_slot_id = _abandoned_slot_lookup(
+                        _dispatch_key_session_id(sid),
+                        _endpoint_from_record(record),
+                    )
                     del srv.local_dispatch_records[sid]
                     try:
                         _p = getattr(srv, "local_prefill_in_flight", None)
@@ -4055,6 +4364,16 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                         )
                     except Exception:
                         pass
+                    # AC1 (LP-0MVRMI5HK00558TB): the sweep abandoned this
+                    # dispatch and cancelled its upstream stream above; record
+                    # the slot so a backend that has not released it yet is
+                    # annotated "busy, not ours".
+                    _record_abandoned_slot(
+                        orphan_slot_id,
+                        session_id=_dispatch_key_session_id(sid),
+                        endpoint=_endpoint_from_record(record),
+                        reason="orphan_cleanup",
+                    )
                     # Decrement local_active_queries for orphaned records
                     # that never completed through the normal request path
                     # (LP-0MRKVN93I000XXXX: cleanup orphaned active queries)
@@ -4122,6 +4441,13 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 released_record,
                 endpoint=endpoint_from_record,
             )
+            # AC1 (LP-0MVRMI5HK00558TB): the watchdog abandoned this dispatch.
+            # Capture the slot identity before the assignment is freed, then
+            # record it so a slot the backend has not released yet is
+            # annotated "busy, not ours" instead of reading as live work.
+            watchdog_slot_id = _abandoned_slot_lookup(
+                session_key, endpoint_from_record
+            )
             try:
                 from proxy.session import _free_slot_assignment
                 _free_slot_assignment(
@@ -4130,6 +4456,12 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
                 )
             except Exception:
                 pass
+            _record_abandoned_slot(
+                watchdog_slot_id,
+                session_id=session_key,
+                endpoint=endpoint_from_record,
+                reason="no_progress_watchdog",
+            )
             # Pop from preflight tracking.
             try:
                 _p = getattr(srv, "local_prefill_in_flight", None)

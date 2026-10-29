@@ -1385,3 +1385,46 @@ async def test_zero_knob_routes_the_failing_prompt_locally(
 
     assert resp.status_code == 200
     assert fallback_harness.call_log == ["local"]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Deadline branch wiring: the abandoned slot is attributable
+# (LP-0MVT2KSN3007QYFK → parent LP-0MVRMI5HK00558TB AC1)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_router_deadline_records_the_abandoned_slot(monkeypatch, clock):
+    """AC1 (wiring): the deadline branch hands the dispatched slot id to the
+    release, so the ghost llama-server keeps computing is attributable on the
+    status payload instead of reading as live proxy-owned work."""
+    from proxy.router import proxy_to_local
+
+    server_cfg = _router_server_cfg()
+    router_mod = _install_router_harness(monkeypatch, server_cfg)
+    # Dispatch to a real slot id so the release has an identity to record.
+    monkeypatch.setattr(
+        router_mod, "_build_slot_context", lambda *_a, **_k: (1, "slot-1.bin", 3.0)
+    )
+    monkeypatch.setattr(
+        router_mod, "_restore_slot_snapshot", AsyncMock(return_value=False)
+    )
+
+    async def _deadline_fires(srv, pending, **kwargs):
+        pending.close()
+        raise TimeoutError()
+
+    monkeypatch.setattr(
+        router_mod, "_await_first_byte_with_prefill_monitor", _deadline_fires
+    )
+
+    resp = await proxy_to_local(_router_request(), "v1/chat/completions")
+    assert resp.status_code == 503
+
+    entry = helpers._abandoned_slot_for(1, now=clock.now)
+    assert entry is not None, (
+        "the prefill deadline must record the abandoned slot identity "
+        "(parent LP-0MVRMI5HK00558TB AC1)"
+    )
+    assert entry["reason"] == "prefill_deadline"
+    assert entry["session_id"] == SESSION_A

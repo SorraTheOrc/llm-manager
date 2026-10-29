@@ -1580,6 +1580,21 @@ PHASE_DECODE = "decode"
 CAPACITY_IDLE = "idle"
 CAPACITY_PREFILL_BOUND = "prefill_bound"
 CAPACITY_SATURATED = "saturated"
+CAPACITY_ABANDONED_BUSY = "abandoned_busy"
+"""Pool occupied only by work the proxy has abandoned (LP-0MVRMI5HK00558TB).
+
+Additive extension of the ``capacity_hint`` decision table. Measured defect it
+fixes (LP-0MVOG7IP80003MLV, 2026-10-24 20:00 -> 2026-10-25 07:00): 332
+abandoned local dispatches left llama-server computing prompts nobody was
+waiting for, and 247 fresh ``/slots`` polls reported ``saturated`` while
+``local_in_flight_requests`` was 0. ``saturated`` must keep meaning *live,
+proxy-owned decode work*, and abandoned work must never be folded into
+``idle`` either (that would admit a newcomer behind a ghost and make the tail
+worse), so it gets its own value.
+
+Consumer rule: any hint value a consumer does not recognise — including this
+one, and any future one — must be treated as **busy**, never as idle.
+"""
 
 STALE_DECODE_EVIDENCE_MAX_IDLE_SECONDS = 15.0
 """Maximum proxy-observed idle age that still counts as fresh decode evidence.
@@ -1648,6 +1663,11 @@ def compute_capacity_hint(slots: list[dict]) -> str:
 
     Decision table, evaluated **in order**:
 
+    0. ``abandoned_busy`` — no slot is free, nothing occupied is live
+       (proxy-owned) work, and at least one occupied slot is processing work
+       the proxy has abandoned (LP-0MVRMI5HK00558TB AC1). Busy, but not ours:
+       never ``saturated`` (that must mean live work) and never ``idle``
+       (folding a ghost into ``idle`` admits a newcomer behind it).
     1. ``idle`` — at least one slot is ``free`` **or** every occupied slot is
        ``idle_leased`` (nothing is actually being generated).
     2. ``prefill_bound`` — no slot is free and at least one occupied slot is
@@ -1660,6 +1680,12 @@ def compute_capacity_hint(slots: list[dict]) -> str:
     (fail-open — never claim saturation with no evidence), and a pool with no
     free slot, no prefill and mixed ``decode``/``idle_leased`` occupancy is
     ``saturated`` (genuine decode work with nothing available to a newcomer).
+
+    Rule 0 is additive and conservative: it requires that **no** generating
+    slot is live, so a pool with any live proxy-owned work alongside an
+    abandoned slot keeps its previous verdict — an abandonment never
+    discounts real work (the truthful-status rules of LP-0MVKSXR4P001V0CM).
+    Slots without an ``abandoned`` annotation behave exactly as before.
     """
     if not slots:
         return CAPACITY_IDLE
@@ -1675,6 +1701,13 @@ def compute_capacity_hint(slots: list[dict]) -> str:
         return CAPACITY_IDLE
     if all(str(s.get("lease_state")) == LEASE_STATE_IDLE_LEASED for s in occupied):
         return CAPACITY_IDLE
+    generating = [
+        s for s in occupied if str(s.get("lease_state")) == LEASE_STATE_GENERATING
+    ]
+    live_generating = [s for s in generating if not s.get("abandoned")]
+    if generating and not live_generating:
+        # Every working slot is one the proxy has given up on.
+        return CAPACITY_ABANDONED_BUSY
     if any(s.get("phase") == PHASE_PREFILL for s in occupied):
         return CAPACITY_PREFILL_BOUND
     if all(s.get("phase") == PHASE_DECODE for s in occupied):
@@ -1826,9 +1859,11 @@ def annotate_slots_for_status(
     """Annotate compact ``/slots`` dicts with capacity fields (AC2/AC3/AC5).
 
     Adds, per slot: ``owner_session_id``, ``lease_state``, ``phase``,
-    ``context_tokens`` and ``prefill_eta_seconds``. Never mutates the input
-    dicts (the per-slot detail cache must stay pristine) and never raises —
-    a failure leaves the base fields intact. Per-slot ETAs are ``None`` when
+    ``context_tokens``, ``prefill_eta_seconds`` and the abandonment annotation
+    (``abandoned`` / ``abandonment_reason`` / ``abandoned_session_id`` /
+    ``abandoned_at_seconds_ago``, LP-0MVRMI5HK00558TB AC1). Never mutates the
+    input dicts (the per-slot detail cache must stay pristine) and never raises
+    — a failure leaves the base fields intact. Per-slot ETAs are ``None`` when
     the underlying ``/slots`` poll is stale (AC7) rather than echoing a stale
     number, and the estimate comes from the shared ``prefill_eta`` calibration
     (AC3), never a second estimator.
@@ -1850,6 +1885,10 @@ def annotate_slots_for_status(
         processing_map = _build_slot_to_session_map(srv, slot_details=slot_details)
     except Exception:
         processing_map = {}
+    try:
+        from proxy.router_helpers import _abandoned_slot_for
+    except Exception:  # pragma: no cover - defensive
+        _abandoned_slot_for = None
 
     annotated: list[dict] = []
     for slot in slot_details:
@@ -1885,6 +1924,29 @@ def annotate_slots_for_status(
         # that no longer report prompt progress) so the payload contract is stable.
         entry["context_tokens"] = entry.get("context_tokens")
         entry["prefill_eta_seconds"] = prefill_eta
+        # AC1 (LP-0MVRMI5HK00558TB): "busy, not ours". A slot the proxy has
+        # abandoned (registry match on the slot identity) is annotated so a
+        # consumer can tell a ghost from live proxy-owned work. Always present
+        # and always attributable — ``abandoned`` is paired with the reason and
+        # the abandoning session, never emitted as a bare boolean.
+        abandonment = None
+        if _abandoned_slot_for is not None and slot_id is not None:
+            try:
+                abandonment = _abandoned_slot_for(slot_id)
+            except Exception:
+                abandonment = None
+        entry["abandoned"] = abandonment is not None
+        entry["abandonment_reason"] = (
+            abandonment.get("reason") if abandonment else None
+        )
+        entry["abandoned_session_id"] = (
+            abandonment.get("session_id") if abandonment else None
+        )
+        entry["abandoned_at_seconds_ago"] = (
+            round(max(0.0, time.monotonic() - float(abandonment.get("abandoned_at", 0.0))), 1)
+            if abandonment
+            else None
+        )
         annotated.append(entry)
     return annotated
 
