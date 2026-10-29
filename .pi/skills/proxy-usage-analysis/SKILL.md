@@ -19,6 +19,15 @@ rule-based Python, not an LLM. The skill is a thin, CLI-focused wrapper
 around the pipeline. The daily report is produced unattended by the 05:00
 cron, and the same CLI is invoked for on-demand runs.
 
+**No behavioural change from the per-turn correlation id.** Since
+LP-0MVMBM467005BT4A the proxy appends `turn=<8 hex>` to every structured line
+a request emits, and the parser/aggregation use it to join a turn's lines
+exactly. The report keeps its sections, columns and JSON keys; only the
+pairing *method* improves (exact where ids exist, unchanged FIFO/nearest-line
+heuristics for pre-change log lines). Nothing in the CLI, the flags or the
+daily cron path changes — see
+[REFERENCE.md](REFERENCE.md#how-it-works) for the field contract.
+
 ## Invocation
 
 Run the CLI non-interactively (the canonical entry point):

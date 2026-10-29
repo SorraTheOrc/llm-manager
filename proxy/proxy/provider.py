@@ -73,6 +73,10 @@ from proxy.provider_budget import (
     affinity_ttl_seconds,
     record_provider_affinity,
 )
+
+# Per-turn correlation id stamped on every structured line this module emits
+# (LP-0MVMBM467005BT4A).
+from proxy.turn_id import bind_turn_id, turn_field
 from proxy.utils import _is_empty_response
 
 logger = logging.getLogger("llama-proxy.provider")
@@ -665,12 +669,13 @@ def note_routing_hop(
     try:
         extra = " ".join(f"{k}={v}" for k, v in context.items() if v is not None)
         logger.info(
-            "routing_hop session=%s from=%s to=%s hops=%d%s",
+            "routing_hop session=%s from=%s to=%s hops=%d%s%s",
             session_id,
             previous or "none",
             provider_name,
             hops,
             f" {extra}" if extra else "",
+            turn_field(),
         )
     except Exception:  # pragma: no cover - defensive
         pass
@@ -750,6 +755,13 @@ def _fallback_evidence(
         parts.append(f"limit={budget.get('limit', 0)}")
         parts.append(f"remaining={budget.get('remaining', 0)}")
         parts.append(f"waited={float(budget.get('waited', 0.0)):.3f}")
+    # Per-turn correlation id (LP-0MVMBM467005BT4A AC1): carried on every
+    # ``Fallback triggered`` line so the hop is attributable to one turn without
+    # FIFO/nearest-line heuristics. Appended last so every existing field — and
+    # every end-anchored consumer regex — is unchanged.
+    turn = turn_field()
+    if turn:
+        parts.append(turn.strip())
     return " " + " ".join(parts)
 
 
@@ -3348,13 +3360,14 @@ def _record_provider_context_skip(
     logger.info(
         "routing_skip_provider_context provider=%s type=%s "
         "status=provider_context_exceeded estimated_tokens=%d limit=%d "
-        "reason=provider_context_exceeded session=%s preference=%s",
+        "reason=provider_context_exceeded session=%s preference=%s%s",
         provider_name,
         provider_type,
         estimated_tokens,
         limit,
         str(session_id or "unknown"),
         preference or DEFAULT_PREFERENCE,
+        turn_field(),
     )
 
 
@@ -10780,7 +10793,15 @@ async def _run_chain_cycles(
 
     When the feature is not configured, *cycle_fn* is run exactly once —
     legacy single-pass behavior with no hold.
+
+    The request's per-turn correlation id is bound here — the earliest point
+    every provider-chain request is known — so every hop of the chain
+    (local, remote, chain-hold retries) logs the same id
+    (LP-0MVMBM467005BT4A AC1/AC2). Binding is idempotent: a nested call from
+    ``proxy_to_local``/``proxy_to_remote`` keeps the id instead of
+    re-generating it.
     """
+    bind_turn_id(request)
     if not _chain_hold_enabled(config):
         try:
             return await cycle_fn(request, path, model_config, config)
@@ -11841,12 +11862,13 @@ async def _proxy_with_fallback_cycle(
                         "routing_skip_local provider=%s model=%s "
                         "session=%s preference=%s cooldown_remaining=%.0fs "
                         "reason=prefill_thrash_cooldown → skipping local, "
-                        "routing to next remote provider",
+                        "routing to next remote provider%s",
                         provider_name,
                         provider_cfg.get("llama_model") or "unknown",
                         _session_id or "unknown",
                         _preference,
                         _thrash_cooldown_remaining,
+                        turn_field(),
                     )
                     _record_attempt(
                         attempts,
@@ -12333,7 +12355,7 @@ async def _proxy_with_fallback_cycle(
                         "new_tokens=%d cached_ratio=%.2f cache_state=%s "
                         "preference=%s "
                         "reason=%s → skipping local, routing to next remote provider "
-                        "session=%s chain_hold_cycle=%d",
+                        "session=%s chain_hold_cycle=%d%s",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
@@ -12346,6 +12368,7 @@ async def _proxy_with_fallback_cycle(
                         _skip_reason,
                         _session_id or "unknown",
                         _get_chain_hold_cycle(request),
+                        turn_field(),
                     )
                     _record_attempt(
                         attempts,

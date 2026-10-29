@@ -1871,6 +1871,11 @@ async def test_fallback_logging(sample_model_config, caplog):
             assert "remote-primary" in record.getMessage()
             assert "remote-fallback" in record.getMessage()
             assert "HTTP 502" in record.getMessage()
+            # Per-turn correlation id (LP-0MVMBM467005BT4A): the fallback line
+            # carries the request's id so the hop is attributable by id.
+            assert re.search(r"\bturn=[0-9a-f]{8}\b", record.getMessage()), (
+                record.getMessage()
+            )
             break
     assert found, "Expected 'Fallback triggered' log message not found"
 

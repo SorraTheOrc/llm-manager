@@ -35,6 +35,11 @@ import httpx
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
+# Per-turn correlation id stamped on every structured line these helpers emit
+# (LP-0MVMBM467005BT4A). Read from the request's bound context so the shared
+# helpers keep their existing signatures.
+from proxy.turn_id import bind_turn_id, get_turn_id, turn_field
+
 
 # ---------------------------------------------------------------------------
 # Lazy server import — avoids circular imports when server.py imports us
@@ -267,12 +272,19 @@ def log_request(
       leaking sensitive system-prompt data in proxy logs.
     - This function is the single source of truth for request logging and
       is called by both ``proxy_to_local`` and ``proxy_to_remote``.
+    - The per-turn correlation id (``turn=``) is appended last when a turn is
+      bound; a caller that has not bound one gets one generated here so the
+      dispatch line is never unattributed (LP-0MVMBM467005BT4A AC1).
     """
     srv = _srv()
     try:
         method = request.method
         url = str(request.url)
         body_preview = _strip_system_messages_from_preview(body)
+        # Bind (or keep) the request's per-turn id: the line below always
+        # carries ``turn=``, even when the caller dispatched straight into
+        # this helper (LP-0MVMBM467005BT4A AC1).
+        bind_turn_id(request)
         session_headers = {
             k: v
             for k, v in request.headers.items()
@@ -296,12 +308,12 @@ def log_request(
         if source == "remote" and endpoint:
             srv.logger.info(
                 f"[{source}] {method} {url} -> {endpoint} "
-                f"body={body_preview} {session_info}"
+                f"body={body_preview} {session_info}{turn_field(request)}"
             )
         else:
             srv.logger.info(
                 f"[{source}] {method} {url} "
-                f"body={body_preview} {session_info}"
+                f"body={body_preview} {session_info}{turn_field(request)}"
             )
     except Exception:
         srv.logger.debug("Failed to log request", exc_info=True)
@@ -353,7 +365,7 @@ TOKENS_MISSING = "tokens=missing"
 _PENDING_STREAM_FINISH_LIMIT = 64
 
 #: Deferred ``Stream finished`` parts keyed by stream identity.
-_pending_stream_finish: dict[tuple[str, str, str, str], list[str]] = {}
+_pending_stream_finish: dict[tuple[str, str, str, str, str], list[str]] = {}
 
 
 def _stream_finish_key(
@@ -361,9 +373,22 @@ def _stream_finish_key(
     provider: str | None,
     model: str | None,
     entry: str | None,
-) -> tuple[str, str, str, str]:
-    """Identity of one stream for the deferred-finish buffer."""
-    return (session_id or "", provider or "", model or "", entry or "")
+) -> tuple[str, str, str, str, str]:
+    """Identity of one stream for the deferred-finish buffer.
+
+    The per-turn correlation id (LP-0MVMBM467005BT4A) is part of the identity:
+    two interleaved turns of one session that share provider/model/entry must
+    not be able to complete each other's deferred ``Stream finished`` line
+    (an empty component when no turn is bound keeps the pre-change behaviour
+    for direct helper calls and legacy logs).
+    """
+    return (
+        session_id or "",
+        provider or "",
+        model or "",
+        entry or "",
+        get_turn_id() or "",
+    )
 
 
 def _usage_token_field(usage: Any) -> str | None:
@@ -385,7 +410,7 @@ def _usage_token_field(usage: Any) -> str | None:
 
 
 def _defer_stream_finish(
-    key: tuple[str, str, str, str], parts: list[str]
+    key: tuple[str, str, str, str, str], parts: list[str]
 ) -> None:
     """Buffer *parts* until the stream's usage chunk arrives."""
     if len(_pending_stream_finish) >= _PENDING_STREAM_FINISH_LIMIT:
@@ -397,7 +422,7 @@ def _defer_stream_finish(
 
 
 def _flush_deferred_stream_finish(
-    key: tuple[str, str, str, str], token_field: str | None
+    key: tuple[str, str, str, str, str], token_field: str | None
 ) -> bool:
     """Emit a buffered ``Stream finished`` line, optionally with usage.
 
@@ -516,6 +541,11 @@ def log_non_stream_usage(
         parts.append(f"provider={provider}")
     if model:
         parts.append(f"model={model}")
+    # Per-turn correlation id (LP-0MVMBM467005BT4A AC1): the buffered reply's
+    # terminal line joins the same turn as its dispatch lines.
+    turn = turn_field()
+    if turn:
+        parts.append(turn.strip())
     try:
         _srv().logger.info(" ".join(parts))
     except Exception:
@@ -658,6 +688,12 @@ def log_response_chunk(
                 preview = _get_request_preview(body_json)
                 if preview:
                     parts.append(f"request={preview}")
+            # Per-turn correlation id (LP-0MVMBM467005BT4A AC1): appended last
+            # so every existing field (and every end-anchored consumer regex)
+            # is unchanged. Absent when no turn is bound (legacy shape).
+            turn = turn_field()
+            if turn:
+                parts.append(turn.strip())
             if expect_usage and token_field is None:
                 # The usage block arrives in the NEXT chunk: defer so the
                 # line can carry the measured counts (LP-0MVMHNVKT003PRIK).

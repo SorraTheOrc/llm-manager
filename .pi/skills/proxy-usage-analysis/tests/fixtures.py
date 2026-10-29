@@ -314,6 +314,86 @@ ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT = (
     "reason=provider_context_exceeded session=herdr-1792524101-1636143-212"
 )
 
+# --- Per-turn correlation id (``turn=``, LP-0MVMBM467005BT4A) --------------
+#
+# Since LP-0MVMBM467005BT4A the proxy stamps an 8-hex ``turn=`` id on every
+# structured line one client request emits. Two turns of ONE session are shown
+# interleaved below: with ids the joins are exact, without them the analysis
+# has to fall back to per-session FIFO / nearest-line heuristics.
+TURN_SESSION = "019fc284-dcb8-74ca-9a64-9306b6f9d286"
+TURN_A = "a1b2c3d4"
+TURN_B = "9f8e7d6c"
+
+# Turn A: skipped local (context too large), fell back, streamed remotely.
+TURN_A_STARTED = (
+    "2026-10-25 10:00:00,100 - INFO - Stream started: provider=opencode-go "
+    "model=deepseek-v4-flash "
+    f"session={TURN_SESSION} request=[{{'type': 'text', 'text': 'turn A'}}] "
+    f"turn={TURN_A}"
+)
+
+TURN_A_FINISHED = (
+    "2026-10-25 10:00:20,000 - INFO - Stream finished: reason=stop "
+    "tokens=1000/200/1200 "
+    f"session={TURN_SESSION} provider=opencode-go model=deepseek-v4-flash turn={TURN_A}"
+)
+
+TURN_A_SKIP = (
+    "2026-10-25 10:00:00,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+    "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+    "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+    f"provider session={TURN_SESSION} chain_hold_cycle=0 turn={TURN_A}"
+)
+
+TURN_A_FALLBACK = (
+    "2026-10-25 10:00:00,050 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=local-qwen3, to=opencode-go, reason=context_too_large "
+    f"session={TURN_SESSION} attempt=1 turn={TURN_A}"
+)
+
+# Turn B of the SAME session, interleaved: it is a local dispatch that was
+# refused by another session's lease, then fell back with a *different* reason.
+TURN_B_STARTED = (
+    "2026-10-25 10:00:05,000 - INFO - Stream started: provider=opencode-go "
+    "model=deepseek-v4-flash "
+    f"session={TURN_SESSION} request=[{{'type': 'text', 'text': 'turn B'}}] "
+    f"turn={TURN_B}"
+)
+
+TURN_B_FINISHED = (
+    "2026-10-25 10:00:35,000 - INFO - Stream finished: reason=stop "
+    "tokens=800/100/900 "
+    f"session={TURN_SESSION} provider=opencode-go model=deepseek-v4-flash turn={TURN_B}"
+)
+
+TURN_B_FALLBACK = (
+    "2026-10-25 10:00:04,900 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=local-qwen3, to=opencode-go, reason=local_lease_active "
+    f"session={TURN_SESSION} attempt=2 turn={TURN_B}"
+)
+
+# Local TTFT lines for the two turns: A is cold (55.6 s), B is warm (1.1 s).
+# FIFO pairing alone would mis-assign them when the turns interleave; the ids
+# make the join exact.
+TURN_A_DISPATCH = (
+    "2026-10-25 10:00:00,090 - INFO - dispatch_first_byte_ms=55656.5 "
+    "dispatch_to_first_byte_ms=55655.9 cache_state=cold cached_ratio=0.000 "
+    f"queue_wait_ms=0.6 session={TURN_SESSION} model=Qwen3 turn={TURN_A}"
+)
+
+TURN_B_DISPATCH = (
+    "2026-10-25 10:00:04,990 - INFO - dispatch_first_byte_ms=1100.5 "
+    "dispatch_to_first_byte_ms=1100.1 cache_state=warm cached_ratio=0.980 "
+    f"queue_wait_ms=0.4 session={TURN_SESSION} model=Qwen3 turn={TURN_B}"
+)
+
+# Same-session ``local_dispatch_denied`` belonging to turn B only: the denial
+# must never be attributed to turn A.
+TURN_B_DENIED = (
+    "2026-10-25 10:00:04,800 - INFO - local_dispatch_denied "
+    f"session={TURN_SESSION} owner=019fc27d active=4 cold_start=False turn={TURN_B}"
+)
+
 # --- local_dispatch_denied --------------------------------------------------
 
 DISPATCH_DENIED = (

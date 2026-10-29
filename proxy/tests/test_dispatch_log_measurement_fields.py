@@ -20,6 +20,7 @@ upstream and assert the *observable* log line, not the source text.
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -119,8 +120,13 @@ def _sse_chunks() -> list[str]:
     return [f"data: {payload}\n\n", f"data: {final}\n\n", "data: [DONE]\n\n"]
 
 
-async def _drive_local_stream(headers: dict | None = None):
-    """Run one streaming local dispatch and return the captured log records."""
+async def _drive_local_stream(headers: dict | None = None, *, iterate: bool = True):
+    """Run one streaming local dispatch and return the captured log records.
+
+    *iterate* is disabled for callers that expect the request to be refused
+    before any stream is produced (e.g. the ``local_dispatch_denied`` path),
+    where the response has no body iterator to drain.
+    """
     from fastapi import Request as FastAPIRequest
     from proxy.router import proxy_to_local
 
@@ -147,8 +153,9 @@ async def _drive_local_stream(headers: dict | None = None):
     client = _MockStreamingClient(_sse_chunks())
     with patch("proxy.router.httpx.AsyncClient", return_value=client):
         response = await proxy_to_local(request, "v1/chat/completions")
-        async for _ in response.body_iterator:
-            pass
+        if iterate:
+            async for _ in response.body_iterator:
+                pass
     return response
 
 
@@ -178,6 +185,85 @@ async def test_dispatch_line_carries_priority_and_prompt_size(caplog):
     assert " queue_wait_ms=" in line
     assert " session=" in line
     assert " model=" in line
+
+
+#: Per-turn correlation id contract (LP-0MVMBM467005BT4A): 8 lowercase hex.
+_TURN_RE = re.compile(r"\bturn=([0-9a-f]{8})\b")
+
+
+def _turn_of(line: str) -> str | None:
+    m = _TURN_RE.search(line)
+    return m.group(1) if m else None
+
+
+@pytest.mark.asyncio
+async def test_local_dispatch_lines_share_one_turn_id(caplog):
+    """One local request stamps the same turn id on all of its lines (AC1/AC2).
+
+    The local path is the cross-cutting one: ``[local] POST`` (request
+    logging), ``Stream started``, ``dispatch_first_byte_ms`` (TTFT) and
+    ``Stream finished`` are emitted from three different modules and must all
+    carry the *same* id, otherwise the turn cannot be reconstructed.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO)
+    response = await _drive_local_stream()
+    assert response.status_code == 200
+
+    messages = [record.getMessage() for record in caplog.records]
+    expected_prefixes = (
+        "[local] POST",
+        "Stream started:",
+        "dispatch_first_byte_ms=",
+        "Stream finished:",
+    )
+    found: dict[str, str] = {}
+    for prefix in expected_prefixes:
+        line = next((m for m in messages if m.startswith(prefix)), None)
+        assert line is not None, f"no {prefix!r} line in {messages}"
+        turn = _turn_of(line)
+        assert turn is not None, f"{prefix!r} line carries no turn id: {line!r}"
+        found[prefix] = turn
+
+    assert len(set(found.values())) == 1, found
+
+
+@pytest.mark.asyncio
+async def test_local_dispatch_denied_line_carries_turn(caplog, monkeypatch):
+    """The refusal line carries the refused request's turn id (AC1)."""
+    import logging
+
+    from proxy import server as srv_module
+
+    caplog.set_level(logging.INFO)
+    # A generating dispatch already holds the single slot, so this explicit
+    # session's dispatch is refused before any upstream call.
+    monkeypatch.setattr(
+        srv_module,
+        "config",
+        {"server": {"llama_router_mode": False, "llama_server_port": 8080,
+                    "session_slot_pool_size": 1, "max_concurrent_queries": 1}},
+    )
+    monkeypatch.setattr(srv_module, "local_generating_queries", 1)
+
+    response = await _drive_local_stream(
+        headers={"content-type": "application/json", "x-session-id": "turn-denied-session"},
+        iterate=False,
+    )
+
+    assert response.status_code >= 400, response.status_code
+    line = next(
+        (
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("local_dispatch_denied")
+        ),
+        None,
+    )
+    assert line is not None, [r.getMessage() for r in caplog.records]
+    assert _turn_of(line) is not None, line
+    assert "session=" in line, line
 
 
 @pytest.mark.asyncio

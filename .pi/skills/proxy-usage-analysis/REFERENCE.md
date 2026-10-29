@@ -459,6 +459,49 @@ entry is a local runtime edit, not a committed artifact.
    into the event's `chain_hold_cycle` field (LP-0MU5AIAAY003KVM0); lines
    without the token (pre-chain-hold rotated logs) parse with
    `chain_hold_cycle=None`, which aggregates as cycle 0 (genuine demand).
+   **Per-turn correlation id (`turn=`, LP-0MVMBM467005BT4A).** Every
+   structured line one client request emits carries a short correlation id:
+
+   ```text
+   Stream started: provider=<p> model=<m> session=<uuid> request=<preview> turn=a1b2c3d4
+   Stream finished: reason=<r> tokens=<p>/<c>/<t> session=<uuid> provider=<p> model=<m> turn=a1b2c3d4
+   routing_skip_local ... session=<uuid> chain_hold_cycle=<n> turn=a1b2c3d4
+   routing_skip_provider_context ... session=<uuid> preference=<pref> turn=a1b2c3d4
+   Fallback triggered for model=<path>, from=<a>, to=<b>, reason=<r> session=<uuid> attempt=<n> turn=a1b2c3d4
+   routing_hop session=<uuid> from=<a> to=<b> hops=<n> turn=a1b2c3d4
+   local_dispatch_denied session=<uuid> owner=<owner> active=<n> cold_start=<bool> turn=a1b2c3d4
+   [local] POST <url> body=<preview> session_id=<uuid> session={...} slot=<id> turn=a1b2c3d4
+   [remote] POST <url> -> <endpoint> body=<preview> session_id=<uuid> session={...} slot=<id> turn=a1b2c3d4
+   dispatch_first_byte_ms=<ms> ... session=<uuid> model=<m> priority=<p> estimated_tokens=<n> turn=a1b2c3d4
+   ttft_seconds=<s> session=<uuid> provider=<p> model=<m> turn=a1b2c3d4
+   Stream error: session=<uuid> provider=<p> model=<m> error=<type> turn=a1b2c3d4
+   ```
+
+   - **Format.** Eight lowercase hex characters (`uuid4().hex[:8]`), emitted as
+     the last `key=value` on the line by
+     `proxy/turn_id.py::turn_field()`. Short on purpose: it keeps lines
+     readable while making a per-session collision negligible.
+   - **Stability.** One id per client request, generated at the request's entry
+     point (`_run_chain_cycles`, `proxy_to_local`, `proxy_to_remote`, and
+     idempotently at `log_request`) and **never** re-generated: it is stable
+     across local↔remote fallback hops, chain-hold retry cycles, provider
+     reroutes and stream start/finish. Two turns of the same session always get
+     different ids.
+   - **Parsing.** `log_parser` extracts it into `LogEvent.turn` on
+     `stream_started`, `stream_finished`, `stream_finish_error`, `fallback`,
+     `routing_skip`, `provider_context_skip`, `dispatch_denied`,
+     `local_dispatch` and `ttft` events. Absent on any other kind (and on every
+     pre-change rotated line), where it stays `None`.
+   - **Exact attribution.** With ids present the joins are exact and no longer
+     depend on ordering: `pair_ttft_to_streams()` pairs a
+     `dispatch_first_byte_ms=`/`ttft_seconds=` line with the `Stream started`
+     line of the same turn, `pair_stream_events()` pairs `Stream started` with
+     its own `Stream finished` (busy time, decode/prefill slot-seconds), and
+     `_attribute_fallback()` prefers the fallback/skip/denial evidence carrying
+     the first remote stream's turn. Lines **without** ids (rotated logs
+     predating the field) keep the historical per-session FIFO and
+     nearest-line-within-60s heuristics, so historical windows still analyse
+     unchanged.
    Local `dispatch_first_byte_ms=` lines (LP-0MTSSM5SO003PKU0) parse into
    `ttft` events carrying the prefill breakdown: `ttft_ms` (dispatch → first
    byte total), `dispatch_to_first_byte_ms` (total minus queued wait),
@@ -503,7 +546,8 @@ entry is a local runtime edit, not a committed artifact.
 4. **Local model utilization (busy time)** — local `Stream started` /
    `Stream finished` events are collected across the analysis's effective
    margin beyond the window (48h, shared with the mode timeline in step 5;
-   see `MODE_TIMELINE_MARGIN`), paired per session (FIFO), clipped back to
+   see `MODE_TIMELINE_MARGIN`), paired **exactly by `turn=`** where the ids
+   are present and per session (FIFO) for pre-change lines, clipped back to
    the window, and merged. **Busy is the union of dispatch → finish
    intervals** (LP-0MVJN9H2I00116FP): each paired stream's interval starts at
    its back-calculated dispatch time (`ttft.ts - ttft_ms/1000`, i.e. the
@@ -1106,6 +1150,17 @@ work outside the proxy's slot accounting.
   its own inherited an unrelated neighbour's `rate_limited` within the 60s
   window (11 of 26 clean local-using sessions in the 2026-10-23/24 window were
   mislabelled that way).
+- **Per-turn attribution is exact where `turn=` ids exist
+  (LP-0MVMBM467005BT4A).** Since the field was introduced, every structured
+  line a request emits (routing skips, context skips, fallbacks, routing hops,
+  dispatch denials, `[local]`/`[remote]` POST, `Stream started`,
+  `Stream finished`, TTFT, error lines) carries the request's 8-hex id, so
+  TTFT→stream, start→finish, and skip/fallback→stream joins are made by id and
+  cannot mix up two interleaved turns of one session. Log lines written before
+  the field existed carry no id, so windows spanning the change fall back to the
+  FIFO/nearest-line heuristics for those lines — the report states the pairing
+  method in its busy-time note. A turn that logged no id (e.g. a task detached
+  from the request context) is likewise paired by the legacy rules.
 - Provider context-ceiling skips (`routing_skip_provider_context`) are counted
   per event, not per provider chain: one request that exceeds several entries'
   ceilings logs one line per entry, so the count is *entry* attempts skipped.

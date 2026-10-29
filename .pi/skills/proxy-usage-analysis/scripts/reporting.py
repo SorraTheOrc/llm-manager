@@ -1048,6 +1048,15 @@ def build_report(
         "`no_remote_fallback` (see the `fallback_attribution` CSV column)."
     )
     ap(
+        "- Every structured line a request emits also carries a per-turn correlation id "
+        "(`turn=<8 hex>`, LP-0MVMBM467005BT4A). Where ids are present the pairing is "
+        "**exact** — fallbacks, routing skips, dispatch denials, stream start/finish and "
+        "TTFT lines are joined by id, so interleaved turns of one session can no longer "
+        "swap reasons or pair with the wrong stream. Lines without ids (rotated logs "
+        "predating the field) still use the per-session FIFO / nearest-line heuristics "
+        "described above."
+    )
+    ap(
         "- Related context: work item LP-0MSAOQTJS000FFVM (evaluate increasing local ctx-size) can "
         "use this report's `large_context_bypass` data. See the skill's SKILL.md for interpretation."
     )
@@ -2292,8 +2301,9 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
                f"started more than 1h before the window (from earlier windows) also lack a "
                f"logged `Stream finished`; they do not affect this window's busy time._")
     ap("")
-    ap("Method: streams are paired per session (FIFO) across the margin-widened "
-       f"event stream (48h collection margin, max({log_parser.BUSY_WINDOW_MARGIN} "
+    ap("Method: streams are paired exactly by their per-turn id (`turn=`) and, "
+       "for pre-change lines without an id, per session FIFO across the "
+       f"margin-widened event stream (48h collection margin, max({log_parser.BUSY_WINDOW_MARGIN} "
        "busy-pairing, 48h mode timeline)), each pair extended back to its "
        "back-calculated dispatch time (`ttft.ts - ttft_ms/1000`) when a "
        "`dispatch_first_byte_ms` line exists, then clipped to the window so "

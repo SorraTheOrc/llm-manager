@@ -112,6 +112,10 @@ _PARSED_PREFERENCE = {
 _KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
 
 
+#: Per-turn correlation id (LP-0MVMBM467005BT4A): 8 lowercase hex characters.
+_PER_TURN_ID_RE = re.compile(r"\bturn=([0-9a-f]{8})\b")
+
+
 def _parse_kv(line: str) -> dict[str, str]:
     """Parse the ``key=value`` pairs of a log line into a dict.
 
@@ -604,6 +608,36 @@ async def test_not_local_line_keeps_every_pre_existing_key(row, preference, capl
     assert not missing, (
         f"{row.description}: the line lost pre-existing key(s) {missing} — "
         f"log-grep consumers break. Line: {line!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-turn correlation id on the routing-skip exit lines (LP-0MVMBM467005BT4A)
+# ---------------------------------------------------------------------------
+
+#: The routing-skip lines are emitted from the provider chain, so they must
+#: carry the request's ``turn=`` id (8 hex) and carry the *same* id: without it
+#: two interleaved turns of one session are only separable by FIFO heuristics.
+_TURN_SKIP_LINE_PREFIXES = ("routing_skip_local", "routing_skip_provider_context")
+_TURN_SKIP_ROWS = tuple(
+    r for r in _NOT_LOCAL_LINE_ROWS if r.prefix in _TURN_SKIP_LINE_PREFIXES
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "row", _TURN_SKIP_ROWS, ids=[r.trigger for r in _TURN_SKIP_ROWS]
+)
+@pytest.mark.parametrize("preference", _preference_params())
+async def test_routing_skip_line_carries_the_per_turn_id(row, preference, caplog):
+    """``routing_skip_local`` / ``routing_skip_provider_context`` carry ``turn=``."""
+    await _issue(row, preference)
+    line = _assert_line_present(_messages(caplog), row)
+    match = _PER_TURN_ID_RE.search(line)
+
+    assert match, (
+        f"{row.description}: the skip line must carry the per-turn correlation "
+        f"id (LP-0MVMBM467005BT4A). Line: {line!r}"
     )
 
 

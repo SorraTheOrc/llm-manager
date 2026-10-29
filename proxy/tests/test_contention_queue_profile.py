@@ -145,6 +145,15 @@ class TestParseFallbackTriggered:
         )
         assert f2 is not None and f2["reason"] == "model_switch_in_progress"
 
+    def test_per_turn_id_does_not_break_parsing(self):
+        """LP-0MVMBM467005BT4A appends ``turn=<8 hex>`` after the evidence
+        fields; the bounded ``reason=`` extractor is unaffected."""
+        f = m.parse_fallback_triggered(
+            fallback_triggered_line(f"{BASE_TS} INFO router.routing:")
+            + " session=herdr-1-2-3 attempt=2 turn=a1b2c3d4"
+        )
+        assert f is not None and f["reason"] == "local_concurrency_limit"
+
 
 # ---------------------------------------------------------------------------
 # Burst / gap / bucket helpers

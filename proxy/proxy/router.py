@@ -21,6 +21,10 @@ import httpx
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+# Per-turn correlation id stamped on every structured line this module emits
+# (LP-0MVMBM467005BT4A).
+from proxy.turn_id import bind_turn_id, turn_field
+
 logger = logging.getLogger("llama-proxy.router")
 
 
@@ -46,9 +50,10 @@ def _log_local_stream_client_disconnect(srv, session_id, model_name):
     """
     try:
         srv.logger.info(
-            "Stream finished: reason=client_disconnect session=%s provider=local model=%s",
+            "Stream finished: reason=client_disconnect session=%s provider=local model=%s%s",
             session_id or "unknown",
             model_name,
+            turn_field(),
         )
     except Exception:
         pass
@@ -1014,6 +1019,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     default ``http://localhost:{llama_port}`` (LP-0MRPILSMW004T4H8).
 
     """
+    # Per-turn correlation id (LP-0MVMBM467005BT4A): bound at the local entry
+    # point so this dispatch's lines carry it. Idempotent — a call from inside
+    # a provider chain keeps the id the chain already bound.
+    bind_turn_id(request)
     srv = _srv()
     server_config = srv.config.get("server", {})
     llama_port = server_config.get("llama_server_port", 8080)
@@ -1401,11 +1410,12 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         if not acquired:
             _cold = cold_start.is_cold(server_config)
             srv.logger.info(
-                "local_dispatch_denied session=%s owner=%s active=%s cold_start=%s",
+                "local_dispatch_denied session=%s owner=%s active=%s cold_start=%s%s",
                 session_id if session_id else "unknown",
                 owner if owner else "none",
                 active_count,
                 _cold,
+                turn_field(),
             )
             _record_backend_signal("local_dispatch_denied")
 
@@ -2084,9 +2094,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 else:
                                     srv.logger.warning(
                                         "dispatch_first_byte_timeout session=%s "
-                                        "ceiling=%.0fs",
+                                        "ceiling=%.0fs%s",
                                         session_id if session_id else "unknown",
                                         _first_byte_ceiling,
+                                        turn_field(),
                                     )
                             except Exception:
                                 pass
@@ -2344,10 +2355,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         try:
                             _request_preview = _get_request_preview(body_json)
                             srv.logger.info(
-                                "Stream started: provider=local model=%s session=%s request=%s",
+                                "Stream started: provider=local model=%s session=%s request=%s%s",
                                 model_name,
                                 session_id or "unknown",
                                 _request_preview or "",
+                                turn_field(),
                             )
                         except Exception:
                             pass
@@ -2733,7 +2745,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                 srv.logger.info(
                                                     "dispatch_first_byte_ms=%.1f dispatch_to_first_byte_ms=%.1f "
                                                     "cache_state=%s cached_ratio=%.3f queue_wait_ms=%.1f session=%s model=%s "
-                                                    "priority=%s estimated_tokens=%d",
+                                                    "priority=%s estimated_tokens=%d%s",
                                                     _first_byte_total_ms,
                                                     _first_byte_service_ms,
                                                     _cache_state,
@@ -2743,6 +2755,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                                     model_name or "unknown",
                                                     _priority or "unknown",
                                                     int(_estimated_tokens or 0),
+                                                    turn_field(),
                                                 )
                                                 # Feed the prefill-ETA calibration window
                                                 # (LP-0MVGDUV5E005UWBQ): the observed service
@@ -3037,10 +3050,11 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     )
                                 else:
                                     srv.logger.warning(
-                                        "Stream error: session=%s provider=local model=%s error=%s",
+                                        "Stream error: session=%s provider=local model=%s error=%s%s",
                                         session_id or "unknown",
                                         model_name,
                                         _error_type,
+                                        turn_field(),
                                     )
                             except Exception:
                                 pass

@@ -44,6 +44,7 @@ from log_parser import (
     STATUS_REQUEST,
     LogEvent,
     PrefillMatch,
+    pair_stream_events,
     pair_ttft_to_streams,
 )
 
@@ -1347,6 +1348,7 @@ def _attribute_fallback(
     fallback_events: list[LogEvent],
     dispatch_denied: int = 0,
     provider_context_skips: dict[str, list[LogEvent]] | None = None,
+    turn: str | None = None,
 ) -> tuple[datetime | None, str | None, str]:
     """Find (move_time, reason, attribution) for a session that reached remote.
 
@@ -1377,10 +1379,24 @@ def _attribute_fallback(
     both reasons are reported separately (per-session reason and the
     provider-context breakdown), so nothing is lost by this precedence.
 
+    When *turn* is given (the turn id of the session's first remote stream),
+    evidence carrying the **same** turn id is preferred at every step: with ids
+    present the join is exact, so two interleaved turns of one session can no
+    longer be confused (LP-0MVMBM467005BT4A AC3). Without ids the historical
+    session/timestamp rules above apply unchanged.
+
     Returns ``(None, None, attribution)`` when there is no timestamped
     evidence.
     """
+
+    def _same_turn(events: list[LogEvent]) -> list[LogEvent]:
+        return [e for e in events if turn and e.turn == turn]
+
     skips = [e for e in routing_skips.get(session_id, []) if e.ts <= first_remote_ts]
+    exact = _same_turn(skips)
+    if exact:
+        e = max(exact, key=lambda x: x.ts)
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
     if skips:
         e = max(skips, key=lambda x: x.ts)
         return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
@@ -1390,6 +1406,10 @@ def _attribute_fallback(
             for e in provider_context_skips.get(session_id, [])
             if e.ts <= first_remote_ts
         ]
+        exact = _same_turn(ctx_skips)
+        if exact:
+            e = max(exact, key=lambda x: x.ts)
+            return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
         if ctx_skips:
             e = max(ctx_skips, key=lambda x: x.ts)
             return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
@@ -1398,6 +1418,10 @@ def _attribute_fallback(
         for e in fallback_events
         if e.session == session_id and e.ts <= first_remote_ts
     ]
+    exact = _same_turn(own)
+    if exact:
+        e = max(exact, key=lambda x: x.ts)
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
     if own:
         e = max(own, key=lambda x: x.ts)
         return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
@@ -1458,6 +1482,7 @@ def _build_session(
             fallback_events,
             dispatch_denied=builder.dispatch_denied,
             provider_context_skips=provider_context_skips,
+            turn=first_remote.turn,
         )
         if move_ts is None:
             move_ts = first_remote.ts if has_local else None
@@ -1730,9 +1755,15 @@ def compute_busy_stats(
     can only ever contribute its lower-bound time — the busy figure is never
     overstated.
 
+    Start/finish pairs are exact when both lines carry the same ``turn=`` id
+    (LP-0MVMBM467005BT4A) and FIFO per session for pre-change lines without
+    one, so two interleaved turns of a session keep their own decode/prefill
+    durations.
+
     ``ttft_events`` are the local ``dispatch_first_byte_ms`` TTFT events
-    (LP-0MVJN45LF009CO2V). When supplied they are paired FIFO to the local
-    streams per session and reported as :attr:`BusyStats.prefill_stats`:
+    (LP-0MVJN45LF009CO2V). When supplied they are paired to the local
+    streams — exactly by ``turn=`` where present, FIFO per session otherwise —
+    and reported as :attr:`BusyStats.prefill_stats`:
     p10/p50/p90/max plus the window total of the prefill interval
     ``[ttft.ts - ttft_ms/1000, ttft.ts]``. Every prefill figure is
     **slot-time, not wall-clock** (the per-stream durations are summed, not
@@ -1794,7 +1825,12 @@ def compute_busy_stats(
     for session_id, session_starts in started.items():
         ss = sorted(session_starts, key=lambda e: e.ts)
         ff = sorted(finished.get(session_id, []), key=lambda e: e.ts)
-        for start_ev, finish_ev in zip(ss, ff):
+        # Exact pairing when both lines of a stream carry the same ``turn=`` id
+        # (LP-0MVMBM467005BT4A); FIFO for pre-change logs. ``unpaired_starts``
+        # replaces the old ``ss[len(ff):]`` slice so an exact pair can no
+        # longer leave a mis-paired start behind.
+        pairs, unpaired_starts = pair_stream_events(ss, ff)
+        for start_ev, finish_ev in pairs:
             # Decode-only interval (``Stream started`` → ``Stream finished``).
             d_lo, d_hi = max(start_ev.ts, window_start), min(finish_ev.ts, window_end)
             if d_hi > d_lo:
@@ -1826,12 +1862,12 @@ def compute_busy_stats(
                 # ``streams`` (LP-0MVKN85WO007O00H).
                 if measured_dispatch is not None:
                     prefill_extended += 1
-        # FIFO pairing: the earliest ``len(ff)`` starts pair with finishes;
-        # the remaining starts are unpaired (no logged finish). Only starts
+        # Unpaired starts (no logged finish) — FIFO leftovers on pre-change
+        # logs, or a start whose own ``turn=`` finish is absent. Only starts
         # within the busy margin before the window (or inside it) count as
         # this window's unfinished; earlier starts are pre-window leftovers;
         # starts after the window end belong to the next window.
-        for start_ev in ss[len(ff):]:
+        for start_ev in unpaired_starts:
             if start_ev.ts < margin_start:
                 pre_window_unfinished += 1
             elif start_ev.ts <= window_end:

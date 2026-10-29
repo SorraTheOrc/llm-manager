@@ -53,6 +53,14 @@ LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3}) - (\w+) - 
 RE_PROVIDER = re.compile(r"\bprovider=(\S+)")
 RE_MODEL = re.compile(r"\bmodel=(\S+)")
 RE_SESSION = re.compile(r"\bsession=([A-Za-z0-9_.-]+)")
+# Per-turn correlation id (LP-0MVMBM467005BT4A): every structured line a client
+# request emits carries ``turn=<8 hex>``, so one turn's lifecycle (routing
+# skips, fallbacks, stream start/finish, TTFT, dispatch denials) can be
+# reconstructed exactly instead of by FIFO/nearest-line heuristics.
+# Deliberately strict (8 lowercase hex characters) so nothing else in a log
+# line can be mistaken for an id; pre-change rotated logs simply have no match
+# and every event's ``turn`` stays ``None``.
+RE_TURN = re.compile(r"\bturn=([0-9a-f]{8})\b")
 
 # TTFT (Time to First Token) measurement lines.
 # Local stream path (router.py): "dispatch_first_byte_ms=<ms> dispatch_to_first_byte_ms=<ms> session=<id> model=<model>"
@@ -695,6 +703,19 @@ class LogEvent:
     # with neither marker nor counts reads ``None`` too — that shape predates
     # the marker and is still counted as "without usage" by token presence).
     usage_missing: bool | None = None
+    #: Per-turn correlation id (LP-0MVMBM467005BT4A), parsed from ``turn=`` on
+    #: every structured line one client request emits. Present on
+    #: ``stream_started``, ``stream_finished``, ``stream_finish_error``,
+    #: ``fallback``, ``routing_skip``, ``provider_context_skip``,
+    #: ``dispatch_denied``, ``local_dispatch`` and ``ttft`` events. ``None``
+    #: on every pre-change line (and on kinds that are not per-request), in
+    #: which case the legacy FIFO/nearest-line pairing applies unchanged.
+    turn: str | None = None
+
+
+def _turn_from(text: str) -> str | None:
+    """Extract the per-turn correlation id, or ``None`` when absent."""
+    return _first(RE_TURN, text)
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -769,39 +790,135 @@ class PrefillMatch:
         return self.ttft.ts - timedelta(milliseconds=self.ttft.ttft_ms)
 
 
+def _pair_key(ev: LogEvent) -> str | None:
+    """Grouping key for a stream event: session UUID, else its turn id.
+
+    Historical behaviour grouped events by session only and skipped
+    session-less ones. A per-turn id (LP-0MVMBM467005BT4A) still identifies
+    one request when the session is absent, so the turn id becomes the
+    fallback key instead of dropping the event.
+    """
+    if ev.session is not None:
+        return ev.session
+    if ev.turn:
+        return f"turn:{ev.turn}"
+    return None
+
+
 def pair_ttft_to_streams(
     ttft_events: Iterable[LogEvent],
     started_events: Iterable[LogEvent],
 ) -> list[PrefillMatch]:
-    """Pair local streams with their TTFT events per session, FIFO by time.
+    """Pair local streams with their TTFT events — exactly by ``turn=``.
 
-    TTFT lines carry ``session=``, so the Nth ``dispatch_first_byte_ms``
-    event of a session pairs with that session's Nth ``stream_started`` event
-    (the same FIFO convention ``aggregation.compute_busy_stats`` uses for
-    start/finish pairs). Streams are returned sorted by their start timestamp;
-    streams with no TTFT paired are included with ``ttft=None`` so callers can
-    count them as unknown prefill instead of losing them. TTFT events beyond a
-    session's stream count have no stream to attribute to and are ignored.
-    Session-less events cannot be paired and are skipped.
+    A ``turn=`` id (LP-0MVMBM467005BT4A) identifies one client request on both
+    the ``dispatch_first_byte_ms=`` and the ``Stream started`` line, so when
+    both sides carry one the pairing is **exact** and needs no ordering
+    assumption: two interleaved turns of the same session can no longer be
+    mis-paired.
+
+    Lines without ids (rotated logs predating the field) fall back to the
+    historical FIFO rule: the Nth ``dispatch_first_byte_ms`` event of a
+    session pairs with that session's Nth ``stream_started`` event (the same
+    convention ``aggregation.compute_busy_stats`` uses for start/finish
+    pairs). Streams are returned sorted by their start timestamp; streams with
+    no TTFT paired are included with ``ttft=None`` so callers can count them as
+    unknown prefill instead of losing them. TTFT events beyond a group's stream
+    count have no stream to attribute to and are ignored. Events carrying
+    neither a session nor a turn cannot be paired and are skipped.
     """
-    starts: dict[str, list[LogEvent]] = {}
-    for ev in started_events:
-        if ev.session is not None:
-            starts.setdefault(ev.session, []).append(ev)
-    ttfts: dict[str, list[LogEvent]] = {}
-    for ev in ttft_events:
-        if ev.session is not None:
-            ttfts.setdefault(ev.session, []).append(ev)
+    all_starts = list(started_events)
+    all_ttfts = list(ttft_events)
 
     matches: list[PrefillMatch] = []
-    for session_id, session_starts in starts.items():
-        ordered_starts = sorted(session_starts, key=lambda e: e.ts)
-        ordered_ttfts = sorted(ttfts.get(session_id, []), key=lambda e: e.ts)
+    used_starts: set[int] = set()
+    used_ttfts: set[int] = set()
+
+    # --- Exact phase: same turn id on both sides ---------------------------
+    starts_by_turn: dict[str, list[LogEvent]] = {}
+    for ev in all_starts:
+        if ev.turn:
+            starts_by_turn.setdefault(ev.turn, []).append(ev)
+    for ttft in all_ttfts:
+        if not ttft.turn:
+            continue
+        candidates = starts_by_turn.get(ttft.turn)
+        if not candidates:
+            continue
+        stream = candidates.pop(0)
+        used_starts.add(id(stream))
+        used_ttfts.add(id(ttft))
+        matches.append(PrefillMatch(stream=stream, ttft=ttft))
+
+    # --- Legacy phase: per-group FIFO over the unpaired events -------------
+    starts: dict[str, list[LogEvent]] = {}
+    for ev in all_starts:
+        if id(ev) in used_starts:
+            continue
+        key = _pair_key(ev)
+        if key is None:
+            continue
+        starts.setdefault(key, []).append(ev)
+    ttfts: dict[str, list[LogEvent]] = {}
+    for ev in all_ttfts:
+        if id(ev) in used_ttfts:
+            continue
+        key = _pair_key(ev)
+        if key is None:
+            continue
+        ttfts.setdefault(key, []).append(ev)
+
+    for key, group_starts in starts.items():
+        ordered_starts = sorted(group_starts, key=lambda e: e.ts)
+        ordered_ttfts = sorted(ttfts.get(key, []), key=lambda e: e.ts)
         for index, stream in enumerate(ordered_starts):
             ttft = ordered_ttfts[index] if index < len(ordered_ttfts) else None
             matches.append(PrefillMatch(stream=stream, ttft=ttft))
     matches.sort(key=lambda m: m.stream.ts)
     return matches
+
+
+def pair_stream_events(
+    start_events: Iterable[LogEvent],
+    finish_events: Iterable[LogEvent],
+) -> tuple[list[tuple[LogEvent, LogEvent]], list[LogEvent]]:
+    """Pair ``Stream started`` events with their ``Stream finished`` events.
+
+    Returns ``(pairs, unpaired_starts)``. Pairs are exact when both lines carry
+    the same ``turn=`` id (LP-0MVMBM467005BT4A); the remaining events fall back
+    to the historical FIFO rule (earliest N starts pair with the N finishes in
+    time order), so pre-change logs pair exactly as before. Unpaired starts are
+    returned in time order — their duration is unknown, not zero.
+    """
+    ordered_starts = sorted(start_events, key=lambda e: e.ts)
+    ordered_finishes = sorted(finish_events, key=lambda e: e.ts)
+
+    finishes_by_turn: dict[str, list[LogEvent]] = {}
+    for ev in ordered_finishes:
+        if ev.turn:
+            finishes_by_turn.setdefault(ev.turn, []).append(ev)
+
+    pairs: list[tuple[LogEvent, LogEvent]] = []
+    used_finishes: set[int] = set()
+    remaining_starts: list[LogEvent] = []
+    for start in ordered_starts:
+        candidates = finishes_by_turn.get(start.turn) if start.turn else None
+        if candidates:
+            finish = candidates.pop(0)
+            used_finishes.add(id(finish))
+            pairs.append((start, finish))
+        else:
+            remaining_starts.append(start)
+
+    remaining_finishes = [
+        ev for ev in ordered_finishes if id(ev) not in used_finishes
+    ]
+    pairs.extend(zip(remaining_starts, remaining_finishes))
+
+    paired_starts = {id(ev) for ev, _ in pairs}
+    unpaired = [ev for ev in ordered_starts if id(ev) not in paired_starts]
+    pairs.sort(key=lambda pair: pair[0].ts)
+    return pairs, unpaired
 
 
 def _attribution_from(msg: str) -> tuple[str | None, str | None, str | None]:
@@ -845,6 +962,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             provider=_first(RE_PROVIDER, msg),
             model=_first(RE_MODEL, msg),
             session=_session_from(msg),
+            turn=_turn_from(msg),
         )
     if msg.startswith(STREAM_FINISHED):
         tokens = RE_TOKENS.search(msg)
@@ -871,6 +989,7 @@ def parse_log_line(line: str) -> LogEvent | None:
                 error_message=_first(RE_ERROR_MESSAGE, msg),
                 suggested_action=_first(RE_SUGGESTED_ACTION, msg),
                 entry=_first(RE_ENTRY, msg),
+                turn=_turn_from(msg),
                 raw=line,
             )
         return LogEvent(
@@ -891,6 +1010,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             usage_missing=(
                 True if RE_TOKENS_MISSING.search(msg) else None
             ),
+            turn=_turn_from(msg),
         )
     if msg.startswith(FALLBACK):
         m2 = RE_FALLBACK.search(msg)
@@ -910,6 +1030,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             budget_limit=_int(RE_FALLBACK_BUDGET_LIMIT, msg),
             budget_remaining=_int(RE_FALLBACK_BUDGET_REMAINING, msg),
             budget_waited=_float(RE_FALLBACK_BUDGET_WAITED, msg),
+            turn=_turn_from(msg),
         )
     if msg.startswith(ROUTING_SKIP_PROVIDER_CONTEXT):
         # "routing_skip_provider_context provider=munitoai-free type=remote
@@ -928,6 +1049,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             reason=_first(RE_REASON_KV, msg),
             estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
             limit=_int(RE_SKIP_LIMIT, msg),
+            turn=_turn_from(msg),
             raw=line,
         )
     if msg.startswith(ROUTING_SKIP):
@@ -944,20 +1066,26 @@ def parse_log_line(line: str) -> LogEvent | None:
             # on lines that carried no ``tokens=`` payload (``None``, never
             # an estimate).
             estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
+            turn=_turn_from(msg),
         )
     if msg.startswith(LOCAL_POST):
         # ``[local] POST http://... body={...} session_id=<uuid> session={...}``.
         # The request body is echoed (truncated) into the line and may itself
         # contain ``session=``/``provider=`` text, so no field is extracted
         # here: the event is a per-attempt marker, counted by hour only.
-        return LogEvent("local_dispatch", ts)
+        return LogEvent("local_dispatch", ts, turn=_turn_from(msg))
     if msg.startswith(DISPATCH_DENIED):
         m2 = RE_DISPATCH_DENIED.search(msg)
         if m2 is None:
             return None
         session, owner, active = m2.groups()
         return LogEvent(
-            "dispatch_denied", ts, session=session, owner=owner, active=int(active)
+            "dispatch_denied",
+            ts,
+            session=session,
+            owner=owner,
+            active=int(active),
+            turn=_turn_from(msg),
         )
     if msg.startswith(CONTENTION_DISPATCH):
         # "contention_queue_dispatch provider=... session=... queued_duration=1.23s policy=queue depth=0"
@@ -1392,6 +1520,7 @@ def parse_log_line(line: str) -> LogEvent | None:
                 queue_wait_ms=_float(RE_QUEUE_WAIT_MS, msg),
                 cache_state=_first(RE_CACHE_STATE, msg),
                 cached_ratio=_float(RE_CACHED_RATIO, msg),
+                turn=_turn_from(msg),
                 raw=line,
             )
 
