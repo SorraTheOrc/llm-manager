@@ -162,6 +162,31 @@ its name-encoded hour, ``scripts/lib/proxy_logs.py``).
     distinct ``session=`` count, with the ``session=herdr-*`` subset separated
     (herdr-orchestrated work).
 
+``prefill_thrash_cooldown``
+    The post-deadline prefill-thrash cooldown chain (LP-0MVRMI5HK00558TB AC2/AC4;
+    additive block added by LP-0MVT2KVVS002YZT8). Counts
+    ``routing_skip_local … reason=prefill_thrash_cooldown`` lines
+    (``proxy/proxy/provider.py``) in the window, with the distinct-session
+    count and the ``session=herdr-*`` subset — the downtime dispatcher's own
+    workload. Two free-GPU attributions are reported, because the recorded
+    baseline and the parent's operational definition are not the same rule:
+
+    * ``skips_without_live_local_work`` — the skip's **nearest preceding**
+      status poll within 120 s reports ``local_in_flight_requests=0``. This is
+      how the recorded 336-skip / 308-idle-hint baseline was derived (relaxed
+      rule: freshness not required). Re-derived 2026-10-24 20:00 →
+      2026-10-25 07:00: **337** / **308**.
+    * ``skips_with_free_gpu`` — the same poll must *also* report
+      ``slots_detail_stale=false`` (the parent Appendix's rule: a **fresh**
+      snapshot). Same window: **71** / **42**.
+
+    ``releases`` counts ``prefill_thrash_cooldown_released`` lines by reason
+    (``free_gpu`` after LP-0MVT2KSXY002O75C); a window predating that line
+    reads zero releases, never an error. ``window_covered`` carries the
+    coverage verdict for the same reason the other blocks do: a partial window
+    is a gap, not a zero. One row per skip goes to the additional
+    ``prefill_thrash_skips.csv`` artifact.
+
 ``herdr_downtime_dispatches``
     Read from the herdr downtime dispatch log,
     ``<repo>/.worklog/downtime-dispatches.log`` (JSONL, written by
@@ -364,6 +389,33 @@ _LOCAL_DISPATCH_RE = re.compile(
 )
 _CACHE_STATE_RE = re.compile(r"\bcache_state=(?P<state>warm|cold)\b")
 _SESSION_RE = re.compile(r"\bsession=(?P<session>\S+)")
+
+#: A post-deadline prefill-thrash cooldown skip (``proxy/proxy/provider.py``):
+#: the session's local dispatch was refused because the window armed by an
+#: abandonment was still live. Additive metric for LP-0MVRMI5HK00558TB AC2/AC4
+#: — before this existed the 916-skip baseline was an ad-hoc grep.
+_PREFILL_THRASH_SKIP_RE = re.compile(
+    r"\brouting_skip_local\b.*?\breason=prefill_thrash_cooldown\b"
+)
+#: The cooldown release line (``router_helpers``): a window whose justification
+#: expired was released, e.g. ``reason=free_gpu``. Absent from older logs, which
+#: must read as zero releases rather than a failure.
+_PREFILL_THRASH_RELEASED_RE = re.compile(
+    r"\bprefill_thrash_cooldown_released\b.*?\breason=(?P<reason>[a-z_]+)"
+)
+#: Fields read off a skip line. Kept separate from ``_STATUS_FIELD_RE`` so the
+#: status-poll contract is untouched (strictly additive metric).
+_PREFILL_THRASH_FIELD_RE = re.compile(
+    r"\b(?P<key>provider|session|preference|cooldown_remaining)=(?P<value>[^\s]+)"
+)
+#: The free-GPU attribution rule from the parent's Appendix: the **nearest
+#: preceding status poll within this lookback** must show
+#: ``local_in_flight_requests=0`` and ``slots_detail_stale=false`` for a skip
+#: to count as "the proxy declined local while its own snapshot said the GPU was
+#: free". Stated in the report itself so the number is not a magic constant.
+PREFILL_THRASH_FREE_GPU_LOOKBACK_SECONDS = 120.0
+#: Top-N per-session split carried in the report (the full rows are in the CSV).
+PREFILL_THRASH_SESSION_LIMIT = 10
 
 #: Verdict literals (also asserted by the unit tests).
 VERDICT_PASS = "PASS"
@@ -637,6 +689,223 @@ def analyse_status_stream(
             "distinct_sessions": len(dispatch_sessions),
             "herdr_session_dispatches": len(herdr_dispatch_sessions),
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Post-deadline prefill-thrash cooldown skips (LP-0MVRMI5HK00558TB AC2/AC4)
+# ---------------------------------------------------------------------------
+
+
+def _prefill_thrash_fields(line: str) -> dict[str, str]:
+    """Return the ``key=value`` fields of a cooldown-skip line."""
+    return {
+        match.group("key"): match.group("value")
+        for match in _PREFILL_THRASH_FIELD_RE.finditer(line)
+    }
+
+
+def _strip_seconds_suffix(value: str | None) -> int | None:
+    """Parse ``cooldown_remaining=600s`` (the log carries a trailing unit)."""
+    if not value:
+        return None
+    return _parse_int(value[:-1] if value.endswith("s") else value)
+
+
+def _nearest_status_poll(
+    poll_times: list[str],
+    polls: list[dict],
+    stamp: str,
+    lookback_seconds: float,
+) -> dict | None:
+    """The nearest preceding status poll for *stamp* inside the lookback.
+
+    ``poll_times`` is sorted, so each lookup is a bisect rather than a rescan
+    (the baseline window holds 11 654 polls and 916 skips). Returns ``None``
+    when there is no poll at or before the skip, or the nearest one is older
+    than the lookback — never a guess.
+    """
+    index = bisect.bisect_right(poll_times, stamp) - 1
+    if index < 0:
+        return None
+    seconds = (
+        dt.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        - dt.datetime.strptime(poll_times[index], "%Y-%m-%d %H:%M:%S")
+    ).total_seconds()
+    if seconds > lookback_seconds:
+        return None
+    return polls[index]
+
+
+def analyse_prefill_thrash_skips(
+    log_dir: Path,
+    *,
+    since: dt.datetime | None = None,
+    until: dt.datetime | None = None,
+    free_gpu_lookback_seconds: float = PREFILL_THRASH_FREE_GPU_LOOKBACK_SECONDS,
+    session_limit: int = PREFILL_THRASH_SESSION_LIMIT,
+) -> dict:
+    """Measure ``routing_skip_local reason=prefill_thrash_cooldown`` in a window.
+
+    The before/after evidence for LP-0MVRMI5HK00558TB AC2 and the AC4
+    re-measurement. Every figure is derived from the same log lines and the
+    same per-line window filter as the other metrics (``scripts/lib/proxy_logs``
+    handles dot/dash/``.gz`` names; a rotated file's name never bounds its
+    content).
+
+    Reported:
+
+    * ``count`` / ``distinct_sessions`` — total skips and how many sessions
+      they belong to;
+    * ``herdr_skips`` / ``herdr_sessions`` — the subset for ``herdr-*``
+      sessions, i.e. the downtime dispatcher's own workload;
+    * ``skips_with_free_gpu`` — skips whose **nearest preceding** status poll
+      within ``free_gpu_lookback_seconds`` reported
+      ``local_in_flight_requests=0`` **and** ``slots_detail_stale=false``: the
+      proxy declined local routing while its own **fresh** snapshot said
+      nothing was running locally (the parent Appendix's operational rule);
+    * ``skips_with_free_gpu_idle_hint`` — the sub-count where that poll also
+      read ``capacity_hint=idle``;
+    * ``skips_without_live_local_work`` / ``..._idle_hint`` — the same two
+      counts under the **relaxed** rule that only requires
+      ``local_in_flight_requests=0`` (no freshness requirement). This is the
+      population the recorded 336-skip baseline was derived from: measured on
+      the 2026-10-24 20:00 → 2026-10-25 07:00 window the relaxed rule gives
+      337 and the strict rule 71, so both are reported and the AC4 comparison
+      is made like-for-like;
+    * ``releases`` — cooldown releases by reason (``free_gpu`` after
+      LP-0MVT2KSXY002O75C; **zero** when the window predates that log line,
+      never an error);
+    * ``rows`` — one row per skip for the CSV artifact.
+
+    Strictly additive: no existing metric name, definition or shape changes.
+    """
+    log_dir = Path(log_dir)
+    polls: list[dict] = []
+    skips: list[dict] = []
+    releases: dict[str, int] = {}
+    for path in discover_proxy_log_files(log_dir):
+        with open_proxy_log_text(path) as handle:
+            for line in handle:
+                ts = parse_line_timestamp(line)
+                if not _in_window(ts, since, until):
+                    continue
+                stamp = ts.strftime("%Y-%m-%d %H:%M:%S")
+                if is_status_poll(line):
+                    fields = _status_fields(line)
+                    polls.append(
+                        {
+                            "timestamp": stamp,
+                            "local_in_flight_requests": fields.get(
+                                "local_in_flight_requests"
+                            ),
+                            "slots_detail_stale": fields.get("slots_detail_stale"),
+                            "capacity_hint": fields.get("capacity_hint"),
+                        }
+                    )
+                    continue
+                released = _PREFILL_THRASH_RELEASED_RE.search(line)
+                if released:
+                    reason = released.group("reason")
+                    releases[reason] = releases.get(reason, 0) + 1
+                    continue
+                if _PREFILL_THRASH_SKIP_RE.search(line):
+                    fields = _prefill_thrash_fields(line)
+                    skips.append(
+                        {
+                            "timestamp": stamp,
+                            "session": fields.get("session"),
+                            "provider": fields.get("provider"),
+                            "preference": fields.get("preference"),
+                            "cooldown_remaining_seconds": _strip_seconds_suffix(
+                                fields.get("cooldown_remaining")
+                            ),
+                        }
+                    )
+    polls.sort(key=lambda poll: poll["timestamp"])
+    skips.sort(key=lambda skip: skip["timestamp"])
+    poll_times = [poll["timestamp"] for poll in polls]
+
+    by_session: dict[str, int] = {}
+    free_gpu = 0
+    free_gpu_idle_hint = 0
+    no_live_work = 0
+    no_live_work_idle_hint = 0
+    rows: list[dict] = []
+    for skip in skips:
+        session = skip["session"] or ""
+        if session:
+            by_session[session] = by_session.get(session, 0) + 1
+        poll = _nearest_status_poll(
+            poll_times, polls, skip["timestamp"], free_gpu_lookback_seconds
+        )
+        poll_idle = bool(poll and poll.get("local_in_flight_requests") == "0")
+        poll_says_free = bool(
+            poll_idle and poll.get("slots_detail_stale") == "false"
+        )
+        if poll_says_free:
+            free_gpu += 1
+            if poll.get("capacity_hint") == "idle":
+                free_gpu_idle_hint += 1
+        if poll_idle:
+            no_live_work += 1
+            if poll.get("capacity_hint") == "idle":
+                no_live_work_idle_hint += 1
+        rows.append(
+            {
+                **skip,
+                "herdr": session.startswith("herdr-"),
+                "free_gpu": poll_says_free,
+                "free_gpu_capacity_hint": (
+                    poll.get("capacity_hint") if poll_says_free else None
+                ),
+                "free_gpu_poll_timestamp": (
+                    poll.get("timestamp") if poll_says_free else None
+                ),
+                "no_live_local_work": poll_idle,
+                "no_live_local_work_capacity_hint": (
+                    poll.get("capacity_hint") if poll_idle else None
+                ),
+                "nearest_poll_timestamp": (
+                    poll.get("timestamp") if poll else None
+                ),
+            }
+        )
+
+    herdr_sessions = [name for name in by_session if name.startswith("herdr-")]
+    sessions = sorted(by_session.items(), key=lambda item: (-item[1], item[0]))
+    return {
+        "attribution_rule": (
+            "skips_with_free_gpu counts a skip whose nearest preceding "
+            "status poll within "
+            f"{free_gpu_lookback_seconds:.0f}s reports "
+            "local_in_flight_requests=0 AND slots_detail_stale=false (the "
+            "parent Appendix rule); skips_without_live_local_work counts the "
+            "same population under the relaxed local_in_flight_requests=0 "
+            "rule the recorded 336-skip baseline was derived with (freshness "
+            "not required); each *_idle_hint figure is the sub-count where "
+            "that poll also reads capacity_hint=idle"
+        ),
+        "free_gpu_lookback_seconds": free_gpu_lookback_seconds,
+        "count": len(rows),
+        "distinct_sessions": len(by_session),
+        "herdr_skips": sum(
+            count for name, count in by_session.items() if name.startswith("herdr-")
+        ),
+        "herdr_sessions": len(herdr_sessions),
+        "skips_with_free_gpu": free_gpu,
+        "skips_with_free_gpu_idle_hint": free_gpu_idle_hint,
+        "skips_without_live_local_work": no_live_work,
+        "skips_without_live_local_work_idle_hint": no_live_work_idle_hint,
+        "releases": {
+            "count": sum(releases.values()),
+            "by_reason": dict(sorted(releases.items())),
+        },
+        "sessions": [
+            {"session": name, "skips": count}
+            for name, count in sessions[: max(0, session_limit)]
+        ],
+        "rows": rows,
     }
 
 
@@ -1171,6 +1440,15 @@ def measure(
         ),
         until=until,
     )
+    # AC2 before/after evidence (LP-0MVRMI5HK00558TB): cooldown skips and the
+    # subset taken while the proxy's own snapshot said the GPU was free.
+    # Additive block; a coverage gap is carried through so a partial window is
+    # reported as a gap instead of as zero skips.
+    prefill_thrash = analyse_prefill_thrash_skips(
+        log_dir, since=since, until=until
+    )
+    prefill_thrash["window_covered"] = bool(coverage.get("covered"))
+    prefill_thrash["coverage_gaps"] = len(coverage.get("gaps") or [])
     attribution = attribute_violations(
         metrics["saturated_without_live_work"]["rows"],
         events,
@@ -1221,6 +1499,7 @@ def measure(
         "coverage": coverage,
         "metrics": metrics,
         "abandonment_events": abandonment_events,
+        "prefill_thrash_cooldown": prefill_thrash,
         "attribution": attribution,
         "herdr_downtime_dispatches": dispatches,
         "verdict": verdict,
@@ -1259,7 +1538,35 @@ def write_artifacts(report: dict, out_dir: Path) -> list[Path]:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
-    return [out_dir / "measurement.json", out_dir / "measurement.txt", csv_path]
+    artifacts = [out_dir / "measurement.json", out_dir / "measurement.txt", csv_path]
+    # Additive artifact (LP-0MVRMI5HK00558TB AC2): one row per cooldown skip,
+    # with the free-GPU attribution columns, so the before/after count can be
+    # re-checked line by line. Existing artifacts are untouched.
+    thrash = report.get("prefill_thrash_cooldown") or {}
+    thrash_path = out_dir / "prefill_thrash_skips.csv"
+    with thrash_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "timestamp",
+                "session",
+                "provider",
+                "preference",
+                "cooldown_remaining_seconds",
+                "herdr",
+                "free_gpu",
+                "free_gpu_capacity_hint",
+                "free_gpu_poll_timestamp",
+                "no_live_local_work",
+                "no_live_local_work_capacity_hint",
+                "nearest_poll_timestamp",
+            ],
+        )
+        writer.writeheader()
+        for row in thrash.get("rows") or []:
+            writer.writerow(row)
+    artifacts.append(thrash_path)
+    return artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -1338,6 +1645,46 @@ def render(report: dict) -> str:
             f"{abandonment['count']} "
             f"({', '.join(f'{key}={value}' for key, value in abandonment['by_reason'].items()) or 'none'})"
         )
+    thrash = report.get("prefill_thrash_cooldown")
+    if thrash is not None:
+        if thrash.get("window_covered") is False:
+            out.append(
+                "prefill-thrash cooldown skips    : "
+                f"{thrash['count']} (WINDOW NOT FULLY COVERED — "
+                f"{thrash.get('coverage_gaps', 0)} gap(s); not a complete figure)"
+            )
+        else:
+            out.append(
+                "prefill-thrash cooldown skips    : "
+                f"{thrash['count']} (sessions={thrash['distinct_sessions']}, "
+                f"herdr={thrash['herdr_skips']}/{thrash['herdr_sessions']} sessions)"
+            )
+        out.append(
+            "  skips, no live local work     : "
+            f"{thrash['skips_without_live_local_work']} "
+            f"(capacity_hint=idle on the poll: "
+            f"{thrash['skips_without_live_local_work_idle_hint']}; relaxed "
+            "rule — the recorded 336 baseline)"
+        )
+        out.append(
+            "  skips while the GPU was free  : "
+            f"{thrash['skips_with_free_gpu']} "
+            f"(fresh poll, capacity_hint=idle: "
+            f"{thrash['skips_with_free_gpu_idle_hint']})"
+        )
+        releases = thrash.get("releases") or {}
+        out.append(
+            "  cooldown releases             : "
+            f"{releases.get('count', 0)} "
+            f"({', '.join(f'{k}={v}' for k, v in (releases.get('by_reason') or {}).items()) or 'none'})"
+        )
+        if thrash.get("sessions"):
+            worst = ", ".join(
+                f"{entry['session']}({entry['skips']})"
+                for entry in thrash["sessions"][:5]
+            )
+            out.append(f"  busiest sessions              : {worst}")
+        out.append(f"  free-GPU rule                 : {thrash['attribution_rule']}")
     no_slots = metrics["saturated_without_available_slots"]
     out.append(
         "saturated, available_slots=0    : "

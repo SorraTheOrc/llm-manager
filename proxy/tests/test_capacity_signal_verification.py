@@ -1054,14 +1054,18 @@ def test_write_artifacts_emits_json_text_and_attribution_csv(csv, tmp_path):
     out_dir = tmp_path / "artifacts"
     written = csv.write_artifacts(report, out_dir)
 
+    # LP-0MVRMI5HK00558TB AC2: the cooldown-skip CSV is an ADDITIONAL
+    # artifact; the pre-existing three keep their names and contents.
     assert sorted(path.name for path in written) == [
         "measurement.json",
         "measurement.txt",
+        "prefill_thrash_skips.csv",
         "saturated_without_live_work_attribution.csv",
     ]
     assert sorted(path.name for path in out_dir.iterdir()) == [
         "measurement.json",
         "measurement.txt",
+        "prefill_thrash_skips.csv",
         "saturated_without_live_work_attribution.csv",
     ]
     payload = json.loads((out_dir / "measurement.json").read_text())
@@ -1177,3 +1181,270 @@ def test_bulk_eviction_keeps_one_event_per_session(csv, tmp_path):
     )
 
     assert [event["session"] for event in events] == ["s1", "s2", "s3"]
+
+
+# ---------------------------------------------------------------------------
+# Post-deadline prefill-thrash cooldown skips (LP-0MVT2KVVS002YZT8)
+#
+# Parent LP-0MVRMI5HK00558TB AC2 needs the before/after numbers to come from the
+# same tool invocation shape as everything else; the 916-skip / 336-free-GPU
+# baseline was derived with ad-hoc greps. The block is strictly additive: every
+# existing metric keeps its name, definition and JSON shape.
+# ---------------------------------------------------------------------------
+
+
+def cooldown_skip_line(
+    ts: str,
+    *,
+    session: str = "s1",
+    provider: str = "local-llama",
+    preference: str = "prefer-local",
+    cooldown_seconds: int = 540,
+) -> str:
+    """One ``routing_skip_local reason=prefill_thrash_cooldown`` log line."""
+    return (
+        f"{ts},000 - INFO - routing_skip_local provider={provider} "
+        f"model=Qwen3 session={session} preference={preference} "
+        f"cooldown_remaining={cooldown_seconds}s "
+        "reason=prefill_thrash_cooldown → skipping local, routing to next "
+        "remote provider\n"
+    )
+
+
+def cooldown_released_line(ts: str, *, session: str = "s1", reason: str = "free_gpu") -> str:
+    """The release line a free-GPU (or other) release writes."""
+    return (
+        f"{ts},000 - INFO - prefill_thrash_cooldown_released session={session} "
+        f"reason={reason} cooldown_remaining=300s endpoint=default\n"
+    )
+
+
+WINDOW = {
+    "since": dt.datetime(2026, 10, 24, 20, 0),
+    "until": dt.datetime(2026, 10, 25, 7, 0),
+}
+
+
+def test_prefill_thrash_skips_counted_with_herdr_split(csv, tmp_path):
+    """Total skips, distinct sessions, and the ``herdr-*`` subset."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        cooldown_skip_line("2026-10-24 23:39:17", session="herdr-a")
+        + cooldown_skip_line("2026-10-24 23:40:17", session="herdr-a")
+        + cooldown_skip_line("2026-10-25 00:00:49", session="herdr-b")
+        + cooldown_skip_line("2026-10-25 01:00:00", session="agent-x"),
+    )
+
+    thrash = csv.analyse_prefill_thrash_skips(log_dir, **WINDOW)
+
+    assert thrash["count"] == 4
+    assert thrash["distinct_sessions"] == 3
+    assert thrash["herdr_skips"] == 3
+    assert thrash["herdr_sessions"] == 2
+    assert thrash["sessions"][0] == {"session": "herdr-a", "skips": 2}
+    # The remaining fields are read off the line, not guessed.
+    assert thrash["rows"][0]["provider"] == "local-llama"
+    assert thrash["rows"][0]["cooldown_remaining_seconds"] == 540
+
+
+def test_prefill_thrash_skip_free_gpu_attribution(csv, tmp_path):
+    """The free-GPU rule: nearest preceding poll within 120 s must be fresh
+    and show no live local work; the ``idle`` hint is a sub-count."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        # skip 1: nearest poll 5 s earlier, fresh, nothing in flight, idle
+        status_line(
+            "2026-10-24 23:39:12", hint="idle", detail_stale="false", in_flight=0
+        )
+        + cooldown_skip_line("2026-10-24 23:39:17", session="herdr-a")
+        # skip 2: nearest poll 10 s earlier, fresh, nothing in flight, but
+        # abandoned_busy (not idle) -> counts as free, not as idle-hint
+        + status_line(
+            "2026-10-24 23:40:10",
+            hint="abandoned_busy",
+            detail_stale="false",
+            in_flight=0,
+        )
+        + cooldown_skip_line("2026-10-24 23:40:20", session="herdr-a")
+        # skip 3: nearest poll shows live work -> NOT a free-GPU skip
+        + status_line(
+            "2026-10-24 23:41:00", hint="saturated", detail_stale="false", in_flight=1
+        )
+        + cooldown_skip_line("2026-10-24 23:41:05", session="agent-x")
+        # skip 4: nearest poll is stale detail -> NOT a free-GPU skip
+        + status_line(
+            "2026-10-24 23:42:00", hint="idle", detail_stale="true", in_flight=0
+        )
+        + cooldown_skip_line("2026-10-24 23:42:05", session="agent-y")
+        # skip 5: nearest poll is 130 s older than the lookback -> NOT counted
+        + status_line(
+            "2026-10-24 23:44:00", hint="idle", detail_stale="false", in_flight=0
+        )
+        + cooldown_skip_line("2026-10-24 23:46:10", session="agent-z"),
+    )
+
+    thrash = csv.analyse_prefill_thrash_skips(log_dir, **WINDOW)
+
+    assert thrash["count"] == 5
+    # Strict rule (parent Appendix): fresh poll AND nothing in flight.
+    assert thrash["skips_with_free_gpu"] == 2
+    assert thrash["skips_with_free_gpu_idle_hint"] == 1
+    # Relaxed rule (the population the recorded 336 baseline came from): the
+    # stale-detail poll is included, so three skips have no live local work.
+    assert thrash["skips_without_live_local_work"] == 3
+    assert thrash["skips_without_live_local_work_idle_hint"] == 2
+    assert [row["free_gpu"] for row in thrash["rows"]] == [
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert [row["no_live_local_work"] for row in thrash["rows"]] == [
+        True,
+        True,
+        False,
+        True,
+        False,
+    ]
+    # Both rules are stated in the report so the numbers are re-derivable.
+    assert "local_in_flight_requests=0" in thrash["attribution_rule"]
+    assert "slots_detail_stale=false" in thrash["attribution_rule"]
+    assert "relaxed" in thrash["attribution_rule"]
+    assert "120s" in thrash["attribution_rule"]
+    assert thrash["free_gpu_lookback_seconds"] == 120.0
+
+
+def test_prefill_thrash_skip_before_any_poll_is_not_attributed(csv, tmp_path):
+    """A skip with no preceding poll (head of the window) is never guessed."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        cooldown_skip_line("2026-10-24 20:00:01", session="herdr-a")
+        + status_line(
+            "2026-10-24 20:00:30", hint="idle", detail_stale="false", in_flight=0
+        ),
+    )
+
+    thrash = csv.analyse_prefill_thrash_skips(log_dir, **WINDOW)
+
+    assert thrash["count"] == 1
+    assert thrash["skips_with_free_gpu"] == 0
+
+
+def test_prefill_thrash_releases_counted_by_reason(csv, tmp_path):
+    """Releases are counted by reason; an older window with no release line
+    reads zero releases rather than failing."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        cooldown_skip_line("2026-10-24 23:00:00", session="s1")
+        + cooldown_released_line("2026-10-24 23:01:00", reason="free_gpu")
+        + cooldown_released_line("2026-10-24 23:02:00", reason="free_gpu")
+        + cooldown_released_line("2026-10-24 23:03:00", reason="comparable_success"),
+    )
+
+    thrash = csv.analyse_prefill_thrash_skips(log_dir, **WINDOW)
+
+    assert thrash["releases"] == {
+        "count": 3,
+        "by_reason": {"comparable_success": 1, "free_gpu": 2},
+    }
+
+    # Older logs: no release line at all -> zero, not an error.
+    bare = tmp_path / "bare"
+    write_log(bare / "proxy.log", cooldown_skip_line("2026-10-24 23:00:00"))
+    assert csv.analyse_prefill_thrash_skips(bare, **WINDOW)["releases"] == {
+        "count": 0,
+        "by_reason": {},
+    }
+
+
+def test_prefill_thrash_skips_window_and_rotation(csv, tmp_path):
+    """Same per-line window semantics as every other metric, and gzip/rotated
+    files are read (the file name never bounds its content)."""
+    log_dir = tmp_path / "logs"
+    # In-window lines inside a .gz whose name says another hour, plus an
+    # out-of-window line in a plain file.
+    write_log(
+        log_dir / "proxy.log-2026-10-24_23.gz",
+        cooldown_skip_line("2026-10-24 23:30:00", session="herdr-a")
+        + cooldown_skip_line("2026-10-25 07:00:00", session="herdr-a"),
+    )
+    write_log(
+        log_dir / "proxy.log-2026-10-25_00",
+        cooldown_skip_line("2026-10-25 00:10:00", session="herdr-b")
+        + cooldown_skip_line("2026-10-24 19:59:59", session="herdr-b"),
+    )
+
+    thrash = csv.analyse_prefill_thrash_skips(log_dir, **WINDOW)
+
+    assert thrash["count"] == 2
+    assert thrash["distinct_sessions"] == 2
+
+
+def test_prefill_thrash_block_is_additive_and_carries_coverage(csv, tmp_path):
+    """The block is a new key; existing metrics keep their shape, and a
+    coverage gap is carried into the block instead of reading as zero skips."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        status_line("2026-10-23 00:00:01", hint="idle", detail_stale="false", in_flight=0)
+        + dispatch_line("2026-10-23 00:00:02", session="s1")
+        + cooldown_skip_line("2026-10-23 00:00:03", session="herdr-a"),
+    )
+
+    # The window starts a day before the retained data: a hard head gap, so
+    # the coverage verdict must say the window is not fully covered.
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 22, 0, 0),
+        until=dt.datetime(2026, 10, 23, 6, 0),
+        dispatch_log=None,
+    )
+
+    # Existing shapes untouched.
+    assert report["metrics"]["status_polls"] == 1
+    assert report["metrics"]["local_dispatches"]["count"] == 1
+    assert report["metrics"]["saturated_without_live_work"]["count"] == 0
+    assert set(report["abandonment_events"]) == {"count", "by_reason"}
+
+    thrash = report["prefill_thrash_cooldown"]
+    assert thrash["count"] == 1
+    assert thrash["window_covered"] is False
+    assert thrash["coverage_gaps"] >= 1
+    assert "not a complete figure" in csv.render(report)
+
+
+def test_prefill_thrash_csv_artifact_is_additional(csv, tmp_path):
+    """The per-skip CSV is written alongside the existing artifacts."""
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        status_line(
+            "2026-10-23 00:00:10", hint="idle", detail_stale="false", in_flight=0
+        )
+        + cooldown_skip_line("2026-10-23 00:00:20", session="herdr-a"),
+    )
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 0, 30),
+        dispatch_log=None,
+    )
+
+    out_dir = tmp_path / "artifacts"
+    csv.write_artifacts(report, out_dir)
+
+    rows = (out_dir / "prefill_thrash_skips.csv").read_text().splitlines()
+    assert rows[0] == (
+        "timestamp,session,provider,preference,cooldown_remaining_seconds,"
+        "herdr,free_gpu,free_gpu_capacity_hint,free_gpu_poll_timestamp,"
+        "no_live_local_work,no_live_local_work_capacity_hint,"
+        "nearest_poll_timestamp"
+    )
+    assert len(rows) == 2
+    assert "herdr-a" in rows[1]
+    assert ",True,True,idle," in rows[1]
