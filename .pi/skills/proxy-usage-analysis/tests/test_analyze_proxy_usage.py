@@ -8005,6 +8005,244 @@ class TestResidencyAdmission:
 
 
 # ---------------------------------------------------------------------------
+# Residency measurement provenance: grammar + report breakdown
+# (LP-0MVT2PF1C008LAPB — parent LP-0MVRZXPH70025ZNR AC3(v) / AC4)
+# ---------------------------------------------------------------------------
+
+PENDING_MEASUREMENT_GRAMMAR = (
+    "pending LP-0MVT2QHMU0008F2V (usage-report measurement breakdown: "
+    "log_parser measurement= field) + LP-0MVT2Q1SD009JLKD (measurement= "
+    "vocabulary emitted by the proxy)"
+)
+PENDING_REPORT_BREAKDOWN = (
+    "pending LP-0MVT2QHMU0008F2V (usage-report measurement breakdown in the "
+    "residency section)"
+)
+
+#: The closed ``measurement=`` vocabulary values these fixtures exercise.
+MEASURED = "measured"
+NO_PRIOR = "unavailable:no_prior_measurement"
+NO_SLOT = "unavailable:no_slot"
+CAPTURE_DISABLED = "unavailable:capture_disabled"
+
+
+class TestResidencyMeasurementProvenance:
+    """The additive ``measurement=`` grammar and its report breakdown.
+
+    The parent defect (LP-0MVRZXPH70025ZNR) is that every residency decision
+    logs ``n_past_actual=none`` / ``reuse_ratio=none``, so the usage report
+    shows ``3607`` decisions with ``0`` measured and the AC4 reuse rule can
+    never fire — while an unmeasurable decision and a measurable-but-unmeasured
+    one look identical. The fix adds an additive ``measurement=`` field
+    (``measured`` / ``unavailable:<reason>``) and reports the split, so
+    "decisions logged but all unmeasured" is a visible finding.
+
+    Red-first: the assertions that describe the new field/section are marked
+    ``xfail(strict=True)`` naming the implementation child that turns them
+    green, so the tree stays green for the dev-push gate. The pre-change
+    grammar assertions run unmarked — they are the backward-compatibility
+    guarantee the change must not break.
+    """
+
+    @staticmethod
+    def _section(md: str) -> str:
+        return md.split("## Residency-aware admission", 1)[1].split("\n## ", 1)[0]
+
+    def _summary(self, lines: list[str]) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events([fixtures.STREAM_STARTED_LOCAL, *lines,
+                     fixtures.STREAM_FINISHED_LOCAL]),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+
+    def _all_unmeasured_summary(self) -> aggregation.AnalysisResult:
+        return self._summary(
+            [
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_CAPTURE_DISABLED,
+            ]
+        )
+
+    # -- grammar -----------------------------------------------------------
+
+    @pytest.mark.xfail(strict=True, reason=PENDING_MEASUREMENT_GRAMMAR)
+    def test_parser_reads_measured_provenance(self):
+        """AC: a ``measurement=measured`` line parses to the literal value."""
+        ev = log_parser.parse_log_line(fixtures.ROUTING_RESIDENT_PREFIX_MEASURED)
+
+        assert ev.kind == "residency_decision"
+        assert ev.measurement == MEASURED
+        assert ev.residency_source == "measured_last_dispatch"
+        assert ev.reuse_ratio == pytest.approx(0.611)
+
+    @pytest.mark.xfail(strict=True, reason=PENDING_MEASUREMENT_GRAMMAR)
+    def test_parser_reads_unavailable_reason_verbatim(self):
+        """AC: an unmeasured decision carries its closed-vocabulary reason.
+
+        The reason is parsed verbatim (``unavailable:<detail>``), never
+        collapsed to a bare ``none`` or an empty string, and it accompanies an
+        absent — not fabricated — ratio.
+        """
+        ev = log_parser.parse_log_line(
+            fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR
+        )
+
+        assert ev.measurement == NO_PRIOR
+        assert ev.n_past_actual is None
+        assert ev.reuse_ratio is None
+        assert ev.residency_source == "session_slot"
+
+    @pytest.mark.xfail(strict=True, reason=PENDING_MEASUREMENT_GRAMMAR)
+    @pytest.mark.parametrize(
+        "line,reason",
+        [
+            (fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT, NO_SLOT),
+            (fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR, NO_PRIOR),
+            (
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_CAPTURE_DISABLED,
+                CAPTURE_DISABLED,
+            ),
+        ],
+        ids=["no_slot", "no_prior_measurement", "capture_disabled"],
+    )
+    def test_each_unmeasured_reason_is_distinguishable(self, line, reason):
+        """AC2: every unmeasured cause has its own value, not a shared ``none``."""
+        ev = log_parser.parse_log_line(line)
+
+        assert ev.measurement == reason
+        assert ev.reuse_ratio is None
+
+    def test_reuse_ratio_none_still_maps_to_none(self):
+        """Parent constraint: ``reuse_ratio=none`` was never 0, and stays ``None``.
+
+        This holds on the new grammar too, so the additive field changes no
+        existing consumer (LP-0MVNPZY22008B536's guarantee).
+        """
+        ev = log_parser.parse_log_line(
+            fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT
+        )
+
+        assert ev.reuse_ratio is None
+        assert ev.n_past_actual is None
+        assert ev.decision == "resident_prefix_insufficient"
+
+    def test_legacy_line_parses_unchanged(self):
+        """AC: a pre-change line (no ``measurement=``) keeps every old field."""
+        ev = log_parser.parse_log_line(fixtures.ROUTING_RESIDENT_PREFIX_LEGACY)
+
+        assert ev.kind == "residency_decision"
+        assert ev.decision == "admit"
+        assert ev.n_past_actual == 49103
+        assert ev.estimated_tokens == 49103
+        assert ev.reuse_ratio == pytest.approx(1.0)
+        assert ev.residency_source == "measured"
+
+    @pytest.mark.xfail(strict=True, reason=PENDING_MEASUREMENT_GRAMMAR)
+    def test_legacy_line_has_no_measurement_value(self):
+        """AC: an absent ``measurement=`` field reads ``None``, never fabricated.
+
+        Old log files must not be reclassified: a line that predates the field
+        has no provenance, so ``measurement`` is ``None`` rather than a
+        ``measured``/``unavailable:*`` claim the line never made.
+        """
+        measured = log_parser.parse_log_line(fixtures.ROUTING_RESIDENT_PREFIX_LEGACY)
+        unmeasured = log_parser.parse_log_line(
+            fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_UNMEASURED
+        )
+
+        assert measured.measurement is None
+        assert unmeasured.measurement is None
+
+    # -- report section ----------------------------------------------------
+
+    def test_section_reports_measured_and_unmeasured_counts(self):
+        """AC: the section keeps reporting measured vs unmeasured decision counts.
+
+        Passes on the pre-change grammar and must keep passing: the split is
+        the existing contract, and the additive field only refines it.
+        """
+        summary = self._summary(
+            [
+                fixtures.ROUTING_RESIDENT_PREFIX_MEASURED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_CAPTURE_DISABLED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_UNMEASURED,
+            ]
+        )
+        section = self._section(reporting.build_report(summary, None))
+
+        assert "(measured ratio: 2, no measurement: 4)" in section
+
+    @pytest.mark.xfail(strict=True, reason=PENDING_REPORT_BREAKDOWN)
+    def test_section_breaks_down_unmeasured_reasons(self):
+        """AC: the section shows a per-reason unmeasured breakdown.
+
+        "unmeasurable" is not one condition: no slot to measure, no prior
+        measurement for the pair, and capture switched off are three different
+        operator problems with three different remedies. Each must appear with
+        its own count instead of hiding behind a single "no measurement" total.
+        """
+        summary = self._all_unmeasured_summary()
+        section = self._section(reporting.build_report(summary, None))
+
+        for reason in (NO_PRIOR, NO_SLOT, CAPTURE_DISABLED):
+            rows = [ln for ln in section.splitlines() if reason in ln]
+            assert rows, f"per-reason breakdown must name {reason}"
+            assert any("1" in ln for ln in rows), (
+                f"the {reason} breakdown must carry its count"
+            )
+
+    @pytest.mark.xfail(strict=True, reason=PENDING_REPORT_BREAKDOWN)
+    def test_all_unmeasured_window_is_a_visible_finding(self):
+        """AC: an all-unmeasured window states the finding, not a silent zero.
+
+        The exact 3607/0 production condition (LP-0MVRZXPH70025ZNR): rendering
+        ``measured ratio: 0`` is silently ambiguous — it reads as a quiet window
+        rather than a broken measurement ladder. The section must say so.
+        """
+        summary = self._all_unmeasured_summary()
+        section = self._section(reporting.build_report(summary, None))
+
+        findings = [
+            ln
+            for ln in section.splitlines()
+            if re.search(r"\ball\b[^\n]*unmeasured", ln, re.IGNORECASE)
+        ]
+        assert findings, "an all-unmeasured window must render an explicit finding"
+        # The finding is its own line, not the counts bullet restated.
+        assert any("Residency decisions:" not in ln for ln in findings)
+        # And the window is still counted truthfully.
+        assert "(measured ratio: 0, no measurement: 3)" in section
+
+    # -- aggregation -------------------------------------------------------
+
+    def test_legacy_window_counters_unchanged(self):
+        """AC: old-format fixtures produce the same residency counters as before.
+
+        ``summary_to_json`` is a downstream consumer: the change must not
+        reclassify, double-count or drop a legacy decision.
+        """
+        summary = self._summary(
+            [
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_UNMEASURED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_TENANT,
+            ]
+        )
+        counters = reporting.summary_to_json(summary)
+
+        assert counters["residency_decisions"] == 3
+        assert counters["residency_resident_admits"] == 1
+        assert counters["residency_evicted_denials"] == 1
+        assert counters["residency_tenant_limit_denials"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Explicit no-usage marker (LP-0MVMBM6N400541EH)
 # ---------------------------------------------------------------------------
 
