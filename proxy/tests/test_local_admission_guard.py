@@ -58,7 +58,7 @@ import proxy.provider as provider
 import pytest
 from fastapi import Response
 
-from proxy import contention_queue, prefill_eta
+from proxy import admission_reserve, contention_queue, prefill_eta
 
 
 class _DummyRequest:
@@ -1902,6 +1902,175 @@ def test_one_verdict_log_line_per_refusal(caplog):
     assert fields.get("preference"), (
         f"the line must name the intent that produced the refusal; got {fields!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The 2026-10-28 incident, end-to-end (LP-0MVSHXTX1007D58Z AC2)
+#
+# The refusal body contract above is pinned at builder level. This section
+# replays the *whole* request through ``proxy_with_fallback`` with the numbers
+# the incident log line recorded, because the regression that mattered was not
+# the payload but the routing: a fits-local, ``local-preferred`` request was
+# handed to a paid provider.
+#
+# Only this section pins literal numbers (taken from the log line); every other
+# row in the suite derives its expectations from config plus the projection.
+# ---------------------------------------------------------------------------
+
+#: The priced own-ETA of the incident request: it fits the 60 s wait budget.
+INCIDENT_DEFERRAL_ETA_SECONDS = 31.7
+#: The projection with one occupant ahead of it: it does not.
+INCIDENT_DEFERRAL_PROJECTED_WAIT_SECONDS = 63.4
+#: The wait budget the caller allowed.
+INCIDENT_DEFERRAL_BUDGET_SECONDS = 60.0
+#: New (uncached) tokens the guard priced — far inside the cold-prefill cap.
+INCIDENT_DEFERRAL_NEW_TOKENS = 6_627
+#: The flat cold-prefill cap in force, so the cap cannot be what refused it.
+INCIDENT_DEFERRAL_BUDGET_TOKENS = 25_000
+#: ``ceil(63.4 - 60.0)``: how much longer than the budget the wait was.
+INCIDENT_DEFERRAL_RETRY_AFTER = 4
+
+_INCIDENT_DEFERRAL_CASE = _OccupancyRefusalCase(
+    reason="eta_exceeds_budget",
+    path="queue",
+    eta_prefill_seconds=INCIDENT_DEFERRAL_ETA_SECONDS,
+    projected_wait_seconds=INCIDENT_DEFERRAL_PROJECTED_WAIT_SECONDS,
+    budget_seconds=INCIDENT_DEFERRAL_BUDGET_SECONDS,
+    expected_retry_after=INCIDENT_DEFERRAL_RETRY_AFTER,
+)
+
+
+async def _issue_2026_10_28_incident(mixed_model_config) -> tuple:
+    """Replay the incident request; return ``(response, dispatches)``.
+
+    One occupied local slot (the request queued behind a single in-flight
+    prefill), one remote provider available, and a ``local-preferred`` client.
+    """
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    config = _queue_cfg(
+        local_cold_prefill_budget_tokens=INCIDENT_DEFERRAL_BUDGET_TOKENS,
+        contention_queue_max_wait_seconds=INCIDENT_DEFERRAL_BUDGET_SECONDS,
+    )
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_DEFERRAL_NEW_TOKENS),
+        _fixed_wait_projection(_INCIDENT_DEFERRAL_CASE),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"x-local-preference": "local-preferred"}),
+            "v1/chat/completions",
+            mixed_model_config,
+            config,
+        )
+    return result, calls
+
+
+@pytest.mark.asyncio
+async def test_2026_10_28_incident_is_deferred_and_never_moved_remote(
+    mixed_model_config,
+):
+    """AC2: the incident numbers defer and refuse, with **zero** remote dispatch.
+
+    ``eta_prefill_s=31.7`` fits the 60 s budget, so the request is genuinely
+    fits-local: waiting can help, the verdict is ``deferrable``, and a
+    ``local-preferred`` client must be deferred rather than promoted to a paid
+    provider. The refusal is the retryable 429, timed from the *projection*
+    (``ceil(63.4 - 60) = 4 s``) and echoing the incident's own token evidence —
+    the numbers a client needs to decide between retrying and compacting.
+    """
+    result, calls = await _issue_2026_10_28_incident(mixed_model_config)
+
+    assert calls == [], (
+        "the incident request is fits-local and local-preferred: it must never "
+        f"be dispatched anywhere (dispatched={calls})"
+    )
+    assert result.status_code == 429, f"got {result.status_code}"
+    assert result.headers.get("X-Local-Route") == "refused"
+    assert result.headers.get("X-Local-Fallback-Reason") == (
+        _INCIDENT_DEFERRAL_CASE.reason
+    )
+
+    body = json.loads(result.body)
+    # The verdict comes from the production classifier, never a literal: a
+    # rename in the owning item fails here instead of drifting.
+    assert (
+        admission_reserve.local_capacity_verdict(reason=body["reason"]).verdict
+        == admission_reserve.CAPACITY_DEFERRABLE
+    ), f"a temporal wait is never too_large; got reason={body['reason']!r}"
+    assert body["verdict"] == admission_reserve.CAPACITY_DEFERRABLE
+    assert body["verdict"] in admission_reserve.CAPACITY_VERDICTS
+
+    # Retryable, with the incident's own arithmetic and an absolute instant.
+    assert body["retryable"] is True
+    assert body["retry_after"] == INCIDENT_DEFERRAL_RETRY_AFTER
+    assert result.headers.get("Retry-After") == str(INCIDENT_DEFERRAL_RETRY_AFTER)
+    retry_at = _parse_rfc3339_utc(body["retry_at"])
+    expected_at = datetime.now(UTC) + timedelta(
+        seconds=INCIDENT_DEFERRAL_RETRY_AFTER
+    )
+    assert abs((retry_at - expected_at).total_seconds()) <= (
+        RETRY_AT_TOLERANCE_SECONDS
+    ), "retry_at must be now + Retry-After"
+
+    # The incident's own evidence, echoed unchanged (never recomputed).
+    assert body["new_tokens"] == INCIDENT_DEFERRAL_NEW_TOKENS
+    assert body["budget_tokens"] == INCIDENT_DEFERRAL_BUDGET_TOKENS
+    assert body["projected_wait_seconds"] == pytest.approx(
+        INCIDENT_DEFERRAL_PROJECTED_WAIT_SECONDS
+    )
+    assert body["budget_seconds"] == pytest.approx(INCIDENT_DEFERRAL_BUDGET_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_2026_10_28_incident_is_pinned_not_reported_as_a_dead_end(
+    mixed_model_config, caplog
+):
+    """AC2: the incident is reported as a pin refusal, not as chain exhaustion.
+
+    The incident surfaced as an exhaustion error, which reads as a dead end to
+    an operator and to a client's retry logic. This refusal is produced *before*
+    the queue (the projection already exceeds the budget), so the pin held and
+    the single per-request outcome line reports ``outcome=pinned`` — the queue
+    exits that spend the wait budget report ``outcome=deferred`` instead. Either
+    way the refusal is attributable in ``proxy.log`` and is explicitly not a
+    genuinely exhausted chain.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+
+    result, _calls = await _issue_2026_10_28_incident(mixed_model_config)
+
+    body = json.loads(result.body)
+    assert body["error"] == "Local admission refused", (
+        f"the incident was a local pin refusal, not chain exhaustion; got "
+        f"error={body['error']!r}"
+    )
+    assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+    assert b"All providers exhausted" not in result.body
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("local_preference_resolved ")
+    ]
+    assert len(lines) == 1, f"one outcome line per request; got {lines!r}"
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("outcome") == provider.LOCAL_ROUTING_OUTCOME_PINNED, (
+        f"the pin held, so the outcome line must say so; got {lines[0]!r}"
+    )
+    assert fields.get("outcome") in provider.LOCAL_ROUTING_OUTCOMES
+    assert fields.get("reason") == _INCIDENT_DEFERRAL_CASE.reason
 
 
 async def _issue_guard_refusal(

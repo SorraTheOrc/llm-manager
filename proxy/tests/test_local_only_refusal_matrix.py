@@ -1,6 +1,14 @@
-"""Local-only refusal matrix: one row per exit from the local route.
+"""Local-pinned refusal matrix (``local-preferred``, legacy ``local-only`` alias):
+one row per exit from the local route, plus the cross-cutting behaviour matrix.
 
 LP-0MVRMC0Z500883O0 (child of LP-0MVNU2KTK009D4AG, AC1/AC2/AC3/AC6).
+
+The file keeps its historical name (``test_local_only_refusal_matrix.py``): a
+rename would break the citations in ``proxy/docs/routing.md``, in the sibling
+work items and in ``test_local_admission_retry_docs.py`` for no behavioural
+gain (LP-0MVSHXTX1007D58Z planning decision 2). ``local-only`` is the deployed
+legacy alias of the canonical ``local-preferred`` value, and every row below is
+asserted for both spellings.
 
 The contract under test is one sentence: with ``X-Local-Preference: local-only``
 a request either completes **locally** or receives the local-only refusal — it
@@ -62,7 +70,7 @@ import re
 import time
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -449,6 +457,10 @@ def _row_patches(row: _ExitRow) -> list:
     elif trigger in ("local_error_status", "local_empty_response"):
         # Post-dispatch failures: the shared patches already leave a free slot
         # so the loop discovers the failure at the dispatch itself.
+        pass
+    elif trigger == HEALTHY_FREE_SLOT:
+        # The healthy baseline: no exit to take, no row-specific patch. Named
+        # here so a new trigger cannot silently reuse it.
         pass
     else:  # pragma: no cover - a new row must name its trigger
         raise AssertionError(f"unknown local-route exit trigger {trigger!r}")
@@ -1340,12 +1352,13 @@ def _expected_queue_remainder(row: _ExitRow) -> int:
 
 
 async def _issue_with_chain(
-    row: _ExitRow, preference: str, model_config: dict
+    row: _ExitRow, preference: str | None, model_config: dict
 ) -> tuple:
     """Issue *row*'s request against an explicit *model_config*.
 
     Mirrors :func:`_issue` (same row fixtures/patches) so a row can be run
-    against a chain that has no remote entry at all.
+    against a chain that has no remote entry at all. *preference* ``None``
+    sends no ``X-Local-Preference`` header (the absent baseline).
     """
     calls: list[str] = []
 
@@ -1369,8 +1382,11 @@ async def _issue_with_chain(
         stack.enter_context(patch("proxy.provider.request_priority", return_value="low"))
         for ctx in _row_patches(row):
             stack.enter_context(ctx)
+        headers = (
+            {} if preference is None else {"X-Local-Preference": preference}
+        )
         result = await provider.proxy_with_fallback(
-            _DummyRequest(headers={"X-Local-Preference": preference}),
+            _DummyRequest(headers=headers),
             "v1/chat/completions",
             model_config,
             _config(row),
@@ -1610,3 +1626,332 @@ async def test_every_row_logs_exactly_one_outcome_line(
         f"{row.exit_description}: expected reason={expected_reason}, got "
         f"{fields.get('reason')!r}. Line: {lines[0]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The behaviour matrix (LP-0MVSHXTX1007D58Z)
+#
+# One table for the whole contract: for every (preference, slot state, capacity
+# verdict) combination a client can hit, the matrix states what it observes —
+# HTTP status, ``X-Local-Route``, the ``X-Provider`` that served it, whether
+# *anything* was dispatched upstream, and, for a deferral, the retry story.
+#
+# The rows cite the exit fixtures above (``exit_trigger``) instead of restating
+# what each exit means: those tables own "how local became unavailable", this
+# one owns "what the client sees". Deep per-exit coverage (queue invariants,
+# one-line-per-request logging, the single verdict source) stays in the
+# sections above; the matrix is the cross-cutting summary, so a red parameter
+# names the behaviour that broke rather than an implementation detail (AC4).
+#
+# Two baseline rows (an absent header and ``prefer-local`` on a healthy local
+# route) additionally assert *byte-compatibility*: a client that never asked
+# for pin-local behaviour keeps today's response shape, with no ``retryable``
+# or ``verdict`` field invented for it (parent AC5).
+# ---------------------------------------------------------------------------
+
+#: Pseudo-trigger for the healthy route: a local entry, a free slot, no exit at
+#: all — the unchanged baseline the preference work must not disturb.
+HEALTHY_FREE_SLOT = "healthy_free_slot"
+
+_HEALTHY_ROW = _ExitRow(
+    trigger=HEALTHY_FREE_SLOT,
+    token="",
+    expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
+    exit_description="a healthy local route with a free slot",
+    concurrency=(0, 1),
+)
+
+
+@dataclass(frozen=True)
+class _BehaviourMatrixRow:
+    """One row of the local-preference behaviour matrix.
+
+    Every field is an *observation* (what the client sees), never a mechanism:
+    the mechanism is the exit fixture the row points at.
+    """
+
+    #: Parametrisation id, composed ``preference-slot-outcome`` so a red row
+    #: reads as behaviour (AC4).
+    behaviour: str
+    #: Wire value sent in ``X-Local-Preference``; ``None`` = header absent.
+    preference: str | None
+    #: The exit fixture the row runs against (or :data:`HEALTHY_FREE_SLOT`).
+    exit_trigger: str = HEALTHY_FREE_SLOT
+    #: Slot-state override; ``None`` keeps the exit fixture's own state.
+    concurrency: tuple[int, int] | None = None
+    #: Serve from a chain with no remote entry at all (a ``private`` model).
+    remote_less_chain: bool = False
+    expected_status: int = 200
+    expected_route: str = "local"
+    #: ``X-Provider`` of the served response; ``None`` when nothing served.
+    expected_provider: str | None = LOCAL_PROVIDER_NAME
+    #: Ordered upstream dispatches: ``("remote",)`` proves remote dispatch,
+    #: ``("local",)`` proves a local serve, ``()`` proves nothing dispatched.
+    expected_dispatches: tuple[str, ...] = ()
+    #: Refusal contract: the body ``reason`` and the body ``verdict``.
+    #: ``None`` reason = the row is served, not refused (and every refusal row
+    #: here is deferrable, so its retry story is asserted in the test).
+    expected_refusal_reason: str | None = None
+    expected_verdict: str | None = None
+
+
+_BEHAVIOUR_MATRIX = (
+    pytest.param(
+        _BehaviourMatrixRow(
+            behaviour="prefer-local-free-slot-serves-local",
+            preference=PREFER_LOCAL,
+            expected_dispatches=("local",),
+        ),
+        id="prefer-local-free-slot-serves-local",
+    ),
+    pytest.param(
+        _BehaviourMatrixRow(
+            behaviour="absent-free-slot-serves-local",
+            preference=None,
+            expected_dispatches=("local",),
+        ),
+        id="absent-free-slot-serves-local",
+    ),
+    pytest.param(
+        _BehaviourMatrixRow(
+            behaviour="prefer-local-busy-deferrable-falls-through-remote",
+            preference=PREFER_LOCAL,
+            exit_trigger="chain_cooldown",
+            concurrency=(1, 1),
+            expected_route="remote",
+            expected_provider=REMOTE_PROVIDER_NAME,
+            expected_dispatches=("remote",),
+        ),
+        id="prefer-local-busy-deferrable-falls-through-remote",
+    ),
+    pytest.param(
+        _BehaviourMatrixRow(
+            behaviour="remote-ok-free-slot-strips-local",
+            preference=REMOTE_OK,
+            expected_route="remote",
+            expected_provider=REMOTE_PROVIDER_NAME,
+            expected_dispatches=("remote",),
+        ),
+        id="remote-ok-free-slot-strips-local",
+    ),
+    pytest.param(
+        _BehaviourMatrixRow(
+            behaviour="local-preferred-free-slot-serves-local",
+            preference=LOCAL_PREFERRED,
+            expected_dispatches=("local",),
+        ),
+        id="local-preferred-free-slot-serves-local",
+    ),
+    pytest.param(
+        _BehaviourMatrixRow(
+            behaviour="local-preferred-busy-deferrable-refuses",
+            preference=LOCAL_PREFERRED,
+            exit_trigger="queue_wait_expiry",
+            expected_status=429,
+            expected_route="refused",
+            expected_provider=None,
+            expected_dispatches=(),
+            expected_refusal_reason="fallback_after_queue",
+            expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
+        ),
+        id="local-preferred-busy-deferrable-refuses",
+    ),
+    pytest.param(
+        _BehaviourMatrixRow(
+            behaviour="local-preferred-busy-too-large-promotes-remote",
+            preference=LOCAL_PREFERRED,
+            exit_trigger="entry_context_cap",
+            concurrency=(1, 1),
+            expected_route="remote",
+            expected_provider=REMOTE_PROVIDER_NAME,
+            expected_dispatches=("remote",),
+        ),
+        id="local-preferred-busy-too-large-promotes-remote",
+    ),
+    pytest.param(
+        _BehaviourMatrixRow(
+            behaviour="local-only-legacy-busy-deferrable-refuses",
+            preference=LOCAL_ONLY,
+            exit_trigger="queue_wait_expiry",
+            expected_status=429,
+            expected_route="refused",
+            expected_provider=None,
+            expected_dispatches=(),
+            expected_refusal_reason="fallback_after_queue",
+            expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
+        ),
+        id="local-only-legacy-busy-deferrable-refuses",
+    ),
+    pytest.param(
+        _BehaviourMatrixRow(
+            behaviour="local-preferred-remote-less-chain-still-defers",
+            preference=LOCAL_PREFERRED,
+            exit_trigger="queue_wait_expiry",
+            remote_less_chain=True,
+            expected_status=429,
+            expected_route="refused",
+            expected_provider=None,
+            expected_dispatches=(),
+            expected_refusal_reason="fallback_after_queue",
+            expected_verdict=admission_reserve.CAPACITY_DEFERRABLE,
+        ),
+        id="local-preferred-remote-less-chain-still-defers",
+    ),
+)
+
+#: The deprecation line the legacy alias must emit exactly once per request.
+_DEPRECATION_MARKER = "deprecated X-Local-Preference"
+
+
+def _matrix_exit_row(row: _BehaviourMatrixRow) -> _ExitRow:
+    """The exit fixture *row* runs against, with its slot state applied."""
+    exit_row = (
+        _HEALTHY_ROW
+        if row.exit_trigger == HEALTHY_FREE_SLOT
+        else _row(row.exit_trigger)
+    )
+    if row.concurrency is None:
+        return exit_row
+    return replace(exit_row, concurrency=row.concurrency)
+
+
+def _matrix_model_config(row: _BehaviourMatrixRow, exit_row: _ExitRow) -> dict:
+    """The model chain for *row* (remote-less when the row asks for it)."""
+    model_config = _model_config(exit_row)
+    if row.remote_less_chain:
+        model_config["providers"] = [
+            entry
+            for entry in model_config["providers"]
+            if entry.get("type") == "local"
+        ]
+    return model_config
+
+
+async def _issue_matrix_row(row: _BehaviourMatrixRow) -> tuple:
+    """Issue *row* end-to-end; return ``(response, dispatches)``."""
+    exit_row = _matrix_exit_row(row)
+    return await _issue_with_chain(
+        exit_row, row.preference, _matrix_model_config(row, exit_row)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row", _BEHAVIOUR_MATRIX)
+async def test_each_matrix_row_serves_or_refuses_as_the_preference_matrix_says(
+    row: _BehaviourMatrixRow, caplog
+):
+    """One matrix row: status, route, serving provider, dispatches, retry story.
+
+    Each row carries its own expected values, so a red parameter names the
+    behaviour that regressed (AC1) and ``calls`` makes "never dispatched" a
+    first-class assertion rather than an inference from the response (AC2).
+    """
+    caplog.set_level(logging.WARNING, logger="llama-proxy")
+
+    result, calls = await _issue_matrix_row(row)
+
+    assert result.status_code == row.expected_status, (
+        f"{row.behaviour}: expected HTTP {row.expected_status}, got "
+        f"{result.status_code}"
+    )
+    assert result.headers.get("X-Local-Route") == row.expected_route, (
+        f"{row.behaviour}: expected X-Local-Route={row.expected_route!r}, got "
+        f"{result.headers.get('X-Local-Route')!r}"
+    )
+    assert result.headers.get("X-Provider") == row.expected_provider, (
+        f"{row.behaviour}: expected X-Provider={row.expected_provider!r}, got "
+        f"{result.headers.get('X-Provider')!r}"
+    )
+    assert calls == list(row.expected_dispatches), (
+        f"{row.behaviour}: expected upstream dispatches "
+        f"{list(row.expected_dispatches)}, got {calls}"
+    )
+
+    body = json.loads(result.body)
+    if row.expected_refusal_reason is None:
+        # Byte-compatibility: no retry story is invented for a served request.
+        assert "retryable" not in body, (
+            f"{row.behaviour}: a served response must keep today's body shape "
+            f"(no 'retryable' field), got {sorted(body)}"
+        )
+        assert "verdict" not in body, (
+            f"{row.behaviour}: a served response must keep today's body shape "
+            f"(no 'verdict' field), got {sorted(body)}"
+        )
+        assert result.headers.get("Retry-After") is None, (
+            f"{row.behaviour}: a served response must not advertise a retry"
+        )
+        assert body.get("code") != provider.EXHAUSTION_CODE_LOCAL_ADMISSION, (
+            f"{row.behaviour}: a served request must not carry the "
+            f"local-capacity refusal code"
+        )
+    else:
+        assert body.get("reason") == row.expected_refusal_reason, (
+            f"{row.behaviour}: refusal reason must be "
+            f"{row.expected_refusal_reason!r}, got {body.get('reason')!r}"
+        )
+        assert result.headers.get("X-Local-Fallback-Reason") == (
+            row.expected_refusal_reason
+        ), f"{row.behaviour}: the header and the body must agree on the reason"
+        assert body.get("verdict") == row.expected_verdict, (
+            f"{row.behaviour}: refusal verdict must be {row.expected_verdict!r}, "
+            f"got {body.get('verdict')!r}"
+        )
+        assert bool(body.get("retryable")) is True, (
+            f"{row.behaviour}: a deferral is a bounded wait, so it is retryable"
+        )
+        retry_after = body.get("retry_after")
+        assert isinstance(retry_after, int) and retry_after >= 1, (
+            f"{row.behaviour}: retry_after must be whole seconds >= 1, got "
+            f"{retry_after!r}"
+        )
+        assert result.headers.get("Retry-After") == str(retry_after), (
+            f"{row.behaviour}: Retry-After and body retry_after must agree"
+        )
+        _parse_retry_at(body.get("retry_at"))
+
+    # The legacy alias normalises silently-but-logged: exactly one deprecation
+    # line per request, and none for a canonical value (parent AC5).
+    deprecations = [
+        record.getMessage()
+        for record in caplog.records
+        if _DEPRECATION_MARKER in record.getMessage()
+    ]
+    expected_deprecations = 1 if row.preference == LOCAL_ONLY else 0
+    assert len(deprecations) == expected_deprecations, (
+        f"{row.behaviour}: expected {expected_deprecations} deprecation line(s) "
+        f"for preference {row.preference!r}, got {deprecations!r}"
+    )
+
+
+def test_behaviour_matrix_covers_every_documented_behaviour():
+    """The table is the contract: one row per documented behaviour, unique ids.
+
+    The previous incident (2026-10-28) was a matrix row that did not exist:
+    a fits-local, pin-local request promoted to a paid provider. A new
+    preference/slot/verdict combination must therefore arrive with a row, and a
+    row that disappears loses its guarantee loudly rather than silently.
+    """
+    ids = [param.id for param in _BEHAVIOUR_MATRIX]
+    assert len(ids) == len(set(ids)), f"duplicate behaviour rows: {ids}"
+    assert set(ids) == {
+        "prefer-local-free-slot-serves-local",
+        "absent-free-slot-serves-local",
+        "prefer-local-busy-deferrable-falls-through-remote",
+        "remote-ok-free-slot-strips-local",
+        "local-preferred-free-slot-serves-local",
+        "local-preferred-busy-deferrable-refuses",
+        "local-preferred-busy-too-large-promotes-remote",
+        "local-only-legacy-busy-deferrable-refuses",
+        "local-preferred-remote-less-chain-still-defers",
+    }, "a behaviour matrix row is missing from (or unexpected in) the table"
+
+    for param in _BEHAVIOUR_MATRIX:
+        row = param.values[0]
+        assert row.behaviour == param.id, (
+            f"{param.id}: the row's behaviour label must be its "
+            f"parametrisation id, got {row.behaviour!r} (AC4)"
+        )
+        assert row.behaviour.startswith(
+            ("prefer-local", "absent", "remote-ok", "local-preferred", "local-only")
+        ), f"{param.id}: the id must start with the preference it pins"

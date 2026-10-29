@@ -653,6 +653,107 @@ async def test_pin_local_refuses_429_when_guard_would_fall_back_remote(
     assert body["retry_after"] >= 1
 
 
+async def _issue_pin_local_refusal(preference: str) -> tuple:
+    """Issue a pin-local request the guard refuses; return ``(response, calls)``.
+
+    The occupied gate plus a calibrated 12k-token prompt projects past the 60 s
+    wait budget, so the *only* variable between calls is the wire spelling of
+    the pin-local preference.
+    """
+    _seed_calibration()
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {
+                "name": "remote-fallback",
+                "type": "remote",
+                "endpoint": "https://api.example.com/v1",
+            },
+        ],
+        "aliases": ["hybrid*"],
+    }
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _estimate_patches(),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"X-Local-Preference": preference}),
+            "v1/chat/completions",
+            config,
+            _cfg(),
+        )
+    return result, calls
+
+
+@pytest.mark.asyncio
+async def test_legacy_alias_refusal_is_field_for_field_the_canonical_one(caplog):
+    """Row 7: the alias is the same refusal, plus exactly one deprecation line.
+
+    ``local-only`` is a *wire* alias, not a second behaviour: the two spellings
+    must produce an identical refusal — status, route/reason headers and every
+    stable body field (including the retry story) — and the alias must announce
+    itself exactly once per request, never once per routing decision
+    (LP-0MVSHWYVE005MS16 AC1/AC2). ``retry_at`` is excluded from the comparison
+    because it is stamped from the wall clock at build time.
+    """
+    caplog.set_level(logging.WARNING, logger="llama-proxy")
+
+    canonical, canonical_calls = await _issue_pin_local_refusal("local-preferred")
+    canonical_deprecations = [
+        record.getMessage()
+        for record in caplog.records
+        if "deprecated X-Local-Preference" in record.getMessage()
+    ]
+    caplog.clear()
+    legacy, legacy_calls = await _issue_pin_local_refusal("local-only")
+    legacy_deprecations = [
+        record.getMessage()
+        for record in caplog.records
+        if "deprecated X-Local-Preference" in record.getMessage()
+    ]
+
+    assert canonical_calls == legacy_calls == [], (
+        "neither spelling may reach a remote provider (dispatched="
+        f"{canonical_calls!r}/{legacy_calls!r})"
+    )
+    assert canonical.status_code == legacy.status_code == 429
+    for header in ("X-Local-Route", "X-Local-Fallback-Reason", "Retry-After"):
+        assert legacy.headers.get(header) == canonical.headers.get(header), (
+            f"the alias must not change {header}: canonical="
+            f"{canonical.headers.get(header)!r}, legacy="
+            f"{legacy.headers.get(header)!r}"
+        )
+    canonical_body = json.loads(canonical.body)
+    legacy_body = json.loads(legacy.body)
+    for key in ("code", "reason", "verdict", "retryable", "retry_after"):
+        assert legacy_body.get(key) == canonical_body.get(key), (
+            f"the alias must not change body[{key!r}]: canonical="
+            f"{canonical_body.get(key)!r}, legacy={legacy_body.get(key)!r}"
+        )
+
+    assert canonical_deprecations == [], (
+        "the canonical value is not deprecated; got "
+        f"{canonical_deprecations!r}"
+    )
+    assert len(legacy_deprecations) == 1, (
+        "the legacy alias must log exactly one deprecation per request; got "
+        f"{legacy_deprecations!r}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_prefer_local_still_falls_back_remote_when_refused(caplog):
     """Backcompat (AC8): prefer-local (and absent header) keep the fallback."""
@@ -1106,7 +1207,7 @@ def _spy_capacity_verdict(sentinel: str = _SPY_SENTINEL):
     return spy, patch("proxy.admission_reserve.local_capacity_verdict", new=spy)
 
 
-def _refusal_builder_calls(spy: "_CapacityVerdictSpy") -> list[dict]:
+def _refusal_builder_calls(spy: _CapacityVerdictSpy) -> list[dict]:
     """Return the spy calls made by the refusal builder (one per refusal).
 
     LP-0MVSLZY470051ZB2 added a *pre-dispatch* consultation of the same helper
