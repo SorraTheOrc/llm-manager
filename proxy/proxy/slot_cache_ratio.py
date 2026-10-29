@@ -223,7 +223,8 @@ def write_slot_ratio_sidecar(
     model: str | None,
     cached_tokens: int,
     prompt_tokens: int,
-    messages: Any,
+    messages: Any = None,
+    fingerprints: list[str] | None = None,
     saved_at: datetime | None = None,
 ) -> bool:
     """Persist the post-save cache state next to the slot snapshot.
@@ -231,6 +232,10 @@ def write_slot_ratio_sidecar(
     ``cached_tokens`` is the measured number of tokens now resident in the
     saved KV cache (the served request's ``prompt_tokens``), so a later request
     whose message list extends this one can be credited for them.
+
+    Callers that already hold the message fingerprints can pass them as
+    *fingerprints* instead of *messages* — the eviction save path has no
+    request body, only the session's recorded prefix (LP-0MVK0E80C009HUQC).
 
     Writes atomically (temp file + replace) and never raises: a sidecar failure
     must not fail the request or the slot save.
@@ -244,7 +249,11 @@ def write_slot_ratio_sidecar(
             "model": model,
             "cached_tokens": int(cached_tokens),
             "prompt_tokens": int(prompt_tokens),
-            "messages": message_fingerprints(messages),
+            "messages": (
+                list(fingerprints)
+                if fingerprints is not None
+                else message_fingerprints(messages)
+            ),
             "saved_at": (saved_at or datetime.now(UTC)).isoformat(),
         }
         path = sidecar_path(slot_filename)

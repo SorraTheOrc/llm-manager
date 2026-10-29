@@ -31,7 +31,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -42,11 +42,27 @@ from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy import cold_start, quota_pacing, quota_state
+
+#: The single source of truth for the ``X-Local-Preference`` vocabulary and its
+#: parser (LP-0MVSHWYVE005MS16 AC4). ``PREF_LOCAL_ONLY`` is imported only as the
+#: **observability** token the refusal log line keeps emitting (byte-identical
+#: log contract); every routing comparison uses the canonical pin-local value
+#: ``PREF_LOCAL_PREFERRED``, so an alias-normalised ``local-only`` request still
+#: hits the same choke points (AC5).
+from proxy.admission_reserve import (
+    CAPACITY_TOO_LARGE,
+    DEFAULT_PREFERENCE,
+    PREF_LOCAL_ONLY,
+    PREF_LOCAL_PREFERRED,
+    PREF_REMOTE_OK,
+    parse_preference,
+)
 from proxy.observability import _record_backend_signal
 from proxy.priority import (
     PRIORITY_HIGH,
     PRIORITY_LOW,
     VALID_PRIORITIES,
+    apply_local_preference,
     effective_chain_for_request,
     priority_routing_profile,
     request_priority,
@@ -57,6 +73,10 @@ from proxy.provider_budget import (
     affinity_ttl_seconds,
     record_provider_affinity,
 )
+
+# Per-turn correlation id stamped on every structured line this module emits
+# (LP-0MVMBM467005BT4A).
+from proxy.turn_id import bind_turn_id, turn_field
 from proxy.utils import _is_empty_response
 
 logger = logging.getLogger("llama-proxy.provider")
@@ -172,6 +192,15 @@ _usage_reset_at: dict[str, float] = {}
 # after a restart (LP-0MUQTCMW2001VXH8).
 _usage_reset_guessed: set[str] = set()
 
+# Account key -> the quota window (``rolling`` / ``weekly`` / ``monthly``)
+# whose own reset bounded the quarantine, or absent when the quarantine came
+# from an explicit message duration, an x-ratelimit header, or legacy state.
+# The window is what makes a quarantine revalidatable: as soon as a fresh
+# ``/v1/usage`` poll shows that window lifted, the quarantine is cleared, so
+# an account can never stay locked out past its own window
+# (LP-0MVPAE77Z002VGIA AC7/AC11).
+_usage_reset_window: dict[str, str] = {}
+
 # 2-minute safety margin added to the computed usage-limit reset time so a
 # clock-skewed upstream does not start re-serving 429s the moment the limit
 # nominally resets.
@@ -232,7 +261,10 @@ _usage_limit_probe_transport: Callable[[dict], Awaitable[bool]] | None = None
 # ---------------------------------------------------------------------------
 
 # On-disk schema version for the persisted provider-availability document.
-_PROVIDER_STATE_VERSION = 1
+# Version 2 adds the optional ``usage_reset_window`` companion map; version-1
+# documents are still read (their quarantine entries simply carry no window
+# metadata, LP-0MVPAE77Z002VGIA AC11).
+_PROVIDER_STATE_VERSION = 2
 
 # Environment override for the state-file path (used by tests and non-default
 # deployments). When unset, the file lives beside proxy/.mode.
@@ -241,6 +273,12 @@ _PROVIDER_STATE_FILE_ENV = "LLAMA_PROXY_PROVIDER_STATE_FILE"
 # Top-level keys of the persisted document.
 _PROVIDER_STATE_COOLDOWNS_KEY = "provider_unavailable_until"
 _PROVIDER_STATE_QUARANTINE_KEY = "usage_reset_at"
+
+# Optional companion map (version 2+): account key -> the quota window whose
+# reset produced the quarantine. A version-1 payload has no such map, so its
+# entries carry no window metadata and are revalidated as legacy entries
+# (cleared by the first poll that shows no window exhausted).
+_PROVIDER_STATE_QUARANTINE_WINDOWS_KEY = "usage_reset_window"
 
 
 def default_provider_state_file() -> Path:
@@ -271,6 +309,12 @@ def save_provider_state(path: str | Path | None = None) -> None:
     concurrent reader never observes a partial file. Already-expired entries
     are excluded from the payload so the file does not grow with stale keys.
 
+    Version 2 additionally writes ``usage_reset_window`` — the quota window
+    each persisted quarantine was derived from — for the accounts that are
+    actually written, so a restarted proxy can still revalidate (and clear) a
+    window-derived quarantine as soon as that window is reported lifted
+    (LP-0MVPAE77Z002VGIA AC7/AC11).
+
     The write is synchronous: callers invoke it on the cold path (a provider
     failing or an upstream 429), where a small atomic write is inexpensive.
     A failure is raised to the caller, which is expected to persist
@@ -299,6 +343,11 @@ def save_provider_state(path: str | Path | None = None) -> None:
         _PROVIDER_STATE_QUARANTINE_KEY: _prune_expired_expiries(
             persistable_quarantine, now
         ),
+        _PROVIDER_STATE_QUARANTINE_WINDOWS_KEY: {
+            key: window
+            for key, window in _usage_reset_window.items()
+            if key in persistable_quarantine
+        },
     }
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -335,17 +384,43 @@ def _coerce_expiry_map(raw: Any) -> dict[str, float]:
     return result
 
 
+def _coerce_window_map(raw: Any) -> dict[str, str]:
+    """Coerce persisted quarantine-window metadata to ``{account: window}``.
+
+    Each value must identify one of the quota windows (case/whitespace
+    normalised via :func:`proxy.quota_state.window_for_limit_name`); unknown
+    or malformed values are dropped rather than raising, so a stale or foreign
+    entry never resurrects a wrong-window lockout.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        window = quota_state.window_for_limit_name(value)
+        if window is None:
+            continue
+        result[key] = window
+    return result
+
+
 def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
     """Restore provider cooldowns and usage-limit quarantine from disk.
 
     Reads the state file written by :func:`save_provider_state`, drops any
     entry whose absolute epoch expiry is at or before ``time.time()``, and
     installs the remainder into the module-level maps. Both maps are replaced
-    (not merged) so a reload is deterministic.
+    (not merged) so a reload is deterministic. The optional
+    ``usage_reset_window`` map (schema version 2, LP-0MVPAE77Z002VGIA) is
+    restored alongside the quarantine and pruned to the accounts that survived
+    the expiry check; a version-1 payload simply restores no window metadata,
+    leaving its entries revalidatable as legacy entries.
 
-    Corruption tolerance: a missing, unreadable, malformed, or non-dict file
-    leaves the maps empty and logs a warning; a malformed entry is skipped
-    while valid siblings survive. This function never raises.
+    Corruption tolerance: a missing, unreadable, malformed, non-dict, or
+    foreign-version file restores whatever valid entries it contains and logs a
+    warning; a malformed entry is skipped while valid siblings survive. This
+    function never raises.
 
     Args:
         path: Source state-file path (defaults to
@@ -359,6 +434,7 @@ def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
     now = time.time()
     cooldowns: dict[str, float] = {}
     quarantine: dict[str, float] = {}
+    windows: dict[str, str] = {}
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -391,11 +467,19 @@ def load_provider_state(path: str | Path | None = None) -> tuple[int, int]:
         quarantine = _prune_expired_expiries(
             _coerce_expiry_map(raw.get(_PROVIDER_STATE_QUARANTINE_KEY)), now
         )
+        # Window metadata is additive (schema v2): a version-1 payload has no
+        # such key, and each value must name a real window. Entries that do
+        # not survive the expiry prune are dropped from the window map too, so
+        # the two maps never disagree about which accounts are quarantined.
+        windows = _coerce_window_map(raw.get(_PROVIDER_STATE_QUARANTINE_WINDOWS_KEY))
+        windows = {key: w for key, w in windows.items() if key in quarantine}
 
     _provider_unavailable_until.clear()
     _provider_unavailable_until.update(cooldowns)
     _usage_reset_at.clear()
     _usage_reset_at.update(quarantine)
+    _usage_reset_window.clear()
+    _usage_reset_window.update(windows)
     # Loaded entries are always explicit/hard (guessed quarantines are never
     # persisted), so no stale guessed markers survive a reload.
     _usage_reset_guessed.clear()
@@ -585,12 +669,13 @@ def note_routing_hop(
     try:
         extra = " ".join(f"{k}={v}" for k, v in context.items() if v is not None)
         logger.info(
-            "routing_hop session=%s from=%s to=%s hops=%d%s",
+            "routing_hop session=%s from=%s to=%s hops=%d%s%s",
             session_id,
             previous or "none",
             provider_name,
             hops,
             f" {extra}" if extra else "",
+            turn_field(),
         )
     except Exception:  # pragma: no cover - defensive
         pass
@@ -670,6 +755,13 @@ def _fallback_evidence(
         parts.append(f"limit={budget.get('limit', 0)}")
         parts.append(f"remaining={budget.get('remaining', 0)}")
         parts.append(f"waited={float(budget.get('waited', 0.0)):.3f}")
+    # Per-turn correlation id (LP-0MVMBM467005BT4A AC1): carried on every
+    # ``Fallback triggered`` line so the hop is attributable to one turn without
+    # FIFO/nearest-line heuristics. Appended last so every existing field — and
+    # every end-anchored consumer regex — is unchanged.
+    turn = turn_field()
+    if turn:
+        parts.append(turn.strip())
     return " " + " ".join(parts)
 
 
@@ -3054,11 +3146,18 @@ def _evaluate_idle_admission_override(
     budget maths). When it refuses, the returned dict carries
     ``admitted: False`` plus the refusal ``reason`` so the caller can keep
     skipping local and log the refusal as attributable — silent routing as if
-    idle capacity were blocked would hide the budget doing its job.
+    idle capacity were blocked would hide the budget doing its work.
+
+    ``guard_decision`` is the :class:`proxy.prefill_eta.AdmissionDecision`
+    that priced this request against the budget, carried on BOTH verdicts
+    (LP-0MVODJ3P6000AIUM AC1): on an admit it lets the dispatch record thread
+    the ETA the budget guard actually costed instead of re-pricing the prompt
+    at record creation.
 
     Returns:
         ``{"admitted", "reason", "idle_seconds", "threshold_seconds",
-        "guard_reason"}`` when idle capacity applies, else ``None``.
+        "guard_reason", "guard_decision"}`` when idle capacity applies, else
+        ``None``.
     """
     try:
         server_config = config.get("server", config) if isinstance(config, dict) else {}
@@ -3104,10 +3203,13 @@ def _idle_admission_budget_verdict(
 ):
     """Run the shared cold-prefill admission guard for the idle bypass path.
 
-    Returns the :class:`proxy.prefill_eta.AdmissionDecision` when the guard
-    actually refused (so the caller can log it and keep skipping local), else
-    ``None`` — an inert guard or an admitted verdict leaves the idle bypass
-    behaviour byte-for-byte unchanged (LP-0MVN4LBZ500281Z7 AC3c/AC8).
+    Returns the :class:`proxy.prefill_eta.AdmissionDecision` that priced this
+    request against the cold-prefill budget, or ``None`` when the guard is
+    inert (policy off / no budget / unmeasurable prompt). The decision is
+    returned on BOTH verdicts (LP-0MVODJ3P6000AIUM AC1) so the idle-admit
+    accept path can thread the costed ETA to the dispatch record; before that
+    fix only refusals were observable and accepted dispatches were re-priced
+    at record creation from drifted inputs.
     """
     try:
         from proxy import prefill_eta
@@ -3132,17 +3234,26 @@ def _idle_admission_budget_verdict(
         decision = prefill_eta.evaluate_admission(
             config, model_name, estimated_tokens, cached_ratio, "medium"
         )
-        if decision.admit or not decision.active:
+        # LP-0MVODJ3P6000AIUM AC1: return the decision for BOTH verdicts so
+        # the idle-admit accept path can thread the ETA the guard actually
+        # costed. An *active* decision is always returned (refusals must keep
+        # refusing); an inert decision is returned only when it priced the
+        # prompt (``insufficient_samples`` carries an ETA), so ``policy_off`` /
+        # ``no_budget`` stay inert (``None``) and the documented byte-for-byte
+        # fallback is preserved. ``record_guard_decision`` stays refusal-only —
+        # on an admit there is no guard event to record.
+        if not decision.active and decision.eta_prefill_seconds is None:
             return None
-        prefill_eta.record_guard_decision(
-            decision,
-            provider=(
-                provider_cfg.get("name") if isinstance(provider_cfg, dict) else None
-            ),
-            model=model_name,
-            priority="medium",
-            free_slot=False,
-        )
+        if not decision.admit:
+            prefill_eta.record_guard_decision(
+                decision,
+                provider=(
+                    provider_cfg.get("name") if isinstance(provider_cfg, dict) else None
+                ),
+                model=model_name,
+                priority="medium",
+                free_slot=False,
+            )
         return decision
     except Exception:
         logger.debug("idle admission budget verdict failed", exc_info=True)
@@ -3217,6 +3328,7 @@ def _record_provider_context_skip(
     estimated_tokens: int,
     limit: int,
     session_id: str | None = None,
+    preference: str | None = None,
 ) -> None:
     """Record + log a per-entry context-ceiling skip (AC3).
 
@@ -3227,6 +3339,13 @@ def _record_provider_context_skip(
     affinity — so the entry stays eligible for later, smaller requests. The
     counter mirrors ``context_too_large`` (LP-0MVF9N3BV00155RI) and is exposed
     as ``backend_signals`` on ``/health`` and ``/admin/metrics``.
+
+    ``preference`` is the request's already-parsed ``X-Local-Preference``
+    (``_request_local_preference`` — never a second parse of the header),
+    logged as an additive `` preference=<parsed>`` suffix so every "not local"
+    line names the intent that made the decision (LP-0MVTF2WLQ008BNYK, parent
+    AC4). An absent value logs the parser's default rather than an empty or
+    missing field, so the invariant holds for header-less clients too.
     """
     _record_attempt(
         attempts,
@@ -3241,12 +3360,14 @@ def _record_provider_context_skip(
     logger.info(
         "routing_skip_provider_context provider=%s type=%s "
         "status=provider_context_exceeded estimated_tokens=%d limit=%d "
-        "reason=provider_context_exceeded session=%s",
+        "reason=provider_context_exceeded session=%s preference=%s%s",
         provider_name,
         provider_type,
         estimated_tokens,
         limit,
         str(session_id or "unknown"),
+        preference or DEFAULT_PREFERENCE,
+        turn_field(),
     )
 
 
@@ -3571,9 +3692,10 @@ def resolve_provider(
         if reset_remaining > 0:
             logger.info(
                 "Skipping provider=%s: usage_limit_reset_pending "
-                "(account=%s, reset_at=%s, reset_in=%ds)",
+                "(account=%s, window=%s, reset_at=%s, reset_in=%ds)",
                 name,
                 usage_key,
+                _usage_reset_window.get(usage_key, "unknown"),
                 datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
             )
@@ -4346,6 +4468,124 @@ def _max_retry_after_seconds(config: dict | None) -> int:
     return int(seconds)
 
 
+#: Reasons for which no amount of waiting can restore local service: the
+#: cause is a property of the *request* (a prompt permanently over the flat
+#: cold-prefill token cap, or one that cannot fit a KV slot), so a timer would
+#: only invite futile retries — the 2026-10-25 incident answered such a request
+#: with ``Retry-After: 1`` and the client backed off seven times before
+#: reporting the 429 as terminal (LP-0MVNTT4X8009IO2X AC1).
+NOT_TIME_RETRYABLE_REFUSAL_REASONS = frozenset(
+    {"prefill_budget_exceeded", "context_too_large"}
+)
+
+#: Remedy advertised for a refusal waiting cannot fix.
+_COMPACTION_GUIDANCE = (
+    "Do not retry: waiting cannot make this request fit. Compact the session "
+    "history (the refusal carries new_tokens/budget_tokens so the target size "
+    "is explicit) and resend, or send X-Local-Preference: prefer-local to "
+    "allow a remote fallback."
+)
+
+#: Remedy advertised for a refusal whose cause is a bounded wait.
+_RETRY_GUIDANCE = (
+    "Retry after the advertised delay (retry_at carries the same instant as an "
+    "RFC 3339 UTC timestamp), reduce the prompt size (compact the session) so "
+    "the prefill fits the local wait budget, or route the request to a remote "
+    "provider."
+)
+
+
+@dataclass(frozen=True)
+class RefusalRetryTiming:
+    """The retry story of one local-admission refusal.
+
+    ``retryable`` answers *whether* retrying can help; ``retry_after`` /
+    ``retry_at`` answer *when* — and are both ``None`` when it cannot
+    (LP-0MVNTT4X8009IO2X AC1/AC2).
+    """
+
+    retryable: bool
+    retry_after: int | None = None
+    retry_at: str | None = None
+
+
+def _retry_at_isoformat(seconds: int) -> str:
+    """Absolute instant *seconds* from now, RFC 3339 UTC.
+
+    Clients acting on ``Retry-After`` are forced to trust their own clock;
+    ``retry_at`` lets a scheduler compare against the proxy's (AC2).
+    """
+    return (datetime.now(UTC) + timedelta(seconds=int(seconds))).isoformat()
+
+
+def _refusal_retry_timing(
+    reason: str | None,
+    *,
+    eta_prefill_seconds: float | None = None,
+    budget_seconds: float | None = None,
+    projected_wait_seconds: float | None = None,
+    advertised_retry_after: int | float | None = None,
+    config: dict | None = None,
+) -> RefusalRetryTiming:
+    """Single reason→timing decision for every local-admission refusal.
+
+    Both refusal builders (``_build_local_admission_reject_response`` and
+    ``_build_local_only_refusal_response``) resolve their retry story here, so
+    a reason can never ship with a different timer on the two paths
+    (LP-0MVNTT4X8009IO2X AC1/AC2):
+
+    - ``prefill_budget_exceeded`` / ``context_too_large`` → **not**
+      time-retryable: no ``Retry-After``, no ``retry_at`` (AC1).
+    - ETA/occupancy reasons → ``ceil(projected_wait - budget)``, at least 1 s
+      and capped by ``server.max_retry_after_seconds``, plus ``retry_at``
+      (AC2). The *projected wait* (own prefill plus the occupied gate ahead of
+      it) is the wait the client actually faces, so it is preferred over the
+      own-prefill ETA when the guard measured it.
+    - *advertised_retry_after* lets a caller that already resolved a real
+      expiry (a cooldown/lease/queue-expiry remainder) own the number; the
+      1 s floor and the cap still apply (AC3).
+
+    Unknown reasons keep the historical ETA-derived behaviour, so a new
+    reason cannot silently lose its timer.
+    """
+    label = str(reason or "eta_exceeds_budget")
+    if label in NOT_TIME_RETRYABLE_REFUSAL_REASONS:
+        return RefusalRetryTiming(retryable=False)
+
+    maximum = _max_retry_after_seconds(config)
+    if advertised_retry_after is not None:
+        try:
+            seconds = int(advertised_retry_after)
+        except (TypeError, ValueError):
+            pass
+        else:
+            bounded = max(1, min(maximum, seconds))
+            return RefusalRetryTiming(
+                retryable=True,
+                retry_after=bounded,
+                retry_at=_retry_at_isoformat(bounded),
+            )
+
+    from proxy.prefill_eta import suggested_retry_after_seconds
+
+    wait = (
+        projected_wait_seconds
+        if projected_wait_seconds is not None
+        else eta_prefill_seconds
+    )
+    seconds = suggested_retry_after_seconds(wait, budget_seconds, maximum=maximum)
+    return RefusalRetryTiming(
+        retryable=True,
+        retry_after=seconds,
+        retry_at=_retry_at_isoformat(seconds),
+    )
+
+
+def _refusal_suggested_action(timing: RefusalRetryTiming) -> str:
+    """Remedy matching the refusal's retry story (AC1/AC2)."""
+    return _RETRY_GUIDANCE if timing.retryable else _COMPACTION_GUIDANCE
+
+
 def _quarantined_providers(model_config: dict) -> list[dict[str, Any]]:
     """Return provider entries quarantined by a pending usage-limit reset.
 
@@ -4356,7 +4596,9 @@ def _quarantined_providers(model_config: dict) -> list[dict[str, Any]]:
     seconds and the true reason (quarantine before window/cooldown),
     (LP-0MU56ZFVD001LP0H).
 
-    Each entry contains ``name``, ``type``, ``account``, ``reset_in`` (whole
+    Each entry contains ``name``, ``type``, ``account``, ``window`` (the quota
+    window that produced the quarantine, or ``"unknown"`` for
+    message/header/legacy entries — LP-0MVPAE77Z002VGIA), ``reset_in`` (whole
     seconds) and ``reset_at`` (ISO-8601 UTC). Entries sharing a quarantined
     account are each returned; expired entries are pruned by
     ``_usage_reset_remaining``.
@@ -4373,6 +4615,7 @@ def _quarantined_providers(model_config: dict) -> list[dict[str, Any]]:
             "name": p.get("name", "unknown"),
             "type": p.get("type", "remote"),
             "account": account,
+            "window": _usage_reset_window.get(account, "unknown"),
             "reset_in": int(remaining),
             "reset_at": datetime.fromtimestamp(
                 _usage_reset_at[account], tz=UTC
@@ -4399,6 +4642,7 @@ def _record_quarantine_attempts(
             provider=q["name"],
             type=q["type"],
             status="usage_limit_reset",
+            window=q["window"],
             reset_in=q["reset_in"],
             reset_at=q["reset_at"],
         )
@@ -4721,7 +4965,9 @@ def _apply_ratelimit_account_quarantine(
 ) -> float | None:
     """Quarantine the failing API-key ACCOUNT for an upstream reset window.
 
-    A quota 429 (a per-account rate-limit error or an explicit
+    A quota 429 (a per-account rate-limit error — ``rate_limit_error`` /
+    ``rate_limit_exceeded`` / ``insufficient_quota`` /
+    ``free_daily_limit_exceeded`` — or an explicit
     ``x-ratelimit-over-limit`` flag) that also carries a parseable
     ``x-ratelimit-reset-*`` duration is evidence the upstream will not serve
     that ACCOUNT until the reported reset. The ENTRY-level cooldown applied by
@@ -4730,6 +4976,11 @@ def _apply_ratelimit_account_quarantine(
     recording the reset as an explicit ACCOUNT quarantine here makes the wait
     survive the request, feeds :func:`_compute_retry_after` and the chain-hold,
     and is persisted to ``provider-state.json`` (LP-0MVFA1VRT007T9HT).
+
+    Note: a daily free-limit 429 (``insufficient_quota`` with an absolute reset
+    instant) never reaches here — it takes the usage-limit reset path earlier
+    in the fallback cycle, so the daily window always wins over the rolling
+    ``x-ratelimit-*`` window (LP-0MVT8SAZE00570J5).
 
     The quarantine is keyed on :func:`_usage_limit_account_key`
     (``api_key_env@endpoint:model``), so a paid sibling on the same gateway
@@ -5074,7 +5325,7 @@ def validate_priority_config(config: dict) -> list[str]:
 
     Models that declare no ``priorities`` anywhere stay unlabelled: every
     provider remains eligible for every priority (the documented legacy
-    default used by ``embed`` / ``github`` / ``private``).
+    default used by ``embed`` / ``private``).
 
     Returns a list of human-readable problem descriptions (empty when the
     priority configuration is consistent).
@@ -5458,17 +5709,33 @@ def _build_local_admission_reject_response(
     cannot finish inside the caller's wait budget, and the request normally
     falls through to a remote provider. When the rest of the chain is
     exhausted as well, the client gets this distinguishable 429 instead of the
-    generic exhaustion body: ``Retry-After`` carries how much longer the local
-    prefill would need than the caller was prepared to wait, and the
-    ``X-Local-Admission*`` headers expose the estimate so a dispatcher can pace
-    its next attempt (LP-0MVGDUV5E005UWBQ AC3).
-    """
-    from proxy.prefill_eta import suggested_retry_after_seconds
+    generic exhaustion body (LP-0MVGDUV5E005UWBQ AC3).
 
+    The retry story is reason-aware and shared with
+    ``_build_local_only_refusal_response`` via
+    :func:`_refusal_retry_timing` (LP-0MVNTT4X8009IO2X AC1/AC2): ETA/occupancy
+    reasons carry ``Retry-After`` (how much longer than the caller's budget the
+    projected wait is) plus ``retry_at``, while a request that waiting cannot
+    heal (``prefill_budget_exceeded``) carries **no** ``Retry-After`` and says
+    so with ``retryable: false`` and compaction guidance. The admission token
+    evidence is always attached so a client can size the compaction.
+    """
+    attempt = attempt or {}
     eta = float(attempt.get("eta_prefill_seconds") or 0.0)
     budget = float(attempt.get("budget_seconds") or 0.0)
-    retry_after = suggested_retry_after_seconds(
-        eta, budget, maximum=_max_retry_after_seconds(config)
+    projected = attempt.get("projected_wait_seconds")
+    reason = str(attempt.get("reason") or "eta_exceeds_budget")
+    new_tokens = _admission_token_evidence(attempt, "new_tokens")
+    budget_tokens = _admission_token_evidence(attempt, "budget_tokens")
+    timing = _refusal_retry_timing(
+        reason,
+        eta_prefill_seconds=eta,
+        budget_seconds=budget,
+        projected_wait_seconds=(
+            float(projected) if projected is not None else None
+        ),
+        advertised_retry_after=attempt.get("retry_after_s"),
+        config=config,
     )
     payload: dict[str, Any] = {
         "error": "All providers exhausted",
@@ -5477,21 +5744,26 @@ def _build_local_admission_reject_response(
             "local admission refused: projected prefill exceeds the wait budget "
             "and no remote provider is available"
         ),
+        "reason": reason,
         "eta_prefill_seconds": eta,
         "budget_seconds": budget,
-        "retry_after": retry_after,
-        "suggested_action": (
-            "Retry after the advertised delay, reduce the prompt size (compact "
-            "the session) so the prefill fits the local wait budget, or route "
-            "the request to a remote provider."
-        ),
+        "retryable": timing.retryable,
+        "retry_after": timing.retry_after,
+        "suggested_action": _refusal_suggested_action(timing),
     }
+    if timing.retry_at is not None:
+        payload["retry_at"] = timing.retry_at
+    if projected is not None:
+        payload["projected_wait_seconds"] = float(projected)
+    if new_tokens is not None:
+        payload["new_tokens"] = new_tokens
+    if budget_tokens is not None:
+        payload["budget_tokens"] = budget_tokens
     try:
         payload["diagnostics"] = [attempt]
     except Exception:
         pass
     headers = {
-        "Retry-After": str(retry_after),
         "Cache-Control": "no-store",
         "X-Local-Admission": "reject",
         "X-Local-Admission-Eta": f"{eta:.1f}",
@@ -5499,10 +5771,9 @@ def _build_local_admission_reject_response(
         # LP-0MVIKPCSG002B0NL AC6: the refusal is a routing outcome, not a
         # remote serve — say so on the response itself.
         "X-Local-Route": "refused",
-        "X-Local-Fallback-Reason": str(
-            attempt.get("reason") or "eta_exceeds_budget"
-        ),
+        "X-Local-Fallback-Reason": reason,
     }
+    headers.update(_refusal_timing_headers(timing, new_tokens, budget_tokens))
     return Response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=429,
@@ -5904,6 +6175,96 @@ def _get_local_concurrency_info(config: dict, endpoint: str | None = None) -> tu
     return (cur_active, max_local)
 
 
+# ---------------------------------------------------------------------------
+# Snapshot sidecar measurement (LP-0MVK0E80C009HUQC)
+# ---------------------------------------------------------------------------
+# How much of the served prompt a saved slot snapshot can honestly claim as
+# KV-resident. Derived here (next to the slot-pool accounting) because both
+# the request-completion path and the eviction save path consume it, and the
+# recorded prefix it reads lives in ``_last_prompt_prefix`` above.
+
+
+def get_recorded_prompt_prefix(
+    model_name: str | None, session_id: str | None
+) -> tuple[int, list[str]] | None:
+    """Return the recorded ``(prompt_tokens, fingerprints)`` for a session.
+
+    ``None`` when this session has no measured local turn yet. Used by the slot
+    eviction save path, which has no request body of its own: the recorded
+    prefix is the only trustworthy token count describing what the slot holds
+    (LP-0MVK0E80C009HUQC).
+    """
+    if not model_name or not session_id:
+        return None
+    record = _last_prompt_prefix.get((model_name, session_id))
+    if record is None:
+        return None
+    try:
+        tokens, fingerprints = record
+        tokens = int(tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    if tokens <= 0 or not fingerprints:
+        return None
+    return tokens, list(fingerprints)
+
+
+def sidecar_cached_tokens(
+    model_name: str | None,
+    session_id: str | None,
+    messages: list | None,
+    *,
+    measured_prompt_tokens: int = 0,
+) -> int:
+    """Token count to record in a slot-snapshot sidecar (``0`` = write none).
+
+    The sidecar is written *after* the slot save, so ``cached_tokens`` is how
+    much of the served prompt is now resident in the saved KV cache. Three
+    sources, in decreasing order of trustworthiness:
+
+    1. the upstream usage block's ``prompt_tokens`` for *this* request
+       (unchanged behaviour — a direct measurement);
+    2. the recorded prompt prefix from a previous measured local turn, but
+       only when its fingerprints prefix-match *messages* — that makes it a
+       genuine lower bound for the saved KV rather than a stale guess;
+    3. the router's own prompt estimate (``_estimate_prompt_tokens_for_routing``,
+       the same tokenizer the routing decision uses, counting message text
+       only — it ignores tool definitions and per-message overhead, so it
+       under-counts and cannot inflate credit).
+
+    ``0`` when no trustworthy count exists: the caller then writes no sidecar
+    rather than inventing a measurement (AC5 risk note, LP-0MVK0E80C009HUQC).
+    """
+    try:
+        measured = int(measured_prompt_tokens or 0)
+    except (TypeError, ValueError):
+        measured = 0
+    if measured > 0:
+        return measured
+    try:
+        from proxy.slot_cache_ratio import message_fingerprints, prefix_matches
+
+        incoming = message_fingerprints(messages)
+    except Exception:
+        logger.debug("sidecar token resolution failed", exc_info=True)
+        return 0
+    if not incoming:
+        return 0
+    recorded = get_recorded_prompt_prefix(model_name, session_id)
+    if recorded is not None:
+        try:
+            if prefix_matches(recorded[1], incoming):
+                return recorded[0]
+        except Exception:
+            logger.debug("sidecar prefix check failed", exc_info=True)
+    try:
+        estimate = _estimate_prompt_tokens_for_routing({"messages": messages})
+        return max(0, int(estimate or 0))
+    except Exception:
+        logger.debug("sidecar prompt estimate failed", exc_info=True)
+        return 0
+
+
 def _local_slot_saturation(
     config: dict, max_local: int, endpoint: str | None = None
 ) -> str | None:
@@ -6167,42 +6528,165 @@ the occupied gate ahead of it* against the budget, so it needs the number of
     return busy, in_flight
 
 
-def _note_local_fallback_reason(request, reason: str | None) -> None:
+def _local_occupant_prefill_seconds(
+    endpoint: str | None = None, session_id: str | None = None
+) -> float:
+    """Measured remaining prefill service owed by other sessions' prefills.
+
+    LP-0MVOFVCA2008DQVE: the symmetric ``eta * busy_slots`` occupancy floor
+    prices an occupant at the newcomer's own prefill, which is wrong when a
+    small warm prompt queues behind a large cold one. This projects each live
+    occupant from its own dispatch record so the deadline bound sees the real
+    time to first byte; since LP-0MVS9YK9P006M1NQ the projection re-prices the
+    occupant's remaining uncached *new tokens* at the contended co-residency
+    rate instead of decaying its optimistic admission ETA.
+
+    Never raises: a routing decision must not break on an observability gap
+    (0.0 leaves the symmetric floor in charge).
+    """
+    try:
+        import proxy.server as _srv
+        from proxy.router_helpers import _live_prefill_remaining_seconds
+
+        return float(
+            _live_prefill_remaining_seconds(
+                _srv, exclude_session=session_id, endpoint=endpoint
+            )
+            or 0.0
+        )
+    except Exception:
+        return 0.0
+
+
+#: Attribute holding the real expiry (seconds from now) behind the recorded
+#: local-route exit, and the routing token evidence a refusal advertises.
+LOCAL_FALLBACK_RETRY_AFTER_ATTR = "_local_fallback_retry_after_s"
+LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR = "_local_fallback_token_evidence"
+
+#: Outcome stamped on ``request._local_routing_outcome``: what the proxy
+#: actually did with the request's local-route intent. The closed vocabulary of
+#: the single per-request outcome line (LP-0MVSM06Z8003UQTM) — every decision
+#: point that ends the local route stamps one of these, and
+#: :func:`_stamp_local_route_headers` emits the one line that reports it.
+#:
+#: - ``pinned`` — a pin-local request was refused rather than moved to a paid
+#:   provider (the loop-head choke point,
+#:   :func:`_build_local_only_refusal_for_remote`).
+#: - ``deferred`` — a pin-local ``deferrable`` request spent its contention-queue
+#:   (or lease) budget and ended in the retryable 429
+#:   (:func:`_build_deferral_refusal_response`).
+#: - ``promoted`` — the pre-loop capacity verdict removed the local entry from
+#:   the effective chain (LP-0MVSM06LB001PRU4), so the remote tiers serve it.
+#: - ``local`` — the local route served the request.
+#: - ``remote`` — a non-local provider served the request.
+#: - ``exhausted`` — every provider in the chain was exhausted; no provider
+#:   served the request and it was not a pin refusal.
+LOCAL_ROUTING_OUTCOME_PINNED = "pinned"
+LOCAL_ROUTING_OUTCOME_DEFERRED = "deferred"
+LOCAL_ROUTING_OUTCOME_PROMOTED = "promoted"
+LOCAL_ROUTING_OUTCOME_LOCAL = "local"
+LOCAL_ROUTING_OUTCOME_REMOTE = "remote"
+LOCAL_ROUTING_OUTCOME_EXHAUSTED = "exhausted"
+
+#: The closed outcome set the per-request line may report (LP-0MVSM06Z8003UQTM
+#: Constraints: no new observability vocabulary).
+LOCAL_ROUTING_OUTCOMES = frozenset({
+    LOCAL_ROUTING_OUTCOME_PINNED,
+    LOCAL_ROUTING_OUTCOME_DEFERRED,
+    LOCAL_ROUTING_OUTCOME_PROMOTED,
+    LOCAL_ROUTING_OUTCOME_LOCAL,
+    LOCAL_ROUTING_OUTCOME_REMOTE,
+    LOCAL_ROUTING_OUTCOME_EXHAUSTED,
+})
+
+#: Stable ``code`` values that identify a chain-exhaustion response
+#: (:func:`_build_exhausted_response` and its admission-refusal variant). Used
+#: only to classify the outcome of the single per-request line — the response
+#: itself is never modified.
+_EXHAUSTION_RESPONSE_CODES = frozenset({
+    EXHAUSTION_CODE_ALL,
+    EXHAUSTION_CODE_SLOTS,
+    EXHAUSTION_CODE_TIME_WINDOW,
+    EXHAUSTION_CODE_LOCAL_ADMISSION,
+})
+
+
+def _stamp_local_routing_outcome(request, outcome: str) -> None:
+    """Stamp the request's terminal local-routing *outcome* (best-effort).
+
+    Called at the decision points that end the local route so the single
+    per-request line (:func:`_log_local_preference_resolved`) reports *why* the
+    request ended where it did instead of re-deriving it from response headers.
+    Never raises: observability must not be able to break routing.
+    """
+    try:
+        setattr(request, "_local_routing_outcome", outcome)
+    except Exception:  # pragma: no cover - stamping is best-effort
+        pass
+
+
+def _note_local_fallback_reason(
+    request, reason: str | None, retry_after_s: int | float | None = None
+) -> None:
     """Record why local was not used, for ``X-Local-Fallback-Reason``.
 
     LP-0MVIKPCSG002B0NL AC6: a client must be able to observe its loss at the
     moment it happens. The reason is stamped on the request as the routing
     cycle falls back and surfaced by ``_stamp_local_route_headers`` at the
     top-level return, so every fallback path is covered by one choke point.
-    Never raises: header bookkeeping must not break routing.
+
+    *retry_after_s* records the **real** expiry behind this exit — the cooldown
+    remainder, the lease remainder or the contention-queue window — so the
+    refusal can advertise when local capacity actually returns instead of the
+    ETA formula (LP-0MVQ23B80009OZ9V AC1–AC4). It is always overwritten, so a
+    later exit can never inherit a stale expiry; ``None`` clears it. Never
+    raises: header bookkeeping must not break routing.
     """
     try:
         setattr(request, "_local_fallback_reason", reason)
+        setattr(request, LOCAL_FALLBACK_RETRY_AFTER_ATTR, retry_after_s)
     except Exception:
         pass
 
 
-_PREF_LOCAL_ONLY = "local-only"
-_PREF_REMOTE_OK = "remote-ok"
+def _note_local_token_evidence(
+    request, *, new_tokens=None, budget_tokens=None
+) -> None:
+    """Record the token evidence a refused client needs to size a compaction.
+
+    The routing probe already priced the prompt (``new_tokens`` against the
+    flat cold-prefill cap), so a chain-resolution skip such as
+    ``context_too_large`` can carry the same evidence the admission guard
+    emits instead of forcing the client to guess (LP-0MVNTT4X8009IO2X AC4).
+    Missing values are omitted rather than reported as a misleading ``0``.
+    """
+    evidence: dict[str, int] = {}
+    try:
+        if new_tokens is not None:
+            evidence["new_tokens"] = int(new_tokens)
+        if budget_tokens is not None:
+            evidence["budget_tokens"] = int(budget_tokens)
+        setattr(request, LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR, evidence or None)
+    except Exception:
+        pass
 
 
 def _request_local_preference(request) -> str:
     """Return the request's ``X-Local-Preference`` (default ``prefer-local``).
 
     Unknown values fall back to today's behaviour (AC8). The parsed value is
-    cached on the request so both routing cycles and the refusal path agree.
+    cached on the request so both routing cycles and the refusal path agree —
+    which is also what makes the legacy-alias deprecation in
+    :func:`admission_reserve.parse_preference` once per *request* rather than
+    once per decision (LP-0MVSHWYVE005MS16 AC2).
     """
     cached = getattr(request, "_local_preference", None)
     if cached:
         return cached
     try:
-        from proxy import admission_reserve
-
-        preference = admission_reserve.parse_preference(
-            getattr(request, "headers", {}) or {}
-        )
+        preference = parse_preference(getattr(request, "headers", {}) or {})
     except Exception:
-        preference = "prefer-local"
+        preference = DEFAULT_PREFERENCE
     try:
         setattr(request, "_local_preference", preference)
     except Exception:
@@ -6210,29 +6694,344 @@ def _request_local_preference(request) -> str:
     return preference
 
 
+def _local_capacity_verdict_for_request(request):
+    """Return this request's local-capacity verdict (one implementation).
+
+    The verdict answers *why* the local route cannot serve the request right
+    now: ``deferrable`` when waiting can help (stay pinned to local) or
+    ``too_large`` when waiting cannot help (the request may fall through to a
+    remote provider).
+
+    Single-implementation contract (LP-0MVSLZY470051ZB2 AC3): the
+    classification comes from
+    :func:`admission_reserve.local_capacity_verdict` and never from a reason or
+    size table re-derived here — ``provider.py`` must not own a second verdict.
+    The evidence is what the routing cycle already recorded: the guard's own
+    decision (``request._local_admission_decision``), the skip reason stamped
+    by :func:`_note_local_fallback_reason` and the token evidence stamped by
+    :func:`_note_local_token_evidence`, so nothing is re-priced.
+
+    A verdict computed once per request before the dispatch loop
+    (``request._local_capacity_verdict``) is reused verbatim; without one the
+    verdict is derived from the live evidence and deliberately **not** cached,
+    because the recorded reason changes as the cycle walks its exits and a
+    stale ``too_large`` (or ``deferrable``) would silently re-route the
+    request.
+    """
+    cached = getattr(request, "_local_capacity_verdict", None)
+    if cached is not None:
+        return cached
+    from proxy import admission_reserve
+
+    evidence = getattr(request, LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR, None) or {}
+    return admission_reserve.local_capacity_verdict(
+        getattr(request, "_local_admission_decision", None),
+        reason=getattr(request, "_local_fallback_reason", None),
+        new_tokens=evidence.get("new_tokens"),
+        budget_tokens=evidence.get("budget_tokens"),
+    )
+
+
+def _local_preference_pins_local(request, preference: str | None = None) -> bool:
+    """True when *preference* pins this request to the local route.
+
+    The single pin decision (LP-0MVSLZY470051ZB2 AC3): every local-route exit
+    that would otherwise hand the request to a non-local provider asks this
+    predicate instead of comparing the preference itself, so the choke point,
+    the admission refusal and the free-slot guard cannot drift apart.
+
+    ``True`` only when the *resolved* preference is the canonical pin-local
+    value (``local-preferred``, including a legacy ``local-only`` header
+    normalised upstream by :func:`admission_reserve.parse_preference`) **and**
+    the capacity verdict is not ``too_large``:
+
+    * ``deferrable`` — waiting can help, so the request is never moved to a
+      paid provider (parent assumption A2): it is deferred or refused.
+    * ``too_large`` — waiting cannot help, so the request must fall through to
+      the remote tiers and must **not** be refused for local capacity
+      (parent AC4). Chain-level stripping and the promoted outcome line belong
+      to LP-0MVSM06LB001PRU4; this predicate only declines the pin.
+    * ``prefer-local`` / ``remote-ok`` / absent header — never pinned, exactly
+      as today (parent AC5).
+
+    Fail-safe direction (parent constraints): an unclassifiable exit stays
+    pinned, because
+    :func:`admission_reserve.local_capacity_verdict` defaults an unknown (or
+    absent) reason to ``deferrable`` — an unknown reason can therefore never
+    promote a fits-local request to a paid provider.
+    """
+    resolved = (
+        preference if preference is not None else _request_local_preference(request)
+    )
+    if resolved != PREF_LOCAL_PREFERRED:
+        return False
+    return _local_capacity_verdict_for_request(request).verdict != CAPACITY_TOO_LARGE
+
+
+async def _promote_too_large_local_request(
+    request,
+    chain: list[dict],
+    preference: str | None,
+    config: dict,
+    body_json: dict | None,
+    routing_estimate,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Drop the local entry when a pin-local request is ``too_large`` (AC1).
+
+    Called once per cycle, after the authoritative routing estimate exists and
+    **before** the dispatch loop. A ``too_large`` verdict means the prompt
+    outgrows the local serving envelope, so waiting cannot help: the local
+    entry is removed from the chain at resolution time (the same filter
+    ``remote-ok`` uses, :func:`proxy.priority.apply_local_preference`) and the
+    remote tiers serve the request with no local attempt, no queue entry, no
+    lease and no local-capacity 429 (parent AC4). A ``deferrable`` verdict
+    leaves the chain untouched — a fits-local request stays pinned.
+
+    Inputs are the ones the cycle already built, never a second estimate:
+
+    * the shared :class:`_RoutingEstimateCache` for the prompt size,
+    * ``expected_cached_ratio`` for the *new* (uncached) tokens the cold-prefill
+      budget prices — the same ratio the in-loop gate uses, so a warm large
+      prompt is not mistaken for a cold one,
+    * ``server.local_cold_prefill_budget_tokens`` through
+      :func:`_cold_prefill_budget_tokens` (i.e.
+      :data:`proxy.prefill_eta.COLD_PREFILL_BUDGET_KEY`), and
+    * the local entry's own context ceiling
+      (:func:`_provider_context_limit`).
+
+    The classification itself is delegated to
+    :func:`admission_reserve.local_capacity_verdict` — the single verdict
+    source (parent AC1/AC3); no reason or size table is re-derived here.
+
+    Only a pin-local (``local-preferred``) request is eligible: ``prefer-local``
+    and ``remote-ok`` keep today's behaviour (parent AC5). A chain with no
+    non-local entry is left intact (the filter's remote-less carve-out):
+    stripping it would manufacture an empty-chain exhaustion, so the local
+    route keeps its existing deferral/refusal exits (parent A5/AC5).
+
+    The verdict is cached on the request (``request._local_capacity_verdict``)
+    and the outcome stamped (``request._local_routing_outcome``) so the pin
+    predicate and the observability slice reuse this one computation instead of
+    re-pricing the prompt (AC2). Only a verdict that actually stripped is
+    cached: a ``deferrable`` verdict is derived from live exit evidence by
+    :func:`_local_capacity_verdict_for_request`, because the recorded reason
+    changes as the cycle walks its exits and a stale value would silently
+    re-route the request.
+
+    Returns:
+        The chain to dispatch. When nothing was stripped the *same list object*
+        is returned, so the caller can skip re-stamping ``model_config``.
+    """
+    if preference != PREF_LOCAL_PREFERRED:
+        return chain
+    local_entry = next(
+        (
+            entry
+            for entry in chain
+            if isinstance(entry, dict) and entry.get("type") == "local"
+        ),
+        None,
+    )
+    if local_entry is None:
+        # No local route in the chain (e.g. a remote-only model): there is no
+        # local capacity to classify.
+        return chain
+    estimated = 0
+    if routing_estimate is not None:
+        try:
+            estimated = int(await routing_estimate.get())
+        except Exception:  # pragma: no cover - estimate is best-effort
+            logger.debug("too-large verdict: prompt estimate unavailable")
+            estimated = 0
+    try:
+        cached_ratio = expected_cached_ratio(
+            local_entry.get("llama_model") or "",
+            session_id,
+            estimated,
+            body_json.get("messages") if isinstance(body_json, dict) else None,
+            server_config=(
+                config.get("server", config) if isinstance(config, dict) else None
+            ),
+        )
+    except Exception:  # pragma: no cover - ratio is best-effort
+        cached_ratio = 0.0
+    try:
+        new_tokens = int(estimated * (1 - float(cached_ratio or 0.0)))
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        new_tokens = 0
+    from proxy import admission_reserve
+
+    verdict = admission_reserve.local_capacity_verdict(
+        new_tokens=new_tokens,
+        budget_tokens=_cold_prefill_budget_tokens(config),
+        estimated_tokens=estimated,
+        context_limit=_provider_context_limit(local_entry),
+    )
+    if verdict.verdict != CAPACITY_TOO_LARGE:
+        return chain
+    stripped = apply_local_preference(chain, preference, verdict=verdict.verdict)
+    if stripped is chain:
+        # Remote-less chain: the filter kept it intact so the existing local
+        # attempt/deferral/refusal behaviour applies. Nothing to cache — a
+        # cached ``too_large`` would change the pin decision.
+        return chain
+    try:
+        setattr(request, "_local_capacity_verdict", verdict)
+        setattr(request, "_local_routing_outcome", LOCAL_ROUTING_OUTCOME_PROMOTED)
+    except Exception:  # pragma: no cover - stamping is best-effort
+        pass
+    # No log line here: the single per-request outcome line
+    # (LP-0MVSM06Z8003UQTM) reports the stamped outcome.
+    return stripped
+
+
+def _admission_token_evidence(attempt: dict[str, Any], key: str) -> int | None:
+    """Read one admission token count from *attempt*, or ``None`` when absent.
+
+    The evidence is threaded from the guard's own decision (never recomputed
+    here — LP-0MVNTT4X8009IO2X Constraints), so a refusal advertises exactly
+    the numbers the guard compared.
+    """
+    raw = attempt.get(key)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _refusal_timing_headers(
+    timing: RefusalRetryTiming,
+    new_tokens: int | None,
+    budget_tokens: int | None,
+) -> dict[str, str]:
+    """Headers for *timing*: ``Retry-After`` only when a retry can help (AC1/AC2).
+
+    An over-budget prompt must carry **no** ``Retry-After`` at all — a delay
+    header is what invited the 2026-10-25 retry storm — while the token
+    evidence stays on every refusal so the client can compact instead.
+    """
+    headers: dict[str, str] = {}
+    if timing.retry_after is not None:
+        headers["Retry-After"] = str(timing.retry_after)
+    if new_tokens is not None:
+        headers["X-Local-Admission-New-Tokens"] = str(new_tokens)
+    if budget_tokens is not None:
+        headers["X-Local-Admission-Budget-Tokens"] = str(budget_tokens)
+    return headers
+
+
+def _log_local_only_refusal(
+    reason: str | None,
+    preference: str | None = None,
+    verdict: str | None = None,
+) -> None:
+    """One attributable line per pin-local refusal (parent AC4/AC5).
+
+    LP-0MVRMC275000R2W6: a pin-local request that ends in the refusal must be
+    visible in ``proxy.log`` without correlating headers back to the client, so
+    the line names the refusal reason *and* the intent that caused it. Emitted
+    by the refusal paths (the shared builder below plus the admission-reject
+    refusal) so there is exactly one line per refused request. Never raises:
+    observability must not break a refusal.
+
+    LP-0MVSMINPR006SWT6: the refusal builder also passes the capacity
+    ``verdict`` (``deferrable`` / ``too_large``) computed once by
+    :func:`admission_reserve.local_capacity_verdict`, so the line reports the
+    same classification as the 429 body rather than a second guess. The key is
+    appended only when supplied: the free-slot/exhausted caller keeps its
+    two-key line byte-identical.
+
+    ``preference`` is the *parsed* intent threaded in by the call sites; it
+    defaults to ``PREF_LOCAL_ONLY`` so a direct builder caller (and the
+    pre-existing log contract) keeps its current spelling.
+    """
+    try:
+        if verdict is None:
+            logger.info(
+                "local_only_refused reason=%s preference=%s",
+                reason or LOCAL_ROUTE_UNAVAILABLE,
+                preference or PREF_LOCAL_ONLY,
+            )
+        else:
+            logger.info(
+                "local_only_refused reason=%s preference=%s verdict=%s",
+                reason or LOCAL_ROUTE_UNAVAILABLE,
+                preference or PREF_LOCAL_ONLY,
+                verdict,
+            )
+    except Exception:  # pragma: no cover - observability is best-effort
+        pass
+
+
 def _build_local_only_refusal_response(
-    attempt: dict[str, Any] | None, config: dict | None = None
+    attempt: dict[str, Any] | None,
+    config: dict | None = None,
+    preference: str | None = None,
 ) -> Response:
-    """429 for a ``local-only`` request the admission guard refused (AC4).
+    """429 for a pin-local request that could not be served locally (AC4).
 
     Unlike the exhaustion path, this response is produced **while remote
-    providers are still available**: the client said local-only, so moving it
-    remote would silently violate its intent. It carries the same retryable
-    contract as the exhaustion refusal (``Retry-After``, ``X-Local-Admission*``)
-    plus ``X-Local-Route: refused``.
-    """
-    from proxy.prefill_eta import suggested_retry_after_seconds
+    providers are still available**: the client pinned local, so moving it
+    remote would silently violate its intent, and with a ``deferrable``
+    capacity verdict the honest answer is a retry timer rather than a
+    fall-through (LP-0MVSHXTLS000VMLE). A ``too_large`` request never reaches
+    this builder — the pin declines and the remote tiers serve it. The retry story is the shared
+    reason→timing decision (:func:`_refusal_retry_timing`), so this path can
+    never advertise a different timer from the exhaustion refusal: ETA/occupancy
+    reasons carry ``Retry-After`` + ``retry_at``, reasons waiting cannot heal
+    carry neither (LP-0MVNTT4X8009IO2X AC1/AC2). Adds
+    ``X-Local-Route: refused``.
 
+    LP-0MVSMINPR006SWT6: this builder is the **only** place in ``provider.py``
+    that classifies a refusal, and it delegates that classification to
+    :func:`admission_reserve.local_capacity_verdict` — the shared helper is the
+    single implementation (parent AC1/AC3). The helper is called *once* here,
+    from evidence already on *attempt* (the guard's own ``reason`` /
+    ``new_tokens`` / ``budget_tokens``); the one resulting verdict feeds both
+    the additive 429 body field and the log line, so the two surfaces cannot
+    disagree and no reason table is re-derived here. *preference* is the parsed
+    ``X-Local-Preference`` intent, forwarded to the log line only; it defaults
+    to ``PREF_LOCAL_ONLY`` so direct unit-test callers keep today's line.
+    """
     attempt = attempt or {}
     eta = float(attempt.get("eta_prefill_seconds") or 0.0)
     budget = float(attempt.get("budget_seconds") or 0.0)
-    projected = float(attempt.get("projected_wait_seconds") or eta)
+    measured_wait = attempt.get("projected_wait_seconds")
+    # An occupancy-aware measurement displaces the own-prefill ETA; without one
+    # the ETA is the best available wait, and with neither (a guard verdict
+    # that never costed a prefill, e.g. ``prefill_budget_exceeded``) the field
+    # is omitted rather than reported as a misleading 0 s.
+    projected = (
+        float(measured_wait)
+        if measured_wait is not None
+        else (eta if eta > 0.0 else None)
+    )
     reason = str(attempt.get("reason") or "eta_exceeds_budget")
-    retry_after = attempt.get("retry_after_s")
-    if retry_after is None:
-        retry_after = suggested_retry_after_seconds(
-            eta, budget, maximum=_max_retry_after_seconds(config)
-        )
+    new_tokens = _admission_token_evidence(attempt, "new_tokens")
+    budget_tokens = _admission_token_evidence(attempt, "budget_tokens")
+    from proxy import admission_reserve
+
+    # Single implementation (parent AC1/AC3): the only verdict computation in
+    # ``provider.py`` — a second table or estimator here would be the defect
+    # this contract forbids. Evidence comes from the attempt, never recomputed.
+    capacity = admission_reserve.local_capacity_verdict(
+        reason=reason,
+        new_tokens=new_tokens,
+        budget_tokens=budget_tokens,
+    )
+    timing = _refusal_retry_timing(
+        reason,
+        eta_prefill_seconds=eta,
+        budget_seconds=budget,
+        projected_wait_seconds=(
+            float(measured_wait) if measured_wait is not None else None
+        ),
+        advertised_retry_after=attempt.get("retry_after_s"),
+        config=config,
+    )
     payload: dict[str, Any] = {
         "error": "Local admission refused",
         "code": EXHAUSTION_CODE_LOCAL_ADMISSION,
@@ -6241,18 +7040,24 @@ def _build_local_only_refusal_response(
             "budget and X-Local-Preference: local-only forbids remote fallback"
         ),
         "reason": reason,
+        # Additive only (parent AC2/AC3): every pre-existing field and header
+        # keeps its exact value; ``verdict`` is the one new key.
+        "verdict": capacity.verdict,
         "eta_prefill_seconds": eta,
-        "projected_wait_seconds": projected,
         "budget_seconds": budget,
-        "retry_after": retry_after,
-        "suggested_action": (
-            "Retry after the advertised delay, reduce the prompt size so the "
-            "prefill fits the local wait budget, or send "
-            "X-Local-Preference: prefer-local to allow a remote fallback."
-        ),
+        "retryable": timing.retryable,
+        "retry_after": timing.retry_after,
+        "suggested_action": _refusal_suggested_action(timing),
     }
+    if projected is not None:
+        payload["projected_wait_seconds"] = projected
+    if timing.retry_at is not None:
+        payload["retry_at"] = timing.retry_at
+    if new_tokens is not None:
+        payload["new_tokens"] = new_tokens
+    if budget_tokens is not None:
+        payload["budget_tokens"] = budget_tokens
     headers = {
-        "Retry-After": str(retry_after),
         "Cache-Control": "no-store",
         "X-Local-Admission": "reject",
         "X-Local-Admission-Eta": f"{eta:.1f}",
@@ -6260,6 +7065,12 @@ def _build_local_only_refusal_response(
         "X-Local-Route": "refused",
         "X-Local-Fallback-Reason": reason,
     }
+    headers.update(_refusal_timing_headers(timing, new_tokens, budget_tokens))
+    # One line per refusal, naming the reason the client is told about, the
+    # intent that produced it and the verdict computed above (parent AC4).
+    _log_local_only_refusal(
+        reason, preference=preference, verdict=capacity.verdict
+    )
     return Response(
         content=json.dumps(payload).encode("utf-8"),
         status_code=429,
@@ -6268,28 +7079,640 @@ def _build_local_only_refusal_response(
     )
 
 
+def _response_is_chain_exhaustion(response: Any) -> bool:
+    """True when *response* is a chain-exhaustion response, not an upstream error.
+
+    Exhaustion responses are built by :func:`_build_exhausted_response` (and its
+    admission-refusal variant) and are the only error responses carrying one of
+    the stable :data:`_EXHAUSTION_RESPONSE_CODES`. Read-only: the response is
+    inspected, never modified. Never raises — a body that cannot be read simply
+    classifies as "not exhaustion".
+    """
+    try:
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return False
+        if headers.get("X-Provider"):
+            # A provider served (or answered) this response: whatever the body
+            # says, the chain did not exhaust.
+            return False
+        if int(getattr(response, "status_code", 200) or 200) < 400:
+            return False
+        body = getattr(response, "body", None)
+        if not body:
+            return False
+        payload = json.loads(body)
+        return (
+            isinstance(payload, dict)
+            and payload.get("code") in _EXHAUSTION_RESPONSE_CODES
+        )
+    except Exception:  # pragma: no cover - classification is best-effort
+        return False
+
+
+def _local_routing_outcome_for_response(response: Any, request) -> str:
+    """Resolve the outcome the per-request line reports (one closed value).
+
+    The stamped outcome wins: a pin refusal, deferral or promotion is known at
+    its decision point and is more specific than what the response alone shows
+    (a promoted request is *served* remotely but its outcome is ``promoted``).
+    Everything else is classified from the response the top-level return is
+    about to hand back, so ``local`` / ``remote`` / ``exhausted`` need no extra
+    stamping inside either dispatch loop — which is what keeps the line emitted
+    exactly once per request rather than once per cycle (AC5).
+    """
+    stamped = getattr(request, "_local_routing_outcome", None)
+    if stamped:
+        return stamped
+    headers = getattr(response, "headers", None) or {}
+    route = headers.get("X-Local-Route")
+    if route == "refused":
+        # A refusal that did not stamp an outcome is either a pin refusal (the
+        # client's intent was honoured) or the admission-refusal exhaustion
+        # variant reached by a client that never asked to be pinned — the one
+        # pin predicate decides, so the line never claims a pin that was not
+        # there.
+        if _local_preference_pins_local(request):
+            return LOCAL_ROUTING_OUTCOME_PINNED
+        return LOCAL_ROUTING_OUTCOME_EXHAUSTED
+    if _response_is_chain_exhaustion(response):
+        return LOCAL_ROUTING_OUTCOME_EXHAUSTED
+    if route == "local":
+        return LOCAL_ROUTING_OUTCOME_LOCAL
+    return LOCAL_ROUTING_OUTCOME_REMOTE
+
+
+def _local_routing_reason_for_response(response: Any, request) -> str:
+    """Resolve the reason token the per-request line reports (or ``none``).
+
+    A refusal already names the exact canonical token the client is told, so the
+    response header wins there — the request's own ``_local_fallback_reason``
+    can be a coarser interim token (``local_admission_guard``) than the reason
+    the refusal body and header carry (``eta_exceeds_budget_direct``), and the
+    line must agree with the refusal it describes (AC2). Every other outcome
+    reports the reason the request recorded, or ``none`` when it recorded none
+    (a promotion or a clean local serve has no skip reason).
+    """
+    headers = getattr(response, "headers", None) or {}
+    if headers.get("X-Local-Route") == "refused":
+        return (
+            headers.get("X-Local-Fallback-Reason")
+            or getattr(request, "_local_fallback_reason", None)
+            or "none"
+        )
+    return getattr(request, "_local_fallback_reason", None) or "none"
+
+
+def _log_local_preference_resolved(
+    response: Any, request, model_config: dict | None
+) -> None:
+    """Emit the single per-request routing-outcome line (best-effort).
+
+    One line per **request**, never per cycle, per skip branch or per refusal
+    builder: it is called only from :func:`_stamp_local_route_headers`, the
+    top-level return choke point both entries reach exactly once after
+    ``_run_chain_cycles()``, so a chain-hold retry that runs several cycles still
+    produces one line (AC5).
+
+    The line names the **resolved** preference (``request._local_preference``,
+    the value the canonical parser cached — so a legacy ``local-only`` header is
+    reported as ``local-preferred``, AC3), the outcome and the recorded reason
+    token (``none`` when the request recorded none), so an operator can tell a
+    deferral (``outcome=deferred reason=fallback_after_queue``) from chain
+    exhaustion (``outcome=exhausted``) without correlating per-skip lines
+    (AC2).
+
+    Side-effect free by contract (AC4): wrapped in ``try/except`` and it never
+    touches the response, so observability can never break or alter a request.
+    """
+    try:
+        preference = _request_local_preference(request)
+        outcome = _local_routing_outcome_for_response(response, request)
+        reason = _local_routing_reason_for_response(response, request)
+        session_id = "unknown"
+        try:
+            from proxy.session import _resolve_session_id_header
+
+            session_id, _ = _resolve_session_id_header(
+                getattr(request, "headers", {}) or {}
+            )
+        except Exception:
+            session_id = "unknown"
+        logger.info(
+            "local_preference_resolved preference=%s outcome=%s reason=%s "
+            "session=%s model=%s",
+            preference,
+            outcome,
+            reason,
+            session_id or "unknown",
+            (model_config or {}).get("name") or "unknown",
+        )
+    except Exception:  # pragma: no cover - emission is best-effort
+        logger.debug("local preference resolution line failed", exc_info=True)
+
+
 def _stamp_local_route_headers(
     response: Response, request, model_config: dict
 ) -> Response:
-    """Add ``X-Local-Route`` / ``X-Local-Fallback-Reason`` to *response*.
+    """Add ``X-Local-Route`` / ``X-Local-Fallback-Reason`` and log the outcome.
 
     Single choke point on the top-level return path so local success, remote
     success, refusal and exhaustion are all covered (LP-0MVIKPCSG002B0NL AC6).
-    A response that already carries the route header (a local-only refusal) is
+    A response that already carries the route header (a pin-local refusal) is
     left untouched; every other response is classified by the ``X-Provider``
     that served it.
+
+    This is also the single emission point for the per-request routing-outcome
+    line (LP-0MVSM06Z8003UQTM): both entries call this exactly once, *after*
+    ``_run_chain_cycles()``, so exactly one
+    ``local_preference_resolved preference=… outcome=… reason=…`` line is
+    emitted per request. The outcome is **stamped on the request at the decision
+    point that produced it** (pin refusal, deferral, promotion) and only
+    classified from the response for the three outcomes that have no branch of
+    their own (``local`` / ``remote`` / ``exhausted``) — logging at each branch
+    would emit one line per cycle, per skip and per refusal builder, which is
+    exactly the correlation work this line exists to remove. Emission is
+    best-effort and never mutates the response, so the line can never change
+    behaviour (AC4).
     """
     try:
         from proxy import admission_reserve
 
-        return admission_reserve.stamp_route_headers(
+        stamped = admission_reserve.stamp_route_headers(
             response,
             model_config,
             fallback_reason=getattr(request, "_local_fallback_reason", None),
         )
     except Exception:  # pragma: no cover - header stamping is best-effort
         logger.debug("route header stamping failed", exc_info=True)
-        return response
+        stamped = response
+    _log_local_preference_resolved(stamped, request, model_config)
+    return stamped
+
+
+#: ``X-Local-Fallback-Reason`` tokens the pin-local choke point emits when
+#: the request recorded no skip reason (LP-0MVRMC1L3006F0F3). ``_note_local_fallback_reason()``
+#: is the primary source; these two defaults keep the structural refusal
+#: attributable when an exit left no reason behind:
+#:
+#: - ``local_only_no_local_route`` — the model's chain has no local entry at
+#:   all, so there was no local route to skip (planned-AC1 reading made
+#:   explicit in LP-0MVRMC1W6003MV3Y).
+#: - ``local_route_unavailable`` — a local entry existed but was skipped
+#:   without recording a reason (a chain-resolution skip inside
+#:   ``_resolve_provider_with_exclusions``, e.g. cooldown/quota/window; the
+#:   sibling LP-0MVRMC1W6003MV3Y pins the per-branch vocabulary and narrows
+#:   this generic fallback).
+
+def _canonical_local_fallback_reason(token: str) -> str:
+    """Resolve *token* against the canonical reason-token table (AC1).
+
+    The table lives in :mod:`proxy.admission_reserve` (the module that owns
+    the header) so every surface draws from one place; importing it lazily
+    keeps this module's import graph free of a new module-level dependency
+    while still failing loudly on a token the table does not know.
+    """
+    from proxy import admission_reserve
+
+    return admission_reserve.canonical_local_fallback_reason(token)
+
+
+LOCAL_ONLY_NO_LOCAL_ROUTE = _canonical_local_fallback_reason(
+    "local_only_no_local_route"
+)
+LOCAL_ROUTE_UNAVAILABLE = _canonical_local_fallback_reason(
+    "local_route_unavailable"
+)
+
+#: Chain-resolution skip tokens (LP-0MVRMC1W6003MV3Y AC2): the same strings
+#: the ``reason=`` log fields carry, so a skip can be attributed verbatim.
+SKIP_REASON_LOCAL_PROVIDER_COOLDOWN = _canonical_local_fallback_reason(
+    "local_provider_cooldown"
+)
+SKIP_REASON_QUOTA_HARD_STOP = _canonical_local_fallback_reason("quota_hard_stop")
+SKIP_REASON_USAGE_LIMIT_RESET_PENDING = _canonical_local_fallback_reason(
+    "usage_limit_reset_pending"
+)
+SKIP_REASON_OUTSIDE_AVAILABLE_WINDOW = _canonical_local_fallback_reason(
+    "outside_available_window"
+)
+
+#: Lease-active continue token: expected local contention, which used to fall
+#: through to remote with no recorded reason at all.
+SKIP_REASON_LOCAL_LEASE_ACTIVE = _canonical_local_fallback_reason(
+    "local_lease_active"
+)
+
+#: Local-route exits whose retry hint is a *real* availability expiry rather
+#: than the ETA formula (LP-0MVQ23B80009OZ9V AC1–AC4). An exit records the
+#: expiry it measured via ``_note_local_fallback_reason(..., retry_after_s=)``;
+#: the chain-resolution reasons are recomputed from the live cooldown / reset /
+#: window state at refusal time because no expiry reaches the request through
+#: the ``reason_sink`` callback.
+REAL_EXPIRY_FALLBACK_REASONS = frozenset({
+    SKIP_REASON_LOCAL_PROVIDER_COOLDOWN,
+    SKIP_REASON_USAGE_LIMIT_RESET_PENDING,
+    SKIP_REASON_OUTSIDE_AVAILABLE_WINDOW,
+    SKIP_REASON_LOCAL_LEASE_ACTIVE,
+    "prefill_thrash_cooldown",
+    "fallback_after_queue",
+})
+
+
+def _compute_local_retry_after(
+    model_config: dict | None,
+    config: dict | None = None,
+    now_utc: datetime | None = None,
+) -> int:
+    """Real seconds until a local entry is usable again (AC2).
+
+    The local-scoped counterpart of :func:`_compute_retry_after`: it reads the
+    same real state (entry cooldown ``_provider_unavailable_until``, usage-limit
+    quarantine ``_usage_reset_at``, ``available_times`` window edges) but only
+    for ``type: local`` entries, so a refusal never advertises a remote
+    provider's cooldown the client is forbidden from using. Returns ``0`` when
+    no local entry has a pending expiry (an unknown wait, not an instant one).
+    """
+    candidates: list[float] = []
+    for p in (model_config or {}).get("providers") or []:
+        if not isinstance(p, dict) or p.get("type") != "local":
+            continue
+        cooldown_key = _entry_cooldown_key(p)
+        if cooldown_key is not None:
+            remaining = _provider_cooldown_remaining(cooldown_key)
+            if remaining > 0:
+                candidates.append(float(remaining))
+        reset_remaining = _usage_reset_remaining(_usage_limit_account_key(p))
+        if reset_remaining > 0:
+            candidates.append(float(reset_remaining))
+        window = _seconds_until_next_window(p, now_utc=now_utc, config=config)
+        if window is not None and window > 0:
+            candidates.append(float(window))
+    if not candidates:
+        return 0
+    return int(max(candidates))
+
+
+def _local_lease_retry_after_seconds(
+    config: dict | None, endpoint: str | None = None
+) -> int:
+    """Real seconds until a held local dispatch lease is released (AC3).
+
+    The live dispatch record's ``expires_at`` is the truthful remainder; when
+    no record is visible (an anonymous/legacy dispatch, or a unit test) the
+    configured ``local_dispatch_lease_timeout_seconds`` — the same bound
+    :func:`proxy.router_helpers._get_lease_timeout_seconds` reports — is the
+    best available answer. ``0`` means no lease expiry could be resolved.
+    """
+    try:
+        import proxy.server as _srv
+        from proxy.router_helpers import _get_lease_timeout_seconds
+    except Exception:  # pragma: no cover - imports are always available
+        return 0
+    now = time.monotonic()
+    remaining: list[float] = []
+    try:
+        records = getattr(_srv, "local_dispatch_records", None) or {}
+        for key, record in list(records.items()):
+            if not isinstance(record, dict):
+                continue
+            # Endpoint-aware records are keyed (endpoint, session): a lease on
+            # ANOTHER local backend says nothing about this one.
+            if (
+                endpoint
+                and isinstance(key, tuple)
+                and key
+                and key[0]
+                and key[0] != endpoint
+            ):
+                continue
+            expires_at = float(record.get("expires_at") or 0.0)
+            if not record.get("active") and expires_at <= now:
+                continue
+            remaining.append(max(0.0, expires_at - now))
+    except Exception:  # pragma: no cover - defensive
+        remaining = []
+    if remaining:
+        return max(1, int(math.ceil(max(remaining))))
+    try:
+        configured = _get_lease_timeout_seconds(
+            type("_LeaseConfigView", (), {"config": config})()
+        )
+    except Exception:  # pragma: no cover - defensive
+        return 0
+    if configured <= 0:
+        return 0
+    return max(1, int(math.ceil(configured)))
+
+
+def _contention_queue_expiry_seconds(config: dict | None) -> int:
+    """The contention-queue wait window, in seconds (AC4).
+
+    A request that exits the queue has spent (or been refused) that window; a
+    retry that ignores it would spend the same window again, so the window is
+    the honest retry hint. Resolved through the router's own config helper so
+    the advertised value is the clamped value the queue actually used.
+    """
+    try:
+        from proxy.router import _get_contention_queue_config
+
+        server_cfg = (
+            config.get("server", config) if isinstance(config, dict) else {}
+        )
+        max_wait = float(_get_contention_queue_config(server_cfg)["max_wait_seconds"])
+    except Exception:  # pragma: no cover - defensive
+        return 0
+    if max_wait <= 0:
+        return 0
+    return max(1, int(math.ceil(max_wait)))
+
+
+def _contention_queue_remaining_seconds(
+    config: dict | None, elapsed_wait_seconds: float | None
+) -> int:
+    """Queue wait budget still measurable after a queue exit (AC6).
+
+    LP-0MVSM06BK008FZUE: a deferral ends when the contention queue hands the
+    request back — its wait budget expired, or the depth cap refused to
+    enqueue it. Both exits know *how much of the window they consumed*
+    (``elapsed_wait_seconds``), so the honest retry hint is the remainder of
+    that window rather than a re-derived estimate:
+
+    - a depth-cap exit never started the clock, so the whole window remains;
+    - a wait-budget expiry has consumed the window, so the 1 s floor is all
+      that is left (``_refusal_retry_timing`` clamps the same way).
+
+    The remainder is ceiling-rounded because the queue itself accounts in
+    whole seconds and a client must not retry a fraction of a second early.
+    ``_contention_queue_expiry_seconds`` supplies the clamped window the queue
+    actually used, so this can never advertise more than the configured bound.
+    """
+    window = _contention_queue_expiry_seconds(config)
+    try:
+        elapsed = max(0.0, float(elapsed_wait_seconds or 0.0))
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    if window <= 0:
+        return 1
+    return max(1, int(math.ceil(window - elapsed)))
+
+
+def _cold_prefill_budget_tokens(config: dict | None) -> int:
+    """The flat cold-prefill token cap, for refusal token evidence (AC5)."""
+    try:
+        from proxy.prefill_eta import resolve_config
+
+        return int(resolve_config(config).cold_prefill_budget_tokens)
+    except Exception:  # pragma: no cover - defensive
+        return 0
+
+
+def _local_refusal_retry_after_s(
+    request, reason: str | None, model_config: dict | None, config: dict | None
+) -> int | None:
+    """Real expiry (seconds) behind a non-admission local-route exit (AC1).
+
+    The exit's own measurement wins (a lease remainder, a queue window, the
+    thrash-cooldown remainder). A chain-resolution exit records no expiry on
+    the request, so it is recomputed from live local availability state. Every
+    other reason — ETA/occupancy and the not-time-retryable causes — returns
+    ``None`` so the shared timing decision is left untouched.
+    """
+    recorded = getattr(request, LOCAL_FALLBACK_RETRY_AFTER_ATTR, None)
+    if recorded is not None:
+        try:
+            return max(1, int(recorded))
+        except (TypeError, ValueError):
+            pass
+    if reason in REAL_EXPIRY_FALLBACK_REASONS:
+        recomputed = _compute_local_retry_after(model_config, config)
+        if recomputed > 0:
+            return recomputed
+    return None
+
+
+async def _stamp_local_routing_token_evidence(
+    request, body_json, model_config, config, routing_estimate
+) -> None:
+    """Stamp routing token evidence for a pin-local refusal (AC5).
+
+    Called only when a refusal is actually being built — the choke point has
+    already decided not to dispatch — so the tokenizer pass this may trigger
+    is paid at most once per refused request (never on the dispatch path).
+    The admission guard's own evidence is left alone when a decision exists:
+    it is the more specific record of what was compared.
+    """
+    if getattr(request, "_local_admission_decision", None) is not None:
+        return
+    if getattr(request, LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR, None):
+        return
+    if routing_estimate is None:
+        return
+    local_model = ""
+    for entry in (model_config.get("providers") or []):
+        if isinstance(entry, dict) and entry.get("type") == "local":
+            local_model = entry.get("llama_model", "") or ""
+            break
+    else:
+        # No local entry in the chain: the cold-prefill budget is meaningless
+        # evidence, and pricing the prompt would be wasted work.
+        return
+    try:
+        estimated = await routing_estimate.get()
+        if estimated <= 0:
+            return
+        try:
+            from proxy.session import _resolve_session_id_header
+
+            session_id, _ = _resolve_session_id_header(
+                getattr(request, "headers", {}) or {}
+            )
+        except Exception:
+            session_id = None
+        server_config = (
+            config.get("server", config) if isinstance(config, dict) else None
+        )
+        ratio = expected_cached_ratio(
+            local_model,
+            session_id,
+            estimated,
+            body_json.get("messages") if isinstance(body_json, dict) else None,
+            server_config=(
+                server_config if isinstance(server_config, dict) else None
+            ),
+        )
+        _note_local_token_evidence(
+            request,
+            new_tokens=int(estimated * (1 - ratio)),
+            budget_tokens=_cold_prefill_budget_tokens(config),
+        )
+    except Exception:  # pragma: no cover - evidence is best-effort
+        logger.debug("local refusal token evidence unavailable", exc_info=True)
+
+
+def _build_deferral_refusal_response(
+    request,
+    config: dict | None,
+    preference: str | None,
+    reason: str,
+    *,
+    retry_after_s: int | float | None = None,
+    elapsed_wait_seconds: float | None = None,
+) -> Response | None:
+    """End a spent local deferral in the retryable 429 (parent AC3/AC6).
+
+    LP-0MVSM06BK008FZUE: with ``X-Local-Preference: local-preferred`` and a
+    ``deferrable`` capacity verdict the request *waited* in the contention
+    queue — so a queue exit is the end of that deferral, not a licence to
+    promote a fits-local request to a paid provider (parent assumption A2).
+    Both queue exits (wait budget expired, depth cap refusing to enqueue) and
+    the ``local_lease_active`` exit funnel through here, which
+
+    - refuses **before** the next candidate is resolved and before any
+      remote dispatch, attempt, cooldown or usage-limit state is written, so
+      the request is enqueued at most once and takes no lease it will not use;
+    - builds the single refusal payload in
+      :func:`_build_local_only_refusal_response` (the one place that
+      classifies a refusal), so the header and body agree on *reason* and the
+      verdict stays ``deferrable``;
+    - supplies the *measured* expiry through ``advertised_retry_after`` so
+      ``Retry-After`` / ``retry_at`` come from
+      :func:`_refusal_retry_timing` and name the real wait instead of a
+      re-derived estimate.
+
+    Returns ``None`` — leaving the caller's pre-existing ``continue`` exactly
+    as it was — when the request is not pinned to local (``prefer-local`` /
+    ``remote-ok`` / absent header keep today's fall-through) or when its
+    verdict is ``too_large`` (waiting cannot help; that request is promoted to
+    the remote tiers by the sibling chain-stripping slice, never refused for
+    local capacity).
+    """
+    if not _local_preference_pins_local(request, preference):
+        return None
+    attempt: dict[str, Any] = {"reason": reason}
+    if retry_after_s is not None:
+        attempt["retry_after_s"] = retry_after_s
+    if elapsed_wait_seconds is not None:
+        attempt["elapsed_wait_seconds"] = round(float(elapsed_wait_seconds), 3)
+    response = _build_local_only_refusal_response(
+        attempt, config, preference=preference
+    )
+    # The deferral outcome is stamped where the deferral ends, so the single
+    # per-request line can tell a spent deferral (``deferred``) from chain
+    # exhaustion (``exhausted``) without correlating per-skip lines
+    # (LP-0MVSM06Z8003UQTM AC2).
+    _stamp_local_routing_outcome(request, LOCAL_ROUTING_OUTCOME_DEFERRED)
+    return response
+
+
+async def _build_local_only_refusal_for_remote(
+    request,
+    provider_cfg: dict,
+    model_config: dict,
+    config: dict,
+    preference: str,
+    routing_estimate=None,
+    body_json: dict | None = None,
+) -> Response | None:
+    """The pin-local choke point: refuse before any non-local dispatch.
+
+    LP-0MVRMC1L3006F0F3 (parent AC1/AC2): with a pin-local ``X-Local-Preference``
+    — the canonical ``local-preferred``, including a legacy ``local-only``
+    header normalised to it by :func:`admission_reserve.parse_preference`
+    (LP-0MVSHWYVE005MS16 AC5) — the dispatch loop must NEVER hand the request
+    to a non-local provider, regardless of which skip branch the local route
+    took — the structural analogue of ``remote-ok`` being enforced by
+    ``apply_local_preference()`` (intent enforced by structure, not by
+    remembering to patch each ``continue``). Called at the head of both
+    dispatch cycles immediately after the next candidate provider is resolved;
+    when the candidate is not local and the client is pin-local it returns
+    the refusal built from the skip reason already recorded on the request by
+    :func:`_note_local_fallback_reason`, so no existing ``continue`` path is
+    edited and the loop returns the refusal before the first remote dispatch.
+
+    The refusal's ``X-Local-Fallback-Reason`` is that recorded reason; when
+    the exit recorded none (a chain-resolution skip in
+    ``_resolve_provider_with_exclusions``, or a chain with no local entry at
+    all) the refusal is attributed with the stable fallback tokens above — the
+    sibling reason-token item (LP-0MVRMC1W6003MV3Y) pins the per-branch
+    vocabulary and narrows the generic fallback.
+
+    Inert for a local candidate (the request still completes locally) and,
+    through the single pin predicate
+    :func:`_local_preference_pins_local`, for ``prefer-local`` / absent header /
+    ``remote-ok`` clients, so AC3 byte-compatibility and the ``remote-ok``
+    strip are preserved. The predicate also declines the pin when the request's
+    capacity verdict is ``too_large`` (LP-0MVSLZY470051ZB2 AC4): a prompt that
+    outgrows the local serving envelope is never refused for local capacity —
+    it falls through to the remote tiers. The refusal is terminal for the
+    request: no attempt/cooldown/budget state is written and the request is
+    never enqueued, so the response is stamped exactly once and no
+    contention-queue slot/lease is leaked.
+
+    The refusal's retry story is reason-driven: a non-admission exit advertises
+    the real expiry it recorded (or one recomputed from live local availability
+    state), the ETA/occupancy reasons keep the projected-wait timer, and the
+    not-time-retryable reasons carry no timer at all
+    (LP-0MVQ23B80009OZ9V AC1–AC5). Token evidence is added for a
+    chain-resolution refusal so the client can size a compaction.
+
+    Single-implementation contract (LP-0MVSMINPR006SWT6 AC1/AC6): this choke
+    point does **not** classify the refusal itself — it forwards the parsed
+    *preference* and the evidence it already gathered to
+    :func:`_build_local_only_refusal_response`, which is the one place that
+    consults :func:`admission_reserve.local_capacity_verdict`. Both dispatch
+    cycles therefore reach the same single verdict computation.
+    """
+    if not _local_preference_pins_local(request, preference):
+        return None
+    if provider_cfg.get("type", "remote") == "local":
+        return None
+    reason = getattr(request, "_local_fallback_reason", None)
+    if not reason:
+        has_local_entry = any(
+            isinstance(entry, dict) and entry.get("type") == "local"
+            for entry in (model_config.get("providers") or [])
+        )
+        reason = (
+            LOCAL_ONLY_NO_LOCAL_ROUTE
+            if not has_local_entry
+            else LOCAL_ROUTE_UNAVAILABLE
+        )
+    # Non-admission retry timing (AC1–AC4): resolve the real expiry BEFORE
+    # re-recording the reason — recording clears a stale expiry by default, so
+    # the exit's own measurement would otherwise be lost here.
+    retry_after_s = _local_refusal_retry_after_s(
+        request, reason, model_config, config
+    )
+    _note_local_fallback_reason(request, reason, retry_after_s)
+    # Token evidence (AC5/parent AC4) when no admission decision supplies it,
+    # e.g. a chain-resolution skip (cooldown) or ``context_too_large``.
+    await _stamp_local_routing_token_evidence(
+        request, body_json, model_config, config, routing_estimate
+    )
+    attempt: dict[str, Any] = {"reason": reason}
+    # Routing token evidence (AC5): a chain-resolution skip such as
+    # ``context_too_large`` carries the numbers the routing probe actually used,
+    # so the client can size a compaction instead of waiting for a timer that
+    # cannot help.
+    token_evidence = getattr(request, LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR, None)
+    if isinstance(token_evidence, dict):
+        attempt.update(token_evidence)
+    decision = getattr(request, "_local_admission_decision", None)
+    if decision is not None:
+        attempt.update(_local_admission_evidence(decision))
+    if retry_after_s is not None:
+        attempt["retry_after_s"] = retry_after_s
+    # The parsed intent is threaded through so the single refusal line names the
+    # preference that actually caused the refusal (LP-0MVSMINPR006SWT6 AC4);
+    # the builder computes the verdict exactly once and never re-derives it.
+    response = _build_local_only_refusal_response(
+        attempt, config, preference=preference
+    )
+    # Pin refusal: the client's intent was honoured and the request was not
+    # promoted (LP-0MVSM06Z8003UQTM).
+    _stamp_local_routing_outcome(request, LOCAL_ROUTING_OUTCOME_PINNED)
+    return response
 
 
 async def _prefill_admission_guard(
@@ -6358,6 +7781,12 @@ async def _prefill_admission_guard(
         occupancy, in_flight_prefills = _local_gate_occupancy(
             config, max_local, endpoint=endpoint
         )
+        # Occupant-evidence pricing (LP-0MVOFVCA2008DQVE): price the remaining
+        # service the in-flight prefills still owe, not the newcomer's own
+        # ETA, so the deadline bound reflects the real time to first byte.
+        occupant_prefill_seconds = _local_occupant_prefill_seconds(
+            endpoint=endpoint, session_id=session_id
+        )
         decision = prefill_eta.evaluate_admission(
             config,
             model_name,
@@ -6366,6 +7795,7 @@ async def _prefill_admission_guard(
             priority,
             busy_slots=occupancy,
             in_flight_prefills=in_flight_prefills,
+            occupant_prefill_seconds=occupant_prefill_seconds,
         )
         if not decision.active:
             return None
@@ -6401,6 +7831,37 @@ async def _prefill_admission_guard(
         return None
 
 
+def _local_admission_evidence(decision: Any) -> dict[str, Any]:
+    """Admission evidence fields for a refusal attempt record.
+
+    The evidence is read off the guard's own decision, so the refusal carries
+    the numbers the guard actually compared — ``new_tokens`` against
+    ``budget_tokens`` (LP-0MVN4LBZ500281Z7) and the occupancy-aware
+    ``projected_wait_seconds`` the retry timer is derived from
+    (LP-0MVNTT4X8009IO2X AC2). ``projected_wait_seconds`` keeps full precision:
+    it feeds ``ceil(wait - budget)``, so rounding it could move the advertised
+    delay. Missing attributes are omitted rather than guessed.
+    """
+    evidence: dict[str, Any] = {
+        "eta_prefill_seconds": round(
+            float(getattr(decision, "eta_prefill_seconds", 0.0) or 0.0), 1
+        ),
+        "budget_seconds": round(
+            float(getattr(decision, "budget_seconds", 0.0) or 0.0), 1
+        ),
+    }
+    projected = getattr(decision, "projected_wait_seconds", None)
+    if projected is not None:
+        evidence["projected_wait_seconds"] = float(projected)
+    new_tokens = getattr(decision, "new_tokens", None)
+    if new_tokens is not None:
+        evidence["new_tokens"] = int(new_tokens)
+    budget_tokens = getattr(decision, "budget_tokens", None)
+    if budget_tokens is not None:
+        evidence["budget_tokens"] = int(budget_tokens)
+    return evidence
+
+
 def _local_admission_reject_payload(attempts: list | None) -> dict | None:
     """Return the ETA-guard rejection diagnostic from *attempts*, if any.
 
@@ -6426,6 +7887,90 @@ def _set_queue_wait_on_request(request, elapsed: float) -> None:
     (Q2=a: total wait + serve stays within ``llama_adaptive_timeout_*``)."""
     try:
         setattr(request, "_contention_queue_wait_seconds", float(elapsed or 0.0))
+    except Exception:
+        pass
+
+
+#: Attribute name on the request holding the admission-time pricing snapshot.
+#: LP-0MVODJ3P6000AIUM AC1: stamped once by :func:`_stamp_local_admission_evidence`
+#: before the first local dispatch so every dispatch-record creation path
+#: (router ``_try_acquire_local_dispatch`` / ``_increment_local_active_queries``,
+#: including the slot-retry re-dispatches) inherits the same verbatim numbers
+#: instead of re-pricing the prompt at record creation.
+LOCAL_ADMISSION_EVIDENCE_ATTR = "_local_admission_evidence"
+
+
+def _stamp_local_admission_evidence(
+    request,
+    *,
+    estimated_tokens: int | None,
+    cached_ratio: float,
+    new_tokens: int | None,
+    decision=None,
+    model_name: str | None = None,
+    busy_slots: int | None = None,
+    in_flight_prefills: int | None = None,
+) -> None:
+    """Stamp the routing/admission decision's pricing values on the request.
+
+    Called exactly once, immediately before the first local dispatch, with the
+    values the admission model actually used: ``_estimated_tokens``,
+    ``_routing_cached_ratio`` and ``_routing_new_tokens`` from the routing
+    probe plus ``eta_prefill_seconds`` from the governing admission decision
+    (direct guard, queue-entry guard, or the idle-admit budget verdict — the
+    most authoritative one available). The dispatch record then stores these
+    numbers verbatim (LP-0MVODJ3P6000AIUM AC1), so the post-acceptance
+    eviction event can never claim an over-budget admission that the decision
+    never priced (AC3).
+
+    *busy_slots* / *in_flight_prefills* (LP-0MVS9Y76R004B5M8) stamp the
+    admission-time co-residency snapshot: an occupied gate at admission marks
+    the dispatch's future calibration sample as contended, which the router
+    ORs with a first-byte-time live check before recording the sample.
+
+    Best-effort: a non-request object or a stamping failure is a no-op — a
+    routing decision must never break on observability instrumentation.
+    """
+    try:
+        eta = None
+        if decision is not None:
+            try:
+                eta = getattr(decision, "eta_prefill_seconds", None)
+            except Exception:
+                eta = None
+        if eta is None:
+            # No governing decision carried an ETA (inert/uncalibrated guard,
+            # or no budget-configured gate): cost the prompt NOW with the
+            # admission-time routing values through the same conservative
+            # estimator the guards use. This keeps the ETA on every accept
+            # path (LP-0MVODJ3P6000AIUM AC1) without ever re-sampling
+            # drifted inputs at record creation.
+            try:
+                from proxy import prefill_eta
+
+                eta, _ = prefill_eta.estimate_prefill_seconds(
+                    model_name,
+                    max(0, int(estimated_tokens or 0)) if estimated_tokens is not None else 0,
+                    float(cached_ratio or 0.0) if cached_ratio is not None else 0.0,
+                )
+            except Exception:
+                eta = None
+        setattr(
+            request,
+            LOCAL_ADMISSION_EVIDENCE_ATTR,
+            {
+                "estimated_tokens": max(0, int(estimated_tokens or 0))
+                if estimated_tokens is not None else None,
+                "cached_ratio": cached_ratio,
+                "new_tokens": max(0, int(new_tokens or 0))
+                if new_tokens is not None else None,
+                "eta_prefill_s": eta,
+                "busy_slots": max(0, int(busy_slots or 0))
+                if busy_slots is not None else None,
+                "in_flight_prefills": max(0, int(in_flight_prefills or 0))
+                if in_flight_prefills is not None else None,
+            },
+        )
     except Exception:
         pass
 
@@ -6463,10 +8008,11 @@ async def _maybe_queue_for_local_slot(
         the wait budget; the caller falls through to the next provider
         immediately (no queueing) and records the ETA diagnostic
         (LP-0MVGDUV5E005UWBQ).
-      - ``"refused_local_only"`` — the guard refused and the caller set
-        ``X-Local-Preference: local-only``: the caller must return the
-        retryable 429 admission response instead of falling back to a remote
-        provider (LP-0MVIKPCSG002B0NL AC4).
+      - ``"refused_local_only"`` — the guard refused and the request is pinned
+        to local (``local-preferred``, including the normalised alias) with a
+        ``deferrable`` verdict: the caller must return the retryable 429
+        admission response instead of falling back to a remote provider
+        (LP-0MVIKPCSG002B0NL AC4).
 
     A valid ``X-Local-Reservation`` ticket is consumed first: a reservation is
     a pre-granted admission, so the follow-up request dispatches without
@@ -6550,12 +8096,16 @@ async def _maybe_queue_for_local_slot(
             setattr(request, "_local_admission_decision", _admission)
         except Exception:
             pass
-        # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): with
-        # ``X-Local-Preference: local-only`` the client must never be moved
-        # remote. The caller turns this into the retryable 429 admission
-        # response instead of falling through to the next provider.
+        # Explicit client intent (LP-0MVIKPCSG002B0NL AC4 / pin slice
+        # LP-0MVSLZY470051ZB2 AC1/AC2): the single pin predicate. With a
+        # pin-local preference (``local-preferred``, incl. the normalised
+        # legacy ``local-only`` alias) and a ``deferrable`` capacity verdict
+        # the client must never be moved remote; the caller turns this into
+        # the retryable 429 admission response instead of falling through to
+        # the next provider. A ``too_large`` verdict declines the pin, so the
+        # request keeps the ``admission_reject`` fall-through with no 429.
         _preference = _request_local_preference(request)
-        if _preference == _PREF_LOCAL_ONLY:
+        if _local_preference_pins_local(request, _preference):
             return ("refused_local_only", _admission.reason, None)
         return ("admission_reject", _admission.reason, None)
 
@@ -6873,12 +8423,58 @@ def _usage_limit_account_key(provider_cfg: dict) -> str:
     return _failure_domain_key(provider_cfg)
 
 
+def _chain_skip_reason(
+    provider_cfg: dict,
+    reason_sink: Callable[[str | None], None] | None,
+    local_token: str,
+    generic_reason: str,
+) -> str:
+    """Return the ``reason=`` value a chain-resolution skip must log.
+
+    LP-0MVRMC1W6003MV3Y AC2/AC3: chain resolution walks every candidate, so a
+    skip reason belongs to the *local* route only when the skipped entry is
+    itself local — a remote entry's cooldown must never mint a local fallback
+    token. For a local entry the canonical token is recorded on the request
+    through *reason_sink* and returned verbatim, so the log field, the
+    ``X-Local-Fallback-Reason`` header and the refusal body cannot drift. For
+    any other entry the branch's generic name is returned and nothing is
+    recorded.
+
+    Never raises: observability must not break routing.
+    """
+    if not isinstance(provider_cfg, dict) or (
+        provider_cfg.get("type", "remote") != "local"
+    ):
+        return generic_reason
+    if reason_sink is not None:
+        try:
+            reason_sink(local_token)
+        except Exception:  # pragma: no cover - sinks are best-effort
+            logger.debug("chain-skip reason sink failed", exc_info=True)
+    return local_token
+
+
+def _preference_log_suffix(preference: str | None) -> str:
+    """The `` preference=<parsed>`` suffix for skip/fallback log lines.
+
+    LP-0MVRMC275000R2W6 (parent AC4): every line that decides "not local"
+    names the parsed ``X-Local-Preference`` so an intent violation is visible
+    in ``proxy.log``. The value comes from the request's single cached parse
+    (``_request_local_preference``) — never a second parse of the header. An
+    empty suffix is returned for callers that have no request at all (e.g. the
+    ``_has_next_provider`` predicate), so no line invents a preference.
+    """
+    return f" preference={preference}" if preference else ""
+
+
 def _resolve_provider_with_exclusions(
     model_config: dict,
     excluded_provider_names: set[str],
     excluded_domains: set[str] | None = None,
     *,
     config: dict | None = None,
+    reason_sink: Callable[[str | None], None] | None = None,
+    preference: str | None = None,
 ) -> dict | None:
     """Resolve next available provider while excluding names tried this request
     and any entry sharing an already-failed failure domain.
@@ -6893,6 +8489,24 @@ def _resolve_provider_with_exclusions(
     Quota-managed entries are walked in descending headroom urgency order
     (LP-0MVF7KIKE002DZVD); ``config`` supplies the ordering gates and defaults
     to the documented behaviour when omitted.
+
+    ``reason_sink`` is an optional callback that receives the stable reason
+    token of a chain-resolution skip **for a local entry only** (cooldown,
+    quota hard stop, pending usage-limit reset, ``available_times`` window).
+    The routing cycles pass ``_note_local_fallback_reason`` bound to their
+    request, which is how a pin-local refusal learns *why* local was
+    unavailable instead of reporting the generic fallback
+    (LP-0MVRMC1W6003MV3Y AC3). The return contract is unchanged for every
+    other caller.
+
+    ``preference`` carries the request's parsed ``X-Local-Preference`` so EVERY
+    skip line emitted here also logs `` preference=<parsed>``
+    (LP-0MVRMC275000R2W6 AC4, completed for the failure-domain /
+    usage-limit-account / proactive-quota lines in LP-0MVTI957W006KS0P): a
+    chain-resolution skip of the local entry becomes attributable to the
+    request that caused it. Optional: unfederated callers without a request
+    (e.g. the ``_has_next_provider`` predicate) omit it and the lines are
+    emitted unchanged.
     """
     providers = _quota_ranked_providers(model_config, config)
     if not providers:
@@ -6908,9 +8522,10 @@ def _resolve_provider_with_exclusions(
         if matched_domain is not None:
             logger.info(
                 "Skipping provider=%s: same failure domain as an already-failed "
-                "entry (domain=%s)",
+                "entry (domain=%s)%s",
                 name,
                 matched_domain,
+                _preference_log_suffix(preference),
             )
             continue
         # Usage-limit reset pending (LP-0MSLJPOCC0001ROJ): the ACCOUNT hit an
@@ -6922,26 +8537,41 @@ def _resolve_provider_with_exclusions(
         if usage_key in excluded_domains:
             logger.info(
                 "Skipping provider=%s: same usage-limit account as an "
-                "already-exhausted entry (account=%s)",
+                "already-exhausted entry (account=%s)%s",
                 name,
                 usage_key,
+                _preference_log_suffix(preference),
             )
             continue
         # Proactive quota state says this account has nothing left to spend
         # (LP-0MVF7KIKE002DZVD): treat it as unavailable.
         quota_reason = _quota_unavailable_reason(provider_cfg, config)
         if quota_reason is not None:
-            logger.info("Skipping provider=%s: %s", name, quota_reason)
+            logger.info(
+                "Skipping provider=%s: %s%s",
+                name,
+                quota_reason,
+                _preference_log_suffix(preference),
+            )
             continue
         reset_remaining = _usage_reset_remaining(usage_key)
         if reset_remaining > 0:
+            _reason = _chain_skip_reason(
+                provider_cfg,
+                reason_sink,
+                SKIP_REASON_USAGE_LIMIT_RESET_PENDING,
+                "usage_limit_reset_pending",
+            )
             logger.info(
                 "Skipping provider=%s: usage_limit_reset_pending "
-                "(account=%s, reset_at=%s, reset_in=%ds)",
+                "(account=%s, window=%s, reset_at=%s, reset_in=%ds) reason=%s%s",
                 name,
                 usage_key,
+                _usage_reset_window.get(usage_key, "unknown"),
                 datetime.fromtimestamp(_usage_reset_at[usage_key], tz=UTC).isoformat(),
                 int(reset_remaining),
+                _reason,
+                _preference_log_suffix(preference),
             )
             continue
         # Quota hard stop (LP-0MVF7KO8C005NB59): at-or-near the monthly cap the
@@ -6954,22 +8584,51 @@ def _resolve_provider_with_exclusions(
             provider_cfg, config
         )
         if quota_hard_stop:
-            logger.info("Skipping provider=%s: %s", name, quota_stop_reason)
+            _reason = _chain_skip_reason(
+                provider_cfg,
+                reason_sink,
+                SKIP_REASON_QUOTA_HARD_STOP,
+                "quota_hard_stop",
+            )
+            logger.info(
+                "Skipping provider=%s: %s reason=%s%s",
+                name,
+                quota_stop_reason,
+                _reason,
+                _preference_log_suffix(preference),
+            )
             continue
         cooldown_key = _entry_cooldown_key(provider_cfg)
         if cooldown_key is not None:
             remaining = _provider_cooldown_remaining(cooldown_key)
+            _reason = _chain_skip_reason(
+                provider_cfg,
+                reason_sink,
+                SKIP_REASON_LOCAL_PROVIDER_COOLDOWN,
+                "provider_cooldown",
+            )
             logger.info(
-                "Skipping provider=%s: %s in cooldown (%ds remaining)",
+                "Skipping provider=%s: %s in cooldown (%ds remaining) reason=%s%s",
                 name,
                 cooldown_key,
                 remaining,
+                _reason,
+                _preference_log_suffix(preference),
             )
             continue
         if not _provider_in_allowed_window(provider_cfg, config):
+            _reason = _chain_skip_reason(
+                provider_cfg,
+                reason_sink,
+                SKIP_REASON_OUTSIDE_AVAILABLE_WINDOW,
+                "outside_available_window",
+            )
             logger.info(
-                "Skipping provider=%s: outside its available_times window (UTC)",
+                "Skipping provider=%s: outside its available_times window (UTC) "
+                "reason=%s%s",
                 name,
+                _reason,
+                _preference_log_suffix(preference),
             )
             continue
         return provider_cfg
@@ -7047,25 +8706,45 @@ def _is_free_usage_limit_error(response: Response, body_text: str) -> bool:
     return False
 
 
+#: 429 body markers identifying a per-ACCOUNT quota / usage-limit event.
+#: ``rate_limit_error`` / ``rate_limit_exceeded`` are the observed api.munito.ai
+#: per-minute quota; ``insufficient_quota`` / ``free_daily_limit_exceeded`` are
+#: the out-of-credit and daily-capped shapes (LP-0MVT8SAZE00570J5). All are
+#: account-scoped: an independent API key on the same endpoint keeps serving.
+_ACCOUNT_QUOTA_ERROR_TYPES = frozenset({"rate_limit_error", "insufficient_quota"})
+_ACCOUNT_QUOTA_ERROR_CODES = frozenset(
+    {"rate_limit_exceeded", "free_daily_limit_exceeded"}
+)
+_ACCOUNT_QUOTA_MARKERS = tuple(
+    _ACCOUNT_QUOTA_ERROR_TYPES | _ACCOUNT_QUOTA_ERROR_CODES
+)
+
+
 def _is_account_rate_limit_error(response: Response, body_text: str) -> bool:
     """Return True when a 429 response is a per-ACCOUNT rate-limit error.
 
     Detects upstream responses whose JSON body identifies the rate limit as
-    bound to a specific API-key account -- ``type == "rate_limit_error"`` or
-    ``code == "rate_limit_exceeded"`` (case-insensitive), either top-level
-    (observed api.munito.ai body) or nested under an ``error`` dict.
+    bound to a specific API-key account -- ``type == "rate_limit_error"``,
+    ``code == "rate_limit_exceeded"``, ``type == "insufficient_quota"`` or
+    ``code == "free_daily_limit_exceeded"`` (case-insensitive), either
+    top-level (observed api.munito.ai body) or nested under an ``error`` dict.
 
-    A per-account rate limit is consumed by ONE API key: entries that share a
+    A per-account quota is consumed by ONE API key: entries that share a
     gateway but use different ``api_key_env`` values have independent quota
     (LP-0MSMBWB23009XYPW), so the failing entry must poison only its ACCOUNT
     key in the per-request exclusion set, NOT the shared endpoint failure
     domain -- otherwise paid sibling keys on the same gateway are skipped for
     the rest of the request despite having independent quota
-    (LP-0MVCX0E2V001VB5N).
+    (LP-0MVCX0E2V001VB5N). ``insufficient_quota`` / ``free_daily_limit_exceeded``
+    are the same shape of event: an out-of-credit or daily-capped KEY cannot
+    serve, while its paid sibling on the same endpoint/model still can
+    (LP-0MVT8SAZE00570J5 AC5).
 
-    Expected upstream format (observed from api.munito.ai):
+    Expected upstream formats (observed on api.munito.ai):
         HTTP 429
         Body: {"code": "rate_limit_exceeded", "type": "rate_limit_error"}
+        Body: {"error": {"type": "insufficient_quota",
+                         "code": "free_daily_limit_exceeded", "message": ...}}
     """
     status = int(getattr(response, "status_code", 0) or 0)
     if status != 429:
@@ -7087,12 +8766,15 @@ def _is_account_rate_limit_error(response: Response, body_text: str) -> bool:
         for cand in candidates:
             err_type = str(cand.get("type", "")).strip().lower()
             code = str(cand.get("code", "")).strip().lower()
-            if err_type == "rate_limit_error" or code == "rate_limit_exceeded":
+            if (
+                err_type in _ACCOUNT_QUOTA_ERROR_TYPES
+                or code in _ACCOUNT_QUOTA_ERROR_CODES
+            ):
                 return True
 
     # Fallback: check raw body text for the identifying markers
     lowered_body = (body_text or "").strip().lower()
-    return "rate_limit_error" in lowered_body or "rate_limit_exceeded" in lowered_body
+    return any(marker in lowered_body for marker in _ACCOUNT_QUOTA_MARKERS)
 
 
 def _parse_resets_in(message: str) -> float | None:
@@ -7127,18 +8809,156 @@ def _parse_resets_in(message: str) -> float | None:
     return total if found else None
 
 
+#: Absolute-timestamp shapes an upstream 429 message may advertise for the
+#: instant a quota resets. Only forms carrying explicit timezone evidence are
+#: matched (`` UTC`` suffix, ``Z``, or a ``±HH:MM``/``±HHMM`` offset): a bare
+#: local-time timestamp is deliberately NOT guessed, because assuming the
+#: wrong zone would quarantine for hours in the wrong direction
+#: (LP-0MVT8SAZE00570J5 AC2/AC4, assumption A3).
+_RESETS_AT_ISO_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)"
+    r"(Z|[+-]\d{2}:?\d{2})",
+    re.IGNORECASE,
+)
+_RESETS_AT_UTC_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s*UTC\b",
+    re.IGNORECASE,
+)
+
+#: Quota period names an upstream body may advertise; mirrors the keys of
+#: :data:`_PERIOD_DEFAULT_SECONDS`. Used to bound an absolute-timestamp
+#: quarantine to the period the payload itself names.
+_PERIOD_KEYWORD_RE = re.compile(r"\b(daily|weekly|monthly)\b", re.IGNORECASE)
+
+
+def _parse_resets_at_timestamp(
+    message: str, now: datetime | None = None
+) -> float | None:
+    """Parse an absolute ``resets at <timestamp>`` instant into seconds.
+
+    Returns the seconds from *now* until the advertised reset instant, or
+    ``None`` when the message carries no usable timestamp. Supported forms,
+    all with explicit timezone evidence::
+
+        … It resets at 2026-10-30 00:00 UTC.      (observed MunitoAI body)
+        … resets at 2026-10-30 00:00:30 UTC.
+        … resets at 2026-10-30T00:00:00Z.
+        … resets at 2026-10-30T02:00:00+02:00.
+
+    ``_parse_resets_in`` handles *relative* durations only (``Resets in 22hr
+    43min``), so a gateway advertising an absolute instant
+    (``error.code=free_daily_limit_exceeded``, observed api.munito.ai) was
+    previously unparseable and fell back to re-probing a dead account every
+    ~60 s (LP-0MVT8SAZE00570J5).
+
+    A timestamp in the past is not usable evidence and returns ``None`` (as
+    does anything unparseable), so the caller falls back to the guessed-period
+    rules rather than quarantining on stale data. ``now`` is injectable for
+    deterministic tests and defaults to ``datetime.now(timezone.utc)``.
+    """
+    text = message or ""
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+
+    target: datetime | None = None
+    match = _RESETS_AT_ISO_RE.search(text)
+    if match:
+        zone = match.group(3).upper()
+        if zone == "Z":
+            zone = "+00:00"
+        elif ":" not in zone:
+            zone = f"{zone[:3]}:{zone[3:]}"
+        try:
+            target = datetime.fromisoformat(
+                f"{match.group(1)}T{match.group(2)}{zone}"
+            )
+        except ValueError:
+            target = None
+    if target is None:
+        match = _RESETS_AT_UTC_RE.search(text)
+        if match:
+            try:
+                target = datetime.fromisoformat(
+                    f"{match.group(1)}T{match.group(2)}"
+                ).replace(tzinfo=UTC)
+            except ValueError:
+                target = None
+    if target is None:
+        return None
+
+    seconds = (target - now.astimezone(UTC)).total_seconds()
+    if seconds <= 0:
+        return None
+    return seconds
+
+
+def _usage_limit_period_name(
+    message: str | None,
+    limit_name: str | None,
+    codes: list[str] | None = None,
+) -> str | None:
+    """Name the quota period a 429 payload advertises, or ``None``.
+
+    ``metadata.limitName`` wins when it names a known period; otherwise the
+    payload's own wording is used — the observed MunitoAI free-tier body names
+    no ``limitName`` but says "The daily free limit of …" and carries
+    ``code=free_daily_limit_exceeded`` (LP-0MVT8SAZE00570J5). Only
+    ``daily``/``weekly``/``monthly`` are recognised; anything else is
+    unparseable and leaves the caller on its bounded fallback.
+    """
+    if limit_name in _PERIOD_DEFAULT_SECONDS:
+        return limit_name
+    if "free_daily_limit_exceeded" in (codes or ()):
+        return "daily"
+    match = _PERIOD_KEYWORD_RE.search(message or "")
+    return match.group(1).lower() if match else None
+
+
 class _UsageLimitReset(NamedTuple):
     """Resolved usage-limit reset for a 429 response.
 
-    ``explicit`` is True only when the gateway message carried an actual
-    ``Resets in ...`` duration; a duration guessed from ``metadata.limitName``
-    is ``explicit=False`` and is capped and treated as soft/re-checkable
-    (LP-0MUQTCMW2001VXH8).
+    ``explicit`` is True only when the reset came from hard evidence — an
+    actual ``Resets in ...`` duration in the gateway message, an absolute
+    ``resets at <timestamp>`` instant, or the account's own quota-snapshot
+    reset. A duration guessed from ``metadata.limitName`` / the payload's
+    period wording (or bounded because the named window's snapshot data is
+    contradictory) is ``explicit=False`` and is capped and treated as
+    soft/re-checkable (LP-0MUQTCMW2001VXH8).
+
+    An explicit absolute-timestamp reset is still **bounded** by the period
+    the payload names (``free_daily_limit_exceeded`` / "daily … limit" → 24 h)
+    plus the safety margin, so a far-future or clock-skewed timestamp cannot
+    lock an account out indefinitely; a payload that names no period is
+    bounded by the guess cap instead (LP-0MVT8SAZE00570J5 AC4).
+
+    ``window`` names the quota window (``rolling`` / ``weekly`` / ``monthly``)
+    whose own reset bounded the quarantine, or ``None`` when no window was
+    involved (message duration, stale/absent quota state, x-ratelimit
+    headers, legacy state). The window is what lets a later fresh poll clear
+    the quarantine as soon as that window is reported lifted
+    (LP-0MVPAE77Z002VGIA AC7/AC11).
     """
 
     seconds: float
     explicit: bool
     limit_name: str | None
+    window: str | None = None
+
+
+class _WindowResetChoice(NamedTuple):
+    """One window-aware quarantine duration, before the safety margin.
+
+    Internal to :func:`_usage_limit_reset_info`: ``source`` is the stable
+    ``source=`` code for the log line (``snapshot`` for hard snapshot
+    evidence, ``snapshot-bounded`` for a bounded/guessed snapshot derivation).
+    """
+
+    seconds: float
+    explicit: bool
+    window: str | None
+    source: str
 
 
 def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
@@ -7173,19 +8993,73 @@ def _usage_limit_guess_cap_seconds(config: dict | None = None) -> float:
     return float(_USAGE_LIMIT_GUESS_MAX_SECONDS)
 
 
-def _quota_snapshot_reset_seconds(
+def _fresh_quota_snapshot(
     provider_cfg: dict | None, config: dict | None = None
-) -> float | None:
-    """Return the authoritative reset for *provider_cfg* from quota state.
+) -> quota_state.QuotaSnapshot | None:
+    """Return the fresh quota snapshot for *provider_cfg*, or ``None``.
 
-    Only ``opencode-*`` entries are quota-managed, and the value is honoured
-    only while the quota source is strictly **enabled** for routing
+    A snapshot is usable when the entry is quota-managed (``opencode-*``), a
+    snapshot exists and it is younger than
+    ``server.quota_state_max_age_seconds``. Deliberately **ignores** the surge
+    kill switch and dry-run: those switch quota-driven *routing* decisions
+    off, not the revalidation of an existing quarantine
+    (LP-0MVPAE77Z002VGIA AC7). Never blocks, never polls and never raises:
+    a pure cache read on the request path with a fail-safe exception guard.
+    """
+    if not isinstance(provider_cfg, dict):
+        return None
+    try:
+        if not quota_state.is_quota_provider(provider_cfg, config):
+            return None
+        snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
+        if snapshot is None:
+            return None
+        if not snapshot.is_fresh(quota_state.quota_state_max_age_seconds(config)):
+            return None
+    except Exception:
+        logger.info(
+            "usage-limit snapshot unavailable; falling back to the "
+            "message/guess path",
+            exc_info=True,
+        )
+        return None
+    return snapshot
+
+
+def _quota_snapshot_for_reset(
+    provider_cfg: dict | None, config: dict | None = None
+) -> quota_state.QuotaSnapshot | None:
+    """The fresh snapshot an *opencode-* entry may resolve a 429 against.
+
+    Adds the routing-mode gate on top of :func:`_fresh_quota_snapshot`: the
+    value is honoured only while the quota source is strictly **enabled**
     (:func:`proxy.quota_state.quota_behaviour`): a disabled (kill switch),
     stale (suspended) or dry-run quota mode returns ``None`` so the reactive
     usage-limit handling keeps its pre-feature guessed/message behaviour for
-    every other case (LP-0MVF7MPZN009GOJB).
+    every other case (LP-0MVF7MPZN009GOJB). Never raises.
+    """
+    if not isinstance(provider_cfg, dict):
+        return None
+    try:
+        if not quota_state.quota_behaviour(config).applies:
+            return None
+    except Exception:
+        logger.info(
+            "usage-limit snapshot reset unavailable; falling back to the "
+            "message/guess path",
+            exc_info=True,
+        )
+        return None
+    return _fresh_quota_snapshot(provider_cfg, config)
 
-    The returned value is the account-level
+
+def _quota_snapshot_reset_seconds(
+    provider_cfg: dict | None, config: dict | None = None
+) -> float | None:
+    """Return the account-level authoritative reset for *provider_cfg*.
+
+    See :func:`_quota_snapshot_for_reset` for the gating; the returned value
+    is the account-level
     :attr:`~proxy.quota_state.QuotaSnapshot.seconds_to_reset` (the monthly
     allowance window, resolved per account from ``monthly.resetsAt`` — the
     same value surge and ``available_times`` treat as authoritative) rather
@@ -7194,28 +9068,192 @@ def _quota_snapshot_reset_seconds(
     non-positive value all return ``None`` (fail open to the existing
     message/guess cascade). Never blocks, never polls and never raises: a
     pure cache read on the request path with a fail-safe exception guard.
+
+    Window-aware reset resolution (which window the 429 actually named) is
+    handled by :func:`_usage_limit_reset_info`;
+    :func:`_quota_snapshot_window_reset_seconds` exposes a single window's
+    countdown for tests and callers that need it.
     """
-    if not isinstance(provider_cfg, dict):
+    snapshot = _quota_snapshot_for_reset(provider_cfg, config)
+    if snapshot is None:
+        return None
+    seconds = snapshot.seconds_to_reset
+    if seconds <= 0:
+        return None
+    return float(seconds)
+
+
+def _quota_snapshot_window_reset_seconds(
+    provider_cfg: dict | None,
+    config: dict | None = None,
+    window: str | None = None,
+) -> float | None:
+    """Return one window's own authoritative reset for *provider_cfg*.
+
+    Like :func:`_quota_snapshot_reset_seconds` but for a single named window
+    (``rolling`` / ``weekly`` / ``monthly``): the countdown for **that**
+    window's ``resetsAt``, or ``None`` when the window is unknown, the
+    snapshot is unusable or the countdown is non-positive (LP-0MVPAE77Z002VGIA
+    AC1-AC3). Never blocks, never polls and never raises.
+    """
+    if window is None:
+        return None
+    snapshot = _quota_snapshot_for_reset(provider_cfg, config)
+    if snapshot is None:
         return None
     try:
-        if not quota_state.is_quota_provider(provider_cfg, config):
-            return None
-        if not quota_state.quota_behaviour(config).applies:
-            return None
-        snapshot = quota_state.get_quota_snapshot(provider_cfg, config)
-        if snapshot is None:
-            return None
-        seconds = snapshot.seconds_to_reset
+        seconds = snapshot.window(window).seconds_to_reset
     except Exception:
-        logger.info(
-            "usage-limit snapshot reset unavailable; falling back to the "
-            "message/guess path",
-            exc_info=True,
-        )
         return None
     if seconds <= 0:
         return None
     return float(seconds)
+
+
+def _window_reset_seconds(
+    snapshot: quota_state.QuotaSnapshot, window: str
+) -> float:
+    """Seconds until *window* resets according to *snapshot* (0 unusable)."""
+    try:
+        seconds = float(snapshot.window(window).seconds_to_reset)
+    except Exception:
+        return 0.0
+    return seconds if seconds > 0 else 0.0
+
+
+def _soonest_usable_window_reset(
+    snapshot: quota_state.QuotaSnapshot,
+) -> tuple[str, float] | None:
+    """The ``(name, seconds)`` of the soonest still-usable window, or ``None``.
+
+    A window is *usable* when it is present, healthy (not blocking) and has a
+    positive reset countdown. Used to bound a quarantine whose limit name does
+    not identify a window (absent/empty/unknown `limitName`, AC4), so the
+    quarantine can never outlive the shortest window that is genuinely still
+    open.
+    """
+    best: tuple[str, float] | None = None
+    for name in quota_state.WINDOW_NAMES:
+        window = snapshot.window(name)
+        if window.blocking:
+            continue
+        seconds = window.seconds_to_reset
+        if seconds <= 0:
+            continue
+        if best is None or seconds < best[1]:
+            best = (name, float(seconds))
+    return best
+
+
+#: A quota window reads as "effectively empty" (i.e. it has rolled over) at
+#: or below this consumption percentage. Used only by the window-quarantine
+#: revalidation as strong evidence that a window reset, so an account that is
+#: merely *near* its limit keeps its quarantine until the window actually
+#: resets (LP-0MVPAE77Z002VGIA AC7).
+_WINDOW_RESET_PERCENT = 1.0
+
+
+def _window_limit_lifted(
+    snapshot: quota_state.QuotaSnapshot,
+    window: str,
+    config: dict | None,
+    remaining_seconds: float = 0.0,
+) -> bool:
+    """True when *snapshot* proves *window*'s limit has been lifted (AC7).
+
+    Two signals, both requiring the window to be healthy (present, status ok)
+    and its consumption to be back below the quota hard-stop threshold:
+
+    - **rollover** — the window reads as effectively empty
+      (:data:`_WINDOW_RESET_PERCENT`), which is what a reset does; or
+    - **extended countdown** — the window now resets *later* than the
+      quarantine would expire (``remaining_seconds``), so it must have rolled
+      over since the quarantine was recorded.
+
+    A window still sitting near its limit therefore keeps the quarantine until
+    its own reset: over-quarantining is bounded by the window, whereas
+    clearing early would dispatch to a still-limited account and burn a 429
+    on every poll cycle.
+    """
+    try:
+        w = snapshot.window(window)
+    except Exception:
+        return False
+    if w.blocking:
+        return False
+    if w.percent >= quota_state.quota_exhaustion_percent(config):
+        return False
+    if w.percent <= _WINDOW_RESET_PERCENT:
+        return True
+    return w.seconds_to_reset > remaining_seconds
+
+
+def _snapshot_shows_exhaustion(
+    snapshot: quota_state.QuotaSnapshot, config: dict | None
+) -> bool:
+    """True when any window is blocking or at/above the hard-stop threshold.
+
+    The legacy/account-level answer to "is this account still exhausted": a
+    window that is missing, unhealthy, or consumed to the quota hard stop
+    keeps the quarantine. A poll showing no window anywhere near the limit
+    clears it (AC11).
+    """
+    threshold = quota_state.quota_exhaustion_percent(config)
+    for name in quota_state.WINDOW_NAMES:
+        w = snapshot.window(name)
+        if w.blocking or w.percent >= threshold:
+            return True
+    return False
+
+
+def _snapshot_reset_choice(
+    snapshot: quota_state.QuotaSnapshot,
+    config: dict | None,
+    named_window: str | None,
+) -> _WindowResetChoice | None:
+    """Choose the quarantine duration a fresh snapshot supports (AC1-AC4/AC8).
+
+    Resolution, in order:
+
+    1. The quota window the 429 named (``metadata.limitName``) and whose own
+       reset the snapshot reports as positive → quarantine for **that**
+       window's remaining time, hard/explicit (AC1-AC3, AC5). This replaces
+       the pre-fix behaviour of always using the monthly account-level reset.
+    2. The named window's reset is non-positive (contradictory, stale
+       snapshot) while upstream still 429s for it → bounded by the named
+       period capped at the guess cap, recorded *guessed* so the self-healing
+       probe revalidates it — never a multi-week explicit lockout (AC8).
+    3. No usable limit name (absent/empty/unknown) → bounded by the **soonest
+       usable window** reset, recorded *guessed*: never the monthly value
+       while a shorter window is still open (AC4).
+    4. No usable window at all → the account-level ``seconds_to_reset`` +
+       margin path is retained, unchanged (AC4 tail).
+
+    Returns ``None`` when nothing yields a positive duration (the caller then
+    falls through to the message/guess cascade). Never raises.
+    """
+    if named_window is not None:
+        seconds = _window_reset_seconds(snapshot, named_window)
+        if seconds > 0:
+            return _WindowResetChoice(seconds, True, named_window, "snapshot")
+        bounded = min(
+            float(
+                _PERIOD_DEFAULT_SECONDS.get(
+                    named_window, _USAGE_LIMIT_GUESS_MAX_SECONDS
+                )
+            ),
+            _usage_limit_guess_cap_seconds(config),
+        )
+        return _WindowResetChoice(bounded, False, named_window, "snapshot-bounded")
+
+    soonest = _soonest_usable_window_reset(snapshot)
+    if soonest is not None:
+        return _WindowResetChoice(soonest[1], False, soonest[0], "snapshot-bounded")
+
+    account_seconds = snapshot.seconds_to_reset
+    if account_seconds > 0:
+        return _WindowResetChoice(float(account_seconds), True, None, "snapshot")
+    return None
 
 
 def _usage_limit_reset_info(
@@ -7226,24 +9264,56 @@ def _usage_limit_reset_info(
 ) -> _UsageLimitReset | None:
     """Return the resolved usage-limit reset for a 429 error response.
 
-    Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ) and any usage-limit
+    Recognizes ``GoUsageLimitError`` (LP-0MSLJPOCC0001ROJ), any usage-limit
     error variant that carries a reset duration in its message (including
-    ``FreeUsageLimitError`` responses that include one).
+    ``FreeUsageLimitError`` responses that include one), and the
+    ``insufficient_quota`` / ``free_daily_limit_exceeded`` markers (the
+    observed MunitoAI free-tier daily-limit body, LP-0MVT8SAZE00570J5 AC1).
+    Those markers are read from the top level **and** from a nested ``error``
+    dict, because gateways disagree about the nesting.
 
-    Resolution order (LP-0MVF7MPZN009GOJB): for an ``opencode-*`` entry with a
-    **fresh** quota snapshot the snapshot's authoritative ``seconds_to_reset``
-    is used (monthly window, + the 2-minute margin) and returned as a hard
-    ``explicit=True`` quarantine -- the guessed cap path is unreachable for
-    that case. Otherwise (non-``opencode-*`` entry, or stale/absent/disabled
+    Resolution order, **window-aware** (LP-0MVPAE77Z002VGIA): for an
+    ``opencode-*`` entry with a **fresh** quota snapshot and quota behaviour
+    strictly enabled, the quarantine is derived from the quota window the 429
+    named in ``metadata.limitName``:
+
+    - a known window (``rolling`` / ``weekly`` / ``monthly``) with a positive
+      reset countdown quarantines for **that window's** remaining time + the
+      2-minute margin, as a hard ``explicit=True`` quarantine
+      (``source=snapshot``, AC1-AC3);
+    - a known window whose snapshot reset is non-positive (contradictory —
+      stale evidence) is bounded by the named period capped at
+      :func:`_usage_limit_guess_cap_seconds` and marked *guessed* so the
+      self-healing probe revalidates it (``source=snapshot-bounded``, AC8);
+    - an absent, empty or unknown ``limitName`` (e.g. the documentation-only
+      upstream ``daily``) is bounded by the **soonest usable window** reset and
+      marked *guessed*, so it can never outlive the shortest open window —
+      in particular never the monthly value (AC4);
+    - when no window yields a usable reset, the account-level
+      :attr:`~proxy.quota_state.QuotaSnapshot.seconds_to_reset` (monthly) path
+      is retained unchanged (AC4 tail).
+
+    Otherwise (non-``opencode-*`` entry, or stale/absent/disabled/dry-run
     quota state) the previous cascade is unchanged: an explicit
-    ``Resets in 22hr 43min`` duration is honoured in full; when the message
-    has no explicit duration, ``metadata.limitName`` (daily/weekly/monthly)
-    supplies a GUESSED period capped at
+    ``Resets in 22hr 43min`` duration is honoured in full; an absolute
+    ``resets at 2026-10-30 00:00 UTC`` instant is parsed by
+    :func:`_parse_resets_at_timestamp` and honoured as explicit evidence,
+    **bounded** to the period the payload names (daily → 24 h, else the guess
+    cap) so a far-future or clock-skewed timestamp cannot lock the account out
+    indefinitely; when neither is present, ``metadata.limitName`` / the
+    payload's period wording supplies a GUESSED period capped at
     :func:`_usage_limit_guess_cap_seconds` (24h by default) — the full 30-day
-    period is never used without explicit evidence (LP-0MUQTCMW2001VXH8). The
-    2-minute safety margin is added to the returned duration. The guess path
-    is therefore retained purely as the stale/absent fallback, never for a
-    fresh-snapshot ``opencode-*`` account.
+    period is never used without explicit evidence (LP-0MUQTCMW2001VXH8). An
+    ``insufficient_quota`` 429 with no reset information of any kind is
+    quarantined *guessed* for the cap (self-healing probe, never persisted) so
+    an out-of-credit account is not re-probed every ~60 s. The 2-minute safety
+    margin is added to every returned duration.
+
+    The chosen window (if any) is carried on the returned
+    :class:`_UsageLimitReset` so the quarantine can be persisted with it and
+    revalidated as soon as a fresh poll reports that window lifted (AC7).
+    An absolute-timestamp reset names no quota *window*, so it is recorded
+    without window metadata and revalidated as a legacy entry.
 
     Returns ``None`` when the response is not a 429 usage-limit error or no
     reset duration can be computed — callers then fall back to the existing
@@ -7254,6 +9324,14 @@ def _usage_limit_reset_info(
         Body: {"type": "error", "error": {"type": "GoUsageLimitError",
               "message": "Weekly usage limit reached. Resets in 22hr 43min."},
               "metadata": {"limitName": "weekly"}}
+
+    Expected daily-limit format (observed from api.munito.ai):
+        HTTP 429
+        Body: {"error": {"message": "The daily free limit of
+              deepseek-ai/deepseek-v4-flash is reached. It resets at
+              2026-10-30 00:00 UTC. Add credits to continue now.",
+              "type": "insufficient_quota", "code":
+              "free_daily_limit_exceeded"}}
     """
     status = int(getattr(response, "status_code", 0) or 0)
     if status != 429:
@@ -7264,43 +9342,75 @@ def _usage_limit_reset_info(
     except Exception:
         payload = None
 
-    err_type = None
+    err_types: list[str] = []
+    codes: list[str] = []
     message = None
     limit_name = None
     if isinstance(payload, dict):
+        # Two-candidate reading (payload then nested ``error``), matching
+        # ``_is_account_rate_limit_error``: some gateways put the markers at
+        # the top level (observed api.munito.ai), others nest them under
+        # ``error`` (OpenAI-style), and the top-level ``type`` may be a generic
+        # wrapper such as ``"error"`` — so every candidate is inspected
+        # instead of taking the first non-empty value.
+        candidates = [payload]
         error = payload.get("error")
         if isinstance(error, dict):
-            err_type = str(error.get("type", "")).strip().lower()
-            message = error.get("message")
+            candidates.append(error)
+        for cand in candidates:
+            cand_type = str(cand.get("type", "")).strip().lower()
+            cand_code = str(cand.get("code", "")).strip().lower()
+            if cand_type:
+                err_types.append(cand_type)
+            if cand_code:
+                codes.append(cand_code)
+            if message is None and isinstance(cand.get("message"), str):
+                message = cand["message"]
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
             limit_name = str(metadata.get("limitName", "")).strip().lower()
 
-    if err_type not in ("gousagelimiterror", "freeusagelimiterror"):
+    quota_marker = any(
+        err_type == "insufficient_quota" for err_type in err_types
+    ) or "free_daily_limit_exceeded" in codes
+    if not quota_marker and not any(
+        err_type in ("gousagelimiterror", "freeusagelimiterror")
+        for err_type in err_types
+    ):
         return None
 
     if provider_cfg is not None:
-        snapshot_seconds = _quota_snapshot_reset_seconds(provider_cfg, config)
-        if snapshot_seconds is not None:
-            logger.info(
-                "usage-limit reset source=snapshot provider=%s account=%s "
-                "seconds_to_reset=%.0f limit=%s",
-                provider_cfg.get("name", ""),
-                _usage_limit_account_key(provider_cfg),
-                snapshot_seconds,
-                limit_name or "",
+        snapshot = _quota_snapshot_for_reset(provider_cfg, config)
+        if snapshot is not None:
+            choice = _snapshot_reset_choice(
+                snapshot,
+                config,
+                quota_state.window_for_limit_name(limit_name),
             )
-            return _UsageLimitReset(
-                snapshot_seconds + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
-                True,
-                limit_name,
-            )
+            if choice is not None:
+                logger.info(
+                    "usage-limit reset source=%s provider=%s account=%s "
+                    "window=%s seconds_to_reset=%.0f limit=%s",
+                    choice.source,
+                    provider_cfg.get("name", ""),
+                    _usage_limit_account_key(provider_cfg),
+                    choice.window or "account",
+                    choice.seconds + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                    limit_name or "",
+                )
+                return _UsageLimitReset(
+                    choice.seconds + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                    choice.explicit,
+                    limit_name,
+                    choice.window,
+                )
 
     account = (
         _usage_limit_account_key(provider_cfg)
         if isinstance(provider_cfg, dict)
         else None
     )
+    period = _usage_limit_period_name(message, limit_name, codes)
     seconds = _parse_resets_in(message) if message else None
     if seconds is not None:
         if account is not None:
@@ -7315,9 +9425,37 @@ def _usage_limit_reset_info(
         return _UsageLimitReset(
             float(seconds) + _USAGE_LIMIT_RESET_MARGIN_SECONDS, True, limit_name
         )
-    if limit_name in _PERIOD_DEFAULT_SECONDS:
+
+    timestamp_seconds = _parse_resets_at_timestamp(message) if message else None
+    if timestamp_seconds is not None:
+        # Explicit evidence, but bounded by the period the payload itself
+        # names (daily → 24h) so a malformed / far-future / clock-skewed
+        # timestamp cannot lock the account out indefinitely (AC4). A payload
+        # naming no period is bounded by the guessed-period cap instead.
+        bound = (
+            float(_PERIOD_DEFAULT_SECONDS[period])
+            if period is not None
+            else _usage_limit_guess_cap_seconds(config)
+        )
+        bounded = min(float(timestamp_seconds), bound)
+        if account is not None:
+            logger.info(
+                "usage-limit reset source=timestamp provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                account,
+                bounded + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                period or limit_name or "",
+            )
+        return _UsageLimitReset(
+            bounded + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+            True,
+            period or limit_name,
+        )
+
+    if period in _PERIOD_DEFAULT_SECONDS:
         guessed = min(
-            float(_PERIOD_DEFAULT_SECONDS[limit_name]),
+            float(_PERIOD_DEFAULT_SECONDS[period]),
             _usage_limit_guess_cap_seconds(config),
         )
         if account is not None:
@@ -7327,7 +9465,25 @@ def _usage_limit_reset_info(
                 provider_cfg.get("name", ""),
                 account,
                 guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
-                limit_name,
+                period,
+            )
+        return _UsageLimitReset(
+            guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, period
+        )
+
+    if quota_marker:
+        # An out-of-credit account with no reset information of any kind: a
+        # capped GUESS (self-healing probe, never persisted) instead of the
+        # generic ~60 s re-probe loop this item exists to remove (AC4).
+        guessed = _usage_limit_guess_cap_seconds(config)
+        if account is not None:
+            logger.info(
+                "usage-limit reset source=guess provider=%s account=%s "
+                "seconds_to_reset=%.0f limit=%s",
+                provider_cfg.get("name", ""),
+                account,
+                guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS,
+                limit_name or "",
             )
         return _UsageLimitReset(
             guessed + _USAGE_LIMIT_RESET_MARGIN_SECONDS, False, limit_name
@@ -7358,13 +9514,21 @@ def _set_usage_limit_quarantine(
     Guessed (period-name-only) quarantines are tagged in
     ``_usage_reset_guessed`` so they are capped at read time, skipped by the
     persistence layer, and eligible for self-healing probes
-    (LP-0MUQTCMW2001VXH8).
+    (LP-0MUQTCMW2001VXH8). The quota window that bounded the quarantine (when
+    known) is recorded in ``_usage_reset_window`` so a later fresh poll can
+    clear it as soon as that window is reported lifted (LP-0MVPAE77Z002VGIA
+    AC7); entries without a window (message durations, x-ratelimit headers,
+    legacy state) carry no metadata and are revalidated as legacy entries.
     """
     _usage_reset_at[account] = time.time() + reset.seconds
     if reset.explicit:
         _usage_reset_guessed.discard(account)
     else:
         _usage_reset_guessed.add(account)
+    if reset.window:
+        _usage_reset_window[account] = reset.window
+    else:
+        _usage_reset_window.pop(account, None)
     _persist_provider_state_best_effort()
 
 
@@ -7382,10 +9546,12 @@ def clear_usage_limit_quarantine(account: str | None = None) -> list[str]:
         cleared = list(_usage_reset_at)
         _usage_reset_at.clear()
         _usage_reset_guessed.clear()
+        _usage_reset_window.clear()
         _usage_limit_last_probe.clear()
     elif account in _usage_reset_at:
         del _usage_reset_at[account]
         _usage_reset_guessed.discard(account)
+        _usage_reset_window.pop(account, None)
         _usage_limit_last_probe.pop(account, None)
         cleared = [account]
     else:
@@ -7410,6 +9576,7 @@ def _usage_reset_remaining(failure_domain: str) -> float:
     if remaining <= 0:
         del _usage_reset_at[failure_domain]
         _usage_reset_guessed.discard(failure_domain)
+        _usage_reset_window.pop(failure_domain, None)
         _usage_limit_last_probe.pop(failure_domain, None)
         return 0.0
     return remaining
@@ -7495,16 +9662,33 @@ async def _probe_usage_limit_account(provider_cfg: dict) -> bool:
         return False
 
 
-async def _maybe_probe_quarantined_accounts(model_config: dict) -> None:
-    """Self-heal guessed usage-limit quarantines before routing.
+async def _maybe_probe_quarantined_accounts(
+    model_config: dict,
+    config: dict | None = None,
+) -> None:
+    """Self-heal quotas before routing: probe guesses, revalidate windows.
 
-    For each provider whose account carries a GUESSED quarantine that is due
-    for a probe (interval-gated), issue a cheap probe and clear the
-    quarantine on success, so the recovered account is routed to within the
-    same request cycle. Hard (explicit-duration) quarantines are left alone.
+    Three revalidation paths, all on the existing cadence (never per-request
+    polling, no blocking I/O on the request path):
+
+    - **Guessed** quarantines (``_usage_reset_guessed``): the existing cheap
+      transport probe, interval-gated, clears on success
+      (LP-0MUQTCMW2001VXH8).
+    - **Window-derived** quarantines (window metadata in
+      ``_usage_reset_window``): revalidated from a fresh quota snapshot —
+      when the window that produced the quarantine is reported lifted, the
+      quarantine is cleared without any network call (AC7).
+    - **Legacy** entries (no window metadata): cleared by the first healthy
+      poll that shows no window exhausted, so a schema version-1 state file
+      can never survive as a multi-week lockout (AC11).
+
+    Hard explicit quarantines with a window are deliberately revalidated
+    rather than probed: the fast path reintroduces them without upstream
+    traffic the moment their own window rolls over.
+
     Never raises.
     """
-    if not _usage_reset_guessed:
+    if not _usage_reset_at:
         return
     now = time.time()
     seen: set[str] = set()
@@ -7512,23 +9696,64 @@ async def _maybe_probe_quarantined_accounts(model_config: dict) -> None:
         if not isinstance(provider_cfg, dict):
             continue
         account = _usage_limit_account_key(provider_cfg)
-        if account in seen or account not in _usage_reset_guessed:
+        if account in seen:
             continue
         seen.add(account)
         if account not in _usage_reset_at:
             _usage_reset_guessed.discard(account)
             continue
-        last = _usage_limit_last_probe.get(account, 0.0)
-        if now - last < _USAGE_LIMIT_PROBE_INTERVAL_SECONDS:
+        if account in _usage_reset_guessed:
+            # Soft guess: cheap transport probe, interval-gated.
+            last = _usage_limit_last_probe.get(account, 0.0)
+            if now - last < _USAGE_LIMIT_PROBE_INTERVAL_SECONDS:
+                continue
+            _usage_limit_last_probe[account] = now
+            if await _probe_usage_limit_account(provider_cfg):
+                logger.info(
+                    "usage-limit probe succeeded; clearing quarantine for "
+                    "account=%s",
+                    account,
+                )
+                clear_usage_limit_quarantine(account)
             continue
-        _usage_limit_last_probe[account] = now
-        if await _probe_usage_limit_account(provider_cfg):
-            logger.info(
-                "usage-limit probe succeeded; clearing quarantine for "
-                "account=%s",
-                account,
-            )
-            clear_usage_limit_quarantine(account)
+        # Hard window-derived / legacy entry: revalidate from a fresh snapshot.
+        _revalidate_quarantine_from_snapshot(account, provider_cfg, config)
+
+
+def _revalidate_quarantine_from_snapshot(
+    account: str, provider_cfg: dict, config: dict | None
+) -> bool:
+    """Clear a quarantined *account* when a fresh poll proves the limit lifted.
+
+    Window-derived entries are cleared when the window that produced them is
+    reported lifted (healthy and below the hard-stop threshold); legacy
+    entries (no window metadata — schema version 1, or the account-level
+    fallback) are cleared on the first poll showing no window exhausted. A
+    missing/stale snapshot, or a snapshot that still shows exhaustion, keeps
+    the quarantine.
+
+    Returns True when the quarantine was cleared. Never raises.
+    """
+    try:
+        snapshot = _fresh_quota_snapshot(provider_cfg, config)
+    except Exception:
+        return False
+    if snapshot is None:
+        return False
+    window = _usage_reset_window.get(account)
+    if window:
+        remaining = _usage_reset_at.get(account, 0.0) - time.time()
+        if not _window_limit_lifted(snapshot, window, config, remaining):
+            return False
+    elif _snapshot_shows_exhaustion(snapshot, config):
+        return False
+    logger.info(
+        "usage-limit quarantine lifted account=%s window=%s reason=window_reset",
+        account,
+        window or "unknown",
+    )
+    clear_usage_limit_quarantine(account)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -8811,7 +11036,15 @@ async def _run_chain_cycles(
 
     When the feature is not configured, *cycle_fn* is run exactly once —
     legacy single-pass behavior with no hold.
+
+    The request's per-turn correlation id is bound here — the earliest point
+    every provider-chain request is known — so every hop of the chain
+    (local, remote, chain-hold retries) logs the same id
+    (LP-0MVMBM467005BT4A AC1/AC2). Binding is idempotent: a nested call from
+    ``proxy_to_local``/``proxy_to_remote`` keeps the id instead of
+    re-generating it.
     """
+    bind_turn_id(request)
     if not _chain_hold_enabled(config):
         try:
             return await cycle_fn(request, path, model_config, config)
@@ -8919,10 +11152,10 @@ async def _proxy_with_remote_fallback_cycle(
         ChainExhaustedError: when all providers are exhausted (the carried
             response is the 503/429/error response the cycle would return).
     """
-    # Self-healing: re-validate guessed (period-name-only) usage-limit
-    # quarantines so a recovered account is reintroduced within this request
-    # cycle (LP-0MUQTCMW2001VXH8).
-    await _maybe_probe_quarantined_accounts(model_config)
+    # Self-healing: re-validate guessed (period-name-only) and window-derived
+    # usage-limit quarantines so a recovered account is reintroduced within
+    # this request cycle (LP-0MUQTCMW2001VXH8, LP-0MVPAE77Z002VGIA).
+    await _maybe_probe_quarantined_accounts(model_config, config)
     cooldown_seconds = _get_cooldown_seconds(config)
     all_slot_exhaustion = True
     any_provider_tried = False
@@ -8982,17 +11215,23 @@ async def _proxy_with_remote_fallback_cycle(
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
-    elif _preference == _PREF_REMOTE_OK:
+    elif _preference == PREF_REMOTE_OK:
         # ``remote-ok`` with no remote-capable provider in the chain: the
         # client asked for no local route, so the chain is genuinely empty
         # (AC5).
         model_config = {**model_config, "providers": []}
     logger.info(
-        "priority_routing model=%s priority=%s providers=%d preference=%s",
+        "priority_routing model=%s priority=%s providers=%d preference=%s "
+        "session=%s",
         model_config.get("name") or "unknown",
         _priority,
         len(_chain or model_config.get("providers") or []),
         _preference,
+        # Already resolved once above for this cycle's gates — the same
+        # ``_resolve_session_id_header`` value names this line's session, so
+        # a preference can be tied to a request without correlation
+        # heuristics and the header is never parsed twice (parent AC5).
+        _budget_session_id or "unknown",
     )
 
     # Per-entry context ceiling (LP-0MVF9N2QL001CDA7): parse the body once so
@@ -9014,10 +11253,39 @@ async def _proxy_with_remote_fallback_cycle(
         request, body_json, model_config, config,
     )
 
+    # Too-large promotion (LP-0MVSM06LB001PRU4, parent AC4): a pin-local
+    # request whose capacity verdict is ``too_large`` never resolves, queues,
+    # leases or refuses the local entry — the local entry is removed from the
+    # chain here, before the dispatch loop, through the same filter
+    # ``remote-ok`` uses. The verdict is computed once and cached on the
+    # request for the pin predicate and the outcome line (AC2). A chain with
+    # no non-local entry is returned unchanged (remote-less carve-out), so a
+    # ``private`` model keeps its existing local exits.
+    _promoted_chain = await _promote_too_large_local_request(
+        request,
+        _chain,
+        _preference,
+        config,
+        body_json,
+        _routing_estimate,
+        session_id=_budget_session_id,
+    )
+    if _promoted_chain is not _chain:
+        _chain = _promoted_chain
+        model_config = {**model_config, "providers": _chain}
+
     while True:
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
             config=config,
+            # Chain-resolution skips (cooldown / quota / usage-limit reset /
+            # available_times window) record their stable token on THIS
+            # request, so a pin-local refusal reports why local was
+            # unavailable instead of the generic fallback
+            # (LP-0MVRMC1W6003MV3Y AC3). ``preference`` adds the parsed
+            # intent to those skip lines (LP-0MVRMC275000R2W6 AC4).
+            reason_sink=lambda token: _note_local_fallback_reason(request, token),
+            preference=_preference,
         )
         if provider_cfg is None:
             break
@@ -9025,6 +11293,17 @@ async def _proxy_with_remote_fallback_cycle(
         provider_name = provider_cfg.get("name", "unknown")
         attempted_provider_names.add(provider_name)
         provider_type = provider_cfg.get("type", "remote")
+        # LP-0MVRMC1L3006F0F3: the pin-local choke point — one structural
+        # guard ahead of every ``continue``, so a skip can never hand a
+        # pin-local client to a non-local provider. The refusal is built from
+        # the reason already recorded on the request; inert for every other
+        # preference, for a ``too_large`` verdict and for a local candidate.
+        _refusal = await _build_local_only_refusal_for_remote(
+            request, provider_cfg, model_config, config, _preference,
+            routing_estimate=_routing_estimate, body_json=body_json,
+        )
+        if _refusal is not None:
+            return _refusal
         try:
             # Mark that we attempted this provider
             any_provider_tried = True
@@ -9045,6 +11324,7 @@ async def _proxy_with_remote_fallback_cycle(
                     _record_provider_context_skip(
                         attempts, provider_name, provider_type,
                         _entry_estimate, _context_limit, _budget_session_id,
+                        preference=_preference,
                     )
                     fallback_reason = "provider_context_exceeded"
                     prev_provider = provider_name
@@ -9213,10 +11493,11 @@ async def _proxy_with_remote_fallback_cycle(
                     continue
 
                 # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
-                # FreeUsageLimitError-with-reset-time quarantines the failing
-                # API-key ACCOUNT until the computed reset time + 2m margin.
-                # Not the whole endpoint: distinct api_key_env entries on the
-                # same gateway have independent limits (LP-0MSMBWB23009XYPW).
+                # FreeUsageLimitError-with-reset-time / insufficient_quota (the
+                # MunitoAI daily free limit, LP-0MVT8SAZE00570J5) quarantines the
+                # failing API-key ACCOUNT until the computed reset time + 2m
+                # margin. Not the whole endpoint: distinct api_key_env entries on
+                # the same gateway have independent limits (LP-0MSMBWB23009XYPW).
                 _reset_info = _usage_limit_reset_info(
                     response, body_text, config, provider_cfg=provider_cfg
                 )
@@ -9567,10 +11848,10 @@ async def _proxy_with_fallback_cycle(
         ChainExhaustedError: when all providers are exhausted (the carried
             response is the 503/429/error response the cycle would return).
     """
-    # Self-healing: re-validate guessed (period-name-only) usage-limit
-    # quarantines so a recovered account is reintroduced within this request
-    # cycle (LP-0MUQTCMW2001VXH8).
-    await _maybe_probe_quarantined_accounts(model_config)
+    # Self-healing: re-validate guessed (period-name-only) and window-derived
+    # usage-limit quarantines so a recovered account is reintroduced within
+    # this request cycle (LP-0MUQTCMW2001VXH8, LP-0MVPAE77Z002VGIA).
+    await _maybe_probe_quarantined_accounts(model_config, config)
     cooldown_seconds = _get_cooldown_seconds(config)
     local_slot_retry_attempts = _get_local_slot_retry_attempts(config)
     local_slot_retry_delay_seconds = _get_local_slot_retry_delay_seconds(config)
@@ -9631,17 +11912,21 @@ async def _proxy_with_fallback_cycle(
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
-    elif _preference == _PREF_REMOTE_OK:
+    elif _preference == PREF_REMOTE_OK:
         # ``remote-ok`` with no remote-capable provider in the chain: the
         # client asked for no local route, so the chain is genuinely empty
         # (AC5).
         model_config = {**model_config, "providers": []}
     logger.info(
-        "priority_routing model=%s priority=%s providers=%d preference=%s",
+        "priority_routing model=%s priority=%s providers=%d preference=%s "
+        "session=%s",
         model_config.get("name") or "unknown",
         _priority,
         len(_chain or model_config.get("providers") or []),
         _preference,
+        # Already resolved once above for this cycle's routing gates — reuse
+        # it rather than parsing the header again (parent AC5).
+        _session_id or "unknown",
     )
 
     # Shared per-cycle routing estimate (LP-0MVF9N2QL001CDA7 AC4): computed
@@ -9651,6 +11936,24 @@ async def _proxy_with_fallback_cycle(
     _routing_estimate = _RoutingEstimateCache(
         request, body_json, model_config, config,
     )
+
+    # Too-large promotion (LP-0MVSM06LB001PRU4, parent AC4): with a
+    # ``too_large`` verdict the local entry leaves the chain before the
+    # dispatch loop — no local resolution, queue entry, lease or local-capacity
+    # 429 (the loop only ever sees the remote tiers). ``deferrable`` verdicts
+    # leave the chain intact, and a remote-less chain is never stripped.
+    _promoted_chain = await _promote_too_large_local_request(
+        request,
+        _chain,
+        _preference,
+        config,
+        body_json,
+        _routing_estimate,
+        session_id=_session_id,
+    )
+    if _promoted_chain is not _chain:
+        _chain = _promoted_chain
+        model_config = {**model_config, "providers": _chain}
 
     # Diagnostics: record attempts (ordered) for inclusion in exhausted responses
     attempts: list[dict[str, Any]] = []
@@ -9665,8 +11968,31 @@ async def _proxy_with_fallback_cycle(
         provider_cfg = _resolve_provider_with_exclusions(
             model_config, attempted_provider_names, attempted_domains,
             config=config,
+            # Same per-request reason sink as the remote-only cycle: every
+            # chain-resolution skip is attributed on the request
+            # (LP-0MVRMC1W6003MV3Y AC3), and the parsed preference rides
+            # along on those skip lines (LP-0MVRMC275000R2W6 AC4).
+            reason_sink=lambda token: _note_local_fallback_reason(request, token),
+            preference=_preference,
         )
         if provider_cfg is None and fallback_reason == "local_lease_active":
+            # Deferral backstop (LP-0MVSM06BK008FZUE): a pin-local
+            # ``deferrable`` request that ends on the lease-active exit must
+            # never run this remote-only walk — a fits-local request is not
+            # promoted. Its refusal names ``local_lease_active`` and carries
+            # the lease remainder; the walk below stays byte-identical for
+            # ``prefer-local`` / ``remote-ok`` / absent-header clients.
+            _lease_refusal = _build_deferral_refusal_response(
+                request,
+                config,
+                _preference,
+                SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                retry_after_s=_local_refusal_retry_after_s(
+                    request, SKIP_REASON_LOCAL_LEASE_ACTIVE, model_config, config
+                ),
+            )
+            if _lease_refusal is not None:
+                return _lease_refusal
             # Local lease-active is expected contention, not provider failure.
             # For transparent fallback, allow trying the next remote provider
             # even if it is currently in cooldown.
@@ -9692,6 +12018,15 @@ async def _proxy_with_fallback_cycle(
         provider_name = provider_cfg.get("name", "unknown")
         attempted_provider_names.add(provider_name)
         provider_type = provider_cfg.get("type", "remote")
+        # LP-0MVRMC1L3006F0F3: the pin-local choke point (see
+        # ``_build_local_only_refusal_for_remote``) — refuse before any
+        # non-local dispatch, whatever reason the local route exited.
+        _refusal = await _build_local_only_refusal_for_remote(
+            request, provider_cfg, model_config, config, _preference,
+            routing_estimate=_routing_estimate, body_json=body_json,
+        )
+        if _refusal is not None:
+            return _refusal
 
         try:
             # Mark attempt
@@ -9715,31 +12050,69 @@ async def _proxy_with_fallback_cycle(
                 # window is armed by router.py on the deadline event, cleared
                 # on expiry or a successful local first byte, and per-session
                 # (AC2 cross-session isolation).
+                #
+                # LP-0MVT2KSXY002O75C (parent LP-0MVRMI5HK00558TB AC2) narrows
+                # what this gate refuses, without weakening that it does
+                # engage on every dispatch entry:
+                #
+                # - the window is keyed by (session, prompt fingerprint), so an
+                #   unrelated — usually much smaller — prompt is no longer
+                #   vetoed by one doomed prompt (measured 2026-10-24 20:00 →
+                #   2026-10-25 07:00: 916 skips / 46 sessions, 241 of them for
+                #   21 ``herdr-*`` sessions);
+                # - when the proxy's own fresh snapshot proves the GPU free,
+                #   the window is released before the skip is taken (336 of
+                #   those 916 skips had ``local_in_flight_requests=0``, 308
+                #   with ``capacity_hint=idle``).
+                #
+                # A missing fingerprint falls back to the session-wide window,
+                # so a site that cannot fingerprint a request fails open to the
+                # pre-fix behaviour rather than losing the gate.
                 _thrash_cooldown_remaining = 0.0
                 try:
                     from proxy.router_helpers import (
                         _prefill_thrash_cooldown_remaining,
+                        _prefill_thrash_fingerprint,
+                        _release_prefill_thrash_cooldown_on_free_gpu,
                     )
 
+                    _thrash_fingerprint = _prefill_thrash_fingerprint(body_json)
                     _thrash_cooldown_remaining = (
                         _prefill_thrash_cooldown_remaining(
                             _session_id,
                             config,
+                            fingerprint=_thrash_fingerprint,
                         )
                         or 0.0
                     )
+                    if _thrash_cooldown_remaining > 0:
+                        # Release ONLY on positive free-GPU evidence
+                        # (fresh snapshot, no live dispatch, no
+                        # non-abandoned processing slot). The release is
+                        # logged with an attributable reason; when it fires
+                        # the request proceeds through the remaining gates
+                        # exactly as if no window had been armed.
+                        if _release_prefill_thrash_cooldown_on_free_gpu(
+                            _session_id,
+                            config,
+                            endpoint=local_endpoint,
+                            fingerprint=_thrash_fingerprint,
+                        ):
+                            _thrash_cooldown_remaining = 0.0
                 except Exception:
                     _thrash_cooldown_remaining = 0.0
                 if _thrash_cooldown_remaining > 0:
                     logger.info(
                         "routing_skip_local provider=%s model=%s "
-                        "session=%s cooldown_remaining=%.0fs "
+                        "session=%s preference=%s cooldown_remaining=%.0fs "
                         "reason=prefill_thrash_cooldown → skipping local, "
-                        "routing to next remote provider",
+                        "routing to next remote provider%s",
                         provider_name,
                         provider_cfg.get("llama_model") or "unknown",
                         _session_id or "unknown",
+                        _preference,
                         _thrash_cooldown_remaining,
+                        turn_field(),
                     )
                     _record_attempt(
                         attempts,
@@ -9755,7 +12128,10 @@ async def _proxy_with_fallback_cycle(
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     _note_local_fallback_reason(
-                        request, "prefill_thrash_cooldown"
+                        request,
+                        "prefill_thrash_cooldown",
+                        # Real expiry: the session's cooldown remainder.
+                        _thrash_cooldown_remaining,
                     )
                     continue
                 # Local concurrency limit check (LP-0MR5MAJNM005R905):
@@ -9799,9 +12175,11 @@ async def _proxy_with_fallback_cycle(
                             _cq_depth,
                         )
                     elif _cq_action == "fallback":
-                        # Caps exceeded — fall back to the next remote provider
-                        # exactly as today (fallback-after-queue recorded with
-                        # the elapsed queue wait, F4 AC2).
+                        # Caps exceeded — the request never got a local slot:
+                        # either the depth cap refused to enqueue it or its
+                        # wait budget expired. Both are the *end* of a
+                        # deferral, so the remainder of the queue window is
+                        # what a retry should honour (F4 AC2).
                         _record_attempt(
                             attempts,
                             provider=provider_name,
@@ -9814,13 +12192,37 @@ async def _proxy_with_fallback_cycle(
                         fallback_reason = "fallback_after_queue"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
-                        _note_local_fallback_reason(request, fallback_reason)
+                        # Real expiry (AC4): the queue's *measured* remainder,
+                        # not the whole window and not the ETA formula.
+                        _cq_remaining_s = _contention_queue_remaining_seconds(
+                            config, _cq_elapsed
+                        )
+                        _note_local_fallback_reason(
+                            request,
+                            fallback_reason,
+                            _cq_remaining_s,
+                        )
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
-                            "session=%s queued_duration=%.2fs",
+                            "session=%s queued_duration=%.2fs preference=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
+                            _preference,
                         )
+                        # Deferral (LP-0MVSM06BK008FZUE): a pin-local
+                        # ``deferrable`` request must never be promoted — the
+                        # spent queue wait ends in the retryable 429, built by
+                        # the one refusal builder and timed from the measured
+                        # remainder. Returned here, before the next candidate
+                        # is resolved, so nothing is enqueued twice and no
+                        # lease/attempt state is written for a refusal.
+                        _deferral_refusal = _build_deferral_refusal_response(
+                            request, config, _preference, fallback_reason,
+                            retry_after_s=_cq_remaining_s,
+                            elapsed_wait_seconds=_cq_elapsed,
+                        )
+                        if _deferral_refusal is not None:
+                            return _deferral_refusal
                         continue
                     elif _cq_action == "context_bypass":
                         # Context bypasses never queue (AC4): fall back exactly
@@ -9852,12 +12254,7 @@ async def _proxy_with_fallback_cycle(
                             type=provider_type,
                             status="local_admission_reject",
                             reason=_cq_reason,
-                            eta_prefill_seconds=round(
-                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
-                            ),
-                            budget_seconds=round(
-                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
-                            ),
+                            **_local_admission_evidence(_admission),
                         )
                         fallback_reason = "local_admission_guard"
                         prev_provider = provider_name
@@ -9865,9 +12262,9 @@ async def _proxy_with_fallback_cycle(
                         _note_local_fallback_reason(request, fallback_reason)
                         continue
                     elif _cq_action == "refused_local_only":
-                        # AC4 (LP-0MVIKPCSG002B0NL): the client set
-                        # X-Local-Preference: local-only and the admission
-                        # guard refused. Unlike admission_reject, the request
+                        # AC4 (LP-0MVIKPCSG002B0NL) / LP-0MVSHXTLS000VMLE: the
+                        # client pinned local and the admission guard refused a
+                        # deferrable request. Unlike admission_reject, the request
                         # must NOT fall through to a remote provider — return
                         # the retryable 429 with X-Local-Route: refused now.
                         _admission = getattr(
@@ -9877,18 +12274,14 @@ async def _proxy_with_fallback_cycle(
                         _refusal_attempt = {
                             "status": "local_admission_reject",
                             "reason": _cq_reason or "eta_exceeds_budget",
-                            "eta_prefill_seconds": round(
-                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
-                            ),
-                            "budget_seconds": round(
-                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
-                            ),
-                            "projected_wait_seconds": round(
-                                float(getattr(_admission, "projected_wait_seconds", 0.0) or 0.0), 1
-                            ),
+                            **_local_admission_evidence(_admission),
                         }
+                        # The verdict and the preference named on the single
+                        # refusal line come from the shared builder / the parsed
+                        # intent (LP-0MVSMINPR006SWT6 AC1/AC4) — never re-derived
+                        # on this branch.
                         return _build_local_only_refusal_response(
-                            _refusal_attempt, config
+                            _refusal_attempt, config, preference=_preference
                         )
                     else:  # fallback_policy — fast mode unchanged
                         _record_attempt(
@@ -9994,7 +12387,7 @@ async def _proxy_with_fallback_cycle(
                     "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
                     "new_tokens=%d cached_ratio=%.2f cache_state=%s "
                     "messages=%d session=%s "
-                    "chain_hold_cycle=%d",
+                    "chain_hold_cycle=%d preference=%s",
                     provider_name,
                     _llama_model or "unknown",
                     _estimated_tokens,
@@ -10006,6 +12399,7 @@ async def _proxy_with_fallback_cycle(
                     len(body_json.get("messages", [])) if isinstance(body_json, dict) else -1,
                     _session_id or "unknown",
                     _get_chain_hold_cycle(request),
+                    _preference,
                 )
                 # Context-pressure compaction signal (LP-0MSDCLQ2W001LGWC):
                 # KV reads scale linearly with context (20 KB/token at f16),
@@ -10054,6 +12448,10 @@ async def _proxy_with_fallback_cycle(
                     session_tenants=_session_tenants,
                     tenancy_idle_seconds=_tenancy_idle,
                 )
+                # LP-0MVODJ3P6000AIUM: initialised here so the admission-evidence
+                # stamp below can consult the idle-admit verdict even on the
+                # direct-admit path (where this block does not run).
+                _idle_admit = None
                 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): spend
                 # obviously idle GPU capacity instead of paying for a remote
                 # call. Only the ECONOMIC misses are overridable — the physical
@@ -10199,8 +12597,9 @@ async def _proxy_with_fallback_cycle(
                         "routing_skip_local provider=%s model=%s "
                         "estimated_tokens=%d cold_threshold=%d warm_threshold=%d "
                         "new_tokens=%d cached_ratio=%.2f cache_state=%s "
+                        "preference=%s "
                         "reason=%s → skipping local, routing to next remote provider "
-                        "session=%s chain_hold_cycle=%d",
+                        "session=%s chain_hold_cycle=%d%s",
                         provider_name,
                         _llama_model or "unknown",
                         _estimated_tokens,
@@ -10209,9 +12608,11 @@ async def _proxy_with_fallback_cycle(
                         _routing_new_tokens,
                         _routing_cached_ratio,
                         _routing_cache_state,
+                        _preference,
                         _skip_reason,
                         _session_id or "unknown",
                         _get_chain_hold_cycle(request),
+                        turn_field(),
                     )
                     _record_attempt(
                         attempts,
@@ -10230,6 +12631,14 @@ async def _proxy_with_fallback_cycle(
                     prev_provider = provider_name
                     all_slot_exhaustion = False
                     _note_local_fallback_reason(request, _skip_reason)
+                    # Token evidence for a size-driven skip (AC5): the refusal
+                    # names how far over the flat cold-prefill cap the prompt
+                    # was, so the client can compact instead of retrying.
+                    _note_local_token_evidence(
+                        request,
+                        new_tokens=_routing_new_tokens,
+                        budget_tokens=_cold_prefill_budget_tokens(config),
+                    )
 
                     # Server-side compaction rescue (LP-0MU5ARWSP001BYYB).
                     # The bypass used to ``continue`` here, before any session
@@ -10429,10 +12838,19 @@ async def _proxy_with_fallback_cycle(
                 if _direct_admission is not None and not _direct_admission.admit:
                     # Deadline refusal (LP-0MVKUKEU80022C3U) keeps its own
                     # reason so the diagnostic says *why* local was refused.
+                    # The cold-prefill budget and its deadline-relative sibling
+                    # keep their own reasons too (LP-0MVNTT4X8009IO2X AC1): the
+                    # retry contract is reason-driven, so relabelling the
+                    # refusal as an ETA miss would advertise a timer for a
+                    # prompt that waiting cannot heal.
                     if str(_direct_admission.reason).startswith(
-                        "prefill_eta_exceeds_deadline"
+                        (
+                            "prefill_eta_exceeds_deadline",
+                            "prefill_eta_exceeds_safety_budget",
+                            "prefill_budget_exceeded",
+                        )
                     ):
-                        _direct_reason = "prefill_eta_exceeds_deadline"
+                        _direct_reason = str(_direct_admission.reason)
                     else:
                         _direct_reason = "eta_exceeds_budget_direct"
                     try:
@@ -10450,45 +12868,39 @@ async def _proxy_with_fallback_cycle(
                         type=provider_type,
                         status="local_admission_reject",
                         reason=_direct_reason,
-                        eta_prefill_seconds=round(
-                            float(
-                                getattr(
-                                    _direct_admission,
-                                    "eta_prefill_seconds",
-                                    0.0,
-                                )
-                                or 0.0
-                            ),
-                            1,
-                        ),
-                        budget_seconds=round(
-                            float(
-                                getattr(_direct_admission, "budget_seconds", 0.0)
-                                or 0.0
-                            ),
-                            1,
-                        ),
+                        **_local_admission_evidence(_direct_admission),
                     )
                     try:
                         logger.info(
                             "local_admission_guard_direct_fallback "
-                            "provider=%s model=%s session=%s "
+                            "provider=%s model=%s session=%s preference=%s "
                             "reason=%s free_slot=true → routing to next provider",
                             provider_name,
                             _llama_model or "unknown",
                             _session_id or "unknown",
+                            _preference,
                             _direct_reason,
                         )
                     except Exception:
                         pass
-                    # Explicit client intent (LP-0MVIKPCSG002B0NL AC4): a
-                    # local-only client must never be moved remote — the
-                    # caller turns the decision into the retryable 429.
-                    if _preference == _PREF_LOCAL_ONLY:
+                    # Explicit client intent (LP-0MVIKPCSG002B0NL AC4 / pin
+                    # slice LP-0MVSLZY470051ZB2 AC1/AC2): the single pin
+                    # predicate. A pin-local client (``local-preferred`` or
+                    # its normalized ``local-only`` alias) with a
+                    # ``deferrable`` capacity verdict must never be moved
+                    # remote — the caller turns the decision into the
+                    # retryable 429. A ``too_large`` verdict (e.g.
+                    # ``prefill_budget_exceeded``) declines the pin and keeps
+                    # the direct-guard fall-through to the next provider.
+                    if _local_preference_pins_local(request, _preference):
                         fallback_reason = "local_admission_guard"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
                         _note_local_fallback_reason(request, fallback_reason)
+                        # The refusal the client receives names
+                        # ``_direct_reason``; log that same reason with the
+                        # intent that caused it (LP-0MVRMC275000R2W6 AC4).
+                        _log_local_only_refusal(_direct_reason)
                         return _build_exhausted_response(
                             all_local_slot_exhaustion=False,
                             unavailable_providers={},
@@ -10500,6 +12912,58 @@ async def _proxy_with_fallback_cycle(
                     all_slot_exhaustion = False
                     _note_local_fallback_reason(request, fallback_reason)
                     continue
+
+                # LP-0MVODJ3P6000AIUM AC1: stamp the admission-time pricing
+                # snapshot (the numbers the decision above actually used) ONCE,
+                # immediately before the first local dispatch, so every
+                # dispatch-record creation path — including the slot-retry
+                # re-dispatches below, which reuse this request — inherits the
+                # same verbatim values. The ETA comes from the most
+                # authoritative decision in scope: the direct free-slot guard,
+                # else the idle-admit budget verdict (which now carries its
+                # decision on the admit path). Best-effort; never throws.
+                _admission_snapshot_decision = None
+                for _snapshot_candidate in (
+                    _direct_admission,
+                    (_idle_admit or {}).get("guard_decision"),
+                ):
+                    if (
+                        _snapshot_candidate is not None
+                        and getattr(
+                            _snapshot_candidate, "eta_prefill_seconds", None
+                        )
+                        is not None
+                    ):
+                        _admission_snapshot_decision = _snapshot_candidate
+                        break
+                # Co-residency snapshot (LP-0MVS9Y76R004B5M8): the admission-
+                # time occupancy, taken from the same governing decision so the
+                # contended tag on the future calibration sample matches the
+                # gate state that priced the admission (never re-queried at
+                # stamp time). Missing decision -> None markers, and the router
+                # falls back to its first-byte-time live check.
+                try:
+                    _snapshot_busy = getattr(
+                        _admission_snapshot_decision, "busy_slots", None
+                    ) if _admission_snapshot_decision is not None else None
+                    _snapshot_in_flight = getattr(
+                        _admission_snapshot_decision, "in_flight_prefills", None
+                    ) if _admission_snapshot_decision is not None else None
+                except Exception:
+                    _snapshot_busy, _snapshot_in_flight = None, None
+                try:
+                    _stamp_local_admission_evidence(
+                        request,
+                        estimated_tokens=_estimated_tokens,
+                        cached_ratio=_routing_cached_ratio,
+                        new_tokens=_routing_new_tokens,
+                        decision=_admission_snapshot_decision,
+                        model_name=_llama_model or provider_name,
+                        busy_slots=_snapshot_busy,
+                        in_flight_prefills=_snapshot_in_flight,
+                    )
+                except Exception:
+                    pass
 
                 response = await _dispatch_local(ptr_local, request, path, local_endpoint)
 
@@ -10534,6 +12998,7 @@ async def _proxy_with_fallback_cycle(
                         _record_provider_context_skip(
                             attempts, provider_name, provider_type,
                             _entry_estimate, _context_limit, _session_id,
+                            preference=_preference,
                         )
                         fallback_reason = "provider_context_exceeded"
                         prev_provider = provider_name
@@ -10768,7 +13233,18 @@ async def _proxy_with_fallback_cycle(
                         ):
                             # Still denied after the wait: fall through to the
                             # remote chain (bounded, no further waiting).
+                            # LP-0MVRMC1W6003MV3Y: record WHY local was
+                            # unavailable — this continue was the silent
+                            # fall-through of the 2026-10-25 incident.
                             all_slot_exhaustion = False
+                            _note_local_fallback_reason(
+                                request,
+                                SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                                # Real expiry (AC3): the lease remainder.
+                                _local_lease_retry_after_seconds(
+                                    config, local_endpoint
+                                ),
+                            )
                             continue
                         # Slot freed — evaluate the fresh response below.
                     elif _lease_action == "fallback":
@@ -10781,13 +13257,41 @@ async def _proxy_with_fallback_cycle(
                         )
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
-                            "session=%s queued_duration=%.2fs "
+                            "session=%s queued_duration=%.2fs preference=%s "
                             "reason=local_lease_active",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
+                            _preference,
                         )
                         all_slot_exhaustion = False
+                        # The token matches the log's reason= field verbatim.
+                        # Real expiry (AC3): the lease remainder, measured once
+                        # so the recorded expiry and the refusal timing below
+                        # cannot drift apart.
+                        _lease_remaining_s = _local_lease_retry_after_seconds(
+                            config, local_endpoint
+                        )
+                        _note_local_fallback_reason(
+                            request,
+                            SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                            _lease_remaining_s,
+                        )
+                        # Deferral (LP-0MVSM06BK008FZUE): a pin-local
+                        # ``deferrable`` request that waited out the lease
+                        # queue is refused on the spot (naming
+                        # ``local_lease_active``) instead of walking to a
+                        # remote candidate below.
+                        _deferral_refusal = _build_deferral_refusal_response(
+                            request,
+                            config,
+                            _preference,
+                            SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                            retry_after_s=_lease_remaining_s,
+                            elapsed_wait_seconds=_lease_elapsed,
+                        )
+                        if _deferral_refusal is not None:
+                            return _deferral_refusal
                         continue
                     elif _lease_action == "context_bypass":
                         _record_attempt(
@@ -10799,6 +13303,10 @@ async def _proxy_with_fallback_cycle(
                         )
                         fallback_reason = _lease_reason
                         all_slot_exhaustion = False
+                        # Contention-queue context bypass: the skip reason is
+                        # the router's own context token, recorded verbatim
+                        # (mirrors the first queue decision point).
+                        _note_local_fallback_reason(request, _lease_reason)
                         continue
                     elif _lease_action == "admission_reject":
                         # Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ) on
@@ -10812,21 +13320,17 @@ async def _proxy_with_fallback_cycle(
                             type=provider_type,
                             status="local_admission_reject",
                             reason=_lease_reason,
-                            eta_prefill_seconds=round(
-                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
-                            ),
-                            budget_seconds=round(
-                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
-                            ),
+                            **_local_admission_evidence(_admission),
                         )
                         fallback_reason = "local_admission_guard"
                         all_slot_exhaustion = False
                         _note_local_fallback_reason(request, fallback_reason)
                         continue
                     elif _lease_action == "refused_local_only":
-                        # AC4 (LP-0MVIKPCSG002B0NL): local-only + guard refusal
-                        # on the lease path — return the 429 instead of
-                        # falling through to a remote provider.
+                        # AC4 (LP-0MVIKPCSG002B0NL) / LP-0MVSHXTLS000VMLE:
+                        # pinned-local + guard refusal on the lease path —
+                        # return the 429 instead of falling through to a
+                        # remote provider.
                         _admission = getattr(
                             request, "_local_admission_decision", None
                         )
@@ -10834,18 +13338,14 @@ async def _proxy_with_fallback_cycle(
                         _refusal_attempt = {
                             "status": "local_admission_reject",
                             "reason": _lease_reason or "eta_exceeds_budget",
-                            "eta_prefill_seconds": round(
-                                float(getattr(_admission, "eta_prefill_seconds", 0.0) or 0.0), 1
-                            ),
-                            "budget_seconds": round(
-                                float(getattr(_admission, "budget_seconds", 0.0) or 0.0), 1
-                            ),
-                            "projected_wait_seconds": round(
-                                float(getattr(_admission, "projected_wait_seconds", 0.0) or 0.0), 1
-                            ),
+                            **_local_admission_evidence(_admission),
                         }
+                        # Same single-implementation contract as the queue
+                        # branch above: the builder classifies, the parsed
+                        # preference is only threaded for the log line
+                        # (LP-0MVSMINPR006SWT6 AC1/AC4).
                         return _build_local_only_refusal_response(
-                            _refusal_attempt, config
+                            _refusal_attempt, config, preference=_preference
                         )
                     else:
                         # Queue disabled / fallback policy: preserve the
@@ -10916,6 +13416,17 @@ async def _proxy_with_fallback_cycle(
                                 slot_info=slot_info,
                             )
                             all_slot_exhaustion = False
+                            # LP-0MVRMC1W6003MV3Y: the retry loop ended on a
+                            # lease-active answer — name that reason on the
+                            # request so the refusal can report it.
+                            # Real expiry (AC3): the lease remainder.
+                            _note_local_fallback_reason(
+                                request,
+                                SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                                _local_lease_retry_after_seconds(
+                                    config, local_endpoint
+                                ),
+                            )
                             continue
 
                         mark_provider_unavailable(provider_name, slot_unavailable_cooldown)
@@ -11063,10 +13574,12 @@ async def _proxy_with_fallback_cycle(
                         continue
 
                     # Usage-limit reset (LP-0MSLJPOCC0001ROJ): GoUsageLimitError /
-                    # FreeUsageLimitError-with-reset-time quarantines the failing
-                    # API-key ACCOUNT until the computed reset time + 2m margin.
-                    # Not the whole endpoint: distinct api_key_env entries on the
-                    # same gateway have independent limits (LP-0MSMBWB23009XYPW).
+                    # FreeUsageLimitError-with-reset-time / insufficient_quota (the
+                    # MunitoAI daily free limit, LP-0MVT8SAZE00570J5) quarantines
+                    # the failing API-key ACCOUNT until the computed reset time +
+                    # 2m margin. Not the whole endpoint: distinct api_key_env
+                    # entries on the same gateway have independent limits
+                    # (LP-0MSMBWB23009XYPW).
                     _reset_info = _usage_limit_reset_info(
                         response, body_text, config, provider_cfg=provider_cfg
                     )

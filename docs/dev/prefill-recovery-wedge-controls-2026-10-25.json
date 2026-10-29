@@ -1,0 +1,192 @@
+{
+  "generated": "2026-10-25",
+  "skill": "LP-0MVLHMCN6003GAMD AC1 sensitivity controls",
+  "command": "scripts/prefill_recovery_verification.py --measure --no-pipeline --json",
+  "windows": [
+    {
+      "label": "pre-fix 24 h control",
+      "since": "2026-10-21 20:00:00",
+      "until": "2026-10-22 20:00:00",
+      "note": "the fix was not deployed; the metric must fail here",
+      "ac1": {
+        "verdict_basis": "wedge_attribution: a denial caused by a lease owner holding the gate with no client-visible first byte for >= wedge_bound_seconds (restated by LP-0MVLHMCN6003GAMD AC1)",
+        "wedge_bound_seconds": 300,
+        "wedge_denials": 567,
+        "productive_holder_denials": 59,
+        "short_hold_denials": 701,
+        "stale_owner_denials": 227,
+        "unleased_denials": 0,
+        "denials_examined": 1554,
+        "max_unproductive_hold_seconds": 1512.0,
+        "max_productive_hold_seconds": 1103.0,
+        "wedge_examples": [
+          {
+            "denied_session": "herdr-1792608793-1551209-32135",
+            "owner": "herdr-1792604295-1155195-12116",
+            "denied_at": "2026-10-21 20:14:32",
+            "hold_seconds": 370.0
+          },
+          {
+            "denied_session": "herdr-1792604295-1155195-12116",
+            "owner": "herdr-1792608793-1551209-32135",
+            "denied_at": "2026-10-21 20:20:07",
+            "hold_seconds": 305.0
+          },
+          {
+            "denied_session": "herdr-1792604295-1155195-12116",
+            "owner": "herdr-1792608793-1551209-32135",
+            "denied_at": "2026-10-21 20:20:31",
+            "hold_seconds": 329.0
+          },
+          {
+            "denied_session": "herdr-1792604295-1155195-12116",
+            "owner": "herdr-1792608793-1551209-32135",
+            "denied_at": "2026-10-21 20:20:52",
+            "hold_seconds": 350.0
+          },
+          {
+            "denied_session": "herdr-1792611622-1846229-18301",
+            "owner": "01a15feb-4f84-7240-996d-62357ba71daa",
+            "denied_at": "2026-10-21 20:47:59",
+            "hold_seconds": 402.0
+          }
+        ],
+        "diagnostics": {
+          "min_attempts": 10,
+          "thrash_hours": [],
+          "lease_active_fallbacks": 0,
+          "hours_checked": 0,
+          "note": "thrash hours and the lease-active fallback volume are admission-side signals (LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I / LP-0MVOFVCA2008DQVE); they no longer determine this verdict"
+        },
+        "verdict_met": false
+      }
+    },
+    {
+      "label": "incident day",
+      "since": "2026-10-23 00:00:00",
+      "until": "2026-10-23 08:00:00",
+      "note": "the 2026-10-23 02:00-06:00 wedge day",
+      "ac1": {
+        "verdict_basis": "wedge_attribution: a denial caused by a lease owner holding the gate with no client-visible first byte for >= wedge_bound_seconds (restated by LP-0MVLHMCN6003GAMD AC1)",
+        "wedge_bound_seconds": 300,
+        "wedge_denials": 55,
+        "productive_holder_denials": 1,
+        "short_hold_denials": 570,
+        "stale_owner_denials": 29,
+        "unleased_denials": 0,
+        "denials_examined": 655,
+        "max_unproductive_hold_seconds": 338.0,
+        "max_productive_hold_seconds": 62.0,
+        "wedge_examples": [
+          {
+            "denied_session": "01a165fc-9263-7186-a835-8ed4dc4fa96d",
+            "owner": "herdr-1792711832-616590-8248",
+            "denied_at": "2026-10-23 00:40:17",
+            "hold_seconds": 334.0
+          },
+          {
+            "denied_session": "herdr-1792711827-616329-14270",
+            "owner": "herdr-1792711832-616590-8248",
+            "denied_at": "2026-10-23 00:40:42",
+            "hold_seconds": 359.0
+          },
+          {
+            "denied_session": "01a165fc-e09c-7726-b47a-ea95dbbcab48",
+            "owner": "herdr-1792711832-616590-8248",
+            "denied_at": "2026-10-23 00:40:42",
+            "hold_seconds": 359.0
+          },
+          {
+            "denied_session": "herdr-1792711566-1936750-27558",
+            "owner": "herdr-1792711832-616590-8248",
+            "denied_at": "2026-10-23 00:40:49",
+            "hold_seconds": 366.0
+          },
+          {
+            "denied_session": "01a16604-8b8f-742e-a0b6-bd86448d9c13",
+            "owner": "herdr-1792711827-616329-14270",
+            "denied_at": "2026-10-23 00:54:09",
+            "hold_seconds": 325.0
+          }
+        ],
+        "diagnostics": {
+          "min_attempts": 10,
+          "thrash_hours": [],
+          "lease_active_fallbacks": 0,
+          "hours_checked": 0,
+          "note": "thrash hours and the lease-active fallback volume are admission-side signals (LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I / LP-0MVOFVCA2008DQVE); they no longer determine this verdict"
+        },
+        "verdict_met": false
+      }
+    },
+    {
+      "label": "incident hour",
+      "since": "2026-10-23 02:00:00",
+      "until": "2026-10-23 03:00:00",
+      "note": "the AC's own hour; leases were recycled every ~4 min by idle_timeout, so no single hold exceeded the 5-minute bound (see the doc)",
+      "ac1": {
+        "verdict_basis": "wedge_attribution: a denial caused by a lease owner holding the gate with no client-visible first byte for >= wedge_bound_seconds (restated by LP-0MVLHMCN6003GAMD AC1)",
+        "wedge_bound_seconds": 300,
+        "wedge_denials": 0,
+        "productive_holder_denials": 0,
+        "short_hold_denials": 132,
+        "stale_owner_denials": 9,
+        "unleased_denials": 0,
+        "denials_examined": 141,
+        "max_unproductive_hold_seconds": 300.0,
+        "max_productive_hold_seconds": null,
+        "wedge_examples": [],
+        "diagnostics": {
+          "min_attempts": 10,
+          "thrash_hours": [],
+          "lease_active_fallbacks": 0,
+          "hours_checked": 0,
+          "note": "thrash hours and the lease-active fallback volume are admission-side signals (LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I / LP-0MVOFVCA2008DQVE); they no longer determine this verdict"
+        },
+        "verdict_met": true
+      }
+    },
+    {
+      "label": "24 h post-fix (the measurement)",
+      "since": "2026-10-23 22:04:14",
+      "until": "2026-10-24 22:04:14",
+      "note": "the completed 24 h post-deploy window measured by LP-0MVM83F6X0005V8S",
+      "ac1": {
+        "verdict_basis": "wedge_attribution: a denial caused by a lease owner holding the gate with no client-visible first byte for >= wedge_bound_seconds (restated by LP-0MVLHMCN6003GAMD AC1)",
+        "wedge_bound_seconds": 300,
+        "wedge_denials": 0,
+        "productive_holder_denials": 2,
+        "short_hold_denials": 306,
+        "stale_owner_denials": 141,
+        "unleased_denials": 0,
+        "denials_examined": 449,
+        "max_unproductive_hold_seconds": 164.0,
+        "max_productive_hold_seconds": 190.0,
+        "wedge_examples": [],
+        "diagnostics": {
+          "min_attempts": 10,
+          "thrash_hours": [
+            "2026-10-23 23:00:00",
+            "2026-10-24 00:00:00",
+            "2026-10-24 01:00:00",
+            "2026-10-24 03:00:00",
+            "2026-10-24 05:00:00",
+            "2026-10-24 06:00:00",
+            "2026-10-24 07:00:00",
+            "2026-10-24 08:00:00",
+            "2026-10-24 11:00:00",
+            "2026-10-24 13:00:00",
+            "2026-10-24 17:00:00",
+            "2026-10-24 18:00:00",
+            "2026-10-24 19:00:00",
+            "2026-10-24 20:00:00"
+          ],
+          "lease_active_fallbacks": 93,
+          "hours_checked": 25,
+          "note": "thrash hours and the lease-active fallback volume are admission-side signals (LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I / LP-0MVOFVCA2008DQVE); they no longer determine this verdict"
+        },
+        "verdict_met": true
+      }
+    }
+  ]
+}

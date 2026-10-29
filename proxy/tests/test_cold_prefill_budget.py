@@ -335,6 +335,56 @@ def test_idle_economic_bypass_still_admits_a_within_budget_prompt():
     assert verdict["admitted"] is True
 
 
+def test_idle_admit_carries_its_decision_for_the_eviction_snapshot():
+    """AC1 coverage: the idle-admit ACCEPT path must expose its budget decision.
+
+    The 2026-10-23 measured sample was admitted by idle-admit; the dispatch
+    record needs that decision's ETA so the eviction event reports the numbers
+    the admission actually used (LP-0MVODJ3P6000AIUM AC1 / AC3). The verdict
+    therefore carries ``guard_decision`` on the admitted path too, with a
+    costed ``eta_prefill_seconds``.
+    """
+    import proxy.provider as provider
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(provider, "_idle_admit_config", lambda cfg: (True, 30.0))
+        mp.setattr(provider, "_local_idle_blocker", lambda *a, **k: None)
+        import proxy.local_activity as activity
+
+        mp.setattr(activity, "local_idle_seconds", lambda: 500.0)
+
+        verdict = provider._evaluate_idle_admission_override(
+            _cfg(), {"llama_model": "Qwen3", "name": "local-qwen3"}, 20_000, 0.0
+        )
+
+    assert verdict is not None
+    assert verdict["admitted"] is True
+    decision = verdict["guard_decision"]
+    assert decision is not None, "idle-admit path must expose its budget decision"
+    assert decision.admit is True
+    assert decision.eta_prefill_seconds is not None
+    assert decision.eta_prefill_seconds > 0
+
+    # And the snapshot helper threads that ETA verbatim onto the request.
+    class _Request:
+        pass
+
+    request = _Request()
+    provider._stamp_local_admission_evidence(
+        request,
+        estimated_tokens=20_000,
+        cached_ratio=0.0,
+        new_tokens=20_000,
+        decision=decision,
+    )
+
+    snap = getattr(request, provider.LOCAL_ADMISSION_EVIDENCE_ATTR)
+    assert snap["estimated_tokens"] == 20_000
+    assert snap["new_tokens"] == 20_000
+    assert snap["cached_ratio"] == 0.0
+    assert snap["eta_prefill_s"] == decision.eta_prefill_seconds
+
+
 def test_reserve_endpoint_refuses_an_over_budget_request():
     """Path (d): ``POST /llama/local/reserve`` shares the same decision."""
     from proxy import admission_reserve

@@ -15,7 +15,7 @@ Covers the child work item's acceptance criteria:
 
 import json
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import proxy.provider as provider
@@ -55,10 +55,12 @@ def _reset_provider_state():
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
     yield
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
 
 
 def _provider(
@@ -197,6 +199,25 @@ class TestExhaustionPayloadQuarantine:
         assert result.headers.get("retry-after") == str(body["retry_after"])
 
     @pytest.mark.asyncio
+    async def test_quarantine_diagnostics_name_the_quota_window(self):
+        """AC9 (LP-0MVPAE77Z002VGIA): the exhaustion diagnostics tell an
+        operator WHICH quota window holds an account out."""
+        weekly = _provider("q1", api_key_env="K1")
+        legacy = _provider("q2", api_key_env="K2", endpoint="https://beta.example/v1")
+        _quarantine(weekly, 3600)
+        provider._usage_reset_window[
+            provider._usage_limit_account_key(weekly)
+        ] = "weekly"
+        _quarantine(legacy, 3600)  # no window metadata (message/header/legacy)
+
+        result = await _exhaust({"providers": [weekly, legacy]})
+
+        body = json.loads(result.body)
+        by_provider = {d["provider"]: d for d in body["diagnostics"]}
+        assert by_provider["q1"]["window"] == "weekly"
+        assert by_provider["q2"]["window"] == "unknown"
+
+    @pytest.mark.asyncio
     async def test_quarantine_plus_window_reports_quarantine_once(self):
         with patch("proxy.provider.datetime", _FixedDateTime):
             p1 = _provider("q1", api_key_env="K1", available_times=["09:00-17:00"])
@@ -269,3 +290,101 @@ class TestExhaustionPayloadQuarantine:
         assert body["code"] == "outside_time_window"
         assert "scheduled time window" in body["detail"]
         assert _statuses(body)["w1"] == "outside_time_window"
+
+
+# ---------------------------------------------------------------------------
+# Integration: a daily free-limit 429 (LP-0MVT8SAZE00570J5 AC3)
+# ---------------------------------------------------------------------------
+
+#: Hours the MunitoAI daily-limit payload advertises until its reset.
+_DAILY_RESET_HOURS = 6
+
+
+def _daily_limit_429(hours: int = _DAILY_RESET_HOURS) -> Response:
+    """A MunitoAI free-tier daily-limit 429 (insufficient_quota + timestamp)."""
+    reset_at = datetime.now(UTC) + timedelta(hours=hours)
+    body = json.dumps({
+        "error": {
+            "message": (
+                "The daily free limit of deepseek-ai/deepseek-v4-flash is "
+                "reached. It resets at "
+                f"{reset_at.strftime('%Y-%m-%d %H:%M UTC')}. Add credits to "
+                "continue now."
+            ),
+            "type": "insufficient_quota",
+            "param": None,
+            "code": "free_daily_limit_exceeded",
+        }
+    })
+    return Response(
+        content=body.encode("utf-8"),
+        status_code=429,
+        media_type="application/json",
+    )
+
+
+class TestDailyLimitQuarantineDiagnostics:
+    @pytest.mark.asyncio
+    async def test_daily_limit_reset_is_visible_in_every_surface(self, caplog):
+        """The account quarantine from an absolute daily reset is recorded as a
+        ``usage_limit_reset`` attempt with ``reset_in_seconds``, appears in the
+        exhausted-chain ``usage_limit_reset=`` map, and feeds ``retry_after``."""
+        free = _provider("munitoai-free", brand="MunitoAI", api_key_env="K_FREE")
+        paid = _provider(
+            "munitoai", brand="MunitoAI", api_key_env="K_PAID"
+        )
+        model = {"providers": [free, paid]}
+        recorded: list[dict] = []
+        original = provider._record_attempt
+
+        def _spy(attempts, **fields):
+            recorded.append(dict(fields))
+            return original(attempts, **fields)
+
+        async def _both_daily(_req, _path, _cfg):
+            return _daily_limit_429()
+
+        with patch("proxy.provider._record_attempt", _spy):
+            with patch("proxy.server.proxy_to_remote", _both_daily):
+                with caplog.at_level("WARNING", logger="llama-proxy.provider"):
+                    result = await provider.proxy_with_remote_fallback(
+                        _DummyRequest(), "v1/chat/completions", model,
+                        {"provider_cooldown_seconds": 60},
+                    )
+
+        assert result.status_code == 503
+        reset_attempts = [
+            entry for entry in recorded if entry.get("status") == "usage_limit_reset"
+        ]
+        assert reset_attempts, "each daily-limit 429 records a usage_limit_reset attempt"
+        assert reset_attempts[0]["reset_in_seconds"] >= _DAILY_RESET_HOURS * 3600 - 120
+        assert reset_attempts[0]["reset_in_seconds"] <= (
+            _DAILY_RESET_HOURS * 3600 + provider._USAGE_LIMIT_RESET_MARGIN_SECONDS
+        )
+
+        body = json.loads(result.body)
+        statuses = _statuses(body)
+        assert statuses["munitoai-free"] == "usage_limit_reset"
+        assert statuses["munitoai"] == "usage_limit_reset"
+        free_diags = [
+            d for d in body["diagnostics"] if d["provider"] == "munitoai-free"
+        ]
+        # The cycle's own attempt carries ``reset_in_seconds``; the
+        # exhausted-chain quarantine diagnostic carries ``reset_in``.
+        assert free_diags[0]["reset_in_seconds"] >= _DAILY_RESET_HOURS * 3600 - 120
+        quarantine_diag = next(d for d in free_diags if "reset_in" in d)
+        assert quarantine_diag["reset_in"] >= _DAILY_RESET_HOURS * 3600 - 120
+        assert body["unavailable_providers"]["munitoai-free"] >= (
+            _DAILY_RESET_HOURS * 3600 - 120
+        )
+        assert body["retry_after"] > 0
+        assert result.headers.get("retry-after") == str(body["retry_after"])
+
+        exhaustion_lines = [
+            rec.message
+            for rec in caplog.records
+            if "All providers exhausted" in rec.message
+        ]
+        assert exhaustion_lines, "the exhausted-chain diagnostic must be logged"
+        assert "usage_limit_reset=" in exhaustion_lines[-1]
+        assert "munitoai-free" in exhaustion_lines[-1]

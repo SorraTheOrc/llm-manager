@@ -740,7 +740,9 @@ class TestPerSlotDetails:
     async def test_slot_dicts_carry_capacity_fields(self):
         """AC1/AC2/AC5: each slot dict is compact but carries the additive
         capacity fields (owner_session_id, lease_state, phase, context_tokens,
-        prefill_eta_seconds) on top of the legacy base fields.
+        prefill_eta_seconds) on top of the legacy base fields, plus the
+        abandonment annotation (abandoned / abandonment_reason /
+        abandoned_session_id / abandoned_at_seconds_ago, LP-0MVRMI5HK00558TB).
         """
         j, _ = await self._get(
             query_result={"llama_server_running": True},
@@ -758,7 +760,16 @@ class TestPerSlotDetails:
                 "lease_state",
                 "phase",
                 "prefill_eta_seconds",
+                "abandoned",
+                "abandonment_reason",
+                "abandoned_session_id",
+                "abandoned_at_seconds_ago",
             }
+            # The abandonment annotation is always present and always
+            # attributable: a boolean alone is not enough.
+            assert slot["abandoned"] is False
+            assert slot["abandonment_reason"] is None
+            assert slot["abandoned_session_id"] is None
             assert isinstance(slot["slot_id"], int)
             assert isinstance(slot["is_processing"], bool)
             assert slot["n_decoded"] is None or isinstance(slot["n_decoded"], int)
@@ -767,7 +778,7 @@ class TestPerSlotDetails:
             assert slot["prefill_eta_seconds"] is None or isinstance(
                 slot["prefill_eta_seconds"], (int, float)
             )
-        assert j["status_schema_version"] == 3  # AC1: additive + versioned
+        assert j["status_schema_version"] == 4  # AC1: additive + versioned
 
 
 # ======================================================================
@@ -1022,8 +1033,16 @@ async def test_new_capacity_fields_are_additive_and_versioned():
         slots_detail=[_slot(0, is_processing=False), _slot(1, is_processing=True, n_decoded=9)],
     )
 
-    assert j["status_schema_version"] == 3
-    assert j["capacity_hint"] in ("idle", "prefill_bound", "saturated")
+    # v4 (LP-0MVRMI5HK00558TB): per-slot abandonment annotation, the additive
+    # ``abandoned_busy`` hint value and ``local_abandoned_slots``.
+    assert j["status_schema_version"] == 4
+    assert j["capacity_hint"] in (
+        "idle",
+        "prefill_bound",
+        "saturated",
+        "abandoned_busy",
+    )
+    assert j["local_abandoned_slots"] == 0
     assert "prefill_budget_seconds" in j
     for slot in j["slots"]:
         assert {"lease_state", "phase", "owner_session_id", "prefill_eta_seconds"} <= set(slot)

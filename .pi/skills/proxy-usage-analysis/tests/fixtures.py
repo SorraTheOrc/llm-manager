@@ -71,6 +71,44 @@ STREAM_FINISHED_LOCAL = (
     "provider=local model=Qwen3 request=[{'type': 'text', 'text': '/plan SA-0MSAS108O009DYKT'}]"
 )
 
+# --- Measured local usage (LP-0MVMHNVKT003PRIK) -----------------------------
+#
+# Local streams now report llama-server's usage block, so ``Stream finished``
+# lines carry real ``tokens=prompt/completion/total``. Buffered (non-streaming)
+# local replies carry the same payload plus ``stream=false`` so consumers can
+# keep them out of stream/busy pairing while still using the measured counts.
+
+STREAM_FINISHED_LOCAL_MEASURED = (
+    "2026-08-02 14:00:12,000 - INFO - Stream finished: reason=stop "
+    "tokens=30000/200/30200 session=019fc284-dcb8-74ca-9a64-9306b6f9d286 "
+    "provider=local model=Qwen3 request=[{'type': 'text', 'text': 'explain the router'}]"
+)
+
+STREAM_FINISHED_LOCAL_NON_STREAM = (
+    "2026-08-02 14:05:00,000 - INFO - Stream finished: reason=stop "
+    "tokens=31000/150/31150 stream=false "
+    "session=019fc284-dcb8-74ca-9a64-9306b6f9d286 provider=local model=Qwen3"
+)
+
+# --- Explicit no-usage marker (LP-0MVMBM6N400541EH) -------------------------
+#
+# When an upstream reports no usage (aborted/errored stream, or a provider that
+# omits the block), the proxy now writes ``tokens=missing`` instead of omitting
+# ``tokens=`` entirely, so "no data" is distinguishable from "zero tokens".
+
+STREAM_FINISHED_TOKENS_MISSING = (
+    "2026-08-02 14:06:00,000 - INFO - Stream finished: reason=stop "
+    "tokens=missing session=019fc284-dcb8-74ca-9a64-9306b6f9d286 "
+    "provider=local model=Qwen3 request=[{'type': 'text', 'text': 'explain the router'}]"
+)
+
+STREAM_FINISHED_TOKENS_MISSING_REMOTE = (
+    "2026-08-02 14:07:00,000 - INFO - Stream finished: reason=length "
+    "tokens=missing session=019fbfea-40b0-74a5-8cc9-bf3723f2b458 "
+    "provider=opencode-go model=deepseek-v4-flash"
+)
+
+
 # --- Prefill TTFT lines (real /var/log/llama-proxy/proxy.log lines) --------
 #
 # Local requests log ``dispatch_first_byte_ms`` (dispatch → first byte, the
@@ -274,6 +312,86 @@ ROUTING_SKIP_PROVIDER_CONTEXT_NO_LIMIT = (
     "2026-10-21 04:13:11,900 - INFO - routing_skip_provider_context provider=munitoai-free "
     "type=remote status=provider_context_exceeded estimated_tokens=160001 "
     "reason=provider_context_exceeded session=herdr-1792524101-1636143-212"
+)
+
+# --- Per-turn correlation id (``turn=``, LP-0MVMBM467005BT4A) --------------
+#
+# Since LP-0MVMBM467005BT4A the proxy stamps an 8-hex ``turn=`` id on every
+# structured line one client request emits. Two turns of ONE session are shown
+# interleaved below: with ids the joins are exact, without them the analysis
+# has to fall back to per-session FIFO / nearest-line heuristics.
+TURN_SESSION = "019fc284-dcb8-74ca-9a64-9306b6f9d286"
+TURN_A = "a1b2c3d4"
+TURN_B = "9f8e7d6c"
+
+# Turn A: skipped local (context too large), fell back, streamed remotely.
+TURN_A_STARTED = (
+    "2026-10-25 10:00:00,100 - INFO - Stream started: provider=opencode-go "
+    "model=deepseek-v4-flash "
+    f"session={TURN_SESSION} request=[{{'type': 'text', 'text': 'turn A'}}] "
+    f"turn={TURN_A}"
+)
+
+TURN_A_FINISHED = (
+    "2026-10-25 10:00:20,000 - INFO - Stream finished: reason=stop "
+    "tokens=1000/200/1200 "
+    f"session={TURN_SESSION} provider=opencode-go model=deepseek-v4-flash turn={TURN_A}"
+)
+
+TURN_A_SKIP = (
+    "2026-10-25 10:00:00,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+    "estimated_tokens=40000 cold_threshold=39594 warm_threshold=39594 new_tokens=323 "
+    "cached_ratio=0.99 reason=context_too_large → skipping local, routing to next remote "
+    f"provider session={TURN_SESSION} chain_hold_cycle=0 turn={TURN_A}"
+)
+
+TURN_A_FALLBACK = (
+    "2026-10-25 10:00:00,050 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=local-qwen3, to=opencode-go, reason=context_too_large "
+    f"session={TURN_SESSION} attempt=1 turn={TURN_A}"
+)
+
+# Turn B of the SAME session, interleaved: it is a local dispatch that was
+# refused by another session's lease, then fell back with a *different* reason.
+TURN_B_STARTED = (
+    "2026-10-25 10:00:05,000 - INFO - Stream started: provider=opencode-go "
+    "model=deepseek-v4-flash "
+    f"session={TURN_SESSION} request=[{{'type': 'text', 'text': 'turn B'}}] "
+    f"turn={TURN_B}"
+)
+
+TURN_B_FINISHED = (
+    "2026-10-25 10:00:35,000 - INFO - Stream finished: reason=stop "
+    "tokens=800/100/900 "
+    f"session={TURN_SESSION} provider=opencode-go model=deepseek-v4-flash turn={TURN_B}"
+)
+
+TURN_B_FALLBACK = (
+    "2026-10-25 10:00:04,900 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=local-qwen3, to=opencode-go, reason=local_lease_active "
+    f"session={TURN_SESSION} attempt=2 turn={TURN_B}"
+)
+
+# Local TTFT lines for the two turns: A is cold (55.6 s), B is warm (1.1 s).
+# FIFO pairing alone would mis-assign them when the turns interleave; the ids
+# make the join exact.
+TURN_A_DISPATCH = (
+    "2026-10-25 10:00:00,090 - INFO - dispatch_first_byte_ms=55656.5 "
+    "dispatch_to_first_byte_ms=55655.9 cache_state=cold cached_ratio=0.000 "
+    f"queue_wait_ms=0.6 session={TURN_SESSION} model=Qwen3 turn={TURN_A}"
+)
+
+TURN_B_DISPATCH = (
+    "2026-10-25 10:00:04,990 - INFO - dispatch_first_byte_ms=1100.5 "
+    "dispatch_to_first_byte_ms=1100.1 cache_state=warm cached_ratio=0.980 "
+    f"queue_wait_ms=0.4 session={TURN_SESSION} model=Qwen3 turn={TURN_B}"
+)
+
+# Same-session ``local_dispatch_denied`` belonging to turn B only: the denial
+# must never be attributed to turn A.
+TURN_B_DENIED = (
+    "2026-10-25 10:00:04,800 - INFO - local_dispatch_denied "
+    f"session={TURN_SESSION} owner=019fc27d active=4 cold_start=False turn={TURN_B}"
 )
 
 # --- local_dispatch_denied --------------------------------------------------

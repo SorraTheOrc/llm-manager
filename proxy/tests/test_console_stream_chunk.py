@@ -116,7 +116,7 @@ def test_stop_reason_with_usage(tmp_path):
 
 
 def test_stop_reason_no_usage(tmp_path):
-    """Stop-reason line omits tokens when usage is absent."""
+    """Stop-reason line marks missing usage explicitly (LP-0MVMBM6N400541EH)."""
     logger, ch, strio = _configure_logger_for_test(tmp_path)
 
     chunk = b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}\n\n'
@@ -124,7 +124,8 @@ def test_stop_reason_no_usage(tmp_path):
 
     out = strio.getvalue()
     assert "Stream finished: reason=stop" in out
-    assert "tokens=" not in out
+    # No usage reported \u2192 the marker, never a silent absence.
+    assert "tokens=missing" in out
 
 
 def test_no_stop_reason_without_finish_reason(tmp_path):

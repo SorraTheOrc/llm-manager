@@ -24,6 +24,10 @@ from fastapi.responses import StreamingResponse
 # provider._build_resolved_model_value so the two sites cannot diverge).
 from proxy.provider import _resolve_display_provider_name
 
+# Per-turn correlation id stamped on the lines this module emits
+# (LP-0MVMBM467005BT4A).
+from proxy.turn_id import bind_turn_id, turn_field
+
 # Import utils functions used by this module
 from proxy.utils import SSEEventReframer, count_text_tokens
 
@@ -746,6 +750,11 @@ async def proxy_to_remote(
     model_config: dict,
 ) -> Response:
     """Proxy request to remote API endpoint."""
+    # Per-turn correlation id (LP-0MVMBM467005BT4A): bound at the remote entry
+    # point so this dispatch's lines carry it. Idempotent — a call from inside
+    # a provider chain keeps the id the chain already bound, which is what
+    # makes the id stable across local<->remote fallback hops (AC2).
+    bind_turn_id(request)
     endpoint = model_config.get("endpoint", "")
 
     # Responses-API mode (LP-0MTGK5DQO001Y8H0): providers configured with
@@ -1297,10 +1306,11 @@ async def _handle_remote_streaming(
             if upstream_status >= 400:
                 err_preview = (body_bytes or b"").decode("utf-8", errors="replace")[:500]
                 _srv().logger.warning(
-                    "[remote] upstream error status=%s url=%s body=%s",
+                    "[remote] upstream error status=%s url=%s body=%s%s",
                     upstream_status,
                     target_url,
                     err_preview,
+                    turn_field(),
                 )
         except Exception:
             pass
@@ -1392,12 +1402,13 @@ async def _handle_remote_streaming(
         try:
             _request_preview = _get_request_preview(body_json)
             _srv().logger.info(
-                "Stream started: provider=%s model=%s session=%s request=%s%s",
+                "Stream started: provider=%s model=%s session=%s request=%s%s%s",
                 provider or "remote",
                 model_name,
                 session_id or "unknown",
                 _request_preview or "",
                 f" entry={entry}" if entry else "",
+                turn_field(),
             )
         except Exception:
             pass
@@ -1876,11 +1887,12 @@ async def _handle_remote_streaming(
                                             try:
                                                 _ttft_secs = time.monotonic() - _ttft_start
                                                 _srv().logger.info(
-                                                    "ttft_seconds=%.3f session=%s provider=%s model=%s",
+                                                    "ttft_seconds=%.3f session=%s provider=%s model=%s%s",
                                                     _ttft_secs,
                                                     session_id or "unknown",
                                                     provider or "remote",
                                                     model_name,
+                                                    turn_field(),
                                                 )
                                             except Exception:
                                                 pass
@@ -2126,12 +2138,13 @@ async def _handle_remote_streaming(
                 try:
                     _error_type = type(exc).__name__
                     _srv().logger.warning(
-                        "Stream error: session=%s provider=%s model=%s error=%s%s",
+                        "Stream error: session=%s provider=%s model=%s error=%s%s%s",
                         session_id or "unknown",
                         provider or "remote",
                         model_name,
                         _error_type,
                         f" entry={entry}" if entry else "",
+                        turn_field(),
                     )
                 except Exception:
                     pass

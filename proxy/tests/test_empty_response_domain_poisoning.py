@@ -46,6 +46,7 @@ def reset_cooldown_state():
     provider._provider_unavailable_until.clear()
     provider._provider_failure_count.clear()
     provider._usage_reset_at.clear()
+    provider._usage_reset_window.clear()
     provider._sibling_failure_count.clear()
     provider._sibling_failure_streak_start.clear()
     yield

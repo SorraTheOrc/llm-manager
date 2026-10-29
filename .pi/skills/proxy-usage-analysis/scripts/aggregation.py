@@ -29,6 +29,7 @@ aggregated. A session is included iff it has at least one in-window
 
 from __future__ import annotations
 
+import bisect
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -40,8 +41,10 @@ from log_parser import (
     BUSY_WINDOW_MARGIN,
     FALLBACK_ATTRIBUTION_WINDOW_SECONDS,
     LOCAL_PROVIDER,
+    STATUS_REQUEST,
     LogEvent,
     PrefillMatch,
+    pair_stream_events,
     pair_ttft_to_streams,
 )
 
@@ -118,6 +121,36 @@ FALLBACK_ATTRIBUTION_ORDER = (
 # ``local_denials`` (``local_dispatch_denied`` refusals) and
 # ``lease_active_fallbacks`` (``Fallback triggered`` /
 # ``contention_queue_fallback_after_queue`` with ``reason=local_lease_active``).
+
+# Provenance of a session's "context size at fallback" (LP-0MVM93DE6009JGBU
+# AC4). The value is derived from this session's OWN evidence, in this order:
+#
+# - ``routing_skip`` — ``estimated_tokens=`` on the session's own
+#   ``routing_skip_local`` line at/before its recorded fallback: the estimate
+#   the routing decision itself priced;
+# - ``remote_stream`` — the prompt tokens (``tokens=prompt/...``) of the
+#   session's first remote ``Stream finished`` line;
+# - ``session_context`` — the session's own measured context columns
+#   (``start_context_size``, else ``max_context_size``) when neither of the
+#   above is logged;
+# - ``None`` — no token evidence at all. The report renders an explicit
+#   ``n/a`` and a limitation note; it never fabricates an estimate.
+CONTEXT_AT_FALLBACK_ROUTING_SKIP = "routing_skip"
+CONTEXT_AT_FALLBACK_REMOTE_STREAM = "remote_stream"
+CONTEXT_AT_FALLBACK_SESSION_CONTEXT = "session_context"
+
+# Fallback reasons that describe a PROMPT-SIZE decision (the local or remote
+# entry's context ceiling) rather than an availability/quality problem. They
+# fire as a session's context grows past the configured thresholds, so the
+# local-turn coverage section uses them for its context-size interpretation
+# note (LP-0MVM93DE6009JGBU). ``warm_cache_bypass`` is the pre-change spelling
+# of ``context_too_large`` and is normalised by the parser.
+CONTEXT_FALLBACK_REASONS = (
+    "context_too_large",
+    "large_context_bypass",
+    "provider_context_exceeded",
+)
+
 AVAILABILITY_COUNTERS = (
     "local_dispatch_attempts",
     "local_served",
@@ -126,6 +159,71 @@ AVAILABILITY_COUNTERS = (
 )
 
 UNKNOWN_LABEL = "(unknown)"
+
+# Denial-attribution verdicts (LP-0MVGR2OXT0096OGK M1). ``local_dispatch_denied``
+# lines carry no ``lease_state``, so the pool state at each denial is derived
+# from the adjacent ``local_admission_guard`` record's *measured* fields:
+# ``busy_slots`` (slots decoding), ``in_flight_prefills`` (prefills running)
+# and ``free_slot``. The verdict vocabulary is deliberately shallow:
+#
+# * ``idle_leased`` — no slot decoding and no prefill in flight: the pool
+#   reports leases held (``active`` on the denial line) but the GPU measured
+#   zero local work. This is the idle-lease false-busy case the item probes.
+# * ``prefill_bound`` — at least one prefill running: serialised prefills make
+#   this the gating resource, even when decode slots are also occupied.
+# * ``saturated`` — slots decoding and no prefill in flight.
+# * ``unknown`` — legacy guard line without the pool-state fields.
+DENIAL_VERDICT_IDLE_LEASED = "idle_leased"
+DENIAL_VERDICT_PREFILL_BOUND = "prefill_bound"
+DENIAL_VERDICT_SATURATED = "saturated"
+DENIAL_VERDICT_UNKNOWN = "unknown"
+DENIAL_VERDICT_ORDER = (
+    DENIAL_VERDICT_IDLE_LEASED,
+    DENIAL_VERDICT_PREFILL_BOUND,
+    DENIAL_VERDICT_SATURATED,
+    DENIAL_VERDICT_UNKNOWN,
+)
+# Marker for a denial whose 60s timestamp block holds no guard record; kept
+# out of :data:`DENIAL_VERDICT_ORDER` so it is visibly separate from a
+# measured ``unknown`` verdict.
+DENIAL_VERDICT_UNATTRIBUTED = "unattributed"
+
+# Seconds either side of a ``local_dispatch_denied`` within which the nearest
+# ``local_admission_guard`` reject record is treated as the denial's decision
+# block (LP-0MVGR2OXT0096OGK M1). Measured on the 2026-10-27 16:16 →
+# 2026-10-28 15:56 window (111 denials, 3,558 guard rejects): the nearest
+# guard sits 0-20ms away for the majority (the proxy logs the denial then the
+# routing decision), ±30s covers 68.5%, ±60s 73.9% and ±120s 82.9%. 60s is
+# the widest bound that still keeps the join inside one contention burst —
+# longer windows start attributing to the stale guard of a previous burst, so
+# the remainder is reported as ``unattributed`` rather than guessed.
+DENIAL_GUARD_JOIN_WINDOW_SECONDS = 60.0
+
+# New-token bands for the admission-verdict split (LP-0MVS9YKHL007UBBZ AC2).
+# The band edges are the **conversion harness's** bands
+# (``scripts/prefill_admission_conversion.py``), because the report's per-band
+# admission → first-byte conversion counts are read against that harness's
+# baseline/post-change numbers. ``(label, lower_inclusive, upper_exclusive)``;
+# ``None`` upper = unbounded. ``tests/test_admission_rate_bucket_report.py``
+# pins the two definitions together so the contract cannot drift silently.
+ADMISSION_TOKEN_BANDS: tuple[tuple[str, int, int | None], ...] = (
+    ("<8k", 0, 8_000),
+    ("8k-20k", 8_000, 20_000),
+    ("20k-32k", 20_000, 32_000),
+    ("32k-64k", 32_000, 64_000),
+    (">=64k", 64_000, None),
+)
+#: Band for a guard line that carries no priced ``new_tokens`` (every
+#: pre-change line): counted so the verdicts still add up, never squashed into
+#: ``<8k`` as if it had been priced at zero.
+UNKNOWN_BAND_LABEL = "unknown"
+#: Rate-bucket key for a guard line with no ``rate_bucket`` field (pre-change
+#: logs). Distinct from a real bucket so ``solitary_fallback`` — the *declared*
+#: residual-optimism marker — is never confused with an unparsed line.
+UNKNOWN_RATE_BUCKET_LABEL = "unknown"
+#: Canonical display order for the known rate buckets; any other observed
+#: bucket follows alphabetically and the unknown key last.
+RATE_BUCKET_ORDER = ("contended", "solitary", "solitary_fallback")
 
 # Unit of the slot-seconds figures on :class:`SlotSecondsStats` (and its
 # :class:`PrefillStats` / :class:`DecodeStats` subclasses) and on
@@ -180,6 +278,242 @@ RESTART_CORRELATION_WINDOW_SECONDS = 120
 # cause. Other error kinds (slot_save, backend_retry, upstream HTTP) are
 # infrastructure/informational signals and leave ``root_cause`` unset.
 STREAM_ERROR_KINDS = ("stream_finish_error", "stream_error")
+
+
+@dataclass(frozen=True)
+class DenialAttribution:
+    """One ``local_dispatch_denied`` joined to its decision-block guard record.
+
+    LP-0MVGR2OXT0096OGK M1: the denial line itself carries no pool state, so
+    ``ts`` is the denial time, ``guard_ts``/``guard_reason`` come from the
+    adjacent ``local_admission_guard`` reject record, and ``verdict`` is the
+    derived :func:`classify_denial_verdict` pool state. The raw measured
+    fields are kept so the report can corroborate the verdict
+    (``busy_slots=0`` / ``in_flight_prefills=0`` / ``free_slot``).
+    """
+
+    ts: datetime
+    guard_ts: datetime
+    guard_reason: str | None
+    verdict: str
+    busy_slots: int | None
+    in_flight_prefills: int | None
+    free_slot: str | None
+
+
+def classify_denial_verdict(guard: LogEvent) -> str:
+    """Derive the pool-state verdict for one guard record (M1).
+
+    Ordered so a running prefill wins over slot occupancy: prefills are
+    serialised (``local_max_concurrent_prefills: 1``), so an in-flight prefill
+    is the gating resource even when every slot is also decoding. A guard line
+    without the measured pool-state fields predates the payload change and
+    yields :data:`DENIAL_VERDICT_UNKNOWN` — never a fabricated ``idle_leased``.
+    """
+    busy = getattr(guard, "busy_slots", None)
+    prefills = getattr(guard, "in_flight_prefills", None)
+    if busy is None or prefills is None:
+        return DENIAL_VERDICT_UNKNOWN
+    if prefills >= 1:
+        return DENIAL_VERDICT_PREFILL_BOUND
+    if busy == 0:
+        return DENIAL_VERDICT_IDLE_LEASED
+    return DENIAL_VERDICT_SATURATED
+
+
+def attribute_denials(
+    denials: Iterable[LogEvent],
+    guards: Iterable[LogEvent],
+    window_seconds: float = DENIAL_GUARD_JOIN_WINDOW_SECONDS,
+) -> list[DenialAttribution]:
+    """Join each denial to its nearest guard reject within ``window_seconds``.
+
+    The proxy logs the ``local_dispatch_denied`` line and then the guard's
+    routing decision milliseconds apart, so the nearest guard (either side,
+    inclusive bound) inside the timestamp block is the decision that refused
+    the dispatch. A denial with no guard in the block is simply omitted: the
+    report counts it as ``unattributed`` instead of borrowing a stale record
+    from an earlier burst (LP-0MVGR2OXT0096OGK M1).
+
+    ``guards`` should be the ``local_admission_guard`` events with
+    ``decision=reject`` — an ``admit`` record did not refuse this dispatch.
+    """
+    guard_list = sorted(guards, key=lambda e: e.ts)
+    guard_ts = [g.ts for g in guard_list]
+    out: list[DenialAttribution] = []
+    for denial in sorted(denials, key=lambda e: e.ts):
+        i = bisect.bisect_left(guard_ts, denial.ts)
+        best: LogEvent | None = None
+        best_delta: float | None = None
+        for j in (i - 1, i):
+            if not (0 <= j < len(guard_list)):
+                continue
+            delta = abs((guard_list[j].ts - denial.ts).total_seconds())
+            if best_delta is None or delta < best_delta:
+                best, best_delta = guard_list[j], delta
+        if best is None or best_delta is None or best_delta > window_seconds:
+            continue
+        out.append(
+            DenialAttribution(
+                ts=denial.ts,
+                guard_ts=best.ts,
+                guard_reason=getattr(best, "reason", None),
+                verdict=classify_denial_verdict(best),
+                busy_slots=getattr(best, "busy_slots", None),
+                in_flight_prefills=getattr(best, "in_flight_prefills", None),
+                free_slot=getattr(best, "free_slot", None),
+            )
+        )
+    return out
+
+
+@dataclass
+class AdmissionBandStats:
+    """Admission verdicts and conversion counts for one new-token band.
+
+    LP-0MVS9YKHL007UBBZ: ``admit``/``reject`` are event-level guard verdicts
+    (a session may make several requests); ``converted``/``unconverted`` are
+    **session-level**: a session with an admit is ``converted`` when a local
+    first byte follows it, ``unconverted`` when none does — the same join the
+    admission-conversion harness performs. A band with no admitted session
+    reports ``conversion_share=None`` (not ``0.0``), so "nothing admitted" is
+    never read as "nothing converted".
+    """
+
+    admit: int = 0
+    reject: int = 0
+    converted: int = 0
+    unconverted: int = 0
+
+    @property
+    def conversion_share(self) -> float | None:
+        """Converted share of admitted sessions, or ``None`` when none."""
+        total = self.converted + self.unconverted
+        return (self.converted / total) if total else None
+
+    def to_dict(self) -> dict:
+        share = self.conversion_share
+        return {
+            "admit": self.admit,
+            "reject": self.reject,
+            "converted": self.converted,
+            "unconverted": self.unconverted,
+            "conversion_share": round(share, 4) if share is not None else None,
+        }
+
+
+def admission_token_band(new_tokens: int | None) -> str:
+    """Return the conversion-harness band for *new_tokens*.
+
+    ``None`` (a pre-change line with no priced token count) maps to
+    :data:`UNKNOWN_BAND_LABEL`, matching the harness's own ``band_for``.
+    """
+    if new_tokens is None:
+        return UNKNOWN_BAND_LABEL
+    for label, lower, upper in ADMISSION_TOKEN_BANDS:
+        if new_tokens >= lower and (upper is None or new_tokens < upper):
+            return label
+    return UNKNOWN_BAND_LABEL
+
+
+def _ordered_band_keys(keys: Iterable[str]) -> list[str]:
+    """Canonical band order (harness order, ``unknown`` last)."""
+    present = set(keys)
+    ordered = [label for label, _, _ in ADMISSION_TOKEN_BANDS if label in present]
+    if UNKNOWN_BAND_LABEL in present:
+        ordered.append(UNKNOWN_BAND_LABEL)
+    # Defensive: a band label outside the table can only appear if the tables
+    # drift, but never drop data on the floor.
+    ordered.extend(sorted(present - set(ordered)))
+    return ordered
+
+
+def _ordered_rate_bucket_keys(keys: Iterable[str]) -> list[str]:
+    """Canonical rate-bucket order (known buckets, then extras, ``unknown``)."""
+    present = set(keys)
+    ordered = [bucket for bucket in RATE_BUCKET_ORDER if bucket in present]
+    extras = present - set(ordered) - {UNKNOWN_RATE_BUCKET_LABEL}
+    ordered.extend(sorted(extras))
+    if UNKNOWN_RATE_BUCKET_LABEL in present:
+        ordered.append(UNKNOWN_RATE_BUCKET_LABEL)
+    return ordered
+
+
+def admission_breakdown(summary: AnalysisResult) -> dict:
+    """Split the guard's verdicts by ``rate_bucket`` and by new-token band.
+
+    LP-0MVS9YKHL007UBBZ AC2: a regression to the optimistic rate bucket (or to
+    ``solitary_fallback``, the uncalibrated-contended fallback) has to be
+    visible in the standard report, not only by reading raw lines. The result
+    is a plain dict so the markdown report and the ``--json`` summary render
+    from one computation::
+
+        {
+          "by_rate_bucket": {bucket: {"admit": n, "reject": n}, ...},
+          "by_token_band": {band: AdmissionBandStats.to_dict(), ...},
+        }
+
+    Buckets and bands with no verdict are **omitted**, never zero-filled: an
+    absent ``contended`` bucket means the guard never priced a contended
+    admission in the window, which is itself the signal. Events whose
+    ``decision`` is neither ``admit`` nor ``reject`` are skipped so the splits
+    always sum to the pre-existing ``local_admission_admit`` /
+    ``local_admission_reject`` counters.
+    """
+    rate_buckets: dict[str, dict[str, int]] = {}
+    bands: dict[str, AdmissionBandStats] = {}
+    admits_by_session: dict[str, list[LogEvent]] = {}
+
+    for event in getattr(summary, "local_admission_events", []) or []:
+        decision = getattr(event, "decision", None)
+        if decision not in ("admit", "reject"):
+            continue
+        bucket = getattr(event, "rate_bucket", None) or UNKNOWN_RATE_BUCKET_LABEL
+        verdicts = rate_buckets.setdefault(bucket, {"admit": 0, "reject": 0})
+        verdicts[decision] += 1
+        band = bands.setdefault(
+            admission_token_band(getattr(event, "new_tokens", None)),
+            AdmissionBandStats(),
+        )
+        if decision == "admit":
+            band.admit += 1
+            if event.session:
+                admits_by_session.setdefault(event.session, []).append(event)
+        else:
+            band.reject += 1
+
+    # Session-level conversion join, mirroring the harness: the first *local*
+    # first byte for the session converts the admit that preceded it (else the
+    # earliest admit). Remote first bytes and sessions with no admit are not
+    # joined — a remote serve did not convert a local admission.
+    first_byte_ts: dict[str, datetime] = {}
+    for event in getattr(summary, "ttft_events", []) or []:
+        if not event.session or getattr(event, "ttft_source", None) != "local":
+            continue
+        seen = first_byte_ts.get(event.session)
+        if seen is None or event.ts < seen:
+            first_byte_ts[event.session] = event.ts
+
+    for session, admits in admits_by_session.items():
+        admits.sort(key=lambda e: e.ts)
+        first_ts = first_byte_ts.get(session)
+        if first_ts is None:
+            band = bands[admission_token_band(admits[0].new_tokens)]
+            band.unconverted += 1
+            continue
+        preceding = [event for event in admits if event.ts <= first_ts] or admits
+        band = bands[admission_token_band(preceding[-1].new_tokens)]
+        band.converted += 1
+
+    return {
+        "by_rate_bucket": {
+            bucket: rate_buckets[bucket]
+            for bucket in _ordered_rate_bucket_keys(rate_buckets)
+        },
+        "by_token_band": {
+            label: bands[label].to_dict() for label in _ordered_band_keys(bands)
+        },
+    }
 
 
 def _near_restart(ts: datetime, restart_signals: Iterable[datetime]) -> bool:
@@ -272,10 +606,51 @@ class SessionStats:
     # Token totals from this session's Stream finished events.
     input_tokens: int = 0
     output_tokens: int = 0
+    # Token totals per SERVING ``(provider, model)`` — the provider/model on
+    # each ``Stream finished`` line itself rather than the session's initial
+    # provider (LP-0MVMHNVKT003PRIK AC4). A session that started local and fell
+    # back to a remote provider therefore attributes each stream's tokens to
+    # the provider that actually served it. Values are ``(input, output)``.
+    tokens_by_model: dict[tuple[str, str], tuple[int, int]] = field(
+        default_factory=dict
+    )
+    # Local turns actually answered (LP-0MVM93DE6009JGBU): a local
+    # ``Stream started`` paired FIFO with a local ``Stream finished`` that is
+    # not an error. ``local_turns_unanswered`` counts routed local turns left
+    # over — reported, never dropped.
+    local_turns_answered: int = 0
+    local_turns_unanswered: int = 0
+    # Context size at the session's local→remote fallback, with its
+    # provenance (one of the ``CONTEXT_AT_FALLBACK_*`` states, or ``None``
+    # when the logs carry no token evidence — rendered ``n/a``).
+    context_at_fallback: int | None = None
+    context_at_fallback_source: str | None = None
+    # Per-session measured-usage coverage (LP-0MVMBM6N400541EH AC3): terminal
+    # ``Stream finished`` lines that carried counted ``tokens=`` vs. those that
+    # reported no usage at all — ``tokens=missing`` on new logs, an absent
+    # ``tokens=`` field on logs predating the marker. A session with
+    # ``streams_without_usage`` > 0 has *unknown* context/size figures (blank in
+    # the CSV, absent from the context averages) rather than zero ones, and the
+    # report names this count instead of leaving the figures unexplained.
+    streams_with_usage: int = 0
+    streams_without_usage: int = 0
 
     @property
     def fell_back(self) -> bool:
         return self.remote_move_time is not None
+
+    @property
+    def local_turn_pct(self) -> float | None:
+        """Share of this session's turns answered by local (percent).
+
+        ``local / (local + remote) * 100`` over the session's routed turns, so
+        a session that never used remote reads 100.0. ``None`` only when the
+        session has no turns at all.
+        """
+        total = self.local_requests + self.remote_requests
+        if total <= 0:
+            return None
+        return round(self.local_requests / total * 100.0, 1)
 
 
 @dataclass
@@ -301,6 +676,15 @@ class AnalysisResult:
     # applied (``false`` in ``observe`` mode), and the projected prefill ETA /
     # wait budget in seconds.
     local_admission_events: list[LogEvent] = field(default_factory=list)
+    # Status-poll payload events (LP-0MVGR2OXT0096OGK M3): one event per
+    # ``status_request`` line inside the window, carrying the calibrated
+    # ``prefill_eta_seconds`` prediction and the published ``capacity_hint``.
+    status_request_events: list[LogEvent] = field(default_factory=list)
+    # Denial → guard attribution (LP-0MVGR2OXT0096OGK M1): each
+    # ``dispatch_denied`` joined to its decision-block guard reject, with the
+    # derived pool-state verdict. The join is lossless (unmatched denials are
+    # simply absent — the report counts them as ``unattributed``).
+    denial_attributions: list[DenialAttribution] = field(default_factory=list)
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): one event per economic
     # cold-cache bypass that was overridden because the GPU had been idle for
     # at least ``threshold_seconds`` (``idle_seconds`` = measured idle age).
@@ -337,6 +721,10 @@ class AnalysisResult:
     speed: object | None = None
     # Local-model utilization (busy time etc.); None when no local traffic.
     busy: BusyStats | None = None
+    # GPU busy-time measured from power consumption via Prometheus (set by
+    # reporting.run_analysis). None when the query fails (best-effort) or
+    # when no local traffic exists (the log-based busy is the primary signal).
+    gpu_busy: object | None = None  # gpu_busy.GpuBusyResult | None
     # Per-hour activity counters for the report's ``## Summary by hour``
     # table (LP-0MTYAZFGN003BYQS): absolute top-of-hour datetime -> Counter
     # over ``requests_started`` / ``local_attempts`` / ``local_served`` /
@@ -372,6 +760,15 @@ class AnalysisResult:
     # already contribute their timestamp to ``restart_signals`` for
     # root-cause correlation (unchanged).
     restart_events: list[LogEvent] = field(default_factory=list)
+    # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): how many terminal
+    # ``Stream finished`` lines were seen in the window at all, and how many of
+    # them carried no ``tokens=`` payload (so their context/size figures are
+    # unknown rather than zero). ``streams_without_usage_by_provider`` splits
+    # the latter by provider, which is what makes "local streams now report
+    # usage" auditable.
+    streams_finished: int = 0
+    streams_without_usage: int = 0
+    streams_without_usage_by_provider: Counter = field(default_factory=Counter)
 
     @property
     def restart_events_sorted(self) -> list[LogEvent]:
@@ -506,15 +903,23 @@ class AnalysisResult:
 
     @property
     def token_by_model(self) -> dict[tuple[str, str], tuple[int, int, int]]:
-        """Token totals grouped by ``(provider, model)`` sorted by total descending."""
-        totals: dict[tuple[str, str], list[tuple[int, int]]] = {}
+        """Token totals grouped by the SERVING ``(provider, model)``.
+
+        Grouped by the ``provider``/``model`` stamped on each ``Stream
+        finished`` line, not by the session's initial provider
+        (LP-0MVMHNVKT003PRIK AC4): a session that started local and fell back
+        to a remote provider splits its tokens between the two instead of
+        attributing every token to the initial provider. Sorted by total
+        descending.
+        """
+        totals: dict[tuple[str, str], list[int]] = {}
         for s in self.sessions.values():
-            key = (s.initial_provider or UNKNOWN_LABEL, s.initial_model or UNKNOWN_LABEL)
-            totals.setdefault(key, []).append((s.input_tokens, s.output_tokens))
+            for key, (inp, out) in s.tokens_by_model.items():
+                pair = totals.setdefault(key, [0, 0])
+                pair[0] += inp
+                pair[1] += out
         result: dict[tuple[str, str], tuple[int, int, int]] = {}
-        for key, pairs in totals.items():
-            inp = sum(p[0] for p in pairs)
-            out = sum(p[1] for p in pairs)
+        for key, (inp, out) in totals.items():
             result[key] = (inp, out, inp + out)
         return dict(sorted(result.items(), key=lambda kv: kv[1][2], reverse=True))
 
@@ -736,9 +1141,13 @@ class BusyStats:
     # The same decode-only union split across fast/cheap periods.
     decode_fast_busy_seconds: float = 0.0
     decode_cheap_busy_seconds: float = 0.0
-    # Number of paired streams whose busy interval was extended backwards to
-    # a measured dispatch time; the rest contribute their decode interval
-    # only (unknown prefill), which keeps the upper bound honest.
+    # Number of paired streams, **inside this window**, whose busy interval
+    # was extended backwards to a measured dispatch time; the rest contribute
+    # their decode interval only (unknown prefill), which keeps the upper bound
+    # honest. Only pairs whose clipped interval is actually counted are
+    # included, so this can never exceed :attr:`streams` — the event stream
+    # handed to :func:`compute_busy_stats` is margin-widened and also carries
+    # pairs from earlier windows (LP-0MVKN85WO007O00H).
     prefill_extended_streams: int = 0
 
     @property
@@ -787,6 +1196,12 @@ class _SessionBuilder:
         self.session_id = session_id
         self.started: list[LogEvent] = []
         self.finished: list[LogEvent] = []
+        # Buffered replies logged with ``stream=false`` (LP-0MVMHNVKT003PRIK):
+        # measured usage with no ``Stream started`` to pair, so they contribute
+        # tokens but never a busy/stream pairing.
+        self.non_stream_finished: list[LogEvent] = []
+        # Per-serving-(provider, model) ``[input, output]`` token totals.
+        self.tokens_by_model: dict[tuple[str, str], list[int]] = {}
         self.last_seen: datetime | None = None
         self.dispatch_denied = 0
         self.routing_skips: list[LogEvent] = []
@@ -794,24 +1209,57 @@ class _SessionBuilder:
         self.local_first: datetime | None = None
         self.local_last: datetime | None = None
         self.local_completion = 0
+        # Measured-usage coverage (LP-0MVMBM6N400541EH AC3): terminal lines with
+        # counted ``tokens=`` vs. terminal lines that reported no usage.
+        self.streams_with_usage = 0
+        self.streams_without_usage = 0
 
     def add(self, ev: LogEvent) -> None:
         self.last_seen = ev.ts
         if ev.kind == "stream_started":
             self.started.append(ev)
         elif ev.kind == "stream_finished":
-            self.finished.append(ev)
+            if getattr(ev, "streamed", None) is False:
+                self.non_stream_finished.append(ev)
+            else:
+                self.finished.append(ev)
         elif ev.kind == "routing_skip":
             self.routing_skips.append(ev)
         elif ev.kind == "dispatch_denied":
             self.dispatch_denied += 1
+        if ev.kind == "stream_finished":
+            self._add_tokens_by_model(ev)
+            # Same rule as the window-level coverage counters: a terminal line
+            # with neither prompt nor completion counts reported no usage.
+            if ev.prompt is None and ev.completion is None:
+                self.streams_without_usage += 1
+            else:
+                self.streams_with_usage += 1
         if ev.provider == LOCAL_PROVIDER and ev.kind in ("stream_started", "stream_finished"):
             if self.local_first is None or ev.ts < self.local_first:
                 self.local_first = ev.ts
             if self.local_last is None or ev.ts > self.local_last:
                 self.local_last = ev.ts
-            if ev.kind == "stream_finished" and ev.completion is not None:
+            if (
+                ev.kind == "stream_finished"
+                and getattr(ev, "streamed", None) is not False
+                and ev.completion is not None
+            ):
                 self.local_completion += ev.completion
+
+    def _add_tokens_by_model(self, ev: LogEvent) -> None:
+        """Accumulate *ev*'s measured tokens under its serving provider/model.
+
+        The provider/model come from the terminal line itself, so tokens are
+        attributed to whoever actually served the stream rather than to the
+        session's initial provider (LP-0MVMHNVKT003PRIK AC4).
+        """
+        if ev.prompt is None and ev.completion is None:
+            return
+        key = (ev.provider or UNKNOWN_LABEL, ev.model or UNKNOWN_LABEL)
+        pair = self.tokens_by_model.setdefault(key, [0, 0])
+        pair[0] += int(ev.prompt or 0)
+        pair[1] += int(ev.completion or 0)
 
 
 def _mean(values: list) -> float | None:
@@ -825,6 +1273,74 @@ def _first_remote(events: Iterable[LogEvent]) -> LogEvent | None:
     return None
 
 
+def _count_local_turns(
+    builder: _SessionBuilder,
+) -> tuple[int, int]:
+    """Return ``(answered, unanswered)`` local turns for one session.
+
+    A turn is *routed to local* by its local ``Stream started`` line and
+    *answered* when a local, non-error ``Stream finished`` is logged for it
+    (paired FIFO, the convention ``compute_busy_stats`` and
+    ``pair_ttft_to_streams`` use). A routed local turn with no non-error
+    finish — an errored stream, an aborted request, a log gap — is counted as
+    **unanswered** rather than dropped, so the coverage table cannot silently
+    over-state local service (LP-0MVM93DE6009JGBU).
+    """
+    starts = sum(1 for e in builder.started if e.provider == LOCAL_PROVIDER)
+    good_finishes = sum(1 for e in builder.finished if e.provider == LOCAL_PROVIDER)
+    answered = min(starts, good_finishes)
+    return answered, starts - answered
+
+
+def _context_at_fallback(
+    session_id: str,
+    anchor_ts: datetime,
+    routing_skips: dict[str, list[LogEvent]],
+    builder: _SessionBuilder,
+    prompt_tokens: list[int],
+) -> tuple[int | None, str | None]:
+    """Derive ``(context_size, source)`` at a session's remote fallback.
+
+    Order of preference (AC4) — this session's own evidence only, never a
+    neighbour's line and never an estimate:
+
+    1. ``estimated_tokens`` from the session's own ``routing_skip_local`` line
+       at/before the fallback (the latest such line);
+    2. the prompt tokens of the session's first remote ``Stream finished`` at
+       or after the first remote ``Stream started``;
+    3. the session's own measured context: ``prompt_tokens[0]``, i.e. the
+       ``start_context_size`` of the session CSV (``max_context_size`` needs no
+       separate branch — it exists only when a prompt measurement does);
+    4. ``(None, None)`` — no token evidence, reported as ``n/a``.
+    """
+    skips = [
+        e
+        for e in routing_skips.get(session_id, [])
+        if e.ts <= anchor_ts and e.estimated_tokens is not None
+    ]
+    if skips:
+        return (
+            max(skips, key=lambda e: e.ts).estimated_tokens,
+            CONTEXT_AT_FALLBACK_ROUTING_SKIP,
+        )
+    remote_finishes = sorted(
+        (
+            e
+            for e in builder.finished
+            if e.provider
+            and e.provider != LOCAL_PROVIDER
+            and e.ts >= anchor_ts
+            and e.prompt is not None
+        ),
+        key=lambda e: e.ts,
+    )
+    if remote_finishes:
+        return remote_finishes[0].prompt, CONTEXT_AT_FALLBACK_REMOTE_STREAM
+    if prompt_tokens:
+        return prompt_tokens[0], CONTEXT_AT_FALLBACK_SESSION_CONTEXT
+    return None, None
+
+
 def _attribute_fallback(
     session_id: str,
     first_remote_ts: datetime,
@@ -832,6 +1348,7 @@ def _attribute_fallback(
     fallback_events: list[LogEvent],
     dispatch_denied: int = 0,
     provider_context_skips: dict[str, list[LogEvent]] | None = None,
+    turn: str | None = None,
 ) -> tuple[datetime | None, str | None, str]:
     """Find (move_time, reason, attribution) for a session that reached remote.
 
@@ -862,10 +1379,24 @@ def _attribute_fallback(
     both reasons are reported separately (per-session reason and the
     provider-context breakdown), so nothing is lost by this precedence.
 
+    When *turn* is given (the turn id of the session's first remote stream),
+    evidence carrying the **same** turn id is preferred at every step: with ids
+    present the join is exact, so two interleaved turns of one session can no
+    longer be confused (LP-0MVMBM467005BT4A AC3). Without ids the historical
+    session/timestamp rules above apply unchanged.
+
     Returns ``(None, None, attribution)`` when there is no timestamped
     evidence.
     """
+
+    def _same_turn(events: list[LogEvent]) -> list[LogEvent]:
+        return [e for e in events if turn and e.turn == turn]
+
     skips = [e for e in routing_skips.get(session_id, []) if e.ts <= first_remote_ts]
+    exact = _same_turn(skips)
+    if exact:
+        e = max(exact, key=lambda x: x.ts)
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
     if skips:
         e = max(skips, key=lambda x: x.ts)
         return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_SKIP
@@ -875,6 +1406,10 @@ def _attribute_fallback(
             for e in provider_context_skips.get(session_id, [])
             if e.ts <= first_remote_ts
         ]
+        exact = _same_turn(ctx_skips)
+        if exact:
+            e = max(exact, key=lambda x: x.ts)
+            return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
         if ctx_skips:
             e = max(ctx_skips, key=lambda x: x.ts)
             return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_PROVIDER_SKIP
@@ -883,6 +1418,10 @@ def _attribute_fallback(
         for e in fallback_events
         if e.session == session_id and e.ts <= first_remote_ts
     ]
+    exact = _same_turn(own)
+    if exact:
+        e = max(exact, key=lambda x: x.ts)
+        return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
     if own:
         e = max(own, key=lambda x: x.ts)
         return e.ts, e.reason, FALLBACK_ATTRIBUTION_OWN_FALLBACK
@@ -913,6 +1452,12 @@ def _build_session(
 ) -> SessionStats:
     started = sorted(builder.started, key=lambda e: e.ts)
     finished = sorted(builder.finished, key=lambda e: e.ts)
+    # Buffered (``stream=false``) replies carry measured usage too, so token /
+    # context statistics include them even though they never pair with a
+    # ``Stream started`` (LP-0MVMHNVKT003PRIK).
+    usage_finished = sorted(
+        builder.finished + builder.non_stream_finished, key=lambda e: e.ts
+    )
 
     first = started[0] if started else (finished[0] if finished else None)
     start = first.ts if first is not None else builder.last_seen
@@ -921,8 +1466,10 @@ def _build_session(
     first_provider = first.provider if first is not None else ""
     first_model = first.model if first is not None else ""
 
-    prompt_tokens = [e.prompt for e in finished if e.prompt is not None]
-    completion_tokens = [e.completion for e in finished if e.completion is not None]
+    prompt_tokens = [e.prompt for e in usage_finished if e.prompt is not None]
+    completion_tokens = [
+        e.completion for e in usage_finished if e.completion is not None
+    ]
 
     first_remote = _first_remote(started)
     has_local = any(e.provider == LOCAL_PROVIDER for e in started)
@@ -935,6 +1482,7 @@ def _build_session(
             fallback_events,
             dispatch_denied=builder.dispatch_denied,
             provider_context_skips=provider_context_skips,
+            turn=first_remote.turn,
         )
         if move_ts is None:
             move_ts = first_remote.ts if has_local else None
@@ -953,6 +1501,22 @@ def _build_session(
 
     local_req = sum(1 for e in started if e.provider == LOCAL_PROVIDER)
     remote_req = len(started) - local_req
+    local_answered, local_unanswered = _count_local_turns(builder)
+
+    # Context size at the fallback (LP-0MVM93DE6009JGBU AC4): anchored on the
+    # session's own recorded move time when it has local evidence, otherwise
+    # on its first remote stream.
+    context_at_fallback: int | None = None
+    context_source: str | None = None
+    if first_remote is not None:
+        anchor = move_ts if has_local and move_ts is not None else first_remote.ts
+        context_at_fallback, context_source = _context_at_fallback(
+            builder.session_id,
+            anchor,
+            routing_skips,
+            builder,
+            prompt_tokens,
+        )
 
     # Token totals for this session.
     input_tokens = sum(prompt_tokens)
@@ -995,6 +1559,16 @@ def _build_session(
         decode_tok_s=decode_tok_s,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        tokens_by_model={
+            key: (pair[0], pair[1])
+            for key, pair in builder.tokens_by_model.items()
+        },
+        local_turns_answered=local_answered,
+        local_turns_unanswered=local_unanswered,
+        context_at_fallback=context_at_fallback,
+        context_at_fallback_source=context_source,
+        streams_with_usage=builder.streams_with_usage,
+        streams_without_usage=builder.streams_without_usage,
     )
 
 
@@ -1181,9 +1755,15 @@ def compute_busy_stats(
     can only ever contribute its lower-bound time — the busy figure is never
     overstated.
 
+    Start/finish pairs are exact when both lines carry the same ``turn=`` id
+    (LP-0MVMBM467005BT4A) and FIFO per session for pre-change lines without
+    one, so two interleaved turns of a session keep their own decode/prefill
+    durations.
+
     ``ttft_events`` are the local ``dispatch_first_byte_ms`` TTFT events
-    (LP-0MVJN45LF009CO2V). When supplied they are paired FIFO to the local
-    streams per session and reported as :attr:`BusyStats.prefill_stats`:
+    (LP-0MVJN45LF009CO2V). When supplied they are paired to the local
+    streams — exactly by ``turn=`` where present, FIFO per session otherwise —
+    and reported as :attr:`BusyStats.prefill_stats`:
     p10/p50/p90/max plus the window total of the prefill interval
     ``[ttft.ts - ttft_ms/1000, ttft.ts]``. Every prefill figure is
     **slot-time, not wall-clock** (the per-stream durations are summed, not
@@ -1215,6 +1795,11 @@ def compute_busy_stats(
             started.setdefault(ev.session, []).append(ev)
             started_events.append(ev)
         else:
+            if getattr(ev, "streamed", None) is False:
+                # Buffered reply: measured usage, but no ``Stream started`` to
+                # pair with — keeping it out of the FIFO keeps every stream's
+                # busy/decode interval correct (LP-0MVMHNVKT003PRIK).
+                continue
             finished.setdefault(ev.session, []).append(ev)
 
     ttft_list = list(ttft_events) if ttft_events is not None else None
@@ -1240,7 +1825,12 @@ def compute_busy_stats(
     for session_id, session_starts in started.items():
         ss = sorted(session_starts, key=lambda e: e.ts)
         ff = sorted(finished.get(session_id, []), key=lambda e: e.ts)
-        for start_ev, finish_ev in zip(ss, ff):
+        # Exact pairing when both lines of a stream carry the same ``turn=`` id
+        # (LP-0MVMBM467005BT4A); FIFO for pre-change logs. ``unpaired_starts``
+        # replaces the old ``ss[len(ff):]`` slice so an exact pair can no
+        # longer leave a mis-paired start behind.
+        pairs, unpaired_starts = pair_stream_events(ss, ff)
+        for start_ev, finish_ev in pairs:
             # Decode-only interval (``Stream started`` → ``Stream finished``).
             d_lo, d_hi = max(start_ev.ts, window_start), min(finish_ev.ts, window_end)
             if d_hi > d_lo:
@@ -1261,18 +1851,23 @@ def compute_busy_stats(
             measured_dispatch = dispatch_start.get(id(start_ev))
             if measured_dispatch is not None:
                 busy_start = measured_dispatch
-                prefill_extended += 1
             else:
                 busy_start = start_ev.ts
             b_lo, b_hi = max(busy_start, window_start), min(finish_ev.ts, window_end)
             if b_hi > b_lo:
                 intervals.append((b_lo, b_hi))
-        # FIFO pairing: the earliest ``len(ff)`` starts pair with finishes;
-        # the remaining starts are unpaired (no logged finish). Only starts
+                # Counted only alongside the interval it annotates: the event
+                # stream is margin-widened, so pairs from earlier windows (empty
+                # clipped intervals) must not inflate this counter past
+                # ``streams`` (LP-0MVKN85WO007O00H).
+                if measured_dispatch is not None:
+                    prefill_extended += 1
+        # Unpaired starts (no logged finish) — FIFO leftovers on pre-change
+        # logs, or a start whose own ``turn=`` finish is absent. Only starts
         # within the busy margin before the window (or inside it) count as
         # this window's unfinished; earlier starts are pre-window leftovers;
         # starts after the window end belong to the next window.
-        for start_ev in ss[len(ff):]:
+        for start_ev in unpaired_starts:
             if start_ev.ts < margin_start:
                 pre_window_unfinished += 1
             elif start_ev.ts <= window_end:
@@ -1613,6 +2208,7 @@ def aggregate(
     contention_dispatch_events: list[LogEvent] = []
     contention_fallback_events: list[LogEvent] = []
     local_admission_events: list[LogEvent] = []
+    status_request_events: list[LogEvent] = []
     idle_admit_events: list[LogEvent] = []
     residency_events: list[LogEvent] = []
     eviction_events: list[LogEvent] = []
@@ -1633,6 +2229,11 @@ def aggregate(
     unattributed = 0
     lines_skipped = 0
     total_lines = 0
+    # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): terminal lines seen
+    # and terminal lines whose payload carried no ``tokens=``.
+    streams_finished = 0
+    streams_without_usage = 0
+    streams_without_usage_by_provider: Counter = Counter()
     # Local stream events across the (margin-widened) event stream for the
     # busy-time calculation; ``iter_events`` yields a margin beyond the window
     # so boundary-crossing streams pair correctly (clipped in compute_busy_stats).
@@ -1700,6 +2301,20 @@ def aggregate(
                 counts["local_attempts"] += 1
         elif ev.kind == "stream_finished" and ev.provider == LOCAL_PROVIDER:
             hourly_activity.setdefault(hour_key, Counter())["local_served"] += 1
+        if ev.kind == "stream_finished":
+            # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): count every
+            # terminal line, and separately those whose payload carried no
+            # token counts ("unknown", not "zero"). Since
+            # LP-0MVMBM6N400541EH such lines carry an explicit
+            # ``tokens=missing`` marker; the token-presence test also covers
+            # rotated logs predating it.
+            if ev.prompt is None and ev.completion is None:
+                streams_without_usage += 1
+                streams_without_usage_by_provider[
+                    ev.provider or UNKNOWN_LABEL
+                ] += 1
+            else:
+                streams_finished += 1
         elif ev.kind == "local_dispatch":
             # A ``[local] POST`` dispatch attempt (LP-0MVKUKG3F0035I85): counted
             # regardless of whether the attempt ever produced a first byte or a
@@ -1779,6 +2394,9 @@ def aggregate(
         if ev.kind == "local_admission_guard":
             local_admission_events.append(ev)
             continue
+        if ev.kind == STATUS_REQUEST:
+            status_request_events.append(ev)
+            continue
         if ev.kind == "idle_admit":
             idle_admit_events.append(ev)
             continue
@@ -1851,6 +2469,14 @@ def aggregate(
         ttft_events=local_ttft_events,
     )
 
+    # M1 (LP-0MVGR2OXT0096OGK): attribute each in-window denial to its
+    # decision-block guard reject and derive the pool-state verdict. Only
+    # ``reject`` records can have refused a dispatch.
+    denial_attributions = attribute_denials(
+        dispatch_denied_events,
+        (e for e in local_admission_events if e.decision == "reject"),
+    )
+
     return AnalysisResult(
         window_start=window_start,
         window_end=window_end,
@@ -1866,6 +2492,8 @@ def aggregate(
         contention_dispatch_events=contention_dispatch_events,
         contention_fallback_events=contention_fallback_events,
         local_admission_events=local_admission_events,
+        status_request_events=status_request_events,
+        denial_attributions=denial_attributions,
         idle_admit_events=idle_admit_events,
         residency_events=residency_events,
         eviction_events=eviction_events,
@@ -1879,4 +2507,7 @@ def aggregate(
         hold_cycle_routing_skip_events=hold_cycle_routing_skip_events,
         provider_context_skip_events=provider_context_skip_events,
         restart_events=restart_events,
+        streams_finished=streams_finished,
+        streams_without_usage=streams_without_usage,
+        streams_without_usage_by_provider=streams_without_usage_by_provider,
     )

@@ -291,7 +291,7 @@ Capacity vs resilience — the three entries are **not** interchangeable:
 
 | Failure | Quarantine key | Effect on the sibling entries |
 |---------|----------------|-------------------------------|
-| HTTP 429 / usage limit | `_usage_limit_account_key` = `api_key_env@endpoint` | Independent per API key: a 429 on `opencode-go-3` leaves `opencode-go-2` and `opencode-go` eligible → 3× rate-limit capacity (LP-0MSMBWB23009XYPW, LP-0MVCX0E2V001VB5N). |
+| HTTP 429 / usage limit | `_usage_limit_account_key` = `api_key_env@endpoint:model` | Independent per API key: a 429 on `opencode-go-3` leaves `opencode-go-2` and `opencode-go` eligible → 3× rate-limit capacity (LP-0MSMBWB23009XYPW, LP-0MVCX0E2V001VB5N). The key includes the **model**, so the same key on a different model is a separate account/limit (LP-0MVT8SAZE00570J5 corrected this row). |
 | 5xx / stall / terminal error | `_failure_domain_key` = `endpoint:model` | Shared domain: one failure skips all three for the rest of the request → **no** 3× outage resilience (LP-0MSG45I8Q0020N1F). |
 
 The fully paid `munitoai` and `deepseek-flash` entries declare exactly
@@ -323,8 +323,8 @@ Rules (all enforced at load by `validate_priority_config` → `ValueError`):
 - **No silent widening.** For a labelled model the filtered chain is used
   as-is; an empty result never falls back to the full `providers` list (which
   would leak the paid tiers during the nine cheap-window hours).
-- **Unlabelled models** (no `priorities` anywhere — `embed`, `github`,
-  `private`) keep the legacy behaviour: every provider is eligible for every
+- **Unlabelled models** (no `priorities` anywhere — `embed`, `private`)
+  keep the legacy behaviour: every provider is eligible for every
   priority.
 - **Per-priority ordering is not supported.** Chain order is always the
   `providers` order, so an entry that must come first for one priority and
@@ -355,7 +355,7 @@ The gate runs in both fallback dispatch loops
 | Situation | Behaviour |
 |-----------|-----------|
 | Estimated context ≤ entry limit | Entry is dispatched normally (all other gates unchanged). |
-| Estimated context > entry limit | Skip the entry: log `routing_skip_provider_context provider=<p> type=<t> status=provider_context_exceeded estimated_tokens=<n> limit=<limit> reason=provider_context_exceeded session=<s>`, record attempt `status=provider_context_exceeded` with the estimate and the limit, continue to the next eligible provider. **No cooldown, failure-domain exclusion, usage-limit reset, affinity record or contention-queue entry** — the entry stays eligible for later, smaller requests. |
+| Estimated context > entry limit | Skip the entry: log `routing_skip_provider_context provider=<p> type=<t> status=provider_context_exceeded estimated_tokens=<n> limit=<limit> reason=provider_context_exceeded session=<s> preference=<parsed>`, record attempt `status=provider_context_exceeded` with the estimate and the limit, continue to the next eligible provider. **No cooldown, failure-domain exclusion, usage-limit reset, affinity record or contention-queue entry** — the entry stays eligible for later, smaller requests. |
 | `max_context_tokens` absent / `0` / non-positive | Ungated: behaviour byte-for-byte as before. |
 | Limit set on a **local** entry | Composes as an additional hard cap: `min(existing local thresholds, max_context_tokens)`. Never loosens `_should_skip_local`. |
 | No tier can serve the request (all capped below it) | Only possible if every tier is capped below the estimate; the shipped config prevents it by capping the final `deepseek-flash` tier at the largest upstream window (1,048,576) so an oversized prompt always has a destination. |
@@ -375,10 +375,6 @@ Shipped values (each sourced in a comment next to the entry in
 | `opencode-go`, `opencode-go-2`, `opencode-go-3` | 1000000 | model-registry context window for `opencode-go/deepseek-v4.1-flash` (Go publishes plan quota as percentages, not per-minute tokens) |
 | `deepseek-flash` | 1048576 | `api.deepseek.com` `/models` `context_window` — largest window in the chain |
 | `compact` chain | 1048576 | model-registry / `api.deepseek.com` windows |
-
-`github-primary` is deliberately left ungated: it declares no `model`, so a
-per-entry ceiling cannot be sourced.
-
 
 Some gateways answer HTTP 429 with custom `x-ratelimit-*` headers instead of
 the standard `Retry-After` (MunitoAI sends none). The proxy can honour them so
@@ -433,13 +429,17 @@ A reset header on a **quota** 429 is applied to the failing ACCOUNT, not just
 the provider entry. This is the account-scoped half of the header support
 above; the entry-level cooldown described there is unchanged.
 
-- **Trigger:** an HTTP 429 whose body is a per-account rate-limit error
-  (`type: rate_limit_error` or `code: rate_limit_exceeded`, top-level or
-  nested under `error` — the observed MunitoAI body) **or** which carries
+- **Trigger:** an HTTP 429 whose body is a per-account quota error
+  (`type: rate_limit_error`, `code: rate_limit_exceeded`,
+  `type: insufficient_quota` or `code: free_daily_limit_exceeded`, top-level or
+  nested under `error` — the observed MunitoAI bodies) **or** which carries
   `x-ratelimit-over-limit: yes`, **and** which also yields a parseable
   `x-ratelimit-reset-*` duration. No reset signal (or a zero/absent value)
   means no account quarantine: the pre-existing short provider cooldown and
-  per-request account-key exclusion apply exactly as before.
+  per-request account-key exclusion apply exactly as before. A daily free-limit
+  429 is handled earlier by the usage-limit reset path instead, so its
+  advertised daily window wins over the rolling header window
+  (LP-0MVT8SAZE00570J5).
 - **Duration:** `parsed reset + _USAGE_LIMIT_RESET_MARGIN_SECONDS` (120 s).
   Two distinct margins apply on such a 429 and they are **not**
   interchangeable: the **2-second** `server.ratelimit_cooldown_margin_seconds`
@@ -464,6 +464,10 @@ above; the entry-level cooldown described there is unchanged.
   720 s) are unchanged: the account is
   excluded, the request advances down the chain, and siblings keep their
   normal eligibility.
+- **No window metadata:** a header-derived quarantine is not tied to a quota
+  window, so it is revalidated as a *legacy* entry — the first fresh
+  `/v1/usage` poll that shows no window exhausted clears it (see the
+  usage-limit section below).
 - **Flag gate:** the header is only consulted when
   `respect_ratelimit_headers` is enabled for the entry (or globally); with it
   off the reset is ignored and no account quarantine is created.
@@ -569,10 +573,13 @@ disk was still scored cold (82.8 % of routing decisions reported
 `proxy/proxy/slot_cache_ratio.py` closes that gap with a sidecar written next to
 each snapshot (`slot_<session>.bin` → `slot_<session>.bin.ratio.json`):
 
-- **Writer** — after a *successful* `slot_save`, the proxy records the measured
-  `prompt_tokens` from the upstream `usage` block (the whole served prompt is
-  now resident in the saved KV cache) plus a SHA-256 fingerprint of every
-  message in the request. No usage block → no sidecar (today's behaviour).
+- **Writer** — after a *successful* `slot_save`, the proxy records the
+  prompt-token count that is now resident in the saved KV cache plus a SHA-256
+  fingerprint of every message in the request. Both save paths write it: the
+  request-completion path and the session **eviction** path, and both couple
+  the sidecar's lifetime to the snapshot's (see
+  [Lifecycle coupling](#snapshot--sidecar-lifecycle-coupling-lp-0mvk0e80c009huqc)
+  below).
 - **Reader** — before the cold-cache gate reads the ratio, the snapshot's
   sidecar is validated and used to seed it:
 
@@ -592,8 +599,8 @@ each snapshot (`slot_<session>.bin` → `slot_<session>.bin.ratio.json`):
   cannot mask an expensive prefill.
 - **Fail-open** — missing/corrupt/expired sidecar, other model, absent
   `session_slot_save_path`, or any error degrades to the previous behaviour
-  (`cached_ratio = 0`, conservative). Session invalidation deletes both the
-  snapshot and its sidecar and clears the in-memory ratio.
+  (`cached_ratio = 0`, conservative). Session invalidation retires the snapshot
+  and its sidecar together and clears the in-memory ratio.
 - **Restart-safe (AC6)** — the sidecar lives on disk, so the first request of a
   session after a proxy restart is scored warm when the snapshot is present
   and valid.
@@ -651,6 +658,117 @@ A high `prefix_mismatch` share points at the guard (rewritten fronts); a high
 `expired` share points at the TTL; `missing_sidecar`/`missing_snapshot` point at
 the writer or at slot-file churn; a high `found` with no `slot_ratio_restored`
 lines would indicate an error inside `set_cached_ratio`.
+
+**Prefer the tallying tool to hand-greps** (rotated and `.gz` logs, no double
+counting, windows handled once):
+
+```bash
+python3 scripts/analyse_slot_ratio_restore.py \
+  --log-dir /var/log/llama-proxy \
+  --slot-cache-dir ./slot-cache \
+  --window "last24h=2026-10-28T10:50:26,2026-10-29T10:50:26"
+```
+
+It splits the outcomes into the two **lookup** outcomes (`missing_sidecar`,
+`missing_snapshot`) and the **guard** outcomes (`expired`, `model_mismatch`,
+`prefix_mismatch`, `empty_ratio`, `found`) under `seed_outcomes`, because that
+split is what identifies the failure mode: guard outcomes are only reachable
+after a snapshot **and** a readable sidecar were found together, so a zero guard
+total across a window means the seed path never got past the lookup and the
+guard (prefix / TTL) cannot be the cause. The first such verdict, and the two
+writer-side gaps that produce it, are recorded in
+[`docs/dev/slot-ratio-seed-verdict-LP-0MVK0E8C40035FG3.md`](../../docs/dev/slot-ratio-seed-verdict-LP-0MVK0E8C40035FG3.md).
+
+### Snapshot ↔ sidecar lifecycle coupling (LP-0MVK0E80C009HUQC)
+
+The verdict above showed the seed path never reached its guard at all: over
+4,488 decisions in 155 h, `missing_sidecar` (3,402; 75.8 %) and
+`missing_snapshot` (1,086; 24.2 %) accounted for **100 %** of outcomes, and
+`found` / `expired` / `model_mismatch` / `prefix_mismatch` / `empty_ratio` were
+**all exactly 0**. A guard branch is only reachable once a snapshot *and* a
+readable sidecar co-exist, so the defect was never the guard, the TTL or the
+credit arithmetic — it was **artefact pairing on the writer side**. Three gaps
+are now closed, and `prefix_matches()`, `ttl_seconds()` and
+`min(1.0, cached/estimated) × margin` are byte-for-byte unchanged.
+
+**What was fixed**
+
+| Failure mode | Before | Now |
+|---|---|---|
+| Eviction saves were unseedable | `session.save_evicted_session_snapshot()` wrote only `slot_<session>.bin` (98 saves across 32 sessions, overlapping 17 of the 31 `missing_sidecar` sessions) | the save writes the sidecar too, from the session's recorded prompt prefix |
+| Request saves without a measured usage block got no sidecar | the write was gated on `_measured_prompt_tokens > 0` | the write is unconditional; the token count falls back to the recorded prefix, then to the router's prompt estimate |
+| Sidecar lifetime was not coupled to the snapshot's | the sidecar was deleted only when a caller passed a filename; nothing else pruned it (139 orphans against 0 snapshots on disk) | every snapshot unlink goes through one retirement helper (root layout *and* `{host}-{port}` subdirectories), and `scripts/cleanup-slot-cache.sh` recurses, deletes the pair together and prunes orphan sidecars |
+
+**Which token count gets recorded.** The sidecar must not invent a
+measurement, so `provider.sidecar_cached_tokens()` resolves it in decreasing
+order of trustworthiness:
+
+1. the upstream `usage` block's `prompt_tokens` for this request (a direct
+   measurement — unchanged behaviour);
+2. else the prompt prefix recorded by `record_prompt_prefix()` on an earlier
+   *measured* local turn, but only when its fingerprints prefix-match the
+   saved messages (then it is a genuine lower bound for the saved KV);
+3. else `_estimate_prompt_tokens_for_routing()` — the same tokenizer the
+   routing decision uses, counting message text only (it ignores tool
+   definitions and per-message overhead, so it under-counts rather than
+   inflating credit);
+4. else **no sidecar at all** — a snapshot with no trustworthy count stays
+   unpaired rather than carrying an invented number (which would be reported
+   as `empty_ratio` or, worse, over-credit).
+
+The eviction path has no request body, so it only ever uses rule 2: a session
+that has never produced a measured local turn gets no sidecar from an eviction
+save.
+
+**What still earns nothing** (unchanged, deliberately):
+
+- a **changed prompt** — a rewritten system prompt or a front-truncated history
+  fails `prefix_matches()` and credits `0` (AC2 of LP-0MVGD9YXH008O304);
+- an **expired sidecar** — older than `session_slot_ratio_ttl_seconds`
+  (default 86 400 s);
+- a **mismatched model** — the sidecar was written for a different
+  `llama_model`;
+- a **weak partial credit** — still subject to the normal cold-cache gate, so
+  it cannot mask an expensive prefill;
+- the **in-memory expected-reuse credit** — `provider.expected_cached_ratio()`
+  keeps the same `prefix_matches()` rule for both call sites.
+
+**Expected post-fix signature** (the ≥24 h re-measurement,
+LP-0MVK0E8NH007XCV3):
+
+- `slot_ratio_seed outcome=missing_sidecar` ≈ 0 for sessions whose snapshot was
+  taken by the eviction path (they now carry a sidecar);
+- `slot_ratio_seed outcome=missing_snapshot` ≈ 0 (orphan sidecars are pruned
+  with their snapshots and by retention);
+- **`found` > 0** and `cache_state=restored` dispatches > 0 — the first real
+  evidence that the feature engages;
+- `prefix_mismatch` and `expired` become *possible* for the first time. A
+  non-zero `prefix_mismatch` count is a **success signal** (the guard is
+  finally running on real traffic), not a regression — do not "fix" the guard
+  in response to it. It is the next measurement's question, and only then is
+  the guard itself the binding constraint.
+
+Aggregate it with the same recipe as the other outcomes, adding the two
+derived counters:
+
+```bash
+# Orphan sidecars still on disk (should trend to 0 as retention prunes them):
+find "$SLOT_CACHE_DIR" -name '*.bin.ratio.json' | while read -r s; do
+  [ -f "${s%.ratio.json}" ] || echo "orphan: $s"
+done | wc -l
+# Pairs restored warm (should be > 0 after the fix):
+grep -c 'slot_ratio_restored ' llama-proxy.log
+```
+
+#### Retention and pairing in `scripts/cleanup-slot-cache.sh`
+
+The cleanup script now walks the legacy root **and** one level of
+`{host}-{port}` endpoint subdirectories, deletes a snapshot and its sidecar as
+one unit under both the age and size rules, and prunes `.ratio.json` files
+whose snapshot is gone (root and subdirectories alike, `--dry-run` honoured).
+Before this, it globbed `"$SLOT_CACHE_DIR"/slot_*.bin` only, so with every live
+snapshot in `localhost-8080/` it printed `No slot files found` and never touched
+an orphan.
 
 ## Capacity-based local admission (LP-0MVGDUVS6003T2IX)
 
@@ -968,10 +1086,14 @@ eta_prefill = coded_tokens * coded_ms_per_token + new_tokens * prefill_ms_per_to
   coded_tokens = est_tokens * cached_ratio          # served from the prompt cache
   new_tokens   = est_tokens * (1 - cached_ratio)    # must actually be prefilled
 
-projected_wait = eta_prefill * (busy_slots + 1)
-  busy_slots = min(slot_pool, max(generating_concurrency, prefills_in_flight))
+projected_wait = own_prefill_seconds + occupied_seconds
+  occupied_seconds = max(eta_prefill * busy_slots, sum(remaining occupant service))
+    # remaining occupant service is re-priced from the occupant's remaining
+    # uncached new tokens at the contended co-residency rate (see below)
+  busy_slots       = min(slot_pool, max(generating_concurrency, prefills_in_flight))
 
 admit  if projected_wait <= wait_budget
+       and projected_wait <  local_prefill_deadline_seconds
 else   refuse local admission immediately -> next provider in the chain
 ```
 
@@ -988,6 +1110,63 @@ when per-slot prefill progress is unobservable
 (`prefill_progress_unobservable`, `alive=False`, `in_flight=True`): an
 in-flight prefill is treated as occupying the gate for at least the calibrated
 estimate, never as "free soon".
+
+**Occupant-evidence pricing** (LP-0MVOFVCA2008DQVE). Pricing the occupant at
+the *newcomer's* own `eta_prefill` (the symmetric floor) is structurally wrong
+for heterogeneous traffic: a warm 7 s prompt behind a huge cold prefill was
+costed at ~14 s, admitted, then cancelled by
+`local_prefill_deadline_seconds` with **zero prefill progress** (measured
+2026-10-25: 22 `local_eviction_after_acceptance reason=prefill_deadline`
+events in 7.4 h, 12 of them user traffic; signature `eta_prefill_s=7.1
+elapsed_s=120.1 progress=None alive=False in_flight=True`). Each live
+dispatch record already carries the occupant's `new_tokens`, `cached_ratio`,
+`model_name`, its optimistic admission `eta_prefill_s` and its `started_at`.
+Since LP-0MVS9YK9P006M1NQ the guard no longer decays that optimistic ETA
+(`max(0, eta_prefill_s − (now − started_at))`, which under-priced the occupant
+by the measured 2-4x and converged to ~0 exactly when it passed its optimistic
+ETA). It instead re-prices the occupant's **remaining uncached new tokens** at
+the contended co-residency rate:
+
+```
+progress      = min(1, elapsed / contended_full_service)
+remaining_new = new_tokens * (1 - progress)
+remaining_s   = estimate_prefill_seconds(remaining_new, cached_ratio=0,
+                                         contended=True)
+```
+
+`contended_full_service` is the contended-rate cost of the occupant's whole
+new-token load, so an occupant past its *optimistic* ETA still reports the work
+it genuinely owes. Over the active, still-prefilling records of *other*
+sessions this remaining service is summed (a same-session re-entry never waits
+behind itself). Measured evidence can only raise the symmetric floor, never
+lower it; a missing/invalid `new_tokens`/`eta_prefill_s`/`started_at`, an
+inactive or already-served record, or an uncalibrated contended window
+contributes nothing — fail-open by construction, never a guessed multiplier.
+The deadline bound is evaluated against this same projected time to first byte,
+so admission and the deadline can no longer disagree about who the occupant is.
+
+**Contended (co-residency) rate selection** (LP-0MVS9Y76R004B5M8). Prefill is
+serialised but prefill+decode batching is not, so an occupant that is
+*generating* halves a newcomer's prefill throughput (measured 2-4x lower
+tok/s). A calibration sample is tagged **contended** when the gate was occupied
+at admission (`busy_slots >= 1`) **or** another session's dispatch record was
+live at first-byte time, and stored in its own per-(model, context bucket)
+window. A contended admission is priced from that window; when it is not yet
+calibrated the guard falls back to the solitary window and reports
+`rate_bucket=solitary_fallback` instead of guessing. Warm prompts
+(`cached_ratio >= 0.9`) stay on the solitary path byte-for-byte. Each decision
+line carries `rate_bucket=contended|solitary|solitary_fallback` and
+`contended_samples=<n>`.
+
+Ordering to keep (the guard does not change these values):
+`contention_queue_max_wait_seconds (60) < local_prefill_deadline_seconds (120)
+< local_dispatch_first_byte_timeout_seconds (840) <
+local_dispatch_max_prefill_seconds (900)` — an admitted request must never be
+cut off by the deadline, and the deadline must fire before the first-byte
+ceiling and the wedge bound. Rollback: `local_admission_guard_policy: observe`
+or `off` (or `local_prefill_deadline_seconds: 0` for the deadline bound only).
+Background, evidence and the per-child cross-reference: [Contended prefill
+pricing and rollback](../../docs/dev/contended-prefill-pricing.md).
 
 `projected_wait` is computed by a single function
 (`prefill_eta.projected_wait_seconds`) that also produces the published
@@ -1019,10 +1198,15 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   `contention_queue_max_wait_seconds`.
 - **Refusal is immediate and visible**: the request falls through to the next
   provider without waiting. If the whole chain is exhausted, the client
-  receives a retryable `429` with `Retry-After` (how much longer the prefill
-  would need than the budget) and `X-Local-Admission: reject` /
-  `X-Local-Admission-Eta` / `X-Local-Admission-Budget` headers, plus the
-  machine-readable `code: local_admission_reject`.
+  receives a `429` with `X-Local-Admission: reject` /
+  `X-Local-Admission-Eta` / `X-Local-Admission-Budget` headers and the
+  machine-readable `code: local_admission_reject`. The retry story is
+  reason-aware: ETA/occupancy reasons carry `Retry-After` + `retry_at`
+  (how much longer the projected wait is than the budget), while
+  `reason=prefill_budget_exceeded` (a prompt permanently over the flat
+  cold-prefill token cap) carries **no** `Retry-After`, says
+  `"retryable": false` and points at compaction — see the
+  [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x).
 - **Observability**: each decision logs
   `local_admission_guard decision=admit|reject reason=… enforced=true|false
   eta_prefill_s=… eta_occupancy_s=… projected_wait_s=… budget_s=…
@@ -1048,12 +1232,18 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   to the next provider. It reuses the same estimator and the same single
   budget (`contention_queue_max_wait_seconds`) — there is no second budget
   knob, and a cold/uncalibrated bucket still admits.
-  **Deadline refusal** (LP-0MVKUKEU80022C3U): when the projected first-byte
-  ETA >= ``local_prefill_deadline_seconds`` (default 90 s) the guard also
-  refuses with ``reason=prefill_eta_exceeds_deadline`` (both paths). The
-  deadline reason dominates the budget reason whenever it fires — it names
-  the hard physical constraint that would cancel the dispatch; when the ETA
-  is below the deadline the budget reason is reported as before.
+  **Deadline refusal** (LP-0MVKUKEU80022C3U): when the projected **time to
+  first byte** — own ETA plus the occupied gate, i.e. the same
+  `projected_wait` above — reaches ``local_prefill_deadline_seconds``
+  (default 120 s) the guard also refuses with
+  ``reason=prefill_eta_exceeds_deadline`` (both paths). The deadline reason
+  dominates the budget reason whenever it fires — it names the hard physical
+  constraint that would cancel the dispatch; when the projected first byte is
+  below the deadline the budget reason is reported as before. Including the
+  occupancy term is the residual fix (LP-0MVOFVCA2008DQVE): a warm prompt
+  whose own prefill fits easily can still be cancelled at the deadline while
+  another session's prefill occupies the GPU, so it is refused (and falls
+  through) instead of being dispatched into a guaranteed cancellation.
 
 Rollout control (`server.local_admission_guard_policy`):
 
@@ -1107,8 +1297,8 @@ POST /llama/local/reserve
   `retry_after_s` is the overshoot.
 - `DELETE /llama/local/reserve/<id>` cancels an outstanding ticket and
   releases its gate claim, so the next ticket can be issued.
-- `dry_run: true` returns the verdict without claiming (the "local-only
-  preamble").
+- `dry_run: true` returns the verdict without claiming (the admission
+  preamble).
 - A stale, expired, cancelled or mismatched ticket is ignored: the request
   takes today's ordinary path (never a hard failure).
 - Fail-open: an uncalibrated estimator admits (the endpoint never rejects on a
@@ -1125,12 +1315,238 @@ reserved dispatch does not consume queue depth.
 | Value | Behaviour |
 |-------|-----------|
 | `prefer-local` (default) | Today's behaviour: use local when it can serve within the budget, else fall through to the next provider |
-| `local-only` | Never fall back remote. If the request cannot be admitted within the budget the proxy returns the retryable `429` admission response **even when remote providers are available** |
+| `local-preferred` | **Local while the request fits local capacity, remote beyond it.** Pin local **while the request can still fit**. A *deferrable* request — the block is temporal, so waiting can help — waits for local capacity and, when the wait budget runs out, receives the retryable `429` deferral (`X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`, `Retry-After` / `retry_at`) instead of being moved to a paid provider. A *too-large* request — one that outgrows the local serving envelope, so waiting cannot help — is **never deferred and never refused for local capacity**: the local entry leaves the chain and a remote tier serves it (`200`, `X-Local-Route: remote`, no `Retry-After`). See [`local-preferred`: pinned while deferrable, promoted when too large](#local-preferred-pinned-while-deferrable-promoted-when-too-large) and the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
 | `remote-ok` | Skip the local route entirely (background / low-priority work). The local provider is removed from the chain |
+
+Wire compatibility (LP-0MVSHWYVE005MS16): `local-only` is the **legacy,
+deprecated** alias of `local-preferred`. It is still accepted and normalised to
+`local-preferred` at parse time — a client that keeps sending it retains
+pin-local semantics and is never demoted to `prefer-local` — and it logs one
+`WARNING` deprecation line per request. No removal date is scheduled, so
+migrating a client is optional: the alias is the same request intent, and an
+un-migrated client needs no code change to get the deferral semantics.
 
 Unknown values (and an absent header) behave as `prefer-local`, so the header
 is purely additive. `high` priority keeps its "never queue" semantics under
 every preference.
+
+### `local-preferred`: pinned while deferrable, promoted when too large
+
+`local-preferred` is one intent with two outcomes, split by a single question:
+**can waiting make this request fit local capacity?**
+
+The answer is the request's *capacity verdict*, computed exactly once per
+request by `admission_reserve.local_capacity_verdict()` from evidence the
+routing path already gathered — the admission guard's own decision, the
+recorded local-route exit and its token evidence — and never re-priced by the
+dispatcher. Two verdicts exist, and each decides what a pinned request does:
+
+| Verdict | Meaning | What `local-preferred` does |
+|---|---|---|
+| `deferrable` | The block is temporal: a slot, a lease or a queue is busy and will free. Waiting can help. | **Pinned.** The request is never dispatched to a non-local provider. It waits for local capacity and, when the wait cannot help it, is answered with the retryable `429` deferral. |
+| `too_large` | The request itself outgrows the local serving envelope, so no amount of waiting helps. | **Promoted.** The local entry leaves the effective chain *before* the dispatch loop (the same filter `remote-ok` uses) and a remote tier serves the request: no local attempt, no queue entry, no lease, no local-capacity `429`. |
+
+#### Pinned: a deferrable request never goes remote
+
+Enforcement is **structural**, ahead of every non-local dispatch — not by
+patching each skip branch at the admission guard. Both dispatch cycles
+(`_proxy_with_fallback_cycle` and `_proxy_with_remote_fallback_cycle`) call
+`_build_local_only_refusal_for_remote()` at the head of the provider loop,
+immediately after the next candidate is resolved and **before** any attempt:
+whenever the candidate is not a local entry and the request is pinned — the
+pin-local preference (canonical `local-preferred`, including the alias
+normalised to it) **and** a non-`too_large` verdict — the request is answered
+with the `429` (`X-Local-Route: refused`) instead of ever reaching that
+candidate. It is the mirror of `remote-ok`: where `remote-ok` removes the local
+route from the chain *before* dispatch, a pinned request refuses *before* any
+remote entry is dispatched (LP-0MVRMC1L3006F0F3). The admission guard is still
+there; it is simply no longer the only line of defence.
+
+The pin is **not** one universal outcome per exit — it is a split decided by
+the request's capacity verdict (`admission_reserve.local_capacity_verdict()`, see
+the [verdict table](#local-preferred-pinned-while-deferrable-promoted-when-too-large)):
+
+- **Deferrable** (the block is temporal, so waiting helps): the request is
+  never dispatched to a non-local provider. Every exit from the local route
+  ends in the retryable `429` deferral — `X-Local-Route: refused`,
+  `X-Local-Fallback-Reason: <exit token>`, `Retry-After` / `retry_at` — or the
+  request is completed locally. `refusing` rows in the table below.
+- **Too large** (the request outgrows the local serving envelope, so waiting
+  cannot help): the exit is **not** a refusal. The local entry leaves the
+  chain before dispatch and a remote tier serves the request — `200`,
+  `X-Local-Route: remote`, the same token as `X-Local-Fallback-Reason`, no
+  `Retry-After` and no local-capacity `429`. `promoting` rows below; the
+  mechanism is [Promoted: a too-large request leaves the local chain](#promoted-a-too-large-request-leaves-the-local-chain).
+
+So a `local-preferred` request is completed locally, told when to retry
+(deferrable), or promoted to a remote tier with the capacity reason stated
+(too large) — and a client can tell the last two apart from the status code and
+`X-Local-Route` alone, without parsing prose.
+
+A deferral's time is spent in the contention queue. In `queue` mode a pinned
+`deferrable` request waits for a local slot up to
+`contention_queue_max_wait_seconds`, bounded by `contention_queue_max_depth`.
+Both queue exits — the wait budget expiring, or the depth cap refusing to
+enqueue it at all — and the `local_lease_active` exit end the deferral in the
+retryable `429`, returned before the next candidate is resolved so nothing is
+enqueued twice and no lease or attempt state is written for a refusal. A
+claimed reservation (`X-Local-Reservation`) is unaffected: a pre-granted ticket
+dispatches without re-checking or queueing.
+
+The refusal's `X-Local-Fallback-Reason` names the exit. Each local-route exit
+records its reason on the request (`_note_local_fallback_reason`) as it falls
+through; the loop-head choke point turns that recorded reason into the refusal
+token, and the same token is what the routing log line carries as `reason=` —
+the header, the refusal body `reason` and `proxy.log` cannot drift. The
+vocabulary is canonicalised in `admission_reserve.LOCAL_FALLBACK_REASON_TOKENS`
+(LP-0MVRMC1W6003MV3Y); an exit that recorded nothing is attributed with a
+structural token, never a remote fall-through: a chain with **no local entry
+at all** refuses with `local_only_no_local_route` (a client that pinned local
+expected no remote spend for any reason), and any other unrecorded exit with
+`local_route_unavailable`.
+
+For a `too_large` verdict the row's token is not a refusal: the entry leaves
+the chain and the same token is stamped as `X-Local-Fallback-Reason` on the
+`remote` response that served the request (the pin declines at this choke point
+for an in-loop `context_too_large` skip, exactly as the pre-loop promotion
+does for the cold-prefill and context-cap classification).
+
+Each row's **Outcome** column says what a pinned `local-preferred` request does
+with that exit: `refusing` rows end in the retryable `429` deferral, while
+`promoting` rows leave the local chain and are served remotely. The promoting
+set is exactly `admission_reserve.CAPACITY_TOO_LARGE_REASONS` —
+`prefill_budget_exceeded` and `context_too_large` (the latter also carrying the
+per-entry `max_context_tokens` ceiling, which composes into the same skip);
+every other row is a temporal (deferrable) exit and therefore refuses.
+
+| Exit from the local route | `X-Local-Fallback-Reason` | Outcome | Log line (`reason=` field) |
+|---|---|---|---|
+| Admission guard, queue path — projected prefill cannot finish inside the wait budget (`contention_queue_max_wait_seconds`) | `eta_exceeds_budget` | refusing | `local_admission_guard ... reason=eta_exceeds_budget ... enforced=true` |
+| Admission guard, queue path — projected first byte reaches `local_prefill_deadline_seconds` | `prefill_eta_exceeds_deadline` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_deadline ...` |
+| Admission guard, queue path — safety-budget bound of the deadline | `prefill_eta_exceeds_safety_budget` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_safety_budget ...` |
+| Admission guard, queue path — flat cold-prefill token cap (`local_cold_prefill_budget_tokens`): the prompt outgrows the local serving envelope | `prefill_budget_exceeded` | promoting | `local_admission_guard ... reason=prefill_budget_exceeded ...` |
+| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` (the deadline/safety/budget reasons keep their own token) | refusing | `local_admission_guard ... free_slot=true ...` / `local_admission_guard_direct_fallback ... reason=...` |
+| Local entry in cooldown (chain resolution) | `local_provider_cooldown` | refusing | `Skipping provider=<local>: ... in cooldown (...s remaining) reason=local_provider_cooldown preference=...` |
+| Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap — the prompt can never fit local, however long it waits | `context_too_large` | promoting | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
+| Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
+| Router skip: residency ladder found too little reusable prefix (an idle-admission denial keeps this token) | `resident_prefix_insufficient` | refusing | `routing_skip_local ... reason=resident_prefix_insufficient ...` |
+| Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | refusing | `routing_skip_local ... reason=tenant_limit ...` |
+| Router skip: (session, prompt) in post-deadline prefill-thrash cooldown | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` |
+| Contention-queue depth cap reached (never queued), or the wait budget expired | `fallback_after_queue` | refusing | `contention_queue_fallback_after_queue ... preference=...` |
+| Local slots busy with the queue disabled (fast-mode fallback policy) | `local_concurrency_limit` | refusing | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
+| Prefill-gate / lease denial (a lease-active 503 after the retry window) | `local_lease_active` | refusing | `contention_queue_fallback_after_queue ... reason=local_lease_active` |
+| Quota hard stop (chain resolution) | `quota_hard_stop` | refusing | `Skipping provider=<local>: ... reason=quota_hard_stop preference=...` |
+| Usage-limit reset pending (chain resolution) | `usage_limit_reset_pending` | refusing | `Skipping provider=<local>: usage_limit_reset_pending ... reason=usage_limit_reset_pending ...` |
+| Outside the entry's `available_times` window (chain resolution) | `outside_available_window` | refusing | `Skipping provider=<local>: outside its available_times window (UTC) reason=outside_available_window ...` |
+| The chain has no local entry at all | `local_only_no_local_route` | refusing | `local_only_refused reason=local_only_no_local_route preference=local-preferred verdict=deferrable` |
+| Any exit that left no reason on the request (e.g. a plain post-dispatch slot-exhaustion 503) | `local_route_unavailable` | refusing | `local_only_refused reason=local_route_unavailable preference=local-preferred verdict=deferrable` |
+
+The table is pinned by `proxy/tests/test_local_only_refusal_matrix.py` (one row
+per exit: a pinned `local-preferred` request ⇒ `429` + token + **no upstream
+call**; `prefer-local` and an absent header ⇒ today's remote fall-through,
+byte-compatible) and by `proxy/tests/test_local_fallback_reason_tokens.py`
+(per-branch tokens equal the log `reason=` verbatim). Every "not local" line
+also carries `preference=<parsed>` and `priority_routing ... session=<id>`
+(LP-0MVRMC275000R2W6), and each refusal emits exactly one
+`local_only_refused reason=<token> preference=<parsed> verdict=<verdict>` line
+— so a pin violation, the exit that caused it, and whether waiting can help are
+attributable from `proxy.log` alone. `preference` is the parsed value (a
+legacy alias header is normalised to `local-preferred`), and the `verdict`
+(`deferrable` / `too_large`) is the same classification the 429 body carries,
+computed once by `admission_reserve.local_capacity_verdict`
+(LP-0MVSMINPR006SWT6).
+
+#### Promoted: a too-large request leaves the local chain
+
+A `too_large` verdict is never deferred and never refused for local capacity.
+It is decided **before** the dispatch loop, once the authoritative routing
+estimate exists, by `_promote_too_large_local_request()`: the local entry is
+filtered out with the same `apply_local_preference()` filter `remote-ok` uses,
+so the remote tiers serve the request exactly as if the client had sent
+`remote-ok` — no local attempt, no queue entry, no lease. The per-request
+routing line reports `outcome=promoted`, which is how an operator tells a
+capacity promotion from a client asking for remote.
+
+Two thresholds define the local serving envelope:
+
+| Threshold | Config key (shipped value) | What it bounds |
+|---|---|---|
+| Cold-prefill token cap | `server.local_cold_prefill_budget_tokens` (`25000`) | The **new (uncached)** tokens local is willing to prefill. The expected cached ratio is applied first, so a long prompt whose reusable prefix keeps its *new*-token count under the cap stays eligible; the comparison is `new_tokens > budget_tokens`. |
+| Local context limit | `server.local_model_ctx_size` (`262144`) per local slot — `local_model_ctx_size // slots` minus the output headroom — composed with a local entry's optional `max_context_tokens` ceiling | The physical KV-slot ceiling (the warm routing cap). A prompt at or over it can never be served locally, however long a client is willing to wait. |
+
+The same classification reaches the pin from inside the loop too: a router skip
+that reports `context_too_large` (or the guard's `prefill_budget_exceeded`)
+yields a `too_large` verdict, so the pin declines and the request falls through
+to the remote tiers instead of being refused. A `too_large` request therefore
+never receives a local-capacity `429` with retry timing: those two reasons are
+compaction signals, and a `local-preferred` client meets them as a refusal only
+when its chain has no remote tier to promote to (the remote-less carve-out
+below), where the refusal carries no `Retry-After` and `retryable: false`.
+
+#### Worked example: the 2026-10-28 incident
+
+A `local-preferred` request for `new_tokens=6627` — comfortably inside the
+`25000`-token cold-prefill budget — arrived while the single local slot was
+mid-prefill. The admission guard measured a projected wait more than twice the
+wait budget and logged:
+
+```
+local_admission_guard decision=reject reason=eta_exceeds_budget_direct
+  eta_prefill_s=31.7 eta_occupancy_s=31.7 projected_wait_s=63.4
+  budget_s=60.0 busy_slots=1
+```
+
+Under the old pin-local reading this was the end of the request: the only
+outcomes were a silent dispatch to a paid provider or a terminal "All providers
+exhausted" body, neither of which the client could act on. The capacity verdict
+is `deferrable` — the prompt fits locally, only the *moment* does not — so the
+request stays pinned and is answered with the retryable `429`:
+`X-Local-Route: refused`, `X-Local-Fallback-Reason: eta_exceeds_budget_direct`,
+body `code: local_admission_reject`, `retryable: true`, `Retry-After: 4`
+(`ceil(63.4 − 60.0)`, the overshoot over the wait budget, and `retry_at` naming
+the same instant in RFC 3339 UTC), with `new_tokens: 6627` /
+`X-Local-Admission-New-Tokens: 6627` against `budget_tokens: 25000` /
+`X-Local-Admission-Budget-Tokens: 25000`. A client that honours the retryable
+`429` retries once the advertised slot frees and is served locally; nothing is
+silently dispatched to a paid provider, and a momentarily busy local slot never
+surfaces as a terminal exhaustion. (This direct free-slot refusal is the one
+shape that does not carry the body `verdict` field yet —
+LP-0MVSS435600370D6.)
+
+#### Remote-less (`private`) chains still defer
+
+Stripping never *manufactures* an empty chain. When every entry is
+`type: local` — the `private` model — the capacity filter returns the chain
+intact, so its existing local attempt and deferral behaviour applies unchanged:
+a busy local slot still queues and still ends in the retryable `429` rather
+than a paid fallback. `local-preferred` promotion needs a remote tier to promote
+to, so a remote-less chain cannot promote at all; its too-large prompts are
+bounded by the local capacity limits instead.
+
+#### Client migration: what a client author must do
+
+**No change is required to keep pin-local semantics.** A client that already
+sends `local-only` may keep sending it: the alias is accepted and normalised to
+`local-preferred`, so the request keeps the deferral behaviour described here
+(one deprecation `WARNING` is logged per request). Renaming the value is a
+clean-up, not a migration gate.
+
+What *is* needed for end-to-end deferral is client-side and tracked outside
+this repository, in the ContextHub store:
+
+- **ContextHub epic WL-0MVSI1JMN002CGC0** — the client-side `local-only` →
+  `local-preferred` rename: herdr **WL-0MVSI1RX2005O9NE** and the pi extension
+  **WL-0MVSI1S5P003UAMB**.
+- **WL-0MVSBF5XZ001H7V7** — the client honouring the retryable `429`. This is
+  the half that makes deferral real end to end: a client that treats the `429`
+  as terminal (or silently retries a different model) gets none of the benefit,
+  however correct the proxy side is. Read `retryable`; when it is `true`, wait
+  for `Retry-After` (or until `retry_at`) and resend the **same** request
+  pinned to local; when it is `false`, compact the prompt to
+  `budget_tokens` and resend instead of retrying.
+
+All of the above is client-side and out of scope for this repository: the
+contract in this document is what those clients implement against.
 
 ### Response headers
 
@@ -1138,11 +1554,142 @@ Every response carries `X-Local-Route`:
 
 - `local` — served by a local provider.
 - `remote` — served by a remote provider; `X-Local-Fallback-Reason` names why
-  local was not used (`eta_exceeds_budget`, `local_concurrency_limit`,
-  `cached_tokens_skip`/`large_context_bypass`, `remote_ok`, …).
-- `refused` — local-only refusal or exhausted chain; `X-Local-Fallback-Reason`
-  carries the refusal reason. Refusals also carry `Retry-After` and the
-  `X-Local-Admission*` estimate headers.
+  local was not used — one of the exit tokens in the
+  [pin-local section](#local-preferred-pinned-while-deferrable-promoted-when-too-large),
+  or `no_local_provider` when the local route was never attempted (a
+  `remote-ok` chain strip that removed every local entry, or a chain that
+  never had one). A `local-preferred` request promoted because it is
+  `too_large` also lands here, with the capacity reason as its token: no
+  `Retry-After`, no local-capacity `429`. Promotion never manufactures an empty
+  chain — a chain with **no non-local entry** (the `private` model) is never
+  stripped, so it keeps deferring and refuses with `Retry-After` instead of
+  falling through to a provider that does not exist.
+- `refused` — a refusal response: the pin-local deferral or refusal, or the
+  admission-guard refusal after the rest of the chain is exhausted.
+  `X-Local-Fallback-Reason` carries the exit's reason token, byte-identical to
+  the body `reason`. Refusals also carry `Retry-After` (only when waiting can
+  help), `retry_at` (the same instant, RFC 3339 UTC) and the
+  `X-Local-Admission*` estimate and token headers — see the
+  [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x).
+
+`prefer-local` (the default) keeps today's behaviour unchanged: on every one
+of the exits above it falls through to the next provider exactly as before.
+The pin adds the deferral for `local-preferred` while its verdict is
+`deferrable`, and drops the local entry entirely when the verdict is
+`too_large`. `remote-ok`, by contrast, is enforced structurally: the local
+route is removed from the chain *before* dispatch (`apply_local_preference`),
+so a `remote-ok` request never reaches a local-route exit at all.
+
+### Per-reason retry contract (LP-0MVNTT4X8009IO2X)
+
+Every refusal is a `429` stamped `X-Local-Route: refused` that answers two
+questions a scheduler needs: **whether** waiting can help (`retryable`) and,
+when it can, **when** (`Retry-After` and an absolute `retry_at`). Every field
+and header a client must honour:
+
+- status `429` + `X-Local-Route: refused` — the request was refused, not served
+  and not moved remote. The same headers appear on the deferral (a pinned
+  request whose wait ran out) and on the admission refusal.
+- `X-Local-Fallback-Reason` (header) and `reason` (body) — the exit token,
+  byte-identical on both surfaces, naming *why* local could not serve the
+  request. The token vocabulary is the exit table in the
+  [pin-local section](#local-preferred-pinned-while-deferrable-promoted-when-too-large).
+- `Retry-After` — relative seconds to wait before retrying. Present **only**
+  when waiting can help; absent when it cannot.
+- `retry_at` — the same instant as an absolute RFC 3339 UTC timestamp, so a
+  client need not trust its own clock. Present exactly when `Retry-After` is.
+- `retryable` — `false` when no amount of waiting can make this request fit
+  local capacity; the remedy is compaction, not a timer.
+- `suggested_action` — human-readable remediation: "compact and resend" when
+  `retryable: false`, "wait / reduce the size / route remote" when `true`. On
+  `retryable: false` the shipped string still carries a pre-deferral clause
+  suggesting a switch to `prefer-local` to reach a remote fallback; a
+  `too_large` `local-preferred` request is already promoted automatically, so
+  treat the compaction half (resend at `budget_tokens` or less) as the
+  actionable remedy. The string refresh is tracked in LP-0MVTGI2RP009SRKN.
+- `verdict` — `deferrable` when the block is temporal (waiting can help) or
+  `too_large` when the request itself exceeds the local serving envelope
+  (`prefill_budget_exceeded` / `context_too_large`). Additive: every other
+  field/header keeps its value. It is computed exactly once by
+  `admission_reserve.local_capacity_verdict` in the pin-local refusal builder,
+  which is the only verdict computation in `provider.py`
+  (LP-0MVSMINPR006SWT6). A deferral therefore always reads
+  `verdict: deferrable` — that is what kept the request pinned. The direct
+  free-slot admission-reject 429 does not carry it yet (LP-0MVSS435600370D6).
+- Token evidence — `X-Local-Admission-New-Tokens` / body `new_tokens` and
+  `X-Local-Admission-Budget-Tokens` / body `budget_tokens` on **every**
+  refusal, so a client can size the compaction: how far over the flat
+  `server.local_cold_prefill_budget_tokens` cap the request was.
+- Admission estimate — `X-Local-Admission: reject` plus
+  `X-Local-Admission-Eta` / `X-Local-Admission-Budget` (the projected prefill
+  ETA and the wait budget in seconds), and the same numbers in the body as
+  `eta_prefill_seconds`, `budget_seconds` and, when the guard measured the
+  occupancy ahead of the request, `projected_wait_seconds`.
+- `code` — the stable discriminator `local_admission_reject`, so a client can
+  classify the refusal without relying on the prose in `detail`.
+
+| Reason | `Retry-After` | `retryable` | `retry_at` | Client action |
+|---|---|---|---|---|
+| `prefill_budget_exceeded` | absent | `false` | absent | compact the prompt |
+| `context_too_large` | absent | `false` | absent | compact the prompt |
+| `eta_exceeds_budget` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
+| `eta_exceeds_budget_direct` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
+| `prefill_eta_exceeds_deadline` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
+| `prefill_eta_exceeds_safety_budget` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
+| `cooldown` | real cooldown remainder | `true` | RFC 3339 UTC | wait, then retry |
+
+**Which reasons have no timer — and why.** `prefill_budget_exceeded` is a
+property of the *request*: the prompt is permanently over the flat
+`local_cold_prefill_budget_tokens` cap, so any advertised delay would invite
+exactly the futile retry storm observed on 2026-10-25 (the client backed off
+seven times on `Retry-After: 1` before reporting the 429 terminal).
+`context_too_large` is the same shape at the physical KV-slot cap: only
+compaction (shorten the session history) changes the verdict.
+
+**When waiting helps, the timer is real.** For the ETA/occupancy reasons it is
+`ceil(projected_wait_seconds − budget_seconds)`, at least 1 s and capped by
+`server.max_retry_after_seconds`; `retry_at` is that same delay from now, RFC
+3339 UTC. For `cooldown`/lease-held/contention-queue-expiry skips the timer is
+derived from the *real* expiry state (the cooldown remainder, the lease
+remainder or the queue exit) — never from the ETA formula — so the hint tracks
+when local capacity actually returns.
+
+The real-expiry mapping is the contract of LP-0MVQ23B80009OZ9V. Every
+non-admission exit advertises the expiry of the state that actually blocked
+it, never the ETA formula:
+
+- a local entry **cooling down** → the cooldown remainder
+  (`_provider_unavailable_until`, the state behind `unavailable_providers`);
+- a **quarantined local account** → the usage-limit reset remainder
+  (`_usage_reset_at`);
+- a local entry **outside its `available_times` window** → the seconds until
+  the next window opens;
+- a **held local dispatch lease** → the lease remainder (the live dispatch
+  record's `expires_at`, else the configured
+  `local_dispatch_lease_timeout_seconds`);
+- a **contention-queue exit** → the queue's wait window
+  (`contention_queue_max_wait_seconds`);
+- a **post-deadline prefill-thrash cooldown** → the session's cooldown
+  remainder.
+
+A chain-resolution exit (cooldown / reset / window) records no expiry on the
+request, so it is recomputed from live local availability state at refusal
+time; an exit that measures its own expiry (lease, queue, thrash cooldown)
+records it as it falls through. Only the pin-local refusal advertises these
+values — `prefer-local` keeps today's remote fall-through, and the ETA/occupancy
+reasons keep their `ceil(wait − budget)` timer.
+
+**Local-preferred means pinned while deferrable, promoted when too large.** A
+pin-local request whose capacity verdict is `deferrable` is never moved to a
+paid provider: it is answered with this `429` (`X-Local-Route: refused`, body
+`verdict: deferrable`) even while remote providers are available, and the
+advertised timer says when a retry can succeed — the walk-through and the full
+exit→token table are in
+[`local-preferred`: pinned while deferrable, promoted when too large](#local-preferred-pinned-while-deferrable-promoted-when-too-large).
+A request that is `too_large` is **never refused for local capacity**: waiting
+cannot help, so the local entry leaves the chain and a remote tier serves it
+(`outcome=promoted`). Under `prefer-local` (the default) an exit instead falls
+through to the next provider, and waiting is the client's own choice.
 
 `/llama/local/status` publishes the reservation counters
 (`reserved_outstanding`, `reserved_issued`, `reserved_used`,
@@ -1236,35 +1783,118 @@ SSE headers arrive. Frames *before* the headers (the strict prefill window)
 need the local dispatch to return a streaming response before the upstream
 first byte; that gap is tracked separately.
 
-#### Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL)
+#### Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL, rescoped by LP-0MVT2KSXY002O75C)
 
 A deadline cancellation is *evidence that the prefill cannot complete* — the
-root cause of the thrash: the client re-dispatches the identical
-prompt and the whole prefill burns again (the incident's 41 local POSTs, 35
-inside 02:00-03:00, re-prefilling near-duplicates of the same 28k-124k-token
-prompts). To suppress that loop, the deadline event arms a **per-session
-cooldown** (`server.local_prefill_thrash_cooldown_seconds`, default **600 s**;
-0 disables):
+root cause of the thrash: the client re-dispatches the identical prompt and the
+whole prefill burns again (the incident's 41 local POSTs, 35 inside
+02:00-03:00, re-prefilling near-duplicates of the same 28k-124k-token prompts).
 
-1. On `prefill_deadline_exceeded` router.py logs
-   `prefill_thrash_cooldown_started session=… cooldown_s=…` and arms the
-   window for that session.
-2. While armed, the session's local routing skips once per request
-   (`routing_skip_local … session=… cooldown_remaining=Ns
-   reason=prefill_thrash_cooldown → skipping local`) — *before* the
-   concurrency/queue/smart-routing gates, so the request never queues for a
-   slot it would then be forbidden to use — and the chain reaches the next
-   provider immediately.
-3. The window clears on expiry (lazy, at the next request) and on a
-   successful local first byte (`_clear_prefill_thrash_cooldown` in the
-   router's success path), and is keyed per session, so other sessions are
-   unaffected. Setting the knob to 0 disables the arming and the skip
-   (documented rollback).
+**What it refuses.** The window is keyed by **(session, prompt fingerprint)**,
+not by session alone. The fingerprint is a 32-hex-char SHA-256 prefix over the
+request's `messages` (sorted keys, compact separators); message order is
+significant, and a body with no usable `messages` yields no fingerprint. So:
 
-The cooldown is in-process (a proxy restart resets routing state, matching
-its own leases) and lives in `proxy/proxy/router_helpers.py`
-(`_prefill_thrash_cooldowns` + the `_…_prefill_thrash…` helpers); unit and
-routing-level behaviour are pinned by `proxy/tests/test_prefill_thrash_cooldown.py`.
+- a re-dispatch of the **failing prompt** is still refused — on every local
+  dispatch entry, because the gate sits in `provider.py` *before* the
+  concurrency / queue / smart-routing gates, so a refused request never queues
+  for a slot it would be forbidden to use;
+- a **different prompt** from the same session — usually far smaller — is
+  admitted. That is the measured over-reach this fixes: 2026-10-24 20:00 →
+  2026-10-25 07:00, 916 `routing_skip_local … reason=prefill_thrash_cooldown`
+  skips across 46 sessions, **241 of them for 21 `herdr-*` sessions** (the
+  downtime dispatcher starving its own workload), 337 of them where the
+  proxy's own nearest status poll within 120 s reported
+  `local_in_flight_requests=0`.
+- a **fail-open fallback** keeps the gate engaged when a fingerprint cannot be
+  derived: an arming site without a fingerprint arms the session-wide
+  (empty-fingerprint) window, and a gate without one consults **every** window
+  of the session. The narrowing is lost, never the gate.
+
+**When it is released.** Besides expiry and a comparable-size successful first
+byte (`local_prefill_thrash_recovery_fraction`, LP-0MVQITN6P008DPLB), the
+window is released when the proxy's own evidence proves the GPU free
+(`_release_prefill_thrash_cooldown_on_free_gpu`):
+
+| Release trigger | Condition (all must hold) | Log line |
+|---|---|---|
+| `free_gpu` | no `active` dispatch record; a **fresh** `/slots` snapshot (`proxy.residency` view `known`); **no** processing slot (an abandoned ghost still processing blocks it) | `prefill_thrash_cooldown_released session=… reason=free_gpu cooldown_remaining=Ns endpoint=…` |
+| comparable first byte | a successful local dispatch prefilled ≥ `local_prefill_thrash_recovery_fraction` of the armed size, for the same fingerprint | (cleared silently on the success path) |
+| expiry | lazy prune at the next request | — |
+| knob 0 | `server.local_prefill_thrash_cooldown_seconds: 0` — disables arming, skipping and release | — |
+
+The `free_gpu` release is what removes the measured free-GPU skips; it is not a
+blanket disable (any of a stale snapshot, a live dispatch or a processing slot
+keeps the window armed), and it was sequenced after the abandoned-work fix
+below, because a ghost still computing legitimately blocks the release.
+
+**Wiring.** Arming: `router.py` on `prefill_deadline_exceeded` and on the
+measured-cache-deficit early abort (both log
+`prefill_thrash_cooldown_started session=… cooldown_s=…`), with the request's
+fingerprint and its prompt size. Gating: `provider.py`, which logs
+`routing_skip_local … session=… cooldown_remaining=Ns
+reason=prefill_thrash_cooldown → skipping local`. Clearing: the router's
+first-byte success path. The store is in-process (`_prefill_thrash_cooldowns`,
+keyed `(session, fingerprint)`; a proxy restart resets it with the routing
+state it guards) in `proxy/proxy/router_helpers.py`. Unit and routing-level
+behaviour are pinned by `proxy/tests/test_prefill_thrash_cooldown.py`; the skip
+counts are measured by `scripts/capacity_signal_verification.py`
+(`prefill_thrash_cooldown` block — both the strict "fresh poll" attribution and
+the relaxed "no live local work" population the 336-skip baseline was derived
+with).
+
+#### Abandoned local dispatches (LP-0MVRMI5HK00558TB AC1)
+
+An *abandoned* dispatch is one the proxy stops waiting for while llama-server
+still has it: it produced no first byte and the proxy gave up on the
+deadline, the session, the client or the watchdog. Abandoned work is not live
+work, and it must not read as live work either.
+
+Measured before this change (LP-0MVOG7IP80003MLV, 2026-10-24 20:00 →
+2026-10-25 07:00): 332 abandonments (`prefill_deadline` 260,
+`session_evicted` 60, `no_progress_watchdog` 11, `client_disconnect` 1) left
+247 fresh `/slots` polls reporting `capacity_hint=saturated` with
+`local_in_flight_requests=0` — ghosts, counted as live.
+
+Two mechanisms, applied per reason:
+
+| Abandonment reason | Mechanism | Log line |
+|---|---|---|
+| `prefill_deadline` | **Cancel**: the captured upstream stream (`cm`) is closed by `_release_unserved_dispatch` (`LP-0MVT2KSN3007QYFK`); the slot is recorded as abandoned | `lease_released … reason=prefill_deadline`, `abandoned_slot_recorded …` |
+| `session_evicted` | **Cancel** the pinned `stream_cm` of each released record, then **annotate** what could not be cancelled | `lease_released … reason=session_evicted`, `abandoned_slot_recorded …` |
+| `no_progress_watchdog` | **Cancel** the record's `stream_cm` (existing, `LP-0MVIQ0FJC000YLX0`) + **annotate** | `lease_released … reason=no_progress_watchdog`, `abandoned_slot_recorded …` |
+| `client_disconnect` | **Cancel** the record's `stream_cm` (existing, `LP-0MVLFVY6K003VYEL`) + **annotate** | `lease_released … reason=client_disconnect`, `abandoned_slot_recorded …` |
+| `orphan_cleanup` / measured cache deficit | **Cancel** + **annotate** (same shared core) | `lease_released … reason=<that reason>` |
+
+The cancel is real on this build, not decoration. llama-server aborts at its
+next write to the socket, and `return_progress` guarantees such writes
+throughout prefill. Evidence (2026-10-28 `llama-server.log`, 82
+`Connection handling canceled` events): **42** of them cancelled a task that
+never reached `prompt processing done`, i.e. mid-prefill cancellation is
+achievable and observable here. The sequence is always
+`Connection handling canceled` → `stop: cancel task, id_task = N` →
+`slot release: … stop processing`.
+
+Because the backend can lag the close, the abandonment is also **recorded**
+(`_record_abandoned_slot`, `proxy/proxy/router_helpers.py`) with a bounded TTL
+(`DEFAULT_ABANDONED_SLOT_TTL_SECONDS`, 900 s — longer than the 600 s cooldown
+so the annotation outlives the window in which the ghost can still be seen
+processing), keyed by slot identity so the registry cannot grow past the pool,
+and pruned lazily on read. It is published on `/llama/local/status`:
+`status_schema_version` 4, each slot carrying `abandoned`,
+`abandonment_reason`, `abandoned_session_id` and `abandoned_at_seconds_ago`,
+the top level carrying `local_abandoned_slots`, and `capacity_hint` gaining the
+additive value `abandoned_busy` for a pool occupied *only* by abandoned work.
+`saturated` therefore keeps meaning live, proxy-owned decode work, and a
+busy-but-abandoned pool is never reported `idle`. See
+[per-slot-status-verification.md](per-slot-status-verification.md) for the
+status semantics and the consumer rule (any unrecognised hint value → treat as
+busy).
+
+Interaction with the cooldown above: the annotation is what makes the *skip*
+decision honest (a ghost no longer reads as live work), while the ghost itself
+keeps the *free-GPU release* from firing — the GPU really is busy until
+llama-server finishes the cancelled task.
 
 #### Regression coverage for the prefill-thrash wedge
 
@@ -1374,39 +2004,86 @@ still quenches normally. The window is re-armed per restart by
 `cold_start.note_model_loaded()`; router-level concurrent-dispatch gating
 (`local_cold_start_max_concurrent`) is unchanged.
 
-## Usage-limit reset quarantine (GoUsageLimitError)
+## Usage-limit reset quarantine (GoUsageLimitError, insufficient_quota)
 
 HTTP 429 responses whose error type is `GoUsageLimitError` (a usage-limit
-variant distinct from `FreeUsageLimitError`) are treated as usage-limit
-**reset** events rather than generic rate-limit events. The quarantine is
-**account-scoped** (`_usage_limit_account_key` = `api_key_env@endpoint`):
+variant distinct from `FreeUsageLimitError`), or which carry the
+`error.type == "insufficient_quota"` / `error.code ==
+"free_daily_limit_exceeded"` markers MunitoAI sends for its daily free limit,
+are treated as usage-limit **reset** events rather than generic rate-limit
+events. The markers are read **case-insensitively from the top level and from
+a nested `error` dict** (gateways disagree about the nesting, and the code
+alone is enough for payloads that omit `type`). The quarantine is
+**account-scoped** (`_usage_limit_account_key` = `api_key_env@endpoint:model`):
 distinct API keys on the same gateway keep independent limits
 (LP-0MSMBWB23009XYPW), and the 2-minute `_USAGE_LIMIT_RESET_MARGIN_SECONDS`
 safety margin is always added.
 
-The reset duration is resolved in this order (LP-0MVF7MPZN009GOJB):
+The reset duration is resolved in this order, **per quota window**
+(LP-0MVPAE77Z002VGIA; supersedes the fixed monthly reading of
+LP-0MVF7MPZN009GOJB):
 
-1. **Authoritative quota snapshot** — for an `opencode-*` account with a
-   **fresh** quota snapshot and quota behaviour strictly enabled, the
-   snapshot's account-level `seconds_to_reset` (the monthly window derived
-   from `monthly.resetsAt` by the `/v1/usage` poller, LP-0MVF4FIP1001RD8P) is
-   used and logged as `source=snapshot`. This is a hard (`explicit`)
-   quarantine: it is exempt from the guessed-quarantine 24 h cap and is
-   persisted. The snapshot wins over any `Resets in ...` text in the message.
+1. **Authoritative quota snapshot, window-aware** — for an `opencode-*` account
+   with a **fresh** quota snapshot and quota behaviour strictly enabled, the
+   window the 429 names in `metadata.limitName`
+   (`rolling`/`weekly`/`monthly`, normalised case/whitespace) determines the
+   quarantine:
+   - a known window with a positive reset countdown quarantines for **that
+     window's** `seconds_to_reset` + the margin (`source=snapshot`,
+     `window=<name>`); a weekly-limited account therefore returns within the
+     week, never waiting for the monthly reset;
+   - a known window whose snapshot reset is non-positive (contradictory, stale
+     evidence) is bounded by the named period capped at
+     `_usage_limit_guess_cap_seconds` and marked *guessed*
+     (`source=snapshot-bounded`), so the self-healing probe revalidates it;
+   - an absent/empty/unknown `limitName` (e.g. `daily`) is bounded by the
+     **soonest usable window** reset and marked *guessed* — never the monthly
+     value while a shorter window is still open;
+   - when no window yields a usable reset, the account-level
+     `seconds_to_reset` (monthly) path is retained unchanged.
+   The chosen window is persisted with the quarantine
+   (`usage_reset_window` in `provider-state.json`) and revalidated on the poll
+   cadence: as soon as a fresh `/v1/usage` poll shows that window reset
+   (effectively empty, or its countdown extended past the quarantine), the
+   quarantine is cleared and the account returns to rotation without a proxy
+   restart. Legacy entries with no window metadata (schema version 1) clear on
+   the first healthy poll that shows no window exhausted.
 2. **Message duration** — for a non-`opencode-*` entry (no quota source), or
    when the snapshot is stale/absent or the quota source is disabled
    (`quota_surge_enabled: false`) / dry-run, an explicit `Resets in 22hr
    43min` duration in the message is honoured in full (`source=message`).
-3. **Guessed period** — when there is no explicit duration, `metadata.limitName`
+3. **Absolute reset instant** — an absolute instant such as `It resets at
+   2026-10-30 00:00 UTC` (the observed MunitoAI free-tier daily-limit 429) is
+   parsed into seconds-until-reset and honoured as explicit evidence
+   (`source=timestamp`). Supported shapes are `YYYY-MM-DD HH:MM UTC`,
+   `YYYY-MM-DD HH:MM:SS UTC`, ISO-8601 with `Z`, and ISO-8601 with an explicit
+   `±HH:MM`/`±HHMM` offset; a bare timestamp with **no** timezone evidence is
+   treated as unparseable rather than guessed in local time. The resulting
+   quarantine is **bounded to the period the payload names**
+   (`free_daily_limit_exceeded` / "daily … limit" → 24 h) plus the margin, so
+   a malformed, far-future or clock-skewed timestamp cannot lock the account
+   out indefinitely (LP-0MVT8SAZE00570J5 AC4).
+4. **Guessed period** — when there is no explicit duration or usable
+   timestamp, `metadata.limitName` / the payload's period wording
    (daily/weekly/monthly) supplies a guessed period capped at
    `_usage_limit_guess_cap_seconds` (24 h by default), logged as
    `source=guess`. This guessed branch is **fallback-only**: it is unreachable
    for a fresh-snapshot `opencode-*` account, and the full 30-day period is
-   never used without explicit evidence (LP-0MUQTCMW2001VXH8).
+   never used without explicit evidence (LP-0MUQTCMW2001VXH8). A past or
+   unparseable absolute timestamp falls back here; an `insufficient_quota`
+   body with no reset information at all is quarantined *guessed* for the cap
+   (self-healing probe, never persisted) instead of being re-probed every
+   ~60 s.
+
+Because this check runs **before** `_handle_http_error_with_cooldown()` /
+`_apply_ratelimit_account_quarantine()`, an advertised daily reset always wins
+over a rolling `x-ratelimit-*` header window (LP-0MVT8SAZE00570J5 AC3).
 
 Routing decisions during the block log `usage_limit_reset_pending` with the
-reset time and do not contact the upstream; once the reset time arrives the
-account becomes eligible again without operator intervention.
+reset time and the window that holds the account out (e.g.
+`window=weekly`); once the reset time arrives (or a fresh poll proves the
+window reset) the account becomes eligible again without operator
+intervention.
 `FreeUsageLimitError` responses without a reset time get the default 3-hour
 cooldown (10800s; per-provider overrides were retired with
 `opencode-big-pickle` in LP-0MT652JRM004ZLSI). Tracked in

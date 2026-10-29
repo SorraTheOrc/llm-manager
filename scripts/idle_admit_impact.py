@@ -20,6 +20,27 @@ metrics for LP-0MVGHXD59008UOUD:
 local serve share, ``large_context_bypass`` count and remote fallback count for
 both windows, plus ``local_dispatch_denied`` and local prefill slot-seconds.
 
+**AC1 (LP-0MVK16GME007EYUW) — lease-gate shape attribution.** Every
+``local_dispatch_denied`` line whose ``cold_start=False`` is a
+``local_lease_active`` refusal (the dispatch gate refusing an otherwise
+idle-admissible request because a foreign session holds the local lease —
+``owner=``/``active=``). Refusals are split by the ``active=`` field: 0 →
+**shape A** (inactive cooldown lease only: the owner finished and the record
+sits reserved for the 30 s base cooldown), >= 1 → **shape B** (an ``active``
+record with no GPU work behind it). The B split is corroborated with the
+owner's ``lease_released reason=`` (``no_progress_watchdog`` /
+``orphan_cleanup`` / ``idle_timeout`` → no work; ``prefill_deadline`` → a long
+silent prefill; completion reasons → genuinely working) and ``status_request``
+lines (``local_active_query=false`` for that owner → confirmed idle).
+``lease_released`` lines are counted by raw reason and by group
+(no-progress watchdog / adaptive expiry / explicit release / …), and the
+bounded contention-queue outcomes (``contention_queue_dispatch`` /
+``contention_queue_fallback_after_queue``) say how many refusals the 60 s
+budget converted. When the window holds fewer than
+``--min-lease-samples`` (default 5) attributable refusals the split
+percentages are withheld and the run is a WARN (exit 2) — never a silent
+vacuous pass.
+
 **AC2 — idle-admitted vs non-idle local dispatches, same context bucket.**
 ``dispatch_first_byte_ms`` percentiles and prefill slot-seconds
 (``dispatch_to_first_byte_ms``, the slot-held service time) for idle-admitted
@@ -120,6 +141,39 @@ _DENIED_TOLERANCE_PCT = 5.0
 #: read timeouts + first-byte ceiling aborts).
 _TIMEOUT_REASONS = {"ReadTimeout", "empty_response", "ConnectTimeout"}
 
+#: Below this many **attributable** lease-gate refusals (denials whose
+#: ``active=`` field parsed) in the post-deploy window the shape A/B split is
+#: withheld and the run is a WARN (LP-0MVK35HBI003SB3Z).
+_MIN_LEASE_SAMPLES = 5
+
+#: Corroboration window after a refusal in which its owner's ``lease_released``
+#: and ``status_request`` lines are credited to that refusal. A wedged adaptive
+#: lease can run to the 900 s ceiling, so the window matches the ceiling.
+_LEASE_EVIDENCE_WINDOW_S = 900.0
+
+#: ``lease_released`` reason → report group. The three groups AC1 of
+#: LP-0MVK16GME007EYUW names (no-progress watchdog / adaptive expiry / explicit
+#: release) are guaranteed group labels.
+_LEASE_RELEASE_GROUPS = {
+    "no_progress_watchdog": "no_progress_watchdog",
+    "idle_timeout": "adaptive_expiry",
+    "prefill_deadline": "adaptive_expiry",
+    "orphan_cleanup": "orphan_cleanup",
+    "explicit_release": "explicit_release",
+    "non_explicit": "client_disconnect",
+    "disconnect": "client_disconnect",
+    "client_disconnect": "client_disconnect",
+    "session_evicted": "session_evicted",
+}
+
+#: Release reasons that say the shape-B owner was doing real work (a normal
+#: completion / the client left), i.e. **genuine contention**, not an idle lease.
+_LEASE_WORKING_REASONS = {"explicit_release", "non_explicit", "disconnect", "client_disconnect", "session_evicted"}
+
+#: Release reasons that confirm the shape-B active record had no work behind
+#: it (wedged/abandoned stream, or a lease that idled out).
+_LEASE_NO_WORK_REASONS = {"no_progress_watchdog", "orphan_cleanup", "idle_timeout"}
+
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3}) - ")
 _TS_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")
 
@@ -145,6 +199,22 @@ _DISPATCH_QWAIT = re.compile(r"\bqueue_wait_ms=([\d.]+)")
 _FALLBACK_REASON = re.compile(r"\breason=([A-Za-z0-9_ ]+?)(?=\s+[a-z_]+=|\s*$)")
 _SKIP_REASON = re.compile(r"\breason=([A-Za-z0-9_]+)")
 _CEILING = re.compile(r"\bceiling=([\d.]+)s")
+
+#: ``local_dispatch_denied`` payload fields (router.py): ``owner=`` may be
+#: ``none``; ``active=`` is the occupancy count that decides shape A/B;
+#: ``cold_start=True`` denials are a warmup deferral, not a lease refusal.
+_KV_OWNER = re.compile(r"\bowner=([A-Za-z0-9_.:-]+)")
+_KV_ACTIVE_COUNT = re.compile(r"\bactive=(\d+)")
+_KV_COLD_START = re.compile(r"\bcold_start=(True|False|true|false)")
+_KV_RELEASE_REASON = re.compile(r"lease_released\b.*?\breason=([A-Za-z0-9_]+)")
+
+#: ``status_request`` (/llama/local/status) corroboration fields.
+_KV_LOCAL_ACTIVE_QUERY = re.compile(r"\blocal_active_query=(true|false)")
+_KV_OWNER_SESSION = re.compile(r"\blocal_owner_session_id=(\S+)")
+_KV_OWNER_LEASE_REMAIN = re.compile(r"\blocal_owner_lease_remaining_seconds=(None|[\d.]+)")
+_KV_PREFILL_ETA = re.compile(r"\bprefill_eta_seconds=(None|[\d.]+)")
+_KV_IN_FLIGHT = re.compile(r"\blocal_in_flight_requests=(\d+)")
+_KV_QUEUED = re.compile(r"\bqueued_duration=([\d.]+)s")
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -281,7 +351,55 @@ def parse_event(line: str, ts: dt.datetime) -> dict | None:
             }
         return None
     if "local_dispatch_denied" in line:
-        return {"kind": "dispatch_denied", "ts": ts, "session": _first(_KV_SESSION, line)}
+        cold_raw = _first(_KV_COLD_START, line)
+        return {
+            "kind": "dispatch_denied",
+            "ts": ts,
+            "session": _first(_KV_SESSION, line),
+            "owner": _first(_KV_OWNER, line),
+            # ``active=`` is the occupancy count the gate refused on: 0 means
+            # only inactive (cooldown) leases occupy the pool → shape A;
+            # >= 1 means an ``active`` record exists → shape B (possibly with
+            # no work behind it). ``None`` on pre-instrumentation logs.
+            "active": _int(_KV_ACTIVE_COUNT, line),
+            "cold_start": None if cold_raw is None else cold_raw.lower() == "true",
+        }
+    if "lease_released" in line:
+        reason = _first(_KV_RELEASE_REASON, line) or _first(_SKIP_REASON, line)
+        return {
+            "kind": "lease_released",
+            "ts": ts,
+            "session": _first(_KV_SESSION, line),
+            "reason": reason,
+        }
+    if "contention_queue_dispatch" in line or "contention_queue_fallback_after_queue" in line:
+        return {
+            "kind": "contention_queue",
+            "ts": ts,
+            # The queue is only reached on a local-capacity condition; the
+            # ``reason=`` field says which (``local_lease_active`` is the lease
+            # gate's bounded wait).
+            "action": (
+                "dispatch" if "contention_queue_dispatch" in line else "fallback_after_queue"
+            ),
+            "reason": _first(_SKIP_REASON, line),
+            "session": _first(_KV_SESSION, line),
+            "queued_seconds": _num(_KV_QUEUED, line),
+        }
+    if "status_request" in line:
+        flag = _first(_KV_LOCAL_ACTIVE_QUERY, line)
+        owner = _first(_KV_OWNER_SESSION, line)
+        remaining = _num(_KV_OWNER_LEASE_REMAIN, line)
+        prefill_eta = _num(_KV_PREFILL_ETA, line)
+        return {
+            "kind": "status_request",
+            "ts": ts,
+            "owner": None if owner in (None, "None") else owner,
+            "local_active_query": None if flag is None else flag == "true",
+            "owner_lease_remaining_seconds": remaining,
+            "prefill_eta_seconds": prefill_eta,
+            "in_flight": _int(_KV_IN_FLIGHT, line),
+        }
     if "routing_idle_admit" in line:
         return {
             "kind": "idle_admit",
@@ -373,11 +491,269 @@ def _window_length_hours(start: dt.datetime, end: dt.datetime) -> float:
     return max((end - start).total_seconds() / 3600.0, 1e-9)
 
 
+def _lease_release_group(reason: str | None) -> str:
+    """Map a raw ``lease_released reason=`` onto its report group."""
+    return _LEASE_RELEASE_GROUPS.get(reason or "", "other")
+
+
+_LEASE_ATTRIBUTION_RULE = (
+    "Every `local_dispatch_denied` line with `cold_start=False` is a "
+    "`local_lease_active` refusal. The `active=` field on that line decides the "
+    "shape: `active=0` → shape A (no active record at all, so the pool is held "
+    "only by inactive cooldown leases — the owner finished and its record is "
+    "reserved for the base cooldown); `active>=1` → shape B (an `active` record "
+    "exists). Shape B is corroborated, not assumed: the owner's earliest "
+    "`lease_released` inside 900 s of the refusal says whether the record had no "
+    "work behind it (`no_progress_watchdog`, `orphan_cleanup`, `idle_timeout`), "
+    "was a long silent prefill (`prefill_deadline`), or was genuinely working "
+    "(a completion/disconnect reason); `status_request` lines that name the "
+    "owner with `local_active_query=false` confirm an idle owner. Buckets are "
+    "counted in that precedence order, so each refusal lands in exactly one."
+)
+
+
+def lease_gate_summary(
+    denials: list[dict],
+    releases: list[dict],
+    statuses: list[dict],
+    queues: list[dict],
+    *,
+    min_samples: int,
+    evidence_window_s: float = _LEASE_EVIDENCE_WINDOW_S,
+) -> dict:
+    """Attribute every ``local_lease_active`` refusal to shape A or shape B.
+
+    Read-only aggregation: the refusal counts are direct observations, the
+    A/B split comes from the denial's own ``active=`` field, and the shape-B
+    sub-split is corroborated by the owner's ``lease_released`` reason and by
+    ``status_request`` snapshots. Percentages are withheld when fewer than
+    *min_samples* refusals could be attributed, so a thin window can never read
+    as a confident split.
+    """
+    refusals = [d for d in denials if d.get("cold_start") is not True]
+    cold_start_refusals = len(denials) - len(refusals)
+
+    releases_by_session: dict[str, list[dict]] = defaultdict(list)
+    for event in releases:
+        if event.get("session"):
+            releases_by_session[event["session"]].append(event)
+    statuses_by_owner: dict[str, list[dict]] = defaultdict(list)
+    for event in statuses:
+        if event.get("owner"):
+            statuses_by_owner[event["owner"]].append(event)
+
+    by_active = {"active_0": 0, "active_positive": 0, "unknown": 0}
+    shape_a = 0
+    shape_b = 0
+    a_release_groups: dict[str, int] = defaultdict(int)
+    b_evidence: dict[str, int] = defaultdict(int)
+    owner_stats: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"refusals": 0, "shape_a": 0, "shape_b": 0}
+    )
+
+    for denial in refusals:
+        owner = denial.get("owner")
+        if owner in (None, "none", "unknown"):
+            owner = None
+        active = denial.get("active")
+        if owner:
+            owner_stats[owner]["refusals"] += 1
+
+        # Owner evidence: the earliest release after the refusal, and any
+        # status snapshot naming the owner inside the evidence window.
+        release = None
+        if owner:
+            for candidate in releases_by_session.get(owner, []):
+                delay = (candidate["ts"] - denial["ts"]).total_seconds()
+                if 0 <= delay <= evidence_window_s:
+                    release = candidate
+                    break
+        status_idle = False
+        if owner:
+            for candidate in statuses_by_owner.get(owner, []):
+                delay = (candidate["ts"] - denial["ts"]).total_seconds()
+                if 0 <= delay <= evidence_window_s and candidate.get("local_active_query") is False:
+                    status_idle = True
+                    break
+        release_reason = release.get("reason") if release else None
+
+        if active is None:
+            by_active["unknown"] += 1
+            continue
+        if active == 0:
+            by_active["active_0"] += 1
+            shape_a += 1
+            if owner:
+                owner_stats[owner]["shape_a"] += 1
+            a_release_groups[_lease_release_group(release_reason) if release_reason else "none"] += 1
+            continue
+
+        by_active["active_positive"] += 1
+        shape_b += 1
+        if owner:
+            owner_stats[owner]["shape_b"] += 1
+        # Precedence: a hard release reason first (it is direct evidence of
+        # what the record was doing), then the status snapshot, then a
+        # completion reason, then no evidence at all.
+        if release_reason in _LEASE_NO_WORK_REASONS:
+            b_evidence[_lease_release_group(release_reason)] += 1
+        elif release_reason == "prefill_deadline":
+            b_evidence["prefill_deadline"] += 1
+        elif status_idle:
+            b_evidence["status_idle_owner"] += 1
+        elif release_reason in _LEASE_WORKING_REASONS:
+            b_evidence["owner_working"] += 1
+        else:
+            b_evidence["unconfirmed"] += 1
+
+    samples = by_active["active_0"] + by_active["active_positive"]
+    attributable = samples >= min_samples
+
+    def _pct(count: int) -> float | None:
+        if not attributable or samples == 0:
+            return None
+        return round(100.0 * count / samples, 1)
+
+    no_work = (
+        b_evidence.get("no_progress_watchdog", 0)
+        + b_evidence.get("orphan_cleanup", 0)
+        + b_evidence.get("adaptive_expiry", 0)
+        + b_evidence.get("status_idle_owner", 0)
+    )
+    silent_prefill = b_evidence.get("prefill_deadline", 0)
+    owner_working = b_evidence.get("owner_working", 0)
+    unconfirmed = b_evidence.get("unconfirmed", 0)
+
+    queue_counts = {"dispatch": 0, "fallback_after_queue": 0}
+    for event in queues:
+        if event.get("reason") != "local_lease_active":
+            continue
+        action = event.get("action")
+        if action in queue_counts:
+            queue_counts[action] += 1
+
+    if samples == 0:
+        headline = (
+            "No attributable `local_lease_active` refusals in this window: the "
+            "lease-gate cost cannot be attributed."
+        )
+    elif not attributable:
+        headline = (
+            f"Only {samples} attributable `local_lease_active` refusal(s) "
+            f"(< {min_samples} required): shape A/B split withheld."
+        )
+    else:
+        headline = (
+            f"{samples} attributable `local_lease_active` refusal(s): shape A "
+            f"{shape_a} ({_pct(shape_a)} %), shape B {shape_b} ({_pct(shape_b)} %). "
+            f"Shape B evidence: no work behind it {no_work}, silent prefill "
+            f"{silent_prefill}, owner working {owner_working}, unconfirmed "
+            f"{unconfirmed}. Contention queue: converted {queue_counts['dispatch']} "
+            f"to local, fell through {queue_counts['fallback_after_queue']}."
+        )
+
+    return {
+        "refusals": len(refusals),
+        "cold_start_refusals": cold_start_refusals,
+        "samples": samples,
+        "unattributed_refusals": by_active["unknown"],
+        "min_samples": min_samples,
+        "attribution_status": "ok" if attributable else "insufficient_samples",
+        "attribution_rule": _LEASE_ATTRIBUTION_RULE,
+        "refusals_by_active": by_active,
+        "shape_a": {
+            "label": (
+                "inactive cooldown lease (owner finished; record reserved for its "
+                "session for the base cooldown)"
+            ),
+            "count": shape_a,
+            "pct": _pct(shape_a),
+            "owner_release_groups": dict(sorted(a_release_groups.items(), key=lambda kv: -kv[1])),
+        },
+        "shape_b": {
+            "label": (
+                "`active` record with no GPU work behind it (wedged/abandoned "
+                "stream or a long silent prefill)"
+            ),
+            "count": shape_b,
+            "pct": _pct(shape_b),
+            "no_work_behind_it": no_work,
+            "silent_prefill": silent_prefill,
+            "owner_working": owner_working,
+            "unconfirmed": unconfirmed,
+            "by_evidence": {
+                key: b_evidence.get(key, 0)
+                for key in (
+                    "no_progress_watchdog",
+                    "orphan_cleanup",
+                    "adaptive_expiry",
+                    "status_idle_owner",
+                    "prefill_deadline",
+                    "owner_working",
+                    "unconfirmed",
+                )
+            },
+        },
+        "contention_queue": queue_counts,
+        "top_owners": [
+            {"owner": owner, **counts}
+            for owner, counts in sorted(
+                owner_stats.items(), key=lambda kv: (-kv[1]["refusals"], kv[0])
+            )[:5]
+        ],
+        "headline": headline,
+    }
+
+
+def lease_release_summary(releases: list[dict]) -> dict:
+    """Count ``lease_released`` lines by raw reason and by report group."""
+    by_reason: dict[str, int] = defaultdict(int)
+    by_group: dict[str, int] = defaultdict(int)
+    for event in releases:
+        reason = event.get("reason") or "unknown"
+        by_reason[reason] += 1
+        by_group[_lease_release_group(event.get("reason"))] += 1
+    return {
+        "total": len(releases),
+        "by_reason": dict(sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "by_group": dict(sorted(by_group.items(), key=lambda kv: (-kv[1], kv[0]))),
+        # The three groups the parent AC1 names explicitly; always present so
+        # a reader never has to guess whether a zero means "none" or "missing".
+        "groups_documented": ["no_progress_watchdog", "adaptive_expiry", "explicit_release"],
+    }
+
+
+def lease_status_summary(statuses: list[dict]) -> dict:
+    """Aggregate the ``status_request`` corroboration fields."""
+    remaining = [
+        event["owner_lease_remaining_seconds"]
+        for event in statuses
+        if event.get("owner_lease_remaining_seconds") is not None
+    ]
+    return {
+        "samples": len(statuses),
+        "local_active_query_true": sum(
+            1 for event in statuses if event.get("local_active_query") is True
+        ),
+        "local_active_query_false": sum(
+            1 for event in statuses if event.get("local_active_query") is False
+        ),
+        "owner_lease_remaining_seconds_p50": (
+            round(_percentile(remaining, 50), 1) if remaining else None
+        ),
+        "owner_lease_remaining_seconds_max": round(max(remaining), 1) if remaining else None,
+        "prefill_in_flight_samples": sum(
+            1 for event in statuses if event.get("prefill_eta_seconds") is not None
+        ),
+    }
+
+
 def summarise_window(
     events: list[dict],
     *,
     bucket_edges: tuple[int, ...],
     correlation_window_s: float,
+    min_lease_samples: int = _MIN_LEASE_SAMPLES,
 ) -> dict:
     """Aggregate one window's events into the AC1/AC2/AC3/AC4 metric set."""
     local_dispatches = [e for e in events if e["kind"] == "local_dispatch"]
@@ -385,6 +761,9 @@ def summarise_window(
     skips = [e for e in events if e["kind"] == "routing_skip"]
     idle_admits = [e for e in events if e["kind"] == "idle_admit"]
     denials = [e for e in events if e["kind"] == "dispatch_denied"]
+    releases = [e for e in events if e["kind"] == "lease_released"]
+    statuses = [e for e in events if e["kind"] == "status_request"]
+    queues = [e for e in events if e["kind"] == "contention_queue"]
     timeouts = [e for e in events if e["kind"] == "timeout"] + [
         e for e in fallbacks if e.get("timeout")
     ]
@@ -658,6 +1037,18 @@ def summarise_window(
         "ac2": ac2,
         "ac3": ac3,
         "ac4": ac4,
+        # LP-0MVK35HBI003SB3Z: parent LP-0MVK16GME007EYUW AC1 evidence — how
+        # much of the idle-capacity win the local dispatch lease gate costs,
+        # split by blocking shape.
+        "lease_gate": lease_gate_summary(
+            denials,
+            releases,
+            statuses,
+            queues,
+            min_samples=min_lease_samples,
+        ),
+        "lease_released": lease_release_summary(releases),
+        "lease_status": lease_status_summary(statuses),
         "event_counts": {
             "local_dispatch": len(local_dispatches),
             "stream_finished": len(streams),
@@ -666,6 +1057,9 @@ def summarise_window(
             "routing_check": len(checks),
             "idle_admit": len(idle_admits),
             "dispatch_denied": len(denials),
+            "lease_released": len(releases),
+            "status_request": len(statuses),
+            "contention_queue": len(queues),
             "timeout": len(timeouts),
         },
         "_idle_records": idle_records,  # internal (rendered only in JSON detail)
@@ -777,6 +1171,7 @@ def evaluate(
     deployed_at: dt.datetime | None,
     after_start: dt.datetime | None,
     min_idle_samples: int = _MIN_IDLE_SAMPLES,
+    min_lease_samples: int = _MIN_LEASE_SAMPLES,
 ) -> dict:
     """Evaluate the AC checks and produce the AC5 recommendation."""
     checks: list[dict] = []
@@ -925,6 +1320,53 @@ def evaluate(
         notes.append(
             "Interactive latency regressed beyond the noise band; idle-admitted prompts at "
             f"the SAME priority tier: {overlapping_text}."
+        )
+
+    # ---- Parent AC1 (LP-0MVK16GME007EYUW) — lease-gate shape attribution ----
+    # The idle-admission decision and the dispatch lease gate must agree about
+    # what "idle" means; this check makes the lease-gate cost a measured input
+    # to the conversion-rate decision instead of an inference. Too few samples
+    # is an explicit WARN, never a silent vacuous pass.
+    lease_after = after["lease_gate"]
+    lease_samples = lease_after["samples"]
+    checks.append(
+        {
+            "target": (
+                f"AC1 (LP-0MVK16GME007EYUW): lease-gate refusals attributable "
+                f"(>= {min_lease_samples} samples)"
+            ),
+            "observed": lease_samples,
+            "shape_a": lease_after["shape_a"]["count"],
+            "shape_b": lease_after["shape_b"]["count"],
+            "pass": lease_samples >= min_lease_samples,
+        }
+    )
+    if lease_samples < min_lease_samples:
+        notes.append(
+            f"Too few lease-gate samples in the post-deploy window "
+            f"({lease_samples} < {min_lease_samples}): the shape A/B split percentages "
+            "are withheld and the lease-gate effect on the measured conversion rate "
+            "cannot be attributed. Extend the window, or confirm that "
+            "`local_dispatch_denied ... active=` and `lease_released ... reason=` "
+            "lines are present in the log stream."
+        )
+    elif lease_after["unattributed_refusals"]:
+        notes.append(
+            f"{lease_after['unattributed_refusals']} refusal(s) predate the `active=` "
+            "field and could not be attributed; the A/B split covers the attributable "
+            f"{lease_samples} only."
+        )
+    else:
+        shape_b = lease_after["shape_b"]
+        notes.append(
+            "Lease-gate refusals: "
+            f"{lease_after['headline']} "
+            f"(shape A = inactive cooldown lease, shape B = `active` record with no "
+            f"work behind it; of the {shape_b['count']} shape-B refusals, "
+            f"{shape_b['no_work_behind_it']} had no work behind it, "
+            f"{shape_b['silent_prefill']} were silent prefills, "
+            f"{shape_b['owner_working']} were genuinely working owners and "
+            f"{shape_b['unconfirmed']} lacked corroborating evidence)."
         )
 
     # ---- AC5 decision ----------------------------------------------------
@@ -1083,6 +1525,50 @@ def render(meta: dict, windows: dict, verdict: dict) -> str:
         )
     out.append("")
 
+    out.append("AC1 (LP-0MVK16GME007EYUW) — lease-gate shape attribution")
+    out.append("-" * 68)
+    for label in ("before", "after"):
+        lease = windows[label]["lease_gate"]
+        released = windows[label]["lease_released"]
+        status = windows[label]["lease_status"]
+        out.append(
+            f"[{label}] refusals={lease['refusals']} (cold-start {lease['cold_start_refusals']}) "
+            f"attributable={lease['samples']} status={lease['attribution_status']}"
+        )
+        if lease["samples"]:
+            def _pct_text(shape: dict) -> str:
+                return "n/a" if shape["pct"] is None else f"{shape['pct']}%"
+
+            out.append(
+                f"  shape A={lease['shape_a']['count']} "
+                f"({_pct_text(lease['shape_a'])}) "
+                f"shape B={lease['shape_b']['count']} "
+                f"({_pct_text(lease['shape_b'])})  "
+                f"B: no-work={lease['shape_b']['no_work_behind_it']} "
+                f"prefill={lease['shape_b']['silent_prefill']} "
+                f"working={lease['shape_b']['owner_working']} "
+                f"unconfirmed={lease['shape_b']['unconfirmed']}"
+            )
+            by_evidence = ", ".join(
+                f"{key}={value}" for key, value in lease["shape_b"]["by_evidence"].items()
+            )
+            out.append(f"    B evidence: {by_evidence}")
+        release_text = ", ".join(
+            f"{key}={value}" for key, value in released["by_group"].items()
+        ) or "none"
+        out.append(f"  lease_released: {release_text}")
+        out.append(
+            f"  contention queue: dispatch={lease['contention_queue']['dispatch']} "
+            f"fallback_after_queue={lease['contention_queue']['fallback_after_queue']}  "
+            f"status samples={status['samples']} "
+            f"(owner-active-query=false {status['local_active_query_false']}, "
+            f"lease-remaining p50/max {status['owner_lease_remaining_seconds_p50']}/"
+            f"{status['owner_lease_remaining_seconds_max']} s)"
+        )
+        if lease["samples"] and lease["attribution_status"] == "ok":
+            out.append(f"  {lease['headline']}")
+    out.append("")
+
     out.append("AC2 — idle-admitted vs non-idle local dispatches (same bucket)")
     out.append("-" * 68)
     for label in ("before", "after"):
@@ -1209,6 +1695,75 @@ def render_markdown(meta: dict, windows: dict, verdict: dict) -> str:
             f"{data['non_idle']['service_ms']['sum_slot_seconds']} |"
         )
     out.append("")
+
+    # Lease-gate shape attribution (LP-0MVK35HBI003SB3Z — parent LP-0MVK16GME007EYUW AC1).
+    after_lease = windows["after"]["lease_gate"]
+    out.append("| Lease-gate metric | Baseline | Post-deploy |")
+    out.append("|---|---:|---:|")
+    for key, title in (
+        ("refusals", "`local_lease_active` refusals"),
+        ("cold_start_refusals", "Cold-start denials (excluded)"),
+        ("samples", "Attributable refusal samples"),
+        ("attribution_status", "Attribution status"),
+    ):
+        out.append(
+            f"| {title} | {windows['before']['lease_gate'][key]} | {after_lease[key]} |"
+        )
+    for shape_key, title in (
+        ("shape_a", "Shape A (inactive cooldown lease)"),
+        ("shape_b", "Shape B (`active` record, no work behind it)"),
+    ):
+        before_shape = windows["before"]["lease_gate"][shape_key]
+        after_shape = after_lease[shape_key]
+        before_cell = (
+            f"{before_shape['count']} ({before_shape['pct']}%)"
+            if before_shape["pct"] is not None
+            else f"{before_shape['count']} (insufficient)"
+        )
+        after_cell = (
+            f"{after_shape['count']} ({after_shape['pct']}%)"
+            if after_shape["pct"] is not None
+            else f"{after_shape['count']} (insufficient)"
+        )
+        out.append(f"| {title} | {before_cell} | {after_cell} |")
+    for key, title in (
+        ("no_work_behind_it", "— Shape B: no work behind it"),
+        ("silent_prefill", "— Shape B: silent prefill"),
+        ("owner_working", "— Shape B: genuinely working owner"),
+        ("unconfirmed", "— Shape B: unconfirmed"),
+    ):
+        out.append(
+            f"| {title} | {windows['before']['lease_gate']['shape_b'][key]} | "
+            f"{after_lease['shape_b'][key]} |"
+        )
+    groups_before = windows["before"]["lease_released"]["by_group"]
+    groups_after = windows["after"]["lease_released"]["by_group"]
+    for group in ("no_progress_watchdog", "adaptive_expiry", "explicit_release"):
+        out.append(
+            f"| `lease_released` reason group: {group} | {groups_before.get(group, 0)} | "
+            f"{groups_after.get(group, 0)} |"
+        )
+    queue_before = windows["before"]["lease_gate"]["contention_queue"]
+    queue_after = after_lease["contention_queue"]
+    out.append(
+        f"| Contention queue: converted to local | {queue_before['dispatch']} | "
+        f"{queue_after['dispatch']} |"
+    )
+    out.append(
+        f"| Contention queue: fell through to remote | {queue_before['fallback_after_queue']} | "
+        f"{queue_after['fallback_after_queue']} |"
+    )
+    if after_lease["attribution_status"] == "ok":
+        out.append("")
+        out.append(f"**Lease-gate answer:** {after_lease['headline']}")
+    else:
+        out.append("")
+        out.append(
+            f"**Lease-gate answer:** too few samples (`{after_lease['samples']} < "
+            f"{after_lease['min_samples']}`) — split withheld, do not read the A/B "
+            "counts as a confident attribution."
+        )
+    out.append("")
     out.append(
         f"Interactive ({windows['after']['ac4']['interactive_priority'] or 'high'}) first byte: "
         f"baseline p50 {windows['before']['ac4'].get('interactive', _dist_stats([]))['p50_ms']} ms / "
@@ -1274,8 +1829,11 @@ def _build_meta(args, log_dir, before_window, after_window, interactive_priority
         "interactive_priority": interactive_priority,
         "correlation_window_seconds": args.correlation_window,
         "idle_threshold_seconds": args.idle_threshold,
+        "min_lease_samples": args.min_lease_samples,
         "bucket_edges": args.bucket_edges_list,
         "window_closed": args.window_closed,
+        "lease_gate_work_item": "LP-0MVK35HBI003SB3Z",
+        "lease_gate_parent_work_item": "LP-0MVK16GME007EYUW",
     }
 
 
@@ -1309,6 +1867,16 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=_DEFAULT_IDLE_THRESHOLD_S,
         help="idle threshold used by the counterfactual estimator (default 60)",
+    )
+    parser.add_argument(
+        "--min-lease-samples",
+        type=int,
+        default=_MIN_LEASE_SAMPLES,
+        dest="min_lease_samples",
+        help=(
+            "minimum attributable lease-gate refusals before the shape A/B split is "
+            f"reported (default {_MIN_LEASE_SAMPLES}); below it the report WARNs"
+        ),
     )
     parser.add_argument(
         "--interactive-priority",
@@ -1370,6 +1938,7 @@ def main(argv: list[str] | None = None) -> int:
             events,
             bucket_edges=args.bucket_edges_list,
             correlation_window_s=args.correlation_window,
+            min_lease_samples=args.min_lease_samples,
         )
         summary["counterfactual"] = counterfactual(summary, idle_threshold_s=args.idle_threshold)
         summary["start"] = start.isoformat(sep=" ")
@@ -1394,6 +1963,7 @@ def main(argv: list[str] | None = None) -> int:
         window_closed=args.window_closed,
         deployed_at=args.deployed_at,
         after_start=after_window[0],
+        min_lease_samples=args.min_lease_samples,
     )
     meta = _build_meta(
         args, log_dir, before_window, after_window, args.interactive_priority, args.deployed_at

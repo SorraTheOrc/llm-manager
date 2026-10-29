@@ -26,6 +26,7 @@ from pathlib import Path
 import aggregation
 import bucketing
 import config_loader
+import gpu_busy
 import llama_log_parser
 import log_parser
 import recommendations
@@ -53,11 +54,62 @@ CSV_COLUMNS = [
     "ctx_size",
     "local_requests",
     "remote_requests",
+    "local_turns_answered",
+    "local_turns_unanswered",
+    "local_turn_pct",
+    "context_at_fallback",
+    "context_at_fallback_source",
     "dispatch_denied",
     "decode_tok_s",
+    # Measured-usage coverage per session (LP-0MVMBM6N400541EH AC3): the
+    # per-session record of how many terminal lines reported no usage, so a
+    # blank context column is explainable rather than looking like a bug.
+    "streams_with_usage",
+    "streams_without_usage",
 ]
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+# --- Contention-prediction measurement (LP-0MVGR2OXT0096OGK) --------------
+#
+# The item measures whether the payload's ``lease_state`` /
+# ``prefill_eta_seconds`` signals predict real local contention:
+#
+# * M1 — per-hour denial attribution by ``local_admission_guard`` reason plus
+#   the guard's measured ``busy_slots`` / ``in_flight_prefills`` / ``free_slot``
+#   (the denial line itself carries no ``lease_state``), reduced to an
+#   ``idle_leased`` / ``prefill_bound`` / ``saturated`` / ``unknown`` verdict.
+# * M2 — the window's local busy fraction beside those denials (already
+#   computed by :class:`aggregation.BusyStats`; rendered here for comparison).
+# * M3 — predicted-versus-observed prefill duration at p50/p90, comparing the
+#   ``prefill_eta_seconds`` published on ``status_request`` polls against the
+#   llama-server ``prompt eval time`` samples for dispatches that ran.
+#
+# The baseline these are compared against (measured before the payload change,
+# from this item's description):
+CONTENTION_BASELINE = {
+    "window": "2026-10-19 07:23 → 2026-10-20 07:23",
+    "denials": 2641,
+    "hours": 24.0,
+    "busy_pct": 29.3,
+    "worst_hour": "2026-10-20 04:00–05:00",
+    "worst_hour_denials": 187,
+    "worst_hour_busy_pct": 2.5,
+    "idle_lease_records": 2633,
+    "source": "LP-0MVGR2OXT0096OGK description (pre-change baseline)",
+}
+
+# M3 verdict tolerance: the predicted p50 prefill duration is called a match
+# when it is within this percentage of the observed p50. Wider than the 10%
+# band the calibration itself targets because this compares two differently
+# conditioned distributions (reference-prompt, cache-cold prediction vs the
+# prompt mix that actually ran) at a quantile, not per dispatch.
+PREFILL_ETA_MATCH_TOLERANCE_PCT = 25.0
+
+# M1 verdict threshold: the share of attributed denials whose decision block
+# measured zero local work (``idle_leased``) above which the lease/busy signal
+# is judged NOT to reflect reality.
+IDLE_LEASED_SHARE_THRESHOLD_PCT = 50.0
 
 
 @dataclass
@@ -96,8 +148,24 @@ def _session_row(s: SessionStats) -> dict:
         "ctx_size": str(s.ctx_size) if s.ctx_size else "",
         "local_requests": str(s.local_requests),
         "remote_requests": str(s.remote_requests),
+        # Local-turn coverage (LP-0MVM93DE6009JGBU AC5): the per-session data
+        # behind the report's "Local model usage by session" section, so the
+        # numbers are auditable from an artifact instead of the Markdown only.
+        "local_turns_answered": str(s.local_turns_answered),
+        "local_turns_unanswered": str(s.local_turns_unanswered),
+        "local_turn_pct": (
+            f"{s.local_turn_pct:.1f}" if s.local_turn_pct is not None else ""
+        ),
+        "context_at_fallback": (
+            str(s.context_at_fallback)
+            if s.context_at_fallback is not None
+            else ""
+        ),
+        "context_at_fallback_source": s.context_at_fallback_source or "",
         "dispatch_denied": str(s.dispatch_denied),
         "decode_tok_s": f"{s.decode_tok_s:.1f}" if s.decode_tok_s is not None else "",
+        "streams_with_usage": str(getattr(s, "streams_with_usage", 0)),
+        "streams_without_usage": str(getattr(s, "streams_without_usage", 0)),
     }
 
 
@@ -296,6 +364,409 @@ def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ---------------------------------------------------------------------------
+# Local-turn coverage (LP-0MVM93DE6009JGBU)
+# ---------------------------------------------------------------------------
+#
+# "Which sessions actually used the local model, how many turns did it answer,
+# what share of the session's turns were local, and why did each session move
+# to remote?" Everything below is derived from data the pipeline already
+# collects (per-session turns and fallback attribution), so the section needs no
+# new data source:
+#
+# - a session is *covered* when it has at least one local turn (whether or not
+#   that turn was answered — an unanswered turn is flagged, never dropped);
+# - ``% local turns`` = local / (local + remote) × 100, 100 % for a session
+#   that never used remote;
+# - the summary table's percentile rows use linear interpolation (the shared
+#   ``_percentile`` convention) over the covered sessions; the total row sums
+#   the turn columns and recomputes the share from those sums, and shows the
+#   mean of the sessions that have token data for the context column;
+# - the reason distribution is its own counts-and-percent table because a
+#   reason is categorical and has no meaningful percentile;
+# - ``context size at fallback`` is the session's own evidence (see
+#   ``aggregation.CONTEXT_AT_FALLBACK_*``), rendered ``n/a`` — with a named
+#   limitation — when the logs carry no tokens at all.
+LOCAL_TURN_PERCENTILES = ((10, "P10"), (50, "P50"), (90, "P90"))
+
+
+@dataclass(frozen=True)
+class LocalTurnRow:
+    """One local-using session's coverage row (report + JSON)."""
+
+    session_id: str
+    local_turns: int
+    answered_turns: int
+    unanswered_turns: int
+    remote_turns: int
+    local_turn_pct: float
+    reason: str
+    context_at_fallback: int | None
+    context_source: str | None
+    # Terminal streams in this session that reported no usage
+    # (LP-0MVMBM6N400541EH AC3): the concrete reason a session's
+    # ``context size at fallback`` can read ``n/a`` — those lines carry
+    # ``tokens=missing``, so they contribute no prompt tokens to any figure.
+    streams_without_usage: int = 0
+
+
+NO_LOCAL_TURNS_TEXT = "No session in the window used the local model."
+
+
+def _fallback_reason_label(session: SessionStats) -> str:
+    """Reason label for the per-session coverage tables.
+
+    The session's own attributed ``fallback_reason`` when it has one; otherwise
+    its attribution state, so a session that never left local reads
+    ``no_remote_fallback`` and one with no own evidence reads ``unattributed``
+    (LP-0MVMBMSWR0036RES — a reason is never inherited from a neighbour).
+    """
+    if session.fallback_reason:
+        return session.fallback_reason
+    if session.fallback_attribution:
+        return session.fallback_attribution
+    if session.remote_requests == 0:
+        return aggregation.FALLBACK_ATTRIBUTION_NO_REMOTE
+    return aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+
+
+def local_turn_rows(
+    sessions: dict[str, SessionStats] | list[SessionStats],
+) -> list[LocalTurnRow]:
+    """Coverage rows for the sessions with at least one local turn.
+
+    Sorted by ``# turns local`` **descending** (more local turns is the goal,
+    so the best sessions read first), then by session id so equal counts keep a
+    deterministic order.
+    """
+    candidates = sessions.values() if isinstance(sessions, dict) else sessions
+    rows = [
+        LocalTurnRow(
+            session_id=s.session_id,
+            local_turns=s.local_requests,
+            answered_turns=s.local_turns_answered,
+            unanswered_turns=s.local_turns_unanswered,
+            remote_turns=s.remote_requests,
+            local_turn_pct=s.local_turn_pct
+            if s.local_turn_pct is not None
+            else 0.0,
+            reason=_fallback_reason_label(s),
+            context_at_fallback=s.context_at_fallback,
+            context_source=s.context_at_fallback_source,
+            streams_without_usage=getattr(s, "streams_without_usage", 0),
+        )
+        for s in candidates
+        if s.local_requests > 0
+    ]
+    rows.sort(key=lambda r: (-r.local_turns, r.session_id))
+    return rows
+
+
+def local_turn_coverage(summary: AnalysisResult) -> dict:
+    """Machine-readable local-turn coverage (shared by the report and JSON).
+
+    Returns the covered rows, the percentile/total table rows and the
+    fallback-reason counts-and-percent rows, so the Markdown section and the
+    ``--json`` summary can never disagree.
+    """
+    rows = local_turn_rows(summary.sessions)
+    with_local = len(rows)
+    local_values = [float(r.local_turns) for r in rows]
+    remote_values = [float(r.remote_turns) for r in rows]
+    pct_values = [r.local_turn_pct for r in rows]
+    context_values = [
+        float(r.context_at_fallback)
+        for r in rows
+        if r.context_at_fallback is not None
+    ]
+
+    percentiles: list[dict] = []
+    for percentile, label in LOCAL_TURN_PERCENTILES:
+        context = _percentile(context_values, percentile)
+        percentiles.append(
+            {
+                "label": label,
+                "local_turns": _round1(_percentile(local_values, percentile)),
+                "remote_turns": _round1(_percentile(remote_values, percentile)),
+                "local_turn_pct": _round1(_percentile(pct_values, percentile)),
+                "context_at_fallback": (
+                    int(round(context)) if context is not None else None
+                ),
+            }
+        )
+
+    total_local = sum(r.local_turns for r in rows)
+    total_remote = sum(r.remote_turns for r in rows)
+    total_turns = total_local + total_remote
+    total = {
+        "local_turns": total_local,
+        "remote_turns": total_remote,
+        "local_turn_pct": round(total_local / total_turns * 100.0, 1)
+        if total_turns
+        else None,
+        "context_at_fallback": (
+            int(round(sum(context_values) / len(context_values)))
+            if context_values
+            else None
+        ),
+        "answered_turns": sum(r.answered_turns for r in rows),
+        "unanswered_turns": sum(r.unanswered_turns for r in rows),
+        "context_samples": len(context_values),
+    }
+
+    reason_counts = Counter(r.reason for r in rows)
+    reasons = [
+        {
+            "reason": reason,
+            "sessions": count,
+            "pct_of_sessions_with_local": round(count / with_local * 100.0, 1)
+            if with_local
+            else 0.0,
+        }
+        for reason, count in sorted(
+            reason_counts.items(), key=lambda kv: (-kv[1], kv[0])
+        )
+    ]
+
+    # Interpretation notes (deterministic, data-gated). These are counted over
+    # ALL sessions in the window, not just the covered rows: the decision-first
+    # finding is precisely about the sessions that reached remote *without* a
+    # local turn, so they can never appear in the per-session table.
+    all_sessions = list(summary.sessions.values())
+    reached_remote = [s for s in all_sessions if s.remote_requests > 0]
+    declined_before_local = [s for s in reached_remote if s.local_requests == 0]
+    context_fallbacks = [
+        s
+        for s in all_sessions
+        if _fallback_reason_label(s) in aggregation.CONTEXT_FALLBACK_REASONS
+    ]
+    context_before_local = [s for s in context_fallbacks if s.local_requests == 0]
+    rate_limited = [
+        s for s in all_sessions if _fallback_reason_label(s) == "rate_limited"
+    ]
+
+    return {
+        "sessions_in_window": len(summary.sessions),
+        "sessions_with_local": with_local,
+        # Sessions whose terminal streams reported no usage
+        # (LP-0MVMBM6N400541EH): the concrete cause of a context-at-fallback
+        # figure that has to render ``n/a``.
+        "sessions_without_usage": sum(
+            1 for r in rows if r.streams_without_usage
+        ),
+        "percentiles": percentiles,
+        "total": total,
+        "reasons": reasons,
+        "sessions": [
+            {
+                "session_id": r.session_id,
+                "local_turns": r.local_turns,
+                "answered_turns": r.answered_turns,
+                "unanswered_turns": r.unanswered_turns,
+                "remote_turns": r.remote_turns,
+                "local_turn_pct": r.local_turn_pct,
+                "reason": r.reason,
+                "context_at_fallback": r.context_at_fallback,
+                "context_at_fallback_source": r.context_source,
+                # Per-session no-usage count (LP-0MVMBM6N400541EH AC3): names
+                # why a session's context-at-fallback figure is ``n/a``.
+                "streams_without_usage": r.streams_without_usage,
+            }
+            for r in rows
+        ],
+        "notes": {
+            "sessions_reaching_remote": len(reached_remote),
+            "declined_before_local_turn": len(declined_before_local),
+            "context_fallback_sessions": len(context_fallbacks),
+            "context_fallback_before_local_turn": len(context_before_local),
+            "rate_limited_sessions": len(rate_limited),
+        },
+    }
+
+
+def _round1(value: float | None) -> float | None:
+    return round(value, 1) if value is not None else None
+
+
+def _fmt_count(value: float | None) -> str:
+    """Render a percentile figure: integers without a decimal, else one place."""
+    if value is None:
+        return "-"
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.1f}"
+
+
+def _fmt_fallback_tokens(value: int | None) -> str:
+    """Render a context-at-fallback figure, or an explicit ``n/a``."""
+    return "n/a" if value is None else f"{value:,}"
+
+
+def _append_local_turn_coverage_section(
+    ap, summary: AnalysisResult
+) -> None:
+    """Append the ``## Local model usage by session`` section.
+
+    Three deterministic tables (summary percentiles, fallback-reason counts,
+    per-session sampling) plus data-gated interpretation notes. Renders a named
+    no-local-traffic line instead of an empty section when no session used the
+    local model (LP-0MVM93DE6009JGBU AC1–AC4).
+    """
+    coverage = local_turn_coverage(summary)
+    ap("")
+    ap("## Local model usage by session")
+    ap("")
+    if not coverage["sessions_with_local"]:
+        ap(NO_LOCAL_TURNS_TEXT)
+        return
+
+    total = coverage["total"]
+    total_turns = total["local_turns"] + total["remote_turns"]
+    ap(
+        "Sessions with at least one local turn (a local `Stream started` paired "
+        "with a local `Stream finished`): "
+        f"**{coverage['sessions_with_local']} of "
+        f"{coverage['sessions_in_window']}** sessions "
+        f"({_pct(coverage['sessions_with_local'], coverage['sessions_in_window']):.1f}%), "
+        f"**{total['local_turns']}** local turns "
+        f"({total['answered_turns']} answered, {total['unanswered_turns']} unanswered) "
+        f"and {total['remote_turns']} remote turns "
+        f"({_pct(total['local_turns'], total_turns):.1f}% local overall)."
+    )
+    ap("")
+    ap("| Percentile | # turns local | # turns remote | % local turns | Context size at fallback |")
+    ap("|---|---|---|---|---|")
+    for row in coverage["percentiles"]:
+        ap(
+            f"| {row['label']} | {_fmt_count(row['local_turns'])} | "
+            f"{_fmt_count(row['remote_turns'])} | "
+            f"{_fmt_count(row['local_turn_pct'])}% | "
+            f"{_fmt_fallback_tokens(row['context_at_fallback'])} |"
+        )
+    total_row = (
+        f"| Total | {total['local_turns']} | {total['remote_turns']} | "
+        f"{_fmt_count(total['local_turn_pct'])}% | "
+        f"{_fmt_fallback_tokens(total['context_at_fallback'])} |"
+    )
+    ap(total_row)
+    ap("")
+    ap(
+        "P10/P50/P90 are percentiles (linear interpolation) over the sessions "
+        "with ≥1 local turn. The total row sums the turn columns, recomputes "
+        "`% local turns` from those sums, and shows the mean context at "
+        "fallback of the sessions with token data. Context size at fallback "
+        "covers the "
+        f"{total['context_samples']} of {coverage['sessions_with_local']} sessions "
+        "with token evidence at their fallback; sessions with none are "
+        "excluded from that column's percentiles rather than counted as 0."
+    )
+
+    ap("")
+    ap("### Fallback reason distribution")
+    ap("")
+    ap("| Reason | Sessions | % of sessions-with-local |")
+    ap("|---|---|---|")
+    for row in coverage["reasons"]:
+        ap(
+            f"| {row['reason']} | {row['sessions']} | "
+            f"{row['pct_of_sessions_with_local']:.1f}% |"
+        )
+    ap("")
+    ap(
+        "`no_remote_fallback` marks a session that never used a remote provider; "
+        "`unattributed` means it reached remote with no own evidence "
+        "(LP-0MVMBMSWR0036RES — a session never inherits a neighbour's reason)."
+    )
+
+    ap("")
+    ap("### Per-session coverage")
+    ap("")
+    ap(
+        "| Session ID | # turns local | # turns remote | % local turns | "
+        "Reason for remote fallback | Context size at fallback | "
+        "Streams without usage |"
+    )
+    ap("|---|---|---|---|---|---|---|")
+    for row in coverage["sessions"]:
+        local_cell = str(row["local_turns"])
+        if row["unanswered_turns"]:
+            local_cell += f" ({row['unanswered_turns']} unanswered)"
+        ap(
+            f"| {row['session_id']} | {local_cell} | {row['remote_turns']} | "
+            f"{row['local_turn_pct']:.1f}% | {row['reason']} | "
+            f"{_fmt_fallback_tokens(row['context_at_fallback'])} | "
+            f"{row.get('streams_without_usage', 0)} |"
+        )
+    ap("")
+    ap(
+        "Sorted by `# turns local` descending (more local turns is the goal), "
+        "then by session id. `% local turns` = local / (local + remote) × 100 "
+        "for that session; an unanswered local turn is counted and flagged in "
+        "the local column rather than dropped. `Streams without usage` counts "
+        "the session's terminal lines that reported no usage — they carry "
+        "`tokens=missing` (LP-0MVMBM6N400541EH) — which is why its context "
+        "figures can be `n/a`."
+    )
+
+    notes = coverage["notes"]
+    if notes["sessions_reaching_remote"]:
+        ap("")
+        ap("Interpretation:")
+        ap(
+            "- Decision-first routing: "
+            f"{notes['declined_before_local_turn']} of "
+            f"{notes['sessions_reaching_remote']} sessions that reached remote "
+            f"never served a local turn "
+            f"({_pct(notes['declined_before_local_turn'], notes['sessions_reaching_remote']):.1f}%) "
+            "— local is declined pre-emptively, not after a failed attempt."
+        )
+        if notes["context_fallback_sessions"]:
+            ap(
+                "- Context-size fallbacks "
+                "(`context_too_large` / `large_context_bypass` / "
+                "`provider_context_exceeded`): "
+                f"{notes['context_fallback_before_local_turn']} of "
+                f"{notes['context_fallback_sessions']} were declined before the "
+                "session's first local turn. These are `estimated_tokens` "
+                "threshold decisions, so they fire only once a prompt grows past "
+                "the configured cold/warm thresholds — never on a session's first "
+                "message."
+            )
+        if notes["rate_limited_sessions"]:
+            ap(
+                "- `rate_limited` is the proxy's own per-provider RPM budget "
+                "pacing (`provider_budget.py`: the configured `rate_limit_rpm` "
+                "window for that provider is exhausted, so the request passes to "
+                "the next provider immediately) — not an upstream HTTP 429; those "
+                "surface as `upstream_http_error status=429` events instead."
+            )
+
+    missing = coverage["sessions_with_local"] - coverage["total"]["context_samples"]
+    if missing:
+        # LP-0MVMBM6N400541EH AC4: when the affected sessions actually logged
+        # usage-less streams, name the marker as the cause. A session can also
+        # have no context figure simply because it never fell back (no
+        # ``routing_skip_local`` and no remote stream), so the marker is only
+        # named when the evidence shows it.
+        marker_note = ""
+        if coverage["sessions_without_usage"]:
+            marker_note = (
+                " Terminal streams that reported no usage carry the explicit "
+                "`tokens=missing` marker (LP-0MVMBM6N400541EH) and are counted "
+                "in the `Streams without usage` column, so their `n/a` is "
+                "explained by the logs rather than being an unexplained gap."
+            )
+        ap("")
+        ap(
+            f"**Limitation:** {missing} of {coverage['sessions_with_local']} "
+            "session(s) have no token evidence at their fallback — their "
+            "`routing_skip_local` line carried no `estimated_tokens=`, no remote "
+            "stream reported usage and the session itself logged no prompt "
+            "tokens." + marker_note + " They render `n/a`; the report never "
+            "fabricates an estimate."
+        )
+
+
 def _ap_fallback_attribution(ap, summary: AnalysisResult) -> None:
     """Render the per-session fallback-attribution states (LP-0MVMBMSWR0036RES).
 
@@ -433,6 +904,11 @@ def build_report(
 
     _append_total_tokens_section(ap, summary)
 
+    # Local-turn coverage (LP-0MVM93DE6009JGBU): which sessions used local, how
+    # many turns it answered, the per-session share and the reason each session
+    # moved to remote — read straight from the session aggregates above.
+    _append_local_turn_coverage_section(ap, summary)
+
     if summary.fallback_reason_counts:
         ap("")
         ap("## Fallback reasons")
@@ -476,6 +952,12 @@ def build_report(
     # and agent-audit traffic.
     _append_prefill_regression_section(ap, summary)
 
+    # Contended-pricing observability (LP-0MVS9YKHL007UBBZ, parent AC1/AC4):
+    # admission verdicts split by the rate bucket the ETA was priced from and
+    # by the conversion harness's new-token bands, next to the other admission
+    # evidence.
+    _append_admission_bucket_section(ap, summary)
+
     # Hold-cycle routing-skip re-emissions (LP-0MUIEO6IP0030CT3): surfaced
     # separately so a stuck hold is not read as repeated client retries.
     _append_hold_cycle_section(ap, summary)
@@ -506,6 +988,7 @@ def build_report(
 
     _append_busy_section(ap, summary, schedule)
     _append_prefill_vs_decode_section(ap, summary)
+    _append_contention_prediction_section(ap, summary, speed)
 
     _append_mode_timeline_section(ap, summary, mode_map)
 
@@ -527,7 +1010,15 @@ def build_report(
     ap(
         "- Sessions are identified by their session UUID; context/response sizes use the "
         "authoritative per-request `tokens=prompt/completion/total` from `Stream finished` lines "
-        "(log-line payloads are truncated and are never used for sizes)."
+        "(log-line payloads are truncated and are never used for sizes). Local streams report "
+        "llama-server's measured usage since LP-0MVMHNVKT003PRIK (the proxy requests "
+        "`stream_options.include_usage`), so local prompt sizes and per-model local tokens are "
+        "measured rather than inferred from the session's initial provider. A terminal line "
+        "whose upstream reported no usage carries the explicit marker `tokens=missing` "
+        "(LP-0MVMBM6N400541EH) — that is the cause of any missing context/response figure, and "
+        "those lines are counted per session in the **Total tokens** section rather than "
+        "silently treated as zero. Logs written before that marker carry no `tokens=` at all and "
+        "are counted the same way."
     )
     ap(
         "- A session is included when it has at least one `Stream started` inside the window; "
@@ -555,6 +1046,15 @@ def build_report(
         "lease refusal are labelled `lease_denied` (`local_lease_active`); any other session "
         "without own evidence is `unattributed`, and a session that never used remote is "
         "`no_remote_fallback` (see the `fallback_attribution` CSV column)."
+    )
+    ap(
+        "- Every structured line a request emits also carries a per-turn correlation id "
+        "(`turn=<8 hex>`, LP-0MVMBM467005BT4A). Where ids are present the pairing is "
+        "**exact** — fallbacks, routing skips, dispatch denials, stream start/finish and "
+        "TTFT lines are joined by id, so interleaved turns of one session can no longer "
+        "swap reasons or pair with the wrong stream. Lines without ids (rotated logs "
+        "predating the field) still use the per-session FIFO / nearest-line heuristics "
+        "described above."
     )
     ap(
         "- Related context: work item LP-0MSAOQTJS000FFVM (evaluate increasing local ctx-size) can "
@@ -1316,6 +1816,69 @@ def _append_prefill_regression_section(ap, summary: AnalysisResult) -> None:
             ap(f"| {reason} | {count} |")
 
 
+def _append_admission_bucket_section(ap, summary: AnalysisResult) -> None:
+    """Append the ``## Admission verdicts by rate bucket and prompt band`` section.
+
+    LP-0MVS9YKHL007UBBZ (parent LP-0MVS8T6F4006DGG3): the contended-pricing
+    fix prices a contended admission against the contended rate bucket and
+    falls back to the solitary window (logged ``rate_bucket=solitary_fallback``)
+    while that window is uncalibrated. Surfacing the split here makes a
+    regression to the optimistic rate visible in the standard report instead
+    of requiring ad-hoc log archaeology, and the per-band conversion counts
+    are read against the same bands the admission-conversion harness
+    (``scripts/prefill_admission_conversion.py``) reports.
+
+    Omitted entirely when the window holds no guard decision, like the
+    report's other conditional sections. Buckets/bands with no verdict are
+    omitted rather than zero-filled: an absent ``contended`` row means the
+    guard never priced a contended admission, which is itself the signal.
+    """
+    breakdown = aggregation.admission_breakdown(summary)
+    by_bucket = breakdown["by_rate_bucket"]
+    by_band = breakdown["by_token_band"]
+    if not by_bucket and not by_band:
+        return
+
+    ap("")
+    ap("## Admission verdicts by rate bucket and prompt band")
+    ap("")
+    ap("`local_admission_guard` decisions in the window, split by the pricing "
+       "bucket the prefill ETA was calibrated from (`rate_bucket`) and by the "
+       "new-token bands the admission-conversion harness "
+       "(`scripts/prefill_admission_conversion.py`) measures. `contended` "
+       "prices against the contended window; `solitary_fallback` means the "
+       "contended window was uncalibrated so the solitary window was used — "
+       "the deliberately-optimistic residual case, so a high "
+       "`solitary_fallback` share is the signal that the contended window "
+       "still needs samples. `unknown` is a pre-change line with no bucket "
+       "field (or a banded line with no priced `new_tokens`).")
+    ap("")
+    ap("### By pricing rate bucket")
+    ap("")
+    ap("| Rate bucket | Admitted | Refused | Refused share |")
+    ap("|---|---:|---:|---:|")
+    for bucket, verdicts in by_bucket.items():
+        total = verdicts["admit"] + verdicts["reject"]
+        ap(f"| {bucket} | {verdicts['admit']} | {verdicts['reject']} | "
+           f"{_pct(verdicts['reject'], total):.1f}% |")
+    ap("")
+    ap("### By new-token band (conversion-harness bands)")
+    ap("")
+    ap("| Band | Admitted | Refused | Conversions | Unconverted | Conversion share |")
+    ap("|---|---:|---:|---:|---:|---:|")
+    for band, entry in by_band.items():
+        share = entry["conversion_share"]
+        share_cell = f"{share * 100:.1f}%" if share is not None else "-"
+        ap(f"| {band} | {entry['admit']} | {entry['reject']} | "
+           f"{entry['converted']} | {entry['unconverted']} | {share_cell} |")
+    ap("")
+    ap("Conversions join a session's `decision=admit` to a later **local** "
+       "first byte (`dispatch_first_byte_ms`); an admitted session with no "
+       "local first byte counts as unconverted, and a remote first byte never "
+       "converts a local admission. A band with no admitted session shows `-` "
+       "rather than 0%.")
+
+
 def _append_hold_cycle_section(ap, summary: AnalysisResult) -> None:
     """Append the ``## Hold-cycle re-emissions`` section to the report.
 
@@ -1712,12 +2275,21 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
     ap(f"| Total compute (slot-time) | {_fmt_duration(b.total_compute_seconds)} | - | - |")
     ap(f"| Avg concurrency (while busy) | {b.avg_concurrency:.2f} | - | - |")
     ap(f"| Peak concurrency | {b.peak_concurrency} | - | - |")
+    # GPU-based busy time from Prometheus power consumption (hardware-side).
+    gpu = summary.gpu_busy
+    if gpu is not None:
+        ap(f"| GPU busy — power-based (hardware) | "
+           f"{_busy_cell(gpu.busy_seconds, gpu.total_seconds)} | - | - |")
     ap("")
     ap(f"_Bounds: lower = {aggregation.BUSY_LOWER_BOUND_LABEL}; upper = "
        f"{aggregation.BUSY_UPPER_BOUND_LABEL}. {b.prefill_extended_streams} of "
        f"{b.streams} stream(s) contributed a measured prefill (a first-byte line); "
        "the rest fall back to their decode interval, so the upper bound is never "
-       "overstated._")
+       "overstated. The count covers the paired streams whose busy interval "
+       "falls inside the window, so it never exceeds Streams served; the "
+       "`Prefill vs decode` Samples column counts first-byte samples anchored "
+       "in the window, unfinished streams included, and may legitimately exceed "
+       "Streams served._")
     if b.unfinished_streams or b.pre_window_unfinished:
         ap("")
         ap(f"_Note: {b.unfinished_streams} local stream(s) started inside the window "
@@ -1729,8 +2301,9 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
                f"started more than 1h before the window (from earlier windows) also lack a "
                f"logged `Stream finished`; they do not affect this window's busy time._")
     ap("")
-    ap("Method: streams are paired per session (FIFO) across the margin-widened "
-       f"event stream (48h collection margin, max({log_parser.BUSY_WINDOW_MARGIN} "
+    ap("Method: streams are paired exactly by their per-turn id (`turn=`) and, "
+       "for pre-change lines without an id, per session FIFO across the "
+       f"margin-widened event stream (48h collection margin, max({log_parser.BUSY_WINDOW_MARGIN} "
        "busy-pairing, 48h mode timeline)), each pair extended back to its "
        "back-calculated dispatch time (`ttft.ts - ttft_ms/1000`) when a "
        "`dispatch_first_byte_ms` line exists, then clipped to the window so "
@@ -1738,6 +2311,15 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
        "started inside the window or within its 1h busy-pairing margin with no "
        "logged finish (earlier starts are pre-window leftovers); fast/cheap split "
        "follows the slot schedule.")
+    # GPU-based busy-time note (hardware signal, not log-derived).
+    if gpu is not None:
+        ap("")
+        ap("_The **GPU busy** row uses Prometheus power-consumption data "
+           "(`avg_over_time(gpu:computing:bool[Nh])`, evaluated every 15 s): "
+           "1 while the GPU draws ≥ 90 W (the recording-rule threshold), 0 "
+           "otherwise. It is the authoritative hardware-side busy measure, "
+           "complementary to the log-based slot-occupancy figures above, "
+           "and does not depend on the proxy's stream lifecycle logs._")
 
 
 def _phase_cell(value: float | None) -> str:
@@ -1873,6 +2455,164 @@ def _append_prefill_vs_decode_section(ap, summary: AnalysisResult) -> None:
         )
 
 
+def _append_contention_prediction_section(
+    ap, summary: AnalysisResult, speed: llama_log_parser.SpeedStats | None
+) -> None:
+    """Append the ``## Local contention prediction vs reality`` section (M1-M3).
+
+    LP-0MVGR2OXT0096OGK: measures whether the payload's ``lease_state`` /
+    ``prefill_eta_seconds`` signals predict real local contention. Rendered
+    after the busy sections so the M2 busy fractions are already on the page;
+    the three measurements and the explicit matches/does-not-match verdicts
+    follow (the same numbers are also in ``--json`` under
+    ``denial_attribution`` and ``prefill_eta_error``). Skipped when the window
+    carries neither a denial nor a status poll, so unchanged windows render
+    unchanged reports.
+    """
+    denials = int(summary.dispatch_denied_count)
+    statuses = getattr(summary, "status_request_events", []) or []
+    if not denials and not statuses:
+        return
+
+    att = denial_attribution_json(summary)
+    eta = prefill_eta_error_json(summary, speed)
+    hours = max((summary.window_end - summary.window_start).total_seconds() / 3600.0, 1e-9)
+    busy_pct = summary.busy.busy_pct if summary.busy else 0.0
+
+    ap("")
+    ap("## Local contention prediction vs reality")
+    ap("")
+    ap("Measures whether the payload's `lease_state` / `prefill_eta_seconds` "
+       "signals predict **real** local contention (LP-0MVGR2OXT0096OGK). "
+       "`local_dispatch_denied` lines carry no `lease_state`, so each denial is "
+       "joined to its decision-block `local_admission_guard` record "
+       f"(nearest within ±{aggregation.DENIAL_GUARD_JOIN_WINDOW_SECONDS:.0f}s) and "
+       "the pool state at denial time is derived from the guard's measured "
+       "`busy_slots` / `in_flight_prefills` / `free_slot` fields.")
+    ap("")
+    ap("### M1 — denial attribution (pool state at denial time)")
+    ap("")
+    ap("| Hour | Denials | idle_leased | prefill_bound | saturated | unknown | "
+       "unattributed | Local busy % |")
+    ap("|---|---|---:|---:|---:|---:|---:|---:|")
+    for row in att["per_hour"]:
+        ap(
+            f"| {row['hour']} | {row['denials']} | {row['idle_leased']} | "
+            f"{row['prefill_bound']} | {row['saturated']} | {row['unknown']} | "
+            f"{row['unattributed']} | {row['busy_pct']:.1f}% |"
+        )
+    total_row = att["by_verdict"]
+    ap(
+        f"| **Total** | **{att['denials']}** | **{total_row['idle_leased']}** | "
+        f"**{total_row['prefill_bound']}** | **{total_row['saturated']}** | "
+        f"**{total_row['unknown']}** | **{att['unattributed']}** | {busy_pct:.1f}% |"
+    )
+    ap("")
+    if att["by_guard_reason"]:
+        ap("**Guard reason split (attributed denials):** "
+           + ", ".join(f"{k} {v}" for k, v in att["by_guard_reason"].items())
+           + ".")
+    if att["capacity_hint"]:
+        hints = ", ".join(f"{k} {v}" for k, v in att["capacity_hint"].items())
+        ap(f"**Payload's own claim (`capacity_hint` over status polls):** {hints}.")
+    ap("")
+    ap("### M2 — local busy fraction vs denials")
+    ap("")
+    baseline = CONTENTION_BASELINE
+    now_dph = att["denials"] / hours
+    base_dph = baseline["denials"] / baseline["hours"]
+    ap("| Metric | This window | Baseline (pre-change) |")
+    ap("|---|---|---|")
+    ap(f"| Window | {_fmt_dt(summary.window_start)} → {_fmt_dt(summary.window_end)} "
+       f"({hours:.1f}h) | {baseline['window']} ({baseline['hours']:.0f}h) |")
+    ap(f"| Dispatch denials | {att['denials']} | **{baseline['denials']}** |")
+    ap(f"| Denials per hour | {now_dph:.1f} | {base_dph:.1f} |")
+    ap(f"| Local busy (dispatch → finish) | {busy_pct:.1f}% | {baseline['busy_pct']}% |")
+    if att["per_hour"]:
+        worst = max(att["per_hour"], key=lambda r: r["denials"])
+        worst_cell = (
+            f"{worst['hour']} ({worst['denials']} denials at {worst['busy_pct']:.1f}% busy)"
+        )
+    else:
+        worst_cell = "-"
+    ap(f"| Worst hour | {worst_cell} | "
+       f"{baseline['worst_hour']} ({baseline['worst_hour_denials']} denials at "
+       f"{baseline['worst_hour_busy_pct']}% busy) |")
+    ap("")
+    idle_share = att["idle_leased_share_pct"]
+    if idle_share is None:
+        denial_verdict_label = "inconclusive"
+        denial_sentence = (
+            "No denial could be attributed to a guard record — the split is "
+            "inconclusive."
+        )
+    elif idle_share >= IDLE_LEASED_SHARE_THRESHOLD_PCT:
+        denial_verdict_label = "does not match reality"
+        denial_sentence = (
+            f"{idle_share:.1f}% of attributed denials fired while the guard "
+            "measured **zero** local work (no slot decoding, no prefill in "
+            "flight) — the idle-lease false-busy pattern."
+        )
+    else:
+        denial_verdict_label = "matches reality"
+        denial_sentence = (
+            f"Only {idle_share:.1f}% of attributed denials fired with the pool "
+            "measured idle — most denials tracked genuine prefill/decode work."
+        )
+    if eta["verdict"] == "matches_reality":
+        eta_verdict_label = "matches reality"
+        eta_sentence = (
+            "the predicted prefill ETA is within tolerance of observed prefill "
+            "durations."
+        )
+    elif eta["verdict"] in ("over_predicts", "under_predicts"):
+        eta_verdict_label = "does not match reality"
+        eta_sentence = (
+            f"The predicted prefill ETA {eta['verdict']} observed prefill "
+            "durations."
+        )
+    else:
+        eta_verdict_label = "inconclusive"
+        eta_sentence = "the prefill ETA comparison is inconclusive."
+    ap(f"**Denial signal (`lease_state`): {denial_verdict_label}.** {denial_sentence}")
+    ap(f"**Prefill-ETA signal (`prefill_eta_seconds`): {eta_verdict_label}.** {eta_sentence}")
+    if "does not match reality" in (denial_verdict_label, eta_verdict_label):
+        overall_label = "do not unambiguously match reality"
+    else:
+        overall_label = "match reality"
+    ap(f"**Overall: the pre-change false-busy dispatch failures are driven by "
+       f"signals that {overall_label} (denial volume {att['denials']} vs baseline "
+       f"{baseline['denials']}, denials/hour {now_dph:.1f} vs {base_dph:.1f}, busy "
+       f"{busy_pct:.1f}% vs {baseline['busy_pct']}%).**")
+    ap("")
+    ap("### M3 — prefill_eta_seconds accuracy (predicted vs observed, p50/p90)")
+    ap("")
+    ap("| Quantile | Predicted (status polls) | Observed (prompt eval) | "
+       "Error (pred−obs) | Relative |")
+    ap("|---|---:|---:|---:|---:|")
+    pred = eta["predicted"]
+    obs = eta["observed"]
+    ap(f"| p50 | {pred['p50'] if pred['p50'] is not None else '-'} s "
+       f"(n={pred['samples']}) | {obs['p50'] if obs['p50'] is not None else '-'} s "
+       f"(n={obs['samples']}) | {eta['error_p50'] if eta['error_p50'] is not None else '-'} s | "
+       f"{eta['relative_error_p50_pct'] if eta['relative_error_p50_pct'] is not None else '-'}% |")
+    ap(f"| p90 | {pred['p90'] if pred['p90'] is not None else '-'} s | "
+       f"{obs['p90'] if obs['p90'] is not None else '-'} s | "
+       f"{eta['error_p90'] if eta['error_p90'] is not None else '-'} s | "
+       f"{eta['relative_error_p90_pct'] if eta['relative_error_p90_pct'] is not None else '-'}% |")
+    ap("")
+    ap("Predicted = the calibrated `prefill_eta_seconds` published on "
+       "`status_request` polls; observed = llama-server `prompt eval time` "
+       "durations for dispatches that ran. The two streams cannot be paired "
+       "1:1 (llama-server eval lines carry no per-line timestamps), so the "
+       "comparison is quantile-matched: the p50/p90 of each distribution and "
+       "the signed error at both quantiles. The prediction is the cache-cold "
+       "reference-prompt cost, so systematic over-prediction (high predicted "
+       "p50 vs low observed p50) means the ETA over-refuses servable work.")
+    ap(f"**(prefill ETA verdict: {eta['verdict']})**")
+    ap("")
+
+
 def _fmt_tokens(n: int) -> str:
     """Format a token count with comma separators."""
     return f"{n:,}"
@@ -1904,9 +2644,43 @@ def _append_total_tokens_section(ap, summary) -> None:
        "``tokens=prompt/completion/total`` on ``Stream finished`` lines.  "
        "Input = sum(prompt), Output = sum(completion), Total = Input + Output.  "
        "Shares are of the grand Total Tokens, so standard% + low% = 100% and model "
-       "%s sum to 100%.  Streams without ``tokens=`` contribute ``0``; sessions "
-       "without a bucket (unattributed) are excluded from the bucket share.")
+       "%s sum to 100%.  Streams without ``tokens=`` contribute ``0`` and are "
+       "counted below; sessions without a bucket (unattributed) are excluded from "
+       "the bucket share.")
     ap("")
+    # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): local streams report
+    # llama-server's usage block since this work item (the proxy requests
+    # ``stream_options.include_usage``), so real local prompt sizes are
+    # measurable. A non-zero count means some terminal lines still carry no
+    # usage (older rotated logs, providers that omit it, aborted streams).
+    # Since LP-0MVMBM6N400541EH the proxy marks those lines explicitly with
+    # ``tokens=missing``, so "no data" is distinguishable from "zero tokens"
+    # and the per-session count is carried in the *Local model usage by
+    # session* coverage table and the per-session CSVs.
+    without = getattr(summary, "streams_without_usage", 0)
+    measured = getattr(summary, "streams_finished", 0)
+    total_finished = measured + without
+    if total_finished:
+        by_provider = getattr(summary, "streams_without_usage_by_provider", None) or {}
+        provider_part = ""
+        if without:
+            provider_part = " (" + ", ".join(
+                f"{provider} {count}"
+                for provider, count in sorted(by_provider.items())
+            ) + ")"
+        ap(
+            f"Measured usage: **{measured:,} of {total_finished:,}** "
+            f"``Stream finished`` lines carry ``tokens=``."
+        )
+        ap("")
+        ap(
+            f"Streams without usage: **{without:,}**{provider_part}. Those lines "
+            "carry ``tokens=missing`` (logs written before "
+            "LP-0MVMBM6N400541EH simply omit the field). Their context/response "
+            "sizes are unknown (not zero) and are excluded from the token "
+            "totals and the local prompt-size figures."
+        )
+        ap("")
     ap("| Kind | Count | % of total |")
     ap("|---|---|---|")
     ap(f"| Input (prompt) | {_fmt_tokens(grand_input)} | {_pct(grand_input, grand_total):.1f}% |")
@@ -1930,9 +2704,14 @@ def _append_total_tokens_section(ap, summary) -> None:
     ap("")
     ap("### Tokens — by model")
     ap("")
-    ap("Grouped by the session's initial ``(provider, model)`` (same grouping as "
-       "the Per-model breakdown), sorted by Total desc; unknown provider/model "
-       "render as the placeholder ``(unknown)``.")
+    ap("Grouped by the ``(provider, model)`` stamped on each ``Stream finished`` "
+       "line — the provider/model that actually served the stream — sorted by "
+       "Total desc; unknown provider/model render as the placeholder "
+       "``(unknown)``. A session that starts local and falls back to a remote "
+       "provider therefore splits its tokens across both instead of piling them "
+       "onto its initial provider (LP-0MVMHNVKT003PRIK). Local rows are real "
+       "measured prompt/completion counts, so they can be compared against "
+       "remote rows.")
     ap("")
     if grand_total == 0:
         ap("_No tokens in window._")
@@ -1980,6 +2759,13 @@ def _wasted_prefill_tokens(summary: AnalysisResult) -> int:
     compute for a dispatch that was then abandoned before its first byte
     (parent AC4's waste check). Other eviction reasons are excluded — their
     ``new_tokens`` did not necessarily cost a fresh prefill.
+
+    Token semantics (LP-0MVODJ3P6000AIUM AC5): ``new_tokens`` is the
+    **admission-time** value the routing/admission decision priced and the
+    dispatch record stored verbatim — never a value recomputed at eviction
+    time. An event whose record carried no admission snapshot contributes
+    ``0`` (explicit ``unknown`` marker), so the figure can never over-account
+    a re-priced prompt.
     """
     total = 0
     for event in getattr(summary, "eviction_after_acceptance_events", []) or []:
@@ -2352,6 +3138,12 @@ def run_analysis(
         llama_files, window_start, window_end, schedule, mode_map, log_dir=llama_log_dir
     )
 
+    # GPU busy-time from Prometheus power consumption (best-effort).
+    if summary.busy is not None:
+        ws = window_start.timestamp()
+        we = window_end.timestamp()
+        summary.gpu_busy = gpu_busy.compute_gpu_busy(ws, we)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     archived_to = _archive_existing_outputs(output_dir)
     write_csvs(summary, output_dir)
@@ -2407,6 +3199,13 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
     fell_back = sum(1 for s in sessions if s.fell_back)
     remote_only = sum(1 for s in sessions if s.local_requests == 0 and s.remote_requests > 0)
     total = summary.total_requests
+    # Contention-prediction block (LP-0MVGR2OXT0096OGK): computed once here and
+    # shared by the three keys so the attribution split never drifts between
+    # ``denial_attribution`` and ``status_capacity_hint``.
+    _contention = denial_attribution_json(summary)
+    # Contended-pricing split (LP-0MVS9YKHL007UBBZ AC2): the same computation
+    # feeds the markdown section, so the two views cannot disagree.
+    _admission = aggregation.admission_breakdown(summary)
     return {
         "window_start": _fmt_ts(summary.window_start),
         "window_end": _fmt_ts(summary.window_end),
@@ -2445,6 +3244,14 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
             for e in getattr(summary, "local_admission_events", []) or []
             if getattr(e, "decision", None) == "admit"
         ),
+        # Contended-pricing split (LP-0MVS9YKHL007UBBZ AC2): the admit/reject
+        # verdicts above, split by the pricing ``rate_bucket`` the ETA was
+        # calibrated from and by the admission-conversion harness's new-token
+        # bands (with per-band admission → local first-byte conversion). Both
+        # are ADDITIVE, and buckets/bands with no verdict are omitted rather
+        # than zero-filled.
+        "local_admission_by_rate_bucket": _admission["by_rate_bucket"],
+        "local_admission_by_token_band": _admission["by_token_band"],
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J AC3): economic
         # bypasses served locally because the GPU was idle.
         "local_idle_admit": len(getattr(summary, "idle_admit_events", []) or []),
@@ -2516,7 +3323,21 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
             3,
         ),
         "dispatch_denied": summary.dispatch_denied_count,
+        # Contention-prediction measurements (LP-0MVGR2OXT0096OGK): M1 denial
+        # attribution by guard reason/pool state, the payload's own
+        # capacity_hint claim, and M3 predicted-vs-observed prefill ETA error.
+        # All ADDITIVE — no key above changes value or meaning.
+        "denial_attribution": _contention,
+        "prefill_eta_error": prefill_eta_error_json(summary, summary.speed),
+        "status_capacity_hint": _contention["capacity_hint"],
         "unattributed_events": summary.unattributed_events,
+        # Measured-usage coverage (LP-0MVMHNVKT003PRIK AC4): terminal lines with
+        # measured token counts vs. terminal lines with none (unknown, not zero).
+        "streams_with_usage": getattr(summary, "streams_finished", 0),
+        "streams_without_usage": getattr(summary, "streams_without_usage", 0),
+        "streams_without_usage_by_provider": dict(
+            getattr(summary, "streams_without_usage_by_provider", None) or {}
+        ),
         "hold_cycle_routing_skip_events": summary.hold_cycle_reemission_count,
         "provider_context_skips": provider_context_skips_json(summary, mode_map),
         "standard_sessions": sum(1 for s in sessions if s.bucket != "cheap"),
@@ -2528,10 +3349,14 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "compaction": compaction_json(summary),
         "recommendations": len(recommendations.generate_recommendations(summary, None, mode_map)),
         "local_busy": _busy_json(summary.busy),
+        "gpu_busy": _gpu_busy_json(summary.gpu_busy) if summary.gpu_busy else None,
         "local_prefill": _prefill_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
         "ttft": _ttft_json(summary.ttft_events, summary.sessions),
+        # Local-turn coverage (LP-0MVM93DE6009JGBU): the same derivation the
+        # Markdown section renders, so `--json` consumers need not scrape it.
+        "local_turn_coverage": local_turn_coverage(summary),
     }
 
 
@@ -2748,6 +3573,194 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
         # Phase slot-time split (LP-0MVJNDOUU0059MMO): prefill vs decode as
         # slot-seconds and % of combined phase slot-time (sums to 100%).
         "prefill_vs_decode": _prefill_vs_decode_json(busy),
+    }
+
+
+def _gpu_busy_json(gpu: object | None) -> dict | None:
+    """JSON-friendly GPU busy-time from Prometheus power consumption.
+
+    Complement to ``local_busy``: measures the authoritative hardware-side
+    busy fraction from GPU power draw (``gpu:computing:bool``), independent
+    of proxy log events. Returns ``None`` when the query fails.
+    """
+    if gpu is None:
+        return None
+    return {
+        "computing_fraction": round(gpu.computing_fraction, 4),
+        "busy_seconds": round(gpu.busy_seconds, 1),
+        "idle_seconds": round(gpu.idle_seconds, 1),
+        "busy_pct": round(gpu.busy_pct, 1),
+        "idle_pct": round(gpu.idle_pct, 1),
+        "total_seconds": round(gpu.total_seconds, 1),
+        # Smoothed power trace (1-min samples, derived from 15-s raw).
+        "smoothed_power": [
+            {"timestamp": int(ts), "power_watts": round(w, 2)}
+            for ts, w in gpu.smoothed_power_values
+        ],
+    }
+
+
+def prefill_eta_error_json(
+    summary: AnalysisResult, speed: llama_log_parser.SpeedStats | None
+) -> dict:
+    """M3 (LP-0MVGR2OXT0096OGK): predicted-vs-observed prefill ETA error.
+
+    Predicted: every non-``None`` ``prefill_eta_seconds`` published on
+    ``status_request`` polls inside the window. Observed: the llama-server
+    ``prompt eval time`` durations (seconds) for the dispatches that ran.
+    The two streams cannot be joined 1:1 (llama-server eval lines carry no
+    per-line timestamps — see REFERENCE.md limitations), so the comparison is
+    quantile-matched: the p50/p90 of each distribution and the signed error at
+    both quantiles, plus the relative error against the observed value.
+
+    The verdict rescues the operator from reading the table:
+    ``matches_reality`` when the predicted p50 is within the tolerance of the
+    observed p50, ``over_predicts`` / ``under_predicts`` when it misses wide
+    in that direction (an over-prediction is the harmful direction — it
+    refuses work that would have been servable), ``inconclusive`` when either
+    side has no samples.
+    """
+    predicted = sorted(
+        float(e.prefill_eta_seconds)
+        for e in getattr(summary, "status_request_events", []) or []
+        if getattr(e, "prefill_eta_seconds", None) is not None
+    )
+    observed = sorted(float(v) for v in (getattr(speed, "prompt_eval_seconds", None) or []))
+    pred_p50 = _percentile(predicted, 50)
+    pred_p90 = _percentile(predicted, 90)
+    obs_p50 = _percentile(observed, 50)
+    obs_p90 = _percentile(observed, 90)
+    # Duration percentiles are reported to 2 dp (seconds) so JSON consumers
+    # never see float-representation dust like 8.600000000000001.
+    pred_p50 = round(pred_p50, 2) if pred_p50 is not None else None
+    pred_p90 = round(pred_p90, 2) if pred_p90 is not None else None
+    obs_p50 = round(obs_p50, 2) if obs_p50 is not None else None
+    obs_p90 = round(obs_p90, 2) if obs_p90 is not None else None
+
+    def _error(pred: float | None, obs: float | None) -> float | None:
+        if pred is None or obs is None:
+            return None
+        return round(pred - obs, 1)
+
+    def _relative(pred: float | None, obs: float | None) -> float | None:
+        if pred is None or obs is None or not obs:
+            return None
+        return round((pred - obs) / obs * 100.0, 1)
+
+    err_p50 = _error(pred_p50, obs_p50)
+    err_p90 = _error(pred_p90, obs_p90)
+    rel_p50 = _relative(pred_p50, obs_p50)
+    rel_p90 = _relative(pred_p90, obs_p90)
+    if not predicted or not observed or rel_p50 is None:
+        verdict = "inconclusive"
+    elif abs(rel_p50) <= PREFILL_ETA_MATCH_TOLERANCE_PCT:
+        verdict = "matches_reality"
+    elif rel_p50 > 0:
+        verdict = "over_predicts"
+    else:
+        verdict = "under_predicts"
+    return {
+        "predicted": {
+            "samples": len(predicted),
+            "p50": pred_p50,
+            "p90": pred_p90,
+        },
+        "observed": {
+            "samples": len(observed),
+            "p50": obs_p50,
+            "p90": obs_p90,
+        },
+        "error_p50": err_p50,
+        "error_p90": err_p90,
+        "relative_error_p50_pct": rel_p50,
+        "relative_error_p90_pct": rel_p90,
+        "tolerance_pct": PREFILL_ETA_MATCH_TOLERANCE_PCT,
+        "verdict": verdict,
+    }
+
+
+def denial_attribution_json(summary: AnalysisResult) -> dict:
+    """M1/M2 JSON surface (LP-0MVGR2OXT0096OGK): denial attribution split.
+
+    ``local_dispatch_denied`` lines carry no ``lease_state``; each is joined to
+    its decision-block ``local_admission_guard`` reject (nearest within
+    :data:`aggregation.DENIAL_GUARD_JOIN_WINDOW_SECONDS`, inclusive) and the
+    pool-state verdict is derived from the guard's measured fields. Denials
+    with no guard in the block are ``unattributed``. Per-hour rows pair the
+    attribution split with the hour's local busy fraction (M2 corroboration:
+    a denial hour whose busy% is ~0 is a false-busy hour).
+
+    ``capacity_hint`` — the payload field under test — is summarised from the
+    ``status_request`` polls so the payload's own claim is compared against
+    the measured reality (the same ``denials`` can coincide with an
+    ``idle``-claimed pool).
+    """
+    attrs = getattr(summary, "denial_attributions", []) or []
+    statuses = getattr(summary, "status_request_events", []) or []
+    denials_total = int(summary.dispatch_denied_count)
+    attributed = len(attrs)
+    by_verdict: Counter[str] = Counter(a.verdict for a in attrs)
+    by_reason: Counter[str] = Counter(a.guard_reason for a in attrs if a.guard_reason)
+    capacity: Counter[str] = Counter(e.capacity_hint for e in statuses if e.capacity_hint)
+
+    busy_hourly = dict(
+        getattr(getattr(summary, "busy", None), "hourly_busy", []) or []
+    )
+    denials_by_hour: Counter[datetime] = Counter(
+        e.ts.replace(minute=0, second=0, microsecond=0)
+        for e in getattr(summary, "dispatch_denied_events", []) or []
+    )
+    verdicts_by_hour: dict[datetime, Counter[str]] = {}
+    for a in attrs:
+        hk = a.ts.replace(minute=0, second=0, microsecond=0)
+        verdicts_by_hour.setdefault(hk, Counter())[a.verdict] += 1
+
+    per_hour: list[dict] = []
+    for hk in sorted(denials_by_hour):
+        window_seconds = max(
+            0.0,
+            (
+                min(summary.window_end, hk + timedelta(hours=1))
+                - max(summary.window_start, hk)
+            ).total_seconds(),
+        )
+        busy_seconds = float(busy_hourly.get(hk, 0.0))
+        vh = verdicts_by_hour.get(hk, Counter())
+        row: dict = {
+            "hour": _fmt_ts(hk),
+            "denials": denials_by_hour[hk],
+            "attributed": sum(vh.values()),
+            "unattributed": denials_by_hour[hk] - sum(vh.values()),
+            "busy_seconds": round(busy_seconds, 1),
+            "busy_pct": round(busy_seconds / window_seconds * 100.0, 1) if window_seconds else 0.0,
+        }
+        for verdict in aggregation.DENIAL_VERDICT_ORDER:
+            row[verdict] = vh.get(verdict, 0)
+        per_hour.append(row)
+
+    idle_share_pct = (
+        round(by_verdict.get(aggregation.DENIAL_VERDICT_IDLE_LEASED, 0) / attributed * 100.0, 1)
+        if attributed
+        else None
+    )
+    if not attributed:
+        verdict = "inconclusive"
+    elif idle_share_pct is not None and idle_share_pct >= IDLE_LEASED_SHARE_THRESHOLD_PCT:
+        verdict = "does_not_match_reality"
+    else:
+        verdict = "matches_reality"
+
+    return {
+        "denials": denials_total,
+        "attributed": attributed,
+        "unattributed": denials_total - attributed,
+        "join_window_seconds": aggregation.DENIAL_GUARD_JOIN_WINDOW_SECONDS,
+        "idle_leased_share_pct": idle_share_pct,
+        "by_verdict": {v: by_verdict.get(v, 0) for v in aggregation.DENIAL_VERDICT_ORDER},
+        "by_guard_reason": dict(sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "per_hour": per_hour,
+        "capacity_hint": dict(sorted(capacity.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "verdict": verdict,
     }
 
 

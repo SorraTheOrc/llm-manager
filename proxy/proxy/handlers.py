@@ -239,6 +239,25 @@ async def poll_slots_for_model(
     polls = 0
     if not model:
         return None
+    # LP-0MVP7525P008RXMF AC2: the per-model slot poller must target the
+    # discovered child port when it polls the local router, so a page-load
+    # that triggers slot polling cannot generate router-proxied /slots 500s
+    # during a giant prefill.
+    try:
+        srv0 = _srv()
+        cfg0 = getattr(srv0, "config", None)
+        server_cfg0 = cfg0.get("server", {}) if isinstance(cfg0, dict) else {}
+        router_port0 = int(server_cfg0.get("llama_server_port", 8080) or 8080)
+        if not llama_port or int(llama_port) == router_port0:
+            from proxy.router_helpers import _resolve_local_slots_target
+
+            _ep, _port = _resolve_local_slots_target(
+                srv0, model=model, router_port=llama_port
+            )
+            if _port:
+                llama_port = _port
+    except Exception:
+        pass
     slots_url = f"http://localhost:{llama_port}/slots?model={model}"
     while True:
         try:
@@ -434,6 +453,20 @@ async def get_llama_local_status(request: Request):
     httpx timeout bounded by the ``STATUS_QUERY_TIMEOUT`` window so a slow
     /slots response cannot blow the endpoint's response budget.
 
+    Abandoned work (LP-0MVRMI5HK00558TB AC1, ``status_schema_version: 4``):
+    a local dispatch the proxy has given up on (prefill deadline, session
+    eviction, no-progress watchdog, client disconnect) is recorded in-process
+    with its slot identity, so a slot llama-server has not released yet is
+    annotated instead of counted as live work. Each slot carries ``abandoned``
+    (bool), ``abandonment_reason`` and ``abandoned_session_id`` (both ``None``
+    when the slot is not abandoned) and ``abandoned_at_seconds_ago``; the
+    top-level payload carries ``local_abandoned_slots`` (count of annotated
+    slots). ``capacity_hint`` gains the additive value ``abandoned_busy`` —
+    occupied only by abandoned work — so ``saturated`` keeps meaning live,
+    proxy-owned decode work; a genuinely busy GPU is never reported ``idle``.
+    Consumers must treat any unrecognised hint value (this one included) as
+    busy, never as idle.
+
     Per-slot capacity (LP-0MVGDUVGE0024YAI, ``status_schema_version: 3``):
     each slot also carries ``owner_session_id`` and ``lease_state``
     (``generating`` | ``idle_leased`` | ``free``) so a dispatcher can tell a
@@ -582,18 +615,19 @@ async def get_llama_local_status(request: Request):
         if cm:
             try:
                 llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
-                # Prefer the discovered local child port: the router serializes
-                # /slots?model=... behind the busy child (LP-0MTDGBRPU003Z7KU,
-                # measured 5-7s vs 0.17s direct), which starved the shared
-                # client pool and made status polls report llama_server_running
-                # = false on ~76% of polls.
-                from proxy.router_helpers import _discover_local_child_port
-                # LP-0MTP1FQXH004JYEF: pass current_model so the lookup
-                # filters to the Qwen3 child, not the first spawn line
-                # (mxbai-embed) which yields idle n_ctx 256 slots.
-                child_port = _discover_local_child_port(srv, model=cm)
-                if child_port is not None:
-                    llama_port = child_port
+                # LP-0MVP7525P008RXMF AC2: route every proxy-initiated /slots
+                # query through the single shared resolver, which prefers the
+                # discovered model-child port over this router port (the
+                # router serializes /slots?model=... behind the busy child —
+                # 5-7s vs 0.17s direct — and converts a cancelled proxied poll
+                # into an HTTP 500). LP-0MTP1FQXH004JYEF: pass current_model so
+                # the lookup filters to the Qwen3 child, not the first spawn
+                # line (mxbai-embed).
+                from proxy.router_helpers import _resolve_local_slots_target
+
+                _, llama_port = _resolve_local_slots_target(
+                    srv, model=cm, router_port=llama_port
+                )
                 client = srv._http_client if srv._http_client else httpx.AsyncClient(timeout=5.0)
                 from proxy.observability import (
                     _last_slot_details_cache,
@@ -816,6 +850,13 @@ async def get_llama_local_status(request: Request):
     except Exception:
         capacity_hint = "idle"
 
+    # AC1 (LP-0MVRMI5HK00558TB): count the slots annotated as abandoned so a
+    # poll can see the ghost occupancy without re-deriving it from the array.
+    abandoned_slots = 0
+    for _slot in slots:
+        if isinstance(_slot, dict) and _slot.get("abandoned") is True:
+            abandoned_slots += 1
+
     # -- prefill gate state (LP-0MVGDUUV3001XFRJ AC4) ----------------------
     # Prefills are serialised by default (``local_max_concurrent_prefills``),
     # so a dispatcher needs to see how many prefills are in flight, what the
@@ -877,8 +918,9 @@ async def get_llama_local_status(request: Request):
         "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
         "capacity_hint": capacity_hint,
         "local_in_flight_requests": live_local_requests,
+        "local_abandoned_slots": abandoned_slots,
         "slots_detail_stale": detail_stale,
-        "status_schema_version": 3,
+        "status_schema_version": 4,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -934,14 +976,21 @@ async def get_llama_local_status(request: Request):
         # (``None`` when unresolvable — never a fabricated 0).
         "prefill_budget_seconds": prefill_eta.get("prefill_budget_seconds"),
         # Whether the local pool is genuinely working (LP-0MVGDUVGE0024YAI
-        # AC4): ``idle`` | ``prefill_bound`` | ``saturated``.
+        # AC4): ``idle`` | ``prefill_bound`` | ``saturated`` | ``abandoned_busy``
+        # (LP-0MVRMI5HK00558TB AC1 — occupied only by work the proxy abandoned).
         "capacity_hint": capacity_hint,
+        # Abandoned local work (LP-0MVRMI5HK00558TB AC1): how many slots the
+        # proxy has given up on and llama-server has not released yet. Additive
+        # — a consumer that ignores it behaves exactly as before.
+        "local_abandoned_slots": abandoned_slots,
         # Additive payload version (AC1): bumped when per-slot/top-level
         # capacity fields change meaning. Consumers that ignore it behave
         # exactly as before. v3 (LP-0MVKSXR4P001V0CM): ``capacity_hint`` is
         # reconciled with live dispatch state when slot detail is stale, and
         # ``slots_detail_stale`` / ``local_in_flight_requests`` are added.
-        "status_schema_version": 3,
+        # v4 (LP-0MVRMI5HK00558TB): per-slot abandonment annotation, the
+        # additive ``abandoned_busy`` hint and ``local_abandoned_slots``.
+        "status_schema_version": 4,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local
@@ -1026,8 +1075,12 @@ async def reserve_local_slot(request: Request):
         busy_slots, in_flight_prefills = provider_mod._local_gate_occupancy(
             config, current_concurrency[1] or 1, endpoint=None
         )
+        occupant_prefill_seconds = provider_mod._local_occupant_prefill_seconds(
+            endpoint=None, session_id=body.get("session_id")
+        )
     except Exception:
         busy_slots, in_flight_prefills = 0, 0
+        occupant_prefill_seconds = 0.0
 
     status, payload = admission_reserve.reserve(
         body,
@@ -1035,6 +1088,7 @@ async def reserve_local_slot(request: Request):
         model=cm,
         busy_slots=busy_slots,
         in_flight_prefills=in_flight_prefills,
+        occupant_prefill_seconds=occupant_prefill_seconds,
     )
     headers: dict[str, str] = {
         "Cache-Control": "no-store",
@@ -1436,6 +1490,15 @@ async def reload_config():
     srv = _srv()
     try:
         srv.config = srv.load_config()
+        # Re-resolve the prompt log so an edited ``prompt_log:`` section takes
+        # effect without a restart (LP-0MVP79OBP002G6Z1). Best-effort: a bad
+        # section must not fail the whole reload.
+        try:
+            from proxy import prompt_log
+
+            prompt_log.configure(srv.config, getattr(srv, "log_dir", None))
+        except Exception:
+            logger.warning("Prompt log reconfiguration failed", exc_info=True)
         logger.info("Configuration reloaded successfully via admin endpoint")
         return {"status": "success", "message": "Configuration reloaded"}
     except Exception as e:

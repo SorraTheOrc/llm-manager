@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""Admission -> first-byte conversion per new-token band.
+
+Baseline / verification harness for **LP-0MVS8T6F4006DGG3** (parent AC4: prove
+the contended-pricing fix against numbers instead of an inferred 85 % figure).
+This is a *pure log analyser*: it never changes proxy behaviour and never
+requires the proxy to be running. It scans an arbitrary window of the proxy log
+stream (``/var/log/llama-proxy``, live + rotated under either naming scheme,
+plain or ``.gz``) via :mod:`scripts.lib.proxy_logs`.
+
+Bands are on the **priced new (uncached) tokens** of a local dispatch:
+``<8k``, ``8k-20k``, ``20k-32k``, ``32k-64k``, ``>=64k``. The 20k/32k
+boundaries mirror ``local_admission_guard_eta_percentile_min_tokens`` and
+``CONSERVATIVE_MIN_TOKENS``.
+
+Per band the report carries:
+
+- admission verdicts (``admit`` / ``reject`` and the reject ``reason`` counts),
+- **conversion**: sessions with a ``local_admission_guard decision=admit``
+  that later emit ``dispatch_first_byte_ms`` (a first byte *without* an admit
+  is reported separately, never silently joined),
+- **abandoned queue waits**: ``contention_queue_fallback_after_queue`` count
+  and its share of the band's queued waits,
+- queue-wait seconds.
+
+The parser tolerates pre-change log shapes (no ``rate_bucket`` /
+``contended_samples``) and degrades a missing field to ``unknown`` rather than
+dropping the event, so the tool runs unchanged against today's log format and
+the post-change format.
+
+Rotation / decompression is delegated to ``scripts/lib/proxy_logs.py``. The
+line parsing is deliberately local and narrowly scoped: the
+``proxy-usage-analysis`` parser lives under ``.pi/`` agent infrastructure and
+is not imported from repo scripts.
+
+Usage::
+
+    scripts/prefill_admission_conversion.py \
+        --since "2026-10-19 00:00:00" --until "2026-10-20 00:00:00" --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+try:  # script executed directly (``python3 scripts/...``) vs imported as a module
+    from lib.proxy_logs import (
+        discover_proxy_log_files,
+        iter_proxy_log_lines,
+        parse_line_timestamp,
+    )
+except ImportError:  # pragma: no cover - import path for ``scripts`` on sys.path
+    from scripts.lib.proxy_logs import (  # type: ignore[no-redef]
+        discover_proxy_log_files,
+        iter_proxy_log_lines,
+        parse_line_timestamp,
+    )
+
+DEFAULT_LOG_DIR = Path("/var/log/llama-proxy")
+
+#: ``(label, lower_inclusive, upper_exclusive)``; ``None`` upper = unbounded.
+BANDS: tuple[tuple[str, int, int | None], ...] = (
+    ("<8k", 0, 8_000),
+    ("8k-20k", 8_000, 20_000),
+    ("20k-32k", 20_000, 32_000),
+    ("32k-64k", 32_000, 64_000),
+    (">=64k", 64_000, None),
+)
+
+UNKNOWN_BAND = "unknown"
+
+_KV_SESSION = re.compile(r"\bsession=([A-Za-z0-9_.:-]+)")
+_KV_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
+_KV_DECISION = re.compile(r"\bdecision=([A-Za-z_]+)")
+_KV_REASON = re.compile(r"\breason=([A-Za-z0-9_]+)")
+_KV_RATE_BUCKET = re.compile(r"\brate_bucket=([A-Za-z_]+)")
+_KV_CONTENDED_SAMPLES = re.compile(r"\bcontended_samples=(\d+)")
+_KV_QUEUED = re.compile(r"\bqueued_duration=([\d.]+)s")
+
+_TS_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d",
+)
+
+
+def band_for(new_tokens: int | None) -> str:
+    """Return the new-token band label for *new_tokens* (``unknown`` when absent)."""
+    if new_tokens is None:
+        return UNKNOWN_BAND
+    for label, lower, upper in BANDS:
+        if new_tokens >= lower and (upper is None or new_tokens < upper):
+            return label
+    return UNKNOWN_BAND
+
+
+def _first(pattern: re.Pattern[str], line: str) -> str | None:
+    match = pattern.search(line)
+    return match.group(1) if match else None
+
+
+def _int(pattern: re.Pattern[str], line: str) -> int | None:
+    raw = _first(pattern, line)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _float(pattern: re.Pattern[str], line: str) -> float | None:
+    raw = _first(pattern, line)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def parse_timestamp(value: str) -> datetime:
+    """Parse a CLI ``--since``/``--until`` timestamp (naive local time)."""
+    text = value.strip()
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        pass
+    for fmt in _TS_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    raise argparse.ArgumentTypeError(
+        f"invalid timestamp {value!r}; use 'YYYY-MM-DD HH:MM:SS' or ISO 8601"
+    )
+
+
+@dataclass
+class Event:
+    """One parsed log line relevant to the conversion report."""
+
+    kind: str  # admission | first_byte | queue_dispatch | queue_fallback
+    ts: datetime
+    session: str | None
+    new_tokens: int | None = None
+    decision: str | None = None
+    reason: str | None = None
+    rate_bucket: str | None = None
+    contended_samples: int | None = None
+    queued_seconds: float | None = None
+
+
+def parse_event(line: str, ts: datetime) -> Event | None:
+    """Parse one log line into an :class:`Event`, or ``None`` when irrelevant.
+
+    A missing field stays ``None`` rather than dropping the event, so log-format
+    drift degrades a metric instead of breaking the report.
+    """
+    if "local_admission_guard decision=" in line:
+        return Event(
+            kind="admission",
+            ts=ts,
+            session=_first(_KV_SESSION, line),
+            new_tokens=_int(_KV_NEW_TOKENS, line),
+            decision=_first(_KV_DECISION, line),
+            reason=_first(_KV_REASON, line),
+            rate_bucket=_first(_KV_RATE_BUCKET, line),
+            contended_samples=_int(_KV_CONTENDED_SAMPLES, line),
+        )
+    if "dispatch_first_byte_ms=" in line:
+        return Event(
+            kind="first_byte",
+            ts=ts,
+            session=_first(_KV_SESSION, line),
+            new_tokens=_int(_KV_NEW_TOKENS, line),
+        )
+    if "contention_queue_fallback_after_queue" in line:
+        return Event(
+            kind="queue_fallback",
+            ts=ts,
+            session=_first(_KV_SESSION, line),
+            reason=_first(_KV_REASON, line),
+            queued_seconds=_float(_KV_QUEUED, line),
+        )
+    if "contention_queue_dispatch" in line:
+        return Event(
+            kind="queue_dispatch",
+            ts=ts,
+            session=_first(_KV_SESSION, line),
+            queued_seconds=_float(_KV_QUEUED, line),
+        )
+    return None
+
+
+@dataclass
+class BandStats:
+    """Aggregated counters for one new-token band."""
+
+    admits: int = 0
+    rejects: int = 0
+    reject_reasons: dict[str, int] = field(default_factory=dict)
+    sessions_admitted: int = 0
+    converted: int = 0
+    unconverted: int = 0
+    queue_dispatched: int = 0
+    queue_abandoned: int = 0
+    queue_wait_seconds: float = 0.0
+    rate_buckets: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def queued_waits(self) -> int:
+        return self.queue_dispatched + self.queue_abandoned
+
+    @property
+    def conversion_share(self) -> float:
+        total = self.converted + self.unconverted
+        return (self.converted / total) if total else 0.0
+
+    @property
+    def abandoned_share(self) -> float:
+        return (self.queue_abandoned / self.queued_waits) if self.queued_waits else 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "admission_verdicts": {"admit": self.admits, "reject": self.rejects},
+            "reject_reasons": dict(sorted(self.reject_reasons.items())),
+            "rate_buckets": dict(sorted(self.rate_buckets.items())),
+            "sessions_admitted": self.sessions_admitted,
+            "converted": self.converted,
+            "unconverted": self.unconverted,
+            "conversion_share": round(self.conversion_share, 4),
+            "queued_waits": self.queued_waits,
+            "queue_dispatched": self.queue_dispatched,
+            "queue_abandoned": self.queue_abandoned,
+            "abandoned_share": round(self.abandoned_share, 4),
+            "queue_wait_seconds": round(self.queue_wait_seconds, 2),
+        }
+
+
+def _ordered_bands() -> list[str]:
+    return [label for label, _, _ in BANDS] + [UNKNOWN_BAND]
+
+
+def build_report(events: list[Event], *, files: list[str]) -> dict:
+    """Aggregate parsed *events* into the per-band conversion report."""
+    stats: dict[str, BandStats] = {label: BandStats() for label in _ordered_bands()}
+
+    def band_stats(new_tokens: int | None) -> BandStats:
+        return stats[band_for(new_tokens)]
+
+    # Event-level admission verdicts (a session may have several requests).
+    for event in events:
+        if event.kind != "admission":
+            continue
+        entry = band_stats(event.new_tokens)
+        bucket = event.rate_bucket or "unknown"
+        entry.rate_buckets[bucket] = entry.rate_buckets.get(bucket, 0) + 1
+        if event.decision == "admit":
+            entry.admits += 1
+        else:
+            entry.rejects += 1
+            reason = event.reason or "unknown"
+            entry.reject_reasons[reason] = entry.reject_reasons.get(reason, 0) + 1
+
+    # Session-level conversion join: an admit followed (at or after) by a
+    # first byte. Match on session; a first byte with no admit is reported
+    # separately rather than silently joined.
+    admits_by_session: dict[str, list[Event]] = {}
+    first_byte_by_session: dict[str, list[Event]] = {}
+    first_bytes_without_admit = 0
+    for event in events:
+        if event.session is None:
+            continue
+        if event.kind == "admission" and event.decision == "admit":
+            admits_by_session.setdefault(event.session, []).append(event)
+        elif event.kind == "first_byte":
+            first_byte_by_session.setdefault(event.session, []).append(event)
+
+    converted_sessions = 0
+    for session, admits in admits_by_session.items():
+        admits.sort(key=lambda e: e.ts)
+        first_byte = first_byte_by_session.get(session)
+        if not first_byte:
+            # Admitted but never converted: band by the earliest admit.
+            band_stats(admits[0].new_tokens).sessions_admitted += 1
+            band_stats(admits[0].new_tokens).unconverted += 1
+            continue
+        first_byte_ts = min(event.ts for event in first_byte)
+        # The band of the admit that preceded the first byte (else the earliest).
+        preceding = [event for event in admits if event.ts <= first_byte_ts] or admits
+        band_stats(preceding[-1].new_tokens).sessions_admitted += 1
+        band_stats(preceding[-1].new_tokens).converted += 1
+        converted_sessions += 1
+
+    for session in first_byte_by_session:
+        if session not in admits_by_session:
+            first_bytes_without_admit += 1
+
+    # Queue outcomes are banded by the session's admission evidence nearest at
+    # or before the queue event (the queue line itself carries no new_tokens).
+    admission_by_session: dict[str, list[Event]] = {}
+    for event in events:
+        if event.kind == "admission" and event.session is not None:
+            admission_by_session.setdefault(event.session, []).append(event)
+    for events_list in admission_by_session.values():
+        events_list.sort(key=lambda e: e.ts)
+
+    def band_for_queue(event: Event) -> BandStats:
+        candidates = admission_by_session.get(event.session or "", [])
+        preceding = [item for item in candidates if item.ts <= event.ts]
+        chosen = (preceding or candidates)[-1:] or []
+        return band_stats(chosen[0].new_tokens if chosen else None)
+
+    for event in events:
+        if event.kind == "queue_dispatch":
+            entry = band_for_queue(event)
+            entry.queue_dispatched += 1
+        elif event.kind == "queue_fallback":
+            entry = band_for_queue(event)
+            entry.queue_abandoned += 1
+        else:
+            continue
+        entry.queue_wait_seconds += event.queued_seconds or 0.0
+
+    return {
+        "bands": {
+            label: stats[label].to_dict()
+            for label in _ordered_bands()
+            if _band_has_data(stats[label])
+        },
+        "totals": _totals(stats),
+        "first_byte_without_admit": first_bytes_without_admit,
+        "converted_sessions": converted_sessions,
+        "log_files": files,
+    }
+
+
+def _band_has_data(entry: BandStats) -> bool:
+    return bool(
+        entry.admits
+        or entry.rejects
+        or entry.queued_waits
+        or entry.sessions_admitted
+    )
+
+
+def _totals(stats: dict[str, BandStats]) -> dict:
+    total = BandStats()
+    for entry in stats.values():
+        total.admits += entry.admits
+        total.rejects += entry.rejects
+        total.sessions_admitted += entry.sessions_admitted
+        total.converted += entry.converted
+        total.unconverted += entry.unconverted
+        total.queue_dispatched += entry.queue_dispatched
+        total.queue_abandoned += entry.queue_abandoned
+        total.queue_wait_seconds += entry.queue_wait_seconds
+    return total.to_dict()
+
+
+def collect(
+    log_dir: Path,
+    since: datetime,
+    until: datetime,
+) -> tuple[list[Event], list[str]]:
+    """Scan *log_dir* for events inside ``[since, until]``.
+
+    Returns ``(events, files)`` where *files* are the names of the log files
+    that contributed at least one in-window parsed event.
+    """
+    events: list[Event] = []
+    files: set[str] = set()
+    for path, line in iter_proxy_log_lines(log_dir):
+        ts = parse_line_timestamp(line)
+        if ts is None or ts < since or ts > until:
+            continue
+        event = parse_event(line, ts)
+        if event is None:
+            continue
+        events.append(event)
+        files.add(path.name)
+    return events, sorted(files)
+
+
+def analyse(log_dir: Path, since: datetime, until: datetime) -> dict:
+    """Return the full JSON report for the window."""
+    events, files = collect(log_dir, since, until)
+    report = build_report(events, files=files)
+    report["since"] = since.isoformat(sep=" ")
+    report["until"] = until.isoformat(sep=" ")
+    report["log_dir"] = str(log_dir)
+    report["log_files_scanned"] = [
+        path.name for path in discover_proxy_log_files(log_dir)
+    ]
+    return report
+
+
+def render_text(report: dict) -> str:
+    """Render a compact human-readable table for the report."""
+    lines = [
+        f"Window: {report['since']} -> {report['until']}",
+        f"Log dir: {report['log_dir']}",
+        f"Log files read: {len(report['log_files'])}",
+        "",
+        (
+            f"{'band':<10} {'admit':>6} {'reject':>7} {'conv':>5} {'unconv':>7} "
+            f"{'conv%':>6} {'queue':>6} {'aband':>6} {'aban%':>6} {'wait_s':>8}"
+        ),
+    ]
+    for label, entry in report["bands"].items():
+        lines.append(
+            f"{label:<10} {entry['admission_verdicts']['admit']:>6} "
+            f"{entry['admission_verdicts']['reject']:>7} {entry['converted']:>5} "
+            f"{entry['unconverted']:>7} {entry['conversion_share'] * 100:>5.1f}% "
+            f"{entry['queued_waits']:>6} {entry['queue_abandoned']:>6} "
+            f"{entry['abandoned_share'] * 100:>5.1f}% "
+            f"{entry['queue_wait_seconds']:>8.1f}"
+        )
+    lines.append("")
+    lines.append(
+        f"First byte without admit: {report['first_byte_without_admit']}"
+    )
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Per-new-token-band admission -> first-byte conversion and "
+            "abandoned-queue-wait share (LP-0MVS8T6F4006DGG3 baseline harness)."
+        )
+    )
+    parser.add_argument(
+        "--since", required=True, type=parse_timestamp, help="window start (inclusive)"
+    )
+    parser.add_argument(
+        "--until", required=True, type=parse_timestamp, help="window end (inclusive)"
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=DEFAULT_LOG_DIR,
+        help=f"proxy log directory (default: {DEFAULT_LOG_DIR})",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.until < args.since:
+        print("error: --until must not precede --since", file=sys.stderr)
+        return 2
+    report = analyse(args.log_dir, args.since, args.until)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(render_text(report))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(main())

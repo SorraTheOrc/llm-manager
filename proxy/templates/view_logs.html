@@ -246,6 +246,60 @@
         .src-badge.proxy { background:rgba(79,140,255,0.25); color:var(--accent); }
         .src-badge.llama { background:rgba(255,140,79,0.25); color:var(--accent-llama); }
 
+        /* Prompt Log tab — structured first-message record (LP-0MVP79OBP002G6Z1) */
+        .prompt-log-table {
+            width:100%;
+            border-collapse:collapse;
+            font-size:0.85rem;
+            background:var(--bg-card);
+            border:1px solid var(--border);
+            border-radius:8px;
+            overflow:hidden;
+        }
+        .prompt-log-table th, .prompt-log-table td {
+            text-align:left;
+            padding:0.45rem 0.6rem;
+            border-bottom:1px solid rgba(255,255,255,0.04);
+            vertical-align:top;
+        }
+        .prompt-log-table th {
+            background:rgba(255,255,255,0.04);
+            color:var(--text-secondary);
+            font-size:0.72rem;
+            text-transform:uppercase;
+            letter-spacing:0.04em;
+        }
+        .prompt-log-table td.time { white-space:nowrap; color:var(--text-secondary); font-family:monospace; font-size:0.78rem; }
+        .prompt-log-table td.session { font-family:monospace; font-size:0.78rem; max-width:16rem; overflow-wrap:anywhere; }
+        .prompt-log-table td.prompt { max-width:34rem; overflow-wrap:anywhere; }
+        .prompt-log-table tr:last-child td { border-bottom:none; }
+        .prompt-log-scroll { max-height: calc(100vh - 260px); overflow-y:auto; border-radius:8px; }
+        .prompt-text { color:var(--text-primary); }
+        .prompt-text.truncated::after { content:" …"; color:var(--log-warning); }
+        .routed-badge {
+            display:inline-block;
+            padding:0.15rem 0.5rem;
+            border-radius:4px;
+            font-size:0.72rem;
+            font-weight:600;
+            white-space:nowrap;
+            background:rgba(79,140,255,0.2);
+            color:var(--accent);
+        }
+        .routed-badge.error { background:rgba(220,60,70,0.22); color:#ff8a93; }
+        .routed-badge.remote { background:rgba(255,140,79,0.2); color:var(--accent-llama); }
+        .prompt-log-status { margin-bottom:0.5rem; font-size:0.85rem; }
+        .empty-hint {
+            color:var(--text-secondary);
+            font-style:italic;
+            font-size:0.9rem;
+            padding:1.5rem;
+            text-align:center;
+            border:1px dashed var(--border);
+            border-radius:8px;
+            background:var(--bg-card);
+        }
+
         .version-footer {
             position: fixed;
             bottom: 0;
@@ -274,10 +328,11 @@
       </div>
     </div>
 
-    <!-- Tabs: Slots (default) / All Logs (secondary) -->
+    <!-- Tabs: Slots (default) / All Logs / Prompt Log -->
     <div class="tabs">
       <button id="tabSlots" class="tab active" type="button">Slots</button>
       <button id="tabAllLogs" class="tab" type="button">All Logs</button>
+      <button id="tabPromptLog" class="tab" type="button">Prompt Log</button>
     </div>
 
     <!-- Slots tab: one live log section per slot reported by llama-server -->
@@ -356,10 +411,20 @@
       </div>
     </div>
 
-    <!-- Recording panel (hidden by default) -->
     <div id="recordingPanel" class="session-recording-panel" style="display:none;">
       <div id="recordingContent"></div>
     </div>
+    </div>
+
+    <!-- Prompt Log tab: structured first-message record (newest first) -->
+    <div id="tabPromptLogContent" class="tab-content" style="display:none;">
+      <div id="promptLogStatus" class="prompt-log-status muted"></div>
+      <div id="promptLogDisabled" class="empty-hint" style="display:none;">
+        The prompt log is disabled (<code>prompt_log.enabled: false</code>).
+      </div>
+      <div id="promptLogBody">
+        <div class="empty-hint">No prompt-log entries yet.</div>
+      </div>
     </div>
 
   </div>
@@ -1090,20 +1155,26 @@
     document.getElementById('llamaDownload').addEventListener('click', () => downloadLog(llamaLog, 'llama-server.log'));
 
     // ===================================================================
-    // Tabs: Slots (default) / All Logs (secondary)
+    // Tabs: Slots (default) / All Logs / Prompt Log
     // ===================================================================
 
     const tabSlotsBtn = document.getElementById('tabSlots');
     const tabAllLogsBtn = document.getElementById('tabAllLogs');
+    const tabPromptLogBtn = document.getElementById('tabPromptLog');
     const tabSlotsContent = document.getElementById('tabSlotsContent');
     const tabAllLogsContent = document.getElementById('tabAllLogsContent');
+    const tabPromptLogContent = document.getElementById('tabPromptLogContent');
 
     function switchTab(name) {
       const isSlots = name === 'slots';
+      const isAll = name === 'all';
+      const isPrompt = name === 'prompt';
       tabSlotsBtn.classList.toggle('active', isSlots);
-      tabAllLogsBtn.classList.toggle('active', !isSlots);
+      tabAllLogsBtn.classList.toggle('active', isAll);
+      tabPromptLogBtn.classList.toggle('active', isPrompt);
       tabSlotsContent.style.display = isSlots ? 'block' : 'none';
-      tabAllLogsContent.style.display = isSlots ? 'none' : 'block';
+      tabAllLogsContent.style.display = isAll ? 'block' : 'none';
+      tabPromptLogContent.style.display = isPrompt ? 'block' : 'none';
       if (isSlots) {
         // Reconnect slot streams (section DOM is preserved across switches)
         connectSlotEvents();
@@ -1113,17 +1184,26 @@
         // connection budget (LP-0MUJZHTCN006IZRW).
         disconnectProxy();
         disconnectLlama();
-      } else {
+        disconnectPromptLog();
+      } else if (isAll) {
         disconnectSlotEvents();
         disconnectSlotTails();
+        disconnectPromptLog();
         // Raw All Logs panes connect only while this tab is visible.
         connectProxy();
         connectLlama();
+      } else if (isPrompt) {
+        disconnectSlotEvents();
+        disconnectSlotTails();
+        disconnectProxy();
+        disconnectLlama();
+        connectPromptLog();
       }
     }
 
     tabSlotsBtn.addEventListener('click', () => switchTab('slots'));
     tabAllLogsBtn.addEventListener('click', () => switchTab('all'));
+    tabPromptLogBtn.addEventListener('click', () => switchTab('prompt'));
 
     // ===================================================================
     // Slots tab — one live log section per slot reported by llama-server
@@ -1429,6 +1509,106 @@
       });
     }
 
+    // ===================================================================
+    // Prompt Log tab — structured first-message record (LP-0MVP79OBP002G6Z1)
+    //
+    // Polls GET /logs/prompt-log while the tab is visible and renders the
+    // recent window newest-first. The endpoint never fails (missing/disabled
+    // prompt log -> empty/disabled payload), so the renderer only handles
+    // those two states plus the normal list.
+    // ===================================================================
+
+    const PROMPT_LOG_POLL_MS = 5000;
+    const PROMPT_PREVIEW_CHARS = 240;
+    let promptLogTimer = null;
+
+    function routedBadgeClass(routed) {
+      if (typeof routed === 'string' && routed.indexOf('error:') === 0) return 'error';
+      if (typeof routed === 'string' && routed.indexOf('local/') !== 0) return 'remote';
+      return '';
+    }
+
+    function renderPromptLog(payload) {
+      const body = document.getElementById('promptLogBody');
+      const status = document.getElementById('promptLogStatus');
+      const disabled = document.getElementById('promptLogDisabled');
+      const entries = Array.isArray(payload.entries) ? payload.entries : [];
+
+      if (payload.enabled === false) {
+        disabled.style.display = 'block';
+        body.style.display = 'none';
+        status.textContent = 'Prompt log disabled by configuration.';
+        return;
+      }
+      disabled.style.display = 'none';
+      body.style.display = 'block';
+
+      const counters = payload.counters || {};
+      status.textContent = entries.length + ' of up to ' + (payload.max_entries || 0) +
+        ' recent entr' + (entries.length === 1 ? 'y' : 'ies') +
+        ' (recorded=' + (counters.recorded || 0) +
+        ', errors=' + (counters.write_errors || 0) +
+        ', dropped=' + (counters.dropped || 0) + ')';
+
+      if (entries.length === 0) {
+        body.innerHTML = '<div class="empty-hint">No prompt-log entries yet.</div>';
+        return;
+      }
+
+      const rows = entries.map(function (e) {
+        const prompt = String(e.prompt || '');
+        const preview = prompt.length > PROMPT_PREVIEW_CHARS
+          ? prompt.slice(0, PROMPT_PREVIEW_CHARS) + '…'
+          : prompt;
+        const truncatedCls = (e.truncated === true || prompt.length > PROMPT_PREVIEW_CHARS)
+          ? ' truncated' : '';
+        const routed = String(e.routed_model || 'unknown');
+        const timestamp = String(e.timestamp || '');
+        const session = String(e.session_id || 'unknown');
+        const badgeCls = routedBadgeClass(routed);
+        return '<tr>' +
+          '<td class="time">' + escapeHtml(timestamp) + '</td>' +
+          '<td class="session" title="' + escapeHtml(session) + '">' + escapeHtml(session) + '</td>' +
+          '<td><span class="routed-badge ' + badgeCls + '" title="' + escapeHtml(routed) + '">' +
+            escapeHtml(routed) + '</span></td>' +
+          '<td class="prompt"><span class="prompt-text' + truncatedCls + '" ' +
+            'title="' + escapeHtml(prompt) + '">' + escapeHtml(preview) + '</span></td>' +
+          '</tr>';
+      }).join('');
+
+      body.innerHTML =
+        '<div class="prompt-log-scroll"><table class="prompt-log-table">' +
+        '<thead><tr><th>Time</th><th>Session</th><th>Routed model</th><th>Prompt (first non-system message)</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table></div>';
+    }
+
+    async function refreshPromptLog() {
+      try {
+        const resp = await fetch('/logs/prompt-log', { cache: 'no-store' });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const payload = await resp.json();
+        renderPromptLog(payload);
+      } catch (err) {
+        // Never tear down the tab polling on a transient failure; a stale
+        // list is better than a dead tab.
+        document.getElementById('promptLogStatus').textContent =
+          'Prompt log refresh failed: ' + err.message;
+      }
+    }
+
+    function connectPromptLog() {
+      if (promptLogTimer) return;
+      refreshPromptLog();
+      promptLogTimer = setInterval(refreshPromptLog, PROMPT_LOG_POLL_MS);
+    }
+
+    function disconnectPromptLog() {
+      if (promptLogTimer) {
+        clearInterval(promptLogTimer);
+        promptLogTimer = null;
+      }
+    }
+
     // Initialise — the Slots tab is the default, so the raw All Logs panes
     // connect lazily when that tab is first opened (LP-0MUJZHTCN006IZRW).
     loadSessions();
@@ -1441,6 +1621,7 @@
       if (pollTimer) clearInterval(pollTimer);
       if (slotEventSource) slotEventSource.close();
       disconnectSlotTails();
+      disconnectPromptLog();
     });
   </script>
 __LOG_VIEWER_SCRIPT__</body>

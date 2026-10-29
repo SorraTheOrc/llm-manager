@@ -46,6 +46,33 @@ def transport(app):
     return httpx.ASGITransport(app=app)
 
 
+@pytest.fixture(autouse=True)
+def _stub_slot_queries(monkeypatch):
+    """Keep this module hermetic: never perform live ``/slots`` HTTP calls.
+
+    ``proxy.server.current_model`` (and ``config``/``llama_process``) are
+    process globals that earlier tests in the same session leave set, so the
+    status handler's best-effort slot queries would otherwise hit whatever
+    backend happens to be listening on this machine — observed as >5 s
+    responses when a real giant prefill was in flight, failing the
+    concurrency/latency assertions in this module (LP-0MVP7525P008RXMF
+    push-gate failure). The handler behaviour under test (non-blocking,
+    well-formed payload) is unaffected by stubbing the upstream queries.
+    """
+    import proxy.observability as obs
+
+    async def _fake_query_slots(client, port, timeout=2.0, model=None, status_out=None):
+        if isinstance(status_out, dict):
+            status_out.update({"status": 200, "reason": None})
+        return 1, 3
+
+    async def _fake_query_detail(port, timeout=2.0, model=None, _client=None):
+        return [{"slot_id": 0, "is_processing": False, "n_decoded": 0}]
+
+    monkeypatch.setattr(obs, "_query_slots", _fake_query_slots)
+    monkeypatch.setattr(obs, "_query_slots_detail", _fake_query_detail)
+
+
 # ---------------------------------------------------------------------------
 # Model-switch integration tests
 # ---------------------------------------------------------------------------
@@ -224,7 +251,12 @@ async def test_status_query_timeout_fallback(transport):
 
 @pytest.mark.asyncio
 async def test_concurrent_status_requests(transport):
-    """Multiple concurrent GET /llama/local/status requests must all complete within 5 s."""
+    """Multiple concurrent GET /llama/local/status requests must all complete within 5 s.
+
+    The per-slot ``/slots`` queries are stubbed by the module-level autouse
+    fixture so this test measures handler concurrency, not a live backend
+    (LP-0MVP7525P008RXMF).
+    """
     from proxy import server as srv_module
 
     async with httpx.AsyncClient(

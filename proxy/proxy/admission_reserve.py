@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from proxy.prefill_eta import (
+    AdmissionDecision,
     evaluate_admission,
     suggested_retry_after_seconds,
 )
@@ -52,17 +53,250 @@ logger = logging.getLogger("llama-proxy")
 DEFAULT_RESERVE_TTL_SECONDS = 10
 MAX_RESERVE_TTL_SECONDS = 60
 
-#: ``X-Local-Preference`` values (AC2 of the work item).
-PREF_LOCAL_ONLY = "local-only"
+#: Canonical ``X-Local-Preference`` values (AC2 of the work item).
+#:
+#: ``local-preferred`` is the **canonical pin-local value**: the client asks
+#: that its request never be moved to a remote provider while local can serve
+#: it (the deferral/timing semantics live outside this vocabulary module).
+#: ``prefer-local`` (the default) may fall through; ``remote-ok`` strips the
+#: local route from the chain.
+PREF_LOCAL_PREFERRED = "local-preferred"
 PREF_PREFER_LOCAL = "prefer-local"
 PREF_REMOTE_OK = "remote-ok"
-VALID_PREFERENCES = (PREF_LOCAL_ONLY, PREF_PREFER_LOCAL, PREF_REMOTE_OK)
+
+#: Deployed wire value accepted as a **deprecated alias** of
+#: :data:`PREF_LOCAL_PREFERRED` (LP-0MVSHWYVE005MS16). It stays a first-class
+#: constant — never re-spelled at a call site — so the canonical set and the
+#: alias table cannot drift, and so an un-migrated client is normalised rather
+#: than demoted to ``prefer-local`` (which would let its request go remote).
+PREF_LOCAL_ONLY = "local-only"
+
+#: ``alias -> canonical value``. :func:`parse_preference` normalises through
+#: this table and logs one deprecation warning per request.
+LEGACY_PREFERENCE_ALIASES = {PREF_LOCAL_ONLY: PREF_LOCAL_PREFERRED}
+
+VALID_PREFERENCES = (PREF_LOCAL_PREFERRED, PREF_PREFER_LOCAL, PREF_REMOTE_OK)
 DEFAULT_PREFERENCE = PREF_PREFER_LOCAL
 
 HEADER_PREFERENCE = "x-local-preference"
 HEADER_RESERVATION = "x-local-reservation"
 HEADER_ROUTE = "X-Local-Route"
 HEADER_FALLBACK_REASON = "X-Local-Fallback-Reason"
+
+# ---------------------------------------------------------------------------
+# Canonical local-route-exit reason tokens (LP-0MVRMC1W6003MV3Y AC1)
+#
+# One table is the single source of truth for the ``X-Local-Fallback-Reason``
+# header, the ``reason=`` fields of the routing log lines and the refusal body
+# ``reason``: an exit that records anything else (or a new exit that records
+# nothing) fails loudly through :func:`canonical_local_fallback_reason`
+# instead of silently drifting between the three observability surfaces.
+#
+# The 2026-10-25 incident was exactly that drift: chain-resolution skips
+# (cooldown / quota / usage-limit reset / ``available_times`` window) and the
+# lease-active ``continue`` left no reason on the request, so a pin-local
+# refusal (the header was then spelled ``local-only``) reported the generic
+# ``local_route_unavailable`` instead of why local was unavailable.
+# ---------------------------------------------------------------------------
+
+#: Tokens a local-route exit may stamp on a request. Chain-resolution skips
+#: record the *local* token (a remote entry's cooldown must never mint a local
+#: fallback reason); the lease token names expected local contention; the last
+#: two are the structural refusals used when there was no local route at all
+#: or an exit left no reason behind.
+LOCAL_FALLBACK_REASON_TOKENS: frozenset[str] = frozenset(
+    {
+        # Chain resolution (``_resolve_provider_with_exclusions``).
+        "local_provider_cooldown",
+        "quota_hard_stop",
+        "usage_limit_reset_pending",
+        "outside_available_window",
+        # Lease-active continue: expected contention, not a provider failure.
+        "local_lease_active",
+        # Structural refusals.
+        "local_only_no_local_route",
+        "local_route_unavailable",
+    }
+)
+
+
+def canonical_local_fallback_reason(token: str) -> str:
+    """Return *token* when it belongs to the canonical reason-token table.
+
+    Raises:
+        ValueError: *token* is not a canonical reason token. Callers that add
+            a new local-route exit must canonicalise its token in
+            :data:`LOCAL_FALLBACK_REASON_TOKENS` first, so the header, the
+            ``reason=`` log field and the refusal body can never disagree.
+    """
+    if token not in LOCAL_FALLBACK_REASON_TOKENS:
+        raise ValueError(
+            f"unknown local-fallback reason token {token!r}; add it to "
+            "admission_reserve.LOCAL_FALLBACK_REASON_TOKENS to canonicalise it"
+        )
+    return token
+
+
+# ---------------------------------------------------------------------------
+# Local-capacity verdict: ``deferrable`` vs ``too_large`` (LP-0MVSHX47F003XEIZ)
+#
+# One authoritative classification of *why* the local route cannot serve a
+# request right now, so chain selection can distinguish "wait, a slot is
+# coming" from "this prompt will never fit local".
+#
+# **Single-implementation contract.** Both dispatch cycles and the pin-local
+# refusal builder call :func:`local_capacity_verdict`; ``provider.py`` must
+# never re-derive this split. A second copy in the dispatcher would be a
+# defect, not a local optimisation.
+#
+# The inputs are *already computed* by the caller — the
+# :class:`proxy.prefill_eta.AdmissionDecision` and/or the raw values below.
+# The helper never re-prices a prompt: no ETA maths, no token estimation and
+# no second sizing model (parent assumption A1). The reason tokens themselves
+# stay owned by ``prefill_eta`` and ``provider``; this module only classifies
+# them (naming them locally would otherwise need a ``provider`` import, which
+# would create an import cycle).
+# ---------------------------------------------------------------------------
+
+#: Verdict vocabulary — exactly these two values.
+CAPACITY_DEFERRABLE = "deferrable"
+CAPACITY_TOO_LARGE = "too_large"
+
+CAPACITY_VERDICTS: frozenset[str] = frozenset(
+    {CAPACITY_DEFERRABLE, CAPACITY_TOO_LARGE}
+)
+
+#: Reason tokens that describe a property of the request size: waiting cannot
+#: help, so the caller may compact or fall through to a remote provider.
+CAPACITY_TOO_LARGE_REASONS: frozenset[str] = frozenset(
+    {
+        # ``prefill_eta`` cold-prefill cap (``new_tokens > budget_tokens``).
+        "prefill_budget_exceeded",
+        # Local context/size skip (router/priority and provider hard cap).
+        "context_too_large",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CapacityVerdict:
+    """Why the local route cannot serve a request right now.
+
+    Attributes:
+        verdict: :data:`CAPACITY_DEFERRABLE` when the blocking reason is
+            temporal (waiting can help, stay pinned to local) or
+            :data:`CAPACITY_TOO_LARGE` when the request exceeds the local
+            serving envelope (waiting cannot help).
+        reason: The underlying reason token, preserved verbatim so the
+            refusal body and log line can report *why*.
+    """
+
+    verdict: str
+    reason: str | None = None
+
+
+def _as_int(value: Any) -> int | None:
+    """Return *value* as an ``int``, or ``None`` when it is not numeric."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _exceeds(value: Any, limit: Any) -> bool:
+    """True when *value* is greater than an enabled (positive) *limit*.
+
+    A missing value or a non-positive limit means the bound is disabled
+    (``local_cold_prefill_budget_tokens: 0`` / unset context limit), so the
+    comparison cannot fire and the verdict stays fail-safe.
+    """
+    value_int = _as_int(value)
+    limit_int = _as_int(limit)
+    if value_int is None or limit_int is None or limit_int <= 0:
+        return False
+    return value_int > limit_int
+
+
+def local_capacity_verdict(
+    decision: AdmissionDecision | None = None,
+    *,
+    reason: str | None = None,
+    new_tokens: int | None = None,
+    budget_tokens: int | None = None,
+    estimated_tokens: int | None = None,
+    context_limit: int | None = None,
+) -> CapacityVerdict:
+    """Classify why the local route cannot serve this request right now.
+
+    Classification rule table:
+
+    =================== =====================================================
+    Verdict             Trigger
+    =================== =====================================================
+    ``too_large``       The reason is ``prefill_budget_exceeded`` (the guard's
+                        cold-prefill cap) or ``context_too_large`` (the local
+                        context/size skip).
+    ``too_large``       ``new_tokens > budget_tokens`` with ``budget_tokens >
+                        0`` — the raw form of the cold-prefill cap.
+    ``too_large``       ``estimated_tokens > context_limit`` with
+                        ``context_limit > 0`` — the raw form of the size skip.
+    ``deferrable``      A temporal reason: ``eta_exceeds_budget``,
+                        ``eta_exceeds_budget_direct``,
+                        ``prefill_eta_exceeds_deadline``,
+                        ``prefill_eta_exceeds_safety_budget``,
+                        ``local_lease_active``, ``local_provider_cooldown``,
+                        occupancy/busy-slot (``slot_exhaustion``), queue-expiry
+                        (``fallback_after_queue``), ``model_loading`` or
+                        stall/cooldown (``prefill_thrash_cooldown``). Waiting
+                        can help, so the request stays pinned to local.
+    ``deferrable``      Fail safe: an unknown or absent reason, or missing
+                        inputs. Never promotes a fits-local request.
+    =================== =====================================================
+
+    Args:
+        decision: The guard decision already computed by
+            :func:`proxy.prefill_eta.evaluate_admission` (read-only input).
+        reason: A reason token for exits that produced no guard decision
+            (non-guard temporal exits and routing/context skips). Overrides
+            ``decision.reason`` when supplied.
+        new_tokens: New (uncached) tokens priced by the caller. Overrides
+            ``decision.new_tokens`` when supplied.
+        budget_tokens: The configured cold-prefill budget
+            (``server.local_cold_prefill_budget_tokens``). Overrides
+            ``decision.budget_tokens`` when supplied.
+        estimated_tokens: The caller's prompt estimate for the local context
+            bound (the same number the size skip compared).
+        context_limit: The local model's context limit; ``0``/``None``
+            disables the bound.
+
+    Returns:
+        :class:`CapacityVerdict` carrying the verdict and the reason token
+        (verbatim, or ``None`` when no reason was supplied).
+    """
+    resolved_reason = reason
+    if resolved_reason is None and decision is not None:
+        resolved_reason = decision.reason
+
+    resolved_new_tokens = new_tokens
+    if resolved_new_tokens is None and decision is not None:
+        resolved_new_tokens = decision.new_tokens
+
+    resolved_budget_tokens = budget_tokens
+    if resolved_budget_tokens is None and decision is not None:
+        resolved_budget_tokens = decision.budget_tokens
+
+    too_large = (
+        resolved_reason in CAPACITY_TOO_LARGE_REASONS
+        or _exceeds(resolved_new_tokens, resolved_budget_tokens)
+        or _exceeds(estimated_tokens, context_limit)
+    )
+
+    return CapacityVerdict(
+        verdict=CAPACITY_TOO_LARGE if too_large else CAPACITY_DEFERRABLE,
+        reason=resolved_reason,
+    )
 
 
 @dataclass(frozen=True)
@@ -145,11 +379,15 @@ def reserve(
     model: str | None = None,
     busy_slots: int = 0,
     in_flight_prefills: int = 0,
+    occupant_prefill_seconds: float | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Evaluate and (unless refused / dry-run) claim a reservation ticket.
 
     *busy_slots* / *in_flight_prefills* must come from the caller's occupancy
     probe so the verdict is identical to the admission guard's (AC7).
+    *occupant_prefill_seconds* is the same measured remaining occupant service
+    the guard prices (LP-0MVOFVCA2008DQVE) so the two verdicts cannot drift
+    for identical live state.
 
     Returns ``(status_code, payload)``.
     """
@@ -203,6 +441,7 @@ def reserve(
         priority,
         busy_slots=busy_slots,
         in_flight_prefills=in_flight_prefills,
+        occupant_prefill_seconds=occupant_prefill_seconds,
     )
 
     projected = (
@@ -412,6 +651,14 @@ def parse_preference(headers: Any) -> str:
 
     Missing or unknown values fall back to ``prefer-local`` — today's
     behaviour — so the header is purely additive (AC8).
+
+    The legacy wire value ``local-only`` is normalised to the canonical
+    ``local-preferred`` through :data:`LEGACY_PREFERENCE_ALIASES`, so a
+    deployed client keeps pin-local semantics instead of being demoted to
+    ``prefer-local`` (LP-0MVSHWYVE005MS16 AC1/AC5). Each normalisation logs one
+    ``WARNING`` naming both values; because both call sites cache the parsed
+    value on the request (``request._local_preference``), that is once per
+    request, not once per routing decision (AC2).
     """
     if not headers:
         return DEFAULT_PREFERENCE
@@ -424,8 +671,17 @@ def parse_preference(headers: Any) -> str:
         raw = None
     if not raw:
         return DEFAULT_PREFERENCE
-    value = str(raw).strip().lower()
+    requested = str(raw).strip().lower()
+    value = LEGACY_PREFERENCE_ALIASES.get(requested, requested)
     if value in VALID_PREFERENCES:
+        if value != requested:
+            logger.warning(
+                "deprecated X-Local-Preference=%r; treating it as %r — clients "
+                "should send %r",
+                requested,
+                value,
+                PREF_LOCAL_PREFERRED,
+            )
         return value
     logger.debug(
         "unknown X-Local-Preference=%r; using %r", raw, DEFAULT_PREFERENCE
@@ -464,7 +720,7 @@ def stamp_route_headers(
 
     Applied at the top-level entry point so every path (local success, remote
     success, refusal, exhaustion) is covered. A response that already carries
-    ``X-Local-Route`` (e.g. a local-only refusal) is left untouched.
+    ``X-Local-Route`` (e.g. a pin-local refusal) is left untouched.
     """
     try:
         headers = getattr(response, "headers", None)

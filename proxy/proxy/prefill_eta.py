@@ -54,6 +54,24 @@ calibrated estimate, never as "free soon". The change is fail-open by
 construction — it can only refuse admits that were already guaranteed to
 lose, never admit more than before.
 
+Occupant-evidence pricing (LP-0MVOFVCA2008DQVE)
+-----------------------------------------------
+
+The symmetric ``eta * busy_slots`` term prices an occupant at the
+*newcomer's* own prefill, which is structurally wrong for heterogeneous
+traffic: a small warm prompt behind a huge cold prefill was priced at a few
+seconds and admitted, then cancelled by ``local_prefill_deadline_seconds``
+with zero prefill progress (measured 2026-10-25: own ETA 7.1 s, elapsed
+120.1 s, ``progress=None alive=False in_flight=True``). The occupancy term
+therefore also accepts the **measured remaining service** of the in-flight
+prefills (from each occupant's live dispatch record; since
+LP-0MVS9YK9P006M1NQ this is re-priced from the occupant's remaining uncached
+*new tokens* at the contended rate rather than decayed from its optimistic
+admission ETA) and both bounds — the queue wait budget *and* the prefill
+deadline — are evaluated against the projected time to first byte. Measured
+evidence can only raise the symmetric floor, never lower it, so a missing
+record keeps today's behaviour byte-for-byte.
+
 Calibration is data-driven: every local dispatch records a sample
 ``(coded_tokens, new_tokens, dispatch_to_first_byte_ms)`` from the existing
 ``dispatch_first_byte_ms`` log line (service time, i.e. excluding the queue
@@ -147,6 +165,13 @@ CONSERVATIVE_MIN_TOKENS = 32_768
 #: reject. Below this the guard is inert (today's behaviour is unchanged).
 MIN_CALIBRATION_SAMPLES = 5
 
+#: Cached-ratio at or above which a prompt is "warm" and is priced on the
+#: pre-existing solitary path regardless of co-residency
+#: (LP-0MVS9Y76R004B5M8). Warm prompts complete quickly, so contention cannot
+#: make them unservable; keeping their pricing byte-for-byte unchanged is the
+#: parent scope guardrail (``cached_ratio`` / coded-token path untouched).
+WARM_CACHE_RATIO = 0.9
+
 #: Rolling-window size per ``(model, bucket)``.
 WINDOW_SAMPLES = 200
 
@@ -206,6 +231,15 @@ CLIENT_QUEUE_DEADLINE_SECONDS = 900.0
 
 #: ``(model, bucket) -> deque[(coded_tokens, new_tokens, service_ms)]``
 _samples: dict[tuple[str, int], deque] = {}
+#: Co-residency-aware calibration window (LP-0MVS9Y76R004B5M8): the same
+#: shape as ``_samples`` but populated only by dispatches observed while the
+#: gate was contended (``busy_slots >= 1`` at admission, or another session's
+#: live dispatch active at first-byte time). Prefill is serialised but
+#: prefill+decode batching is not: an occupant that is *generating* halves the
+#: newcomer's prefill throughput, so contended samples describe a materially
+#: slower distribution (measured 2-4x lower t/s). Pricing a contended
+#: admission from the mixed solitary-dominated window is therefore optimistic.
+_contended_samples: dict[tuple[str, int], deque] = {}
 #: ``model -> prompt_tokens`` of the most recent observed dispatch.
 _last_prompt_tokens: dict[str, int] = {}
 
@@ -213,6 +247,7 @@ _last_prompt_tokens: dict[str, int] = {}
 def reset() -> None:
     """Clear all calibration state (test helper / config reload)."""
     _samples.clear()
+    _contended_samples.clear()
     _last_prompt_tokens.clear()
 
 
@@ -475,12 +510,20 @@ def record_dispatch_sample(
     prompt_tokens: int,
     cached_ratio: float,
     service_ms: float,
+    contended: bool = False,
 ) -> None:
     """Record one observed local prefill (rolling calibration window).
 
     Called from the local streaming loop where ``dispatch_first_byte_ms`` is
     logged. *service_ms* is ``dispatch_to_first_byte_ms`` (queue wait already
     removed) so the fit describes prefill cost, not contention.
+
+    *contended* (LP-0MVS9Y76R004B5M8) tags the sample's co-residency: True
+    when the gate was observed contended at admission (``busy_slots >= 1``)
+    or another session's live dispatch record was active at first-byte time.
+    Contended samples are stored in their own per-``(model, bucket)`` window so
+    a contended admission can be priced from the co-residency distribution
+    instead of the solitary-dominated mixed window (measured 2-4x optimistic).
 
     Never raises: a metric path must not break a stream. Invalid inputs
     (missing model, non-positive tokens/time, non-finite values) are ignored.
@@ -505,10 +548,11 @@ def record_dispatch_sample(
         coded = int(tokens * ratio)
         new = max(0, tokens - coded)
         bucket = bucket_for(tokens)
-        window = _samples.get((model_key, bucket))
+        window_map = _contended_samples if contended else _samples
+        window = window_map.get((model_key, bucket))
         if window is None:
             window = deque(maxlen=WINDOW_SAMPLES)
-            _samples[(model_key, bucket)] = window
+            window_map[(model_key, bucket)] = window
         window.append((coded, new, ms))
         _last_prompt_tokens[model_key] = tokens
     except Exception:  # pragma: no cover - defensive
@@ -536,6 +580,15 @@ class Coefficients:
     percentile_ms: float | None = None
     floor_ms: float | None = None
     uplift: float = 1.0
+    #: Co-residency calibration bucket this estimate was priced from
+    #: (LP-0MVS9Y76R004B5M8): ``contended`` (priced from the contended
+    #: window), ``solitary`` (priced from the solitary window), or
+    #: ``solitary_fallback`` (a contended admission that fell back to the
+    #: solitary window because the contended window is not yet calibrated).
+    rate_bucket: str = "solitary"
+    #: Number of samples in the contended window for this ``(model, bucket)``
+    #: — always reported for diagnosis, independent of ``rate_bucket``.
+    contended_samples: int = 0
 
 
 def _solve(
@@ -601,26 +654,19 @@ def _median(values: list[float]) -> float:
     return _percentile(sorted(values), 50.0)
 
 
-def coefficients(model: str | None, prompt_tokens: int, config: dict | None = None
-                 ) -> Coefficients:
-    """Return the coefficients to use for *model* at *prompt_tokens*.
+def _fit_coefficients_from_samples(
+    samples: list[tuple[int, int, float]],
+    guard_cfg: GuardConfig,
+    prompt_tokens: int,
+    rate_bucket: str,
+    contended_samples: int,
+) -> Coefficients:
+    """Fit coefficients from a given sample list and compute diagnostics.
 
-    Falls back to the sane defaults (``calibrated=False``) when the bucket has
-    fewer than ``min_samples`` observations or the fit is unusable — in which
-    case the guard stays inert and today's behaviour is preserved.
-
-    For large prompts (``prompt_tokens >= CONSERVATIVE_MIN_TOKENS``) with a
-    configured ``eta_percentile > 0`` the fitted coefficients are uplifted so
-    the bucket's reference prompt prices at that percentile of the observed
-    first-byte times (never below its measured p50) — the conservative-ETA
-    change (LP-0MVKUKF65008D5UN). Smaller prompts and ``eta_percentile: 0``
-    (rollback) return the un-uplifted point estimate byte-for-byte.
+    Shared by :func:`coefficients` for both the solitary and contended windows
+    (LP-0MVS9Y76R004B5M8), so the conservative-uplift and clamp logic is
+    applied identically regardless of which window priced the estimate.
     """
-    guard_cfg = resolve_config(config)
-    model_key = str(model or "").strip()
-    bucket = bucket_for(prompt_tokens)
-    window = _samples.get((model_key, bucket))
-    samples = list(window) if window else []
     if len(samples) < guard_cfg.min_samples:
         return Coefficients(
             coded_ms_per_token=DEFAULT_CODED_MS_PER_TOKEN,
@@ -628,6 +674,8 @@ def coefficients(model: str | None, prompt_tokens: int, config: dict | None = No
             samples=len(samples),
             calibrated=False,
             eta_percentile=guard_cfg.eta_percentile,
+            rate_bucket=rate_bucket,
+            contended_samples=contended_samples,
         )
     fitted = _fit(samples)
     if fitted is None:
@@ -637,6 +685,8 @@ def coefficients(model: str | None, prompt_tokens: int, config: dict | None = No
             samples=len(samples),
             calibrated=False,
             eta_percentile=guard_cfg.eta_percentile,
+            rate_bucket=rate_bucket,
+            contended_samples=contended_samples,
         )
     fitted_coded, fitted_prefill = fitted
     coded_ms = (
@@ -704,6 +754,64 @@ def coefficients(model: str | None, prompt_tokens: int, config: dict | None = No
         percentile_ms=percentile_ms,
         floor_ms=floor_ms,
         uplift=uplift,
+        rate_bucket=rate_bucket,
+        contended_samples=contended_samples,
+    )
+
+
+def coefficients(
+    model: str | None,
+    prompt_tokens: int,
+    config: dict | None = None,
+    contended: bool = False,
+) -> Coefficients:
+    """Return the coefficients to use for *model* at *prompt_tokens*.
+
+    Falls back to the sane defaults (``calibrated=False``) when the bucket has
+    fewer than ``min_samples`` observations or the fit is unusable — in which
+    case the guard stays inert and today's behaviour is preserved.
+
+    For large prompts (``prompt_tokens >= CONSERVATIVE_MIN_TOKENS``) with a
+    configured ``eta_percentile > 0`` the fitted coefficients are uplifted so
+    the bucket's reference prompt prices at that percentile of the observed
+    first-byte times (never below its measured p50) — the conservative-ETA
+    change (LP-0MVKUKF65008D5UN). Smaller prompts and ``eta_percentile: 0``
+    (rollback) return the un-uplifted point estimate byte-for-byte.
+
+    *contended* (LP-0MVS9Y76R004B5M8) selects the co-residency window: when
+    True the estimate is priced from the contended window if it holds
+    ``min_samples`` observations, else it falls back to the solitary window
+    and reports ``rate_bucket='solitary_fallback'`` (never a guessed
+    multiplier). When False the estimate is priced from the solitary window
+    and reports ``rate_bucket='solitary'``. ``contended_samples`` always
+    reports the contended window's sample count for diagnosis.
+    """
+    guard_cfg = resolve_config(config)
+    model_key = str(model or "").strip()
+    bucket = bucket_for(prompt_tokens)
+    solitary_window = _samples.get((model_key, bucket))
+    solitary = list(solitary_window) if solitary_window else []
+    contended_window = _contended_samples.get((model_key, bucket))
+    contended_window_samples = list(contended_window) if contended_window else []
+    contended_count = len(contended_window_samples)
+    if contended:
+        if contended_count >= guard_cfg.min_samples:
+            return _fit_coefficients_from_samples(
+                contended_window_samples,
+                guard_cfg,
+                prompt_tokens,
+                "contended",
+                contended_count,
+            )
+        return _fit_coefficients_from_samples(
+            solitary,
+            guard_cfg,
+            prompt_tokens,
+            "solitary_fallback",
+            contended_count,
+        )
+    return _fit_coefficients_from_samples(
+        solitary, guard_cfg, prompt_tokens, "solitary", contended_count,
     )
 
 
@@ -712,6 +820,7 @@ def estimate_prefill_seconds(
     prompt_tokens: int,
     cached_ratio: float = 0.0,
     config: dict | None = None,
+    contended: bool = False,
 ) -> tuple[float, Coefficients]:
     """Estimated prefill seconds for *prompt_tokens* and its cache state.
 
@@ -721,6 +830,11 @@ def estimate_prefill_seconds(
     estimate is priced conservatively (see :func:`coefficients`): at or above
     the configured percentile of observed first-byte times, and never below
     the window's p50 (LP-0MVKUKF65008D5UN).
+
+    *contended* (LP-0MVS9Y76R004B5M8) prices from the contended co-residency
+    window when it is calibrated; it is threaded through to
+    :func:`coefficients` so the chosen bucket is reported on the returned
+    coefficients.
     """
     try:
         tokens = max(0, int(prompt_tokens or 0))
@@ -730,7 +844,7 @@ def estimate_prefill_seconds(
         ratio = min(1.0, max(0.0, float(cached_ratio)))
     except (TypeError, ValueError):
         ratio = 0.0
-    coeffs = coefficients(model, tokens, config)
+    coeffs = coefficients(model, tokens, config, contended=contended)
     coded = tokens * ratio
     new = tokens - coded
     seconds = (
@@ -768,6 +882,8 @@ def projected_wait_seconds(
     cached_ratio: float = 0.0,
     busy_slots: int = 0,
     config: dict | None = None,
+    occupant_prefill_seconds: float | None = None,
+    contended: bool | None = None,
 ) -> ProjectedWait:
     """Projected pre-gate wait for a newcomer behind *busy_slots* occupants.
 
@@ -781,13 +897,45 @@ def projected_wait_seconds(
     unobservable (``prefill_progress_unobservable``, ``alive=False``): an
     in-flight prefill must be treated as occupying the gate for at least the
     calibrated estimate, never as "free soon" (AC4).
+
+    *occupant_prefill_seconds* is the **measured** remaining service owed by
+    the in-flight prefills, projected from each occupant's own admission
+    evidence (LP-0MVOFVCA2008DQVE). It can only raise the occupancy term above
+    the symmetric floor, never lower it: pricing the occupant at the
+    newcomer's own ETA is structurally wrong when a small warm prompt queues
+    behind a huge cold prefill (measured 2026-10-25: an own ETA of 7.1 s
+    waited 120 s behind a single occupant and was cancelled at the deadline).
+    ``None``/unparseable values leave the floor verdict byte-for-byte
+    unchanged, so every caller that does not probe the live records keeps
+    today's behaviour.
+
+    *contended* (LP-0MVS9Y76R004B5M8) selects the co-residency calibration
+    window: when True the newcomer's own prefill is priced from the contended
+    window (it is behind an occupied gate); when False/None from the solitary
+    window. The default ``None`` keeps every existing caller byte-for-byte on
+    the solitary window. Warm prompts (``cached_ratio >= WARM_CACHE_RATIO``)
+    are always priced on the solitary path so their pricing is unchanged by
+    co-residency (parent scope guardrail).
     """
-    eta, coeffs = estimate_prefill_seconds(model, prompt_tokens, cached_ratio, config)
+    try:
+        ratio_float = min(1.0, max(0.0, float(cached_ratio or 0.0)))
+    except (TypeError, ValueError):
+        ratio_float = 0.0
+    # Warm prompts stay on the solitary path byte-for-byte (AC5).
+    use_contended = bool(contended) and ratio_float < WARM_CACHE_RATIO
+    eta, coeffs = estimate_prefill_seconds(
+        model, prompt_tokens, cached_ratio, config, contended=use_contended
+    )
     try:
         busy = max(0, int(busy_slots or 0))
     except (TypeError, ValueError):
         busy = 0
     occupancy = eta * busy
+    try:
+        measured_occupancy = max(0.0, float(occupant_prefill_seconds or 0.0))
+    except (TypeError, ValueError):
+        measured_occupancy = 0.0
+    occupancy = max(occupancy, measured_occupancy)
     return ProjectedWait(
         own_prefill_seconds=eta,
         occupancy_seconds=occupancy,
@@ -828,6 +976,13 @@ class AdmissionDecision:
     #: ``budget_safety_fraction * prefill_deadline_seconds`` — the ETA a
     #: budgeted prompt must fit inside (0 = bound disabled).
     deadline_budget_seconds: float = 0.0
+    #: Co-residency calibration bucket used for this decision's own-prefill
+    #: term (LP-0MVS9Y76R004B5M8): ``contended`` | ``solitary`` |
+    #: ``solitary_fallback``.
+    rate_bucket: str = "solitary"
+    #: Samples in the contended window for the priced ``(model, bucket)`` at
+    #: decision time (always reported; 0 when none observed).
+    contended_samples: int = 0
 
     @property
     def active(self) -> bool:
@@ -875,6 +1030,8 @@ def evaluate_admission(
     *,
     busy_slots: int = 0,
     in_flight_prefills: int = 0,
+    occupant_prefill_seconds: float | None = None,
+    contended: bool | None = None,
 ) -> AdmissionDecision:
     """Decide whether a local dispatch can finish inside the wait budget.
 
@@ -885,16 +1042,27 @@ def evaluate_admission(
        gate, :func:`projected_wait_seconds`) is compared against the wait
        budget (``contention_queue_max_wait_seconds``).
 
-    2. **Deadline bound (LP-0MVKUKEU80022C3U).** The projected first-byte
-       ETA (own-prefill term only, no occupancy) is compared against
-       ``local_prefill_deadline_seconds`` (default 90 s). When the ETA
-       exceeds the deadline the guard refuses so we never start a prefill
-       that the deadline will later cancel.
+    2. **Deadline bound (LP-0MVKUKEU80022C3U).** The projected time to first
+       byte — own-prefill ETA plus the occupied gate — is compared against
+       ``local_prefill_deadline_seconds`` (default 120 s). When it would
+       exceed the deadline the guard refuses so we never start a dispatch
+       that the deadline will later cancel. Including the occupancy term is
+       the LP-0MVOFVCA2008DQVE residual fix: a warm 7 s prompt admitted
+       behind a 120 s occupant was cancelled with zero prefill progress.
 
     *busy_slots* is the number of occupied gate slots ahead of this request
     (``max(generating concurrency, prefills in flight)``); *in_flight_prefills*
     is carried for the decision log so an unobservable-progress gate is
-    diagnosable (AC4/AC6).
+    diagnosable (AC4/AC6). *occupant_prefill_seconds* is the measured
+    remaining prefill service read from the occupants' own dispatch records
+    (raises, never lowers, the symmetric occupancy floor).
+
+    *contended* (LP-0MVS9Y76R004B5M8) selects the co-residency calibration
+    window for the own-prefill term: ``None`` (default) derives it from the
+    admission — ``busy_slots >= 1`` prices from the contended window when it
+    is calibrated and falls back to the solitary window when it is not
+    (``rate_bucket=contended|solitary|solitary_fallback`` on the decision);
+    an explicit value overrides the derivation.
 
     Fail-open by construction: the guard is inert (``admit=True``) when the
     policy is ``off``, the priority never queues, the bucket is not yet
@@ -922,6 +1090,11 @@ def evaluate_admission(
     def _inert(reason: str, eta: float | None = None, budget: float | None = None,
                coeffs: Coefficients | None = None,
                projected: ProjectedWait | None = None) -> AdmissionDecision:
+        adjudicated = (
+            coeffs
+            if coeffs is not None
+            else (projected.coefficients if projected else None)
+        )
         return AdmissionDecision(
             admit=True,
             reason=reason,
@@ -942,6 +1115,10 @@ def evaluate_admission(
             new_tokens=new_tokens,
             budget_tokens=guard_cfg.cold_prefill_budget_tokens,
             deadline_budget_seconds=_deadline_budget_seconds(guard_cfg),
+            rate_bucket=adjudicated.rate_bucket if adjudicated else "solitary",
+            contended_samples=(
+                adjudicated.contended_samples if adjudicated else 0
+            ),
         )
 
     if guard_cfg.policy == POLICY_OFF:
@@ -975,8 +1152,18 @@ def evaluate_admission(
     budget = wait_budget_seconds(config, priority)
     if budget <= 0:
         return _inert("no_budget")
+    # Co-residency selector (LP-0MVS9Y76R004B5M8): a contended admission
+    # (occupied gate ahead) must be priced from the contended calibration
+    # window when calibrated; an explicit override wins over the derivation.
+    _contended = occupancy >= 1 if contended is None else bool(contended)
     projected = projected_wait_seconds(
-        model, prompt_tokens, cached_ratio, occupancy, config
+        model,
+        prompt_tokens,
+        cached_ratio,
+        occupancy,
+        config,
+        occupant_prefill_seconds=occupant_prefill_seconds,
+        contended=_contended,
     )
     coeffs = projected.coefficients
     eta = projected.own_prefill_seconds
@@ -986,12 +1173,16 @@ def evaluate_admission(
     reason = "within_budget" if within else "eta_exceeds_budget"
     admit = within or guard_cfg.policy == POLICY_OBSERVE
     # Second independent bound: deadline check (LP-0MVKUKEU80022C3U).
-    # If the projected first-byte ETA >= the prefill deadline we refuse
-    # *now* so we never start a prefill the deadline will later cancel.
+    # If the projected TIME TO FIRST BYTE (own prefill + the occupied gate
+    # ahead of it) reaches the prefill deadline we refuse *now* so we never
+    # start a dispatch the deadline will later cancel. The own-prefill term
+    # alone is not the wait a newcomer faces: with prefills serialised the
+    # occupant's remaining prefill is spent inside the same deadline window
+    # (LP-0MVOFVCA2008DQVE residual, measured 2026-10-25).
     # The deadline is the dominant reason when it fires (AC1) and, like
     # the budget bound, honours ``observe`` (log but never refuse).
     deadline = guard_cfg.prefill_deadline_seconds
-    if deadline > 0 and eta >= deadline:
+    if deadline > 0 and projected.projected_seconds >= deadline:
         reason = "prefill_eta_exceeds_deadline"
         admit = guard_cfg.policy == POLICY_OBSERVE
     # Third bound, deadline-RELATIVE (LP-0MVN4LBZ500281Z7 / parent AC3): when a
@@ -1019,6 +1210,8 @@ def evaluate_admission(
         new_tokens=new_tokens,
         budget_tokens=guard_cfg.cold_prefill_budget_tokens,
         deadline_budget_seconds=deadline_budget,
+        rate_bucket=coeffs.rate_bucket,
+        contended_samples=coeffs.contended_samples,
     )
 
 
@@ -1114,7 +1307,14 @@ def status_estimate(
             busy = max(0, total - available)
         else:
             busy = max(0, active)
-        queue_eta = projected_wait_seconds(model, tokens, 0.0, busy, config)
+        # Co-residency (LP-0MVS9Y76R004B5M8): a newcomer behind an occupied
+        # gate is itself contended, so the own-prefill term is priced from the
+        # contended window when it is calibrated (exactly as the admission
+        # guard derives it from ``busy_slots >= 1``), so the published ETA and
+        # the enforced verdict cannot drift apart.
+        queue_eta = projected_wait_seconds(
+            model, tokens, 0.0, busy, config, contended=busy >= 1
+        )
         eta = queue_eta.own_prefill_seconds
         coeffs = queue_eta.coefficients
         # The admission guard's own budget (the contention-queue max wait, 0
@@ -1134,6 +1334,8 @@ def status_estimate(
             "prefill_eta_reference_tokens": tokens,
             "prefill_eta_samples": coeffs.samples,
             "prefill_eta_calibrated": coeffs.calibrated,
+            "prefill_eta_rate_bucket": coeffs.rate_bucket,
+            "prefill_eta_contended_samples": coeffs.contended_samples,
             "prefill_budget_seconds": budget_published,
         }
     except Exception:  # pragma: no cover - defensive
@@ -1146,6 +1348,8 @@ def status_estimate(
             "prefill_eta_reference_tokens": None,
             "prefill_eta_samples": 0,
             "prefill_eta_calibrated": False,
+            "prefill_eta_rate_bucket": "solitary",
+            "prefill_eta_contended_samples": 0,
             "prefill_budget_seconds": None,
         }
 
@@ -1250,6 +1454,7 @@ def record_guard_decision(
         "eta_prefill_s=%.1f eta_occupancy_s=%.1f projected_wait_s=%.1f "
         "budget_s=%.1f deadline_s=%.1f deadline_budget_s=%.1f "
         "new_tokens=%d budget_tokens=%d "
+        "rate_bucket=%s contended_samples=%d "
         "busy_slots=%d in_flight_prefills=%d "
         "free_slot=%s priority=%s policy=%s model=%s samples=%d provider=%s "
         "session=%s",
@@ -1264,6 +1469,8 @@ def record_guard_decision(
         float(decision.deadline_budget_seconds or 0.0),
         int(decision.new_tokens or 0),
         int(decision.budget_tokens or 0),
+        decision.rate_bucket or "solitary",
+        int(decision.contended_samples or 0),
         int(decision.busy_slots or 0),
         int(decision.in_flight_prefills or 0),
         "true" if free_slot else "false",

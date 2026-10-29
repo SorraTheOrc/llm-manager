@@ -78,6 +78,23 @@ Outputs written to:
   hold-cycle routing-skip re-emissions (`chain_hold_cycle>0`) in the
   window, excluded from every demand/local-skip counter
   (LP-0MUIEO6IP0030CT3): `jq .hold_cycle_routing_skip_events`.
+- `--json` summary field `local_turn_coverage` — the deterministic local-turn
+  coverage behind the report's `## Local model usage by session` section
+  (LP-0MVM93DE6009JGBU): `{"sessions_in_window": N,
+  "sessions_with_local": M, "percentiles": [{"label": "P10",
+  "local_turns": f, "remote_turns": f, "local_turn_pct": f,
+  "context_at_fallback": i|null}, …], "total": {"local_turns": N,
+  "remote_turns": N, "local_turn_pct": f, "context_at_fallback": i|null,
+  "answered_turns": N, "unanswered_turns": N, "context_samples": N},
+  "reasons": [{"reason": r, "sessions": N,
+  "pct_of_sessions_with_local": f}, …], "sessions": [{…per-session row
+  with `reason`, `context_at_fallback` and `context_at_fallback_source`…}],
+  "notes": {"sessions_with_fallback": N,
+  "declined_before_local_turn": N, "context_fallback_sessions": N,
+  "context_fallback_before_local_turn": N, "rate_limited_sessions": N}}`.
+  A `% local turns` of 100 means the session never used remote; a null
+  `context_at_fallback` means the logs carried no token evidence (the report
+  renders `n/a`, never an estimate).
 - `--json` summary field `provider_context_skips` — provider context-ceiling
   skips (LP-0MVMBM1Y3001TPRT): `{"total": N, "share_of_skips": f,
   "standard": N, "low": N, "by_provider": {provider: count},
@@ -103,12 +120,98 @@ Outputs written to:
   - `wasted_prefill_tokens` — sum of `new_tokens` over
     `local_eviction_after_acceptance` events whose `reason` is
     `prefill_deadline`: tokens the GPU computed for a dispatch then abandoned
-    before its first byte. Other eviction reasons are excluded.
+    before its first byte. Other eviction reasons are excluded. The summed
+    `new_tokens` are the **admission-time** values the routing decision priced
+    and the dispatch record stored verbatim (LP-0MVODJ3P6000AIUM AC5): the
+    budget's own numbers, never a recompute at eviction time. Records without
+    an admission snapshot contribute 0 (explicit `unknown` marker), so the
+    figure cannot over-account a re-priced prompt. In particular
+    `measured_cache_deficit` (below) is **excluded**: that dispatch was
+    released early, so its tokens are not a deadline cancellation and would
+    over-state this figure.
+
+- **Measured-cache evictions (Option D, LP-0MVR7IN0O000DPXN / guardian
+  LP-0MVR7K74S001PBNI).** A dispatch whose *measured* `prompt_progress`
+  (`total`/`cache`) shows a re-prefill far above the admission-priced
+  `new_tokens` is released **before** the 120 s deadline and logged
+  `local_eviction_after_acceptance ... reason=measured_cache_deficit` with the
+  measured/priced token fields. It is attributable as its own reason, distinct
+  from `prefill_deadline`:
+  - parsed verbatim (never folded into the tenancy `local_eviction` kind nor
+    into the deadline class);
+  - counted in `local_evictions_after_acceptance_by_reason` under the
+    `measured_cache_deficit` key, so a post-deploy window can compare it with
+    the residual `prefill_deadline` count;
+  - listed as its own row in the report's **Post-acceptance evictions**
+    breakdown; the event's admission-priced `new_tokens` stays readable on the
+    event (and in the raw log line) for the wasted-token comparison, while
+    `wasted_prefill_tokens` continues to mean deadline cancellations only.
   - `provider_exhausted_errors` — `All providers exhausted` lines
     (client-visible chain failures); `upstream_status_503_errors` —
     `upstream_http_error` events with `status == 503` (provider-side 5xx).
     The two are separate on purpose: a provider can return 503 while another
     still serves the request.
+- **Contention-prediction keys (LP-0MVGR2OXT0096OGK).** Three additive keys
+  measure whether the payload's `lease_state` / `prefill_eta_seconds` signals
+  predict real local contention; the report renders the same figures in a
+  **Local contention prediction vs reality** section (M1/M2/M3).
+  - `denial_attribution` — M1: each `local_dispatch_denied` (which carries no
+    `lease_state`) is joined to its decision-block `local_admission_guard`
+    `reject` record (nearest within `join_window_seconds`, ±60 s, inclusive) and
+    the pool state at denial time is derived from the guard's measured
+    `busy_slots` / `in_flight_prefills` fields: **`idle_leased`** (no slot
+    decoding, no prefill in flight — the idle-lease false-busy case),
+    **`prefill_bound`** (≥1 prefill running; serialised prefills make it the
+    gating resource), **`saturated`** (slots decoding, no prefill), or
+    **`unknown`** (legacy guard line without the fields). Entries: `denials`,
+    `attributed`, `unattributed` (no guard in the 60 s block — never guessed),
+    `by_verdict`, `by_guard_reason`, `idle_leased_share_pct`, `per_hour`
+    (per absolute hour: `denials`, the four verdict columns,
+    `unattributed`, `busy_seconds`, `busy_pct`), `capacity_hint` (the payload's
+    own claim over `status_request` polls), and `verdict`
+    (`matches_reality` / `does_not_match_reality` / `inconclusive`: the signal
+    does not match when ≥50% of attributed denials fired with the pool measured
+    idle).
+  - `prefill_eta_error` — M3: predicted `prefill_eta_seconds` (from
+    `status_request` polls) vs observed llama-server `prompt eval time`
+    durations, quantile-matched: `predicted` / `observed` (`samples`, `p50`,
+    `p90`), `error_p50` / `error_p90` (predicted − observed, seconds),
+    `relative_error_p50_pct` / `relative_error_p90_pct`, `tolerance_pct` (25)
+    and `verdict` (`matches_reality` within tolerance, `over_predicts` /
+    `under_predicts`, `inconclusive` when either side has no samples).
+  - `status_capacity_hint` — the same `capacity_hint` distribution as a
+    top-level key (`{idle: n, prefill_bound: n, saturated: n}`), so
+    `jq .status_capacity_hint` answers "what did the payload claim while the
+    denials happened?" without parsing Markdown.
+- **Contended-pricing split keys (LP-0MVS9YKHL007UBBZ, parent
+  LP-0MVS8T6F4006DGG3).** Two additive keys split the same
+  `local_admission_reject` / `local_admission_admit` verdicts, so a regression
+  to the optimistic rate is visible in the standard report instead of
+  requiring ad-hoc log archaeology. Both are **omitted-when-empty** maps (a
+  bucket/band with no verdict is absent, never zero-filled):
+  - `local_admission_by_rate_bucket` — `{rate_bucket: {"admit": n, "reject":
+    n}}` over the `rate_bucket=` the prefill ETA was calibrated from:
+    `contended` (priced against the contended window), `solitary` (the history
+    this parser always saw), `solitary_fallback` (the contended window was
+    uncalibrated, so the solitary window was used — the deliberately
+    residual-optimistic case) and `unknown` (a pre-change line with no
+    `rate_bucket` field at all). A high `solitary_fallback` share is the
+    signal that the contended window still needs samples.
+  - `local_admission_by_token_band` — `{band: {"admit": n, "reject": n,
+    "converted": n, "unconverted": n, "conversion_share": f|null}}` over the
+    **admission-conversion harness's** bands
+    (`scripts/prefill_admission_conversion.py`: `<8k`, `8k-20k`, `20k-32k`,
+    `32k-64k`, `>=64k`, plus `unknown` for a line with no priced
+    `new_tokens`), so the report's conversion numbers are directly comparable
+    with the harness's baseline/post-change measurement. `converted` /
+    `unconverted` are **session-level**: a session with `decision=admit` is
+    converted when a **local** first byte (`dispatch_first_byte_ms`) follows
+    it; a remote first byte never converts a local admission, and a band with
+    no admitted session reports `conversion_share: null` rather than `0.0`.
+  The parsed `local_admission_guard` fields behind these keys —
+  `rate_bucket`, `contended_samples`, `eta_occupancy_s` and the priced
+  `new_tokens` — are likewise additive: a pre-change line leaves every one of
+  them `None` and parses exactly as before.
 - `report.md` — the aggregate report: a single **Session summary** table
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
@@ -170,7 +273,23 @@ Outputs written to:
   can audit the availability verdict instead of trusting it, **Local model
   utilization** (busy time %, idle time, streams served, avg
   stream duration, total compute, avg/peak concurrency,
-  fast/cheap split — when the window has local traffic) followed by
+  fast/cheap split, plus the hardware-side **GPU busy — power-based** row when
+  Prometheus is reachable — see [GPU busy time from power](#gpu-busy-time-from-power-prometheus)
+  — when the window has local traffic) followed by
+  **Local contention prediction vs reality** (LP-0MVGR2OXT0096OGK, when the
+  window has a denial or status poll): M1 per-hour denial attribution by
+  derived pool state plus the guard-reason and `capacity_hint` splits; M2 the
+  window's denials-per-hour and busy fraction compared with the pre-change
+  baseline (2,641 denials / 24 h at 29.3% busy); M3 predicted-vs-observed
+  prefill duration at p50/p90 with the signed and relative error; and one
+  explicit matches/does-not-match-reality verdict for the denial signal and
+  one for the prefill ETA), then
+  **Admission verdicts by rate bucket and prompt band** (LP-0MVS9YKHL007UBBZ,
+  when the window has any `local_admission_guard` decision): the admit/reject
+  verdicts split by the pricing `rate_bucket` (`contended` / `solitary` /
+  `solitary_fallback` / `unknown`) and by the conversion harness's new-token
+  bands, with per-band admission → local first-byte conversion counts
+  (buckets/bands with no verdict are omitted), then
   **Prefill vs decode** (phase slot-time split: prefill dispatch → first byte
   vs decode first byte → finish, each as slot-seconds and % of combined phase
   slot time summing to 100%, with p10/p50/p90/max per phase and unknown-stream
@@ -202,8 +321,65 @@ start/avg/max context size, avg/max response size, initial model assignment
 (provider + model), time of move to a remote model (empty if never fell
 back), fallback reason (empty if never fell back), bucket, slots, ctx size
 (per-period context of the profile active for that session), local/remote
-request counts, dispatch denials, decode tok/s (derived from local
+request counts, local turns answered/unanswered, per-session `% local turns`,
+context size at fallback with its provenance
+(`routing_skip` / `remote_stream` / `session_context`, empty when no token
+evidence exists), dispatch denials, decode tok/s (derived from local
 completion tokens ÷ local active span; empty when not derivable).
+
+### Local-turn coverage (`## Local model usage by session`)
+
+Since LP-0MVM93DE6009JGBU the report carries a per-session local-usage
+section — which sessions actually used the local model, how many turns it
+answered, what share of each session's turns were local, and why each session
+moved to remote. It is rendered from data the pipeline already collects (no
+new log source):
+
+```text
+## Local model usage by session
+
+| Percentile | # turns local | # turns remote | % local turns | Context size at fallback |
+| P10 | … |
+| P50 | … |
+| P90 | … |
+| Total | … |
+
+### Fallback reason distribution
+| Reason | Sessions | % of sessions-with-local |
+
+### Per-session coverage
+| Session ID | # turns local | # turns remote | % local turns |
+  Reason for remote fallback | Context size at fallback |
+```
+
+Operational definitions:
+
+- **Covered session** — at least one local `Stream started` inside the
+  window. A local turn counts as *answered* when a local, non-error
+  `Stream finished` pairs with it (FIFO, the busy/TTFT pairing convention); a
+  routed-but-unanswered turn (error, abort, log gap) is counted and flagged
+  in the local column — never dropped.
+- **`% local turns`** = `local / (local + remote) × 100` per session, so a
+  session that never used remote reads 100 %. The summary rows are
+  P10/P50/P90 (linear interpolation) over the covered sessions; the total row
+  sums the turn columns, recomputes the share from those sums and shows the
+  mean context-at-fallback of the sessions with token data.
+- **Fallback reason** — the session's own attributed reason
+  (`fallback_reason`), else its attribution state: `no_remote_fallback` (never
+  used remote) or `unattributed` (no own evidence). A reason is never
+  inherited from a neighbouring session (LP-0MVMBMSWR0036RES).
+- **Context size at fallback** — the session's `routing_skip_local
+  estimated_tokens` at/before its recorded fallback, else the first remote
+  `Stream finished` prompt tokens, else its own `start_context_size` /
+  `max_context_size`. Sessions with no token evidence render `n/a` plus a
+  named limitation; the report never fabricates an estimate.
+
+Sorting: the summary percentile rows ascend (P10 → P90); the per-session table
+is sorted by `# turns local` **descending** (more local turns is the goal),
+then by session id. When no session used local, the section renders the named
+line `No session in the window used the local model.` instead of empty tables.
+The same derivation is exposed as the `local_turn_coverage` `--json` key, so
+Markdown and machine-readable views cannot disagree.
 
 ### Archival
 
@@ -283,6 +459,49 @@ entry is a local runtime edit, not a committed artifact.
    into the event's `chain_hold_cycle` field (LP-0MU5AIAAY003KVM0); lines
    without the token (pre-chain-hold rotated logs) parse with
    `chain_hold_cycle=None`, which aggregates as cycle 0 (genuine demand).
+   **Per-turn correlation id (`turn=`, LP-0MVMBM467005BT4A).** Every
+   structured line one client request emits carries a short correlation id:
+
+   ```text
+   Stream started: provider=<p> model=<m> session=<uuid> request=<preview> turn=a1b2c3d4
+   Stream finished: reason=<r> tokens=<p>/<c>/<t> session=<uuid> provider=<p> model=<m> turn=a1b2c3d4
+   routing_skip_local ... session=<uuid> chain_hold_cycle=<n> turn=a1b2c3d4
+   routing_skip_provider_context ... session=<uuid> preference=<pref> turn=a1b2c3d4
+   Fallback triggered for model=<path>, from=<a>, to=<b>, reason=<r> session=<uuid> attempt=<n> turn=a1b2c3d4
+   routing_hop session=<uuid> from=<a> to=<b> hops=<n> turn=a1b2c3d4
+   local_dispatch_denied session=<uuid> owner=<owner> active=<n> cold_start=<bool> turn=a1b2c3d4
+   [local] POST <url> body=<preview> session_id=<uuid> session={...} slot=<id> turn=a1b2c3d4
+   [remote] POST <url> -> <endpoint> body=<preview> session_id=<uuid> session={...} slot=<id> turn=a1b2c3d4
+   dispatch_first_byte_ms=<ms> ... session=<uuid> model=<m> priority=<p> estimated_tokens=<n> turn=a1b2c3d4
+   ttft_seconds=<s> session=<uuid> provider=<p> model=<m> turn=a1b2c3d4
+   Stream error: session=<uuid> provider=<p> model=<m> error=<type> turn=a1b2c3d4
+   ```
+
+   - **Format.** Eight lowercase hex characters (`uuid4().hex[:8]`), emitted as
+     the last `key=value` on the line by
+     `proxy/turn_id.py::turn_field()`. Short on purpose: it keeps lines
+     readable while making a per-session collision negligible.
+   - **Stability.** One id per client request, generated at the request's entry
+     point (`_run_chain_cycles`, `proxy_to_local`, `proxy_to_remote`, and
+     idempotently at `log_request`) and **never** re-generated: it is stable
+     across local↔remote fallback hops, chain-hold retry cycles, provider
+     reroutes and stream start/finish. Two turns of the same session always get
+     different ids.
+   - **Parsing.** `log_parser` extracts it into `LogEvent.turn` on
+     `stream_started`, `stream_finished`, `stream_finish_error`, `fallback`,
+     `routing_skip`, `provider_context_skip`, `dispatch_denied`,
+     `local_dispatch` and `ttft` events. Absent on any other kind (and on every
+     pre-change rotated line), where it stays `None`.
+   - **Exact attribution.** With ids present the joins are exact and no longer
+     depend on ordering: `pair_ttft_to_streams()` pairs a
+     `dispatch_first_byte_ms=`/`ttft_seconds=` line with the `Stream started`
+     line of the same turn, `pair_stream_events()` pairs `Stream started` with
+     its own `Stream finished` (busy time, decode/prefill slot-seconds), and
+     `_attribute_fallback()` prefers the fallback/skip/denial evidence carrying
+     the first remote stream's turn. Lines **without** ids (rotated logs
+     predating the field) keep the historical per-session FIFO and
+     nearest-line-within-60s heuristics, so historical windows still analyse
+     unchanged.
    Local `dispatch_first_byte_ms=` lines (LP-0MTSSM5SO003PKU0) parse into
    `ttft` events carrying the prefill breakdown: `ttft_ms` (dispatch → first
    byte total), `dispatch_to_first_byte_ms` (total minus queued wait),
@@ -318,11 +537,17 @@ entry is a local runtime edit, not a committed artifact.
 3. **Session grouping** — a session is identified by its UUID
    (`session=<uuid>`). Per-session context/response sizes use the
    authoritative `tokens=prompt/completion/total` from `Stream finished`
-   lines (payloads in logs are truncated and never used for sizes).
+   lines (payloads in logs are truncated and never used for sizes). Local
+   streams report real measured usage since LP-0MVMHNVKT003PRIK (see
+   [Local token reporting and the cold-cache cap](#local-token-reporting-and-the-cold-cache-cap)),
+   and per-model token totals are attributed to the provider/model stamped on
+   each `Stream finished` line — the one that actually served that stream —
+   rather than to the session's initial provider.
 4. **Local model utilization (busy time)** — local `Stream started` /
    `Stream finished` events are collected across the analysis's effective
    margin beyond the window (48h, shared with the mode timeline in step 5;
-   see `MODE_TIMELINE_MARGIN`), paired per session (FIFO), clipped back to
+   see `MODE_TIMELINE_MARGIN`), paired **exactly by `turn=`** where the ids
+   are present and per session (FIFO) for pre-change lines, clipped back to
    the window, and merged. **Busy is the union of dispatch → finish
    intervals** (LP-0MVJN9H2I00116FP): each paired stream's interval starts at
    its back-calculated dispatch time (`ttft.ts - ttft_ms/1000`, i.e. the
@@ -345,7 +570,11 @@ entry is a local runtime edit, not a committed artifact.
    `local_busy` — the definition marker `"definition": "dispatch_to_finish"`,
    `decode_busy_seconds` (retained decode-only union, the lower bound),
    `prefill_busy_seconds` (prefill span, derivable from the two unions),
-   `prefill_extended_streams` (how many streams carried a measured prefill)
+   `prefill_extended_streams` (how many of the in-window paired streams
+   carried a measured prefill — always ≤ `streams`, because the
+   margin-widened collection also carries pairs from earlier windows and
+   only pairs whose clipped busy interval is counted are included,
+   LP-0MVKN85WO007O00H)
    and the human labels `upper_bound_label` / `lower_bound_label` — so a
    machine consumer never has to infer the busy semantics
    (LP-0MVJNW6SN008AKH3). Every pre-change key is retained unchanged, and the
@@ -475,7 +704,17 @@ entry is a local runtime edit, not a committed artifact.
    logic (mode timeline → `server.priority_window` → slot schedule),
    unattributed streams excluded or documented), and a by-model
    sub-table (one row per `provider/model`, absolute + %, sorted by Total desc;
-   unknown provider/model renders as the `(unknown)` placeholder).
+   unknown provider/model renders as the `(unknown)` placeholder). The section
+   also states the **measured-usage coverage** — how many `Stream finished`
+   lines carried `tokens=` and how many did not, split by provider — so
+   "size unknown" is visible instead of being silently counted as zero
+   (`streams_with_usage` / `streams_without_usage` /
+   `streams_without_usage_by_provider` in the JSON summary). Terminal lines
+   with no usage carry `tokens=missing` (LP-0MVMBM6N400541EH), and the
+   per-session counts also appear as the `Streams without usage` column of the
+   **Per-session coverage** table in *Local model usage by session* (next to
+   the `Context size at fallback` figure whose `n/a` it explains) and as
+   `streams_with_usage` / `streams_without_usage` in the per-session CSVs.
 7. **Recommendations** — rule-based heuristics, each citing the data that
    supports it (see below).
 8. **Error taxonomy** — error events (`Stream finished: reason=error`,
@@ -545,6 +784,114 @@ entry is a local runtime edit, not a committed artifact.
    `empty_window_reasons` when the window is empty). The per-session CSV
    `decode_tok_s` column is derived from proxy.log instead (local completion
    tokens ÷ local active span) and stays empty when not derivable.
+
+### Local token reporting and the cold-cache cap
+
+Local streams report **measured** usage since LP-0MVMHNVKT003PRIK. Before that
+change, 0 of ~225 local `Stream finished` lines in a 24h window carried
+`tokens=`, so local prompt sizes were unknown, the per-model token table
+attributed local tokens only via sessions whose *initial* provider was local,
+and the usage-driven cache-credit path (`update_cached_ratio` /
+`record_prompt_prefix` in `proxy/provider.py`) could never fire for local.
+
+The proxy now adds `stream_options: {"include_usage": true}` to local
+streaming requests, so llama-server returns its OpenAI-compatible `usage`
+block (`prompt_tokens`, `completion_tokens`, `total_tokens`,
+`prompt_tokens_details.cached_tokens`). Two log-format details matter when
+reading the logs:
+
+- llama-server emits the usage block in a **separate chunk after** the
+  `finish_reason` chunk, so the proxy defers the `Stream finished` line by one
+  chunk and emits it as
+  `Stream finished: reason=<r> tokens=<p>/<c>/<t> session=<uuid> provider=local model=<m>`.
+  A stream that never delivers usage (client disconnect, aborted prefill)
+  still logs exactly one terminal line, marked `tokens=missing`.
+- **`tokens=missing` (LP-0MVMBM6N400541EH).** When a terminal stream reports no
+  usage at all, the `Stream finished` line carries `tokens=missing` in the
+  position where `tokens=<p>/<c>/<t>` sits — e.g. `Stream finished:
+  reason=stop tokens=missing session=<uuid> provider=local model=<m>`. The
+  marker is emitted from the same code path as the counted field
+  (`proxy/proxy/router_helpers.py`: the deferred-finish flush at `[DONE]` /
+  end-of-stream, the immediate finish-chunk emit for providers that never
+  report usage, and the buffered `stream=false` reply), so "no data" is
+  distinguishable from "zero tokens" instead of the field silently vanishing.
+  It never overrides real usage: a present `usage` block still logs
+  `tokens=<p>/<c>/<t>` unchanged. Consumers matching
+  `tokens=(\d+)/(\d+)/(\d+)` simply do not match the marker (verified for
+  `scripts/idle_admit_impact.py`, `scripts/slot-persistence-correlate.py`,
+  `proxy/scripts/analyze_context_distribution.py` and
+  `proxy/scripts/run_compaction_experiment.py`), and the analyser records it as
+  `usage_missing=True` on the stream-finished event. Those streams are counted
+  (`streams_without_usage`, window level and per session) and excluded from
+  every token/context figure rather than treated as zero — which is why a
+  session's `Context size at fallback` can render `n/a`, and the *Per-session
+  coverage* table carries its `Streams without usage` count so that `n/a` is
+  explained by the logs rather than being an unexplained gap.
+- When the client did not ask for usage itself, the usage-only chunk is not
+  forwarded, so the client-visible SSE stream is unchanged. Buffered
+  (non-streaming) local replies log the same terminal line with an extra
+  `stream=false` marker; it carries measured tokens but is **not** paired with
+  a `Stream started` (there is none), so it never perturbs busy/decode/first-byte
+  statistics.
+
+**Cold-cache cap semantics.** Two independent limits guard local routing
+(`_should_skip_local` in `proxy/provider.py`):
+
+- the **cold cap** (`local_large_context_cold_cache_threshold`, 38K by default)
+  bounds the **new (uncached) tokens** — `new_tokens = estimated_tokens ×
+  (1 − cached_ratio)`. With a measured previous turn, `cached_ratio` reflects
+  the reusable prefix, so a 40K-total turn whose only ~10K tokens are new is
+  still admitted;
+- the **warm cap** (`local_large_context_warm_cache_threshold`) bounds **total
+  context** regardless of cache warmth, and the per-entry
+  `max_context_tokens` can only tighten it.
+
+Measured usage makes the first limit honest: a turn whose measurement is
+missing is priced as fully cold (`cached_ratio = 0.0`), which is what pushed
+large-context sessions permanently onto remote providers.
+
+### GPU busy time from power (Prometheus)
+
+The **Local model utilization** table's primary busy figures are derived from
+proxy logs (the dispatch → finish slot union). Alongside them, when Prometheus
+is reachable, the report adds a **GPU busy — power-based (hardware)** row and
+exposes the same data under `--json`'s `gpu_busy` key. This is the
+**authoritative hardware-side** busy fraction and does **not** depend on the
+proxy's stream-lifecycle logging.
+
+Why power rather than `gpu_busy_percent`: on this Strix Halo APU that counter
+**saturates at ~20 W** — it responds to load within seconds but reads ~100 % for
+any draw above ~20 W, so it reports idle-with-context stretches as busy
+(LP-0MS9GA6QL007XTBP; measured 2026-10-28 over 7 days: 94.5 % mean busy against
+28.1 % of samples at compute power, 45.2 % false-busy; LP-0MVSQQO910077LYL). It
+is not a utilisation signal. AMD's own tooling is not an alternative either:
+`amd-smi` reports `N/A` for usage/power/clocks/energy on this APU, and
+`amdtop`/`rocm-smi` display the very same saturating counter (see
+[monitoring/README.md](../../../monitoring/README.md), *Why not `amd-smi`,
+`rocm-smi` or `amdtop`?*). Power draw discriminates
+cleanly (idle ~10–15 W, computing ≥ 90 W), and the `gpu:computing:bool`
+recording rule (`gpu:power_watts:amdgpu >= bool 90`) is evaluated by Prometheus
+every **15 s** from the node_exporter hwmon series. The report queries
+`avg_over_time(gpu:computing:bool[Nh])` for the window, so the busy fraction is
+computed over the raw 15 s samples (see
+[monitoring/README.md](../../../monitoring/README.md) for the full pipeline).
+
+- The 15 s cadence is comfortably finer than the workload timescales (median
+decode 2.4 s, worst prefill 108 s), so sub-15-second sampling would add no
+accuracy.
+- The row is **best-effort**: if Prometheus is unreachable the query returns
+  `None`, the row is omitted from the report, and `--json`'s `gpu_busy` is
+  `null`. A report run never fails because monitoring is down.
+- The `gpu_busy` block carries `computing_fraction` (0–1), `busy_pct`,
+  `busy_seconds`, `idle_seconds`, `total_seconds`, and `smoothed_power` — the
+  `gpu:power_watts:avg5m` trace at 1-minute resolution, derived from the 15 s
+  raw series by a 5-minute rolling average, for warm-up/cooldown context.
+
+Reading it against the log-based figure: the log union measures *slot
+occupancy* (including queued time and excluding any work the proxy did not
+log); the power figure measures when the *hardware* actually computed. A
+persistent gap between them usually means log gaps, unfinished streams, or GPU
+work outside the proxy's slot accounting.
 
 ## Interpreting the report
 
@@ -649,10 +996,13 @@ entry is a local runtime edit, not a committed artifact.
   `local_prefill_deadline_seconds` versus projected prefill ETA).
 - **Total tokens**: Input + Output + Total (prompt + completion summed from
   `tokens=prompt/completion/total` on `Stream finished` lines; streams without
-  `tokens=` contribute `0`). Check the per-bucket and per-model tables in the
-  **Total tokens** section — all shares are of the same grand total, so
-  fast% + cheap% = 100% and model %s sum to 100%. A large Input / Output
-  disparity can reveal long-prompt sessions driving capacity pressure.
+  `tokens=` contribute `0` and are counted in the section's
+  **Streams without usage** line, split by provider — a non-zero local entry
+  means that stream predates measured local usage or was aborted). Check the
+  per-bucket and per-model tables in the **Total tokens** section — all shares
+  are of the same grand total, so fast% + cheap% = 100% and model %s sum to
+  100%. A large Input / Output disparity can reveal long-prompt sessions
+  driving capacity pressure.
 - **Fast vs cheap**: a large fallback-rate gap between buckets suggests the
   profile under-serves one period. Read the `## Priority window timeline &
   restarts` note first: it states whether the split came from the mode
@@ -748,6 +1098,27 @@ entry is a local runtime edit, not a committed artifact.
 
 ## Limitations
 
+- **Denial attribution is a timestamp-block join, not a session join
+  (LP-0MVGR2OXT0096OGK M1).** `local_dispatch_denied` carries no `lease_state`
+  and the guard record frequently logs `session=unknown`, so a denial is
+  attributed to the nearest `local_admission_guard` `reject` within ±60 s
+  (inclusive). Measured on the 2026-10-27 16:16 → 2026-10-28 15:56 window
+  (111 denials, 3,558 guard rejects): the nearest guard is 0–20 ms away for the
+  majority, ±30 s covers 68.5%, ±60 s 73.9%, ±120 s 82.9%. 60 s is the widest
+  bound that stays inside one contention burst; the remainder is reported as
+  `unattributed` rather than borrowed from a stale earlier burst.
+- **Prefill ETA is compared at matched quantiles, not per dispatch
+  (LP-0MVGR2OXT0096OGK M3).** llama-server eval-timing lines carry no per-line
+  timestamp (the parser assigns one file-mtime timestamp per log file), so a
+  `prefill_eta_seconds` poll cannot be paired with the specific `prompt eval`
+  it predicted. `prefill_eta_error` therefore compares the p50/p90 of the
+  prediction distribution against the p50/p90 of the observed durations. The
+  prediction is the cache-cold *reference-prompt* cost, so systematic
+  over-prediction is expected when the reference prompt is larger than the
+  median served prompt; read it as "does the published ETA reflect the typical
+  real prefill a dispatcher will face", not as a per-request calibration
+  score.
+
 - **Hold-cycle re-emissions are excluded from local-skip demand counters
   (LP-0MUIEO6IP0030CT3).** A held request re-emitted across chain-hold
   cycles (`chain_hold_cycle>0`) counts once (its cycle-0 occurrence) in the
@@ -779,6 +1150,17 @@ entry is a local runtime edit, not a committed artifact.
   its own inherited an unrelated neighbour's `rate_limited` within the 60s
   window (11 of 26 clean local-using sessions in the 2026-10-23/24 window were
   mislabelled that way).
+- **Per-turn attribution is exact where `turn=` ids exist
+  (LP-0MVMBM467005BT4A).** Since the field was introduced, every structured
+  line a request emits (routing skips, context skips, fallbacks, routing hops,
+  dispatch denials, `[local]`/`[remote]` POST, `Stream started`,
+  `Stream finished`, TTFT, error lines) carries the request's 8-hex id, so
+  TTFT→stream, start→finish, and skip/fallback→stream joins are made by id and
+  cannot mix up two interleaved turns of one session. Log lines written before
+  the field existed carry no id, so windows spanning the change fall back to the
+  FIFO/nearest-line heuristics for those lines — the report states the pairing
+  method in its busy-time note. A turn that logged no id (e.g. a task detached
+  from the request context) is likewise paired by the legacy rules.
 - Provider context-ceiling skips (`routing_skip_provider_context`) are counted
   per event, not per provider chain: one request that exceeds several entries'
   ceilings logs one line per entry, so the count is *entry* attempts skipped.
@@ -846,3 +1228,25 @@ entry is a local runtime edit, not a committed artifact.
   local active span (first→last local stream event); it includes
   inter-request gaps, so it is a conservative lower bound of the true decode
   rate. It is empty for sessions with no local completions.
+- **Local-turn coverage (`## Local model usage by session`,
+  LP-0MVM93DE6009JGBU).** `% local turns` uses the *routed* turn counts
+  (local + remote `Stream started` events inside the window), so a session
+  whose local turn started before the window and finished inside it is not
+  counted as a local turn. An unanswered local turn (an errored
+  `Stream finished`, an aborted request with no terminal line) is counted and
+  flagged rather than dropped, so a session can read, e.g.,
+  `2 (1 unanswered)`. Context size at fallback is the session's own evidence
+  only — its `routing_skip_local estimated_tokens`, else the first remote
+  stream's prompt tokens, else its `start_context_size` / `max_context_size`;
+  a session whose logs carry no token evidence renders `n/a` with a named
+  limitation (3 of 26 local-using sessions in the 2026-10-23/24 reference
+  window: `empty_response` / `fallback_after_queue` sessions). The percentile
+  summary's context column is computed over the sessions that have a value,
+  so its sample count can be smaller than the covered-session count — the
+  section states both.
+- **`rate_limited` is budget pacing, not an upstream 429.** The reason comes
+  from `provider_budget.py`'s own per-provider RPM accounting: the configured
+  `rate_limit_rpm` window for that provider entry is exhausted, so the request
+  passes to the next provider immediately. Upstream HTTP 429 responses are a
+  different signal and surface as `upstream_http_error status=429` events, not
+  as `rate_limited` fallbacks.

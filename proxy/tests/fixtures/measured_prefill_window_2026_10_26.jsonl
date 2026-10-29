@@ -1,0 +1,578 @@
+{"_meta": {"captured_by": "proxy/scripts/capture_measured_prefill_window.py", "counts": {"evictions": 120, "evidence_observations": 457, "fake_warm": 29, "fake_warm_clusters": 12}, "evidence_note": "llama-server lines carry no timestamps, so eviction events are not joined to individual tasks; the evidence population below is the measured n_past/prompt-size ground truth for the window. The replay harness derives, per prompt size, the measured re-prefill floor (smallest observed n_past in the size band) and the measured full-reuse ceiling (largest observed reuse).", "fake_warm_clusters": [{"estimated_tokens": 18878, "events": 2, "new_tokens": 17}, {"estimated_tokens": 22973, "events": 1, "new_tokens": 175}, {"estimated_tokens": 30334, "events": 1, "new_tokens": 249}, {"estimated_tokens": 36497, "events": 1, "new_tokens": 300}, {"estimated_tokens": 43772, "events": 3, "new_tokens": 32}, {"estimated_tokens": 46134, "events": 3, "new_tokens": 133}, {"estimated_tokens": 49234, "events": 3, "new_tokens": 170}, {"estimated_tokens": 56468, "events": 3, "new_tokens": 162}, {"estimated_tokens": 63247, "events": 3, "new_tokens": 182}, {"estimated_tokens": 70052, "events": 3, "new_tokens": 143}, {"estimated_tokens": 73214, "events": 3, "new_tokens": 150}, {"estimated_tokens": 78201, "events": 3, "new_tokens": 160}], "fake_warm_definition": "predicted reuse (1 - new_tokens/estimated_tokens) >= 0.99", "parent": "LP-0MVQIT9QY007QU27", "source": "/var/log/llama-proxy/{proxy,llama-server}.log*", "window": {"end": "2026-10-27 09:06:07", "start": "2026-10-26 09:06:07"}, "work_item": "LP-0MVR7IXAI002QXXD"}}
+{"elapsed_s": 120.1, "estimated_tokens": 30334, "eta_prefill_s": 5.4, "fake_warm": true, "kind": "eviction", "new_tokens": 249, "predicted_reuse_ratio": 0.9917913892002373, "reason": "prefill_deadline", "session": "herdr-1793010213-1206155-7718", "ts": "2026-10-26 10:35:21"}
+{"elapsed_s": 134.8, "estimated_tokens": 27071, "eta_prefill_s": 8.0, "fake_warm": false, "kind": "eviction", "new_tokens": 4068, "predicted_reuse_ratio": 0.8497284917439326, "reason": "prefill_deadline", "session": "herdr-1793010668-1280377-4939", "ts": "2026-10-26 10:37:36"}
+{"elapsed_s": 120.1, "estimated_tokens": 23272, "eta_prefill_s": 23.3, "fake_warm": false, "kind": "eviction", "new_tokens": 23272, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "01a177c6-a2ce-727d-90d0-8cb3d01bab96", "ts": "2026-10-26 10:39:36"}
+{"elapsed_s": 120.1, "estimated_tokens": 23272, "eta_prefill_s": 23.3, "fake_warm": false, "kind": "eviction", "new_tokens": 23272, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "01a177c6-a2ce-727d-90d0-8cb3d01bab96", "ts": "2026-10-26 10:41:36"}
+{"elapsed_s": 130.9, "estimated_tokens": 36497, "eta_prefill_s": 6.8, "fake_warm": true, "kind": "eviction", "new_tokens": 300, "predicted_reuse_ratio": 0.9917801463133956, "reason": "prefill_deadline", "session": "herdr-1793010213-1206155-7718", "ts": "2026-10-26 10:49:44"}
+{"elapsed_s": 120.1, "estimated_tokens": 15241, "eta_prefill_s": 59.4, "fake_warm": false, "kind": "eviction", "new_tokens": 15241, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-OSL-0MVN3CIUL0065WFU-phase2_deep-4756120d", "ts": "2026-10-26 10:51:44"}
+{"elapsed_s": 120.1, "estimated_tokens": 33029, "eta_prefill_s": 10.5, "fake_warm": false, "kind": "eviction", "new_tokens": 4963, "predicted_reuse_ratio": 0.8497381089345727, "reason": "prefill_deadline", "session": "herdr-1793010668-1280377-4939", "ts": "2026-10-26 10:58:08"}
+{"elapsed_s": 120.1, "estimated_tokens": 37030, "eta_prefill_s": 23.1, "fake_warm": false, "kind": "eviction", "new_tokens": 17775, "predicted_reuse_ratio": 0.519983796921415, "reason": "prefill_deadline", "session": "audit-OSL-0MVNUS05C000RGW9-parent-fbe118f2", "ts": "2026-10-26 11:08:10"}
+{"elapsed_s": 132.6, "estimated_tokens": 37030, "eta_prefill_s": 23.1, "fake_warm": false, "kind": "eviction", "new_tokens": 17775, "predicted_reuse_ratio": 0.519983796921415, "reason": "prefill_deadline", "session": "audit-OSL-0MVNUS05C000RGW9-parent-fbe118f2", "ts": "2026-10-26 11:10:23"}
+{"elapsed_s": 120.1, "estimated_tokens": 19592, "eta_prefill_s": 19.6, "fake_warm": false, "kind": "eviction", "new_tokens": 19592, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "01a177e6-272e-7664-8a44-48cd4b4da066", "ts": "2026-10-26 11:12:23"}
+{"elapsed_s": 120.1, "estimated_tokens": 39273, "eta_prefill_s": 19.5, "fake_warm": false, "kind": "eviction", "new_tokens": 4237, "predicted_reuse_ratio": 0.892114175133043, "reason": "prefill_deadline", "session": "01a177e6-272e-7664-8a44-48cd4b4da066", "ts": "2026-10-26 11:20:06"}
+{"elapsed_s": 120.1, "estimated_tokens": 39273, "eta_prefill_s": 19.5, "fake_warm": false, "kind": "eviction", "new_tokens": 4237, "predicted_reuse_ratio": 0.892114175133043, "reason": "prefill_deadline", "session": "01a177e6-272e-7664-8a44-48cd4b4da066", "ts": "2026-10-26 11:22:53"}
+{"elapsed_s": 120.2, "estimated_tokens": 21929, "eta_prefill_s": 44.8, "fake_warm": false, "kind": "eviction", "new_tokens": 21929, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793011062-1888225-24791", "ts": "2026-10-26 11:26:53"}
+{"elapsed_s": 120.1, "estimated_tokens": 86022, "eta_prefill_s": 74.6, "fake_warm": false, "kind": "eviction", "new_tokens": 9280, "predicted_reuse_ratio": 0.8921206203064332, "reason": "prefill_deadline", "session": "01a177e6-272e-7664-8a44-48cd4b4da066", "ts": "2026-10-26 11:42:22"}
+{"elapsed_s": 120.1, "estimated_tokens": 86022, "eta_prefill_s": 74.6, "fake_warm": false, "kind": "eviction", "new_tokens": 9280, "predicted_reuse_ratio": 0.8921206203064332, "reason": "prefill_deadline", "session": "01a177e6-272e-7664-8a44-48cd4b4da066", "ts": "2026-10-26 11:44:23"}
+{"elapsed_s": 120.2, "estimated_tokens": 6648, "eta_prefill_s": 15.5, "fake_warm": false, "kind": "eviction", "new_tokens": 6648, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793015034-3342108-31380", "ts": "2026-10-26 11:46:23"}
+{"elapsed_s": 120.1, "estimated_tokens": 6648, "eta_prefill_s": 15.5, "fake_warm": false, "kind": "eviction", "new_tokens": 6648, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793015034-3342108-31380", "ts": "2026-10-26 11:48:23"}
+{"elapsed_s": 120.1, "estimated_tokens": 6648, "eta_prefill_s": 15.5, "fake_warm": false, "kind": "eviction", "new_tokens": 6648, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793015034-3342108-31380", "ts": "2026-10-26 11:50:23"}
+{"elapsed_s": 120.1, "estimated_tokens": 3712, "eta_prefill_s": 8.7, "fake_warm": false, "kind": "eviction", "new_tokens": 3712, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-OSL-0MVNZPNK6000XHAU-phase2_deep-213e248c", "ts": "2026-10-26 11:53:24"}
+{"elapsed_s": 120.7, "estimated_tokens": 66958, "eta_prefill_s": 44.7, "fake_warm": false, "kind": "eviction", "new_tokens": 3311, "predicted_reuse_ratio": 0.9505510917291436, "reason": "prefill_deadline", "session": "herdr-1793016349-3351050-29979", "ts": "2026-10-26 12:11:29"}
+{"elapsed_s": 120.5, "estimated_tokens": 66958, "eta_prefill_s": 44.7, "fake_warm": false, "kind": "eviction", "new_tokens": 3311, "predicted_reuse_ratio": 0.9505510917291436, "reason": "prefill_deadline", "session": "herdr-1793016349-3351050-29979", "ts": "2026-10-26 12:13:30"}
+{"elapsed_s": 120.1, "estimated_tokens": 1949, "eta_prefill_s": 3.6, "fake_warm": false, "kind": "eviction", "new_tokens": 1949, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-OSL-0MVNZPQJZ000EE83-phase2_deep-ecacd134", "ts": "2026-10-26 12:15:30"}
+{"elapsed_s": 120.1, "estimated_tokens": 1949, "eta_prefill_s": 3.6, "fake_warm": false, "kind": "eviction", "new_tokens": 1949, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-OSL-0MVNZPQJZ000EE83-phase2_deep-ecacd134", "ts": "2026-10-26 12:17:30"}
+{"elapsed_s": 120.1, "estimated_tokens": 1949, "eta_prefill_s": 3.6, "fake_warm": false, "kind": "eviction", "new_tokens": 1949, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-OSL-0MVNZPQJZ000EE83-phase2_deep-ecacd134", "ts": "2026-10-26 12:19:30"}
+{"elapsed_s": 10.0, "estimated_tokens": 19745, "eta_prefill_s": 8.8, "fake_warm": false, "kind": "eviction", "new_tokens": 403, "predicted_reuse_ratio": 0.9795897695619145, "reason": "lease_evicted", "session": "audit-OSL-0MVME1PI5005WU58-phase2_deep-fe267f65", "ts": "2026-10-26 12:49:37"}
+{"elapsed_s": 120.1, "estimated_tokens": 25423, "eta_prefill_s": 11.5, "fake_warm": false, "kind": "eviction", "new_tokens": 549, "predicted_reuse_ratio": 0.978405380954254, "reason": "prefill_deadline", "session": "herdr-1793019031-3363896-26838", "ts": "2026-10-26 13:10:30"}
+{"elapsed_s": 136.0, "estimated_tokens": 14179, "eta_prefill_s": 55.3, "fake_warm": false, "kind": "eviction", "new_tokens": 14179, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793020051-2574234-29396", "ts": "2026-10-26 13:19:43"}
+{"elapsed_s": 135.8, "estimated_tokens": 14179, "eta_prefill_s": 55.3, "fake_warm": false, "kind": "eviction", "new_tokens": 14179, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793020051-2574234-29396", "ts": "2026-10-26 13:21:59"}
+{"elapsed_s": 128.6, "estimated_tokens": 14179, "eta_prefill_s": 55.3, "fake_warm": false, "kind": "eviction", "new_tokens": 14179, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793020051-2574234-29396", "ts": "2026-10-26 13:24:08"}
+{"elapsed_s": 120.2, "estimated_tokens": 46134, "eta_prefill_s": 9.2, "fake_warm": true, "kind": "eviction", "new_tokens": 133, "predicted_reuse_ratio": 0.9971170936836173, "reason": "prefill_deadline", "session": "01a178bd-a818-70e7-96b7-221ffbe526dc", "ts": "2026-10-26 15:25:57"}
+{"elapsed_s": 126.9, "estimated_tokens": 46134, "eta_prefill_s": 9.2, "fake_warm": true, "kind": "eviction", "new_tokens": 133, "predicted_reuse_ratio": 0.9971170936836173, "reason": "prefill_deadline", "session": "01a178bd-a818-70e7-96b7-221ffbe526dc", "ts": "2026-10-26 15:28:05"}
+{"elapsed_s": 135.3, "estimated_tokens": 46134, "eta_prefill_s": 9.2, "fake_warm": true, "kind": "eviction", "new_tokens": 133, "predicted_reuse_ratio": 0.9971170936836173, "reason": "prefill_deadline", "session": "01a178bd-a818-70e7-96b7-221ffbe526dc", "ts": "2026-10-26 15:30:20"}
+{"elapsed_s": 132.6, "estimated_tokens": 56468, "eta_prefill_s": 11.2, "fake_warm": true, "kind": "eviction", "new_tokens": 162, "predicted_reuse_ratio": 0.9971311185095983, "reason": "prefill_deadline", "session": "01a178bd-a818-70e7-96b7-221ffbe526dc", "ts": "2026-10-26 15:42:34"}
+{"elapsed_s": 131.4, "estimated_tokens": 56468, "eta_prefill_s": 11.2, "fake_warm": true, "kind": "eviction", "new_tokens": 162, "predicted_reuse_ratio": 0.9971311185095983, "reason": "prefill_deadline", "session": "01a178bd-a818-70e7-96b7-221ffbe526dc", "ts": "2026-10-26 15:44:46"}
+{"elapsed_s": 133.7, "estimated_tokens": 56468, "eta_prefill_s": 11.2, "fake_warm": true, "kind": "eviction", "new_tokens": 162, "predicted_reuse_ratio": 0.9971311185095983, "reason": "prefill_deadline", "session": "01a178bd-a818-70e7-96b7-221ffbe526dc", "ts": "2026-10-26 15:47:00"}
+{"elapsed_s": 120.1, "estimated_tokens": 63247, "eta_prefill_s": 13.8, "fake_warm": true, "kind": "eviction", "new_tokens": 182, "predicted_reuse_ratio": 0.9971223931569877, "reason": "prefill_deadline", "session": "01a178bd-a818-70e7-96b7-221ffbe526dc", "ts": "2026-10-26 16:00:04"}
+{"elapsed_s": 120.1, "estimated_tokens": 63247, "eta_prefill_s": 13.8, "fake_warm": true, "kind": "eviction", "new_tokens": 182, "predicted_reuse_ratio": 0.9971223931569877, "reason": "prefill_deadline", "session": "01a178bd-a818-70e7-96b7-221ffbe526dc", "ts": "2026-10-26 16:02:05"}
+{"elapsed_s": 134.0, "estimated_tokens": 63247, "eta_prefill_s": 13.8, "fake_warm": true, "kind": "eviction", "new_tokens": 182, "predicted_reuse_ratio": 0.9971223931569877, "reason": "prefill_deadline", "session": "01a178bd-a818-70e7-96b7-221ffbe526dc", "ts": "2026-10-26 16:04:19"}
+{"elapsed_s": 134.3, "estimated_tokens": 5898, "eta_prefill_s": 12.0, "fake_warm": false, "kind": "eviction", "new_tokens": 5898, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793030721-147966-29958", "ts": "2026-10-26 16:08:08"}
+{"elapsed_s": 10.0, "estimated_tokens": 18878, "eta_prefill_s": 3.7, "fake_warm": true, "kind": "eviction", "new_tokens": 17, "predicted_reuse_ratio": 0.9990994808772116, "reason": "lease_evicted", "session": "herdr-1793026810-3969985-8256", "ts": "2026-10-26 16:08:18"}
+{"elapsed_s": 120.3, "estimated_tokens": 18878, "eta_prefill_s": 3.7, "fake_warm": true, "kind": "eviction", "new_tokens": 17, "predicted_reuse_ratio": 0.9990994808772116, "reason": "prefill_deadline", "session": "herdr-1793026810-3969985-8256", "ts": "2026-10-26 16:12:19"}
+{"elapsed_s": 120.1, "estimated_tokens": 14302, "eta_prefill_s": 29.2, "fake_warm": false, "kind": "eviction", "new_tokens": 14302, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793031033-166006-7547", "ts": "2026-10-26 16:14:19"}
+{"elapsed_s": 120.1, "estimated_tokens": 14302, "eta_prefill_s": 29.2, "fake_warm": false, "kind": "eviction", "new_tokens": 14302, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793031033-166006-7547", "ts": "2026-10-26 16:16:19"}
+{"elapsed_s": 120.6, "estimated_tokens": 14302, "eta_prefill_s": 29.2, "fake_warm": false, "kind": "eviction", "new_tokens": 14302, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793031033-166006-7547", "ts": "2026-10-26 16:18:20"}
+{"elapsed_s": 120.9, "estimated_tokens": 22973, "eta_prefill_s": 5.0, "fake_warm": true, "kind": "eviction", "new_tokens": 175, "predicted_reuse_ratio": 0.9923823619031037, "reason": "prefill_deadline", "session": "audit-OSL-0MVP7C8OT000S61W-parent-fb5eb1c0", "ts": "2026-10-26 16:34:14"}
+{"elapsed_s": 121.2, "estimated_tokens": 26260, "eta_prefill_s": 59.9, "fake_warm": false, "kind": "eviction", "new_tokens": 19949, "predicted_reuse_ratio": 0.24032749428789035, "reason": "prefill_deadline", "session": "herdr-1793032135-330991-3274", "ts": "2026-10-26 16:36:15"}
+{"elapsed_s": 133.6, "estimated_tokens": 32527, "eta_prefill_s": 18.9, "fake_warm": false, "kind": "eviction", "new_tokens": 1445, "predicted_reuse_ratio": 0.955575368155686, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 18:20:09"}
+{"elapsed_s": 131.9, "estimated_tokens": 32527, "eta_prefill_s": 18.9, "fake_warm": false, "kind": "eviction", "new_tokens": 1445, "predicted_reuse_ratio": 0.955575368155686, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 18:22:21"}
+{"elapsed_s": 120.1, "estimated_tokens": 59637, "eta_prefill_s": 81.1, "fake_warm": false, "kind": "eviction", "new_tokens": 3420, "predicted_reuse_ratio": 0.9426530509582977, "reason": "prefill_deadline", "session": "audit-AH-0MVD1RIH2008YCNV-parent-b7ae9709", "ts": "2026-10-26 18:31:04"}
+{"elapsed_s": 135.3, "estimated_tokens": 59637, "eta_prefill_s": 81.1, "fake_warm": false, "kind": "eviction", "new_tokens": 3420, "predicted_reuse_ratio": 0.9426530509582977, "reason": "prefill_deadline", "session": "audit-AH-0MVD1RIH2008YCNV-parent-b7ae9709", "ts": "2026-10-26 18:33:20"}
+{"elapsed_s": 135.7, "estimated_tokens": 59637, "eta_prefill_s": 81.1, "fake_warm": false, "kind": "eviction", "new_tokens": 3420, "predicted_reuse_ratio": 0.9426530509582977, "reason": "prefill_deadline", "session": "audit-AH-0MVD1RIH2008YCNV-parent-b7ae9709", "ts": "2026-10-26 18:35:36"}
+{"elapsed_s": 120.1, "estimated_tokens": 1880, "eta_prefill_s": 3.9, "fake_warm": false, "kind": "eviction", "new_tokens": 1880, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-AH-0MVD1RK2V009J5D2-parent-94edfba2", "ts": "2026-10-26 18:37:36"}
+{"elapsed_s": 120.1, "estimated_tokens": 1890, "eta_prefill_s": 3.9, "fake_warm": false, "kind": "eviction", "new_tokens": 1890, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-AH-0MVD1RIH2008YCNV-phase2_deep-e6167e26", "ts": "2026-10-26 18:39:36"}
+{"elapsed_s": 120.1, "estimated_tokens": 1966, "eta_prefill_s": 4.0, "fake_warm": false, "kind": "eviction", "new_tokens": 1966, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-AH-0MVD1RK2V009J5D2-phase2_deep-5471d028", "ts": "2026-10-26 18:41:36"}
+{"elapsed_s": 120.4, "estimated_tokens": 50804, "eta_prefill_s": 86.1, "fake_warm": false, "kind": "eviction", "new_tokens": 15245, "predicted_reuse_ratio": 0.6999252027399417, "reason": "prefill_deadline", "session": "audit-AH-0MVF3BESP005ZDAV-parent-d423825e", "ts": "2026-10-26 19:12:04"}
+{"elapsed_s": 40.0, "estimated_tokens": 50804, "eta_prefill_s": 86.1, "fake_warm": false, "kind": "eviction", "new_tokens": 15245, "predicted_reuse_ratio": 0.6999252027399417, "reason": "lease_evicted", "session": "audit-AH-0MVF3BESP005ZDAV-parent-d423825e", "ts": "2026-10-26 19:12:44"}
+{"elapsed_s": 10.0, "estimated_tokens": 50804, "eta_prefill_s": 86.1, "fake_warm": false, "kind": "eviction", "new_tokens": 15245, "predicted_reuse_ratio": 0.6999252027399417, "reason": "lease_evicted", "session": "audit-AH-0MVF3BESP005ZDAV-parent-d423825e", "ts": "2026-10-26 19:12:54"}
+{"elapsed_s": 120.1, "estimated_tokens": 3202, "eta_prefill_s": 6.7, "fake_warm": false, "kind": "eviction", "new_tokens": 3202, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-AH-0MVF3BESP005ZDAV-phase2_deep-639668dd", "ts": "2026-10-26 19:14:55"}
+{"elapsed_s": 120.3, "estimated_tokens": 3202, "eta_prefill_s": 6.7, "fake_warm": false, "kind": "eviction", "new_tokens": 3202, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-AH-0MVF3BESP005ZDAV-phase2_deep-639668dd", "ts": "2026-10-26 19:16:55"}
+{"elapsed_s": 121.0, "estimated_tokens": 3202, "eta_prefill_s": 6.7, "fake_warm": false, "kind": "eviction", "new_tokens": 3202, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-AH-0MVF3BESP005ZDAV-phase2_deep-639668dd", "ts": "2026-10-26 19:18:56"}
+{"elapsed_s": 120.1, "estimated_tokens": 43772, "eta_prefill_s": 59.8, "fake_warm": true, "kind": "eviction", "new_tokens": 32, "predicted_reuse_ratio": 0.9992689390477931, "reason": "prefill_deadline", "session": "herdr-1793035033-888033-25702", "ts": "2026-10-26 19:22:02"}
+{"elapsed_s": 120.1, "estimated_tokens": 43772, "eta_prefill_s": 59.8, "fake_warm": true, "kind": "eviction", "new_tokens": 32, "predicted_reuse_ratio": 0.9992689390477931, "reason": "prefill_deadline", "session": "herdr-1793035033-888033-25702", "ts": "2026-10-26 19:24:02"}
+{"elapsed_s": 120.4, "estimated_tokens": 43772, "eta_prefill_s": 59.8, "fake_warm": true, "kind": "eviction", "new_tokens": 32, "predicted_reuse_ratio": 0.9992689390477931, "reason": "prefill_deadline", "session": "herdr-1793035033-888033-25702", "ts": "2026-10-26 19:26:03"}
+{"elapsed_s": 120.1, "estimated_tokens": 35008, "eta_prefill_s": 49.3, "fake_warm": false, "kind": "eviction", "new_tokens": 1437, "predicted_reuse_ratio": 0.958952239488117, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 19:29:07"}
+{"elapsed_s": 120.1, "estimated_tokens": 35008, "eta_prefill_s": 49.3, "fake_warm": false, "kind": "eviction", "new_tokens": 1437, "predicted_reuse_ratio": 0.958952239488117, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 19:31:07"}
+{"elapsed_s": 120.9, "estimated_tokens": 35008, "eta_prefill_s": 49.3, "fake_warm": false, "kind": "eviction", "new_tokens": 1437, "predicted_reuse_ratio": 0.958952239488117, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 19:33:08"}
+{"elapsed_s": 120.1, "estimated_tokens": 31556, "eta_prefill_s": 35.5, "fake_warm": false, "kind": "eviction", "new_tokens": 7811, "predicted_reuse_ratio": 0.7524717961718849, "reason": "prefill_deadline", "session": "audit-RISE-0MVOHMQZX0070RPQ-parent-e71acd68", "ts": "2026-10-26 19:40:02"}
+{"elapsed_s": 120.1, "estimated_tokens": 47586, "eta_prefill_s": 67.1, "fake_warm": false, "kind": "eviction", "new_tokens": 1953, "predicted_reuse_ratio": 0.9589585172109444, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 19:47:01"}
+{"elapsed_s": 120.1, "estimated_tokens": 47586, "eta_prefill_s": 67.1, "fake_warm": false, "kind": "eviction", "new_tokens": 1953, "predicted_reuse_ratio": 0.9589585172109444, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 19:49:01"}
+{"elapsed_s": 120.1, "estimated_tokens": 47586, "eta_prefill_s": 67.1, "fake_warm": false, "kind": "eviction", "new_tokens": 1953, "predicted_reuse_ratio": 0.9589585172109444, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 19:51:02"}
+{"elapsed_s": 120.5, "estimated_tokens": 2262, "eta_prefill_s": 4.8, "fake_warm": false, "kind": "eviction", "new_tokens": 2262, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-RISE-0MVHAMUKD004NWQY-parent-1af133c4", "ts": "2026-10-26 19:54:02"}
+{"elapsed_s": 120.1, "estimated_tokens": 2262, "eta_prefill_s": 4.8, "fake_warm": false, "kind": "eviction", "new_tokens": 2262, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-RISE-0MVHAMUKD004NWQY-parent-1af133c4", "ts": "2026-10-26 19:56:02"}
+{"elapsed_s": 120.1, "estimated_tokens": 2478, "eta_prefill_s": 5.2, "fake_warm": false, "kind": "eviction", "new_tokens": 2478, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-AH-0MVHT1M6O003PU7P-parent-b47486ec", "ts": "2026-10-26 19:58:02"}
+{"elapsed_s": 120.1, "estimated_tokens": 2478, "eta_prefill_s": 5.2, "fake_warm": false, "kind": "eviction", "new_tokens": 2478, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-AH-0MVHT1M6O003PU7P-parent-b47486ec", "ts": "2026-10-26 20:00:03"}
+{"elapsed_s": 120.1, "estimated_tokens": 51685, "eta_prefill_s": 76.2, "fake_warm": false, "kind": "eviction", "new_tokens": 2121, "predicted_reuse_ratio": 0.9589629486311309, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 20:08:42"}
+{"elapsed_s": 121.0, "estimated_tokens": 55228, "eta_prefill_s": 81.4, "fake_warm": false, "kind": "eviction", "new_tokens": 2266, "predicted_reuse_ratio": 0.958970087636706, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 20:24:22"}
+{"elapsed_s": 120.1, "estimated_tokens": 55228, "eta_prefill_s": 81.4, "fake_warm": false, "kind": "eviction", "new_tokens": 2266, "predicted_reuse_ratio": 0.958970087636706, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 20:26:22"}
+{"elapsed_s": 120.1, "estimated_tokens": 55228, "eta_prefill_s": 81.4, "fake_warm": false, "kind": "eviction", "new_tokens": 2266, "predicted_reuse_ratio": 0.958970087636706, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 20:28:22"}
+{"elapsed_s": 120.1, "estimated_tokens": 1653, "eta_prefill_s": 3.6, "fake_warm": false, "kind": "eviction", "new_tokens": 1653, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-RISE-0MVOHMQZX0070RPQ-parent-4f5919ec", "ts": "2026-10-26 20:33:17"}
+{"elapsed_s": 120.1, "estimated_tokens": 1653, "eta_prefill_s": 3.6, "fake_warm": false, "kind": "eviction", "new_tokens": 1653, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-RISE-0MVOHMQZX0070RPQ-parent-4f5919ec", "ts": "2026-10-26 20:35:17"}
+{"elapsed_s": 120.4, "estimated_tokens": 58096, "eta_prefill_s": 131.2, "fake_warm": false, "kind": "eviction", "new_tokens": 2384, "predicted_reuse_ratio": 0.9589644725970807, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 20:48:17"}
+{"elapsed_s": 120.1, "estimated_tokens": 58096, "eta_prefill_s": 131.2, "fake_warm": false, "kind": "eviction", "new_tokens": 2384, "predicted_reuse_ratio": 0.9589644725970807, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 20:50:17"}
+{"elapsed_s": 120.1, "estimated_tokens": 58096, "eta_prefill_s": 131.2, "fake_warm": false, "kind": "eviction", "new_tokens": 2384, "predicted_reuse_ratio": 0.9589644725970807, "reason": "prefill_deadline", "session": "herdr-1793035053-894353-14088", "ts": "2026-10-26 20:52:18"}
+{"elapsed_s": 120.1, "estimated_tokens": 46538, "eta_prefill_s": 200.2, "fake_warm": false, "kind": "eviction", "new_tokens": 46538, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793035033-888033-25702", "ts": "2026-10-26 20:58:52"}
+{"elapsed_s": 120.1, "estimated_tokens": 46538, "eta_prefill_s": 200.2, "fake_warm": false, "kind": "eviction", "new_tokens": 46538, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793035033-888033-25702", "ts": "2026-10-26 21:00:52"}
+{"elapsed_s": 35.1, "estimated_tokens": 36770, "eta_prefill_s": 73.9, "fake_warm": false, "kind": "eviction", "new_tokens": 16327, "predicted_reuse_ratio": 0.5559695403861844, "reason": "idle_timeout", "session": "herdr-1793049736-3486947-1818", "ts": "2026-10-26 21:25:36"}
+{"elapsed_s": 134.0, "estimated_tokens": 2757, "eta_prefill_s": 4.3, "fake_warm": false, "kind": "eviction", "new_tokens": 2757, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-AH-0MVF3BESP005ZDAV-parent-b2c0ce28", "ts": "2026-10-26 21:27:23"}
+{"elapsed_s": 120.1, "estimated_tokens": 29819, "eta_prefill_s": 62.8, "fake_warm": false, "kind": "eviction", "new_tokens": 14077, "predicted_reuse_ratio": 0.5279184412622824, "reason": "prefill_deadline", "session": "herdr-1793050498-2545805-142", "ts": "2026-10-26 21:40:55"}
+{"elapsed_s": 120.6, "estimated_tokens": 61623, "eta_prefill_s": 141.1, "fake_warm": false, "kind": "eviction", "new_tokens": 11425, "predicted_reuse_ratio": 0.8145984453856514, "reason": "prefill_deadline", "session": "audit-AH-0MVIRYGD1000JVY3-parent-9e3e5940", "ts": "2026-10-26 21:59:38"}
+{"elapsed_s": 120.1, "estimated_tokens": 70052, "eta_prefill_s": 35.5, "fake_warm": true, "kind": "eviction", "new_tokens": 143, "predicted_reuse_ratio": 0.9979586592816765, "reason": "prefill_deadline", "session": "01a17a32-c2ab-73db-b2c8-4a2dd41f3cbf", "ts": "2026-10-26 22:01:38"}
+{"elapsed_s": 120.1, "estimated_tokens": 70052, "eta_prefill_s": 35.5, "fake_warm": true, "kind": "eviction", "new_tokens": 143, "predicted_reuse_ratio": 0.9979586592816765, "reason": "prefill_deadline", "session": "01a17a32-c2ab-73db-b2c8-4a2dd41f3cbf", "ts": "2026-10-26 22:03:39"}
+{"elapsed_s": 120.1, "estimated_tokens": 70052, "eta_prefill_s": 35.5, "fake_warm": true, "kind": "eviction", "new_tokens": 143, "predicted_reuse_ratio": 0.9979586592816765, "reason": "prefill_deadline", "session": "01a17a32-c2ab-73db-b2c8-4a2dd41f3cbf", "ts": "2026-10-26 22:05:39"}
+{"elapsed_s": 120.7, "estimated_tokens": 8, "eta_prefill_s": 0.0, "fake_warm": false, "kind": "eviction", "new_tokens": 8, "predicted_reuse_ratio": 0.0, "reason": "idle_timeout", "session": "benchmark-warmstart-5d061df6", "ts": "2026-10-26 22:16:02"}
+{"elapsed_s": 120.1, "estimated_tokens": 73214, "eta_prefill_s": 37.1, "fake_warm": true, "kind": "eviction", "new_tokens": 150, "predicted_reuse_ratio": 0.997951211516923, "reason": "prefill_deadline", "session": "01a17a32-c2ab-73db-b2c8-4a2dd41f3cbf", "ts": "2026-10-26 22:26:13"}
+{"elapsed_s": 120.2, "estimated_tokens": 73214, "eta_prefill_s": 37.1, "fake_warm": true, "kind": "eviction", "new_tokens": 150, "predicted_reuse_ratio": 0.997951211516923, "reason": "prefill_deadline", "session": "01a17a32-c2ab-73db-b2c8-4a2dd41f3cbf", "ts": "2026-10-26 22:28:13"}
+{"elapsed_s": 120.1, "estimated_tokens": 73214, "eta_prefill_s": 37.1, "fake_warm": true, "kind": "eviction", "new_tokens": 150, "predicted_reuse_ratio": 0.997951211516923, "reason": "prefill_deadline", "session": "01a17a32-c2ab-73db-b2c8-4a2dd41f3cbf", "ts": "2026-10-26 22:30:14"}
+{"elapsed_s": 120.1, "estimated_tokens": 5856, "eta_prefill_s": 20.1, "fake_warm": false, "kind": "eviction", "new_tokens": 5856, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793053799-4040521-8466", "ts": "2026-10-26 22:32:14"}
+{"elapsed_s": 120.1, "estimated_tokens": 5856, "eta_prefill_s": 20.1, "fake_warm": false, "kind": "eviction", "new_tokens": 5856, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793053799-4040521-8466", "ts": "2026-10-26 22:34:14"}
+{"elapsed_s": 120.1, "estimated_tokens": 5856, "eta_prefill_s": 20.1, "fake_warm": false, "kind": "eviction", "new_tokens": 5856, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793053799-4040521-8466", "ts": "2026-10-26 22:36:14"}
+{"elapsed_s": 120.2, "estimated_tokens": 78201, "eta_prefill_s": 39.6, "fake_warm": true, "kind": "eviction", "new_tokens": 160, "predicted_reuse_ratio": 0.9979539903581796, "reason": "prefill_deadline", "session": "01a17a32-c2ab-73db-b2c8-4a2dd41f3cbf", "ts": "2026-10-26 22:43:42"}
+{"elapsed_s": 120.2, "estimated_tokens": 78201, "eta_prefill_s": 39.6, "fake_warm": true, "kind": "eviction", "new_tokens": 160, "predicted_reuse_ratio": 0.9979539903581796, "reason": "prefill_deadline", "session": "01a17a32-c2ab-73db-b2c8-4a2dd41f3cbf", "ts": "2026-10-26 22:45:42"}
+{"elapsed_s": 120.1, "estimated_tokens": 78201, "eta_prefill_s": 39.6, "fake_warm": true, "kind": "eviction", "new_tokens": 160, "predicted_reuse_ratio": 0.9979539903581796, "reason": "prefill_deadline", "session": "01a17a32-c2ab-73db-b2c8-4a2dd41f3cbf", "ts": "2026-10-26 22:47:43"}
+{"elapsed_s": 120.1, "estimated_tokens": 1085, "eta_prefill_s": 3.7, "fake_warm": false, "kind": "eviction", "new_tokens": 1085, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "audit-SA-0MVO0EB1U007L7DS-false-positive-screen-d9261a42", "ts": "2026-10-26 22:57:38"}
+{"elapsed_s": 120.8, "estimated_tokens": 49234, "eta_prefill_s": 94.1, "fake_warm": true, "kind": "eviction", "new_tokens": 170, "predicted_reuse_ratio": 0.9965471015964578, "reason": "prefill_deadline", "session": "audit-AH-0MVJ8YKR70096C6T-parent-235bafcc", "ts": "2026-10-26 23:17:46"}
+{"elapsed_s": 120.1, "estimated_tokens": 49234, "eta_prefill_s": 94.1, "fake_warm": true, "kind": "eviction", "new_tokens": 170, "predicted_reuse_ratio": 0.9965471015964578, "reason": "prefill_deadline", "session": "audit-AH-0MVJ8YKR70096C6T-parent-235bafcc", "ts": "2026-10-26 23:19:46"}
+{"elapsed_s": 120.1, "estimated_tokens": 49234, "eta_prefill_s": 94.1, "fake_warm": true, "kind": "eviction", "new_tokens": 170, "predicted_reuse_ratio": 0.9965471015964578, "reason": "prefill_deadline", "session": "audit-AH-0MVJ8YKR70096C6T-parent-235bafcc", "ts": "2026-10-26 23:21:47"}
+{"elapsed_s": 120.2, "estimated_tokens": 27671, "eta_prefill_s": 65.7, "fake_warm": false, "kind": "eviction", "new_tokens": 10894, "predicted_reuse_ratio": 0.6063026272993386, "reason": "prefill_deadline", "session": "herdr-1793050621-2549566-27850", "ts": "2026-10-26 23:40:12"}
+{"elapsed_s": 120.2, "estimated_tokens": 28172, "eta_prefill_s": 64.8, "fake_warm": false, "kind": "eviction", "new_tokens": 14116, "predicted_reuse_ratio": 0.49893511287803494, "reason": "prefill_deadline", "session": "herdr-1793059272-1012335-10221", "ts": "2026-10-27 00:10:59"}
+{"elapsed_s": 120.2, "estimated_tokens": 28172, "eta_prefill_s": 64.1, "fake_warm": false, "kind": "eviction", "new_tokens": 14116, "predicted_reuse_ratio": 0.49893511287803494, "reason": "prefill_deadline", "session": "herdr-1793059272-1012335-10221", "ts": "2026-10-27 00:12:59"}
+{"elapsed_s": 120.1, "estimated_tokens": 28172, "eta_prefill_s": 64.1, "fake_warm": false, "kind": "eviction", "new_tokens": 14116, "predicted_reuse_ratio": 0.49893511287803494, "reason": "prefill_deadline", "session": "herdr-1793059272-1012335-10221", "ts": "2026-10-27 00:16:24"}
+{"elapsed_s": 120.1, "estimated_tokens": 32791, "eta_prefill_s": 32.8, "fake_warm": false, "kind": "eviction", "new_tokens": 2153, "predicted_reuse_ratio": 0.934341740111616, "reason": "prefill_deadline", "session": "herdr-1793059544-1059855-29810", "ts": "2026-10-27 00:18:51"}
+{"elapsed_s": 120.1, "estimated_tokens": 32791, "eta_prefill_s": 32.8, "fake_warm": false, "kind": "eviction", "new_tokens": 2153, "predicted_reuse_ratio": 0.934341740111616, "reason": "prefill_deadline", "session": "herdr-1793059544-1059855-29810", "ts": "2026-10-27 00:20:51"}
+{"elapsed_s": 120.1, "estimated_tokens": 32791, "eta_prefill_s": 32.8, "fake_warm": false, "kind": "eviction", "new_tokens": 2153, "predicted_reuse_ratio": 0.934341740111616, "reason": "prefill_deadline", "session": "herdr-1793059544-1059855-29810", "ts": "2026-10-27 00:22:52"}
+{"elapsed_s": 120.1, "estimated_tokens": 5315, "eta_prefill_s": 14.9, "fake_warm": false, "kind": "eviction", "new_tokens": 5315, "predicted_reuse_ratio": 0.0, "reason": "prefill_deadline", "session": "herdr-1793060767-1321673-3034", "ts": "2026-10-27 00:28:11"}
+{"elapsed_s": 120.3, "estimated_tokens": 43443, "eta_prefill_s": 42.0, "fake_warm": false, "kind": "eviction", "new_tokens": 2852, "predicted_reuse_ratio": 0.9343507584651152, "reason": "prefill_deadline", "session": "herdr-1793059544-1059855-29810", "ts": "2026-10-27 00:35:10"}
+{"elapsed_s": 120.8, "estimated_tokens": 43443, "eta_prefill_s": 42.0, "fake_warm": false, "kind": "eviction", "new_tokens": 2852, "predicted_reuse_ratio": 0.9343507584651152, "reason": "prefill_deadline", "session": "herdr-1793059544-1059855-29810", "ts": "2026-10-27 00:37:11"}
+{"elapsed_s": 120.4, "estimated_tokens": 43443, "eta_prefill_s": 42.0, "fake_warm": false, "kind": "eviction", "new_tokens": 2852, "predicted_reuse_ratio": 0.9343507584651152, "reason": "prefill_deadline", "session": "herdr-1793059544-1059855-29810", "ts": "2026-10-27 00:39:12"}
+{"elapsed_s": 135.4, "estimated_tokens": 40870, "eta_prefill_s": 105.4, "fake_warm": false, "kind": "eviction", "new_tokens": 5617, "predicted_reuse_ratio": 0.8625642280401272, "reason": "prefill_deadline", "session": "herdr-1793062766-3581972-21513", "ts": "2026-10-27 05:00:14"}
+{"elapsed_s": 133.9, "estimated_tokens": 40870, "eta_prefill_s": 105.4, "fake_warm": false, "kind": "eviction", "new_tokens": 5617, "predicted_reuse_ratio": 0.8625642280401272, "reason": "prefill_deadline", "session": "herdr-1793062766-3581972-21513", "ts": "2026-10-27 05:02:28"}
+{"elapsed_s": 134.0, "estimated_tokens": 40870, "eta_prefill_s": 105.4, "fake_warm": false, "kind": "eviction", "new_tokens": 5617, "predicted_reuse_ratio": 0.8625642280401272, "reason": "prefill_deadline", "session": "herdr-1793062766-3581972-21513", "ts": "2026-10-27 05:04:43"}
+{"cache_tokens": 17777, "kind": "evidence", "pid": 41395, "prompt_tokens": 18011, "source": "llama_server.n_past", "task": 175759}
+{"cache_tokens": 1715, "kind": "evidence", "pid": 41395, "prompt_tokens": 18070, "source": "llama_server.n_past", "task": 236795}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 18122, "source": "llama_server.n_past", "task": 257224}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 18122, "source": "llama_server.n_past", "task": 307904}
+{"cache_tokens": 18184, "kind": "evidence", "pid": 41395, "prompt_tokens": 18245, "source": "llama_server.n_past", "task": 269960}
+{"cache_tokens": 7691, "kind": "evidence", "pid": 41395, "prompt_tokens": 18352, "source": "llama_server.n_past", "task": 168610}
+{"cache_tokens": 18437, "kind": "evidence", "pid": 41395, "prompt_tokens": 18438, "source": "llama_server.n_past", "task": 203406}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 18438, "source": "llama_server.n_past", "task": 203608}
+{"cache_tokens": 4822, "kind": "evidence", "pid": 41395, "prompt_tokens": 18472, "source": "llama_server.n_past", "task": 110004}
+{"cache_tokens": 4822, "kind": "evidence", "pid": 41395, "prompt_tokens": 18472, "source": "llama_server.n_past", "task": 110119}
+{"cache_tokens": 18291, "kind": "evidence", "pid": 41395, "prompt_tokens": 18519, "source": "llama_server.n_past", "task": 240577}
+{"cache_tokens": 6261, "kind": "evidence", "pid": 41395, "prompt_tokens": 18594, "source": "llama_server.n_past", "task": 252880}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 18594, "source": "llama_server.n_past", "task": 254045}
+{"cache_tokens": 18293, "kind": "evidence", "pid": 41395, "prompt_tokens": 18627, "source": "llama_server.n_past", "task": 241663}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 18679, "source": "llama_server.n_past", "task": 401423}
+{"cache_tokens": 9078, "kind": "evidence", "pid": 41395, "prompt_tokens": 18765, "source": "llama_server.n_past", "task": 253498}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 18775, "source": "llama_server.n_past", "task": 202227}
+{"cache_tokens": 18710, "kind": "evidence", "pid": 41395, "prompt_tokens": 18775, "source": "llama_server.n_past", "task": 202494}
+{"cache_tokens": 18711, "kind": "evidence", "pid": 41395, "prompt_tokens": 18801, "source": "llama_server.n_past", "task": 202055}
+{"cache_tokens": 18710, "kind": "evidence", "pid": 41395, "prompt_tokens": 18813, "source": "llama_server.n_past", "task": 202204}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 18956, "source": "llama_server.n_past", "task": 227393}
+{"cache_tokens": 7693, "kind": "evidence", "pid": 41395, "prompt_tokens": 19047, "source": "llama_server.n_past", "task": 161011}
+{"cache_tokens": 1322, "kind": "evidence", "pid": 41395, "prompt_tokens": 19057, "source": "llama_server.n_past", "task": 526229}
+{"cache_tokens": 1630, "kind": "evidence", "pid": 41395, "prompt_tokens": 19161, "source": "llama_server.n_past", "task": 363163}
+{"cache_tokens": 19192, "kind": "evidence", "pid": 41395, "prompt_tokens": 19252, "source": "llama_server.n_past", "task": 512379}
+{"cache_tokens": 6141, "kind": "evidence", "pid": 41395, "prompt_tokens": 19335, "source": "llama_server.n_past", "task": 242386}
+{"cache_tokens": 19341, "kind": "evidence", "pid": 41395, "prompt_tokens": 19342, "source": "llama_server.n_past", "task": 124126}
+{"cache_tokens": 19341, "kind": "evidence", "pid": 41395, "prompt_tokens": 19342, "source": "llama_server.n_past", "task": 124142}
+{"cache_tokens": 19349, "kind": "evidence", "pid": 41395, "prompt_tokens": 19350, "source": "llama_server.n_past", "task": 140787}
+{"cache_tokens": 19349, "kind": "evidence", "pid": 41395, "prompt_tokens": 19350, "source": "llama_server.n_past", "task": 140901}
+{"cache_tokens": 19349, "kind": "evidence", "pid": 41395, "prompt_tokens": 19351, "source": "llama_server.n_past", "task": 140939}
+{"cache_tokens": 19341, "kind": "evidence", "pid": 41395, "prompt_tokens": 19412, "source": "llama_server.n_past", "task": 124150}
+{"cache_tokens": 19345, "kind": "evidence", "pid": 41395, "prompt_tokens": 19413, "source": "llama_server.n_past", "task": 124990}
+{"cache_tokens": 19342, "kind": "evidence", "pid": 41395, "prompt_tokens": 19420, "source": "llama_server.n_past", "task": 178388}
+{"cache_tokens": 19342, "kind": "evidence", "pid": 41395, "prompt_tokens": 19421, "source": "llama_server.n_past", "task": 187755}
+{"cache_tokens": 19347, "kind": "evidence", "pid": 41395, "prompt_tokens": 19449, "source": "llama_server.n_past", "task": 178575}
+{"cache_tokens": 19349, "kind": "evidence", "pid": 41395, "prompt_tokens": 19499, "source": "llama_server.n_past", "task": 140948}
+{"cache_tokens": 19348, "kind": "evidence", "pid": 41395, "prompt_tokens": 19510, "source": "llama_server.n_past", "task": 154675}
+{"cache_tokens": 19349, "kind": "evidence", "pid": 41395, "prompt_tokens": 19582, "source": "llama_server.n_past", "task": 143641}
+{"cache_tokens": 18188, "kind": "evidence", "pid": 41395, "prompt_tokens": 19619, "source": "llama_server.n_past", "task": 225696}
+{"cache_tokens": 1715, "kind": "evidence", "pid": 41395, "prompt_tokens": 19624, "source": "llama_server.n_past", "task": 259777}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 19673, "source": "llama_server.n_past", "task": 175847}
+{"cache_tokens": 19825, "kind": "evidence", "pid": 41395, "prompt_tokens": 19826, "source": "llama_server.n_past", "task": 96434}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 19826, "source": "llama_server.n_past", "task": 96498}
+{"cache_tokens": 6261, "kind": "evidence", "pid": 41395, "prompt_tokens": 19826, "source": "llama_server.n_past", "task": 111202}
+{"cache_tokens": 6261, "kind": "evidence", "pid": 41395, "prompt_tokens": 19984, "source": "llama_server.n_past", "task": 245104}
+{"cache_tokens": 20024, "kind": "evidence", "pid": 41395, "prompt_tokens": 20025, "source": "llama_server.n_past", "task": 97957}
+{"cache_tokens": 20024, "kind": "evidence", "pid": 41395, "prompt_tokens": 20025, "source": "llama_server.n_past", "task": 98054}
+{"cache_tokens": 20023, "kind": "evidence", "pid": 41395, "prompt_tokens": 20026, "source": "llama_server.n_past", "task": 104363}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 20053, "source": "llama_server.n_past", "task": 506000}
+{"cache_tokens": 20024, "kind": "evidence", "pid": 41395, "prompt_tokens": 20098, "source": "llama_server.n_past", "task": 198153}
+{"cache_tokens": 6261, "kind": "evidence", "pid": 41395, "prompt_tokens": 20137, "source": "llama_server.n_past", "task": 380944}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 20175, "source": "llama_server.n_past", "task": 198568}
+{"cache_tokens": 20024, "kind": "evidence", "pid": 41395, "prompt_tokens": 20212, "source": "llama_server.n_past", "task": 197959}
+{"cache_tokens": 7691, "kind": "evidence", "pid": 41395, "prompt_tokens": 20261, "source": "llama_server.n_past", "task": 168151}
+{"cache_tokens": 7691, "kind": "evidence", "pid": 41395, "prompt_tokens": 20261, "source": "llama_server.n_past", "task": 168174}
+{"cache_tokens": 18153, "kind": "evidence", "pid": 41395, "prompt_tokens": 20339, "source": "llama_server.n_past", "task": 410260}
+{"cache_tokens": 20212, "kind": "evidence", "pid": 41395, "prompt_tokens": 20356, "source": "llama_server.n_past", "task": 195201}
+{"cache_tokens": 1727, "kind": "evidence", "pid": 41395, "prompt_tokens": 20382, "source": "llama_server.n_past", "task": 255861}
+{"cache_tokens": 20331, "kind": "evidence", "pid": 41395, "prompt_tokens": 20391, "source": "llama_server.n_past", "task": 512585}
+{"cache_tokens": 1, "kind": "evidence", "pid": 41395, "prompt_tokens": 20488, "source": "llama_server.n_past", "task": 196998}
+{"cache_tokens": 7683, "kind": "evidence", "pid": 41395, "prompt_tokens": 20488, "source": "llama_server.n_past", "task": 230091}
+{"cache_tokens": 20212, "kind": "evidence", "pid": 41395, "prompt_tokens": 20651, "source": "llama_server.n_past", "task": 195361}
+{"cache_tokens": 4727, "kind": "evidence", "pid": 41395, "prompt_tokens": 20775, "source": "llama_server.n_past", "task": 380371}
+{"cache_tokens": 20826, "kind": "evidence", "pid": 41395, "prompt_tokens": 20832, "source": "llama_server.n_past", "task": 492391}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 20863, "source": "llama_server.n_past", "task": 492480}
+{"cache_tokens": 6950, "kind": "evidence", "pid": 41395, "prompt_tokens": 20863, "source": "llama_server.n_past", "task": 499098}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 20864, "source": "llama_server.n_past", "task": 492677}
+{"cache_tokens": 20873, "kind": "evidence", "pid": 41395, "prompt_tokens": 20874, "source": "llama_server.n_past", "task": 97769}
+{"cache_tokens": 1255, "kind": "evidence", "pid": 41395, "prompt_tokens": 20875, "source": "llama_server.n_past", "task": 97862}
+{"cache_tokens": 1255, "kind": "evidence", "pid": 41395, "prompt_tokens": 20875, "source": "llama_server.n_past", "task": 97903}
+{"cache_tokens": 7683, "kind": "evidence", "pid": 41395, "prompt_tokens": 20976, "source": "llama_server.n_past", "task": 408831}
+{"cache_tokens": 20873, "kind": "evidence", "pid": 41395, "prompt_tokens": 20998, "source": "llama_server.n_past", "task": 424755}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 21021, "source": "llama_server.n_past", "task": 324172}
+{"cache_tokens": 1609, "kind": "evidence", "pid": 41395, "prompt_tokens": 21202, "source": "llama_server.n_past", "task": 512799}
+{"cache_tokens": 21107, "kind": "evidence", "pid": 41395, "prompt_tokens": 21203, "source": "llama_server.n_past", "task": 326209}
+{"cache_tokens": 21196, "kind": "evidence", "pid": 41395, "prompt_tokens": 21232, "source": "llama_server.n_past", "task": 536705}
+{"cache_tokens": 21143, "kind": "evidence", "pid": 41395, "prompt_tokens": 21250, "source": "llama_server.n_past", "task": 320182}
+{"cache_tokens": 20875, "kind": "evidence", "pid": 41395, "prompt_tokens": 21278, "source": "llama_server.n_past", "task": 425278}
+{"cache_tokens": 21280, "kind": "evidence", "pid": 41395, "prompt_tokens": 21282, "source": "llama_server.n_past", "task": 394466}
+{"cache_tokens": 21143, "kind": "evidence", "pid": 41395, "prompt_tokens": 21316, "source": "llama_server.n_past", "task": 319057}
+{"cache_tokens": 20873, "kind": "evidence", "pid": 41395, "prompt_tokens": 21341, "source": "llama_server.n_past", "task": 425818}
+{"cache_tokens": 21147, "kind": "evidence", "pid": 41395, "prompt_tokens": 21378, "source": "llama_server.n_past", "task": 319476}
+{"cache_tokens": 21282, "kind": "evidence", "pid": 41395, "prompt_tokens": 21501, "source": "llama_server.n_past", "task": 395173}
+{"cache_tokens": 21280, "kind": "evidence", "pid": 41395, "prompt_tokens": 21524, "source": "llama_server.n_past", "task": 394557}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 21549, "source": "llama_server.n_past", "task": 488792}
+{"cache_tokens": 6984, "kind": "evidence", "pid": 41395, "prompt_tokens": 21549, "source": "llama_server.n_past", "task": 492289}
+{"cache_tokens": 21360, "kind": "evidence", "pid": 41395, "prompt_tokens": 21569, "source": "llama_server.n_past", "task": 193203}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 21648, "source": "llama_server.n_past", "task": 395450}
+{"cache_tokens": 21282, "kind": "evidence", "pid": 41395, "prompt_tokens": 21648, "source": "llama_server.n_past", "task": 395594}
+{"cache_tokens": 21614, "kind": "evidence", "pid": 41395, "prompt_tokens": 21666, "source": "llama_server.n_past", "task": 251374}
+{"cache_tokens": 21360, "kind": "evidence", "pid": 41395, "prompt_tokens": 21737, "source": "llama_server.n_past", "task": 193808}
+{"cache_tokens": 21695, "kind": "evidence", "pid": 41395, "prompt_tokens": 21755, "source": "llama_server.n_past", "task": 403507}
+{"cache_tokens": 6141, "kind": "evidence", "pid": 41395, "prompt_tokens": 21777, "source": "llama_server.n_past", "task": 225776}
+{"cache_tokens": 7683, "kind": "evidence", "pid": 41395, "prompt_tokens": 21896, "source": "llama_server.n_past", "task": 188775}
+{"cache_tokens": 7683, "kind": "evidence", "pid": 41395, "prompt_tokens": 21896, "source": "llama_server.n_past", "task": 197488}
+{"cache_tokens": 6150, "kind": "evidence", "pid": 41395, "prompt_tokens": 21969, "source": "llama_server.n_past", "task": 204331}
+{"cache_tokens": 7692, "kind": "evidence", "pid": 41395, "prompt_tokens": 22246, "source": "llama_server.n_past", "task": 136474}
+{"cache_tokens": 7692, "kind": "evidence", "pid": 41395, "prompt_tokens": 22246, "source": "llama_server.n_past", "task": 136866}
+{"cache_tokens": 22221, "kind": "evidence", "pid": 41395, "prompt_tokens": 22273, "source": "llama_server.n_past", "task": 251589}
+{"cache_tokens": 7683, "kind": "evidence", "pid": 41395, "prompt_tokens": 22303, "source": "llama_server.n_past", "task": 425296}
+{"cache_tokens": 848, "kind": "evidence", "pid": 41395, "prompt_tokens": 22414, "source": "llama_server.n_past", "task": 303146}
+{"cache_tokens": 9078, "kind": "evidence", "pid": 41395, "prompt_tokens": 22414, "source": "llama_server.n_past", "task": 304162}
+{"cache_tokens": 11782, "kind": "evidence", "pid": 41395, "prompt_tokens": 22564, "source": "llama_server.n_past", "task": 505914}
+{"cache_tokens": 4724, "kind": "evidence", "pid": 41395, "prompt_tokens": 22578, "source": "llama_server.n_past", "task": 124031}
+{"cache_tokens": 4724, "kind": "evidence", "pid": 41395, "prompt_tokens": 22578, "source": "llama_server.n_past", "task": 124081}
+{"cache_tokens": 22576, "kind": "evidence", "pid": 41395, "prompt_tokens": 22578, "source": "llama_server.n_past", "task": 124723}
+{"cache_tokens": 22577, "kind": "evidence", "pid": 41395, "prompt_tokens": 22579, "source": "llama_server.n_past", "task": 123887}
+{"cache_tokens": 6150, "kind": "evidence", "pid": 41395, "prompt_tokens": 22788, "source": "llama_server.n_past", "task": 208312}
+{"cache_tokens": 22807, "kind": "evidence", "pid": 41395, "prompt_tokens": 22825, "source": "llama_server.n_past", "task": 202274}
+{"cache_tokens": 22806, "kind": "evidence", "pid": 41395, "prompt_tokens": 22856, "source": "llama_server.n_past", "task": 203063}
+{"cache_tokens": 22806, "kind": "evidence", "pid": 41395, "prompt_tokens": 22879, "source": "llama_server.n_past", "task": 202459}
+{"cache_tokens": 9078, "kind": "evidence", "pid": 41395, "prompt_tokens": 22999, "source": "llama_server.n_past", "task": 317611}
+{"cache_tokens": 22873, "kind": "evidence", "pid": 41395, "prompt_tokens": 23009, "source": "llama_server.n_past", "task": 304198}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 23011, "source": "llama_server.n_past", "task": 304684}
+{"cache_tokens": 9078, "kind": "evidence", "pid": 41395, "prompt_tokens": 23011, "source": "llama_server.n_past", "task": 321039}
+{"cache_tokens": 1624, "kind": "evidence", "pid": 41395, "prompt_tokens": 23014, "source": "llama_server.n_past", "task": 314977}
+{"cache_tokens": 23096, "kind": "evidence", "pid": 41395, "prompt_tokens": 23200, "source": "llama_server.n_past", "task": 427900}
+{"cache_tokens": 23096, "kind": "evidence", "pid": 41395, "prompt_tokens": 23210, "source": "llama_server.n_past", "task": 426403}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 23253, "source": "llama_server.n_past", "task": 251612}
+{"cache_tokens": 6141, "kind": "evidence", "pid": 41395, "prompt_tokens": 23253, "source": "llama_server.n_past", "task": 302508}
+{"cache_tokens": 23096, "kind": "evidence", "pid": 41395, "prompt_tokens": 23277, "source": "llama_server.n_past", "task": 426858}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 23455, "source": "llama_server.n_past", "task": 541789}
+{"cache_tokens": 23490, "kind": "evidence", "pid": 41395, "prompt_tokens": 23543, "source": "llama_server.n_past", "task": 307068}
+{"cache_tokens": 23417, "kind": "evidence", "pid": 41395, "prompt_tokens": 23593, "source": "llama_server.n_past", "task": 415479}
+{"cache_tokens": 23491, "kind": "evidence", "pid": 41395, "prompt_tokens": 23629, "source": "llama_server.n_past", "task": 306641}
+{"cache_tokens": 23417, "kind": "evidence", "pid": 41395, "prompt_tokens": 23648, "source": "llama_server.n_past", "task": 411231}
+{"cache_tokens": 23418, "kind": "evidence", "pid": 41395, "prompt_tokens": 23690, "source": "llama_server.n_past", "task": 411666}
+{"cache_tokens": 1256, "kind": "evidence", "pid": 41395, "prompt_tokens": 23729, "source": "llama_server.n_past", "task": 305449}
+{"cache_tokens": 23479, "kind": "evidence", "pid": 41395, "prompt_tokens": 23798, "source": "llama_server.n_past", "task": 304728}
+{"cache_tokens": 1256, "kind": "evidence", "pid": 41395, "prompt_tokens": 23906, "source": "llama_server.n_past", "task": 305467}
+{"cache_tokens": 23922, "kind": "evidence", "pid": 41395, "prompt_tokens": 23977, "source": "llama_server.n_past", "task": 179305}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 24211, "source": "llama_server.n_past", "task": 202294}
+{"cache_tokens": 24265, "kind": "evidence", "pid": 41395, "prompt_tokens": 24266, "source": "llama_server.n_past", "task": 322742}
+{"cache_tokens": 1624, "kind": "evidence", "pid": 41395, "prompt_tokens": 24266, "source": "llama_server.n_past", "task": 322888}
+{"cache_tokens": 24299, "kind": "evidence", "pid": 41395, "prompt_tokens": 24301, "source": "llama_server.n_past", "task": 111770}
+{"cache_tokens": 23947, "kind": "evidence", "pid": 41395, "prompt_tokens": 24360, "source": "llama_server.n_past", "task": 168826}
+{"cache_tokens": 24299, "kind": "evidence", "pid": 41395, "prompt_tokens": 24410, "source": "llama_server.n_past", "task": 111921}
+{"cache_tokens": 24299, "kind": "evidence", "pid": 41395, "prompt_tokens": 24425, "source": "llama_server.n_past", "task": 114442}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 24498, "source": "llama_server.n_past", "task": 389861}
+{"cache_tokens": 23946, "kind": "evidence", "pid": 41395, "prompt_tokens": 24625, "source": "llama_server.n_past", "task": 169952}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 24672, "source": "llama_server.n_past", "task": 130030}
+{"cache_tokens": 7691, "kind": "evidence", "pid": 41395, "prompt_tokens": 24741, "source": "llama_server.n_past", "task": 169963}
+{"cache_tokens": 7683, "kind": "evidence", "pid": 41395, "prompt_tokens": 24741, "source": "llama_server.n_past", "task": 197473}
+{"cache_tokens": 24859, "kind": "evidence", "pid": 41395, "prompt_tokens": 24860, "source": "llama_server.n_past", "task": 174980}
+{"cache_tokens": 24859, "kind": "evidence", "pid": 41395, "prompt_tokens": 24861, "source": "llama_server.n_past", "task": 174996}
+{"cache_tokens": 24868, "kind": "evidence", "pid": 41395, "prompt_tokens": 24869, "source": "llama_server.n_past", "task": 131447}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 24869, "source": "llama_server.n_past", "task": 131594}
+{"cache_tokens": 24859, "kind": "evidence", "pid": 41395, "prompt_tokens": 24925, "source": "llama_server.n_past", "task": 175005}
+{"cache_tokens": 24966, "kind": "evidence", "pid": 41395, "prompt_tokens": 24968, "source": "llama_server.n_past", "task": 153684}
+{"cache_tokens": 6271, "kind": "evidence", "pid": 41395, "prompt_tokens": 25012, "source": "llama_server.n_past", "task": 192548}
+{"cache_tokens": 25051, "kind": "evidence", "pid": 41395, "prompt_tokens": 25053, "source": "llama_server.n_past", "task": 390825}
+{"cache_tokens": 24967, "kind": "evidence", "pid": 41395, "prompt_tokens": 25060, "source": "llama_server.n_past", "task": 163416}
+{"cache_tokens": 7692, "kind": "evidence", "pid": 41395, "prompt_tokens": 25063, "source": "llama_server.n_past", "task": 153975}
+{"cache_tokens": 7686, "kind": "evidence", "pid": 41395, "prompt_tokens": 25063, "source": "llama_server.n_past", "task": 154312}
+{"cache_tokens": 24966, "kind": "evidence", "pid": 41395, "prompt_tokens": 25082, "source": "llama_server.n_past", "task": 163297}
+{"cache_tokens": 25190, "kind": "evidence", "pid": 41395, "prompt_tokens": 25255, "source": "llama_server.n_past", "task": 191720}
+{"cache_tokens": 25190, "kind": "evidence", "pid": 41395, "prompt_tokens": 25264, "source": "llama_server.n_past", "task": 191790}
+{"cache_tokens": 25269, "kind": "evidence", "pid": 41395, "prompt_tokens": 25286, "source": "llama_server.n_past", "task": 202940}
+{"cache_tokens": 25282, "kind": "evidence", "pid": 41395, "prompt_tokens": 25348, "source": "llama_server.n_past", "task": 403894}
+{"cache_tokens": 25273, "kind": "evidence", "pid": 41395, "prompt_tokens": 25350, "source": "llama_server.n_past", "task": 303764}
+{"cache_tokens": 25282, "kind": "evidence", "pid": 41395, "prompt_tokens": 25363, "source": "llama_server.n_past", "task": 403964}
+{"cache_tokens": 1365, "kind": "evidence", "pid": 41395, "prompt_tokens": 25376, "source": "llama_server.n_past", "task": 125056}
+{"cache_tokens": 7695, "kind": "evidence", "pid": 41395, "prompt_tokens": 25376, "source": "llama_server.n_past", "task": 127207}
+{"cache_tokens": 25051, "kind": "evidence", "pid": 41395, "prompt_tokens": 25376, "source": "llama_server.n_past", "task": 390944}
+{"cache_tokens": 25270, "kind": "evidence", "pid": 41395, "prompt_tokens": 25383, "source": "llama_server.n_past", "task": 202647}
+{"cache_tokens": 25050, "kind": "evidence", "pid": 41395, "prompt_tokens": 25412, "source": "llama_server.n_past", "task": 391755}
+{"cache_tokens": 25460, "kind": "evidence", "pid": 41395, "prompt_tokens": 25543, "source": "llama_server.n_past", "task": 315227}
+{"cache_tokens": 25460, "kind": "evidence", "pid": 41395, "prompt_tokens": 25573, "source": "llama_server.n_past", "task": 315315}
+{"cache_tokens": 848, "kind": "evidence", "pid": 41395, "prompt_tokens": 25638, "source": "llama_server.n_past", "task": 203692}
+{"cache_tokens": 11782, "kind": "evidence", "pid": 41395, "prompt_tokens": 25638, "source": "llama_server.n_past", "task": 207994}
+{"cache_tokens": 25722, "kind": "evidence", "pid": 41395, "prompt_tokens": 25723, "source": "llama_server.n_past", "task": 390138}
+{"cache_tokens": 25640, "kind": "evidence", "pid": 41395, "prompt_tokens": 25739, "source": "llama_server.n_past", "task": 194635}
+{"cache_tokens": 25640, "kind": "evidence", "pid": 41395, "prompt_tokens": 25764, "source": "llama_server.n_past", "task": 195159}
+{"cache_tokens": 25640, "kind": "evidence", "pid": 41395, "prompt_tokens": 25772, "source": "llama_server.n_past", "task": 194495}
+{"cache_tokens": 1256, "kind": "evidence", "pid": 41395, "prompt_tokens": 25840, "source": "llama_server.n_past", "task": 307363}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 25873, "source": "llama_server.n_past", "task": 390776}
+{"cache_tokens": 25722, "kind": "evidence", "pid": 41395, "prompt_tokens": 25884, "source": "llama_server.n_past", "task": 390234}
+{"cache_tokens": 7691, "kind": "evidence", "pid": 41395, "prompt_tokens": 25899, "source": "llama_server.n_past", "task": 170696}
+{"cache_tokens": 7686, "kind": "evidence", "pid": 41395, "prompt_tokens": 25899, "source": "llama_server.n_past", "task": 190547}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 26016, "source": "llama_server.n_past", "task": 96072}
+{"cache_tokens": 25997, "kind": "evidence", "pid": 41395, "prompt_tokens": 26060, "source": "llama_server.n_past", "task": 199636}
+{"cache_tokens": 26076, "kind": "evidence", "pid": 41395, "prompt_tokens": 26205, "source": "llama_server.n_past", "task": 541966}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 26213, "source": "llama_server.n_past", "task": 542338}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 26216, "source": "llama_server.n_past", "task": 542369}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 26251, "source": "llama_server.n_past", "task": 244316}
+{"cache_tokens": 9078, "kind": "evidence", "pid": 41395, "prompt_tokens": 26251, "source": "llama_server.n_past", "task": 253610}
+{"cache_tokens": 26265, "kind": "evidence", "pid": 41395, "prompt_tokens": 26334, "source": "llama_server.n_past", "task": 118312}
+{"cache_tokens": 7691, "kind": "evidence", "pid": 41395, "prompt_tokens": 26579, "source": "llama_server.n_past", "task": 168782}
+{"cache_tokens": 26578, "kind": "evidence", "pid": 41395, "prompt_tokens": 26580, "source": "llama_server.n_past", "task": 168397}
+{"cache_tokens": 7686, "kind": "evidence", "pid": 41395, "prompt_tokens": 26679, "source": "llama_server.n_past", "task": 187574}
+{"cache_tokens": 26578, "kind": "evidence", "pid": 41395, "prompt_tokens": 26762, "source": "llama_server.n_past", "task": 168416}
+{"cache_tokens": 1256, "kind": "evidence", "pid": 41395, "prompt_tokens": 26901, "source": "llama_server.n_past", "task": 307660}
+{"cache_tokens": 26748, "kind": "evidence", "pid": 41395, "prompt_tokens": 26901, "source": "llama_server.n_past", "task": 308542}
+{"cache_tokens": 26749, "kind": "evidence", "pid": 41395, "prompt_tokens": 26997, "source": "llama_server.n_past", "task": 307103}
+{"cache_tokens": 1628, "kind": "evidence", "pid": 41395, "prompt_tokens": 27199, "source": "llama_server.n_past", "task": 277309}
+{"cache_tokens": 1628, "kind": "evidence", "pid": 41395, "prompt_tokens": 27223, "source": "llama_server.n_past", "task": 275306}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 27419, "source": "llama_server.n_past", "task": 358322}
+{"cache_tokens": 26918, "kind": "evidence", "pid": 41395, "prompt_tokens": 27460, "source": "llama_server.n_past", "task": 199778}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 27530, "source": "llama_server.n_past", "task": 326119}
+{"cache_tokens": 9078, "kind": "evidence", "pid": 41395, "prompt_tokens": 27530, "source": "llama_server.n_past", "task": 329780}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 27553, "source": "llama_server.n_past", "task": 513240}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 27790, "source": "llama_server.n_past", "task": 241844}
+{"cache_tokens": 27834, "kind": "evidence", "pid": 41395, "prompt_tokens": 27891, "source": "llama_server.n_past", "task": 431364}
+{"cache_tokens": 9085, "kind": "evidence", "pid": 41395, "prompt_tokens": 28073, "source": "llama_server.n_past", "task": 240815}
+{"cache_tokens": 9078, "kind": "evidence", "pid": 41395, "prompt_tokens": 28073, "source": "llama_server.n_past", "task": 244252}
+{"cache_tokens": 27937, "kind": "evidence", "pid": 41395, "prompt_tokens": 28089, "source": "llama_server.n_past", "task": 426360}
+{"cache_tokens": 27937, "kind": "evidence", "pid": 41395, "prompt_tokens": 28225, "source": "llama_server.n_past", "task": 425983}
+{"cache_tokens": 1321, "kind": "evidence", "pid": 41395, "prompt_tokens": 28407, "source": "llama_server.n_past", "task": 202018}
+{"cache_tokens": 28718, "kind": "evidence", "pid": 41395, "prompt_tokens": 28766, "source": "llama_server.n_past", "task": 497067}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 28874, "source": "llama_server.n_past", "task": 538289}
+{"cache_tokens": 28906, "kind": "evidence", "pid": 41395, "prompt_tokens": 28962, "source": "llama_server.n_past", "task": 431460}
+{"cache_tokens": 29230, "kind": "evidence", "pid": 41395, "prompt_tokens": 29337, "source": "llama_server.n_past", "task": 413445}
+{"cache_tokens": 29229, "kind": "evidence", "pid": 41395, "prompt_tokens": 29358, "source": "llama_server.n_past", "task": 414314}
+{"cache_tokens": 1628, "kind": "evidence", "pid": 41395, "prompt_tokens": 29430, "source": "llama_server.n_past", "task": 263263}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 29685, "source": "llama_server.n_past", "task": 499466}
+{"cache_tokens": 29709, "kind": "evidence", "pid": 41395, "prompt_tokens": 29712, "source": "llama_server.n_past", "task": 95304}
+{"cache_tokens": 29709, "kind": "evidence", "pid": 41395, "prompt_tokens": 29712, "source": "llama_server.n_past", "task": 95336}
+{"cache_tokens": 29230, "kind": "evidence", "pid": 41395, "prompt_tokens": 29759, "source": "llama_server.n_past", "task": 413558}
+{"cache_tokens": 30023, "kind": "evidence", "pid": 41395, "prompt_tokens": 30069, "source": "llama_server.n_past", "task": 431615}
+{"cache_tokens": 1625, "kind": "evidence", "pid": 41395, "prompt_tokens": 30330, "source": "llama_server.n_past", "task": 393774}
+{"cache_tokens": 30120, "kind": "evidence", "pid": 41395, "prompt_tokens": 30358, "source": "llama_server.n_past", "task": 320352}
+{"cache_tokens": 30120, "kind": "evidence", "pid": 41395, "prompt_tokens": 30384, "source": "llama_server.n_past", "task": 320729}
+{"cache_tokens": 30354, "kind": "evidence", "pid": 41395, "prompt_tokens": 30413, "source": "llama_server.n_past", "task": 157295}
+{"cache_tokens": 30120, "kind": "evidence", "pid": 41395, "prompt_tokens": 30429, "source": "llama_server.n_past", "task": 321266}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 30501, "source": "llama_server.n_past", "task": 330149}
+{"cache_tokens": 30515, "kind": "evidence", "pid": 41395, "prompt_tokens": 30517, "source": "llama_server.n_past", "task": 395826}
+{"cache_tokens": 7687, "kind": "evidence", "pid": 41395, "prompt_tokens": 30569, "source": "llama_server.n_past", "task": 327185}
+{"cache_tokens": 7683, "kind": "evidence", "pid": 41395, "prompt_tokens": 30569, "source": "llama_server.n_past", "task": 327313}
+{"cache_tokens": 30514, "kind": "evidence", "pid": 41395, "prompt_tokens": 30879, "source": "llama_server.n_past", "task": 396290}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 30941, "source": "llama_server.n_past", "task": 397416}
+{"cache_tokens": 30514, "kind": "evidence", "pid": 41395, "prompt_tokens": 30941, "source": "llama_server.n_past", "task": 397980}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 31078, "source": "llama_server.n_past", "task": 197025}
+{"cache_tokens": 1365, "kind": "evidence", "pid": 41395, "prompt_tokens": 31080, "source": "llama_server.n_past", "task": 426524}
+{"cache_tokens": 1366, "kind": "evidence", "pid": 41395, "prompt_tokens": 31198, "source": "llama_server.n_past", "task": 340498}
+{"cache_tokens": 31250, "kind": "evidence", "pid": 41395, "prompt_tokens": 31310, "source": "llama_server.n_past", "task": 431727}
+{"cache_tokens": 31570, "kind": "evidence", "pid": 41395, "prompt_tokens": 31573, "source": "llama_server.n_past", "task": 391895}
+{"cache_tokens": 31865, "kind": "evidence", "pid": 41395, "prompt_tokens": 31923, "source": "llama_server.n_past", "task": 157408}
+{"cache_tokens": 12303, "kind": "evidence", "pid": 41395, "prompt_tokens": 32070, "source": "llama_server.n_past", "task": 196518}
+{"cache_tokens": 32072, "kind": "evidence", "pid": 41395, "prompt_tokens": 32099, "source": "llama_server.n_past", "task": 140584}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 32147, "source": "llama_server.n_past", "task": 140840}
+{"cache_tokens": 31970, "kind": "evidence", "pid": 41395, "prompt_tokens": 32268, "source": "llama_server.n_past", "task": 416292}
+{"cache_tokens": 31960, "kind": "evidence", "pid": 41395, "prompt_tokens": 32374, "source": "llama_server.n_past", "task": 415047}
+{"cache_tokens": 7683, "kind": "evidence", "pid": 41395, "prompt_tokens": 32485, "source": "llama_server.n_past", "task": 327703}
+{"cache_tokens": 20792, "kind": "evidence", "pid": 41395, "prompt_tokens": 32485, "source": "llama_server.n_past", "task": 407329}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 32758, "source": "llama_server.n_past", "task": 131166}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 32768, "source": "llama_server.n_past", "task": 97522}
+{"cache_tokens": 1366, "kind": "evidence", "pid": 41395, "prompt_tokens": 32768, "source": "llama_server.n_past", "task": 106051}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 32768, "source": "llama_server.n_past", "task": 133108}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 32768, "source": "llama_server.n_past", "task": 136551}
+{"cache_tokens": 32878, "kind": "evidence", "pid": 41395, "prompt_tokens": 32936, "source": "llama_server.n_past", "task": 157706}
+{"cache_tokens": 32945, "kind": "evidence", "pid": 41395, "prompt_tokens": 32947, "source": "llama_server.n_past", "task": 167388}
+{"cache_tokens": 32945, "kind": "evidence", "pid": 41395, "prompt_tokens": 33067, "source": "llama_server.n_past", "task": 167430}
+{"cache_tokens": 32945, "kind": "evidence", "pid": 41395, "prompt_tokens": 33071, "source": "llama_server.n_past", "task": 167559}
+{"cache_tokens": 33806, "kind": "evidence", "pid": 41395, "prompt_tokens": 33859, "source": "llama_server.n_past", "task": 101190}
+{"cache_tokens": 34206, "kind": "evidence", "pid": 41395, "prompt_tokens": 34269, "source": "llama_server.n_past", "task": 158168}
+{"cache_tokens": 34446, "kind": "evidence", "pid": 41395, "prompt_tokens": 34449, "source": "llama_server.n_past", "task": 188180}
+{"cache_tokens": 34446, "kind": "evidence", "pid": 41395, "prompt_tokens": 34449, "source": "llama_server.n_past", "task": 188218}
+{"cache_tokens": 34480, "kind": "evidence", "pid": 41395, "prompt_tokens": 34542, "source": "llama_server.n_past", "task": 158268}
+{"cache_tokens": 34402, "kind": "evidence", "pid": 41395, "prompt_tokens": 34543, "source": "llama_server.n_past", "task": 398075}
+{"cache_tokens": 34402, "kind": "evidence", "pid": 41395, "prompt_tokens": 34546, "source": "llama_server.n_past", "task": 398328}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 34641, "source": "llama_server.n_past", "task": 398336}
+{"cache_tokens": 34402, "kind": "evidence", "pid": 41395, "prompt_tokens": 34641, "source": "llama_server.n_past", "task": 399404}
+{"cache_tokens": 35151, "kind": "evidence", "pid": 41395, "prompt_tokens": 35244, "source": "llama_server.n_past", "task": 114396}
+{"cache_tokens": 35193, "kind": "evidence", "pid": 41395, "prompt_tokens": 35251, "source": "llama_server.n_past", "task": 468789}
+{"cache_tokens": 1984, "kind": "evidence", "pid": 41395, "prompt_tokens": 35254, "source": "llama_server.n_past", "task": 532273}
+{"cache_tokens": 35165, "kind": "evidence", "pid": 41395, "prompt_tokens": 35260, "source": "llama_server.n_past", "task": 146772}
+{"cache_tokens": 11791, "kind": "evidence", "pid": 41395, "prompt_tokens": 35280, "source": "llama_server.n_past", "task": 207974}
+{"cache_tokens": 1625, "kind": "evidence", "pid": 41395, "prompt_tokens": 35984, "source": "llama_server.n_past", "task": 499929}
+{"cache_tokens": 848, "kind": "evidence", "pid": 41395, "prompt_tokens": 36145, "source": "llama_server.n_past", "task": 559560}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 36347, "source": "llama_server.n_past", "task": 541043}
+{"cache_tokens": 36306, "kind": "evidence", "pid": 41395, "prompt_tokens": 36359, "source": "llama_server.n_past", "task": 101286}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 36649, "source": "llama_server.n_past", "task": 312773}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 36943, "source": "llama_server.n_past", "task": 464579}
+{"cache_tokens": 37301, "kind": "evidence", "pid": 41395, "prompt_tokens": 37359, "source": "llama_server.n_past", "task": 158685}
+{"cache_tokens": 1365, "kind": "evidence", "pid": 41395, "prompt_tokens": 37416, "source": "llama_server.n_past", "task": 427950}
+{"cache_tokens": 1365, "kind": "evidence", "pid": 41395, "prompt_tokens": 37431, "source": "llama_server.n_past", "task": 427987}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 38181, "source": "llama_server.n_past", "task": 338506}
+{"cache_tokens": 38375, "kind": "evidence", "pid": 41395, "prompt_tokens": 38376, "source": "llama_server.n_past", "task": 321315}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 38538, "source": "llama_server.n_past", "task": 321964}
+{"cache_tokens": 38374, "kind": "evidence", "pid": 41395, "prompt_tokens": 38538, "source": "llama_server.n_past", "task": 322482}
+{"cache_tokens": 38375, "kind": "evidence", "pid": 41395, "prompt_tokens": 38547, "source": "llama_server.n_past", "task": 321325}
+{"cache_tokens": 6908, "kind": "evidence", "pid": 41395, "prompt_tokens": 38615, "source": "llama_server.n_past", "task": 424096}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 38685, "source": "llama_server.n_past", "task": 321997}
+{"cache_tokens": 38374, "kind": "evidence", "pid": 41395, "prompt_tokens": 38685, "source": "llama_server.n_past", "task": 322536}
+{"cache_tokens": 4729, "kind": "evidence", "pid": 41395, "prompt_tokens": 38787, "source": "llama_server.n_past", "task": 158810}
+{"cache_tokens": 38970, "kind": "evidence", "pid": 41395, "prompt_tokens": 39025, "source": "llama_server.n_past", "task": 469061}
+{"cache_tokens": 4729, "kind": "evidence", "pid": 41395, "prompt_tokens": 39567, "source": "llama_server.n_past", "task": 158940}
+{"cache_tokens": 39564, "kind": "evidence", "pid": 41395, "prompt_tokens": 39567, "source": "llama_server.n_past", "task": 160705}
+{"cache_tokens": 39603, "kind": "evidence", "pid": 41395, "prompt_tokens": 39658, "source": "llama_server.n_past", "task": 432331}
+{"cache_tokens": 39672, "kind": "evidence", "pid": 41395, "prompt_tokens": 39974, "source": "llama_server.n_past", "task": 399433}
+{"cache_tokens": 39671, "kind": "evidence", "pid": 41395, "prompt_tokens": 40107, "source": "llama_server.n_past", "task": 400573}
+{"cache_tokens": 40075, "kind": "evidence", "pid": 41395, "prompt_tokens": 40170, "source": "llama_server.n_past", "task": 147902}
+{"cache_tokens": 40623, "kind": "evidence", "pid": 41395, "prompt_tokens": 40676, "source": "llama_server.n_past", "task": 101493}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 40752, "source": "llama_server.n_past", "task": 394418}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 40753, "source": "llama_server.n_past", "task": 394514}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 40960, "source": "llama_server.n_past", "task": 102553}
+{"cache_tokens": 1, "kind": "evidence", "pid": 41395, "prompt_tokens": 40960, "source": "llama_server.n_past", "task": 102863}
+{"cache_tokens": 20854, "kind": "evidence", "pid": 41395, "prompt_tokens": 40960, "source": "llama_server.n_past", "task": 103041}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 40960, "source": "llama_server.n_past", "task": 331219}
+{"cache_tokens": 4822, "kind": "evidence", "pid": 41395, "prompt_tokens": 40960, "source": "llama_server.n_past", "task": 349185}
+{"cache_tokens": 41154, "kind": "evidence", "pid": 41395, "prompt_tokens": 41156, "source": "llama_server.n_past", "task": 152748}
+{"cache_tokens": 1365, "kind": "evidence", "pid": 41395, "prompt_tokens": 41156, "source": "llama_server.n_past", "task": 152857}
+{"cache_tokens": 6918, "kind": "evidence", "pid": 41395, "prompt_tokens": 41156, "source": "llama_server.n_past", "task": 152870}
+{"cache_tokens": 41153, "kind": "evidence", "pid": 41395, "prompt_tokens": 41156, "source": "llama_server.n_past", "task": 163049}
+{"cache_tokens": 41153, "kind": "evidence", "pid": 41395, "prompt_tokens": 41156, "source": "llama_server.n_past", "task": 163094}
+{"cache_tokens": 41309, "kind": "evidence", "pid": 41395, "prompt_tokens": 41404, "source": "llama_server.n_past", "task": 148129}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 41517, "source": "llama_server.n_past", "task": 541152}
+{"cache_tokens": 6918, "kind": "evidence", "pid": 41395, "prompt_tokens": 41870, "source": "llama_server.n_past", "task": 187344}
+{"cache_tokens": 41831, "kind": "evidence", "pid": 41395, "prompt_tokens": 41887, "source": "llama_server.n_past", "task": 469171}
+{"cache_tokens": 4724, "kind": "evidence", "pid": 41395, "prompt_tokens": 41910, "source": "llama_server.n_past", "task": 310233}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 42207, "source": "llama_server.n_past", "task": 125127}
+{"cache_tokens": 42222, "kind": "evidence", "pid": 41395, "prompt_tokens": 42223, "source": "llama_server.n_past", "task": 303200}
+{"cache_tokens": 42570, "kind": "evidence", "pid": 41395, "prompt_tokens": 42571, "source": "llama_server.n_past", "task": 163147}
+{"cache_tokens": 6918, "kind": "evidence", "pid": 41395, "prompt_tokens": 42572, "source": "llama_server.n_past", "task": 165881}
+{"cache_tokens": 42570, "kind": "evidence", "pid": 41395, "prompt_tokens": 42572, "source": "llama_server.n_past", "task": 186742}
+{"cache_tokens": 42510, "kind": "evidence", "pid": 41395, "prompt_tokens": 42605, "source": "llama_server.n_past", "task": 148422}
+{"cache_tokens": 42222, "kind": "evidence", "pid": 41395, "prompt_tokens": 42608, "source": "llama_server.n_past", "task": 303234}
+{"cache_tokens": 43092, "kind": "evidence", "pid": 41395, "prompt_tokens": 43094, "source": "llama_server.n_past", "task": 395560}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 43094, "source": "llama_server.n_past", "task": 395772}
+{"cache_tokens": 43095, "kind": "evidence", "pid": 41395, "prompt_tokens": 43096, "source": "llama_server.n_past", "task": 515960}
+{"cache_tokens": 43095, "kind": "evidence", "pid": 41395, "prompt_tokens": 43097, "source": "llama_server.n_past", "task": 516044}
+{"cache_tokens": 43094, "kind": "evidence", "pid": 41395, "prompt_tokens": 43113, "source": "llama_server.n_past", "task": 517022}
+{"cache_tokens": 43091, "kind": "evidence", "pid": 41395, "prompt_tokens": 43147, "source": "llama_server.n_past", "task": 401382}
+{"cache_tokens": 43095, "kind": "evidence", "pid": 41395, "prompt_tokens": 43498, "source": "llama_server.n_past", "task": 516483}
+{"cache_tokens": 43094, "kind": "evidence", "pid": 41395, "prompt_tokens": 43602, "source": "llama_server.n_past", "task": 531224}
+{"cache_tokens": 43644, "kind": "evidence", "pid": 41395, "prompt_tokens": 43645, "source": "llama_server.n_past", "task": 114487}
+{"cache_tokens": 43644, "kind": "evidence", "pid": 41395, "prompt_tokens": 43646, "source": "llama_server.n_past", "task": 114535}
+{"cache_tokens": 43644, "kind": "evidence", "pid": 41395, "prompt_tokens": 43774, "source": "llama_server.n_past", "task": 114553}
+{"cache_tokens": 20048, "kind": "evidence", "pid": 41395, "prompt_tokens": 43789, "source": "llama_server.n_past", "task": 123848}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 44203, "source": "llama_server.n_past", "task": 390079}
+{"cache_tokens": 44201, "kind": "evidence", "pid": 41395, "prompt_tokens": 44254, "source": "llama_server.n_past", "task": 390714}
+{"cache_tokens": 20020, "kind": "evidence", "pid": 41395, "prompt_tokens": 44449, "source": "llama_server.n_past", "task": 115525}
+{"cache_tokens": 20048, "kind": "evidence", "pid": 41395, "prompt_tokens": 44449, "source": "llama_server.n_past", "task": 123806}
+{"cache_tokens": 44729, "kind": "evidence", "pid": 41395, "prompt_tokens": 44730, "source": "llama_server.n_past", "task": 187659}
+{"cache_tokens": 44729, "kind": "evidence", "pid": 41395, "prompt_tokens": 44730, "source": "llama_server.n_past", "task": 187700}
+{"cache_tokens": 6918, "kind": "evidence", "pid": 41395, "prompt_tokens": 44731, "source": "llama_server.n_past", "task": 187918}
+{"cache_tokens": 44729, "kind": "evidence", "pid": 41395, "prompt_tokens": 44749, "source": "llama_server.n_past", "task": 187793}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 45531, "source": "llama_server.n_past", "task": 203353}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 45549, "source": "llama_server.n_past", "task": 410372}
+{"cache_tokens": 45634, "kind": "evidence", "pid": 41395, "prompt_tokens": 45690, "source": "llama_server.n_past", "task": 437275}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 45938, "source": "llama_server.n_past", "task": 102430}
+{"cache_tokens": 20023, "kind": "evidence", "pid": 41395, "prompt_tokens": 45938, "source": "llama_server.n_past", "task": 104987}
+{"cache_tokens": 1366, "kind": "evidence", "pid": 41395, "prompt_tokens": 45977, "source": "llama_server.n_past", "task": 95466}
+{"cache_tokens": 46002, "kind": "evidence", "pid": 41395, "prompt_tokens": 46004, "source": "llama_server.n_past", "task": 391951}
+{"cache_tokens": 46002, "kind": "evidence", "pid": 41395, "prompt_tokens": 46069, "source": "llama_server.n_past", "task": 391983}
+{"cache_tokens": 46002, "kind": "evidence", "pid": 41395, "prompt_tokens": 46069, "source": "llama_server.n_past", "task": 392055}
+{"cache_tokens": 46001, "kind": "evidence", "pid": 41395, "prompt_tokens": 46086, "source": "llama_server.n_past", "task": 392245}
+{"cache_tokens": 46641, "kind": "evidence", "pid": 41395, "prompt_tokens": 46643, "source": "llama_server.n_past", "task": 320805}
+{"cache_tokens": 848, "kind": "evidence", "pid": 41395, "prompt_tokens": 46722, "source": "llama_server.n_past", "task": 321159}
+{"cache_tokens": 46641, "kind": "evidence", "pid": 41395, "prompt_tokens": 46816, "source": "llama_server.n_past", "task": 320853}
+{"cache_tokens": 47051, "kind": "evidence", "pid": 41395, "prompt_tokens": 47108, "source": "llama_server.n_past", "task": 470987}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 47379, "source": "llama_server.n_past", "task": 203284}
+{"cache_tokens": 47514, "kind": "evidence", "pid": 41395, "prompt_tokens": 47613, "source": "llama_server.n_past", "task": 149500}
+{"cache_tokens": 47561, "kind": "evidence", "pid": 41395, "prompt_tokens": 47618, "source": "llama_server.n_past", "task": 471087}
+{"cache_tokens": 848, "kind": "evidence", "pid": 41395, "prompt_tokens": 47917, "source": "llama_server.n_past", "task": 242442}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 47976, "source": "llama_server.n_past", "task": 124865}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 48088, "source": "llama_server.n_past", "task": 394353}
+{"cache_tokens": 49013, "kind": "evidence", "pid": 41395, "prompt_tokens": 49014, "source": "llama_server.n_past", "task": 531406}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 49015, "source": "llama_server.n_past", "task": 532239}
+{"cache_tokens": 49012, "kind": "evidence", "pid": 41395, "prompt_tokens": 49015, "source": "llama_server.n_past", "task": 532771}
+{"cache_tokens": 49012, "kind": "evidence", "pid": 41395, "prompt_tokens": 49015, "source": "llama_server.n_past", "task": 532871}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 49152, "source": "llama_server.n_past", "task": 93740}
+{"cache_tokens": 1366, "kind": "evidence", "pid": 41395, "prompt_tokens": 49152, "source": "llama_server.n_past", "task": 105997}
+{"cache_tokens": 4742, "kind": "evidence", "pid": 41395, "prompt_tokens": 49152, "source": "llama_server.n_past", "task": 131349}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 49152, "source": "llama_server.n_past", "task": 133068}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 49152, "source": "llama_server.n_past", "task": 204045}
+{"cache_tokens": 50423, "kind": "evidence", "pid": 41395, "prompt_tokens": 50479, "source": "llama_server.n_past", "task": 473142}
+{"cache_tokens": 51344, "kind": "evidence", "pid": 41395, "prompt_tokens": 51402, "source": "llama_server.n_past", "task": 473521}
+{"cache_tokens": 1630, "kind": "evidence", "pid": 41395, "prompt_tokens": 51586, "source": "llama_server.n_past", "task": 530171}
+{"cache_tokens": 51179, "kind": "evidence", "pid": 41395, "prompt_tokens": 51921, "source": "llama_server.n_past", "task": 442570}
+{"cache_tokens": 52416, "kind": "evidence", "pid": 41395, "prompt_tokens": 52471, "source": "llama_server.n_past", "task": 442951}
+{"cache_tokens": 52718, "kind": "evidence", "pid": 41395, "prompt_tokens": 52773, "source": "llama_server.n_past", "task": 443057}
+{"cache_tokens": 53407, "kind": "evidence", "pid": 41395, "prompt_tokens": 53463, "source": "llama_server.n_past", "task": 443556}
+{"cache_tokens": 53823, "kind": "evidence", "pid": 41395, "prompt_tokens": 53877, "source": "llama_server.n_past", "task": 443720}
+{"cache_tokens": 54285, "kind": "evidence", "pid": 41395, "prompt_tokens": 54287, "source": "llama_server.n_past", "task": 160740}
+{"cache_tokens": 54285, "kind": "evidence", "pid": 41395, "prompt_tokens": 54287, "source": "llama_server.n_past", "task": 160783}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 54291, "source": "llama_server.n_past", "task": 130834}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 54304, "source": "llama_server.n_past", "task": 152697}
+{"cache_tokens": 19348, "kind": "evidence", "pid": 41395, "prompt_tokens": 54304, "source": "llama_server.n_past", "task": 160811}
+{"cache_tokens": 54285, "kind": "evidence", "pid": 41395, "prompt_tokens": 54304, "source": "llama_server.n_past", "task": 160848}
+{"cache_tokens": 54484, "kind": "evidence", "pid": 41395, "prompt_tokens": 54540, "source": "llama_server.n_past", "task": 444141}
+{"cache_tokens": 55862, "kind": "evidence", "pid": 41395, "prompt_tokens": 55917, "source": "llama_server.n_past", "task": 445039}
+{"cache_tokens": 848, "kind": "evidence", "pid": 41395, "prompt_tokens": 57207, "source": "llama_server.n_past", "task": 337279}
+{"cache_tokens": 57213, "kind": "evidence", "pid": 41395, "prompt_tokens": 57269, "source": "llama_server.n_past", "task": 445830}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 57334, "source": "llama_server.n_past", "task": 131838}
+{"cache_tokens": 1256, "kind": "evidence", "pid": 41395, "prompt_tokens": 57344, "source": "llama_server.n_past", "task": 324225}
+{"cache_tokens": 20020, "kind": "evidence", "pid": 41395, "prompt_tokens": 58062, "source": "llama_server.n_past", "task": 94634}
+{"cache_tokens": 3, "kind": "evidence", "pid": 41395, "prompt_tokens": 61261, "source": "llama_server.n_past", "task": 546207}
+{"cache_tokens": 61676, "kind": "evidence", "pid": 41395, "prompt_tokens": 61731, "source": "llama_server.n_past", "task": 448956}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 62206, "source": "llama_server.n_past", "task": 390891}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 64041, "source": "llama_server.n_past", "task": 410389}
+{"cache_tokens": 4724, "kind": "evidence", "pid": 41395, "prompt_tokens": 65535, "source": "llama_server.n_past", "task": 97167}
+{"cache_tokens": 24871, "kind": "evidence", "pid": 41395, "prompt_tokens": 65535, "source": "llama_server.n_past", "task": 129981}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 65536, "source": "llama_server.n_past", "task": 94215}
+{"cache_tokens": 24892, "kind": "evidence", "pid": 41395, "prompt_tokens": 65536, "source": "llama_server.n_past", "task": 94844}
+{"cache_tokens": 1255, "kind": "evidence", "pid": 41395, "prompt_tokens": 65536, "source": "llama_server.n_past", "task": 97682}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 65536, "source": "llama_server.n_past", "task": 105656}
+{"cache_tokens": 1534, "kind": "evidence", "pid": 41395, "prompt_tokens": 65536, "source": "llama_server.n_past", "task": 548629}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 65682, "source": "llama_server.n_past", "task": 322684}
+{"cache_tokens": 65680, "kind": "evidence", "pid": 41395, "prompt_tokens": 65682, "source": "llama_server.n_past", "task": 322941}
+{"cache_tokens": 66072, "kind": "evidence", "pid": 41395, "prompt_tokens": 66073, "source": "llama_server.n_past", "task": 534194}
+{"cache_tokens": 66602, "kind": "evidence", "pid": 41395, "prompt_tokens": 66604, "source": "llama_server.n_past", "task": 490039}
+{"cache_tokens": 7683, "kind": "evidence", "pid": 41395, "prompt_tokens": 67211, "source": "llama_server.n_past", "task": 188577}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 68408, "source": "llama_server.n_past", "task": 430512}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 68964, "source": "llama_server.n_past", "task": 331243}
+{"cache_tokens": 68962, "kind": "evidence", "pid": 41395, "prompt_tokens": 68964, "source": "llama_server.n_past", "task": 331549}
+{"cache_tokens": 3, "kind": "evidence", "pid": 41395, "prompt_tokens": 69125, "source": "llama_server.n_past", "task": 546156}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 69453, "source": "llama_server.n_past", "task": 547205}
+{"cache_tokens": 66542, "kind": "evidence", "pid": 41395, "prompt_tokens": 69866, "source": "llama_server.n_past", "task": 488928}
+{"cache_tokens": 1630, "kind": "evidence", "pid": 41395, "prompt_tokens": 69876, "source": "llama_server.n_past", "task": 530160}
+{"cache_tokens": 69876, "kind": "evidence", "pid": 41395, "prompt_tokens": 69877, "source": "llama_server.n_past", "task": 530053}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 70371, "source": "llama_server.n_past", "task": 340538}
+{"cache_tokens": 20684, "kind": "evidence", "pid": 41395, "prompt_tokens": 70371, "source": "llama_server.n_past", "task": 389267}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 70944, "source": "llama_server.n_past", "task": 97286}
+{"cache_tokens": 1255, "kind": "evidence", "pid": 41395, "prompt_tokens": 70944, "source": "llama_server.n_past", "task": 97727}
+{"cache_tokens": 19965, "kind": "evidence", "pid": 41395, "prompt_tokens": 71697, "source": "llama_server.n_past", "task": 538953}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 71952, "source": "llama_server.n_past", "task": 203961}
+{"cache_tokens": 4740, "kind": "evidence", "pid": 41395, "prompt_tokens": 72945, "source": "llama_server.n_past", "task": 131987}
+{"cache_tokens": 1366, "kind": "evidence", "pid": 41395, "prompt_tokens": 73728, "source": "llama_server.n_past", "task": 94703}
+{"cache_tokens": 20018, "kind": "evidence", "pid": 41395, "prompt_tokens": 73728, "source": "llama_server.n_past", "task": 105703}
+{"cache_tokens": 24892, "kind": "evidence", "pid": 41395, "prompt_tokens": 73728, "source": "llama_server.n_past", "task": 132822}
+{"cache_tokens": 24892, "kind": "evidence", "pid": 41395, "prompt_tokens": 73728, "source": "llama_server.n_past", "task": 133227}
+{"cache_tokens": 19343, "kind": "evidence", "pid": 41395, "prompt_tokens": 73728, "source": "llama_server.n_past", "task": 203516}
+{"cache_tokens": 356, "kind": "evidence", "pid": 41395, "prompt_tokens": 73728, "source": "llama_server.n_past", "task": 323349}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 73728, "source": "llama_server.n_past", "task": 538875}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 73728, "source": "llama_server.n_past", "task": 547365}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 75857, "source": "llama_server.n_past", "task": 102603}
+{"cache_tokens": 1256, "kind": "evidence", "pid": 41395, "prompt_tokens": 75887, "source": "llama_server.n_past", "task": 309753}
+{"cache_tokens": 77494, "kind": "evidence", "pid": 41395, "prompt_tokens": 77496, "source": "llama_server.n_past", "task": 535207}
+{"cache_tokens": 6919, "kind": "evidence", "pid": 41395, "prompt_tokens": 77687, "source": "llama_server.n_past", "task": 187986}
+{"cache_tokens": 4724, "kind": "evidence", "pid": 41395, "prompt_tokens": 83243, "source": "llama_server.n_past", "task": 463836}
+{"cache_tokens": 11782, "kind": "evidence", "pid": 41395, "prompt_tokens": 84034, "source": "llama_server.n_past", "task": 93781}
+{"cache_tokens": 24892, "kind": "evidence", "pid": 41395, "prompt_tokens": 84034, "source": "llama_server.n_past", "task": 94083}
+{"cache_tokens": 85473, "kind": "evidence", "pid": 41395, "prompt_tokens": 85474, "source": "llama_server.n_past", "task": 331632}
+{"cache_tokens": 848, "kind": "evidence", "pid": 41395, "prompt_tokens": 85474, "source": "llama_server.n_past", "task": 331992}
+{"cache_tokens": 87474, "kind": "evidence", "pid": 41395, "prompt_tokens": 87477, "source": "llama_server.n_past", "task": 538136}
+{"cache_tokens": 87689, "kind": "evidence", "pid": 41395, "prompt_tokens": 87690, "source": "llama_server.n_past", "task": 97206}
+{"cache_tokens": 88704, "kind": "evidence", "pid": 41395, "prompt_tokens": 88706, "source": "llama_server.n_past", "task": 126314}
+{"cache_tokens": 1534, "kind": "evidence", "pid": 41395, "prompt_tokens": 90112, "source": "llama_server.n_past", "task": 548704}
+{"cache_tokens": 92434, "kind": "evidence", "pid": 41395, "prompt_tokens": 92436, "source": "llama_server.n_past", "task": 490454}
+{"cache_tokens": 4739, "kind": "evidence", "pid": 41395, "prompt_tokens": 92436, "source": "llama_server.n_past", "task": 490999}
+{"cache_tokens": 92433, "kind": "evidence", "pid": 41395, "prompt_tokens": 92436, "source": "llama_server.n_past", "task": 491847}
+{"cache_tokens": 1366, "kind": "evidence", "pid": 41395, "prompt_tokens": 94419, "source": "llama_server.n_past", "task": 126458}
+{"cache_tokens": 94417, "kind": "evidence", "pid": 41395, "prompt_tokens": 94419, "source": "llama_server.n_past", "task": 130927}
+{"cache_tokens": 35692, "kind": "evidence", "pid": 41395, "prompt_tokens": 96746, "source": "llama_server.n_past", "task": 102336}
+{"cache_tokens": 97048, "kind": "evidence", "pid": 41395, "prompt_tokens": 97049, "source": "llama_server.n_past", "task": 131020}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 97049, "source": "llama_server.n_past", "task": 131124}
+{"cache_tokens": 97048, "kind": "evidence", "pid": 41395, "prompt_tokens": 97049, "source": "llama_server.n_past", "task": 131555}
+{"cache_tokens": 97465, "kind": "evidence", "pid": 41395, "prompt_tokens": 97466, "source": "llama_server.n_past", "task": 131643}
+{"cache_tokens": 24892, "kind": "evidence", "pid": 41395, "prompt_tokens": 97466, "source": "llama_server.n_past", "task": 132150}
+{"cache_tokens": 19254, "kind": "evidence", "pid": 41395, "prompt_tokens": 98343, "source": "llama_server.n_past", "task": 130666}
+{"cache_tokens": 738, "kind": "evidence", "pid": 41395, "prompt_tokens": 101262, "source": "llama_server.n_past", "task": 96293}
+{"cache_tokens": 107788, "kind": "evidence", "pid": 41395, "prompt_tokens": 107789, "source": "llama_server.n_past", "task": 132669}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 107789, "source": "llama_server.n_past", "task": 132780}
+{"cache_tokens": 107788, "kind": "evidence", "pid": 41395, "prompt_tokens": 107789, "source": "llama_server.n_past", "task": 141973}
+{"cache_tokens": 4834, "kind": "evidence", "pid": 41395, "prompt_tokens": 109667, "source": "llama_server.n_past", "task": 149778}

@@ -1,0 +1,580 @@
+{
+  "arms": {
+    "arm0": {
+      "calibrated": {
+        "aggregate_pct": 26.1,
+        "cold_of": [
+          37,
+          297
+        ],
+        "factors": {
+          "aggregate": 0.6918,
+          "cold": 0.4697,
+          "median_gt20k": 0.5489
+        },
+        "median_pct_gt20k": 15.6
+      },
+      "config": {
+        "clamp": 126976,
+        "comparable": true,
+        "live_slots": 2,
+        "retained_snapshot_pool": null,
+        "skip_when_busy": true
+      },
+      "counters": {
+        "attempts": 303,
+        "excluded_context_too_large": 687,
+        "excluded_cooldown": 0,
+        "excluded_slot_busy": 170,
+        "excluded_timeout": 0,
+        "pool_exhausted": 26,
+        "resident_hits": 190,
+        "restore_failed": 0,
+        "restore_failed_attempted": 0,
+        "restore_opportunities": 44,
+        "restore_success": 29,
+        "reuse": 114.3356,
+        "save_failed": 0,
+        "save_failed_attempted": 0,
+        "save_skipped_context_too_large": 0,
+        "save_skipped_cooldown": 0,
+        "save_skipped_slot_busy": 19,
+        "save_skipped_timeout": 0,
+        "save_success": 98,
+        "total_attempts": 1016
+      },
+      "delta_vs_arm0": {
+        "aggregate_pp": 0.0,
+        "cold_prompts": 0,
+        "local_serve_share": 0.0,
+        "median_pp_gt20k": 0.0
+      },
+      "description": "Baseline: session_slot_pool_size 2, one slot_<session>.bin per session (cleanup-slot-cache.sh disk cap), all deployed gates active.",
+      "exclusions": {
+        "context_too_large": 687,
+        "cooldown": 0,
+        "pool_exhausted": 26,
+        "slot_busy": 170,
+        "timeout_exceeded": 0,
+        "total": 857
+      },
+      "gates": {
+        "G1": {
+          "pass": false,
+          "rationale": "median 15.6% vs threshold 31.2%; aggregate 26.1% vs 36.1%; paired per-session median delta +0.000000 (requires > 0)"
+        },
+        "G2": {
+          "pass": false,
+          "rationale": "restore success rate 1.0 (>= 0.9); skip_when_busy+cooldown exclusion share 0.5611 (<= 0.2)"
+        },
+        "G3": {
+          "pass": true,
+          "rationale": "live slots 2, clamp 126976 (requires 2 / 126 976)"
+        },
+        "G4": {
+          "pass": true,
+          "rationale": "per-band restore cost within adaptive timeout: 10k 0.04s <= 18.0s; 25k 0.052s <= 40.5s; 40k 0.07s <= 60.0s; 60k+ 0.09s <= 60.0s"
+        },
+        "G5": {
+          "pass": true,
+          "rationale": "modelled disk footprint 9882.54 MiB <= 20480 MiB cleanup cap; local-serve share 0.2982 vs Arm 0 0.2982 (must not be lower); deadline cancellations / wasted tokens are admission-side and unchanged by the pool model (fixture baseline 125 / 778 863)"
+        },
+        "G6": {
+          "pass": true,
+          "rationale": "deterministic replay (same fixture/config => identical JSON); Arm 0 recalibrated to the measured 26.1 % / 15.6 % baseline"
+        }
+      },
+      "label": "Arm 0 - control, production config (pool 2, per-session snapshot files, skip_when_busy on)",
+      "name": "arm0",
+      "raw": {
+        "aggregate_pct": 37.73,
+        "attempts": 303,
+        "disk_footprint_mib": 9882.54,
+        "exclusions": {
+          "context_too_large": 687,
+          "cooldown": 0,
+          "pool_exhausted": 26,
+          "slot_busy": 170,
+          "timeout_exceeded": 0,
+          "total": 857
+        },
+        "gt20k": {
+          "aggregate_pct": 38.5,
+          "cold_count": 78,
+          "cold_share": 0.2626,
+          "count": 297,
+          "median_pct": 28.42
+        },
+        "local_serve_share": 0.2982,
+        "local_serves": 303,
+        "pool_exhausted": 26,
+        "resident_hits": 190,
+        "restore": {
+          "failed": 0,
+          "gated": 15,
+          "opportunities": 44,
+          "success": 29,
+          "success_rate": 1.0
+        },
+        "restore_success_rate": 1.0,
+        "retention_evictions": 0,
+        "save": {
+          "failed": 0,
+          "success": 98
+        },
+        "save_skips": {
+          "cooldown": 0,
+          "slot_busy": 19,
+          "timeout_exceeded": 0,
+          "total": 19
+        },
+        "total_attempts": 1016
+      },
+      "restore_success_rate": 1.0,
+      "save_skips": {
+        "cooldown": 0,
+        "slot_busy": 19,
+        "timeout_exceeded": 0,
+        "total": 19
+      }
+    },
+    "arm1": {
+      "calibrated": {
+        "aggregate_pct": 25.83,
+        "cold_of": [
+          38,
+          297
+        ],
+        "factors": {
+          "aggregate": 0.6918,
+          "cold": 0.4697,
+          "median_gt20k": 0.5489
+        },
+        "median_pct_gt20k": 15.5
+      },
+      "config": {
+        "clamp": 126976,
+        "comparable": true,
+        "live_slots": 2,
+        "retained_snapshot_pool": 4,
+        "skip_when_busy": true
+      },
+      "counters": {
+        "attempts": 303,
+        "excluded_context_too_large": 687,
+        "excluded_cooldown": 0,
+        "excluded_slot_busy": 170,
+        "excluded_timeout": 0,
+        "pool_exhausted": 26,
+        "resident_hits": 190,
+        "restore_failed": 0,
+        "restore_failed_attempted": 0,
+        "restore_opportunities": 39,
+        "restore_success": 27,
+        "reuse": 113.137,
+        "save_failed": 0,
+        "save_failed_attempted": 0,
+        "save_skipped_context_too_large": 0,
+        "save_skipped_cooldown": 0,
+        "save_skipped_slot_busy": 19,
+        "save_skipped_timeout": 0,
+        "save_success": 98,
+        "total_attempts": 1016
+      },
+      "delta_vs_arm0": {
+        "aggregate_pp": -0.27,
+        "cold_prompts": 1,
+        "local_serve_share": 0.0,
+        "median_pp_gt20k": -0.1
+      },
+      "description": "Candidate B per C2 \u00a73: live geometry unchanged (AC5), a separate retained-snapshot pool of 4 with least-recently-active eviction.",
+      "exclusions": {
+        "context_too_large": 687,
+        "cooldown": 0,
+        "pool_exhausted": 26,
+        "slot_busy": 170,
+        "timeout_exceeded": 0,
+        "total": 857
+      },
+      "gates": {
+        "G1": {
+          "pass": false,
+          "rationale": "median 15.5% vs threshold 31.2%; aggregate 25.83% vs 36.1%; paired per-session median delta +0.000000 (requires > 0)"
+        },
+        "G2": {
+          "pass": false,
+          "rationale": "restore success rate 1.0 (>= 0.9); skip_when_busy+cooldown exclusion share 0.5611 (<= 0.2)"
+        },
+        "G3": {
+          "pass": true,
+          "rationale": "live slots 2, clamp 126976 (requires 2 / 126 976)"
+        },
+        "G4": {
+          "pass": true,
+          "rationale": "per-band restore cost within adaptive timeout: 10k 0.04s <= 18.0s; 25k 0.052s <= 40.5s; 40k 0.07s <= 60.0s; 60k+ 0.09s <= 60.0s"
+        },
+        "G5": {
+          "pass": true,
+          "rationale": "modelled disk footprint 2165.17 MiB <= 20480 MiB cleanup cap; local-serve share 0.2982 vs Arm 0 0.2982 (must not be lower); deadline cancellations / wasted tokens are admission-side and unchanged by the pool model (fixture baseline 125 / 778 863)"
+        },
+        "G6": {
+          "pass": true,
+          "rationale": "deterministic replay (same fixture/config => identical JSON); Arm 0 recalibrated to the measured 26.1 % / 15.6 % baseline"
+        }
+      },
+      "label": "Arm 1 - candidate B (2 live slots, decoupled retained-snapshot pool of 4, LRU)",
+      "name": "arm1",
+      "raw": {
+        "aggregate_pct": 37.34,
+        "attempts": 303,
+        "disk_footprint_mib": 2165.17,
+        "exclusions": {
+          "context_too_large": 687,
+          "cooldown": 0,
+          "pool_exhausted": 26,
+          "slot_busy": 170,
+          "timeout_exceeded": 0,
+          "total": 857
+        },
+        "gt20k": {
+          "aggregate_pct": 38.09,
+          "cold_count": 80,
+          "cold_share": 0.2694,
+          "count": 297,
+          "median_pct": 28.23
+        },
+        "local_serve_share": 0.2982,
+        "local_serves": 303,
+        "pool_exhausted": 26,
+        "resident_hits": 190,
+        "restore": {
+          "failed": 0,
+          "gated": 12,
+          "opportunities": 39,
+          "success": 27,
+          "success_rate": 1.0
+        },
+        "restore_success_rate": 1.0,
+        "retention_evictions": 16,
+        "save": {
+          "failed": 0,
+          "success": 98
+        },
+        "save_skips": {
+          "cooldown": 0,
+          "slot_busy": 19,
+          "timeout_exceeded": 0,
+          "total": 19
+        },
+        "total_attempts": 1016
+      },
+      "restore_success_rate": 1.0,
+      "save_skips": {
+        "cooldown": 0,
+        "slot_busy": 19,
+        "timeout_exceeded": 0,
+        "total": 19
+      }
+    },
+    "arm2": {
+      "calibrated": {
+        "aggregate_pct": 34.99,
+        "cold_of": [
+          9,
+          64
+        ],
+        "factors": {
+          "aggregate": 0.6918,
+          "cold": 0.4697,
+          "median_gt20k": 0.5489
+        },
+        "median_pct_gt20k": 42.33
+      },
+      "config": {
+        "clamp": 61440,
+        "comparable": false,
+        "live_slots": 4,
+        "retained_snapshot_pool": null,
+        "skip_when_busy": true
+      },
+      "counters": {
+        "attempts": 70,
+        "excluded_context_too_large": 946,
+        "excluded_cooldown": 0,
+        "excluded_slot_busy": 17,
+        "excluded_timeout": 0,
+        "pool_exhausted": 0,
+        "resident_hits": 31,
+        "restore_failed": 0,
+        "restore_failed_attempted": 0,
+        "restore_opportunities": 13,
+        "restore_success": 13,
+        "reuse": 35.4056,
+        "save_failed": 0,
+        "save_failed_attempted": 0,
+        "save_skipped_context_too_large": 0,
+        "save_skipped_cooldown": 0,
+        "save_skipped_slot_busy": 0,
+        "save_skipped_timeout": 0,
+        "save_success": 32,
+        "total_attempts": 1016
+      },
+      "delta_vs_arm0": {
+        "aggregate_pp": 8.89,
+        "cold_prompts": -28,
+        "local_serve_share": -0.2293,
+        "median_pp_gt20k": 26.73
+      },
+      "description": "Candidate A per C2 \u00a73/\u00a74.1: literal session_slot_pool_size 4 shrinks per-slot context to 61 440 and changes live geometry, so it is recorded for completeness but excluded from the bake-off gates.",
+      "exclusions": {
+        "context_too_large": 946,
+        "cooldown": 0,
+        "pool_exhausted": 0,
+        "slot_busy": 17,
+        "timeout_exceeded": 0,
+        "total": 963
+      },
+      "gates": {
+        "G1": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G2": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G3": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G4": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G5": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G6": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        }
+      },
+      "label": "Arm 2 - candidate A (pool 4 literal: 4 live slots, clamp 61 440) - violates AC5, NOT a bake-off arm",
+      "name": "arm2",
+      "raw": {
+        "aggregate_pct": 50.58,
+        "attempts": 70,
+        "disk_footprint_mib": 2410.98,
+        "exclusions": {
+          "context_too_large": 946,
+          "cooldown": 0,
+          "pool_exhausted": 0,
+          "slot_busy": 17,
+          "timeout_exceeded": 0,
+          "total": 963
+        },
+        "gt20k": {
+          "aggregate_pct": 55.32,
+          "cold_count": 20,
+          "cold_share": 0.3125,
+          "count": 64,
+          "median_pct": 77.11
+        },
+        "local_serve_share": 0.0689,
+        "local_serves": 70,
+        "pool_exhausted": 0,
+        "resident_hits": 31,
+        "restore": {
+          "failed": 0,
+          "gated": 0,
+          "opportunities": 13,
+          "success": 13,
+          "success_rate": 1.0
+        },
+        "restore_success_rate": 1.0,
+        "retention_evictions": 0,
+        "save": {
+          "failed": 0,
+          "success": 32
+        },
+        "save_skips": {
+          "cooldown": 0,
+          "slot_busy": 0,
+          "timeout_exceeded": 0,
+          "total": 0
+        },
+        "total_attempts": 1016
+      },
+      "restore_success_rate": 1.0,
+      "save_skips": {
+        "cooldown": 0,
+        "slot_busy": 0,
+        "timeout_exceeded": 0,
+        "total": 0
+      }
+    },
+    "arm3": {
+      "calibrated": {
+        "aggregate_pct": 32.06,
+        "cold_of": [
+          26,
+          297
+        ],
+        "factors": {
+          "aggregate": 0.6918,
+          "cold": 0.4697,
+          "median_gt20k": 0.5489
+        },
+        "median_pct_gt20k": 24.33
+      },
+      "config": {
+        "clamp": 126976,
+        "comparable": false,
+        "live_slots": 2,
+        "retained_snapshot_pool": 4,
+        "skip_when_busy": false
+      },
+      "counters": {
+        "attempts": 303,
+        "excluded_context_too_large": 687,
+        "excluded_cooldown": 0,
+        "excluded_slot_busy": 0,
+        "excluded_timeout": 0,
+        "pool_exhausted": 26,
+        "resident_hits": 188,
+        "restore_failed": 0,
+        "restore_failed_attempted": 0,
+        "restore_opportunities": 53,
+        "restore_success": 53,
+        "reuse": 140.414,
+        "save_failed": 0,
+        "save_failed_attempted": 0,
+        "save_skipped_context_too_large": 0,
+        "save_skipped_cooldown": 0,
+        "save_skipped_slot_busy": 0,
+        "save_skipped_timeout": 0,
+        "save_success": 265,
+        "total_attempts": 1016
+      },
+      "delta_vs_arm0": {
+        "aggregate_pp": 5.96,
+        "cold_prompts": -11,
+        "local_serve_share": 0.0,
+        "median_pp_gt20k": 8.73
+      },
+      "description": "Informational what-if: the same retained pool of 4 without the load-aware gate, so the busy gate's share of any no-uplift can be attributed (C3 measured restores at 0.02-0.09 s even under load).",
+      "exclusions": {
+        "context_too_large": 687,
+        "cooldown": 0,
+        "pool_exhausted": 26,
+        "slot_busy": 0,
+        "timeout_exceeded": 0,
+        "total": 687
+      },
+      "gates": {
+        "G1": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G2": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G3": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G4": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G5": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        },
+        "G6": {
+          "pass": "n/a",
+          "rationale": "not a bake-off arm (C2 \u00a74.1)"
+        }
+      },
+      "label": "Arm 3 - diagnostic: candidate B with skip_when_busy relaxed",
+      "name": "arm3",
+      "raw": {
+        "aggregate_pct": 46.34,
+        "attempts": 303,
+        "disk_footprint_mib": 2866.26,
+        "exclusions": {
+          "context_too_large": 687,
+          "cooldown": 0,
+          "pool_exhausted": 26,
+          "slot_busy": 0,
+          "timeout_exceeded": 0,
+          "total": 687
+        },
+        "gt20k": {
+          "aggregate_pct": 47.28,
+          "cold_count": 56,
+          "cold_share": 0.1886,
+          "count": 297,
+          "median_pct": 44.32
+        },
+        "local_serve_share": 0.2982,
+        "local_serves": 303,
+        "pool_exhausted": 26,
+        "resident_hits": 188,
+        "restore": {
+          "failed": 0,
+          "gated": 0,
+          "opportunities": 53,
+          "success": 53,
+          "success_rate": 1.0
+        },
+        "restore_success_rate": 1.0,
+        "retention_evictions": 32,
+        "save": {
+          "failed": 0,
+          "success": 265
+        },
+        "save_skips": {
+          "cooldown": 0,
+          "slot_busy": 0,
+          "timeout_exceeded": 0,
+          "total": 0
+        },
+        "total_attempts": 1016
+      },
+      "restore_success_rate": 1.0,
+      "save_skips": {
+        "cooldown": 0,
+        "slot_busy": 0,
+        "timeout_exceeded": 0,
+        "total": 0
+      }
+    }
+  },
+  "baseline_ref": {
+    "aggregate_pct": 26.1,
+    "cold_of": [
+      28,
+      227
+    ],
+    "median_pct_gt20k": 15.6,
+    "percentile_definition": "scripts/analyse_slot_ratio_restore._percentiles (linear interpolation, percentages)"
+  },
+  "fixture": "proxy/tests/fixtures/prefill_thrash_2026_10_24.jsonl",
+  "generated_at": "deterministic replay of the committed fixture (regenerate with: python3 proxy/tests/pool_snapshot_bakeoff.py --write)",
+  "model": {
+    "busy_model": "serve holds a dispatch lease for modelled prefill (est*(1-reuse) / band rate); generation time not in the fixture (conservative: underestimates busy)",
+    "calibration": "proportional: Arm 0 anchored to the measured baseline; other arms scaled by the same per-metric factor",
+    "gates": "the real production predicates (slot registry, busy gate, circuit breaker, context cap) driven through the documented stub sources",
+    "restore_cost_source": "proxy/benchmarks/results/slot_snapshot_bands_20261028/summary.json"
+  },
+  "schema_version": 1,
+  "sentinel": "pool-snapshot-bakeoff-replay",
+  "unique_attempts": 1016,
+  "window": {
+    "end": "2026-10-24 23:46:59",
+    "start": "2026-10-24 18:38:00"
+  }
+}

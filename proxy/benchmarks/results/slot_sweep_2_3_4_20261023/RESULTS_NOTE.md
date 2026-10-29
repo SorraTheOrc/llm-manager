@@ -186,7 +186,16 @@ locally (see the reopen conditions in LP-0MVK09622002CRMR).
 
 - `finish_reason` (and therefore `finish_reason=length`) is not recorded per request —
   harness gap, filed as a discovered-from follow-up.
+- **Harness gap resolved 2026-10-26 (LP-0MVLHNEDO008FTBH):** the local-concurrency
+  limitation below is now fixed in `slot_benchmark.py` — a `--warm-start` priming gate
+  (ON by default for `--sweep`) proves the first local prefill completed (and thus
+  `mark_warm()` lifted the cold cap) before the measured set launches, and
+  `--stagger-seconds N` (default 0) replaces the fixed 60 s `INTER_REQUEST_GAP_S`.
+  A re-run in a quiet window (preflight first) can now land requests locally; see the
+  reopen-condition #1 of the verdict doc for the exact command and audit keys
+  (`contention.local_stream_share > 0`, `contention.max_concurrent_local_streams >= 2`,
+  per-request `resolved_model`, `warm_start.completed_locally`).
 - A harness that can exercise *session* concurrency locally is required to test the
-  projection: e.g. stagger arrivals (so the first prefill lifts the cold cap before
-  the next request arrives), single-turn requests with production-sized outputs, or a
-  `--concurrency N` mode that waits for `mark_warm` before launching requests.
+  projection: e.g. warm the backend before the measured set (`--warm-start`, now
+  available), stagger arrivals (`--stagger-seconds`), or single-turn production-sized
+  requests.

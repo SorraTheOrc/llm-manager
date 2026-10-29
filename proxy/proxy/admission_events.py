@@ -19,12 +19,20 @@ Contract:
   ``slot``, ``endpoint``, tenant count) plus ``snapshot_planned`` (whether the
   evicted session's KV snapshot is being persisted so a returning client
   restores warm);
+- the pricing evidence (``estimated_tokens`` / ``new_tokens`` /
+  ``cached_ratio`` / ``eta_prefill_s``) is the **admission-time snapshot** the
+  routing decision stamped on the request (LP-0MVODJ3P6000AIUM AC1): the
+  dispatch record stores the decision's numbers verbatim, so an eviction event
+  never re-prices the prompt from drifted state. A record created without a
+  snapshot carries explicit ``None`` markers rendered as ``0``/``unknown``
+  (AC4) — never a silent recompute.
 - never raises: an eviction path is already an exceptional path.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 
 #: A reclaimed dispatch lease (client disconnect, deadline cancel, orphan).
 EVICTION_LEASE_EVICTED = "lease_evicted"
@@ -41,6 +49,12 @@ EVICTION_TENANCY_LEASE_EXPIRED = "tenancy_lease_expired"
 #: The prefill deadline cancelled an accepted dispatch (parent AC7).
 EVICTION_PREFILL_DEADLINE = "prefill_deadline"
 
+#: The dispatch was released because the *measured* ``prompt_progress`` showed
+#: it re-prefilling far more than admission priced (Option D early abort,
+#: LP-0MVR7IN0O000DPXN). Distinct from :data:`EVICTION_PREFILL_DEADLINE` so the
+#: post-deploy window can count early detours separately from 120 s ones.
+EVICTION_MEASURED_CACHE_DEFICIT = "measured_cache_deficit"
+
 #: The no-progress watchdog released an accepted dispatch.
 EVICTION_NO_PROGRESS_WATCHDOG = "no_progress_watchdog"
 
@@ -55,6 +69,7 @@ EVICTION_ORPHAN_CLEANUP = "orphan_cleanup"
 #: before the first byte.
 EVICTION_REASONS_AFTER_ACCEPTANCE: tuple[str, ...] = (
     EVICTION_PREFILL_DEADLINE,
+    EVICTION_MEASURED_CACHE_DEFICIT,
     EVICTION_NO_PROGRESS_WATCHDOG,
     EVICTION_IDLE_TIMEOUT,
     EVICTION_ORPHAN_CLEANUP,
@@ -69,6 +84,7 @@ EVICTION_REASONS: tuple[str, ...] = (
     EVICTION_RESIDENT_PREFIX_EVICTED,
     EVICTION_TENANCY_LEASE_EXPIRED,
     EVICTION_PREFILL_DEADLINE,
+    EVICTION_MEASURED_CACHE_DEFICIT,
     EVICTION_NO_PROGRESS_WATCHDOG,
     EVICTION_IDLE_TIMEOUT,
     EVICTION_ORPHAN_CLEANUP,
@@ -91,6 +107,7 @@ def record_eviction_after_acceptance(
     *,
     endpoint: str | None = None,
     elapsed_s: float | None = None,
+    extra_fields: Mapping[str, object] | None = None,
 ) -> bool:
     """Record that an ACCEPTED local dispatch was evicted before its first byte.
 
@@ -108,6 +125,13 @@ def record_eviction_after_acceptance(
     Idempotent per record: a second release path racing the first cannot emit
     the event twice (the flag lives on the record).
 
+    Evidence semantics (LP-0MVODJ3P6000AIUM AC1/AC4): the pricing fields are
+    the admission-time values the routing decision used and the request's
+    dispatch record stored verbatim — the event must never claim an over-
+    budget admission that the decision never priced. Records without a
+    threaded snapshot render ``0``/``unknown`` explicitly; nothing here is
+    recomputed from the request body.
+
     Args:
         srv: Server object (its ``logger`` when present); may be ``None``.
         session_id: The evicted session.
@@ -119,6 +143,11 @@ def record_eviction_after_acceptance(
         endpoint: llama-server endpoint scope of the eviction.
         elapsed_s: Seconds from dispatch acceptance to the eviction; computed
             from the record's ``started_at`` (monotonic) when omitted.
+        extra_fields: Optional caller-specific ``key=value`` evidence appended
+            to the line (e.g. the measured/priced numbers behind a
+            ``measured_cache_deficit`` release). Omitted (``None``) leaves the
+            line byte-for-byte as before, so every pre-existing consumer and
+            test regex is unaffected.
 
     Returns:
         True when an event was emitted (and counted), False when suppressed
@@ -159,11 +188,12 @@ def record_eviction_after_acceptance(
     logger = getattr(srv, "logger", None) or logging.getLogger("llama-proxy")
     # One stable, machine-parseable line (AC1/AC7). Unknown values are emitted
     # as ``unknown``/``0`` rather than omitted so the line is always parseable.
+    _suffix = _format_extra_fields(extra_fields)
     try:
         logger.error(
             "local_eviction_after_acceptance session=%s reason=%s "
             "estimated_tokens=%d new_tokens=%d eta_prefill_s=%s "
-            "elapsed_s=%.1f slot_id=%s llama_task_id=%s endpoint=%s",
+            "elapsed_s=%.1f slot_id=%s llama_task_id=%s endpoint=%s%s",
             session_id or "unknown",
             reason,
             estimated_tokens,
@@ -173,10 +203,38 @@ def record_eviction_after_acceptance(
             "unknown" if slot_id is None else slot_id,
             "unknown" if llama_task_id is None else llama_task_id,
             endpoint or "default",
+            _suffix,
         )
     except Exception:
         pass
     return True
+
+
+def _format_extra_fields(extra_fields: Mapping[str, object] | None) -> str:
+    """Render caller evidence as a trailing `` key=value`` run (never raises).
+
+    ``None``/empty renders the empty string so lines emitted without extra
+    evidence stay byte-identical to the pre-change format.
+    """
+    if not extra_fields:
+        return ""
+    parts: list[str] = []
+    try:
+        for key, value in extra_fields.items():
+            if value is None:
+                rendered = "unknown"
+            elif isinstance(value, bool):
+                rendered = "true" if value else "false"
+            elif isinstance(value, int):
+                rendered = str(value)
+            elif isinstance(value, float):
+                rendered = f"{value:.6g}"
+            else:
+                rendered = str(value)
+            parts.append(f"{key}={rendered}")
+    except Exception:
+        return ""
+    return " " + " ".join(parts)
 
 
 def eviction_after_acceptance_counters() -> dict:

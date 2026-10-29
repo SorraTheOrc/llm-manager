@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -32,8 +33,10 @@ from proxy.provider import (
     _get_cached_ratio,
     _get_cached_ratio_source,
     _last_cached_ratio,
+    _last_prompt_prefix,
     _should_skip_local,
     clear_cached_ratio_for_session,
+    record_prompt_prefix,
 )
 from proxy.router_helpers import _classify_cache_state, _lookup_dispatch_cache_state
 from proxy.session import _endpoint_host_port, _slot_filename_for_session
@@ -51,16 +54,17 @@ from proxy.slot_cache_ratio import (
 
 MODEL = "Qwen3"
 SESSION = "sess-restore-1"
+CLEANUP_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "cleanup-slot-cache.sh"
 
 
 @pytest.fixture(autouse=True)
 def _clean_provider_cache_state():
     """Isolate the process-global ratio dicts between tests."""
-    _last_cached_ratio.clear()
-    _cached_ratio_source.clear()
+    for registry in (_last_cached_ratio, _cached_ratio_source, _last_prompt_prefix):
+        registry.clear()
     yield
-    _last_cached_ratio.clear()
-    _cached_ratio_source.clear()
+    for registry in (_last_cached_ratio, _cached_ratio_source, _last_prompt_prefix):
+        registry.clear()
 
 
 def _messages(count: int = 3, system: str = "You are a helpful agent.") -> list[dict]:
@@ -795,3 +799,462 @@ class TestSeedOutcomeInstrumentation:
         )
         assert self._seed_lines(caplog) == []
 
+
+# ---------------------------------------------------------------------------
+# LP-0MVK0E80C009HUQC — snapshot <-> sidecar lifecycle coupling
+#
+# The diagnosis (LP-0MVK0E8C40035FG3) proved the seed path never reached its
+# guard: over 4,488 decisions, `missing_sidecar` (75.8 %) and `missing_snapshot`
+# (24.2 %) accounted for 100 % of outcomes and every guard outcome was exactly
+# 0. The guard cannot be blamed for a pairing defect, so these tests pin the
+# *writer-side* lifecycle: an eviction save gains a sidecar, a request save
+# without a measured usage block gains one too, a retired snapshot takes its
+# sidecar with it, and retention prunes orphan sidecars in endpoint
+# subdirectories as well as the legacy root.
+# ---------------------------------------------------------------------------
+
+
+class _AsyncNullLock:
+    """Minimal async context manager for stub locks."""
+
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+def _eviction_srv(current_model: str = MODEL):
+    srv = MagicMock()
+    srv.current_model = current_model
+    srv.logger = MagicMock()
+    srv.session_manager = MagicMock()
+    srv.session_manager.invalidate = AsyncMock()
+    srv.local_dispatch_records = {}
+    srv.local_dispatch_records_lock = _AsyncNullLock()
+    return srv
+
+
+class TestEvictionSnapshotPairing:
+    """AC1 — an eviction-saved snapshot must be seedable.
+
+    ``save_evicted_session_snapshot()`` used to write only the ``.bin``: 98
+    successful eviction saves across 32 sessions were structurally unseedable
+    (17 of the 31 ``missing_sidecar`` sessions overlap them).
+    """
+
+    ENDPOINT = "http://localhost:8080"
+
+    def _slot_paths(self, tmp_path):
+        slot_root = tmp_path / "slot-cache"
+        base = slot_root / "localhost-8080"
+        base.mkdir(parents=True, exist_ok=True)
+        return (
+            str(_slot_filename_for_session(SESSION, base)),
+            {"session_slot_save_path": str(slot_root)},
+        )
+
+    def _evict(self, monkeypatch, tmp_path, *, snapshot_written: bool = True):
+        """Run one eviction save with the slot-save call stubbed out."""
+        import asyncio
+
+        from proxy import session as session_mod
+
+        filename, server = self._slot_paths(tmp_path)
+
+        async def _fake_save(_port, _slot, target, _timeout, model=None, endpoint=None):
+            if snapshot_written:
+                Path(target).parent.mkdir(parents=True, exist_ok=True)
+                Path(target).write_bytes(b"KV-SNAPSHOT")
+            return snapshot_written
+
+        monkeypatch.setattr(session_mod, "_save_slot_snapshot", _fake_save)
+        monkeypatch.setattr(session_mod, "_srv", _eviction_srv)
+
+        report = asyncio.run(
+            session_mod.save_evicted_session_snapshot(
+                SESSION,
+                server,
+                endpoint=self.ENDPOINT,
+                plan=(0, filename, 3.0),
+            )
+        )
+        return report, filename, server
+
+    def test_eviction_save_writes_the_recorded_prefix_sidecar(
+        self, tmp_path, monkeypatch
+    ):
+        messages = _messages(4)
+        record_prompt_prefix(MODEL, SESSION, 90_000, messages)
+
+        report, filename, _server = self._evict(monkeypatch, tmp_path)
+
+        assert report["saved"] is True
+        meta = read_slot_ratio_sidecar(filename)
+        assert meta is not None
+        assert meta["cached_tokens"] == 90_000
+        assert meta["messages"] == message_fingerprints(messages)
+
+    def test_resumed_request_seeds_from_an_eviction_saved_snapshot(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+        messages = _messages(4)
+        record_prompt_prefix(MODEL, SESSION, 90_000, messages)
+        report, _filename, server = self._evict(monkeypatch, tmp_path)
+        assert report["saved"] is True
+
+        # The client comes back: the conversation extends the saved prefix.
+        resumed = list(messages) + [
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "next"},
+        ]
+        source = seed_cached_ratio(
+            server,
+            {"messages": resumed},
+            MODEL,
+            SESSION,
+            100_000,
+            endpoint=self.ENDPOINT,
+        )
+
+        assert source == "restored"
+        assert _get_cached_ratio_source(MODEL, SESSION) == "restored"
+        # min(1.0, 90_000/100_000) * 0.9 — the unchanged cap arithmetic.
+        assert _get_cached_ratio(MODEL, SESSION) == pytest.approx(
+            0.9 * DEFAULT_SAFETY_MARGIN
+        )
+        seed_lines = [m for m in caplog.messages if m.startswith("slot_ratio_seed ")]
+        assert len(seed_lines) == 1
+        assert "outcome=found" in seed_lines[0]
+        assert [m for m in caplog.messages if m.startswith("slot_ratio_restored ")]
+
+    def test_no_recorded_prefix_writes_no_sidecar(self, tmp_path, monkeypatch):
+        """Documented rule: never invent a token count on the eviction path."""
+        report, filename, _server = self._evict(monkeypatch, tmp_path)
+
+        assert report["saved"] is True
+        assert read_slot_ratio_sidecar(filename) is None
+
+    def test_failed_save_writes_no_sidecar(self, tmp_path, monkeypatch):
+        messages = _messages()
+        record_prompt_prefix(MODEL, SESSION, 90_000, messages)
+
+        report, filename, _server = self._evict(
+            monkeypatch, tmp_path, snapshot_written=False
+        )
+
+        assert report["saved"] is False
+        assert read_slot_ratio_sidecar(filename) is None
+
+    def test_sidecar_failure_never_fails_the_save(self, tmp_path, monkeypatch):
+        """Fail-open: pairing is best effort and must not break an eviction."""
+        messages = _messages()
+        record_prompt_prefix(MODEL, SESSION, 90_000, messages)
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("sidecar write exploded")
+
+        monkeypatch.setattr(
+            "proxy.slot_cache_ratio.write_slot_ratio_sidecar", _boom
+        )
+
+        report, _filename, _server = self._evict(monkeypatch, tmp_path)
+
+        assert report["saved"] is True
+        assert report["reason"] == "eviction"
+
+
+class TestUnmeasuredUsageRequestSave:
+    """AC2 — a request save without a usage block must still be seedable.
+
+    The request-path sidecar write used to be gated on
+    ``_measured_prompt_tokens > 0``, so a snapshot saved from a response with
+    no extractable usage block got no sidecar at all.
+    """
+
+    def _response_without_usage(self):
+        body = {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+        response = MagicMock()
+        response.content = json.dumps(body).encode("utf-8")
+        response.headers = {}
+        return response
+
+    def _save(self, tmp_path, monkeypatch, messages):
+        import asyncio
+
+        import proxy.router as router
+
+        config = _write_snapshot(tmp_path, messages=messages, with_sidecar=False)
+        filename = _slot_filename_for_session(
+            SESSION, config["server"]["session_slot_save_path"]
+        )
+
+        async def _fake_save(*_args, **_kwargs):
+            return True
+
+        monkeypatch.setattr(router, "_save_slot_snapshot", _fake_save, raising=False)
+        monkeypatch.setattr(
+            router, "_detect_restore_signal_from_llama_log", lambda *a, **k: False
+        )
+
+        response = self._response_without_usage()
+        assert "usage" not in json.loads(response.content)
+
+        asyncio.run(
+            router._update_session_and_slot(
+                MagicMock(
+                    current_model=MODEL,
+                    logger=MagicMock(),
+                    session_manager=MagicMock(
+                        set_restore_confirmed=AsyncMock(),
+                        get=AsyncMock(return_value=None),
+                        update_messages=AsyncMock(),
+                        append_messages=AsyncMock(),
+                    ),
+                ),
+                SESSION,
+                {"messages": messages},
+                False,
+                [],
+                len(messages),
+                response,
+                llama_port=8080,
+                slot_id=0,
+                slot_filename=filename,
+                slot_timeout=3.0,
+                slot_model_payload=MODEL,
+                slot_enabled=True,
+                upstream_status=200,
+            )
+        )
+        return filename, config
+
+    def test_pairs_with_the_recorded_prefix_when_usage_was_not_measured(
+        self, tmp_path, monkeypatch
+    ):
+        messages = _messages(4)
+        record_prompt_prefix(MODEL, SESSION, 90_000, messages)
+
+        filename, config = self._save(tmp_path, monkeypatch, messages)
+
+        meta = read_slot_ratio_sidecar(filename)
+        assert meta is not None
+        assert meta["cached_tokens"] == 90_000
+        assert meta["messages"] == message_fingerprints(messages)
+        assert (
+            seed_cached_ratio(
+                config["server"], {"messages": messages}, MODEL, SESSION, 100_000
+            )
+            == "restored"
+        )
+        assert _get_cached_ratio(MODEL, SESSION) == pytest.approx(
+            0.9 * DEFAULT_SAFETY_MARGIN
+        )
+
+    def test_falls_back_to_the_prompt_estimate_without_a_record(
+        self, tmp_path, monkeypatch
+    ):
+        """A first-turn save has no measurement at all: use the router estimate.
+
+        The estimator counts the message text with the same tokenizer the
+        routing decision uses, so seeding with that count as the estimate has
+        to reproduce the full safety margin — proof the recorded count really
+        describes the saved prompt rather than an invented number.
+        """
+        messages = _messages(4)
+
+        filename, config = self._save(tmp_path, monkeypatch, messages)
+
+        meta = read_slot_ratio_sidecar(filename)
+        assert meta is not None
+        assert meta["cached_tokens"] > 0
+        assert meta["messages"] == message_fingerprints(messages)
+
+        source = seed_cached_ratio(
+            config["server"],
+            {"messages": messages},
+            MODEL,
+            SESSION,
+            meta["cached_tokens"],
+        )
+        assert source == "restored"
+        assert _get_cached_ratio(MODEL, SESSION) == pytest.approx(
+            DEFAULT_SAFETY_MARGIN
+        )
+
+    def test_no_trustworthy_token_count_writes_no_sidecar(
+        self, tmp_path, monkeypatch
+    ):
+        filename, _config = self._save(tmp_path, monkeypatch, [])
+
+        assert read_slot_ratio_sidecar(filename) is None
+
+
+class TestSnapshotRetirementCoupling:
+    """AC3 — a snapshot is never retired without its sidecar (and vice versa)."""
+
+    ENDPOINT = "http://localhost:8080"
+
+    @pytest.fixture(autouse=True)
+    def _slot_root(self, tmp_path):
+        """The slot-cache root the stubbed server config advertises."""
+        self.slot_root = tmp_path / "slot-cache"
+
+    def _invalidate(self, monkeypatch, session_id: str, slot_filename: str | None):
+        import asyncio
+
+        from proxy import session as session_mod
+
+        srv = _eviction_srv()
+        srv.config = {
+            "server": {"session_slot_save_path": str(self.slot_root)}
+        }
+        monkeypatch.setattr(session_mod, "_srv", lambda: srv)
+
+        asyncio.run(
+            session_mod._invalidate_session_and_slot(
+                session_id, "history_mismatch", slot_filename
+            )
+        )
+
+    def test_retires_the_snapshot_and_sidecar_without_a_filename(
+        self, tmp_path, monkeypatch
+    ):
+        """The router's history-mismatch path passes no filename on some paths."""
+        _write_snapshot(tmp_path, endpoint=self.ENDPOINT)
+        filename = _slot_filename_for_session(
+            SESSION, tmp_path / "slot-cache" / "localhost-8080"
+        )
+        assert Path(filename).exists()
+        assert sidecar_path(filename).exists()
+
+        self._invalidate(monkeypatch, SESSION, None)
+
+        assert not Path(filename).exists()
+        assert not sidecar_path(filename).exists()
+
+    def test_retires_the_legacy_root_layout_too(self, tmp_path, monkeypatch):
+        _write_snapshot(tmp_path)  # legacy root, no endpoint subdirectory
+        filename = _slot_filename_for_session(
+            SESSION, tmp_path / "slot-cache"
+        )
+
+        self._invalidate(monkeypatch, SESSION, None)
+
+        assert not Path(filename).exists()
+        assert not sidecar_path(filename).exists()
+
+    def test_retires_an_orphan_sidecar_with_no_snapshot(self, tmp_path, monkeypatch):
+        """The ``missing_snapshot`` mode: sidecar on disk, snapshot already gone."""
+        _write_snapshot(tmp_path, endpoint=self.ENDPOINT)
+        filename = _slot_filename_for_session(
+            SESSION, tmp_path / "slot-cache" / "localhost-8080"
+        )
+        Path(filename).unlink()
+        assert sidecar_path(filename).exists()
+
+        self._invalidate(monkeypatch, SESSION, None)
+
+        assert not sidecar_path(filename).exists()
+
+    def test_explicit_filename_is_still_retired_with_its_sidecar(
+        self, tmp_path, monkeypatch
+    ):
+        _write_snapshot(tmp_path)
+        filename = _slot_filename_for_session(SESSION, tmp_path / "slot-cache")
+
+        self._invalidate(monkeypatch, SESSION, filename)
+
+        assert not Path(filename).exists()
+        assert not sidecar_path(filename).exists()
+
+
+class TestCleanupScriptRetention:
+    """AC3 — retention recurses into endpoint subdirectories and prunes orphans."""
+
+    def _run(self, cache: Path, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                "bash",
+                str(CLEANUP_SCRIPT),
+                "--path",
+                str(cache),
+                "--max-age-days",
+                "7",
+                "--max-size-gb",
+                "100",
+                *extra,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    @staticmethod
+    def _make(cache: Path, relative: str, *, age_days: int) -> Path:
+        path = cache / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"KV-SNAPSHOT")
+        stamp = (datetime.now(UTC) - timedelta(days=age_days)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        subprocess.run(["touch", "-d", stamp, str(path)], check=True)
+        sidecar = Path(str(path) + ".ratio.json")
+        sidecar.write_text("{}", encoding="utf-8")
+        subprocess.run(["touch", "-d", stamp, str(sidecar)], check=True)
+        return path
+
+    def test_endpoint_subdirectories_are_retained_by_age(self, tmp_path):
+        cache = tmp_path / "slot-cache"
+        old = self._make(cache, "localhost-8080/slot_old.bin", age_days=10)
+        recent = self._make(cache, "localhost-8080/slot_recent.bin", age_days=1)
+
+        result = self._run(cache)
+
+        assert result.returncode == 0, result.stderr
+        assert not old.exists()
+        assert not Path(str(old) + ".ratio.json").exists()
+        assert recent.exists()
+        assert Path(str(recent) + ".ratio.json").exists()
+
+    def test_orphan_sidecars_are_pruned_with_no_snapshots_present(self, tmp_path):
+        """The observed 139-orphan/0-snapshot state must not be a no-op."""
+        cache = tmp_path / "slot-cache"
+        cache.mkdir(parents=True)
+        root_orphan = cache / "slot_gone.bin.ratio.json"
+        root_orphan.write_text("{}", encoding="utf-8")
+        nested = cache / "localhost-8080"
+        nested.mkdir()
+        nested_orphan = nested / "slot_gone_too.bin.ratio.json"
+        nested_orphan.write_text("{}", encoding="utf-8")
+
+        result = self._run(cache)
+
+        assert result.returncode == 0, result.stderr
+        assert not root_orphan.exists()
+        assert not nested_orphan.exists()
+
+    def test_paired_sidecar_survives_retention(self, tmp_path):
+        cache = tmp_path / "slot-cache"
+        kept = self._make(cache, "slot_kept.bin", age_days=1)
+
+        result = self._run(cache)
+
+        assert result.returncode == 0, result.stderr
+        assert kept.exists()
+        assert Path(str(kept) + ".ratio.json").exists()
+
+    def test_dry_run_keeps_orphans_and_snapshots(self, tmp_path):
+        cache = tmp_path / "slot-cache"
+        old = self._make(cache, "localhost-8080/slot_old.bin", age_days=10)
+        orphan = cache / "slot_orphan.bin.ratio.json"
+        orphan.write_text("{}", encoding="utf-8")
+
+        result = self._run(cache, "--dry-run")
+
+        assert result.returncode == 0, result.stderr
+        assert old.exists()
+        assert Path(str(old) + ".ratio.json").exists()
+        assert orphan.exists()
+        assert "Would delete" in result.stdout

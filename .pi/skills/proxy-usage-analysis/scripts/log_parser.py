@@ -53,6 +53,14 @@ LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3}) - (\w+) - 
 RE_PROVIDER = re.compile(r"\bprovider=(\S+)")
 RE_MODEL = re.compile(r"\bmodel=(\S+)")
 RE_SESSION = re.compile(r"\bsession=([A-Za-z0-9_.-]+)")
+# Per-turn correlation id (LP-0MVMBM467005BT4A): every structured line a client
+# request emits carries ``turn=<8 hex>``, so one turn's lifecycle (routing
+# skips, fallbacks, stream start/finish, TTFT, dispatch denials) can be
+# reconstructed exactly instead of by FIFO/nearest-line heuristics.
+# Deliberately strict (8 lowercase hex characters) so nothing else in a log
+# line can be mistaken for an id; pre-change rotated logs simply have no match
+# and every event's ``turn`` stays ``None``.
+RE_TURN = re.compile(r"\bturn=([0-9a-f]{8})\b")
 
 # TTFT (Time to First Token) measurement lines.
 # Local stream path (router.py): "dispatch_first_byte_ms=<ms> dispatch_to_first_byte_ms=<ms> session=<id> model=<model>"
@@ -72,7 +80,19 @@ RE_TTFT_SECONDS = re.compile(
     r"ttft_seconds=([\d.]+)"
 )
 RE_TOKENS = re.compile(r"\btokens=(\d+)/(\d+)/(\d+)")
+#: Explicit no-usage marker on a terminal ``Stream finished`` line
+#: (LP-0MVMBM6N400541EH): the proxy writes ``tokens=missing`` when the upstream
+#: reported no usage, so "no data" is distinguishable from "zero tokens".
+#: Deliberately NOT matched by ``RE_TOKENS``, so every token aggregate keeps
+#: ignoring these lines instead of reading a fabricated count.
+RE_TOKENS_MISSING = re.compile(r"\btokens=missing\b")
 RE_ENTRY = re.compile(r"\bentry=(\S+)")
+#: Buffered (non-streamed) reply marker on terminal ``Stream finished`` lines
+#: (LP-0MVMHNVKT003PRIK AC1 non-streaming path): such lines carry measured
+#: ``tokens=`` but are not paired into busy/stream counts — there is no
+#: ``Stream started`` for them. Falling back to ``None`` (streaming or
+#: pre-marker logs) keeps every historic consumer unchanged.
+RE_STREAM_FALSE = re.compile(r"\bstream=false\b")
 RE_ERROR_DETAIL = re.compile(r"\berror=([^\s,}]+)")
 RE_FALLBACK = re.compile(
     r"Fallback triggered for model=(\S+?), from=(\S+?), to=(\S+?), "
@@ -155,6 +175,39 @@ RE_LOCAL_ADMISSION_ENFORCED = re.compile(r"\benforced=(true|false)\b")
 RE_LOCAL_ADMISSION_ETA = re.compile(r"\beta_prefill_s=([\d.]+)")
 RE_LOCAL_ADMISSION_BUDGET = re.compile(r"\bbudget_s=([\d.]+)")
 RE_LOCAL_ADMISSION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
+# Measured pool state on the guard record (LP-0MVGR2OXT0096OGK M1): the
+# busy/decode slot count, in-flight prefill count and free-slot flag at
+# decision time — the fields the denial-attribution verdict is derived from
+# (``local_dispatch_denied`` itself carries no ``lease_state``).
+RE_GUARD_BUSY_SLOTS = re.compile(r"\bbusy_slots=(\d+)")
+RE_GUARD_IN_FLIGHT_PREFILLS = re.compile(r"\bin_flight_prefills=(\d+)")
+RE_GUARD_FREE_SLOT = re.compile(r"\bfree_slot=(true|false)")
+# Contended-pricing metadata on the guard record (LP-0MVS8T6F4006DGG3, surfaced
+# by LP-0MVS9YKHL007UBBZ): ``rate_bucket`` names the rate-calibration window the
+# prefill ETA was priced from (``contended``, ``solitary``, or
+# ``solitary_fallback`` when the contended window was uncalibrated and the
+# solitary window was used instead), ``contended_samples`` is that window's
+# sample count, ``eta_occupancy_s`` is the projection's occupancy term and
+# ``new_tokens`` the priced uncached token count. All four are absent on
+# pre-change lines and stay ``None`` (never a fabricated default).
+#: The bucket token is matched generically rather than against a fixed
+#: vocabulary, so a future bucket name stays observable instead of being
+#: silently dropped (the report's unknown bucket is for pre-change lines).
+RE_GUARD_RATE_BUCKET = re.compile(r"\brate_bucket=([A-Za-z_]+)")
+RE_GUARD_CONTENDED_SAMPLES = re.compile(r"\bcontended_samples=(\d+)")
+RE_GUARD_ETA_OCCUPANCY = re.compile(r"\beta_occupancy_s=([\d.]+)")
+RE_GUARD_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
+
+# Status-poll payload (LP-0MVGR2OXT0096OGK M3): ``status_request`` lines carry
+# the calibrated ``prefill_eta_seconds`` prediction and the truthful
+# ``capacity_hint`` (idle / prefill_bound / saturated) the payload change
+# (LP-0MVGDUVGE0024YAI) published. ETA is ``None`` when the estimate failed
+# fail-open; both fields are absent on pre-change schema lines.
+RE_STATUS_PREFILL_ETA = re.compile(r"\bprefill_eta_seconds=([\d.]+|None)")
+RE_STATUS_CAPACITY_HINT = re.compile(r"\bcapacity_hint=([a-z_]+)")
+RE_STATUS_SCHEMA_VERSION = re.compile(r"\bstatus_schema_version=(\d+)")
+RE_STATUS_AVAILABLE_SLOTS = re.compile(r"\bavailable_slots=(\d+)")
+RE_STATUS_TOTAL_SLOTS = re.compile(r"\btotal_slots=(\d+)")
 
 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): the proxy emits
 # ``routing_idle_admit provider=... model=... reason=economic_bypass_idle
@@ -221,6 +274,9 @@ ROUTING_SKIP = "routing_skip_local"
 # carries the session UUID, the provider, the estimate and the ceiling.
 ROUTING_SKIP_PROVIDER_CONTEXT = "routing_skip_provider_context"
 DISPATCH_DENIED = "local_dispatch_denied"
+# Status poll of the local capacity payload (LP-0MVGR2OXT0096OGK M3): carries
+# the predicted ``prefill_eta_seconds`` and ``capacity_hint`` per poll.
+STATUS_REQUEST = "status_request"
 # Local dispatch attempt marker (LP-0MVKUKG3F0035I85): the proxy logs one
 # ``[local] POST http://<backend>/... `` line for **every** attempt it makes at
 # the local llama-server, including attempts that never yield a first byte (a
@@ -544,6 +600,12 @@ class LogEvent:
     # logging (LP-0MTSSM5SO003PKU0). Populated by dispatch_first_byte_ms=
     # (local) or ttft_seconds= (remote) log lines.
     ttft_ms: float | None = None
+    #: Which first-byte path produced a ``ttft`` event: ``"local"`` for the
+    #: ``dispatch_first_byte_ms=`` line, ``"remote"`` for ``ttft_seconds=``.
+    #: ``None`` on pre-change logs and hand-built events. The admission →
+    #: first-byte conversion join counts ``"local"`` only
+    #: (LP-0MVS9YKHL007UBBZ).
+    ttft_source: str | None = None
     # Prefill breakdown carried by the local ``dispatch_first_byte_ms=`` line
     # (LP-0MVJN025B001I8AL): ``ttft_ms`` is the dispatch→first-byte *total*,
     # ``dispatch_to_first_byte_ms`` is the same interval minus the queued wait
@@ -568,6 +630,32 @@ class LogEvent:
     enforced: str | None = None
     eta_prefill_s: str | None = None
     budget_s: str | None = None
+    # Contended-pricing metadata on the same record (LP-0MVS8T6F4006DGG3): the
+    # rate-calibration bucket the ETA was priced from and that bucket's sample
+    # count, plus the occupancy term of the projection. ``new_tokens`` (a
+    # shared field — it means the same on every event kind) is the priced
+    # uncached token count the band split uses. ``None`` on pre-change lines.
+    rate_bucket: str | None = None
+    contended_samples: int | None = None
+    eta_occupancy_s: str | None = None
+    # Measured pool state on the ``local_admission_guard`` record
+    # (LP-0MVGR2OXT0096OGK M1, ``local_admission_guard`` kind): the number of
+    # slots decoding, the number of prefills in flight, and whether a slot was
+    # free at decision time. ``None`` on legacy guard lines that predate the
+    # fields, which is why the denial verdict is ``unknown`` rather than a
+    # fabricated ``idle_leased`` for them.
+    busy_slots: int | None = None
+    in_flight_prefills: int | None = None
+    free_slot: str | None = None
+    # Status-poll payload (LP-0MVGR2OXT0096OGK M3, ``status_request`` kind):
+    # the calibrated predicted prefill duration and the published capacity
+    # hint. ``prefill_eta_seconds`` is ``None`` when the estimate was
+    # unavailable (fail-open) or the line predates the field.
+    prefill_eta_seconds: float | None = None
+    capacity_hint: str | None = None
+    status_schema_version: int | None = None
+    available_slots: int | None = None
+    total_slots: int | None = None
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J, ``idle_admit`` kind):
     # the idle age at admission and the configured threshold. Populated on
     # ``idle_admit`` events only.
@@ -602,6 +690,32 @@ class LogEvent:
     # Prefill-deadline overrun (``prefill_deadline_exceeded`` kind): the
     # configured deadline that was exceeded, in seconds.
     deadline_seconds: float | None = None
+    # Buffered-reply marker on ``stream_finished`` events
+    # (LP-0MVMHNVKT003PRIK AC1 non-streaming path): ``False`` when the line
+    # carried ``stream=false`` (a single JSON reply, not a chunked stream), so
+    # consumers can keep it out of stream pairing while still using its measured
+    # ``tokens=``. ``None`` on streaming lines and on pre-marker logs.
+    streamed: bool | None = None
+    # Explicit no-usage marker on ``stream_finished`` events
+    # (LP-0MVMBM6N400541EH): ``True`` when the terminal line carried
+    # ``tokens=missing``, i.e. the upstream reported no usage at all. ``None``
+    # when the line carried counted ``tokens=`` and on pre-marker logs (a line
+    # with neither marker nor counts reads ``None`` too — that shape predates
+    # the marker and is still counted as "without usage" by token presence).
+    usage_missing: bool | None = None
+    #: Per-turn correlation id (LP-0MVMBM467005BT4A), parsed from ``turn=`` on
+    #: every structured line one client request emits. Present on
+    #: ``stream_started``, ``stream_finished``, ``stream_finish_error``,
+    #: ``fallback``, ``routing_skip``, ``provider_context_skip``,
+    #: ``dispatch_denied``, ``local_dispatch`` and ``ttft`` events. ``None``
+    #: on every pre-change line (and on kinds that are not per-request), in
+    #: which case the legacy FIFO/nearest-line pairing applies unchanged.
+    turn: str | None = None
+
+
+def _turn_from(text: str) -> str | None:
+    """Extract the per-turn correlation id, or ``None`` when absent."""
+    return _first(RE_TURN, text)
 
 
 def _first(pattern: re.Pattern, text: str) -> str | None:
@@ -676,39 +790,135 @@ class PrefillMatch:
         return self.ttft.ts - timedelta(milliseconds=self.ttft.ttft_ms)
 
 
+def _pair_key(ev: LogEvent) -> str | None:
+    """Grouping key for a stream event: session UUID, else its turn id.
+
+    Historical behaviour grouped events by session only and skipped
+    session-less ones. A per-turn id (LP-0MVMBM467005BT4A) still identifies
+    one request when the session is absent, so the turn id becomes the
+    fallback key instead of dropping the event.
+    """
+    if ev.session is not None:
+        return ev.session
+    if ev.turn:
+        return f"turn:{ev.turn}"
+    return None
+
+
 def pair_ttft_to_streams(
     ttft_events: Iterable[LogEvent],
     started_events: Iterable[LogEvent],
 ) -> list[PrefillMatch]:
-    """Pair local streams with their TTFT events per session, FIFO by time.
+    """Pair local streams with their TTFT events — exactly by ``turn=``.
 
-    TTFT lines carry ``session=``, so the Nth ``dispatch_first_byte_ms``
-    event of a session pairs with that session's Nth ``stream_started`` event
-    (the same FIFO convention ``aggregation.compute_busy_stats`` uses for
-    start/finish pairs). Streams are returned sorted by their start timestamp;
-    streams with no TTFT paired are included with ``ttft=None`` so callers can
-    count them as unknown prefill instead of losing them. TTFT events beyond a
-    session's stream count have no stream to attribute to and are ignored.
-    Session-less events cannot be paired and are skipped.
+    A ``turn=`` id (LP-0MVMBM467005BT4A) identifies one client request on both
+    the ``dispatch_first_byte_ms=`` and the ``Stream started`` line, so when
+    both sides carry one the pairing is **exact** and needs no ordering
+    assumption: two interleaved turns of the same session can no longer be
+    mis-paired.
+
+    Lines without ids (rotated logs predating the field) fall back to the
+    historical FIFO rule: the Nth ``dispatch_first_byte_ms`` event of a
+    session pairs with that session's Nth ``stream_started`` event (the same
+    convention ``aggregation.compute_busy_stats`` uses for start/finish
+    pairs). Streams are returned sorted by their start timestamp; streams with
+    no TTFT paired are included with ``ttft=None`` so callers can count them as
+    unknown prefill instead of losing them. TTFT events beyond a group's stream
+    count have no stream to attribute to and are ignored. Events carrying
+    neither a session nor a turn cannot be paired and are skipped.
     """
-    starts: dict[str, list[LogEvent]] = {}
-    for ev in started_events:
-        if ev.session is not None:
-            starts.setdefault(ev.session, []).append(ev)
-    ttfts: dict[str, list[LogEvent]] = {}
-    for ev in ttft_events:
-        if ev.session is not None:
-            ttfts.setdefault(ev.session, []).append(ev)
+    all_starts = list(started_events)
+    all_ttfts = list(ttft_events)
 
     matches: list[PrefillMatch] = []
-    for session_id, session_starts in starts.items():
-        ordered_starts = sorted(session_starts, key=lambda e: e.ts)
-        ordered_ttfts = sorted(ttfts.get(session_id, []), key=lambda e: e.ts)
+    used_starts: set[int] = set()
+    used_ttfts: set[int] = set()
+
+    # --- Exact phase: same turn id on both sides ---------------------------
+    starts_by_turn: dict[str, list[LogEvent]] = {}
+    for ev in all_starts:
+        if ev.turn:
+            starts_by_turn.setdefault(ev.turn, []).append(ev)
+    for ttft in all_ttfts:
+        if not ttft.turn:
+            continue
+        candidates = starts_by_turn.get(ttft.turn)
+        if not candidates:
+            continue
+        stream = candidates.pop(0)
+        used_starts.add(id(stream))
+        used_ttfts.add(id(ttft))
+        matches.append(PrefillMatch(stream=stream, ttft=ttft))
+
+    # --- Legacy phase: per-group FIFO over the unpaired events -------------
+    starts: dict[str, list[LogEvent]] = {}
+    for ev in all_starts:
+        if id(ev) in used_starts:
+            continue
+        key = _pair_key(ev)
+        if key is None:
+            continue
+        starts.setdefault(key, []).append(ev)
+    ttfts: dict[str, list[LogEvent]] = {}
+    for ev in all_ttfts:
+        if id(ev) in used_ttfts:
+            continue
+        key = _pair_key(ev)
+        if key is None:
+            continue
+        ttfts.setdefault(key, []).append(ev)
+
+    for key, group_starts in starts.items():
+        ordered_starts = sorted(group_starts, key=lambda e: e.ts)
+        ordered_ttfts = sorted(ttfts.get(key, []), key=lambda e: e.ts)
         for index, stream in enumerate(ordered_starts):
             ttft = ordered_ttfts[index] if index < len(ordered_ttfts) else None
             matches.append(PrefillMatch(stream=stream, ttft=ttft))
     matches.sort(key=lambda m: m.stream.ts)
     return matches
+
+
+def pair_stream_events(
+    start_events: Iterable[LogEvent],
+    finish_events: Iterable[LogEvent],
+) -> tuple[list[tuple[LogEvent, LogEvent]], list[LogEvent]]:
+    """Pair ``Stream started`` events with their ``Stream finished`` events.
+
+    Returns ``(pairs, unpaired_starts)``. Pairs are exact when both lines carry
+    the same ``turn=`` id (LP-0MVMBM467005BT4A); the remaining events fall back
+    to the historical FIFO rule (earliest N starts pair with the N finishes in
+    time order), so pre-change logs pair exactly as before. Unpaired starts are
+    returned in time order — their duration is unknown, not zero.
+    """
+    ordered_starts = sorted(start_events, key=lambda e: e.ts)
+    ordered_finishes = sorted(finish_events, key=lambda e: e.ts)
+
+    finishes_by_turn: dict[str, list[LogEvent]] = {}
+    for ev in ordered_finishes:
+        if ev.turn:
+            finishes_by_turn.setdefault(ev.turn, []).append(ev)
+
+    pairs: list[tuple[LogEvent, LogEvent]] = []
+    used_finishes: set[int] = set()
+    remaining_starts: list[LogEvent] = []
+    for start in ordered_starts:
+        candidates = finishes_by_turn.get(start.turn) if start.turn else None
+        if candidates:
+            finish = candidates.pop(0)
+            used_finishes.add(id(finish))
+            pairs.append((start, finish))
+        else:
+            remaining_starts.append(start)
+
+    remaining_finishes = [
+        ev for ev in ordered_finishes if id(ev) not in used_finishes
+    ]
+    pairs.extend(zip(remaining_starts, remaining_finishes))
+
+    paired_starts = {id(ev) for ev, _ in pairs}
+    unpaired = [ev for ev in ordered_starts if id(ev) not in paired_starts]
+    pairs.sort(key=lambda pair: pair[0].ts)
+    return pairs, unpaired
 
 
 def _attribution_from(msg: str) -> tuple[str | None, str | None, str | None]:
@@ -752,6 +962,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             provider=_first(RE_PROVIDER, msg),
             model=_first(RE_MODEL, msg),
             session=_session_from(msg),
+            turn=_turn_from(msg),
         )
     if msg.startswith(STREAM_FINISHED):
         tokens = RE_TOKENS.search(msg)
@@ -778,6 +989,7 @@ def parse_log_line(line: str) -> LogEvent | None:
                 error_message=_first(RE_ERROR_MESSAGE, msg),
                 suggested_action=_first(RE_SUGGESTED_ACTION, msg),
                 entry=_first(RE_ENTRY, msg),
+                turn=_turn_from(msg),
                 raw=line,
             )
         return LogEvent(
@@ -790,6 +1002,15 @@ def parse_log_line(line: str) -> LogEvent | None:
             prompt=prompt,
             completion=completion,
             total=total,
+            # ``stream=false`` marks a buffered reply's terminal line
+            # (LP-0MVMHNVKT003PRIK): measured tokens, no stream pairing.
+            streamed=False if RE_STREAM_FALSE.search(msg) else None,
+            # ``tokens=missing`` marks a terminal line whose upstream reported
+            # no usage (LP-0MVMBM6N400541EH).
+            usage_missing=(
+                True if RE_TOKENS_MISSING.search(msg) else None
+            ),
+            turn=_turn_from(msg),
         )
     if msg.startswith(FALLBACK):
         m2 = RE_FALLBACK.search(msg)
@@ -809,6 +1030,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             budget_limit=_int(RE_FALLBACK_BUDGET_LIMIT, msg),
             budget_remaining=_int(RE_FALLBACK_BUDGET_REMAINING, msg),
             budget_waited=_float(RE_FALLBACK_BUDGET_WAITED, msg),
+            turn=_turn_from(msg),
         )
     if msg.startswith(ROUTING_SKIP_PROVIDER_CONTEXT):
         # "routing_skip_provider_context provider=munitoai-free type=remote
@@ -827,6 +1049,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             reason=_first(RE_REASON_KV, msg),
             estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
             limit=_int(RE_SKIP_LIMIT, msg),
+            turn=_turn_from(msg),
             raw=line,
         )
     if msg.startswith(ROUTING_SKIP):
@@ -837,20 +1060,32 @@ def parse_log_line(line: str) -> LogEvent | None:
             session=_session_from(msg),
             reason=_normalize_reason(_first(RE_ROUTING_SKIP_REASON, msg)),
             chain_hold_cycle=int(cycle_m.group(1)) if cycle_m else None,
+            # The routing-time prompt estimate the skip decision priced
+            # (LP-0MVM93DE6009JGBU): the per-session "context size at
+            # fallback" reads this value, so it must survive parsing. Absent
+            # on lines that carried no ``tokens=`` payload (``None``, never
+            # an estimate).
+            estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
+            turn=_turn_from(msg),
         )
     if msg.startswith(LOCAL_POST):
         # ``[local] POST http://... body={...} session_id=<uuid> session={...}``.
         # The request body is echoed (truncated) into the line and may itself
         # contain ``session=``/``provider=`` text, so no field is extracted
         # here: the event is a per-attempt marker, counted by hour only.
-        return LogEvent("local_dispatch", ts)
+        return LogEvent("local_dispatch", ts, turn=_turn_from(msg))
     if msg.startswith(DISPATCH_DENIED):
         m2 = RE_DISPATCH_DENIED.search(msg)
         if m2 is None:
             return None
         session, owner, active = m2.groups()
         return LogEvent(
-            "dispatch_denied", ts, session=session, owner=owner, active=int(active)
+            "dispatch_denied",
+            ts,
+            session=session,
+            owner=owner,
+            active=int(active),
+            turn=_turn_from(msg),
         )
     if msg.startswith(CONTENTION_DISPATCH):
         # "contention_queue_dispatch provider=... session=... queued_duration=1.23s policy=queue depth=0"
@@ -891,7 +1126,12 @@ def parse_log_line(line: str) -> LogEvent | None:
         )
     if msg.startswith(LOCAL_ADMISSION_GUARD):
         # "local_admission_guard decision=reject reason=eta_exceeds_budget
-        #  enforced=true eta_prefill_s=468.0 budget_s=120.0 priority=low ..."
+        #  enforced=true eta_prefill_s=468.0 budget_s=120.0 priority=low
+        #  busy_slots=1 in_flight_prefills=1 free_slot=false ..."
+        #
+        # The pool-state fields (LP-0MVGR2OXT0096OGK M1) are what the
+        # denial-attribution verdict is derived from; they are absent on
+        # legacy lines and stay ``None`` so no verdict is fabricated.
         m2 = RE_LOCAL_ADMISSION_DECISION.search(msg)
         if m2 is None:
             return None
@@ -906,6 +1146,33 @@ def parse_log_line(line: str) -> LogEvent | None:
             enforced=_first(RE_LOCAL_ADMISSION_ENFORCED, msg),
             eta_prefill_s=_first(RE_LOCAL_ADMISSION_ETA, msg),
             budget_s=_first(RE_LOCAL_ADMISSION_BUDGET, msg),
+            busy_slots=_int(RE_GUARD_BUSY_SLOTS, msg),
+            in_flight_prefills=_int(RE_GUARD_IN_FLIGHT_PREFILLS, msg),
+            free_slot=_first(RE_GUARD_FREE_SLOT, msg),
+            # Contended-pricing metadata (LP-0MVS9YKHL007UBBZ AC1): additive;
+            # absent on pre-change lines, where every field stays ``None``.
+            rate_bucket=_first(RE_GUARD_RATE_BUCKET, msg),
+            contended_samples=_int(RE_GUARD_CONTENDED_SAMPLES, msg),
+            eta_occupancy_s=_first(RE_GUARD_ETA_OCCUPANCY, msg),
+            new_tokens=_int(RE_GUARD_NEW_TOKENS, msg),
+        )
+    if msg.startswith(STATUS_REQUEST):
+        # "status_request active_query=false available_slots=2
+        #  capacity_hint=idle ... prefill_eta_seconds=91.6 queue_eta_seconds=183.2
+        #  ... status_schema_version=3 total_slots=2"
+        # The polled payload behind the contention measurement
+        # (LP-0MVGR2OXT0096OGK M3): the calibrated prefill prediction and the
+        # truthful capacity hint. ``prefill_eta_seconds=None`` is meaningful
+        # (estimate unavailable — fail-open), never a zero cost.
+        eta = _float(RE_STATUS_PREFILL_ETA, msg)
+        return LogEvent(
+            STATUS_REQUEST,
+            ts,
+            prefill_eta_seconds=eta,
+            capacity_hint=_first(RE_STATUS_CAPACITY_HINT, msg),
+            status_schema_version=_int(RE_STATUS_SCHEMA_VERSION, msg),
+            available_slots=_int(RE_STATUS_AVAILABLE_SLOTS, msg),
+            total_slots=_int(RE_STATUS_TOTAL_SLOTS, msg),
         )
     if msg.startswith(ROUTING_RESIDENT_PREFIX):
         # "routing_resident_prefix provider=local model=Qwen3 decision=admit
@@ -1248,10 +1515,12 @@ def parse_log_line(line: str) -> LogEvent | None:
                 model=_first(RE_MODEL, msg),
                 session=_session_from(msg),
                 ttft_ms=ttft_ms_val,
+                ttft_source="local" if dispatch_m else "remote",
                 dispatch_to_first_byte_ms=_float(RE_DISPATCH_TO_FIRST_BYTE, msg),
                 queue_wait_ms=_float(RE_QUEUE_WAIT_MS, msg),
                 cache_state=_first(RE_CACHE_STATE, msg),
                 cached_ratio=_float(RE_CACHED_RATIO, msg),
+                turn=_turn_from(msg),
                 raw=line,
             )
 
