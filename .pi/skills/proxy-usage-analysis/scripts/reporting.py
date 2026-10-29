@@ -54,6 +54,11 @@ CSV_COLUMNS = [
     "ctx_size",
     "local_requests",
     "remote_requests",
+    "local_turns_answered",
+    "local_turns_unanswered",
+    "local_turn_pct",
+    "context_at_fallback",
+    "context_at_fallback_source",
     "dispatch_denied",
     "decode_tok_s",
 ]
@@ -138,6 +143,20 @@ def _session_row(s: SessionStats) -> dict:
         "ctx_size": str(s.ctx_size) if s.ctx_size else "",
         "local_requests": str(s.local_requests),
         "remote_requests": str(s.remote_requests),
+        # Local-turn coverage (LP-0MVM93DE6009JGBU AC5): the per-session data
+        # behind the report's "Local model usage by session" section, so the
+        # numbers are auditable from an artifact instead of the Markdown only.
+        "local_turns_answered": str(s.local_turns_answered),
+        "local_turns_unanswered": str(s.local_turns_unanswered),
+        "local_turn_pct": (
+            f"{s.local_turn_pct:.1f}" if s.local_turn_pct is not None else ""
+        ),
+        "context_at_fallback": (
+            str(s.context_at_fallback)
+            if s.context_at_fallback is not None
+            else ""
+        ),
+        "context_at_fallback_source": s.context_at_fallback_source or "",
         "dispatch_denied": str(s.dispatch_denied),
         "decode_tok_s": f"{s.decode_tok_s:.1f}" if s.decode_tok_s is not None else "",
     }
@@ -338,6 +357,375 @@ def _fmt_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ---------------------------------------------------------------------------
+# Local-turn coverage (LP-0MVM93DE6009JGBU)
+# ---------------------------------------------------------------------------
+#
+# "Which sessions actually used the local model, how many turns did it answer,
+# what share of the session's turns were local, and why did each session move
+# to remote?" Everything below is derived from data the pipeline already
+# collects (per-session turns and fallback attribution), so the section needs no
+# new data source:
+#
+# - a session is *covered* when it has at least one local turn (whether or not
+#   that turn was answered — an unanswered turn is flagged, never dropped);
+# - ``% local turns`` = local / (local + remote) × 100, 100 % for a session
+#   that never used remote;
+# - the summary table's percentile rows use linear interpolation (the shared
+#   ``_percentile`` convention) over the covered sessions; the total row sums
+#   the turn columns and recomputes the share from those sums, and shows the
+#   mean of the sessions that have token data for the context column;
+# - the reason distribution is its own counts-and-percent table because a
+#   reason is categorical and has no meaningful percentile;
+# - ``context size at fallback`` is the session's own evidence (see
+#   ``aggregation.CONTEXT_AT_FALLBACK_*``), rendered ``n/a`` — with a named
+#   limitation — when the logs carry no tokens at all.
+LOCAL_TURN_PERCENTILES = ((10, "P10"), (50, "P50"), (90, "P90"))
+
+
+@dataclass(frozen=True)
+class LocalTurnRow:
+    """One local-using session's coverage row (report + JSON)."""
+
+    session_id: str
+    local_turns: int
+    answered_turns: int
+    unanswered_turns: int
+    remote_turns: int
+    local_turn_pct: float
+    reason: str
+    context_at_fallback: int | None
+    context_source: str | None
+
+
+NO_LOCAL_TURNS_TEXT = "No session in the window used the local model."
+
+
+def _fallback_reason_label(session: SessionStats) -> str:
+    """Reason label for the per-session coverage tables.
+
+    The session's own attributed ``fallback_reason`` when it has one; otherwise
+    its attribution state, so a session that never left local reads
+    ``no_remote_fallback`` and one with no own evidence reads ``unattributed``
+    (LP-0MVMBMSWR0036RES — a reason is never inherited from a neighbour).
+    """
+    if session.fallback_reason:
+        return session.fallback_reason
+    if session.fallback_attribution:
+        return session.fallback_attribution
+    if session.remote_requests == 0:
+        return aggregation.FALLBACK_ATTRIBUTION_NO_REMOTE
+    return aggregation.FALLBACK_ATTRIBUTION_UNATTRIBUTED
+
+
+def local_turn_rows(
+    sessions: dict[str, SessionStats] | list[SessionStats],
+) -> list[LocalTurnRow]:
+    """Coverage rows for the sessions with at least one local turn.
+
+    Sorted by ``# turns local`` **descending** (more local turns is the goal,
+    so the best sessions read first), then by session id so equal counts keep a
+    deterministic order.
+    """
+    candidates = sessions.values() if isinstance(sessions, dict) else sessions
+    rows = [
+        LocalTurnRow(
+            session_id=s.session_id,
+            local_turns=s.local_requests,
+            answered_turns=s.local_turns_answered,
+            unanswered_turns=s.local_turns_unanswered,
+            remote_turns=s.remote_requests,
+            local_turn_pct=s.local_turn_pct
+            if s.local_turn_pct is not None
+            else 0.0,
+            reason=_fallback_reason_label(s),
+            context_at_fallback=s.context_at_fallback,
+            context_source=s.context_at_fallback_source,
+        )
+        for s in candidates
+        if s.local_requests > 0
+    ]
+    rows.sort(key=lambda r: (-r.local_turns, r.session_id))
+    return rows
+
+
+def local_turn_coverage(summary: AnalysisResult) -> dict:
+    """Machine-readable local-turn coverage (shared by the report and JSON).
+
+    Returns the covered rows, the percentile/total table rows and the
+    fallback-reason counts-and-percent rows, so the Markdown section and the
+    ``--json`` summary can never disagree.
+    """
+    rows = local_turn_rows(summary.sessions)
+    with_local = len(rows)
+    local_values = [float(r.local_turns) for r in rows]
+    remote_values = [float(r.remote_turns) for r in rows]
+    pct_values = [r.local_turn_pct for r in rows]
+    context_values = [
+        float(r.context_at_fallback)
+        for r in rows
+        if r.context_at_fallback is not None
+    ]
+
+    percentiles: list[dict] = []
+    for percentile, label in LOCAL_TURN_PERCENTILES:
+        context = _percentile(context_values, percentile)
+        percentiles.append(
+            {
+                "label": label,
+                "local_turns": _round1(_percentile(local_values, percentile)),
+                "remote_turns": _round1(_percentile(remote_values, percentile)),
+                "local_turn_pct": _round1(_percentile(pct_values, percentile)),
+                "context_at_fallback": (
+                    int(round(context)) if context is not None else None
+                ),
+            }
+        )
+
+    total_local = sum(r.local_turns for r in rows)
+    total_remote = sum(r.remote_turns for r in rows)
+    total_turns = total_local + total_remote
+    total = {
+        "local_turns": total_local,
+        "remote_turns": total_remote,
+        "local_turn_pct": round(total_local / total_turns * 100.0, 1)
+        if total_turns
+        else None,
+        "context_at_fallback": (
+            int(round(sum(context_values) / len(context_values)))
+            if context_values
+            else None
+        ),
+        "answered_turns": sum(r.answered_turns for r in rows),
+        "unanswered_turns": sum(r.unanswered_turns for r in rows),
+        "context_samples": len(context_values),
+    }
+
+    reason_counts = Counter(r.reason for r in rows)
+    reasons = [
+        {
+            "reason": reason,
+            "sessions": count,
+            "pct_of_sessions_with_local": round(count / with_local * 100.0, 1)
+            if with_local
+            else 0.0,
+        }
+        for reason, count in sorted(
+            reason_counts.items(), key=lambda kv: (-kv[1], kv[0])
+        )
+    ]
+
+    # Interpretation notes (deterministic, data-gated). These are counted over
+    # ALL sessions in the window, not just the covered rows: the decision-first
+    # finding is precisely about the sessions that reached remote *without* a
+    # local turn, so they can never appear in the per-session table.
+    all_sessions = list(summary.sessions.values())
+    reached_remote = [s for s in all_sessions if s.remote_requests > 0]
+    declined_before_local = [s for s in reached_remote if s.local_requests == 0]
+    context_fallbacks = [
+        s
+        for s in all_sessions
+        if _fallback_reason_label(s) in aggregation.CONTEXT_FALLBACK_REASONS
+    ]
+    context_before_local = [s for s in context_fallbacks if s.local_requests == 0]
+    rate_limited = [
+        s for s in all_sessions if _fallback_reason_label(s) == "rate_limited"
+    ]
+
+    return {
+        "sessions_in_window": len(summary.sessions),
+        "sessions_with_local": with_local,
+        "percentiles": percentiles,
+        "total": total,
+        "reasons": reasons,
+        "sessions": [
+            {
+                "session_id": r.session_id,
+                "local_turns": r.local_turns,
+                "answered_turns": r.answered_turns,
+                "unanswered_turns": r.unanswered_turns,
+                "remote_turns": r.remote_turns,
+                "local_turn_pct": r.local_turn_pct,
+                "reason": r.reason,
+                "context_at_fallback": r.context_at_fallback,
+                "context_at_fallback_source": r.context_source,
+            }
+            for r in rows
+        ],
+        "notes": {
+            "sessions_reaching_remote": len(reached_remote),
+            "declined_before_local_turn": len(declined_before_local),
+            "context_fallback_sessions": len(context_fallbacks),
+            "context_fallback_before_local_turn": len(context_before_local),
+            "rate_limited_sessions": len(rate_limited),
+        },
+    }
+
+
+def _round1(value: float | None) -> float | None:
+    return round(value, 1) if value is not None else None
+
+
+def _fmt_count(value: float | None) -> str:
+    """Render a percentile figure: integers without a decimal, else one place."""
+    if value is None:
+        return "-"
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.1f}"
+
+
+def _fmt_fallback_tokens(value: int | None) -> str:
+    """Render a context-at-fallback figure, or an explicit ``n/a``."""
+    return "n/a" if value is None else f"{value:,}"
+
+
+def _append_local_turn_coverage_section(
+    ap, summary: AnalysisResult
+) -> None:
+    """Append the ``## Local model usage by session`` section.
+
+    Three deterministic tables (summary percentiles, fallback-reason counts,
+    per-session sampling) plus data-gated interpretation notes. Renders a named
+    no-local-traffic line instead of an empty section when no session used the
+    local model (LP-0MVM93DE6009JGBU AC1–AC4).
+    """
+    coverage = local_turn_coverage(summary)
+    ap("")
+    ap("## Local model usage by session")
+    ap("")
+    if not coverage["sessions_with_local"]:
+        ap(NO_LOCAL_TURNS_TEXT)
+        return
+
+    total = coverage["total"]
+    total_turns = total["local_turns"] + total["remote_turns"]
+    ap(
+        "Sessions with at least one local turn (a local `Stream started` paired "
+        "with a local `Stream finished`): "
+        f"**{coverage['sessions_with_local']} of "
+        f"{coverage['sessions_in_window']}** sessions "
+        f"({_pct(coverage['sessions_with_local'], coverage['sessions_in_window']):.1f}%), "
+        f"**{total['local_turns']}** local turns "
+        f"({total['answered_turns']} answered, {total['unanswered_turns']} unanswered) "
+        f"and {total['remote_turns']} remote turns "
+        f"({_pct(total['local_turns'], total_turns):.1f}% local overall)."
+    )
+    ap("")
+    ap("| Percentile | # turns local | # turns remote | % local turns | Context size at fallback |")
+    ap("|---|---|---|---|---|")
+    for row in coverage["percentiles"]:
+        ap(
+            f"| {row['label']} | {_fmt_count(row['local_turns'])} | "
+            f"{_fmt_count(row['remote_turns'])} | "
+            f"{_fmt_count(row['local_turn_pct'])}% | "
+            f"{_fmt_fallback_tokens(row['context_at_fallback'])} |"
+        )
+    total_row = (
+        f"| Total | {total['local_turns']} | {total['remote_turns']} | "
+        f"{_fmt_count(total['local_turn_pct'])}% | "
+        f"{_fmt_fallback_tokens(total['context_at_fallback'])} |"
+    )
+    ap(total_row)
+    ap("")
+    ap(
+        "P10/P50/P90 are percentiles (linear interpolation) over the sessions "
+        "with ≥1 local turn. The total row sums the turn columns, recomputes "
+        "`% local turns` from those sums, and shows the mean context at "
+        "fallback of the sessions with token data. Context size at fallback "
+        "covers the "
+        f"{total['context_samples']} of {coverage['sessions_with_local']} sessions "
+        "with token evidence at their fallback; sessions with none are "
+        "excluded from that column's percentiles rather than counted as 0."
+    )
+
+    ap("")
+    ap("### Fallback reason distribution")
+    ap("")
+    ap("| Reason | Sessions | % of sessions-with-local |")
+    ap("|---|---|---|")
+    for row in coverage["reasons"]:
+        ap(
+            f"| {row['reason']} | {row['sessions']} | "
+            f"{row['pct_of_sessions_with_local']:.1f}% |"
+        )
+    ap("")
+    ap(
+        "`no_remote_fallback` marks a session that never used a remote provider; "
+        "`unattributed` means it reached remote with no own evidence "
+        "(LP-0MVMBMSWR0036RES — a session never inherits a neighbour's reason)."
+    )
+
+    ap("")
+    ap("### Per-session coverage")
+    ap("")
+    ap(
+        "| Session ID | # turns local | # turns remote | % local turns | "
+        "Reason for remote fallback | Context size at fallback |"
+    )
+    ap("|---|---|---|---|---|---|")
+    for row in coverage["sessions"]:
+        local_cell = str(row["local_turns"])
+        if row["unanswered_turns"]:
+            local_cell += f" ({row['unanswered_turns']} unanswered)"
+        ap(
+            f"| {row['session_id']} | {local_cell} | {row['remote_turns']} | "
+            f"{row['local_turn_pct']:.1f}% | {row['reason']} | "
+            f"{_fmt_fallback_tokens(row['context_at_fallback'])} |"
+        )
+    ap("")
+    ap(
+        "Sorted by `# turns local` descending (more local turns is the goal), "
+        "then by session id. `% local turns` = local / (local + remote) × 100 "
+        "for that session; an unanswered local turn is counted and flagged in "
+        "the local column rather than dropped."
+    )
+
+    notes = coverage["notes"]
+    if notes["sessions_reaching_remote"]:
+        ap("")
+        ap("Interpretation:")
+        ap(
+            "- Decision-first routing: "
+            f"{notes['declined_before_local_turn']} of "
+            f"{notes['sessions_reaching_remote']} sessions that reached remote "
+            f"never served a local turn "
+            f"({_pct(notes['declined_before_local_turn'], notes['sessions_reaching_remote']):.1f}%) "
+            "— local is declined pre-emptively, not after a failed attempt."
+        )
+        if notes["context_fallback_sessions"]:
+            ap(
+                "- Context-size fallbacks "
+                "(`context_too_large` / `large_context_bypass` / "
+                "`provider_context_exceeded`): "
+                f"{notes['context_fallback_before_local_turn']} of "
+                f"{notes['context_fallback_sessions']} were declined before the "
+                "session's first local turn. These are `estimated_tokens` "
+                "threshold decisions, so they fire only once a prompt grows past "
+                "the configured cold/warm thresholds — never on a session's first "
+                "message."
+            )
+        if notes["rate_limited_sessions"]:
+            ap(
+                "- `rate_limited` is the proxy's own per-provider RPM budget "
+                "pacing (`provider_budget.py`: the configured `rate_limit_rpm` "
+                "window for that provider is exhausted, so the request passes to "
+                "the next provider immediately) — not an upstream HTTP 429; those "
+                "surface as `upstream_http_error status=429` events instead."
+            )
+
+    missing = coverage["sessions_with_local"] - coverage["total"]["context_samples"]
+    if missing:
+        ap("")
+        ap(
+            f"**Limitation:** {missing} of {coverage['sessions_with_local']} "
+            "session(s) have no token evidence at their fallback — their "
+            "`routing_skip_local` line carried no `estimated_tokens=`, no remote "
+            "stream reported usage and the session itself logged no prompt "
+            "tokens. They render `n/a`; the report never fabricates an estimate."
+        )
+
+
 def _ap_fallback_attribution(ap, summary: AnalysisResult) -> None:
     """Render the per-session fallback-attribution states (LP-0MVMBMSWR0036RES).
 
@@ -474,6 +862,11 @@ def build_report(
     ap(f"| Highest context | {total_max} | {fast_max} | {cheap_max} |")
 
     _append_total_tokens_section(ap, summary)
+
+    # Local-turn coverage (LP-0MVM93DE6009JGBU): which sessions used local, how
+    # many turns it answered, the per-session share and the reason each session
+    # moved to remote — read straight from the session aggregates above.
+    _append_local_turn_coverage_section(ap, summary)
 
     if summary.fallback_reason_counts:
         ap("")
@@ -2901,6 +3294,9 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
         "prompt_eval_speed": _speed_json(summary.speed, "prompt_eval") if summary.speed else None,
         "ttft": _ttft_json(summary.ttft_events, summary.sessions),
+        # Local-turn coverage (LP-0MVM93DE6009JGBU): the same derivation the
+        # Markdown section renders, so `--json` consumers need not scrape it.
+        "local_turn_coverage": local_turn_coverage(summary),
     }
 
 

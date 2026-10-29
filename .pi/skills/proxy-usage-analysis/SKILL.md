@@ -168,6 +168,41 @@ exposes the same numbers under `denial_attribution`, `prefill_eta_error` and
   per-line timestamps, so per-dispatch pairing is impossible — see
   REFERENCE.md Limitations).
 
+## Local-turn coverage (LP-0MVM93DE6009JGBU)
+
+The report answers "which sessions actually used the local model, how many
+turns did it answer, what share of each session's turns were local, and why
+did each session move to remote" in a **Local model usage by session** section
+rendered from data the pipeline already collects:
+
+- a summary percentile table (P10/P50/P90 + total) over the sessions with ≥1
+  local turn: `# turns local`, `# turns remote`, `% local turns` and context
+  size at fallback (linear interpolation, the skill's usual convention);
+- a fallback-reason counts-and-percent table (a reason is categorical, so it
+  has no meaningful percentile);
+- a per-session table (session id, turn counts, `% local turns`, fallback
+  reason, context size at fallback) sorted by local turns descending — more
+  local turns is the goal, so the best sessions read first.
+
+Derivation rules that matter when reading it: an unanswered local turn (error
+/ abort / log gap) is counted and flagged rather than dropped; `% local turns`
+is `local / (local + remote)` per session, so a local-only session reads
+100 %; the fallback reason is the session's **own** attribution
+(`no_remote_fallback` when it never used remote, `unattributed` when it has no
+evidence); and context size at fallback is the session's own
+`routing_skip_local estimated_tokens`, else the first remote stream's prompt
+tokens, else its session context — sessions with no token evidence render
+`n/a` with a named limitation, never a fabricated estimate. The same
+figures are in the `--json` summary under `local_turn_coverage` and in the
+per-session CSVs.
+
+Interpretation notes the section prints itself when the data applies:
+context-size fallbacks are `estimated_tokens` threshold decisions (they fire
+only after a prompt grows past the cold/warm thresholds, not on a session's
+first message) and `rate_limited` is the proxy's own per-provider RPM budget
+pacing (`provider_budget.py`), **not** an upstream HTTP 429 — those surface as
+`upstream_http_error status=429` events.
+
 ## Contended-pricing surface (LP-0MVS9YKHL007UBBZ)
 
 Since the contended-pricing fix (parent LP-0MVS8T6F4006DGG3: contended

@@ -120,6 +120,36 @@ FALLBACK_ATTRIBUTION_ORDER = (
 # ``local_denials`` (``local_dispatch_denied`` refusals) and
 # ``lease_active_fallbacks`` (``Fallback triggered`` /
 # ``contention_queue_fallback_after_queue`` with ``reason=local_lease_active``).
+
+# Provenance of a session's "context size at fallback" (LP-0MVM93DE6009JGBU
+# AC4). The value is derived from this session's OWN evidence, in this order:
+#
+# - ``routing_skip`` — ``estimated_tokens=`` on the session's own
+#   ``routing_skip_local`` line at/before its recorded fallback: the estimate
+#   the routing decision itself priced;
+# - ``remote_stream`` — the prompt tokens (``tokens=prompt/...``) of the
+#   session's first remote ``Stream finished`` line;
+# - ``session_context`` — the session's own measured context columns
+#   (``start_context_size``, else ``max_context_size``) when neither of the
+#   above is logged;
+# - ``None`` — no token evidence at all. The report renders an explicit
+#   ``n/a`` and a limitation note; it never fabricates an estimate.
+CONTEXT_AT_FALLBACK_ROUTING_SKIP = "routing_skip"
+CONTEXT_AT_FALLBACK_REMOTE_STREAM = "remote_stream"
+CONTEXT_AT_FALLBACK_SESSION_CONTEXT = "session_context"
+
+# Fallback reasons that describe a PROMPT-SIZE decision (the local or remote
+# entry's context ceiling) rather than an availability/quality problem. They
+# fire as a session's context grows past the configured thresholds, so the
+# local-turn coverage section uses them for its context-size interpretation
+# note (LP-0MVM93DE6009JGBU). ``warm_cache_bypass`` is the pre-change spelling
+# of ``context_too_large`` and is normalised by the parser.
+CONTEXT_FALLBACK_REASONS = (
+    "context_too_large",
+    "large_context_bypass",
+    "provider_context_exceeded",
+)
+
 AVAILABILITY_COUNTERS = (
     "local_dispatch_attempts",
     "local_served",
@@ -583,10 +613,34 @@ class SessionStats:
     tokens_by_model: dict[tuple[str, str], tuple[int, int]] = field(
         default_factory=dict
     )
+    # Local turns actually answered (LP-0MVM93DE6009JGBU): a local
+    # ``Stream started`` paired FIFO with a local ``Stream finished`` that is
+    # not an error. ``local_turns_unanswered`` counts routed local turns left
+    # over — reported, never dropped.
+    local_turns_answered: int = 0
+    local_turns_unanswered: int = 0
+    # Context size at the session's local→remote fallback, with its
+    # provenance (one of the ``CONTEXT_AT_FALLBACK_*`` states, or ``None``
+    # when the logs carry no token evidence — rendered ``n/a``).
+    context_at_fallback: int | None = None
+    context_at_fallback_source: str | None = None
 
     @property
     def fell_back(self) -> bool:
         return self.remote_move_time is not None
+
+    @property
+    def local_turn_pct(self) -> float | None:
+        """Share of this session's turns answered by local (percent).
+
+        ``local / (local + remote) * 100`` over the session's routed turns, so
+        a session that never used remote reads 100.0. ``None`` only when the
+        session has no turns at all.
+        """
+        total = self.local_requests + self.remote_requests
+        if total <= 0:
+            return None
+        return round(self.local_requests / total * 100.0, 1)
 
 
 @dataclass
@@ -1199,6 +1253,74 @@ def _first_remote(events: Iterable[LogEvent]) -> LogEvent | None:
     return None
 
 
+def _count_local_turns(
+    builder: _SessionBuilder,
+) -> tuple[int, int]:
+    """Return ``(answered, unanswered)`` local turns for one session.
+
+    A turn is *routed to local* by its local ``Stream started`` line and
+    *answered* when a local, non-error ``Stream finished`` is logged for it
+    (paired FIFO, the convention ``compute_busy_stats`` and
+    ``pair_ttft_to_streams`` use). A routed local turn with no non-error
+    finish — an errored stream, an aborted request, a log gap — is counted as
+    **unanswered** rather than dropped, so the coverage table cannot silently
+    over-state local service (LP-0MVM93DE6009JGBU).
+    """
+    starts = sum(1 for e in builder.started if e.provider == LOCAL_PROVIDER)
+    good_finishes = sum(1 for e in builder.finished if e.provider == LOCAL_PROVIDER)
+    answered = min(starts, good_finishes)
+    return answered, starts - answered
+
+
+def _context_at_fallback(
+    session_id: str,
+    anchor_ts: datetime,
+    routing_skips: dict[str, list[LogEvent]],
+    builder: _SessionBuilder,
+    prompt_tokens: list[int],
+) -> tuple[int | None, str | None]:
+    """Derive ``(context_size, source)`` at a session's remote fallback.
+
+    Order of preference (AC4) — this session's own evidence only, never a
+    neighbour's line and never an estimate:
+
+    1. ``estimated_tokens`` from the session's own ``routing_skip_local`` line
+       at/before the fallback (the latest such line);
+    2. the prompt tokens of the session's first remote ``Stream finished`` at
+       or after the first remote ``Stream started``;
+    3. the session's own measured context: ``prompt_tokens[0]``, i.e. the
+       ``start_context_size`` of the session CSV (``max_context_size`` needs no
+       separate branch — it exists only when a prompt measurement does);
+    4. ``(None, None)`` — no token evidence, reported as ``n/a``.
+    """
+    skips = [
+        e
+        for e in routing_skips.get(session_id, [])
+        if e.ts <= anchor_ts and e.estimated_tokens is not None
+    ]
+    if skips:
+        return (
+            max(skips, key=lambda e: e.ts).estimated_tokens,
+            CONTEXT_AT_FALLBACK_ROUTING_SKIP,
+        )
+    remote_finishes = sorted(
+        (
+            e
+            for e in builder.finished
+            if e.provider
+            and e.provider != LOCAL_PROVIDER
+            and e.ts >= anchor_ts
+            and e.prompt is not None
+        ),
+        key=lambda e: e.ts,
+    )
+    if remote_finishes:
+        return remote_finishes[0].prompt, CONTEXT_AT_FALLBACK_REMOTE_STREAM
+    if prompt_tokens:
+        return prompt_tokens[0], CONTEXT_AT_FALLBACK_SESSION_CONTEXT
+    return None, None
+
+
 def _attribute_fallback(
     session_id: str,
     first_remote_ts: datetime,
@@ -1335,6 +1457,22 @@ def _build_session(
 
     local_req = sum(1 for e in started if e.provider == LOCAL_PROVIDER)
     remote_req = len(started) - local_req
+    local_answered, local_unanswered = _count_local_turns(builder)
+
+    # Context size at the fallback (LP-0MVM93DE6009JGBU AC4): anchored on the
+    # session's own recorded move time when it has local evidence, otherwise
+    # on its first remote stream.
+    context_at_fallback: int | None = None
+    context_source: str | None = None
+    if first_remote is not None:
+        anchor = move_ts if has_local and move_ts is not None else first_remote.ts
+        context_at_fallback, context_source = _context_at_fallback(
+            builder.session_id,
+            anchor,
+            routing_skips,
+            builder,
+            prompt_tokens,
+        )
 
     # Token totals for this session.
     input_tokens = sum(prompt_tokens)
@@ -1381,6 +1519,10 @@ def _build_session(
             key: (pair[0], pair[1])
             for key, pair in builder.tokens_by_model.items()
         },
+        local_turns_answered=local_answered,
+        local_turns_unanswered=local_unanswered,
+        context_at_fallback=context_at_fallback,
+        context_at_fallback_source=context_source,
     )
 
 

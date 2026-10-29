@@ -78,6 +78,23 @@ Outputs written to:
   hold-cycle routing-skip re-emissions (`chain_hold_cycle>0`) in the
   window, excluded from every demand/local-skip counter
   (LP-0MUIEO6IP0030CT3): `jq .hold_cycle_routing_skip_events`.
+- `--json` summary field `local_turn_coverage` — the deterministic local-turn
+  coverage behind the report's `## Local model usage by session` section
+  (LP-0MVM93DE6009JGBU): `{"sessions_in_window": N,
+  "sessions_with_local": M, "percentiles": [{"label": "P10",
+  "local_turns": f, "remote_turns": f, "local_turn_pct": f,
+  "context_at_fallback": i|null}, …], "total": {"local_turns": N,
+  "remote_turns": N, "local_turn_pct": f, "context_at_fallback": i|null,
+  "answered_turns": N, "unanswered_turns": N, "context_samples": N},
+  "reasons": [{"reason": r, "sessions": N,
+  "pct_of_sessions_with_local": f}, …], "sessions": [{…per-session row
+  with `reason`, `context_at_fallback` and `context_at_fallback_source`…}],
+  "notes": {"sessions_with_fallback": N,
+  "declined_before_local_turn": N, "context_fallback_sessions": N,
+  "context_fallback_before_local_turn": N, "rate_limited_sessions": N}}`.
+  A `% local turns` of 100 means the session never used remote; a null
+  `context_at_fallback` means the logs carried no token evidence (the report
+  renders `n/a`, never an estimate).
 - `--json` summary field `provider_context_skips` — provider context-ceiling
   skips (LP-0MVMBM1Y3001TPRT): `{"total": N, "share_of_skips": f,
   "standard": N, "low": N, "by_provider": {provider: count},
@@ -304,8 +321,65 @@ start/avg/max context size, avg/max response size, initial model assignment
 (provider + model), time of move to a remote model (empty if never fell
 back), fallback reason (empty if never fell back), bucket, slots, ctx size
 (per-period context of the profile active for that session), local/remote
-request counts, dispatch denials, decode tok/s (derived from local
+request counts, local turns answered/unanswered, per-session `% local turns`,
+context size at fallback with its provenance
+(`routing_skip` / `remote_stream` / `session_context`, empty when no token
+evidence exists), dispatch denials, decode tok/s (derived from local
 completion tokens ÷ local active span; empty when not derivable).
+
+### Local-turn coverage (`## Local model usage by session`)
+
+Since LP-0MVM93DE6009JGBU the report carries a per-session local-usage
+section — which sessions actually used the local model, how many turns it
+answered, what share of each session's turns were local, and why each session
+moved to remote. It is rendered from data the pipeline already collects (no
+new log source):
+
+```text
+## Local model usage by session
+
+| Percentile | # turns local | # turns remote | % local turns | Context size at fallback |
+| P10 | … |
+| P50 | … |
+| P90 | … |
+| Total | … |
+
+### Fallback reason distribution
+| Reason | Sessions | % of sessions-with-local |
+
+### Per-session coverage
+| Session ID | # turns local | # turns remote | % local turns |
+  Reason for remote fallback | Context size at fallback |
+```
+
+Operational definitions:
+
+- **Covered session** — at least one local `Stream started` inside the
+  window. A local turn counts as *answered* when a local, non-error
+  `Stream finished` pairs with it (FIFO, the busy/TTFT pairing convention); a
+  routed-but-unanswered turn (error, abort, log gap) is counted and flagged
+  in the local column — never dropped.
+- **`% local turns`** = `local / (local + remote) × 100` per session, so a
+  session that never used remote reads 100 %. The summary rows are
+  P10/P50/P90 (linear interpolation) over the covered sessions; the total row
+  sums the turn columns, recomputes the share from those sums and shows the
+  mean context-at-fallback of the sessions with token data.
+- **Fallback reason** — the session's own attributed reason
+  (`fallback_reason`), else its attribution state: `no_remote_fallback` (never
+  used remote) or `unattributed` (no own evidence). A reason is never
+  inherited from a neighbouring session (LP-0MVMBMSWR0036RES).
+- **Context size at fallback** — the session's `routing_skip_local
+  estimated_tokens` at/before its recorded fallback, else the first remote
+  `Stream finished` prompt tokens, else its own `start_context_size` /
+  `max_context_size`. Sessions with no token evidence render `n/a` plus a
+  named limitation; the report never fabricates an estimate.
+
+Sorting: the summary percentile rows ascend (P10 → P90); the per-session table
+is sorted by `# turns local` **descending** (more local turns is the goal),
+then by session id. When no session used local, the section renders the named
+line `No session in the window used the local model.` instead of empty tables.
+The same derivation is exposed as the `local_turn_coverage` `--json` key, so
+Markdown and machine-readable views cannot disagree.
 
 ### Archival
 
@@ -1073,3 +1147,25 @@ work outside the proxy's slot accounting.
   local active span (first→last local stream event); it includes
   inter-request gaps, so it is a conservative lower bound of the true decode
   rate. It is empty for sessions with no local completions.
+- **Local-turn coverage (`## Local model usage by session`,
+  LP-0MVM93DE6009JGBU).** `% local turns` uses the *routed* turn counts
+  (local + remote `Stream started` events inside the window), so a session
+  whose local turn started before the window and finished inside it is not
+  counted as a local turn. An unanswered local turn (an errored
+  `Stream finished`, an aborted request with no terminal line) is counted and
+  flagged rather than dropped, so a session can read, e.g.,
+  `2 (1 unanswered)`. Context size at fallback is the session's own evidence
+  only — its `routing_skip_local estimated_tokens`, else the first remote
+  stream's prompt tokens, else its `start_context_size` / `max_context_size`;
+  a session whose logs carry no token evidence renders `n/a` with a named
+  limitation (3 of 26 local-using sessions in the 2026-10-23/24 reference
+  window: `empty_response` / `fallback_after_queue` sessions). The percentile
+  summary's context column is computed over the sessions that have a value,
+  so its sample count can be smaller than the covered-session count — the
+  section states both.
+- **`rate_limited` is budget pacing, not an upstream 429.** The reason comes
+  from `provider_budget.py`'s own per-provider RPM accounting: the configured
+  `rate_limit_rpm` window for that provider entry is exhausted, so the request
+  passes to the next provider immediately. Upstream HTTP 429 responses are a
+  different signal and surface as `upstream_http_error status=429` events, not
+  as `rate_limited` fallbacks.

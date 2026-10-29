@@ -920,6 +920,12 @@ def parse_log_line(line: str) -> LogEvent | None:
             session=_session_from(msg),
             reason=_normalize_reason(_first(RE_ROUTING_SKIP_REASON, msg)),
             chain_hold_cycle=int(cycle_m.group(1)) if cycle_m else None,
+            # The routing-time prompt estimate the skip decision priced
+            # (LP-0MVM93DE6009JGBU): the per-session "context size at
+            # fallback" reads this value, so it must survive parsing. Absent
+            # on lines that carried no ``tokens=`` payload (``None``, never
+            # an estimate).
+            estimated_tokens=_int(RE_SKIP_ESTIMATED_TOKENS, msg),
         )
     if msg.startswith(LOCAL_POST):
         # ``[local] POST http://... body={...} session_id=<uuid> session={...}``.
