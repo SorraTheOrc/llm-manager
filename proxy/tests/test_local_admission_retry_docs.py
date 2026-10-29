@@ -21,8 +21,8 @@ the documented table is parsed and every row is replayed through the
   the ETA formula.
 
 Content-based assertions remain only where the contract *is* prose: the
-local-only "refuse, do not fall through to remote" statement, which no
-production helper can express.
+``local-preferred`` "pinned while deferrable, promoted when too large"
+statement, which no production helper can express (LP-0MVSHXU8E004BL57 AC6).
 """
 
 from __future__ import annotations
@@ -227,12 +227,27 @@ def test_documented_retry_at_is_the_same_instant_as_retry_after():
     )
 
 
-def test_local_only_is_documented_as_refusal_not_remote_fallthrough():
-    """AC4: local-only means refuse — the prose must say so, unconditionally."""
-    section = _contract_section()
+def test_local_preferred_is_documented_as_pinned_while_deferrable():
+    """AC6: pinned while deferrable; a too-large request is never refused.
 
-    assert "refuse, not fall through" in section.lower(), (
-        "the contract must state that a local-only refusal is returned to the "
-        "client instead of silently falling through to a remote provider"
+    ``local-preferred`` is one intent with two outcomes, so the contract must
+    state both halves: a ``deferrable`` request is refused (with a real retry
+    timer) instead of being moved to a remote provider, while a ``too_large``
+    request is promoted to the remote tiers instead of being refused for local
+    capacity. Pinning only the first half would let the promotion rule silently
+    disappear from the contract.
+    """
+    section = _contract_section()
+    plain = " ".join(section.lower().split())
+
+    assert "pinned while deferrable" in plain, (
+        "the contract must state that a local-preferred request is pinned while "
+        "its capacity verdict is deferrable"
     )
-    assert "X-Local-Route: refused" in section, "the refusal shape (429 + X-Local-Route: refused) must be documented"
+    assert "X-Local-Route: refused" in section, (
+        "the refusal shape (429 + X-Local-Route: refused) must be documented"
+    )
+    assert "never refused for local capacity" in plain, (
+        "the contract must state that a too-large request is promoted to a "
+        "remote tier, never refused for local capacity"
+    )

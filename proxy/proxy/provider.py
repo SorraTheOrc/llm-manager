@@ -6861,11 +6861,14 @@ def _build_local_only_refusal_response(
     config: dict | None = None,
     preference: str | None = None,
 ) -> Response:
-    """429 for a ``local-only`` request the admission guard refused (AC4).
+    """429 for a pin-local request that could not be served locally (AC4).
 
     Unlike the exhaustion path, this response is produced **while remote
-    providers are still available**: the client said local-only, so moving it
-    remote would silently violate its intent. The retry story is the shared
+    providers are still available**: the client pinned local, so moving it
+    remote would silently violate its intent, and with a ``deferrable``
+    capacity verdict the honest answer is a retry timer rather than a
+    fall-through (LP-0MVSHXTLS000VMLE). A ``too_large`` request never reaches
+    this builder — the pin declines and the remote tiers serve it. The retry story is the shared
     reason→timing decision (:func:`_refusal_retry_timing`), so this path can
     never advertise a different timer from the exhaustion refusal: ETA/occupancy
     reasons carry ``Retry-After`` + ``retry_at``, reasons waiting cannot heal
@@ -7105,7 +7108,7 @@ def _stamp_local_route_headers(
 
     Single choke point on the top-level return path so local success, remote
     success, refusal and exhaustion are all covered (LP-0MVIKPCSG002B0NL AC6).
-    A response that already carries the route header (a local-only refusal) is
+    A response that already carries the route header (a pin-local refusal) is
     left untouched; every other response is classified by the ``X-Provider``
     that served it.
 
@@ -7137,7 +7140,7 @@ def _stamp_local_route_headers(
     return stamped
 
 
-#: ``X-Local-Fallback-Reason`` tokens the local-only choke point emits when
+#: ``X-Local-Fallback-Reason`` tokens the pin-local choke point emits when
 #: the request recorded no skip reason (LP-0MVRMC1L3006F0F3). ``_note_local_fallback_reason()``
 #: is the primary source; these two defaults keep the structural refusal
 #: attributable when an exit left no reason behind:
@@ -7381,7 +7384,7 @@ def _local_refusal_retry_after_s(
 async def _stamp_local_routing_token_evidence(
     request, body_json, model_config, config, routing_estimate
 ) -> None:
-    """Stamp routing token evidence for a local-only refusal (AC5).
+    """Stamp routing token evidence for a pin-local refusal (AC5).
 
     Called only when a refusal is actually being built — the choke point has
     already decided not to dispatch — so the tokenizer pass this may trigger
@@ -7895,10 +7898,11 @@ async def _maybe_queue_for_local_slot(
         the wait budget; the caller falls through to the next provider
         immediately (no queueing) and records the ETA diagnostic
         (LP-0MVGDUV5E005UWBQ).
-      - ``"refused_local_only"`` — the guard refused and the caller set
-        ``X-Local-Preference: local-only``: the caller must return the
-        retryable 429 admission response instead of falling back to a remote
-        provider (LP-0MVIKPCSG002B0NL AC4).
+      - ``"refused_local_only"`` — the guard refused and the request is pinned
+        to local (``local-preferred``, including the normalised alias) with a
+        ``deferrable`` verdict: the caller must return the retryable 429
+        admission response instead of falling back to a remote provider
+        (LP-0MVIKPCSG002B0NL AC4).
 
     A valid ``X-Local-Reservation`` ticket is consumed first: a reservation is
     a pre-granted admission, so the follow-up request dispatches without
@@ -8380,7 +8384,7 @@ def _resolve_provider_with_exclusions(
     token of a chain-resolution skip **for a local entry only** (cooldown,
     quota hard stop, pending usage-limit reset, ``available_times`` window).
     The routing cycles pass ``_note_local_fallback_reason`` bound to their
-    request, which is how a ``local-only`` refusal learns *why* local was
+    request, which is how a pin-local refusal learns *why* local was
     unavailable instead of reporting the generic fallback
     (LP-0MVRMC1W6003MV3Y AC3). The return contract is unchanged for every
     other caller.
@@ -10922,7 +10926,7 @@ async def _proxy_with_remote_fallback_cycle(
             config=config,
             # Chain-resolution skips (cooldown / quota / usage-limit reset /
             # available_times window) record their stable token on THIS
-            # request, so a local-only refusal reports why local was
+            # request, so a pin-local refusal reports why local was
             # unavailable instead of the generic fallback
             # (LP-0MVRMC1W6003MV3Y AC3). ``preference`` adds the parsed
             # intent to those skip lines (LP-0MVRMC275000R2W6 AC4).
@@ -10935,11 +10939,11 @@ async def _proxy_with_remote_fallback_cycle(
         provider_name = provider_cfg.get("name", "unknown")
         attempted_provider_names.add(provider_name)
         provider_type = provider_cfg.get("type", "remote")
-        # LP-0MVRMC1L3006F0F3: the local-only choke point — one structural
+        # LP-0MVRMC1L3006F0F3: the pin-local choke point — one structural
         # guard ahead of every ``continue``, so a skip can never hand a
-        # local-only client to a non-local provider. The refusal is built from
+        # pin-local client to a non-local provider. The refusal is built from
         # the reason already recorded on the request; inert for every other
-        # preference and for a local candidate.
+        # preference, for a ``too_large`` verdict and for a local candidate.
         _refusal = await _build_local_only_refusal_for_remote(
             request, provider_cfg, model_config, config, _preference,
             routing_estimate=_routing_estimate, body_json=body_json,
@@ -11659,7 +11663,7 @@ async def _proxy_with_fallback_cycle(
         provider_name = provider_cfg.get("name", "unknown")
         attempted_provider_names.add(provider_name)
         provider_type = provider_cfg.get("type", "remote")
-        # LP-0MVRMC1L3006F0F3: the local-only choke point (see
+        # LP-0MVRMC1L3006F0F3: the pin-local choke point (see
         # ``_build_local_only_refusal_for_remote``) — refuse before any
         # non-local dispatch, whatever reason the local route exited.
         _refusal = await _build_local_only_refusal_for_remote(
@@ -11866,9 +11870,9 @@ async def _proxy_with_fallback_cycle(
                         _note_local_fallback_reason(request, fallback_reason)
                         continue
                     elif _cq_action == "refused_local_only":
-                        # AC4 (LP-0MVIKPCSG002B0NL): the client set
-                        # X-Local-Preference: local-only and the admission
-                        # guard refused. Unlike admission_reject, the request
+                        # AC4 (LP-0MVIKPCSG002B0NL) / LP-0MVSHXTLS000VMLE: the
+                        # client pinned local and the admission guard refused a
+                        # deferrable request. Unlike admission_reject, the request
                         # must NOT fall through to a remote provider — return
                         # the retryable 429 with X-Local-Route: refused now.
                         _admission = getattr(
@@ -12930,9 +12934,10 @@ async def _proxy_with_fallback_cycle(
                         _note_local_fallback_reason(request, fallback_reason)
                         continue
                     elif _lease_action == "refused_local_only":
-                        # AC4 (LP-0MVIKPCSG002B0NL): local-only + guard refusal
-                        # on the lease path — return the 429 instead of
-                        # falling through to a remote provider.
+                        # AC4 (LP-0MVIKPCSG002B0NL) / LP-0MVSHXTLS000VMLE:
+                        # pinned-local + guard refusal on the lease path —
+                        # return the 429 instead of falling through to a
+                        # remote provider.
                         _admission = getattr(
                             request, "_local_admission_decision", None
                         )

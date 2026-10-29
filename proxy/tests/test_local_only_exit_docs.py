@@ -1,10 +1,12 @@
-"""Docs contract: the local-only every-exit table must match the exits.
+"""Docs contract: the pin-local every-exit table must match the exits.
 
-LP-0MVRMC2HT004NPO6 (child of LP-0MVNU2KTK009D4AG, parent AC7).
+LP-0MVRMC2HT004NPO6 (child of LP-0MVNU2KTK009D4AG, parent AC7); section
+renamed by LP-0MVSHXU8E004BL57 (the pin-local value is ``local-preferred``).
 
 The deliverable here *is* the prose in ``proxy/docs/routing.md``: the
-"Local-only is enforced on every exit from the local route" section must state
-the enforcement and enumerate the exit→token vocabulary a client sees. The
+"``local-preferred``: pinned while deferrable, promoted when too large"
+section must state the enforcement and enumerate the exit→token vocabulary a
+client sees. The
 assertions pin the contract, not the words — the documented token set must be
 exactly the set the refusal paths emit, so a new local-route exit (or a
 renamed token) that does not land in the docs fails here, and a documented
@@ -32,7 +34,12 @@ from pathlib import Path
 ROUTING_DOC = Path(__file__).resolve().parents[1] / "docs" / "routing.md"
 
 #: Heading of the documented section; the section ends at the next heading.
-SECTION_HEADING = "### Local-only is enforced on every exit from the local route"
+#: Renamed by LP-0MVSHXU8E004BL57: the value carrying the per-exit pin is
+#: ``local-preferred`` (``local-only`` is its deprecated alias), and the section
+#: now also documents the ``too_large`` promotion that declines the pin.
+SECTION_HEADING = (
+    "### `local-preferred`: pinned while deferrable, promoted when too large"
+)
 NEXT_HEADING = "### Response headers"
 
 #: The stable ``X-Local-Fallback-Reason`` tokens a local-only client can be

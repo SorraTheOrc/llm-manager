@@ -422,9 +422,11 @@ def apply_local_preference(
     * **``remote-ok`` (by preference).** The client asked for no local route,
       so every ``type: local`` entry is removed (LP-0MVIKPCSG002B0NL AC5).
       ``local-preferred`` (and its normalised legacy alias ``local-only``) and
-      ``prefer-local`` keep the chain intact — their difference is enforced at
-      the admission decision (a pin-local refusal returns 429 instead of
-      falling through).
+      ``prefer-local`` keep the chain intact *here*: their difference is
+      enforced at the admission decision — a pinned, ``deferrable``
+      ``local-preferred`` request is answered with the retryable 429 instead of
+      falling through to a remote provider (LP-0MVSHXTLS000VMLE), and a
+      ``too_large`` one is stripped by the capacity rule below.
     * **``too_large`` (by capacity).** A verdict of
       :data:`proxy.admission_reserve.CAPACITY_TOO_LARGE` means the prompt
       outgrows the local serving envelope, so waiting cannot help: the local

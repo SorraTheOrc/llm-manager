@@ -390,9 +390,13 @@ models:
     aliases:
     - embeddings
     - embed
-  # Private model: local-only, no remote fallback at all.
-  # Uses the Qwen3 llama_model. When the local slot is busy the request
-  # is queued / deferred — it never falls through to a paid provider.
+  # Private model: the local route only — no remote tier, so nothing here can
+  # be promoted. Uses the Qwen3 llama_model. A request still DEFERS when the
+  # local slot is busy: it queues, and a ``local-preferred`` request that
+  # cannot fit the wait budget gets the retryable 429 with real retry timing
+  # (unchanged behaviour, never a paid fallback). ``local-preferred`` promotion
+  # of a too-large prompt needs remote tiers in the chain, so this model cannot
+  # promote: its prompts are bounded by the local capacity limits instead.
   private:
     providers:
       - name: local-qwen3
@@ -1914,13 +1918,27 @@ server:
   # ``DELETE /llama/local/reserve/<id>`` and pruned on expiry.
   #
   # ``X-Local-Preference: prefer-local|local-preferred|remote-ok`` expresses
-  # intent per request: ``local-preferred`` (the canonical pin-local value;
-  # the legacy spelling ``local-only`` is still accepted and normalised to it,
-  # logging one deprecation line per request) returns the 429 admission
-  # response instead of falling back remote (even when remotes exist);
-  # ``remote-ok`` removes the local provider from the chain; unknown values and
-  # an absent header behave exactly as ``prefer-local`` (today). ``high``
-  # priority keeps its never-queue semantics under every preference.
+  # intent per request:
+  #   prefer-local (default) — today's behaviour: serve local when it fits the
+  #     wait budget, otherwise fall through to the next provider.
+  #   local-preferred — the CANONICAL pin-local value. The request's capacity
+  #     verdict splits it two ways. A DEFERRABLE request (the block is
+  #     temporal, so waiting can help) is never moved to a paid provider: it
+  #     waits for local capacity and, when the wait budget expires or no queue
+  #     slot can be taken, is answered with the retryable 429
+  #     (``Retry-After`` / ``retry_at``) telling the client when to retry. A
+  #     TOO-LARGE request (new tokens over ``local_cold_prefill_budget_tokens``,
+  #     or the prompt over the local context limit derived from
+  #     ``local_model_ctx_size``) is never deferred and never refused for local
+  #     capacity: the local entry leaves the chain and a remote tier serves it.
+  #   remote-ok — removes the local provider from the chain.
+  # The legacy spelling ``local-only`` is a DEPRECATED alias: it is still
+  # accepted and normalised to ``local-preferred`` at parse time (one
+  # deprecation line per request), so an un-migrated client keeps pin-local
+  # semantics — sending it is optional, and either spelling means the same
+  # request intent. Unknown values and an absent header behave exactly as
+  # ``prefer-local`` (today). ``high`` priority keeps its never-queue semantics
+  # under every preference.
   #
   # Interaction with the queue: ``contention_queue_max_wait_seconds`` is the
   # wait budget both this guard and ``/reserve`` compare against, and

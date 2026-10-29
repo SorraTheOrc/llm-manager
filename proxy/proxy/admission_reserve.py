@@ -94,9 +94,9 @@ HEADER_FALLBACK_REASON = "X-Local-Fallback-Reason"
 #
 # The 2026-10-25 incident was exactly that drift: chain-resolution skips
 # (cooldown / quota / usage-limit reset / ``available_times`` window) and the
-# lease-active ``continue`` left no reason on the request, so a ``local-only``
-# refusal reported the generic ``local_route_unavailable`` instead of why
-# local was unavailable.
+# lease-active ``continue`` left no reason on the request, so a pin-local
+# refusal (the header was then spelled ``local-only``) reported the generic
+# ``local_route_unavailable`` instead of why local was unavailable.
 # ---------------------------------------------------------------------------
 
 #: Tokens a local-route exit may stamp on a request. Chain-resolution skips
@@ -720,7 +720,7 @@ def stamp_route_headers(
 
     Applied at the top-level entry point so every path (local success, remote
     success, refusal, exhaustion) is covered. A response that already carries
-    ``X-Local-Route`` (e.g. a local-only refusal) is left untouched.
+    ``X-Local-Route`` (e.g. a pin-local refusal) is left untouched.
     """
     try:
         headers = getattr(response, "headers", None)
