@@ -62,6 +62,12 @@ Simulation model
 - The whole 5-minute window is 3 thrash cycles (90s each) plus a 30s tail of
   periodic ``_cleanup_stale_local_dispatch`` sweeps: the module runs in
   well under a second.
+
+Extending the same harness: the post-deadline **in-request** local
+re-dispatch and the un-engaged thrash gate (2026-10-26 10:41-10:47,
+LP-0MVSAM2AV0077UAE) reuse the injected clock, the stale-``/slots`` stub and
+the lease helpers — see the closing section, which pins which gap that
+incident exposed.
 """
 
 from __future__ import annotations
@@ -76,6 +82,7 @@ from proxy.router_helpers import (
     _cleanup_stale_local_dispatch,
     _try_acquire_local_dispatch,
 )
+from proxy.session import _resolve_session_id_header
 
 from proxy import contention_queue, server
 from proxy import router_helpers as helpers
@@ -486,3 +493,555 @@ async def test_simulation_determinism_two_runs_identical(wedge_srv, clock):
     assert [s["marker_present"] for s in snapshots_1] == [
         s["marker_present"] for s in snapshots_2
     ]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Post-deadline in-request local re-dispatch (LP-0MVSAM2AV0077UAE)
+#
+# Child C1 of LP-0MVPUBQLQ008GJOV. The 2026-10-26 10:39-10:47 incident
+# (``/var/log/llama-proxy/proxy.log.2026-10-26_131429``) is a *different*
+# shape from the 2026-10-23 wedge above: the lease really is released, yet a
+# fresh one is acquired ~150 ms later **inside the same request**, and the
+# 600 s thrash cooldown never produces a single skip line for that session:
+#
+#   10:39:36,396  prefill_deadline_exceeded session=01a177c6… deadline=120s
+#   10:39:36,396  prefill_thrash_cooldown_started session=01a177c6… cooldown_s=600
+#   10:39:36,396  lease_released session=01a177c6… reason=prefill_deadline
+#   10:39:36,546  [local] POST http://192.168.0.199:8000/… session=01a177c6…  (+150 ms)
+#   10:41:36,629  lease_released session=01a177c6… reason=prefill_deadline  (same prompt)
+#   10:41:36,776  [local] POST … session=01a177c6…                          (+147 ms)
+#   10:44:25,480  [local] POST … session=01a177c6…                          (fresh hold)
+#   10:47:33,163  lease_released session=01a177c6… reason=no_progress_watchdog
+#                 (~308 s hold; other sessions denied 10:44:43-10:47:08)
+#
+# and **zero** ``routing_skip_local reason=prefill_thrash_cooldown`` lines for
+# ``01a177c6…`` across four successive local dispatches, while ``herdr-…``
+# sessions were consistently skipped.
+#
+# What each test pins, and the cause determination it yields:
+#
+# | gap                                                        | test |
+# |------------------------------------------------------------|------|
+# | the in-request re-dispatch bypasses the gate (hypothesis ii)| AC1 (red) |
+# | arm key == check key on the incident request shape          | AC2a (green — refutes hypothesis i for the incident session) |
+# | a header-less request arms under an id no gate can resolve  | AC2b (red — hypothesis i is real for anonymous sessions) |
+# | the delta-body arm fingerprint never matches the gate's     | AC2c (red — post-2026-10-29 gap of the same family) |
+# | a released marker cannot re-extend a dead dispatch          | AC3 (red) |
+# | a legitimate same-session re-acquisition stays ≤ 300 s      | AC4/AC7 (green regression pin) |
+#
+# Red-first encoding follows ``test_prefill_thrash_cooldown.py``: every
+# assertion C2 must turn green is marked ``pytest.mark.xfail(strict=True)``
+# so this test-only slice lands with a green suite, and C2 removes each
+# marker as it fixes the gap (``strict`` makes an unexpectedly passing test
+# fail, so a marker cannot be forgotten — and a marker left on a green
+# assertion is a visible defect).
+# ═════════════════════════════════════════════════════════════════════════════
+
+#: The incident session id (explicit: the request carried
+#: ``x-client-request-id`` + ``x-session-affinity``, log 10:35:21 and 10:37:30).
+INCIDENT_SESSION = "01a177c6-a2ce-727d-90d0-8cb3d01bab96"
+
+#: The incident request's session headers, verbatim from the log.
+INCIDENT_HEADERS = {
+    "x-client-request-id": INCIDENT_SESSION,
+    "x-session-affinity": INCIDENT_SESSION,
+}
+
+#: Observed gap between ``lease_released … reason=prefill_deadline`` and the
+#: next ``[local] POST`` for the same session: 147-150 ms. It matches the
+#: configured retry delay (``local_slot_exhaustion_retry_delay_seconds: 0.1``
+#: in ``proxy/config.yaml``) that the in-request local retry loops sleep for.
+REDISPATCH_DELAY_SECONDS = 0.15
+
+#: Parent AC3 / this item's AC4: no hold may exceed 300 s simulated.
+REDISPATCH_BOUND_SECONDS = 300.0
+
+#: A prompt big enough that the router's ``local_prefill_deadline_seconds``
+#: (120 s) detour is the documented outcome, used as the cancelled payload.
+_DOOMED_PROMPT = "x" * 40_000
+
+
+def _arm_deadline_cooldown(wedge_srv, session, clock) -> float:
+    """Arm the post-deadline window exactly as ``router.py`` does.
+
+    ``router.py`` arms it from the *post-delta* ``body_json`` it is about to
+    prefill (``_handle_session`` binds ``body_json`` to the delta before the
+    dispatch), with the prompt size it estimated.
+    """
+    return helpers._record_prefill_thrash_cooldown(
+        session,
+        wedge_srv.config,
+        now=clock.now,
+        tokens=23_272,  # the incident's estimated_tokens
+        fingerprint=helpers._prefill_thrash_fingerprint(
+            {"messages": [{"role": "user", "content": _DOOMED_PROMPT}]}
+        ),
+    )
+
+
+async def _in_request_redispatch(
+    wedge_srv,
+    clock,
+    *,
+    lease_session,
+    gate_session,
+    gate_consulted: bool,
+) -> bool:
+    """Mirror the in-request local re-dispatch that follows a deadline detour.
+
+    *gate_consulted* selects which provider.py shape is simulated:
+
+    - ``False`` — the ``local_slot_exhaustion_retry`` / ``local_http_retry``
+      loops (provider.py, ``_proxy_with_fallback_cycle``), which call
+      ``_dispatch_local`` → ``proxy_to_local`` directly. That is the bypass
+      shape the 2026-10-26 log exposes: no ``routing_skip_local``, no
+      provider-cooldown line, just a ``[local] POST`` 147-150 ms after the
+      release.
+    - ``True`` — the provider chain's local-branch entry, which consults
+      ``_prefill_thrash_cooldown_remaining`` (and logs the skip) *before*
+      dispatching. Used as the control that proves the gate itself works.
+
+    *gate_session* is the session id the gate site resolves (provider.py:
+    ``_resolve_session_id_header(request.headers)``); *lease_session* is the
+    id the dispatch path keys the lease on (router.py: ``session.session_id``).
+    They are passed separately because reproducing the arm-key/check-key
+    mismatch needs them to differ.
+
+    Returns True when the dispatch acquired a (fresh) active lease.
+    """
+    # The measured 147-150 ms gap: the retry delay the retry loops sleep for.
+    clock.advance(REDISPATCH_DELAY_SECONDS)
+    if gate_consulted:
+        remaining = helpers._prefill_thrash_cooldown_remaining(
+            gate_session, wedge_srv.config, now=clock.now
+        )
+        if remaining > 0:
+            wedge_srv.logger.info(
+                "routing_skip_local provider=local-qwen3 session=%s "
+                "cooldown_remaining=%.0fs reason=prefill_thrash_cooldown "
+                "→ skipping local, routing to next remote provider",
+                gate_session or "unknown",
+                remaining,
+            )
+            return False
+    acquired, _owner, _active, _retry_after = await _try_acquire_local_dispatch(
+        wedge_srv, max_local=1, session_key=lease_session, backend=None
+    )
+    return acquired
+
+
+def _redispatch_report(wedge_srv, session, clock, *, reacquired: bool) -> str:
+    """Diagnosis used by the post-deadline contract asserts."""
+    record = wedge_srv.local_dispatch_records.get(session)
+    return (
+        "LP-0MVPUBQLQ008GJOV 2026-10-26 pre-fix behaviour reproduced: after "
+        "``lease_released reason=prefill_deadline`` the same session's "
+        f"in-request re-dispatch re-acquired a lease={reacquired} "
+        f"(record_active={bool(record.get('active')) if record else None}), "
+        f"local_prefill_in_flight={session in wedge_srv.local_prefill_in_flight}, "
+        f"now={clock.now:.2f}s. The incident: 4 local POSTs 147-150 ms after "
+        "each release, 3 wedge denials for other sessions, ~308 s unproductive "
+        "hold released only by the no-progress watchdog."
+    )
+
+
+def _skip_lines(wedge_srv) -> list[str]:
+    """Every ``routing_skip_local`` line the harness logged, rendered.
+
+    The harness's logger is a ``MagicMock``, so the recorded call holds the
+    format string plus its arguments — render them the way the logging module
+    would, so the assertion reads the line an operator sees in
+    ``proxy.log``.
+    """
+    lines: list[str] = []
+    for call in wedge_srv.logger.info.call_args_list:
+        args = getattr(call, "args", ())
+        if not args or "routing_skip_local" not in str(args[0]):
+            continue
+        try:
+            lines.append(str(args[0]) % tuple(args[1:]))
+        except Exception:
+            lines.append(str(call))
+    return lines
+
+
+def _in_flight_extension_logged(wedge_srv) -> bool:
+    """Whether ``lease_extended_during_prefill … in_flight=True`` was logged."""
+    for call in wedge_srv.logger.info.call_args_list:
+        args = getattr(call, "args", ())
+        if not args or "lease_extended_during_prefill" not in str(args[0]):
+            continue
+        try:
+            rendered = str(args[0]) % tuple(args[1:])
+        except Exception:
+            rendered = str(call)
+        if "in_flight=True" in rendered:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC6 — the in-request re-dispatch must not re-arm the lease
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "LP-0MVSAM2AV0077UAE AC1/AC6 red phase: the in-request local retry "
+        "loops in provider.py bypass the prefill-thrash gate, so a fresh "
+        "lease is acquired ~150 ms after the deadline release. C2 removes "
+        "this marker."
+    ),
+)
+@pytest.mark.asyncio
+async def test_in_request_redispatch_after_the_deadline_is_not_admitted(
+    wedge_srv, clock
+):
+    """AC1/AC6 + parent AC1: a dispatch cancelled by
+    ``prefill_deadline_exceeded`` is not re-dispatched locally inside the same
+    request.
+
+    The harness runs the exact sequence the log shows: acquire → prefill to
+    the injected-clock deadline → ``_release_prefill_deadline_dispatch`` →
+    same-session local re-dispatch 150 ms later **through the retry shape that
+    skips the gate**. Pre-fix a fresh active record is acquired, so other
+    sessions are denied again (the incident's
+    ``contention_queue_fallback_after_queue reason=local_lease_active``); the
+    fix must leave no record to deny them with.
+    """
+    granted = await _prefill_attempt(wedge_srv, INCIDENT_SESSION)
+    assert granted, "the first dispatch must be admitted"
+    await _detour_cleanup(wedge_srv, INCIDENT_SESSION, session_explicit=True)
+
+    # The release itself is truthful today (C5) — these are the preconditions
+    # the re-dispatch test builds on, not the assertion under test.
+    assert INCIDENT_SESSION not in wedge_srv.local_dispatch_records
+    assert INCIDENT_SESSION not in wedge_srv.local_prefill_in_flight
+    assert helpers._prefill_thrash_cooldown_remaining(
+        INCIDENT_SESSION, wedge_srv.config, now=clock.now
+    ) > 0, "the deadline must arm the session's thrash cooldown"
+
+    reacquired = await _in_request_redispatch(
+        wedge_srv,
+        clock,
+        lease_session=INCIDENT_SESSION,
+        gate_session=INCIDENT_SESSION,
+        gate_consulted=False,  # the retry loops' bypass shape
+    )
+    report = _redispatch_report(
+        wedge_srv, INCIDENT_SESSION, clock, reacquired=reacquired
+    )
+    assert not reacquired, report
+    assert INCIDENT_SESSION not in wedge_srv.local_dispatch_records, report
+
+    # The wedge symptom itself: with no re-armed record, an unrelated session
+    # is admitted instead of denied with ``local_lease_active``.
+    other_admitted, owner, active_count, retry_after = (
+        await _try_acquire_local_dispatch(
+            wedge_srv, max_local=1, session_key=ANON_SESSION_B, backend=None
+        )
+    )
+    assert other_admitted, (
+        f"{report} Next session denied: owner={owner} "
+        f"active={active_count} retry_after={retry_after}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC2 — gate-engagement isolation: arm key vs check key, and the bypass path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_gate_engages_when_the_incident_session_is_checked(
+    wedge_srv, clock
+):
+    """AC2 (hypothesis (i), incident shape): the arming site and the gate site
+    resolve the *same* session id, so the 2026-10-26 non-engagement was not a
+    session-identity mismatch.
+
+    The incident request carried ``x-client-request-id`` and
+    ``x-session-affinity`` (log 10:35:21, 10:37:30) and the router logged
+    ``Session header resolved: source=session_id``. ``_resolve_session_id_header``
+    — the resolver provider.py's gate uses — therefore returns the very id
+    router.py armed the window under, and the gate refuses the attempt and logs
+    ``routing_skip_local reason=prefill_thrash_cooldown``.
+
+    Together with AC1 this isolates the gap: identical state, identical keys —
+    the gate engages when consulted, so the incident's missing skip proves the
+    dispatch path never consulted it (bypass), not that the keys disagreed.
+    """
+    granted = await _prefill_attempt(wedge_srv, INCIDENT_SESSION)
+    assert granted, "the first dispatch must be admitted"
+    await _detour_cleanup(wedge_srv, INCIDENT_SESSION, session_explicit=True)
+
+    check_key, source = _resolve_session_id_header(INCIDENT_HEADERS)
+    assert check_key == INCIDENT_SESSION, (
+        "the arm key (router.py ``session.session_id``) and the check key "
+        f"(provider.py ``_session_id``, resolved from {source}) must agree: "
+        f"{INCIDENT_SESSION!r} != {check_key!r}"
+    )
+    assert helpers._prefill_thrash_cooldown_remaining(
+        check_key, wedge_srv.config, now=clock.now
+    ) > 0
+
+    admitted = await _in_request_redispatch(
+        wedge_srv,
+        clock,
+        lease_session=INCIDENT_SESSION,
+        gate_session=check_key,
+        gate_consulted=True,
+    )
+    assert not admitted, _redispatch_report(
+        wedge_srv, INCIDENT_SESSION, clock, reacquired=admitted
+    )
+    assert INCIDENT_SESSION not in wedge_srv.local_dispatch_records
+
+    skip_lines = _skip_lines(wedge_srv)
+    assert skip_lines, "the engaged skip must be attributable in the log"
+    assert "reason=prefill_thrash_cooldown" in skip_lines[-1]
+    assert f"session={INCIDENT_SESSION}" in skip_lines[-1]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "LP-0MVSAM2AV0077UAE AC2 red phase: a header-less request arms the "
+        "window under the session id the router generated, which no gate site "
+        "can resolve. C2 removes this marker."
+    ),
+)
+@pytest.mark.asyncio
+async def test_a_header_less_session_cannot_engage_the_gate(wedge_srv, clock):
+    """AC2 (hypothesis (i), anonymous shape): the arm key and the check key
+    genuinely disagree when the request carries no session header.
+
+    ``_handle_session`` → ``session_manager.get_or_create(None)`` *generates* a
+    session id, which router.py arms the window under, while provider.py's
+    gate resolves the request's headers itself and finds nothing
+    (``_prefill_thrash_cooldown_remaining(None)`` is always 0). An anonymous
+    session's cooldown can therefore never engage — a second, independent gap
+    of the same family as the bypass.
+
+    Consequence pinned here: the post-deadline re-dispatch of a header-less
+    request must still be refused (any mechanism: the in-request guard AC6
+    allows, or an identity the gate can resolve), i.e. the fix cannot be
+    cooldown-only.
+    """
+    generated_session = "01a177c6-0000-7000-8000-00000000anon"
+    armed = _arm_deadline_cooldown(wedge_srv, generated_session, clock)
+    assert armed > 0, "the router arms the window for a generated session id"
+
+    # provider.py resolves nothing from a header-less request ...
+    check_key, source = _resolve_session_id_header({})
+    assert check_key is None and source is None
+    assert (
+        helpers._prefill_thrash_cooldown_remaining(
+            check_key, wedge_srv.config, now=clock.now
+        )
+        == 0.0
+    ), "the gate has no key to look the armed window up with"
+
+    # ... so an attempt that consults the gate with its own key is admitted.
+    admitted = await _in_request_redispatch(
+        wedge_srv,
+        clock,
+        lease_session=generated_session,
+        gate_session=check_key,
+        gate_consulted=True,
+    )
+    assert not admitted, (
+        "a header-less request re-dispatched locally after its prefill "
+        f"deadline: the window armed under {generated_session!r} is "
+        "unreachable for a gate that resolves no session id, so the "
+        "in-request re-dispatch must be refused independently of it."
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "LP-0MVSAM2AV0077UAE AC2 red phase: router.py arms the window from the "
+        "post-delta body while provider.py checks the original body, so the "
+        "fingerprints never match. C2 removes this marker."
+    ),
+)
+def test_delta_arm_fingerprint_matches_the_gate_check_fingerprint(wedge_srv, clock):
+    """AC2 (arm-key/check-key mismatch, fingerprint component).
+
+    The window is keyed by ``(session, prompt fingerprint)`` since
+    LP-0MVT2KSXY002O75C (2026-10-29, i.e. after this incident). The two sites
+    fingerprint **different bodies**: router.py arms from the ``body_json``
+    ``_handle_session`` has already rewritten to the *delta* messages it is
+    about to prefill, while provider.py fingerprints the *original* request
+    body it parsed before the chain started. For any continuing session the
+    two digests differ, so the gate looks up a key nobody armed and never
+    skips — the same non-engagement, one level down.
+    """
+    history = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first turn"},
+        {"role": "assistant", "content": "ack"},
+    ]
+    turn = [{"role": "user", "content": f"the doomed prompt {_DOOMED_PROMPT}"}]
+    full_messages = history + turn  # what provider.py fingerprints
+    delta_messages = list(turn)  # what router.py fingerprints (and prefills)
+    assert delta_messages != full_messages
+
+    arm_fingerprint = helpers._prefill_thrash_fingerprint(
+        {"messages": delta_messages}
+    )
+    check_fingerprint = helpers._prefill_thrash_fingerprint(
+        {"messages": full_messages}
+    )
+    assert arm_fingerprint and check_fingerprint
+
+    helpers._record_prefill_thrash_cooldown(
+        INCIDENT_SESSION,
+        wedge_srv.config,
+        now=clock.now,
+        tokens=23_272,
+        fingerprint=arm_fingerprint,
+    )
+    remaining = helpers._prefill_thrash_cooldown_remaining(
+        INCIDENT_SESSION,
+        wedge_srv.config,
+        now=clock.now,
+        fingerprint=check_fingerprint,
+    )
+    assert remaining > 0, (
+        "the gate cannot find the window the router armed: "
+        f"arm fingerprint {arm_fingerprint!r} (delta body) != check "
+        f"fingerprint {check_fingerprint!r} (original body), so a continuing "
+        "session's post-deadline cooldown never engages."
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC3 — the cancelled dispatch's marker must not outlive it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "LP-0MVSAM2AV0077UAE AC3 red phase: the in-request re-dispatch re-arms "
+        "the in-flight marker, so the extension path resumes "
+        "``in_flight=True`` for a dispatch whose upstream is dead. C2 removes "
+        "this marker."
+    ),
+)
+@pytest.mark.asyncio
+async def test_a_released_marker_cannot_re_extend_the_cancelled_dispatch(
+    wedge_srv, clock
+):
+    """AC3 + parent AC2: after the cancellation the
+    ``local_prefill_in_flight`` marker is cleared and
+    ``_extend_lease_during_prefill`` can no longer re-extend from it
+    (``lease_extended_during_prefill … in_flight=True`` must not appear for the
+    cancelled dispatch).
+
+    The incident's tell was exactly this: extensions with
+    ``progress=None alive=False in_flight=True`` resumed 10 s after each
+    release, which is only possible if something re-armed an active record and
+    its marker.
+    """
+    granted = await _prefill_attempt(wedge_srv, INCIDENT_SESSION)
+    assert granted, "the first dispatch must be admitted"
+    await _detour_cleanup(wedge_srv, INCIDENT_SESSION, session_explicit=True)
+
+    # The release clears the marker: there is nothing left to extend.
+    assert INCIDENT_SESSION not in wedge_srv.local_prefill_in_flight
+    _progress, extended = await helpers._extend_lease_during_prefill(
+        wedge_srv,
+        INCIDENT_SESSION,
+        llama_port=8080,
+        model_name="qwen3",
+        slot_id=0,
+        last_progress=0,
+        prefill_in_flight=True,
+    )
+    assert extended is False, "no record exists, so nothing may be extended"
+
+    # The in-request re-dispatch must not resurrect the marker/record, so the
+    # extension path cannot resume for a dispatch that never produced a byte.
+    reacquired = await _in_request_redispatch(
+        wedge_srv,
+        clock,
+        lease_session=INCIDENT_SESSION,
+        gate_session=INCIDENT_SESSION,
+        gate_consulted=False,
+    )
+    report = _redispatch_report(
+        wedge_srv, INCIDENT_SESSION, clock, reacquired=reacquired
+    )
+    assert INCIDENT_SESSION not in wedge_srv.local_prefill_in_flight, report
+    _progress, extended_after = await helpers._extend_lease_during_prefill(
+        wedge_srv,
+        INCIDENT_SESSION,
+        llama_port=8080,
+        model_name="qwen3",
+        slot_id=0,
+        last_progress=0,
+        prefill_in_flight=True,
+    )
+    assert extended_after is False, report
+    assert not _in_flight_extension_logged(wedge_srv), (
+        f"{report} A dead dispatch must never produce "
+        "``lease_extended_during_prefill … in_flight=True``."
+    )
+
+
+# ---------------------------------------------------------------------------
+# AC4/AC7 — the remaining hold stays inside the epic's 5-minute bound
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_same_session_reacquisition_hold_is_bounded_within_300s(
+    wedge_srv, clock
+):
+    """AC4 + parent AC3: a legitimate same-session re-acquisition (no-preemption
+    is load-bearing for genuine long prefills) is bounded at ≤300 s simulated.
+
+    The incident's hold chain was released only by the no-progress watchdog at
+    ≈308 s. This pins the bound without weakening either knob: the watchdog
+    timeout (180 s) and the 10 s sweep cadence are unchanged, and the record is
+    extended every poll by the in-flight signal — which must not refresh the
+    no-progress clock (C5 AC4), so the watchdog still fires.
+    """
+    acquired, owner, active, retry_after = await _try_acquire_local_dispatch(
+        wedge_srv, max_local=1, session_key=WEDGE_SESSION, backend=None
+    )
+    assert acquired, f"admission must grant the hold: owner={owner} active={active}"
+
+    start = clock.now
+    while clock.now - start <= WINDOW_SECONDS:
+        # One prefill poll: the stale-/slots stub advances the injected clock
+        # by the poll interval and reports no progress.
+        await helpers._extend_lease_during_prefill(
+            wedge_srv,
+            WEDGE_SESSION,
+            llama_port=8080,
+            model_name="qwen3",
+            slot_id=0,
+            last_progress=0,
+            prefill_in_flight=True,
+        )
+        await _cleanup_stale_local_dispatch(wedge_srv)
+        if WEDGE_SESSION not in wedge_srv.local_dispatch_records:
+            break
+
+    held = clock.now - start
+    report = (
+        f"LP-0MVPUBQLQ008GJOV AC3: {held:.0f}s simulated hold "
+        f"(record_present={WEDGE_SESSION in wedge_srv.local_dispatch_records}, "
+        f"marker_present={WEDGE_SESSION in wedge_srv.local_prefill_in_flight}); "
+        f"the 300 s bound must hold without weakening the "
+        f"{NO_PROGRESS_TIMEOUT_SECONDS:.0f}s no-progress watchdog or the "
+        f"{PREFILL_POLL_SECONDS:.0f}s sweep cadence."
+    )
+    assert WEDGE_SESSION not in wedge_srv.local_dispatch_records, report
+    assert held <= REDISPATCH_BOUND_SECONDS, report
+    assert WEDGE_SESSION not in wedge_srv.local_prefill_in_flight, report
