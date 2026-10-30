@@ -1,0 +1,75 @@
+{
+  "window": {
+    "since": "2026-10-30 21:47:02",
+    "until": "2026-10-30 22:35:00",
+    "log_dir": "/var/log/llama-proxy"
+  },
+  "coverage": {
+    "max_gap_seconds": 3600.0,
+    "files": [
+      {
+        "file": "proxy.log",
+        "first": "2026-10-30 21:47:02",
+        "last": "2026-10-30 22:33:25",
+        "lines": 29193
+      }
+    ],
+    "gaps": [],
+    "window_start_gap_seconds": 0.0,
+    "window_end_gap_seconds": 95.0,
+    "verdict_met": true
+  },
+  "ac1": {
+    "verdict_basis": "wedge_attribution: a denial caused by a lease owner holding the gate with no client-visible first byte for >= wedge_bound_seconds (restated by LP-0MVLHMCN6003GAMD AC1)",
+    "wedge_bound_seconds": 300,
+    "wedge_denials": 0,
+    "productive_holder_denials": 0,
+    "short_hold_denials": 7,
+    "stale_owner_denials": 5,
+    "unleased_denials": 0,
+    "denials_examined": 12,
+    "max_unproductive_hold_seconds": 153.0,
+    "max_productive_hold_seconds": null,
+    "wedge_examples": [],
+    "diagnostics": {
+      "min_attempts": 10,
+      "thrash_hours": [],
+      "lease_active_fallbacks": 6,
+      "hours_checked": 2,
+      "note": "thrash hours and the lease-active fallback volume are admission-side signals (LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I / LP-0MVOFVCA2008DQVE); they no longer determine this verdict"
+    },
+    "verdict_met": true
+  },
+  "ac2": {
+    "recovery_bound_seconds": 300,
+    "pairs": [
+      {
+        "session": "01a18ecc-75c7-7506-9049-c654b6dc23f7",
+        "deadline": "2026-10-30 21:54:54",
+        "release": "2026-10-30 21:54:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18ed7-8279-709d-8f42-5003a2c0444d",
+        "deadline": "2026-10-30 22:08:34",
+        "release": "2026-10-30 22:08:34",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18edc-23d9-76a0-95ae-a0c27ed725bc",
+        "deadline": "2026-10-30 22:12:13",
+        "release": "2026-10-30 22:12:13",
+        "release_seconds": 0.0
+      }
+    ],
+    "unreleased_sessions": [],
+    "max_release_seconds": 0.0,
+    "verdict_met": true
+  },
+  "ac3": {
+    "resume_window_seconds": 3600,
+    "local_finishes_after_last_release": 24,
+    "verdict_met": true
+  },
+  "all_verdicts_met": true
+}

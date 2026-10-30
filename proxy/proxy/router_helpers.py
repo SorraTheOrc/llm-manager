@@ -1198,9 +1198,13 @@ def _get_prefill_deadline_seconds(srv) -> float:
 # prompts (93,038 x2, 93,006 x3, …) with zero tokens delivered.
 #
 # The cooldown is a per-session, in-process window armed by router.py when
-# the prefill deadline fires. While it is armed, provider.py skips local for
-# that session (``routing_skip_local reason=prefill_thrash_cooldown``) so the
-# request reaches the next provider immediately instead of re-prefilling.
+# the prefill deadline fires. While it is armed, local dispatch is refused for
+# that session before any local resource is acquired — provider.py's chain gate
+# skips local and the acquisition choke points refuse it — so the request
+# reaches the next provider immediately instead of re-prefilling. Both sites
+# log ``routing_skip_local reason=prefill_thrash_cooldown`` (the choke points
+# add ``entry=router_dispatch`` / ``entry=lease_acquire``; the choke-point
+# half of the gate is LP-0MVSAMN14001DMTY AC2).
 # Other sessions are untouched. The window is cleared on expiry (lazy prune)
 # and on a successful local first byte, and ``0`` disables it (documented
 # rollback).
@@ -1715,7 +1719,9 @@ def _mark_local_dispatch_terminal(request, now=None) -> float | None:
     request**: the same request can never acquire a fresh dispatch lease after
     the release, so the 2026-10-26 in-request re-dispatch (a fresh ``[local]
     POST`` 147-150 ms after ``lease_released reason=prefill_deadline``) cannot
-    happen.
+    happen. Mechanism, scope and the evidence line
+    (``routing_skip_local reason=post_deadline_terminal``):
+    LP-0MVSAMN14001DMTY AC2, verified by LP-0MVSAMS5O006OAIS.
 
     Scope is deliberately the request, not the session: the session-wide
     cooldown is what suppresses *later* requests, while a concurrent request
