@@ -1333,6 +1333,158 @@ async def test_occupancy_refusal_advertises_a_truthful_retry_time(
 
 
 # ---------------------------------------------------------------------------
+# A local-only refusal is a capacity/intent outcome, never chain exhaustion
+# (LP-0MVNTJJGX00375VQ AC1/AC2/AC6)
+#
+# The 2026-10-25 incident: a client pinned ``X-Local-Preference: local-only``
+# was refused by the admission guard while ``opencode-go`` still reported 62 %
+# effective headroom, yet the response said ``error: "All providers exhausted"``
+# — factually wrong (no remote provider was ever consulted), and unrecoverable-
+# looking to a client retry loop. Both local-only refusal paths — the
+# queue/lease one and the direct free-slot one — must answer with the *one*
+# refusal shape, and the exhaustion prose stays reserved for a chain that
+# really did exhaust (``_build_exhausted_response``).
+# ---------------------------------------------------------------------------
+
+#: The truthful prose of a pin-local refusal, and the exhaustion prose it must
+#: never borrow: a pinned request never consulted the rest of the chain.
+LOCAL_ONLY_REFUSAL_ERROR = "Local admission refused"
+CHAIN_EXHAUSTION_ERROR = "All providers exhausted"
+
+#: Headers both local-only refusal paths must carry (AC1). ``Retry-After`` and
+#: the token headers depend on the *reason*, so they are pinned per row above;
+#: this tuple is the routing/admission shape that must be identical whichever
+#: path refused.
+_SHARED_REFUSAL_HEADERS = (
+    "X-Local-Route",
+    "X-Local-Fallback-Reason",
+    "X-Local-Admission",
+    "X-Local-Admission-Eta",
+    "X-Local-Admission-Budget",
+    "Cache-Control",
+)
+
+
+def _assert_not_chain_exhaustion(result) -> dict:
+    """AC1/AC2/AC6: the refusal must not claim the chain is exhausted."""
+    assert result.status_code == 429, f"got {result.status_code}"
+    assert result.headers.get("X-Local-Route") == "refused"
+    body = json.loads(result.body)
+    assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+    assert body["error"] == LOCAL_ONLY_REFUSAL_ERROR, (
+        "a pin-local refusal is a capacity/intent outcome: remote providers "
+        f"are available, so the body must not read as exhaustion; got {body!r}"
+    )
+    assert CHAIN_EXHAUSTION_ERROR not in result.body.decode(), (
+        "the exhaustion prose is reserved for a genuinely exhausted chain; a "
+        "pinned request never consults one"
+    )
+    # AC2: the detail states the pin intent and the guard's refusal, so a human
+    # reading ``detail`` alone learns why no remote provider was used.
+    assert "local-only" in body["detail"], (
+        f"detail must name the pin intent; got {body['detail']!r}"
+    )
+    assert "refused" in body["detail"], (
+        f"detail must say the local guard refused the request; got {body['detail']!r}"
+    )
+    return body
+
+
+@pytest.mark.asyncio
+async def test_direct_local_only_refusal_is_not_chain_exhaustion(
+    mixed_model_config,
+):
+    """AC1/AC2/AC6: the free-slot (direct) refusal never reports exhaustion.
+
+    A remote provider is in the chain and available throughout; the guard
+    refused local admission on a free slot, so the honest answer is the
+    pin-local refusal — never the chain-exhaustion prose the incident showed.
+    """
+    result, dispatched = await _issue_occupancy_refusal(
+        _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_DIRECT_CASE),
+        mixed_model_config,
+    )
+
+    assert dispatched == [], (
+        "a pinned-local request must never be dispatched locally or moved "
+        f"remote (dispatched={dispatched})"
+    )
+    body = _assert_not_chain_exhaustion(result)
+    for header in _SHARED_REFUSAL_HEADERS:
+        assert result.headers.get(header) is not None, (
+            f"the direct refusal must carry {header}; got {dict(result.headers)!r}"
+        )
+    assert body["verdict"] == admission_reserve.CAPACITY_DEFERRABLE
+
+
+@pytest.mark.asyncio
+async def test_both_local_only_refusal_paths_answer_with_one_shape(
+    mixed_model_config,
+):
+    """AC1: the queue/lease and direct free-slot refusals are one contract.
+
+    Same status, same body keys, same ``error``/``code`` prose and the same
+    header set — only the reason token and its numbers differ, because they
+    describe *which* exit refused the request.
+    """
+    queue_result, queue_calls = await _issue_occupancy_refusal(
+        _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_CASE), mixed_model_config
+    )
+    direct_result, direct_calls = await _issue_occupancy_refusal(
+        _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_DIRECT_CASE),
+        mixed_model_config,
+    )
+
+    assert queue_calls == direct_calls == []
+    queue_body = _assert_not_chain_exhaustion(queue_result)
+    direct_body = _assert_not_chain_exhaustion(direct_result)
+
+    assert set(queue_body) == set(direct_body), (
+        "both local-only refusal paths must return the same body shape; "
+        f"queue-only={sorted(set(queue_body) - set(direct_body))} "
+        f"direct-only={sorted(set(direct_body) - set(queue_body))}"
+    )
+    assert {k: queue_body[k] for k in ("error", "code", "detail")} == {
+        k: direct_body[k] for k in ("error", "code", "detail")
+    }, "the truthful prose and the stable code must not depend on the path"
+    assert set(queue_result.headers) == set(direct_result.headers), (
+        "both paths must carry the same refusal headers; "
+        f"queue-only={sorted(set(queue_result.headers) - set(direct_result.headers))} "
+        f"direct-only={sorted(set(direct_result.headers) - set(queue_result.headers))}"
+    )
+    for header in ("X-Local-Route", "X-Local-Admission"):
+        assert direct_result.headers[header] == queue_result.headers[header]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_chain_keeps_the_exhaustion_prose(mixed_model_config):
+    """AC3/AC6 regression: a genuinely exhausted chain is unchanged.
+
+    The local-only path carries the truthful refusal prose; a request the guard
+    refused that then finds **no** remaining provider still answers with the
+    retained ``All providers exhausted`` prose and the shipped
+    ``local_admission_reject`` code (LP-0MVGDUV5E005UWBQ AC3), so older clients
+    keep parsing exactly what they parse today.
+    """
+    result, dispatched = await _issue_occupancy_refusal(
+        _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_CASE, chain="local_only"),
+        mixed_model_config,
+    )
+
+    assert dispatched == []
+    assert result.status_code == 429
+    body = json.loads(result.body)
+    assert body["error"] == CHAIN_EXHAUSTION_ERROR, (
+        "a genuinely exhausted chain keeps its byte-compatible prose; got "
+        f"{body['error']!r}"
+    )
+    assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+    assert LOCAL_ONLY_REFUSAL_ERROR not in result.body.decode(), (
+        "the pin-local prose must not leak onto the exhaustion surface"
+    )
+
+
+# ---------------------------------------------------------------------------
 # AC6/AC7 (LP-0MVNTT4X8009IO2X): the refusal contract as ONE table
 #
 # The sections above pin each family in depth. This section pins the

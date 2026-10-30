@@ -651,6 +651,20 @@ async def test_pin_local_refuses_429_when_guard_would_fall_back_remote(
     body = json.loads(result.body)
     assert body["code"] == "local_admission_reject"
     assert body["retry_after"] >= 1
+    # LP-0MVNTJJGX00375VQ AC1/AC2/AC6: a pin-local refusal is a capacity/intent
+    # outcome, not chain exhaustion — the remote provider above is available
+    # and was never consulted (``calls == []``), so "All providers exhausted"
+    # would be factually wrong.
+    assert body["error"] == "Local admission refused", (
+        f"the queue-path refusal must not claim exhaustion; got {body['error']!r}"
+    )
+    assert b"All providers exhausted" not in result.body
+    assert "local-only" in body["detail"], (
+        f"detail must name the pin intent; got {body['detail']!r}"
+    )
+    assert "refused" in body["detail"], (
+        f"detail must name the guard's refusal; got {body['detail']!r}"
+    )
 
 
 async def _issue_pin_local_refusal(preference: str) -> tuple:

@@ -7281,6 +7281,15 @@ def _build_local_only_refusal_response(
     carry neither (LP-0MVNTT4X8009IO2X AC1/AC2). Adds
     ``X-Local-Route: refused``.
 
+    This is the **only** builder a pin-local request can be refused with
+    (LP-0MVNTJJGX00375VQ AC1/AC2): both the contention-queue/lease
+    ``refused_local_only`` branches and the direct free-slot admission guard
+    return it, so a pinned client sees one body/header shape and one truthful
+    prose whichever path refused it. ``All providers exhausted`` stays reserved
+    for :func:`_build_exhausted_response`, i.e. a chain that really did exhaust
+    — a pinned request never consults the rest of the chain, so claiming
+    exhaustion for its refusal was the 2026-10-25 defect.
+
     LP-0MVSMINPR006SWT6: this builder is the **only** place in ``provider.py``
     that classifies a refusal, and it delegates that classification to
     :func:`admission_reserve.local_capacity_verdict` — the shared helper is the
@@ -7332,8 +7341,9 @@ def _build_local_only_refusal_response(
         "error": "Local admission refused",
         "code": EXHAUSTION_CODE_LOCAL_ADMISSION,
         "detail": (
-            "local admission refused: the projected wait exceeds the wait "
-            "budget and X-Local-Preference: local-only forbids remote fallback"
+            "local admission refused: the request is pinned to the local route "
+            "(X-Local-Preference: local-only / local-preferred) and the local "
+            "capacity guard refused it; no remote provider was used"
         ),
         "reason": reason,
         # Additive only (parent AC2/AC3): every pre-existing field and header
@@ -13200,15 +13210,30 @@ async def _proxy_with_fallback_cycle(
                         prev_provider = provider_name
                         all_slot_exhaustion = False
                         _note_local_fallback_reason(request, fallback_reason)
-                        # The refusal the client receives names
-                        # ``_direct_reason``; log that same reason with the
-                        # intent that caused it (LP-0MVRMC275000R2W6 AC4).
-                        _log_local_only_refusal(_direct_reason)
-                        return _build_exhausted_response(
-                            all_local_slot_exhaustion=False,
-                            unavailable_providers={},
-                            diagnostics=attempts,
-                            config=config,
+                        # A local-only refusal is a *capacity/intent* outcome,
+                        # not chain exhaustion (LP-0MVNTJJGX00375VQ AC1/AC2):
+                        # the request never consulted the rest of the chain, so
+                        # ``All providers exhausted`` is false whenever a
+                        # remote provider is available — and it made clients
+                        # treat a recoverable refusal as terminal.
+                        #
+                        # Both pin-local refusal paths therefore share the one
+                        # refusal builder (the queue/lease ``refused_local_only``
+                        # branches above). It also emits the single
+                        # ``local_only_refused`` line, naming ``_direct_reason``
+                        # with the parsed intent and the capacity verdict — so
+                        # this branch no longer logs its own line. The
+                        # exhaustion builder keeps its admission-refusal variant
+                        # for the genuinely exhausted chain a ``prefer-local``
+                        # request reaches after the guard refused it.
+                        return _build_local_only_refusal_response(
+                            {
+                                "status": "local_admission_reject",
+                                "reason": _direct_reason,
+                                **_local_admission_evidence(_direct_admission),
+                            },
+                            config,
+                            preference=_preference,
                         )
                     fallback_reason = "local_admission_guard"
                     prev_provider = provider_name

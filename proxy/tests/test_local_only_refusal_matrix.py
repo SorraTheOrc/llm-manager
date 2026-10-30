@@ -60,6 +60,12 @@ tiers (``calls == ["remote"]``, 200, no local-capacity 429) — the boundary tha
 removed the incident's "All providers exhausted" dead end. Both wire spellings
 (the ``local-only`` alias and ``local-preferred``) are asserted per row, and the
 two post-dispatch rows prove the pin also holds *after* a local dispatch failed.
+
+Every row now also asserts the refusal body's verdict, including the free-slot
+direct path (``admission_guard_free_slot``): LP-0MVNTJJGX00375VQ routed that
+branch through the one pin-local refusal builder, so the admission-reject /
+exhaustion payload no longer answers a pinned request and the row's former
+``_VERDICT_NOT_APPLICABLE`` skip is gone (LP-0MVSS435600370D6's deliverable).
 """
 
 from __future__ import annotations
@@ -1009,15 +1015,6 @@ async def test_pin_verdict_comes_only_from_the_shared_capacity_helper():
 # AC1 (LP-0MVSMRT5R009EKP9): the refusal body reports the row's verdict
 # ---------------------------------------------------------------------------
 
-#: Exits whose 429 is the admission-reject/exhausted payload
-#: (``_build_local_admission_reject_response``) rather than the pin-local
-#: refusal builder. That payload is owned by LP-0MVNTJJGX00375VQ and is
-#: explicitly outside the wiring slice (LP-0MVSMINPR006SWT6 boundaries), so it
-#: carries no verdict yet. The row still states its verdict so the follow-up
-#: (LP-0MVSS435600370D6) that wires that payload can promote it here by
-#: deleting this entry.
-_VERDICT_NOT_APPLICABLE = frozenset({"admission_guard_free_slot"})
-
 #: Rows that no longer produce a refusal body at all: the pin slice
 #: (LP-0MVSLZY470051ZB2 AC4) declines the pin for a ``too_large`` verdict, so
 #: those requests are served remotely instead of being refused.
@@ -1027,15 +1024,12 @@ _VERDICT_PARAMS = [
         id=row.trigger,
         marks=pytest.mark.skip(
             reason=(
-                "no refusal body on this row: the free-slot direct path uses "
-                "the admission-reject/exhausted payload (verdict wiring owned "
-                "by LP-0MVSS435600370D6), and a too-large exit is promoted to "
+                "no refusal body on this row: a too-large exit is promoted to "
                 "the remote tiers instead of refused (LP-0MVSLZY470051ZB2 AC4)"
             )
         ),
     )
-    if row.trigger in _VERDICT_NOT_APPLICABLE
-    or row.expected_verdict == admission_reserve.CAPACITY_TOO_LARGE
+    if row.expected_verdict == admission_reserve.CAPACITY_TOO_LARGE
     else pytest.param(row, id=row.trigger)
     for row in _EXIT_ROWS
 ]

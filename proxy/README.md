@@ -908,6 +908,18 @@ When all providers are exhausted:
 
 The response contract is **additive-only**: the legacy `error` prose is retained for older clients, the stable `code` discriminator is what new clients should key on, and `retry_after` / the `Retry-After` header, `unavailable_providers` and `diagnostics` remain present where available.
 
+**Not exhaustion: a pin-local admission refusal (LP-0MVNTJJGX00375VQ).** A
+request pinned to the local route (`X-Local-Preference: local-only` /
+`local-preferred`) that the local capacity guard refuses is a
+**capacity/intent** outcome, not an exhausted chain: no remote provider is
+consulted, so both pin-local refusal paths answer HTTP 429 with
+`error: "Local admission refused"` and `code: "local_admission_reject"` —
+never `"All providers exhausted"`. The exhaustion prose and the
+`all_exhausted` / `outside_time_window` / `all_slots_exhausted` codes stay
+reserved for a chain that really did exhaust (where a `prefer-local` request
+that the guard refused *and* whose remaining chain is exhausted still receives
+`code: "local_admission_reject"` with the retained exhaustion prose).
+
 ##### Client-facing retry-timer cap (LP-0MV0MM5R60025XZE)
 
 The `retry_after` field and the matching `Retry-After` header are **the same

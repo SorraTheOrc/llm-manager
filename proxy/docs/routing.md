@@ -1660,8 +1660,13 @@ and header a client must honour:
   `admission_reserve.local_capacity_verdict` in the pin-local refusal builder,
   which is the only verdict computation in `provider.py`
   (LP-0MVSMINPR006SWT6). A deferral therefore always reads
-  `verdict: deferrable` — that is what kept the request pinned. The direct
-  free-slot admission-reject 429 does not carry it yet (LP-0MVSS435600370D6).
+  `verdict: deferrable` — that is what kept the request pinned. Every
+  **pin-local** refusal carries it: the queue/lease deferral and the direct
+  free-slot admission refusal share the one builder, so both report the verdict
+  and the same body/header shape (LP-0MVNTJJGX00375VQ AC1/AC2). The
+  *chain-exhaustion* admission-refusal variant (the `local_admission_reject`
+  response a `prefer-local` request reaches when the rest of the chain is
+  genuinely exhausted) is the one surface that does not (LP-0MVSS435600370D6).
 - Token evidence — `X-Local-Admission-New-Tokens` / body `new_tokens` and
   `X-Local-Admission-Budget-Tokens` / body `budget_tokens` on **every**
   refusal, so a client can size the compaction: how far over the flat
@@ -1672,7 +1677,34 @@ and header a client must honour:
   `eta_prefill_seconds`, `budget_seconds` and, when the guard measured the
   occupancy ahead of the request, `projected_wait_seconds`.
 - `code` — the stable discriminator `local_admission_reject`, so a client can
-  classify the refusal without relying on the prose in `detail`.
+  classify the refusal without relying on the prose in `detail`. It is never
+  one of the exhaustion codes (`all_exhausted`, `outside_time_window`,
+  `all_slots_exhausted`): those classify a chain that really did exhaust, while
+  `local_admission_reject` classifies a request the **local** capacity guard
+  refused (LP-0MU56ZM0K005F69G, LP-0MVNTJJGX00375VQ).
+- `error` / `detail` — `error: "Local admission refused"`, with a `detail`
+  naming the pin intent (`X-Local-Preference: local-only` / `local-preferred`)
+  and the guard's refusal. A pin-local refusal is a capacity/intent outcome,
+  not chain exhaustion: the rest of the chain was never consulted, so these
+  responses never say `"All providers exhausted"` — that prose is reserved for
+  a genuinely exhausted chain, where it stays byte-compatible for older
+  clients (LP-0MVNTJJGX00375VQ AC1/AC3).
+
+**Client action on a `local_admission_reject` (LP-0MVNTJJGX00375VQ AC5).** Read
+`retryable` (and `code`), never the prose:
+
+- `retryable: true` — honour `retry_at` (equivalently `Retry-After`) and resend
+  the **same** request pinned to local; a slot, lease or queue is what blocked
+  it and waiting can help.
+- `retryable: false` — compact the prompt to `budget_tokens` (or below the local
+  context ceiling) and resend; no amount of waiting makes this request fit
+  local capacity.
+- To let a remote provider serve such a request instead, send
+  `X-Local-Preference: prefer-local` (or `remote-ok`): both stop pinning, so the
+  remote fallback is reachable again. A client that cannot change its routing
+  must read the refusal as "local cannot serve this request now", never as "all
+  providers are down" — the two are different `code` values and different
+  prose.
 
 | Reason | `Retry-After` | `retryable` | `retry_at` | Client action |
 |---|---|---|---|---|
