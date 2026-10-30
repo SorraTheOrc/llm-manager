@@ -129,8 +129,16 @@ a confident split. Denials predating the `active=` field are counted in
 `unattributed_refusals` and are never silently folded into either shape.
 
 **AC3 — denials and mid-stream timeouts.** `local_dispatch_denied` is compared
-as a **rate per hour** (windows may differ in length); an increase beyond 5 %
-fails the check. Mid-stream timeouts (`ReadTimeout`, `empty_response`,
+on a **load-normalised rate — denials per bypass+fallback event** — and an
+increase beyond 5 % fails the check. The raw **per-hour** rate (windows may
+differ in length) is still reported alongside it, but it is
+**load-confounded**: a busier window produces proportionally more of *every*
+event type, so a raw per-hour increase cannot separate "the override causes
+denials" from "a 2× heavier window has 2× denials" (LP-0MVSAZLNL007B072). The
+denominator (bypass + fallback events) is reported with the per-event figures
+so the sample counts are always stated. A window with denials but no
+bypass/fallback events cannot be normalised and the check fails rather than
+silently passing. Mid-stream timeouts (`ReadTimeout`, `empty_response`,
 `ConnectTimeout` fallback reasons, `slot_save failed ... error=ReadTimeout`,
 `dispatch_first_byte_timeout`) are split three ways:
 
@@ -165,7 +173,7 @@ estimate, never as a measurement.
 | AC1 window | post-deploy window ≥ 24 h (and starts at/after `--deployed-at` when given) |
 | AC1 signal | at least one `routing_idle_admit` event in the post-deploy window |
 | AC2 samples | at least 5 idle-admitted dispatches paired with their dispatch event |
-| AC3 denials | per-hour `local_dispatch_denied` does not rise by more than 5 % |
+| AC3 denials | `local_dispatch_denied` per **bypass+fallback event** does not rise by more than 5 % (the raw per-hour rate is reported alongside it but is load-confounded) |
 | AC3 timeouts | zero timeouts attributable to idle-admitted requests |
 | AC4 interactive | non-idle `high`-priority p50/p90 first byte within 10 % |
 | AC1 (LP-0MVK16GME007EYUW) lease gate | at least 5 attributable `local_lease_active` refusals in the post-deploy window (below it the split percentages are withheld and the run is a WARN) |
@@ -364,10 +372,14 @@ measured shape to convert in this window.
 
 **Load caveat.** The after window was ~2× busier than the before window
 (`large_context_bypass` 1,790 → 3,702; remote fallbacks 6,953 → 12,888;
-denials 66.0 → 72.1 per hour), so 0/31 is a heavy-load measurement. The
-mechanism (admit → ETA refusal or deadline abort) does not depend on load, and
-no gate change is justified either way — the decision is "do not change the
-gate", not "the gate costs nothing under all loads".
+denials 66.0 → 72.1 per hour), so 0/31 is a heavy-load measurement. Under the
+load-normalised AC3 reading of LP-0MVSAZLNL007B072 the denial signal is
+benign: 1,584 / 8,743 = **0.181** denials per bypass+fallback event before vs
+1,731 / 16,590 = **0.104** after (**−42 % per event**) — i.e. the raw +9.3 %
+per-hour rise is load, not the override. The mechanism (admit → ETA refusal
+or deadline abort) does not depend on load, and no gate change is justified
+either way — the decision is "do not change the gate", not "the gate costs
+nothing under all loads".
 
 ### AC5 — follow-ups filed rather than added to this scope
 
@@ -408,6 +420,12 @@ asserts the metric contract above (aggregates, hold-cycle exclusion, session
 pairing and the correlation window, bucket comparison, three-way timeout
 attribution, the AC4 control distribution, the recommendation rules, the
 counterfactual, and the CLI's exit codes / JSON shape / markdown rendering).
+The AC3 denial suite asserts the load-normalised verdict against the exact
+recorded window numbers (0.181 → 0.104, −42 %), that a raw per-hour increase
+driven purely by a heavier window passes while a synthetic per-event increase
+still fails, that the raw per-hour delta stays reported next to the verdict
+metric, and that denials with no bypass/fallback events WARN instead of
+silently passing.
 The lease-gate suite asserts the refusal count (cold-start denials excluded),
 the `active=`-field A/B split, the shape-B corroboration (`lease_released`
 reasons, `status_request` `local_active_query=false`, `prefill_deadline` =

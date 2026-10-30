@@ -48,12 +48,18 @@ requests, compared bucket-by-bucket with non-idle local dispatches. Idle-admitte
 requests are expected to be **slow** — that is the trade — so every comparison
 states its sample counts and the bucket edges.
 
-**AC3 — denials and mid-stream timeouts.** ``local_dispatch_denied`` delta
-between windows, and mid-stream timeouts (``ReadTimeout``, ``empty_response``,
-``ConnectTimeout``, ``dispatch_first_byte_timeout``) correlated to an
-idle-admitted request by session id inside a 60 s window. Timeout lines that
-carry no session id are reported separately as *coincident* (never
-*attributed*) — the limitation is stated in the output.
+**AC3 — denials and mid-stream timeouts.** ``local_dispatch_denied`` is
+compared on a **load-normalised rate — denials per bypass+fallback event** —
+because the raw per-hour rate is confounded by window load: a busier window
+produces proportionally more of every event type, so a raw increase cannot
+separate "the override causes denials" from "a 2× heavier window has 2× of
+everything" (LP-0MVSAZLNL007B072). The raw per-hour delta stays reported;
+only the verdict uses the per-event figure. Mid-stream timeouts
+(``ReadTimeout``, ``empty_response``, ``ConnectTimeout``,
+``dispatch_first_byte_timeout``) are correlated to an idle-admitted request by
+session id inside a 60 s window. Timeout lines that carry no session id are
+reported separately as *coincident* (never *attributed*) — the limitation is
+stated in the output.
 
 **AC4 — interactive traffic.** p50/p90 ``dispatch_first_byte_ms`` for the
 interactive priority tier (``--interactive-priority``, default ``high``) before
@@ -1148,6 +1154,29 @@ def _rate(count: float, hours: float) -> float:
     return count / hours if hours > 0 else 0.0
 
 
+def _economic_events(ac1: dict) -> int:
+    """Load denominator for the AC3 denial rate (LP-0MVSAZLNL007B072).
+
+    Economic routing demand: ``large_context_bypass`` skips plus remote
+    fallbacks. Denials per event is the load-normalised figure the AC3
+    verdict uses; the raw per-hour delta cannot separate "the override causes
+    denials" from "a heavier window has proportionally more of everything".
+    """
+    return int(ac1["large_context_bypass"]) + int(ac1["remote_fallback_events"])
+
+
+def _denials_per_event(denials: int, events: int) -> float | None:
+    """Denials per bypass+fallback event, or ``None`` when unmeasurable.
+
+    Zero denials over zero events is a genuine 0.0 rate (nothing to deny and
+    no load to normalise against); denials with zero events cannot be
+    normalised and fail the check instead of silently passing.
+    """
+    if events > 0:
+        return float(denials) / events
+    return 0.0 if denials == 0 else None
+
+
 #: Sentinel change percentage used when a metric was zero in the baseline
 #: window but non-zero after it (a real, unbounded increase).
 _NEW_ACTIVITY_PCT = 999.0
@@ -1248,20 +1277,65 @@ def evaluate(
             f"{after['ac2']['non_idle_service_ms']['sum_slot_seconds']}."
         )
 
-    # AC3: denials must not increase; zero attributed timeouts.
+    # AC3: denials must not increase, judged on the LOAD-NORMALISED rate
+    # (denials per bypass+fallback event). The raw per-hour rate is
+    # load-confounded: a busier window produces proportionally more of every
+    # event type, so it cannot separate "the override causes denials" from
+    # "a 2x heavier window has 2x denials". It stays reported for
+    # transparency; only the verdict moves to the per-event figure
+    # (LP-0MVSAZLNL007B072). Zero attributed timeouts also required.
     denied_before_rate = _rate(before_ac1["local_dispatch_denied"], hours_before)
     denied_after_rate = _rate(after_ac1["local_dispatch_denied"], hours_after)
     denied_change_pct = _pct_change(denied_before_rate, denied_after_rate)
-    denied_ok = denied_change_pct <= _DENIED_TOLERANCE_PCT
+    denied_before_events = _economic_events(before_ac1)
+    denied_after_events = _economic_events(after_ac1)
+    denied_before_per_event = _denials_per_event(
+        before_ac1["local_dispatch_denied"], denied_before_events
+    )
+    denied_after_per_event = _denials_per_event(
+        after_ac1["local_dispatch_denied"], denied_after_events
+    )
+    if denied_before_per_event is None or denied_after_per_event is None:
+        normalised_change_pct = None
+        denied_ok = False
+    else:
+        normalised_change_pct = _pct_change(
+            denied_before_per_event, denied_after_per_event
+        )
+        denied_ok = normalised_change_pct <= _DENIED_TOLERANCE_PCT
     checks.append(
         {
-            "target": f"AC3: local_dispatch_denied does not increase (<= {_DENIED_TOLERANCE_PCT:.0f}%)",
+            "target": (
+                "AC3: local_dispatch_denied per bypass+fallback event does not "
+                f"increase (<= {_DENIED_TOLERANCE_PCT:.0f}%)"
+            ),
+            # Raw per-hour delta stays reported (load-confounded; not the
+            # verdict), alongside the normalised per-event verdict metric.
             "observed_pct_change": denied_change_pct,
             "before_per_hour": round(denied_before_rate, 1),
             "after_per_hour": round(denied_after_rate, 1),
+            "normalised_pct_change": normalised_change_pct,
+            "before_per_event": (
+                None
+                if denied_before_per_event is None
+                else round(denied_before_per_event, 4)
+            ),
+            "after_per_event": (
+                None
+                if denied_after_per_event is None
+                else round(denied_after_per_event, 4)
+            ),
+            "before_events": denied_before_events,
+            "after_events": denied_after_events,
             "pass": denied_ok,
         }
     )
+    if normalised_change_pct is None:
+        notes.append(
+            "AC3 denial check unmeasurable: a window has `local_dispatch_denied` > 0 "
+            "with zero bypass+fallback events to normalise against; the per-event "
+            "rate is undefined there."
+        )
     attributed = after["ac3"]["timeouts_attributed_to_idle_admit"]
     checks.append(
         {
@@ -1427,9 +1501,16 @@ def evaluate(
                 f"{_FALLBACK_REDUCTION_MIN_PCT}% materiality bar"
             )
         if not denied_ok:
-            recommendation["reasons"].append(
-                f"local_dispatch_denied rose {denied_change_pct}% per hour"
-            )
+            if normalised_change_pct is None:
+                recommendation["reasons"].append(
+                    "local_dispatch_denied per bypass+fallback event is "
+                    "unmeasurable (denials with no bypass/fallback events)"
+                )
+            else:
+                recommendation["reasons"].append(
+                    "local_dispatch_denied per bypass+fallback event rose "
+                    f"{normalised_change_pct}%"
+                )
         if attributed:
             recommendation["reasons"].append(
                 f"{len(attributed)} timeout(s) attributable to idle-admitted requests"
@@ -1612,6 +1693,32 @@ def render(meta: dict, windows: dict, verdict: dict) -> str:
             f"attributed={len(ac3['timeouts_attributed_to_idle_admit'])} "
             f"coincident={len(ac3['timeouts_coincident_with_idle_admit'])}"
         )
+    denial_check = next(
+        (
+            check
+            for check in verdict["checks"]
+            if check["target"].startswith("AC3: local_dispatch_denied")
+        ),
+        None,
+    )
+    if denial_check:
+        def _cell(value: float | None, suffix: str = "") -> str:
+            return "n/a" if value is None else f"{value}{suffix}"
+
+        out.append(
+            f"denials/hour (raw, load-confounded — reported only): "
+            f"before {denial_check['before_per_hour']} / "
+            f"after {denial_check['after_per_hour']} "
+            f"({denial_check['observed_pct_change']}%)"
+        )
+        out.append(
+            f"denials/bypass+fallback event (verdict metric): "
+            f"before {_cell(denial_check['before_per_event'])} / "
+            f"after {_cell(denial_check['after_per_event'])} "
+            f"({_cell(denial_check['normalised_pct_change'], '%')})  "
+            f"events before {denial_check['before_events']} / "
+            f"after {denial_check['after_events']}"
+        )
     out.append("")
 
     out.append(
@@ -1683,6 +1790,43 @@ def render_markdown(meta: dict, windows: dict, verdict: dict) -> str:
     ):
         out.append(
             f"| {title} | {windows['before']['ac1'][key]} | {windows['after']['ac1'][key]} |"
+        )
+    out.append("")
+
+    # AC3 denial rate (load-normalised verdict metric, LP-0MVSAZLNL007B072).
+    def _cell(value: float | None, digits: int = 4) -> str:
+        return "n/a" if value is None else f"{value:.{digits}f}"
+
+    ac3_denial = next(
+        (
+            check
+            for check in verdict["checks"]
+            if check["target"].startswith("AC3: local_dispatch_denied")
+        ),
+        None,
+    )
+    out.append("| AC3 denial metric | Baseline | Post-deploy |")
+    out.append("|---|---:|---:|")
+    out.append(
+        f"| `local_dispatch_denied` (raw count) | "
+        f"{windows['before']['ac1']['local_dispatch_denied']} | "
+        f"{windows['after']['ac1']['local_dispatch_denied']} |"
+    )
+    if ac3_denial:
+        out.append(
+            f"| Denials per hour (raw, load-confounded — reported only) | "
+            f"{ac3_denial['before_per_hour']} | {ac3_denial['after_per_hour']} "
+            f"({ac3_denial['observed_pct_change']}%) |"
+        )
+        out.append(
+            f"| **Denials per bypass+fallback event (verdict metric)** | "
+            f"{_cell(ac3_denial['before_per_event'])} | "
+            f"{_cell(ac3_denial['after_per_event'])} "
+            f"({_cell(ac3_denial['normalised_pct_change'], 1)}%) |"
+        )
+        out.append(
+            f"| bypass+fallback events (denominator) | "
+            f"{ac3_denial['before_events']} | {ac3_denial['after_events']} |"
         )
     out.append("")
     out.append("| Bucket | idle n | idle p50 (ms) | idle slot-s | non-idle n | non-idle p50 (ms) | non-idle slot-s |")

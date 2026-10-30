@@ -3,7 +3,7 @@
     "tool": "scripts/idle_admit_impact.py",
     "work_item": "LP-0MVGHXD59008UOUD",
     "feature_work_item": "LP-0MVGD9Z8Z0055Y5J",
-    "generated_at": "2026-10-27T23:44:09",
+    "generated_at": "2026-10-30T22:15:51",
     "log_dir": "/var/log/llama-proxy",
     "files": [
       "proxy.log",
@@ -64,7 +64,7 @@
     },
     "deployed_at": "2026-10-22 21:48:00",
     "label": null,
-    "notes": null,
+    "notes": "; AC3 denial check re-derived on 2026-10-30 with the load-normalised verdict of LP-0MVSAZLNL007B072 (denials per bypass+fallback event): the raw per-hour delta is load-confounded; the original proxy logs for the before window fell out of retention, so the check is recomputed from this artifact's recorded window aggregates via scripts/idle_admit_impact.py's own functions",
     "interactive_priority": "high",
     "correlation_window_seconds": 60.0,
     "idle_threshold_seconds": 60.0,
@@ -896,11 +896,16 @@
         "pass": false
       },
       {
-        "target": "AC3: local_dispatch_denied does not increase (<= 5%)",
+        "target": "AC3: local_dispatch_denied per bypass+fallback event does not increase (<= 5%)",
         "observed_pct_change": 9.3,
         "before_per_hour": 66.0,
         "after_per_hour": 72.1,
-        "pass": false
+        "normalised_pct_change": -42.4,
+        "before_per_event": 0.1812,
+        "after_per_event": 0.1043,
+        "before_events": 8743,
+        "after_events": 16590,
+        "pass": true
       },
       {
         "target": "AC3: zero timeouts attributable to idle-admitted requests",

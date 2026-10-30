@@ -13,7 +13,9 @@ written against:
   * AC2 — idle-admitted requests are paired to their local dispatch by session
     inside the correlation window, bucketed by prompt size, and compared with
     non-idle dispatches in the same bucket with sample counts;
-  * AC3 — denials are compared per hour and mid-stream timeouts are split into
+  * AC3 — denials are compared on the load-normalised **denials per
+    bypass+fallback event** rate (the raw per-hour delta is reported alongside
+    it but is load-confounded) and mid-stream timeouts are split into
     *attributed* (session-matched), *coincident* (no session id, inside the
     window) and *unrelated* rather than silently blamed on the override;
   * AC4 — the interactive priority tier's first-byte p50/p90 is compared
@@ -478,6 +480,116 @@ def test_ac3_denial_increase_fails_the_check(tmp_path):
     )
     assert check["pass"] is False
     assert check["observed_pct_change"] > 5.0
+    # The load-normalised rate also rises (a genuine surge fails either way),
+    # and every pre-existing key stays in the JSON next to the new
+    # normalised keys (backward-compatible check shape):
+    assert check["normalised_pct_change"] > 5.0
+    assert check["before_per_hour"] is not None
+    assert check["after_per_hour"] is not None
+    assert round(check["before_per_event"], 4) == 0.4  # 2 denials / 5 events
+    assert check["before_events"] == 5                  # 1 bypass + 4 fallbacks
+    assert check["after_events"] == 6                   # 0 bypass + 6 fallbacks
+
+
+def test_ac3_load_normalised_rate_decouples_from_window_load(tmp_path):
+    """A raw per-hour increase driven by a heavier window no longer fails AC3.
+
+    LP-0MVSAZLNL007B072 regression pin: the raw per-hour rate cannot separate
+    "the override causes denials" from "a busier window has proportionally more
+    of everything", so the verdict uses denials per bypass+fallback event.
+    Before (24 h): 2 denials over 5 events (0.40/event); after (24 h): 3
+    denials over 20 events (0.15/event). The raw per-hour rate rises
+    (0.083 -> 0.125/h, i.e. +50%, beyond the 5 % band) while the per-event
+    rate falls -62.5%: the check passes and the raw delta is still reported.
+    """
+    before = _baseline_lines()  # 1 bypass + 4 fallbacks + 2 denials
+    after = [
+        _skip_line(_stamp("2026-10-20 01:00", index * 60), f"load-{index}", cycle=0)
+        for index in range(10)
+    ] + [
+        _fallback(_stamp("2026-10-20 03:00", index * 60))
+        for index in range(10)
+    ] + [
+        _denied(_stamp("2026-10-20 20:00", index * 60))
+        for index in range(3)
+    ]
+    data, _ = _result(_write_log(tmp_path, before + after))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC3: local_dispatch_denied")
+    )
+    assert check["pass"] is True
+    assert check["normalised_pct_change"] == -62.5
+    assert round(check["before_per_event"], 4) == 0.4
+    assert round(check["after_per_event"], 4) == 0.15
+    assert check["before_events"] == 5
+    assert check["after_events"] == 20
+    # The raw per-hour delta stays reported next to the verdict metric.
+    assert check["observed_pct_change"] > 5.0
+
+
+def test_ac3_synthetic_per_event_denial_increase_still_fails(tmp_path):
+    """A genuine per-event denial increase still fails AC3."""
+    before = _baseline_lines()  # 2 denials / 5 events = 0.40 per event
+    after = [
+        _skip_line(_stamp("2026-10-20 01:00", index * 60), f"load-{index}", cycle=0)
+        for index in range(4)
+    ] + [
+        _fallback("2026-10-20 03:00:00,000"),
+    ] + [
+        _denied(_stamp("2026-10-20 20:00", index))
+        for index in range(4)
+    ]
+    data, _ = _result(_write_log(tmp_path, before + after))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC3: local_dispatch_denied")
+    )
+    # 4 denials / 5 events = 0.80 per event vs 0.40 before -> +100% -> fails.
+    assert check["pass"] is False
+    assert check["normalised_pct_change"] == 100.0
+    assert check["before_events"] == 5
+    assert check["after_events"] == 5
+
+
+def test_ac3_exact_window_numbers_normalise_as_recorded():
+    """The recorded 2026-10-22/23 window arithmetic (fail -> pass), exact.
+
+    Before 1,584 denials / 8,743 bypass+fallback events = 0.181; after 1,731 /
+    16,590 = 0.104 -> -42.4% per event (pass), while the raw per-hour rate rose
+    +9.3% (66.0 -> 72.1/h) and failed under the old verdict (LP-0MVSAZLNL007B072).
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("idle_admit_impact", SCRIPT)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    before_rate = tool._denials_per_event(1584, 8743)
+    after_rate = tool._denials_per_event(1731, 16590)
+    assert round(before_rate, 3) == 0.181
+    assert round(after_rate, 3) == 0.104
+    assert tool._pct_change(before_rate, after_rate) == -42.4
+    # What the old raw per-hour verdict compared:
+    assert tool._pct_change(1584 / 24.0, 1731 / 24.0) > 5.0
+
+
+def test_ac3_denial_check_warns_when_denials_have_no_load_events(tmp_path):
+    """Denials with zero bypass+fallback events cannot be normalised: the
+    check fails with an explicit note, never a silent vacuous pass."""
+    lines = [_denied(_stamp("2026-10-20 21:00", index * 60)) for index in range(6)]
+    data, _ = _result(_write_log(tmp_path, lines))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC3: local_dispatch_denied")
+    )
+    assert check["pass"] is False
+    assert check["before_per_event"] == 0.0   # zero denials, zero events
+    assert check["after_per_event"] is None   # denials with no events
+    assert check["normalised_pct_change"] is None
+    assert any("unmeasurable" in note for note in data["verdict"]["notes"])
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +670,19 @@ def test_ac5_recommends_enable_by_default_when_fallbacks_fall_without_harm(tmp_p
     lines = (
         _baseline_with_interactive()
         + list(chain.from_iterable(before_lease))
-        + _after_lines(fallbacks=2, denials=1)
+        # Fallbacks fall 4 -> 3 while the six lease-gate refusals still land in
+        # the after window; the AC3 verdict is the load-normalised per-event
+        # rate, so the after window carries matching economic-bypass load
+        # (8 denials / 5 events = 1.60 before vs 7 / 7 = 1.00 after) and the
+        # denial figure passes alongside the 25% fallback reduction.
+        + _after_lines(
+            fallbacks=3,
+            denials=1,
+            actions_after=[
+                _skip_line(_stamp("2026-10-20 18:00", index * 60), f"bypass-{index}")
+                for index in range(4)
+            ],
+        )
         + list(chain.from_iterable(after_lease))
     )
     data, code = _result(_write_log(tmp_path, lines))
