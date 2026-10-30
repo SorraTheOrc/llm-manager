@@ -60,6 +60,7 @@ gate or the tenancy bound never enters the queue (same as today's
 | `residency_source=unknown` share | same section, per-decision lines | small | large ⇒ stale snapshot (the ~1 s poller is not refreshing) — the gate fails open, so local keeps working, but measurement is lost |
 | `residency_source=measured_last_dispatch` share | same section, per-decision lines | most resident decisions (the deployed b8782 build reports no per-slot `context_tokens`, so `measured` is rare) | `session_slot` dominating ⇒ no prior dispatch was captured (non-streaming clients, or `local_measured_cache_abort_enabled: 0`) |
 | `measurement=measured` share | same section | tracks the two measured sources | absent everywhere ⇒ neither measurement source is live |
+| `measurement=unavailable:*` breakdown | same section, per-decision lines | dominated by `no_prior_measurement` while the capture feature ramps up | `stale_view` large ⇒ the ~1 s `/slots` poller is not refreshing; `capture_disabled` large ⇒ the rollback switch is off (or the config cannot be read); `no_slot` large ⇒ genuine churn |
 | Tenant-limit denials | `residency_tenant_limit_denials` | present but modest | dominating ⇒ the bound is too tight for the workload; raise `local_session_tenants` or lower the idle-lapse |
 | Evictions | `local_evictions` by reason | roughly tracks disconnects/cancels | `tenancy_lease_expired` dominant ⇒ sessions are being abandoned silently (client-side problem, proxy is doing the right thing) |
 | Remote spend | report summary, local vs remote | no step change | a large local→remote shift ⇒ the 0.5 default is too aggressive for this workload (see Risks in the parent item) |
@@ -100,6 +101,35 @@ as a ratio.
 decision (the gate off, this rung never consulted);
 `local_measured_cache_abort_enabled: 0` restores the pre-change
 `session_slot` behaviour while leaving the residency gate itself on.
+
+## Unmeasured-reason vocabulary (LP-0MVT2Q1SD009JLKD)
+
+A decision that cannot be measured says **why**: every
+`routing_resident_prefix` line carries exactly one `measurement=` value from a
+closed vocabulary, so "the ladder cannot measure" is distinguishable from
+"there is no slot to measure" and the unmeasured share of AC4 is attributable.
+
+| `measurement=` | Trigger |
+|---|---|
+| `measured` | a real measurement (`measured` live `context_tokens`, or `measured_last_dispatch`) |
+| `unavailable:capture_disabled` | slot-owning session, but `local_measured_cache_abort_enabled` is off — or the switch cannot be read (fail-open ⇒ capture not enabled) |
+| `unavailable:no_prior_measurement` | slot-owning session, capture enabled, but nothing measured yet for `(model, session)` |
+| `unavailable:no_slot` | a fresh view shows no slot of this session's (a measured zero) |
+| `unavailable:stale_view` | the residency view is absent/stale (`residency_source=unknown`), or the decision was logged without residency facts (gate disabled) |
+
+Precedence is deterministic (first match wins): `measured` →
+`capture_disabled` → `no_prior_measurement` → `no_slot` → `stale_view`
+(`provider.measurement_reason`). For a slot-owning session the capture
+rollback wins over a missing prior measurement, so an operator can tell "the
+feature is off" from "nothing was measured". `reuse_ratio=none` remains the
+numeric-absent form for every non-measurement — the internal `0.0`/`1.0` gate
+sentinels are never surfaced.
+
+**Reading the split.** At steady state expect `measured` for resident
+decisions. A rise in `no_prior_measurement` means streaming local dispatches
+are not being captured (or are all non-streaming); `capture_disabled` means the
+rollback switch is off; `stale_view` means the `/slots` snapshot is not being
+refreshed; `no_slot` is genuine non-residency.
 
 ## Rollback
 

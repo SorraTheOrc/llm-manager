@@ -932,15 +932,34 @@ client restores warm instead of prefilling cold, and the shared
 ### Observability
 
 Every decision logs
-`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> [measurement=measured] min_ratio=… tenants=… occupants=… session=…`.
+`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> measurement=<measured|unavailable:no_slot|unavailable:no_prior_measurement|unavailable:stale_view|unavailable:capture_disabled> min_ratio=… tenants=… occupants=… session=…`.
 
 `measurement=` is the additive provenance field (immediately after
-`residency_source=`) that distinguishes a real measurement from the ownership
-sentinel: this item emits `measurement=measured` for both measured sources and
-omits the field where nothing was measured (`reuse_ratio=none` remains the
-numeric-absent form). The closed unmeasured-reason vocabulary
-(`unavailable:no_slot`, `unavailable:no_prior_measurement`, …) is
-LP-0MVT2Q1SD009JLKD.
+`residency_source=`, before `min_ratio=`) that distinguishes a real measurement
+from the ownership sentinel. It carries **exactly one** value per line, drawn
+from a closed vocabulary (`provider.MEASUREMENT_VOCABULARY`), so an unmeasured
+decision is self-describing instead of a bare `reuse_ratio=none` — "the ladder
+cannot measure" is distinguishable from "there is no slot to measure"
+(LP-0MVT2Q1SD009JLKD):
+
+| `measurement=` | Emitted when |
+|---|---|
+| `measured` | the ratio came from a real measurement (`residency_source=measured` live `context_tokens`, or `measured_last_dispatch`) |
+| `unavailable:capture_disabled` | the session owns a slot but `local_measured_cache_abort_enabled` is off (the documented rollback), or the switch could not be read (fail-open ⇒ capture not enabled) |
+| `unavailable:no_prior_measurement` | the session owns its slot and capture is enabled, but no local dispatch has been measured yet for `(model, session)` |
+| `unavailable:no_slot` | a **fresh** view shows the session owns no slot, so its reusable prefix is a measured zero |
+| `unavailable:stale_view` | the residency view is absent/stale (`residency_source=unknown`), or the decision was logged without resolving residency facts (gate disabled: `local_resident_prefix_min_ratio: 0`) |
+
+Precedence is deterministic and first-match: `measured` →
+`capture_disabled` → `no_prior_measurement` → `no_slot` → `stale_view`
+(`provider.measurement_reason`). A measured source is never re-labelled by the
+rollback switch, and `no_slot` requires a fresh view — an absent/stale view is
+reported as `stale_view`, never as a measured zero.
+
+**Backward compatible.** `reuse_ratio=none` remains the numeric-absent form for
+every non-measurement (the internal `0.0`/`1.0` gate sentinels are never
+surfaced — `LP-0MVNPZY22008B536`), `residency_source` values are unchanged, and
+a pre-change line (no `measurement=` field) parses unchanged.
 
 **Measurement sources** (rung order): `measured` is the live `/slots`
 `context_tokens`; when the deployed build does not report it (llama.cpp b8782

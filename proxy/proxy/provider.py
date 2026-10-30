@@ -2487,10 +2487,34 @@ RESIDENCY_SOURCE_SESSION_SLOT = "session_slot"  # owns the slot, size unknown
 RESIDENCY_SOURCE_NON_RESIDENT = "non_resident"  # owns no slot (view is fresh)
 RESIDENCY_SOURCE_UNKNOWN = "unknown"            # no fresh view and no ownership
 
-#: ``measurement=`` provenance value for a decision that *is* measured. The
-#: closed vocabulary for unmeasured decisions (``unavailable:*``) is added by
-#: the sibling item LP-0MVT2Q1SD009JLKD.
+#: ``measurement=`` provenance value for a decision that *is* measured.
 MEASUREMENT_MEASURED = "measured"
+#: Closed vocabulary for a decision that *cannot* be measured
+#: (LP-0MVT2Q1SD009JLKD). Each value names a different cause, so an
+#: unmeasured decision is attributable instead of a bare ``none``:
+#:
+#: - ``no_slot`` — the session owns no slot in a *fresh* view, so there is
+#:   nothing to measure (a measured zero, never a fabricated ratio);
+#: - ``no_prior_measurement`` — the session owns its slot but no local
+#:   dispatch has been measured for the ``(model, session)`` pair yet;
+#: - ``capture_disabled`` — the ``local_measured_cache_abort_enabled``
+#:   rollback is off, so capture cannot happen at all;
+#: - ``stale_view`` — the residency view is absent or stale (no fresh
+#:   ``/slots`` snapshot), so the pool state is genuinely unknown.
+MEASUREMENT_UNAVAILABLE_NO_SLOT = "unavailable:no_slot"
+MEASUREMENT_UNAVAILABLE_NO_PRIOR = "unavailable:no_prior_measurement"
+MEASUREMENT_UNAVAILABLE_STALE_VIEW = "unavailable:stale_view"
+MEASUREMENT_UNAVAILABLE_CAPTURE_DISABLED = "unavailable:capture_disabled"
+
+#: The whole closed vocabulary, in precedence order (first match wins).
+#: ``measurement=`` on a decision line is always exactly one of these.
+MEASUREMENT_VOCABULARY: tuple[str, ...] = (
+    MEASUREMENT_MEASURED,
+    MEASUREMENT_UNAVAILABLE_CAPTURE_DISABLED,
+    MEASUREMENT_UNAVAILABLE_NO_PRIOR,
+    MEASUREMENT_UNAVAILABLE_NO_SLOT,
+    MEASUREMENT_UNAVAILABLE_STALE_VIEW,
+)
 
 
 @dataclass(frozen=True)
@@ -2503,8 +2527,8 @@ class ResidentPrefixFacts:
     source: str
     view_known: bool = False
     #: ``measurement=`` provenance: ``MEASUREMENT_MEASURED`` when the ratio
-    #: came from a real measurement, ``None`` when there is none (the
-    #: unmeasured-reason vocabulary lands in LP-0MVT2Q1SD009JLKD).
+    #: came from a real measurement, otherwise one of the closed
+    #: ``unavailable:<reason>`` values (see :func:`measurement_reason`).
     measurement: str | None = None
 
     @property
@@ -2515,6 +2539,63 @@ class ResidentPrefixFacts:
             RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
             RESIDENCY_SOURCE_SESSION_SLOT,
         )
+
+
+def measurement_reason(
+    source: str | None = None,
+    *,
+    view_known: bool = False,
+    capture_enabled: bool = True,
+) -> str:
+    """The single closed-vocabulary ``measurement=`` value for a decision.
+
+    Deterministic precedence (LP-0MVT2Q1SD009JLKD), first match wins:
+
+    1. a **measured** source (live ``context_tokens`` or the last measured
+       dispatch) ⇒ ``measured`` — a real measurement needs no reason, and the
+       capture rollback never re-labels one;
+    2. a **slot-owning** session (``session_slot``) ⇒
+       ``unavailable:capture_disabled`` when the capture rollback is off (this
+       wins over ``no_prior_measurement``: the operator must be able to tell
+       "the feature is off" from "nothing was measured"), else
+       ``unavailable:no_prior_measurement``;
+    3. a **fresh view** with no slot of this session's ⇒ ``unavailable:no_slot``
+       — the zero is a measured fact, not an absence of data;
+    4. anything else — an ``unknown`` source, or no residency facts at all
+       (``source=None``: the gate is disabled, or the caller logged without
+       resolving one) ⇒ ``unavailable:stale_view``, because no fresh residency
+       view informed the decision.
+
+    Never raises: a metric derivation must not become an admission failure
+    mode.
+    """
+    if source in (RESIDENCY_SOURCE_MEASURED, RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH):
+        return MEASUREMENT_MEASURED
+    if source == RESIDENCY_SOURCE_SESSION_SLOT:
+        return (
+            MEASUREMENT_UNAVAILABLE_NO_PRIOR
+            if capture_enabled
+            else MEASUREMENT_UNAVAILABLE_CAPTURE_DISABLED
+        )
+    if view_known:
+        return MEASUREMENT_UNAVAILABLE_NO_SLOT
+    return MEASUREMENT_UNAVAILABLE_STALE_VIEW
+
+
+def _closed_measurement_value(measurement: str | None) -> str:
+    """Normalise *measurement* into the closed vocabulary — never absent.
+
+    Every ``routing_resident_prefix`` line carries exactly one ``measurement=``
+    value (AC2). ``facts`` is ``None`` when the residency gate is disabled
+    (``local_resident_prefix_min_ratio: 0``) or when a caller logs a decision
+    without resolving one, and a future producer could set a value outside the
+    vocabulary: both report ``unavailable:stale_view`` (no fresh residency view
+    informed the decision), so a line can carry neither zero nor two reasons and
+    the vocabulary cannot widen silently.
+    """
+    if isinstance(measurement, str) and measurement in MEASUREMENT_VOCABULARY:
+        return measurement
+    return MEASUREMENT_UNAVAILABLE_STALE_VIEW
 
 
 def _effective_resident_prefix_min_ratio(config: dict | None) -> float:
@@ -2648,6 +2729,12 @@ def resolve_resident_prefix(
     here: llama-server holds `/slots` for >15 s while processing a prompt
     batch (LP-0MUXTW4MD003TVIC).
 
+    Each rung also sets exactly one ``measurement=`` reason via
+    :func:`measurement_reason`: ``measured`` for rungs 1–2,
+    ``unavailable:capture_disabled`` / ``unavailable:no_prior_measurement`` for
+    rung 3, and ``unavailable:no_slot`` / ``unavailable:stale_view`` for rung 4
+    (LP-0MVT2Q1SD009JLKD).
+
     Args:
         session_id: Session whose prefix is being priced.
         estimated_tokens: The request's estimated prompt size (tokens).
@@ -2693,6 +2780,13 @@ def resolve_resident_prefix(
         )
 
     owned_slot = _session_owns_slot(session_id, endpoint)
+    # Read the capture rollback switch once, and only when a measurement could
+    # possibly be used: it decides both whether rung 2 fires and which
+    # unmeasured reason a slot-owning session reports
+    # (``capture_disabled`` vs ``no_prior_measurement``).
+    capture_enabled = (
+        _measured_capture_enabled(server_config) if owned_slot is not None else True
+    )
 
     # Rung 2 — the last measured dispatch for this (model, session). Consulted
     # only while the session still owns a live slot (a measurement whose slot
@@ -2703,7 +2797,7 @@ def resolve_resident_prefix(
     if (
         owned_slot is not None
         and estimated_tokens > 0
-        and _measured_capture_enabled(server_config)
+        and capture_enabled
     ):
         measured_total = _measured_last_dispatch_total(model_name, session_id)
         if measured_total is not None:
@@ -2725,6 +2819,11 @@ def resolve_resident_prefix(
             slot_owner_session=owner or session_id,
             source=RESIDENCY_SOURCE_SESSION_SLOT,
             view_known=known,
+            measurement=measurement_reason(
+                RESIDENCY_SOURCE_SESSION_SLOT,
+                view_known=known,
+                capture_enabled=capture_enabled,
+            ),
         )
 
     # No ownership. With a *fresh* view that is a measured fact (the pool holds
@@ -2742,12 +2841,19 @@ def resolve_resident_prefix(
         except Exception:
             occupants = ()
         owner = occupants[0] if occupants else None
+    source = (
+        RESIDENCY_SOURCE_NON_RESIDENT if known else RESIDENCY_SOURCE_UNKNOWN
+    )
     return ResidentPrefixFacts(
         n_past_actual=None,
         reuse_ratio=0.0,
         slot_owner_session=owner,
-        source=RESIDENCY_SOURCE_NON_RESIDENT if known else RESIDENCY_SOURCE_UNKNOWN,
+        source=source,
         view_known=known,
+        # A fresh view with no slot of this session's is a *measured* zero
+        # (``no_slot``); an absent/stale view is genuinely unknown
+        # (``stale_view``).
+        measurement=measurement_reason(source, view_known=known),
     )
 
 
@@ -2818,7 +2924,7 @@ def _log_residency_decision(
         reuse = getattr(facts, "reuse_ratio", None)
         owner = getattr(facts, "slot_owner_session", None)
         source = getattr(facts, "source", "none")
-        measurement = getattr(facts, "measurement", None)
+        measurement = _closed_measurement_value(getattr(facts, "measurement", None))
         occupants = len(getattr(tenancy, "occupants", ()) or ())
         tenant_limit = getattr(tenancy, "tenant_limit", None)
         # ``reuse_ratio`` is a *measurement*, so it must be reported as
@@ -2831,15 +2937,19 @@ def _log_residency_decision(
         # measured 0 (a slot reporting ``context_tokens=0``) still logs 0.0000.
         measured_ratio = n_past is not None and isinstance(reuse, (int, float))
         # Additive provenance field, immediately after ``residency_source=``
-        # (LP-0MVT2PY3J00077W6): a measured decision says so; a decision with
-        # no measurement omits the field until the closed unmeasured-reason
-        # vocabulary lands (LP-0MVT2Q1SD009JLKD). Existing keys keep their
-        # relative order so deployed parsers are unaffected.
-        measurement_field = f" measurement={measurement}" if measurement else ""
+        # (LP-0MVT2PY3J00077W6): a measured decision says so; a decision that
+        # cannot be measured says *why* in the closed vocabulary
+        # (LP-0MVT2Q1SD009JLKD — ``unavailable:no_slot`` /
+        # ``unavailable:no_prior_measurement`` /
+        # ``unavailable:stale_view`` / ``unavailable:capture_disabled``).
+        # Exactly one value per line: a line logged without residency facts
+        # (the gate is disabled) still reports ``unavailable:stale_view``.
+        # Existing keys keep their relative order so deployed parsers are
+        # unaffected; ``measurement=`` is the only addition.
         logger.info(
             "routing_resident_prefix provider=local model=%s decision=%s "
             "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
-            "slot_owner_session=%s residency_source=%s%s min_ratio=%s "
+            "slot_owner_session=%s residency_source=%s measurement=%s min_ratio=%s "
             "tenants=%s occupants=%d session=%s",
             model_name or "unknown",
             decision,
@@ -2848,7 +2958,7 @@ def _log_residency_decision(
             f"{reuse:.6f}" if measured_ratio else "none",
             owner or "none",
             source or "none",
-            measurement_field,
+            measurement,
             f"{min_ratio:.2f}" if isinstance(min_ratio, (int, float)) else "none",
             tenant_limit if tenant_limit is not None else "none",
             occupants,
