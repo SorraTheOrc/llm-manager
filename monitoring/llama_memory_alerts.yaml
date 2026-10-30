@@ -1,0 +1,41 @@
+# llama-server process memory (RSS) pressure alerts
+#
+# Restored by LP-0MVO9F877008ZCP7 (AC5). The previous version of this file was
+# removed in LP-0MVO8DOHP008FL48 because the series it selected never carried a
+# value: the proxy published llama_process_rss_bytes as 0 on every scrape
+# (llama-server runs in a podman container so a host process handle was
+# unavailable). The proxy now publishes the real figure — resolved from the
+# container's process tree / cgroup memory.current for podman-backed
+# deployments, and from the host llama-server process tree (router + model
+# children) otherwise — refreshed directly on each /metrics scrape.
+#
+# THRESHOLDS: 75 % / 90 % of the 90 GiB working pool documented by the original
+# rule. This series is the *process* RSS (CPU RAM actually resident for the
+# llama-server and its model children, ~45 GB with Qwen3.6-35B loaded), which
+# is distinct from GPU GTT coverage in gpu_memory_alerts.yaml — the proxy's CPU
+# memory footprint is a separate, alertable resource.
+#
+# Backstop: memory.guaranteed / swap pressure is not measured here; the cgroup
+# memory.current view used for containers includes page cache, which --no-mmap
+# keeps small.
+
+groups:
+  - name: llama-memory.rules
+    rules:
+      - alert: LlamaMemoryHighWarning
+        expr: llama_process_rss_bytes > 0.75 * 90 * 1024 * 1024 * 1024
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "llama-server process memory usage > 75 % of 90 GiB"
+          description: "llama-server RSS ({{ $value | humanize1024 }}B) is above 75 % of the 90 GiB working pool on {{ $labels.instance }}. Check loaded models and consider unloading an idle model."
+
+      - alert: LlamaMemoryHighCritical
+        expr: llama_process_rss_bytes > 0.90 * 90 * 1024 * 1024 * 1024
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "llama-server process memory usage > 90 % of 90 GiB (critical)"
+          description: "llama-server RSS ({{ $value | humanize1024 }}B) is above 90 % of the 90 GiB working pool on {{ $labels.instance }}. A further model load or a large-context session is likely to fail. Unload an idle model immediately."

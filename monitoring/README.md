@@ -223,6 +223,7 @@ So in `monitoring/prometheus.yml` they must be **bare file names**:
 rule_files:
   - "gpu_compute_rules.yaml"
   - "gpu_memory_alerts.yaml"
+  - "llama_memory_alerts.yaml"
 ```
 
 Listing them as `monitoring/gpu_compute_rules.yaml` makes Prometheus look for
@@ -237,11 +238,40 @@ Validate before restarting:
 
 ```bash
 ~/bin/prometheus/promtool check config monitoring/prometheus.yml
-# expected: SUCCESS: 5 rule files found
+# expected: SUCCESS: 6 rule files found
 #           SUCCESS: monitoring/prometheus.yml is valid prometheus config file syntax
 ~/bin/prometheus/promtool test rules monitoring/tests/gpu_rules_test.yml
 # expected: SUCCESS
 systemctl --user restart prometheus.service
+```
+
+### llama-server memory series (llama_process_rss_bytes)
+
+`llama_memory_alerts.yaml` alerts on `llama_process_rss_bytes`, published by
+`proxy/proxy/backend_rss.py` and refreshed on **every `/metrics` scrape** (the
+15 s Prometheus scrape alone keeps it fresh; no `/admin/metrics` poll is
+needed). The value is resolved without requiring a host process handle:
+
+- **podman-backed** (`scripts/podman_start_llama.sh`): the container init pid
+  from `podman inspect -f '{{.State.Pid}}' <name>` and the summed RSS of its
+  process tree, falling back to the container cgroup's `memory.current` (the
+  number `podman stats` reports). Container name: `server.llama_container_name`,
+  else `PODMAN_LC_CONTAINER`, else auto-detected from a `podman` start script.
+- **host-direct**: the summed RSS of the llama-server process tree (router plus
+  its per-model children — model memory lives in children, so a single-process
+  read under-reports by ~99 %). The tracked `llama_process` pid is used when it
+  is a real backend process; otherwise (adopted server with `pid = 0`, or a
+  `podman exec` wrapper pid) pids are discovered by scanning `/proc` for
+  `llama-server --port <llama_server_port>`.
+
+Per-model attribution stays the documented equal split: the
+`llama_model_rss_bytes{model=...}` labels sum to the process total. A runtime
+lookup failure is fail-soft — the scrape still succeeds, the last known value
+is kept, and the reason is logged once (not per scrape). Verify with:
+
+```bash
+curl -s localhost:8000/metrics | grep llama_process_rss_bytes   # non-zero
+curl -s localhost:8000/admin/metrics | jq .process_rss_bytes    # same value
 ```
 
 ## 3. Host and GPU metrics: node_exporter + gpu-metrics

@@ -2491,6 +2491,22 @@ server:
   - code
   llama_server_bin: /home/rgardler/llama.cpp/build/bin/llama-server
   llama_server_port: 8080
+  # llama-server RSS metrics (LP-0MVO9F877008ZCP7). ``/metrics`` refreshes
+  # llama_process_rss_bytes / llama_model_rss_bytes on each scrape, without
+  # needing a host process handle:
+  #   - container-backed: set llama_container_name (or PODMAN_LC_CONTAINER) and
+  #     the proxy reads the container init pid + its process tree, falling back
+  #     to the container cgroup's memory.current.
+  #   - host-direct: the llama-server process tree (router + model children) is
+  #     summed; a pid is discovered via /proc when the adopted-server handle has
+  #     pid = 0 or the tracked process is a podman wrapper.
+  # Leave llama_container_name unset for host-direct; it is auto-detected when
+  # llama_start_script is a podman wrapper (scripts/podman_start_llama.sh).
+  # llama_container_name: llama
+  # Max age (seconds) of a resolved RSS value before a scrape re-resolves it.
+  llama_rss_refresh_seconds: 5
+  # Max age (seconds) of the cached loaded-model list used for per-model split.
+  llama_rss_models_refresh_seconds: 30
   # Must be an absolute path or a script resolvable from PATH.
   # The host-based start-llama.sh is at the project root.
   llama_start_script: start-llama.sh

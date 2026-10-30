@@ -1298,8 +1298,24 @@ async def list_models():
 
 @router.get("/metrics")
 async def prometheus_metrics():
-    """Prometheus scrape endpoint (text/plain, exposition format)."""
+    """Prometheus scrape endpoint (text/plain, exposition format).
+
+    LP-0MVO9F877008ZCP7 AC1: the gauges are refreshed here, not only in
+    ``/admin/metrics``, so a Prometheus 15 s scrape keeps
+    ``llama_process_rss_bytes`` fresh without any poll of ``/admin/metrics``.
+    The refresh is fail-soft: any resolution error is logged once and the
+    endpoint still serves the previously published gauge values.
+    """
     srv = _srv()
+    try:
+        from proxy import backend_rss
+
+        models = await backend_rss.ensure_models(srv)
+        # Resolution shells out to `podman` / walks /proc — keep it off the
+        # event loop (bounded by backend_rss.PODMAN_TIMEOUT_SECONDS).
+        await asyncio.to_thread(backend_rss.update_gauges, srv, models or None)
+    except Exception:
+        pass
     try:
         payload, content_type = srv.metrics.generate_metrics_payload()
         return Response(content=payload, media_type=content_type)
@@ -1342,16 +1358,25 @@ async def admin_metrics():
     for m in loaded_models or []:
         per_model[m] = {"last_used": srv.model_last_used.get(m), "rss_bytes": None}
 
+    # LP-0MVO9F877008ZCP7: RSS resolution no longer depends on a host
+    # process handle. backend_rss resolves the container's process tree /
+    # cgroup memory.current for podman-backed deployments, runs the
+    # host process tree (router + model children) otherwise, and covers the
+    # adopted-server case (pid = 0) via /proc port discovery. The same
+    # TTL-cached value feeds the gauges so it matches /metrics exactly.
     process_rss = None
+    rss_source = None
     try:
-        if 'psutil' in dir(srv) and srv.psutil and srv.llama_process is not None:
-            pid = getattr(srv.llama_process, 'pid', None)
-            if pid:
-                p = srv.psutil.Process(pid)
-                mem = p.memory_info()
-                process_rss = getattr(mem, 'rss', None)
+        from proxy import backend_rss
+
+        # Off the event loop: resolution may shell out to `podman` or walk /proc.
+        process_rss = await asyncio.to_thread(
+            backend_rss.update_gauges, srv, loaded_models
+        )
+        rss_source = backend_rss.last_source()
     except Exception:
         process_rss = None
+        rss_source = None
 
     if process_rss is not None and loaded_models:
         try:
@@ -1362,10 +1387,8 @@ async def admin_metrics():
             for m in loaded_models:
                 per_model[m]['rss_bytes'] = None
 
-    try:
-        srv.metrics.update_metrics(process_rss, loaded_models)
-    except Exception:
-        pass
+    # (the gauges themselves are published by backend_rss.update_gauges above,
+    #  so /metrics and /admin/metrics always agree)
 
     # Session-list index observability (LP-0MSNM9IAC000GVXT): index size,
     # index-hit vs cold-scan counts, last scan duration.
@@ -1385,6 +1408,7 @@ async def admin_metrics():
         "loaded_models": loaded_models,
         "per_model": per_model,
         "process_rss_bytes": process_rss,
+        "process_rss_source": rss_source,
         "index_observability": index_obs,
         "session_metrics": srv.session_manager.get_metrics(),
         "restore_success_total": int(srv.session_restore_observability.get("restore_success_total", 0)),

@@ -43,6 +43,7 @@ REQUIRED_RULE_FILES = {
     "prometheus.yml": [
         "gpu_compute_rules.yaml",
         "gpu_memory_alerts.yaml",
+        "llama_memory_alerts.yaml",
         "proxy_5xx_alerts.yaml",
         "slots_query_alerts.yaml",
         "remote_stream_alerts.yaml",
@@ -56,12 +57,14 @@ REQUIRED_RULE_FILES = {
 #   ~100% for any draw above ~20 W, so idle-with-context stretches report as
 #   busy), i.e. it is not a utilisation signal (LP-0MS9GA6QL007XTBP, quantified
 #   in LP-0MVSQQO910077LYL).
-# - llama_process_rss_bytes: published as 0 by the proxy (llama-server runs in a
-#   podman container, so there is no host process handle to read RSS from).
+# llama_process_rss_bytes is deliberately NOT forbidden: LP-0MVO9F877008ZCP7
+# fixed the always-0 publication (llama-server runs in a podman container, so
+# the proxy now resolves RSS via the container process tree / cgroup
+# memory.current instead of a host process handle) and restored
+# llama_memory_alerts.yaml on the series.
 FORBIDDEN_RULE_SERIES = [
     "rocm_vram_",
     "gpu_busy_percent",
-    "llama_process_rss_bytes",
 ]
 
 EXPECTED_ROCM_EXPORTER_METRICS = [
@@ -498,6 +501,25 @@ class TestAlertRuleFiles:
         assert len(data["groups"]) >= 1
         assert len(data["groups"][0].get("rules", [])) >= 1
 
+    def test_llama_memory_alerts_registered(self):
+        """AC5: llama_memory_alerts.yaml is restored, valid, references the
+        now-working llama_process_rss_bytes series, and is registered in both
+        prometheus.yml rule_files and REQUIRED_RULE_FILES."""
+        path = MONITORING_DIR / "llama_memory_alerts.yaml"
+        data = assert_valid_yaml(path)
+        assert "groups" in data, "llama_memory_alerts.yaml missing 'groups' key"
+        groups = data["groups"]
+        assert len(groups) >= 1
+        rules = groups[0].get("rules", [])
+        assert len(rules) >= 1
+        expressions = "\n".join(str(r.get("expr", "")) for r in rules)
+        assert "llama_process_rss_bytes" in expressions, (
+            "restored rule must select the (now working) llama_process_rss_bytes series"
+        )
+        config = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
+        assert "llama_memory_alerts.yaml" in config.get("rule_files", [])
+        assert "llama_memory_alerts.yaml" in REQUIRED_RULE_FILES["prometheus.yml"]
+
     def test_alert_rule_file_names_in_prometheus_config(self):
         """The prometheus.yml references the GPU and proxy alert rule files."""
         config = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
@@ -515,7 +537,11 @@ class TestAlertRuleFiles:
         """Dead rule files must not come back: they could never fire."""
         config = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
         rule_files = config.get("rule_files", [])
-        for dead in ("gpu_vram_alerts.yaml", "llama_memory_alerts.yaml"):
+        # gpu_vram_alerts.yaml stays dead (rocm_vram_* has no exporter).
+        # llama_memory_alerts.yaml was removed alongside it but is RESTORED by
+        # LP-0MVO9F877008ZCP7 (the llama_process_rss_bytes series it selects
+        # now carries a real value) — see test_llama_memory_alerts_registered.
+        for dead in ("gpu_vram_alerts.yaml",):
             assert dead not in rule_files, (
                 f"{dead} was removed because its expressions can never be "
                 f"satisfied on this host; do not re-add it"
@@ -535,7 +561,7 @@ class TestAlertRuleFiles:
         assert not offenders, (
             "Rules reference series that are unpublished or meaningless on this "
             "host (rocm_vram_* has no exporter, gpu_busy_percent is pinned at "
-            "100%, llama_process_rss_bytes is always 0):\n" + "\n".join(offenders)
+            "100%):\n" + "\n".join(offenders)
         )
 
 

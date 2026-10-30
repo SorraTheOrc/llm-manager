@@ -18,15 +18,18 @@ global:
 #
 # GPU coverage (LP-0MVO8DOHP008FL48): utilisation comes from power draw (see
 # gpu_compute_rules.yaml) because gpu_busy_percent is pinned at 100% on this APU,
-# and memory pressure is measured on GTT (gpu_memory_alerts.yaml) because
-# rocm_vram_* has no exporter. The previous gpu_vram_alerts.yaml and
-# llama_memory_alerts.yaml were removed: the former selected series that no
-# exporter publishes, the latter compared llama_process_rss_bytes against 90 GB
-# although the proxy publishes it as 0 (llama-server runs in a podman container,
-# so the proxy has no host process handle) - see LP-0MVO8DOHP008FL48.
+# and GPU-visible memory pressure is measured on GTT (gpu_memory_alerts.yaml)
+# because rocm_vram_* has no exporter. The previous gpu_vram_alerts.yaml was
+# removed (it selected series no exporter publishes). llama_memory_alerts.yaml
+# was also removed there but is restored by LP-0MVO9F877008ZCP7: it selects
+# llama_process_rss_bytes, which the proxy publishes as 0 when llama-server runs
+# in a podman container (no host process handle) — the proxy now resolves the
+# real RSS from the container's process tree / cgroup memory.current and
+# refreshes it on every /metrics scrape.
 rule_files:
   - "gpu_compute_rules.yaml"
   - "gpu_memory_alerts.yaml"
+  - "llama_memory_alerts.yaml"
   - "proxy_5xx_alerts.yaml"
   - "slots_query_alerts.yaml"
   - "remote_stream_alerts.yaml"
