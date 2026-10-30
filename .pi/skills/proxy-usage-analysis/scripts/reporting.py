@@ -285,6 +285,36 @@ def _error_row(e: log_parser.LogEvent) -> dict:
 # JSON key used when a provider or model is not derivable from the log line.
 UNKNOWN_LABEL = "(unknown)"
 
+# Bucket label for an unmeasured residency decision whose line predates the
+# additive ``measurement=`` field (LP-0MVT2QHMU0008F2V): old logs are not
+# reclassified, and "no provenance recorded" is distinct from a reason the
+# proxy actually emitted.
+UNRECORDED_MEASUREMENT_LABEL = "unrecorded"
+
+
+def _residency_measurement_breakdown(
+    summary: AnalysisResult,
+) -> tuple[int, Counter]:
+    """Return ``(measured_count, unmeasured_reason_counts)`` for residency.
+
+    The single source of truth behind both the rendered breakdown
+    (``_append_residency_section``) and the machine-readable keys in
+    ``summary_to_json`` (LP-0MVT2QHMU0008F2V); the two can never disagree.
+
+    A decision is *measured* when it carries a numeric ``reuse_ratio``. An
+    unmeasured decision is bucketed by its parsed ``measurement=`` value
+    verbatim (``unavailable:no_slot``, ...), or ``unrecorded`` when the line
+    predates the field — never fabricated into a measurement.
+    """
+    events = list(getattr(summary, "residency_events", []) or [])
+    measured_count = sum(1 for ev in events if ev.reuse_ratio is not None)
+    reasons = Counter(
+        ev.measurement or UNRECORDED_MEASUREMENT_LABEL
+        for ev in events
+        if ev.reuse_ratio is None
+    )
+    return measured_count, reasons
+
 
 def error_provider_model_json(summary: AnalysisResult) -> dict:
     """Nested error breakdown ``{error_type: {provider: {model: count}}}``.
@@ -1622,6 +1652,32 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
     Also lists post-acceptance evictions (`local_eviction`) by reason so a
     regression in reclaim behaviour (dead sessions gating the pool) shows up
     as data rather than as a client-visible stall.
+
+    **Measurement provenance (LP-0MVT2QHMU0008F2V AC4).** The pre-change line
+    could only say `reuse_ratio=none`, which made "no slot to measure", "no
+    prior measurement for the pair" and "capture switched off" look identical
+    — the 2026-10-27 window logged 3,607 decisions with 0 measured and the AC4
+    reuse rule could never fire. The additive `measurement=` field
+    (`measured` / `unavailable:<reason>`, closed vocabulary from
+    LP-0MVT2Q1SD009JLKD) is now parsed onto `LogEvent.measurement` and this
+    section reports:
+
+    - the measured / unmeasured decision split (unchanged line);
+    - a per-reason **Unmeasured reason** table, counted with
+      `Counter(ev.measurement or "unrecorded")` over unmeasured decisions, so
+      each cause gets its own count and remedy (a line predating the field
+      counts as `unrecorded`);
+    - an explicit **all-unmeasured finding** when `measured == 0` and there
+      are residency decisions — "decisions logged but all unmeasured" is a
+      broken measurement ladder, never a quiet window.
+
+    **Downstream handoff (LP-0MVQ4X1S30034BQ1 classifier).** The same counts are
+    exposed machine-readably by `summary_to_json` as the additive keys
+    `residency_measured_decisions` (int) and
+    `residency_unmeasured_reasons` (`{reason: count}`; reasons are the raw
+    `measurement=` values, `unrecorded` for old lines). Both are computed by
+    `_residency_measurement_breakdown`, so the report and the JSON can never
+    disagree. No existing key changes meaning or value.
     """
     residency_events = list(getattr(summary, "residency_events", []) or [])
     eviction_events = list(getattr(summary, "eviction_events", []) or [])
@@ -1632,6 +1688,8 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
         return
 
     measured = [ev for ev in residency_events if ev.reuse_ratio is not None]
+    measured_count, unmeasured_reasons = _residency_measurement_breakdown(summary)
+    unmeasured_count = len(residency_events) - measured_count
     resident = [ev for ev in measured if ev.decision == "admit"]
     evicted = [
         ev
@@ -1657,6 +1715,15 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
     ap(f"- Residency decisions: **{len(residency_events)}** "
        f"(measured ratio: {len(measured)}, no measurement: "
        f"{len(residency_events) - len(measured)})")
+    if unmeasured_count and not measured_count:
+        # The exact 3607/0 production condition (LP-0MVRZXPH70025ZNR): a bare
+        # "measured ratio: 0" reads as a quiet window. Say it as a finding.
+        dominant, dominant_count = unmeasured_reasons.most_common(1)[0]
+        ap(f"- **Finding: all {unmeasured_count} residency decisions in this "
+           f"window are unmeasured** (dominant reason: `{dominant}`, "
+           f"{dominant_count} of {unmeasured_count}). The measurement ladder "
+           "is not emitting a numeric prefix — this is a defect signal, not a "
+           "quiet window.")
     ap(f"- Resident admissions (ratio at/above threshold): **{len(resident)}**")
     ap(f"- Evicted denials (`resident_prefix_insufficient`): **{len(evicted)}** "
        f"with a measured prefix, **{len(no_slot)}** with no slot at all")
@@ -1664,6 +1731,15 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
     if eviction_events:
         ap(f"- Post-acceptance evictions (`local_eviction`): "
            f"**{len(eviction_events)}**")
+    if unmeasured_count:
+        # Per-reason breakdown (LP-0MVT2QHMU0008F2V AC4): "unmeasurable" is
+        # three different operator problems; each gets its own count.
+        ap("")
+        ap("| Unmeasured reason | Decisions | Share |")
+        ap("|---|---|---|")
+        for reason, count in unmeasured_reasons.most_common():
+            ap(f"| `{reason}` | {count} | "
+               f"{_pct(count, unmeasured_count):.1f}% |")
 
     if measured:
         def _ratio_stats(events) -> str:
@@ -3208,6 +3284,11 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
     # Contended-pricing split (LP-0MVS9YKHL007UBBZ AC2): the same computation
     # feeds the markdown section, so the two views cannot disagree.
     _admission = aggregation.admission_breakdown(summary)
+    # Measurement provenance (LP-0MVT2QHMU0008F2V): computed once so the two
+    # additive keys below are always consistent with each other.
+    _measured_decisions, _unmeasured_reasons = _residency_measurement_breakdown(
+        summary
+    )
     return {
         "window_start": _fmt_ts(summary.window_start),
         "window_end": _fmt_ts(summary.window_end),
@@ -3276,6 +3357,13 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
             for e in getattr(summary, "residency_events", []) or []
             if getattr(e, "decision", None) == "tenant_limit"
         ),
+        # Measurement provenance (LP-0MVT2QHMU0008F2V AC4, downstream handoff to
+        # LP-0MVQ4X1S30034BQ1's classifier): the measured decision count and the
+        # per-reason unmeasured breakdown. Both are ADDITIVE — every key above
+        # keeps its value and meaning. Reasons are the raw ``measurement=``
+        # values; ``unrecorded`` covers lines predating the field.
+        "residency_measured_decisions": _measured_decisions,
+        "residency_unmeasured_reasons": dict(_unmeasured_reasons),
         "local_evictions": len(getattr(summary, "eviction_events", []) or []),
         # Parent AC7(a), LP-0MVN4LCQJ0034S5S AC2: accepted dispatches evicted
         # before their first byte. Both keys are ADDITIVE — nothing above

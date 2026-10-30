@@ -8071,16 +8071,6 @@ class TestResidencyAdmission:
 # (LP-0MVT2PF1C008LAPB — parent LP-0MVRZXPH70025ZNR AC3(v) / AC4)
 # ---------------------------------------------------------------------------
 
-PENDING_MEASUREMENT_GRAMMAR = (
-    "pending LP-0MVT2QHMU0008F2V (usage-report measurement breakdown: "
-    "log_parser measurement= field) + LP-0MVT2Q1SD009JLKD (measurement= "
-    "vocabulary emitted by the proxy)"
-)
-PENDING_REPORT_BREAKDOWN = (
-    "pending LP-0MVT2QHMU0008F2V (usage-report measurement breakdown in the "
-    "residency section)"
-)
-
 #: The closed ``measurement=`` vocabulary values these fixtures exercise.
 MEASURED = "measured"
 NO_PRIOR = "unavailable:no_prior_measurement"
@@ -8099,11 +8089,11 @@ class TestResidencyMeasurementProvenance:
     (``measured`` / ``unavailable:<reason>``) and reports the split, so
     "decisions logged but all unmeasured" is a visible finding.
 
-    Red-first: the assertions that describe the new field/section are marked
-    ``xfail(strict=True)`` naming the implementation child that turns them
-    green, so the tree stays green for the dev-push gate. The pre-change
-    grammar assertions run unmarked — they are the backward-compatibility
-    guarantee the change must not break.
+    Red-first: the assertions describing the new field/section were written by
+    LP-0MVT2PF1C008LAPB as ``xfail(strict=True)``; the markers are removed here
+    (LP-0MVT2QHMU0008F2V) and now pin the behaviour. The pre-change grammar
+    assertions were unmarked from the start — they are the
+    backward-compatibility guarantee the change must not break.
     """
 
     @staticmethod
@@ -8130,7 +8120,6 @@ class TestResidencyMeasurementProvenance:
 
     # -- grammar -----------------------------------------------------------
 
-    @pytest.mark.xfail(strict=True, reason=PENDING_MEASUREMENT_GRAMMAR)
     def test_parser_reads_measured_provenance(self):
         """AC: a ``measurement=measured`` line parses to the literal value."""
         ev = log_parser.parse_log_line(fixtures.ROUTING_RESIDENT_PREFIX_MEASURED)
@@ -8140,7 +8129,6 @@ class TestResidencyMeasurementProvenance:
         assert ev.residency_source == "measured_last_dispatch"
         assert ev.reuse_ratio == pytest.approx(0.611)
 
-    @pytest.mark.xfail(strict=True, reason=PENDING_MEASUREMENT_GRAMMAR)
     def test_parser_reads_unavailable_reason_verbatim(self):
         """AC: an unmeasured decision carries its closed-vocabulary reason.
 
@@ -8157,7 +8145,6 @@ class TestResidencyMeasurementProvenance:
         assert ev.reuse_ratio is None
         assert ev.residency_source == "session_slot"
 
-    @pytest.mark.xfail(strict=True, reason=PENDING_MEASUREMENT_GRAMMAR)
     @pytest.mark.parametrize(
         "line,reason",
         [
@@ -8202,7 +8189,6 @@ class TestResidencyMeasurementProvenance:
         assert ev.reuse_ratio == pytest.approx(1.0)
         assert ev.residency_source == "measured"
 
-    @pytest.mark.xfail(strict=True, reason=PENDING_MEASUREMENT_GRAMMAR)
     def test_legacy_line_has_no_measurement_value(self):
         """AC: an absent ``measurement=`` field reads ``None``, never fabricated.
 
@@ -8240,7 +8226,6 @@ class TestResidencyMeasurementProvenance:
 
         assert "(measured ratio: 2, no measurement: 4)" in section
 
-    @pytest.mark.xfail(strict=True, reason=PENDING_REPORT_BREAKDOWN)
     def test_section_breaks_down_unmeasured_reasons(self):
         """AC: the section shows a per-reason unmeasured breakdown.
 
@@ -8259,7 +8244,6 @@ class TestResidencyMeasurementProvenance:
                 f"the {reason} breakdown must carry its count"
             )
 
-    @pytest.mark.xfail(strict=True, reason=PENDING_REPORT_BREAKDOWN)
     def test_all_unmeasured_window_is_a_visible_finding(self):
         """AC: an all-unmeasured window states the finding, not a silent zero.
 
@@ -8302,6 +8286,38 @@ class TestResidencyMeasurementProvenance:
         assert counters["residency_resident_admits"] == 1
         assert counters["residency_evicted_denials"] == 1
         assert counters["residency_tenant_limit_denials"] == 1
+
+    # -- downstream handoff ------------------------------------------------
+
+    def test_json_exposes_reason_counts_for_the_classifier(self):
+        """AC: the per-reason counts are machine-readable for the AC4 classifier.
+
+        LP-0MVQ4X1S30034BQ1 classifies deadline events from ``--json`` counters
+        (never ad-hoc grep), so the measured total and the per-reason
+        unmeasured breakdown must be first-class additive keys. A pre-change
+        line has no provenance and is bucketed as ``unrecorded`` — its reason
+        is never fabricated.
+        """
+        summary = self._summary(
+            [
+                fixtures.ROUTING_RESIDENT_PREFIX_MEASURED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_CAPTURE_DISABLED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_UNMEASURED,
+            ]
+        )
+        counters = reporting.summary_to_json(summary)
+
+        assert counters["residency_decisions"] == 6
+        assert counters["residency_measured_decisions"] == 2
+        assert counters["residency_unmeasured_reasons"] == {
+            NO_PRIOR: 1,
+            NO_SLOT: 1,
+            CAPTURE_DISABLED: 1,
+            "unrecorded": 1,
+        }
 
 
 # ---------------------------------------------------------------------------

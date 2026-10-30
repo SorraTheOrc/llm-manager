@@ -229,6 +229,14 @@ RE_N_PAST_ACTUAL = re.compile(r"\bn_past_actual=(\d+|none)\b")
 RE_REUSE_RATIO = re.compile(r"\breuse_ratio=([\d.]+|none)\b")
 RE_SLOT_OWNER_SESSION = re.compile(r"\bslot_owner_session=(\S+)")
 RE_RESIDENCY_SOURCE = re.compile(r"\bresidency_source=([A-Za-z_]+)")
+# Measurement provenance (LP-0MVT2PY3J00077W6 grammar, LP-0MVT2Q1SD009JLKD
+# vocabulary, LP-0MVT2QHMU0008F2V parsing): additive field emitted immediately
+# after ``residency_source=``. Exactly one closed-vocabulary value per line:
+# ``measured`` or ``unavailable:<reason>`` (``no_slot``,
+# ``no_prior_measurement``, ``stale_view``, ``capture_disabled``). The value is
+# parsed verbatim — never collapsed to the old ambiguous ``none`` — and is
+# ``None`` on lines predating the field (old log files).
+RE_MEASUREMENT = re.compile(r"\bmeasurement=([A-Za-z_:]+)")
 RE_TENANT_LIMIT = re.compile(r"\btenants=(\d+|none)\b")
 RE_TENANT_OCCUPANTS = re.compile(r"\boccupants=(\d+)")
 RE_EVICTION_REASON = re.compile(r"\breason=([A-Za-z_]+)")
@@ -294,7 +302,8 @@ ROUTING_IDLE_ADMIT = "routing_idle_admit"
 # ``routing_resident_prefix provider=local model=... decision=<verdict>
 # n_past_actual=<n|none> estimated_tokens=<n> reuse_ratio=<f|none>
 # slot_owner_session=<id|none> residency_source=<measured|session_slot|
-# non_resident|unknown> min_ratio=<f> tenants=<n> occupants=<n> session=<id>``
+# non_resident|unknown> measurement=<measured|unavailable:<reason>>
+# min_ratio=<f> tenants=<n> occupants=<n> session=<id>``
 # once per admission decision. ``decision`` is one of ``admit``,
 # ``resident_prefix_insufficient``, ``tenant_limit`` (plus
 # ``large_context_bypass`` for a live-priced cold miss). The fail-open path
@@ -707,6 +716,11 @@ class LogEvent:
     reuse_ratio: float | None = None
     slot_owner_session: str | None = None
     residency_source: str | None = None
+    # Measurement provenance (LP-0MVT2QHMU0008F2V AC4/AC2): the additive
+    # ``measurement=`` value in its closed vocabulary (``measured`` or
+    # ``unavailable:<reason>``), parsed verbatim. ``None`` when the line
+    # predates the field — old logs are never reclassified.
+    measurement: str | None = None
     tenant_limit: int | None = None
     tenant_occupants: int | None = None
     # Eviction evidence (LP-0MVN1IQTF0037WTG AC6, ``local_eviction`` kind): the
@@ -1236,6 +1250,7 @@ def parse_log_line(line: str) -> LogEvent | None:
             ),
             slot_owner_session=None if not owner or owner == "none" else owner,
             residency_source=_first(RE_RESIDENCY_SOURCE, msg),
+            measurement=_first(RE_MEASUREMENT, msg),
             tenant_limit=(
                 int(_first(RE_TENANT_LIMIT, msg))
                 if _first(RE_TENANT_LIMIT, msg)
