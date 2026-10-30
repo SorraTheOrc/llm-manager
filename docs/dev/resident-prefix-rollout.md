@@ -90,10 +90,54 @@ measured reuse fell below `local_resident_prefix_min_ratio` is now denied with
 `resident_prefix_insufficient`. That is the intended AC4 rule (a) signal (a
 visible cold-prefill admission), not a regression.
 
-**Known limits.** A buffered (non-streaming) local dispatch carries no
-`prompt_progress` events, so it records no measurement; and the stored
+**Known limits.** A buffered (non-streaming) local dispatch carries no `prompt_progress` events, so it records no measurement; and the stored
 measurement is only valid while its session still owns the slot it was
 captured against.
+
+**What the number is.** The `measured_last_dispatch` total is the *previous*
+prompt's size including that dispatch's decode, so the derived reuse ratio is
+an upper bound on what this request will actually reuse — a useful warmth
+estimate, not a promise that the whole prefix is still resident.
+
+## What to read
+
+Grep the resident decisions and read `residency_source` together with
+`measurement=`:
+
+```bash
+grep -o 'residency_source=[a-z_]* measurement=[a-z:_]*' proxy.log | sort | uniq -c
+```
+
+- A **resident** decision whose source is `measured` or
+  `measured_last_dispatch` reports `measurement=measured` with a **numeric**
+  `reuse_ratio` whenever a prior measured dispatch exists for the
+  `(model, session)` pair.
+- A resident decision that cannot be measured reports `reuse_ratio=none` and
+  says why: `unavailable:no_prior_measurement` or
+  `unavailable:capture_disabled`.
+
+**Two expected unmeasured cases — neither is a regression.**
+
+1. **Buffered (non-streaming) dispatches.** `return_progress` is injected only
+   into streaming requests, and llama-server emits `prompt_progress` only while
+   streaming. A buffered local dispatch therefore carries no `prompt_progress`
+   events and records no measurement, so the next decision for that session
+   stays
+   `residency_source=session_slot measurement=unavailable:no_prior_measurement`
+   even though the slot really is warm. Clients that never stream (scripts,
+   batch callers) contribute a persistent `no_prior_measurement` share that no
+   amount of waiting will clear.
+2. **Capture rolled back.** `local_measured_cache_abort_enabled: 0` stops both
+   `return_progress` injection and capture, so every slot-owning resident
+   decision reports `unavailable:capture_disabled` instead of
+   `unavailable:no_prior_measurement`. That is the documented rollback,
+   intended, not a regression — and it never fabricates a ratio (still
+   `reuse_ratio=none`).
+
+So read the `unavailable:*` split per cause: a large `no_prior_measurement`
+share means "nothing was measured for these dispatches yet" (check whether a
+buffered client dominates), while `capture_disabled` means the feature switch
+is off.
 
 **Invalidation (LP-0MVT2QFAP0082BKR).** The `(model, session)` entry is
 cleared wherever that ownership ends, so a stale `total` cannot be re-reported

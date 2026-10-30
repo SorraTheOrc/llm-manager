@@ -31,7 +31,15 @@ from pathlib import Path
 
 import pytest
 import yaml
-from proxy.provider import _effective_resident_prefix_min_ratio
+from proxy.provider import (
+    MEASUREMENT_VOCABULARY,
+    RESIDENCY_SOURCE_MEASURED,
+    RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
+    RESIDENCY_SOURCE_NON_RESIDENT,
+    RESIDENCY_SOURCE_SESSION_SLOT,
+    RESIDENCY_SOURCE_UNKNOWN,
+    _effective_resident_prefix_min_ratio,
+)
 from proxy.router_helpers import (
     DEFAULT_TENANCY_IDLE_SECONDS,
     resolve_session_tenants,
@@ -276,3 +284,84 @@ def test_rollout_doc_does_not_promise_out_of_scope_changes():
 
     assert "LP-0MVN3KPEC007WWL5" in text
     assert "deliberately does not change" in text
+
+
+# ---------------------------------------------------------------------------
+# Measurement provenance documentation (LP-0MVT2QW9P0054LX2)
+# ---------------------------------------------------------------------------
+
+RESIDENCY_SOURCES = (
+    RESIDENCY_SOURCE_MEASURED,
+    RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
+    RESIDENCY_SOURCE_SESSION_SLOT,
+    RESIDENCY_SOURCE_NON_RESIDENT,
+    RESIDENCY_SOURCE_UNKNOWN,
+)
+
+
+def _observability_grammar_line() -> str:
+    """The ``routing_resident_prefix`` grammar line from ``routing.md``."""
+    for line in ROUTING_DOC.read_text(encoding="utf-8").splitlines():
+        if line.startswith("`routing_resident_prefix "):
+            return line
+    raise AssertionError("routing.md must show the routing_resident_prefix grammar")
+
+
+def test_routing_grammar_line_matches_the_shipped_vocabularies():
+    """The logged grammar cannot drift from the constants that produce it."""
+    line = _observability_grammar_line()
+
+    assert " measurement=" in line
+    # Additive field: after the source it qualifies, before the thresholds.
+    assert (
+        line.index("residency_source=")
+        < line.index("measurement=")
+        < line.index("min_ratio=")
+    )
+    for value in MEASUREMENT_VOCABULARY:
+        assert value in line, f"measurement={value} missing from the grammar"
+    for source in RESIDENCY_SOURCES:
+        assert source in line, f"residency_source={source} missing from the grammar"
+
+
+def test_measurement_vocabulary_is_documented_where_operators_look():
+    """Every shipped unmeasured reason is documented, not just the grammar."""
+    for path in (ROUTING_DOC, ROLLOUT_DOC):
+        text = path.read_text(encoding="utf-8")
+        missing = [value for value in MEASUREMENT_VOCABULARY if value not in text]
+        assert missing == [], f"{path.name} does not document {missing}"
+
+
+def test_rollout_doc_explains_what_to_read_and_the_residual_gap():
+    """The runbook says what to grep and which limitation is expected."""
+    text = ROLLOUT_DOC.read_text(encoding="utf-8")
+
+    assert "## What to read" in text
+    assert "measurement=" in text
+    # The residual limitation: buffered dispatches emit no prompt_progress.
+    assert "no `prompt_progress`" in text
+    assert "unavailable:no_prior_measurement" in text
+    # The capture rollback relabels resident decisions, intentionally.
+    assert "local_measured_cache_abort_enabled: 0" in text
+    assert "unavailable:capture_disabled" in text
+    assert "not a regression" in text
+
+
+def test_slot_design_doc_records_the_measured_last_dispatch_rung():
+    """The design doc places the new rung and states its invalidation rule."""
+    text = SLOT_DESIGN_DOC.read_text(encoding="utf-8")
+    section = text.split("## 6. Shipped", 1)[1]
+
+    assert "measured_prefill" in section
+    assert RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH in section
+    # Between the live-snapshot rung and the ownership-only rung.
+    assert (
+        section.index(RESIDENCY_SOURCE_MEASURED)
+        < section.index(RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH)
+        < section.index(RESIDENCY_SOURCE_SESSION_SLOT)
+    )
+    for event in ("eviction", "slot release/reassignment", "model switch"):
+        assert event in section, f"invalidation trigger {event!r} undocumented"
+    # Accuracy: the value is an upper bound, never a promise.
+    assert "upper bound" in section
+    assert "decode" in section

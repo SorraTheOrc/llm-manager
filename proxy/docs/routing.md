@@ -966,7 +966,11 @@ a pre-change line (no `measurement=` field) parses unchanged.
 dropped `n_past`) `measured_last_dispatch` uses the session's most recent local
 dispatch from the in-process `proxy.measured_prefill` store — llama-server's own
 `prompt_progress` `total` for the `(model, session)` pair — before falling back
-to the ownership-only `session_slot` sentinel. The rung is guarded by live
+to the ownership-only `session_slot` sentinel. That `total` is the previous
+prompt's size *including* the tokens that dispatch decoded, so the ratio derived
+from it is an upper bound on the prefix this request will reuse: an honest
+approximation of warmth, never a promise that the whole prefix is still
+resident. The rung is guarded by live
 ownership and the capture rollback switch, and prices admission from
 `min(n_past_actual, estimated_tokens)` reusable tokens, so a *grown* prompt can
 be denied with `resident_prefix_insufficient` (the intended AC4 rule (a)

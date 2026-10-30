@@ -820,6 +820,28 @@ Approach A plus the occupancy work that followed it:
   `local_resident_prefix_min_ratio` (default 0.5) of it. This is the
   per-session affinity objective of §2.1, enforced at admission instead of by
   reserving a slot for the session's whole lifetime.
+- **Measurement source per decision** (`LP-0MVT2PY3J00077W6`): the resident
+  prefix is priced from the best *available* measurement, one rung at a time,
+  because the deployed llama.cpp b8782 build reports no per-slot
+  `context_tokens` (so the live rung is unreachable in production). Rung order,
+  labelled per decision in `residency_source`:
+  `measured` (live `/slots` `context_tokens` from the cached snapshot) →
+  `measured_last_dispatch` (llama-server's own `prompt_progress` `total` for the
+  session's most recent local dispatch, kept per `(model, session)` in the
+  in-process `proxy.measured_prefill` store) → `session_slot` (owns the slot,
+  size unknown — the ownership-only sentinel) → `non_resident` / `unknown`.
+  The `measured_last_dispatch` total is the *previous* prompt's size including
+  that dispatch's decode, so the ratio derived from it is an upper bound on
+  what the current request will reuse: a warmth estimate, never a promise that
+  the whole prefix is still resident.
+- **Captured measurements are invalidated when ownership ends**
+  (`LP-0MVT2QFAP0082BKR`): a stored total is read only while the session still
+  owns the slot it was captured against (the ownership gate is the backstop),
+  and the `(model, session)` entry is cleared on eviction
+  (`router_helpers._record_local_eviction`), on slot release/reassignment
+  (`session._free_slot_assignment`) and on a model switch
+  (`lifecycle.ensure_model_loaded`). After a clear the next decision reports
+  `measurement=unavailable:no_prior_measurement` rather than a stale ratio.
 - **Session tenancy bound**: at most `local_session_tenants` (default: the slot
   count) distinct sessions hold a local reservation at once; a further session
   follows the normal chain instead of evicting a resident. Same-session
@@ -835,9 +857,12 @@ Approach A plus the occupancy work that followed it:
   restores warm instead of prefilling cold. Every eviction emits the shared
   `local_eviction` ERROR event (`proxy/admission_events.py`).
 - **Observability**: `routing_resident_prefix` decision lines carry
-  `n_past_actual`, `estimated_tokens`, `reuse_ratio`, `slot_owner_session` and
-  the decision; `proxy-usage-analysis` reports the resident-vs-evicted reuse
-  split and per-session slot-owner churn.
+  `n_past_actual`, `estimated_tokens`, `reuse_ratio`, `slot_owner_session`,
+  `residency_source` and the additive `measurement=` provenance value
+  (`measured`, or a closed `unavailable:<reason>` — see
+  `proxy/docs/routing.md`) plus the decision; `proxy-usage-analysis` reports the
+  resident-vs-evicted reuse split, the measurement split and per-session
+  slot-owner churn.
 
 Not shipped here, deliberately: no slot-count change (evaluated separately in
 `LP-0MVN3KPEC007WWL5` — at 3 slots the per-slot context falls from 262,144 to
