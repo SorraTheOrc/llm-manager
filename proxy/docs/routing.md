@@ -1532,6 +1532,23 @@ refusal the direct-guard dispatch point emits `local_only_refused` and **not**
 reserved for a real fall-through (the `prefer-local` / `remote-ok` / absent
 header clients that are served by the next provider).
 
+**Worked example.** The 2026-10-25 refusal of session
+`herdr-1792897705-4039879-16152` — a cache-cold 100k-token prompt priced far
+outside the 60 s wait budget and refused by the direct free-slot guard while a
+local slot was free — reproduces in
+`proxy/tests/test_local_admission_guard.py::test_direct_guard_pin_refusal_is_attributable_and_claims_no_fallback`
+and leaves this output (fields elided with `…` are unchanged by this contract;
+the reproducer asserts the refusal line below is the exact line the code
+emits, and that no fall-through line accompanies it):
+
+```text
+local_admission_guard decision=reject reason=eta_exceeds_budget_direct enforced=true eta_prefill_s=468.0 … new_tokens=100000 budget_tokens=0 … free_slot=true priority=low policy=reject model=Qwen3 … provider=local-llama session=herdr-1792897705-4039879-16152
+local_only_refused reason=eta_exceeds_budget_direct preference=local-preferred verdict=deferrable session=herdr-1792897705-4039879-16152 provider=local-llama priority=low new_tokens=100000 budget_tokens=0 eta_prefill_seconds=468.0 budget_seconds=60.0 route=refused
+```
+
+The example contains no `local_admission_guard_direct_fallback` line at all:
+this request was refused, never routed onwards.
+
 #### Promoted: a too-large request leaves the local chain
 
 A `too_large` verdict is never deferred and never refused for local capacity.

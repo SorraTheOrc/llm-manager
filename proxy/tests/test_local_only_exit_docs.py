@@ -383,3 +383,67 @@ def test_refusal_line_fields_and_the_fallback_claim_are_documented():
         "the docs must state that the '→ routing to next provider' line is "
         "emitted only on a real fall-through (AC1)"
     )
+
+
+#: Heading of the worked-example subsection that shows the reproduced incident
+#: (LP-0MVNTJQVB007QWEZ AC5).
+WORKED_EXAMPLE_HEADING = "**Worked example"
+
+#: The 2026-10-25 refusal's session id — the case the example reproduces.
+INCIDENT_REFUSAL_SESSION = "herdr-1792897705-4039879-16152"
+
+#: The test that reproduces the incident end-to-end (and asserts the example is
+#: the exact line it emits).
+REPRODUCTION_TEST = (
+    "test_direct_guard_pin_refusal_is_attributable_and_claims_no_fallback"
+)
+
+
+def _worked_example_block(section: str) -> str:
+    """The fenced log block of the worked example, fences stripped."""
+    rest = section[section.index(WORKED_EXAMPLE_HEADING) :]
+    fence_start = rest.index("```")
+    fence_end = rest.index("```", fence_start + 3)
+    return rest[fence_start + 3 : fence_end]
+
+
+def test_worked_example_shows_the_reproduced_incident_log_output():
+    """LP-0MVNTJQVB007QWEZ AC5: the incident's output is written down.
+
+    "Reproducible in a test" is only verifiable if the output an operator
+    actually sees is recorded next to the reproducer: the worked example must
+    show the refusal line for the 2026-10-25 session, name the test that
+    reproduces it, and — because the refusal was never routed anywhere — claim
+    no fall-through inside the example. (The reproducer additionally asserts
+    the example *is* the line it emits, so the sample cannot be invented.)
+    """
+    section = _section(ROUTING_DOC.read_text())
+    block = _worked_example_block(section)
+
+    assert INCIDENT_REFUSAL_SESSION in block, (
+        "the worked example must show the log output of the 2026-10-25 "
+        f"incident (session {INCIDENT_REFUSAL_SESSION}); got {block!r}"
+    )
+    example_lines = [line.strip() for line in block.splitlines() if line.strip()]
+    assert any(
+        line.startswith("local_only_refused ")
+        and f"session={INCIDENT_REFUSAL_SESSION}" in line
+        for line in example_lines
+    ), (
+        "the worked example must show the countable refusal line for the "
+        f"incident; got {example_lines!r}"
+    )
+    assert any(
+        line.startswith("local_admission_guard decision=reject") for line in example_lines
+    ), (
+        "the worked example must also show the guard decision line the refusal "
+        f"accompanies; got {example_lines!r}"
+    )
+    assert "routing to next provider" not in block, (
+        "the worked example must not show a fall-through claim for a refused "
+        f"request — nothing was routed; got {block!r}"
+    )
+    assert REPRODUCTION_TEST in section, (
+        f"the worked example must name its reproducer ({REPRODUCTION_TEST}) "
+        "so an operator can regenerate the output"
+    )

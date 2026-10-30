@@ -52,6 +52,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import proxy.provider as provider
@@ -2606,6 +2607,26 @@ async def test_deferral_exit_refuses_before_resolving_a_remote_candidate(
 #: The 2026-10-25 refusal's session id — the AC5 reproduction case.
 INCIDENT_REFUSAL_SESSION = "herdr-1792897705-4039879-16152"
 
+#: The operator-facing doc that shows the incident's worked-example log output
+#: (AC5). The reproduction below asserts the example *is* the line it emits, so
+#: the runbook can never show output no build produces.
+_ROUTING_DOC = Path(__file__).resolve().parents[1] / "docs" / "routing.md"
+
+
+def _documented_incident_refusal_line() -> str:
+    """The ``local_only_refused`` line the docs show for the incident session."""
+    documented = [
+        line.strip()
+        for line in _ROUTING_DOC.read_text().splitlines()
+        if line.strip().startswith("local_only_refused ")
+        and f"session={INCIDENT_REFUSAL_SESSION}" in line
+    ]
+    assert len(documented) == 1, (
+        "proxy/docs/routing.md must show exactly one worked-example refusal "
+        f"line for session {INCIDENT_REFUSAL_SESSION}; got {documented!r}"
+    )
+    return documented[0]
+
 
 def _log_messages(caplog) -> list[str]:
     """Every captured message, in emission order."""
@@ -2703,6 +2724,14 @@ async def test_direct_guard_pin_refusal_is_attributable_and_claims_no_fallback(
     )
     assert float(fields.get("eta_prefill_seconds", 0.0)) > 0.0
     assert float(fields.get("budget_seconds", 0.0)) > 0.0
+
+    # AC5: the worked example in proxy/docs/routing.md is *this* line — the
+    # runbook must show output the build really produces, and the doc is what
+    # makes the incident verifiable outside the work item.
+    assert lines[0] == _documented_incident_refusal_line(), (
+        "the documented worked example must be the refusal line this "
+        "reproduction emits; update proxy/docs/routing.md with the emitted line"
+    )
 
     # AC1: nothing was routed, so nothing may claim it was.
     assert [
