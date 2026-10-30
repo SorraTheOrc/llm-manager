@@ -390,6 +390,11 @@ prefill-deadline interaction). Audit-session lease hygiene — why an `active`
 record with no work exists for minutes — stays with the existing wedge/orphan
 items (LP-0MVO8H7VQ003B12I, LP-0MUCEFB8E003YVFF); it is not re-filed here.
 
+**Update — the eligibility fix shipped and is measured** (v0.1.25,
+LP-0MVN4LBZ500281Z7 commit `25e99ff8`); see
+[Idle-admit eligibility](#idle-admit-eligibility-lp-0mvrclpvi0057116-priced-measured-residual-attributed)
+below for the post-fix window and the residual attribution.
+
 ### Appendix Q3 — the probe's ~705 s lease, settled
 
 The original probe's own refusal is inside this window:
@@ -412,6 +417,57 @@ reasons.** (The probe's next request, once the lease cleared, was then refused
 by the ETA guard — `eta_exceeds_budget_direct`, 53.6 s projected prefill vs the
 60 s budget — which is the same prefill-feasibility constraint described above,
 not a lease condition.)
+
+## Idle-admit eligibility (LP-0MVRCLPVI0057116): priced, measured, residual attributed
+
+**What was tuned.** The idle admit is no longer granted on an idle clock alone:
+`_evaluate_idle_admission_override` prices the request with the **same**
+`prefill_eta.evaluate_admission` guard every other admission path uses — the
+flat `local_cold_prefill_budget_tokens` cap (25,000 new tokens) plus the wait,
+`local_prefill_deadline_seconds` and
+`local_admission_guard_budget_safety_fraction × deadline` bounds — and returns
+`admitted: false` (keeping the economic remote fallback) when it refuses. The
+refusal is logged as `routing_idle_admit_refused ... reason=…` so it is
+attributable, never silently mistaken for an idle block. The change shipped in
+v0.1.25 (LP-0MVN4LBZ500281Z7, commit `25e99ff8`). There is no second budget
+copy, the guard knobs are read per dispatch (hot-reloadable), and the
+override's own flag is unchanged. Only the physical `context_too_large` cap and
+the dispatch lease gate remain non-overridable, exactly as before.
+
+**Post-fix window (2026-10-26 00:00 → 2026-10-30 06:00, proxy logs,
+request-scoped: an admit is paired with a first byte in the same session ≤ 60 s
+or with `prefill_deadline_exceeded session=` ≤ 300 s).**
+
+| Outcome | Count |
+| --- | ---: |
+| `routing_idle_admit_refused` before dispatch | 7,567 |
+| — `prefill_budget_exceeded` (flat cap) | 7,320 |
+| — `eta_exceeds_budget` (wait bound) | 167 |
+| — `prefill_eta_exceeds_safety_budget` | 80 |
+| `routing_idle_admit` admissions | 57 |
+| — reached a local first byte ≤ 60 s | 6 |
+| — cancelled at `prefill_deadline_exceeded`, then detoured remote | 30 |
+| — neither (served later / client cancelled) | 21 |
+
+**The 30 residual cancellations are not a pricing gap.** Every one had
+`new_tokens` between **40 and 21,021** — inside the 25,000 cap — and aborted at
+the 120 s deadline with *zero* prefill progress. The trace shows a warm request
+(`estimated_tokens=97773 new_tokens=199 cached_ratio=1.00`) admitted on a free
+gate, then `lease_extended_during_prefill ... progress=None alive=False
+in_flight=True` every 10 s until `prefill_deadline_exceeded deadline=120s`: a
+competing prefill arrived after the admit, which admit-time pricing cannot
+see. This is the pre-existing **zero-progress head-of-line residual**, owned by
+LP-0MVO8H7VQ003B12I — not the "guard's calibrated refusal and the deadline
+disagree" hypothesis the intake recorded. The tuning removes the
+doomed-big-prefill class (7,320 pre-dispatch refusals that would previously
+have been dispatched); removing the residual class needs the head-of-line fix.
+
+**Flag decision (recorded on LP-0MVJXGSEG0045IAF).** Keep
+`local_idle_admit_enabled: true` with the eligibility fix (it is now fail-safe
+and refuses doomed prefills before dispatch), but **do not** enable by default:
+`enable_by_default` requires a window with no idle-admitted
+`prefill_deadline_exceeded`, which needs LP-0MVO8H7VQ003B12I first. Rollback
+remains the flag back to `false` plus `POST /admin/reload-config`.
 
 ## Tests
 

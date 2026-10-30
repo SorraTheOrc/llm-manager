@@ -2160,19 +2160,40 @@ server:
   # `POST /admin/reload-config` that made this flag live (no restart needed)
   # and analysed with ``scripts/idle_admit_impact.py --window-closed``.
   #
-  # MEASURED RESULT: 31 admissions, 0 conversions — 22 dispatched and were
-  # cancelled at ``local_prefill_deadline_seconds`` with zero prefill
-  # progress, 9 were refused by the ETA admission guard's queue budget, and
-  # **none** was refused by the local dispatch lease gate. The lease gate is
-  # therefore not what costs the override its win: it stays a no-preemption
-  # occupancy contract (decision LP-0MVK35UX20081BIB, see
-  # ``docs/dev/idle-window-measurements.md``), and the eligibility gap is
-  # LP-0MVRCLPVI0057116.
+  # ELIGIBILITY (LP-0MVRCLPVI0057116): an idle GPU is not permission to
+  # start a prefill it cannot finish. The admit decision is priced by the
+  # SHARED admission guard — the flat ``local_cold_prefill_budget_tokens``
+  # cap plus the wait / ``local_prefill_deadline_seconds`` /
+  # ``local_admission_guard_budget_safety_fraction`` bounds — so an
+  # over-budget or over-deadline prompt is refused BEFORE dispatch
+  # (``routing_idle_admit_refused ... reason=prefill_budget_exceeded|
+  # eta_exceeds_budget|prefill_eta_exceeds_safety_budget``) instead of being
+  # dispatched and cancelled at the deadline. No second budget copy exists:
+  # the guard knobs above are read per dispatch, so
+  # ``POST /admin/reload-config`` retunes eligibility without a restart.
+  #
+  # MEASURED RESULT (window of record 2026-10-22 21:48 → 2026-10-23 21:48,
+  # before the eligibility fix): 31 admissions, 0 conversions — 22 dispatched
+  # and cancelled at ``local_prefill_deadline_seconds`` with zero prefill
+  # progress, 9 refused by the ETA guard's queue budget, **none** refused by
+  # the local dispatch lease gate (it stays a no-preemption occupancy
+  # contract; decision LP-0MVK35UX20081BIB).
+  #
+  # POST-FIX WINDOW (2026-10-26 00:00 → 2026-10-30 06:00, eligibility fix live):
+  # 7,567 ``routing_idle_admit_refused`` before dispatch (7,320 budget, 167
+  # ETA, 80 safety) and 57 admissions — 6 reached a first byte, 30 were
+  # cancelled at the deadline and 21 neither. All 30 cancellations had
+  # ``new_tokens`` 40–21,021 (under the 25 K cap) and aborted with NO prefill
+  # progress: they are the pre-existing zero-progress head-of-line residual
+  # **LP-0MVO8H7VQ003B12I**, not a pricing failure — admit-time pricing cannot
+  # see a competing prefill that arrives after the admit.
+  #
+  # FLAG DECISION (recorded on LP-0MVJXGSEG0045IAF): keep the flag ON with the
+  # eligibility fix (it eliminates the doomed-big-prefill class). It is NOT
+  # enabled by default: a clean no-deadline-abort window requires the
+  # head-of-line residual fix (LP-0MVO8H7VQ003B12I) first.
   #
   # ROLLBACK is this flag back to ``false`` + the same reload (no other state).
-  # Keep it on only while an eligibility fix (LP-0MVRCLPVI0057116) or a
-  # re-measured window supports `enable_by_default`; the measured window did
-  # not, so leaving it on untuned spends slot time on doomed prefills.
   # A malformed or non-positive ``local_idle_admit_seconds`` also disables the
   # override rather than admitting on a guess.
   local_idle_admit_enabled: true

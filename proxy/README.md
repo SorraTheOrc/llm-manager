@@ -1073,6 +1073,27 @@ saturation kinds are distinguishable in observability.
   the no-progress watchdog, orphan cleanup, session eviction and adaptive
   expiry. Numbers and rationale: `docs/dev/idle-window-measurements.md`;
   design note: `docs/dev/slot-management-design.md` §9.2.
+- **Idle admission is priced against prefill feasibility** (LP-0MVRCLPVI0057116):
+  the idle override is the *last rung* of the admission ladder, so it consults
+  the shared `prefill_eta.evaluate_admission` guard — the flat
+  `local_cold_prefill_budget_tokens` cap plus the wait, prefill-deadline and
+  `local_admission_guard_budget_safety_fraction × deadline` bounds — before it
+  admits a `large_context_bypass`. A prompt the guard refuses keeps the
+  economic remote fallback and is logged as `routing_idle_admit_refused ...
+  reason=prefill_budget_exceeded|eta_exceeds_budget|
+  prefill_eta_exceeds_safety_budget`; it is never dispatched and then cancelled
+  at the deadline. The guard knobs are read per dispatch, so
+  `POST /admin/reload-config` retunes it without a restart; the physical
+  `context_too_large` cap and the `local_lease_active` dispatch gate stay
+  non-overridable. Post-fix window (2026-10-26 00:00 → 2026-10-30 06:00):
+  7,567 pre-dispatch refusals and 57 admissions, of which 6 reached a first
+  byte; the 30 still cancelled at the deadline were all warm/small prompts
+  (`new_tokens` 40–21,021) starved with zero progress behind a competing
+  prefill — the separate zero-progress head-of-line residual
+  LP-0MVO8H7VQ003B12I, not a pricing failure. Decision (LP-0MVJXGSEG0045IAF):
+  keep the flag on with the eligibility fix, not `enable_by_default` until a
+  clean no-deadline-abort window after that residual fix. Numbers:
+  `docs/dev/idle-window-measurements.md`.
 
 Behavior:
 - **Streaming requests** (`stream: true`) receive periodic SSE comment lines
