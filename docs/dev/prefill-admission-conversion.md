@@ -7,12 +7,16 @@ waits ending in `contention_queue_fallback_after_queue` to drop below the 85 %
 baseline measured 2026-10-19/20 over a 24 h window, with no new
 `local_eviction_after_acceptance` events. This record captures that baseline
 **before** the contended-pricing fix is deployed, so the post-change
-measurement (child `LP-0MVS9Z0GY008LCJA`) has a like-for-like comparison on
-the current code.
+measurement (now delivered by `LP-0MVTKTOVI006ZONN` as
+[`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md))
+has a like-for-like comparison on the current code.
 
 The numbers are produced entirely by
 [`scripts/prefill_admission_conversion.py`](../../scripts/prefill_admission_conversion.py)
-(a pure log analyser — no proxy behaviour change, no running proxy required):
+(a pure log analyser — no proxy behaviour change, no running proxy required).
+That page also carries the **post-change 24 h record** (AC4) delivered by
+`LP-0MVTKTOVI006ZONN`, including the `local_eviction_after_acceptance` counts
+by reason.
 
 ```bash
 scripts/prefill_admission_conversion.py \
@@ -97,7 +101,7 @@ AC4) — this page records the pre-change state only.
 | 2 | `LP-0MVS9Y76R004B5M8` | Contended prefill rate bucket (`rate_bucket` log field) |
 | 3 | `LP-0MVS9YK9P006M1NQ` | Occupant-remaining priced from new tokens at the contended rate |
 | 4 | `LP-0MVS9YKHL007UBBZ` | Decision-log / usage-report surface for `rate_bucket` |
-| 5 | `LP-0MVS9Z0GY008LCJA` | Post-change 24 h measurement vs this baseline |
+| 5 | `LP-0MVS9Z0GY008LCJA` | Post-change 24 h measurement vs this baseline (superseded by `LP-0MVTKTOVI006ZONN`, which delivered [`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md)) |
 | 6 | `LP-0MVS9Z034006MFZ6` | Docs and rollback |
 
 Related: [`docs/dev/contended-prefill-pricing.md`](contended-prefill-pricing.md)

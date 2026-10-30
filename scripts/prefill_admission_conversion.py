@@ -28,6 +28,12 @@ The parser tolerates pre-change log shapes (no ``rate_bucket`` /
 dropping the event, so the tool runs unchanged against today's log format and
 the post-change format.
 
+``local_eviction_after_acceptance`` events are counted too (AC4's second
+clause: no *new* eviction class after the change). Counts are reported in
+total and by ``reason``, plus per new-token band (banded by the evicted
+request's own ``new_tokens``, so it is not the same quantity as the admission
+band), so the post-change record needs no hand-rolled log scan.
+
 Rotation / decompression is delegated to ``scripts/lib/proxy_logs.py``. The
 line parsing is deliberately local and narrowly scoped: the
 ``proxy-usage-analysis`` parser lives under ``.pi/`` agent infrastructure and
@@ -148,7 +154,7 @@ def parse_timestamp(value: str) -> datetime:
 class Event:
     """One parsed log line relevant to the conversion report."""
 
-    kind: str  # admission | first_byte | queue_dispatch | queue_fallback
+    kind: str  # admission | first_byte | queue_dispatch | queue_fallback | eviction
     ts: datetime
     session: str | None
     new_tokens: int | None = None
@@ -165,6 +171,14 @@ def parse_event(line: str, ts: datetime) -> Event | None:
     A missing field stays ``None`` rather than dropping the event, so log-format
     drift degrades a metric instead of breaking the report.
     """
+    if "local_eviction_after_acceptance" in line:
+        return Event(
+            kind="eviction",
+            ts=ts,
+            session=_first(_KV_SESSION, line),
+            new_tokens=_int(_KV_NEW_TOKENS, line),
+            reason=_first(_KV_REASON, line),
+        )
     if "local_admission_guard decision=" in line:
         return Event(
             kind="admission",
@@ -215,6 +229,7 @@ class BandStats:
     queue_abandoned: int = 0
     queue_wait_seconds: float = 0.0
     rate_buckets: dict[str, int] = field(default_factory=dict)
+    evictions: int = 0
 
     @property
     def queued_waits(self) -> int:
@@ -243,6 +258,7 @@ class BandStats:
             "queue_abandoned": self.queue_abandoned,
             "abandoned_share": round(self.abandoned_share, 4),
             "queue_wait_seconds": round(self.queue_wait_seconds, 2),
+            "evictions": self.evictions,
         }
 
 
@@ -320,6 +336,14 @@ def build_report(events: list[Event], *, files: list[str]) -> dict:
         chosen = (preceding or candidates)[-1:] or []
         return band_stats(chosen[0].new_tokens if chosen else None)
 
+    evictions_by_reason: dict[str, int] = {}
+    for event in events:
+        if event.kind != "eviction":
+            continue
+        reason = event.reason or "unknown"
+        evictions_by_reason[reason] = evictions_by_reason.get(reason, 0) + 1
+        band_stats(event.new_tokens).evictions += 1
+
     for event in events:
         if event.kind == "queue_dispatch":
             entry = band_for_queue(event)
@@ -338,6 +362,10 @@ def build_report(events: list[Event], *, files: list[str]) -> dict:
             if _band_has_data(stats[label])
         },
         "totals": _totals(stats),
+        "evictions": {
+            "total": sum(evictions_by_reason.values()),
+            "by_reason": dict(sorted(evictions_by_reason.items())),
+        },
         "first_byte_without_admit": first_bytes_without_admit,
         "converted_sessions": converted_sessions,
         "log_files": files,
@@ -350,6 +378,7 @@ def _band_has_data(entry: BandStats) -> bool:
         or entry.rejects
         or entry.queued_waits
         or entry.sessions_admitted
+        or entry.evictions
     )
 
 
@@ -364,6 +393,7 @@ def _totals(stats: dict[str, BandStats]) -> dict:
         total.queue_dispatched += entry.queue_dispatched
         total.queue_abandoned += entry.queue_abandoned
         total.queue_wait_seconds += entry.queue_wait_seconds
+        total.evictions += entry.evictions
     return total.to_dict()
 
 
@@ -428,6 +458,11 @@ def render_text(report: dict) -> str:
     lines.append("")
     lines.append(
         f"First byte without admit: {report['first_byte_without_admit']}"
+    )
+    evictions = report.get("evictions") or {}
+    lines.append(
+        f"local_eviction_after_acceptance: {evictions.get('total', 0)} "
+        f"{evictions.get('by_reason') or {}}"
     )
     return "\n".join(lines)
 

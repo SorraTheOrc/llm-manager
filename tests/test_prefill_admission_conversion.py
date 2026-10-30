@@ -15,6 +15,9 @@ Covered:
   separately rather than silently joined.
 - AC3: graceful degradation when the newer log fields (``rate_bucket`` /
   ``contended_samples``) are absent.
+- AC4 (post-change record): ``local_eviction_after_acceptance`` events counted
+  in total and by ``reason``, window-filtered, never leaking into the
+  admission verdict counters.
 """
 
 from __future__ import annotations
@@ -90,6 +93,17 @@ def _queue_dispatch(ts: str, session: str, queued: float = 12.0) -> str:
         f"provider=local session={session} queued_duration={queued:.2f}s "
         f"policy=queue depth=1"
     )
+
+
+def _eviction(ts: str, session: str, reason: str | None = "measured_cache_deficit") -> str:
+    fields = [
+        "local_eviction_after_acceptance",
+        f"session={session}",
+    ]
+    if reason is not None:
+        fields.append(f"reason={reason}")
+    fields.extend(["estimated_tokens=16788", "new_tokens=81", "eta_prefill_s=15.4"])
+    return f"{ts} - ERROR - " + " ".join(fields)
 
 
 def _write_log(tmp_path: Path, lines: list[str], name: str = "proxy.log") -> Path:
@@ -251,6 +265,48 @@ def test_window_filtering_excludes_out_of_window_events(tmp_path):
     assert report["since"] == "2026-10-19 00:00:00"
     assert report["until"] == "2026-10-20 00:00:00"
     assert report["log_files"] == ["proxy.log"]
+
+
+# ---------------------------------------------------------------------------
+# AC4 — `local_eviction_after_acceptance` counted by reason (no hand-rolled scan)
+# ---------------------------------------------------------------------------
+
+def test_eviction_events_are_counted_by_reason():
+    lines = [
+        _eviction("2026-10-19 10:00:00,000", "s-1", reason="measured_cache_deficit"),
+        _eviction("2026-10-19 10:01:00,000", "s-1", reason="measured_cache_deficit"),
+        _eviction("2026-10-19 10:02:00,000", "s-2", reason="prefill_deadline"),
+        _eviction("2026-10-19 10:03:00,000", "s-3", reason=None),
+    ]
+    events = [parse_event(line, parse_line_timestamp(line)) for line in lines]
+    report = build_report([event for event in events if event is not None], files=[])
+
+    assert report["evictions"] == {
+        "total": 4,
+        "by_reason": {
+            "measured_cache_deficit": 2,
+            "prefill_deadline": 1,
+            "unknown": 1,
+        },
+    }
+    # Banded by the evicted request's own new_tokens (81 -> <8k), and the
+    # eviction never leaks into the admission verdict counters.
+    assert report["bands"]["<8k"]["evictions"] == 4
+    assert report["bands"]["<8k"]["admission_verdicts"] == {"admit": 0, "reject": 0}
+    assert report["totals"]["evictions"] == 4
+
+
+def test_eviction_events_are_window_filtered(tmp_path):
+    log_dir = _write_log(
+        tmp_path,
+        [
+            _eviction("2026-10-18 23:59:59,000", "before", reason="idle_timeout"),
+            _eviction("2026-10-19 12:00:00,000", "inside", reason="idle_timeout"),
+            _eviction("2026-10-20 00:00:01,000", "after", reason="idle_timeout"),
+        ],
+    )
+    report = analyse(log_dir, SINCE, UNTIL)
+    assert report["evictions"] == {"total": 1, "by_reason": {"idle_timeout": 1}}
 
 
 def test_cli_json_emits_window_bounds_and_files(tmp_path):

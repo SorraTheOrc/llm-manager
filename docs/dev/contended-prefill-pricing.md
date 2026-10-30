@@ -119,7 +119,7 @@ dependency order):
 | 2 | `LP-0MVS9Y76R004B5M8` | Contended prefill rate bucket (co-residency calibration + `rate_bucket` log field) |
 | 3 | `LP-0MVS9YK9P006M1NQ` | Occupant-remaining priced from new tokens at the contended rate |
 | 4 | `LP-0MVS9YKHL007UBBZ` | Decision-log and usage-report surface for `rate_bucket` |
-| 5 | `LP-0MVS9Z0GY008LCJA` | Post-change 24 h measurement window vs the 85 % baseline |
+| 5 | `LP-0MVTKTOVI006ZONN` | Post-change 24 h measurement window vs the 85 % baseline (record: [`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md)) |
 | 6 | `LP-0MVS9Z034006MFZ6` | Docs and rollback (this page) |
 
 Related origin items: `LP-0MVKUKF65008D5UN` (conservative ETA for large
@@ -127,5 +127,10 @@ prompts), `LP-0MVICD2YW004DJPV` (occupancy-aware symmetric floor),
 `LP-0MVOFVCA2008DQVE` (measured-occupant term) and `LP-0MVKUKEU80022C3U`
 (deadline admission bound).
 
-The 24 h post-change evidence for parent AC4 is recorded by child 5; until that
-window closes, the parent remains in review with AC4 gated on it.
+The 24 h post-change evidence for parent AC4 is recorded by
+[`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md)
+(delivered by `LP-0MVTKTOVI006ZONN`): the abandoned-queue-wait share is **60.7 %**
+(314/517) over `2026-10-29 00:10:18` → `2026-10-30 00:10:18` UTC, below the
+literal 85 % bar, with **no new** `local_eviction_after_acceptance` class. The
+stricter working baseline (36.9 %) was not cleared — that regression is tracked
+in `LP-0MVV1V213002QAIR`.
