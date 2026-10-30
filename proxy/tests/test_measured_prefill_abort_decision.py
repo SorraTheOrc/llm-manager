@@ -33,7 +33,6 @@ import json
 import random
 
 import pytest
-
 from proxy.measured_cache_abort import (
     BOUND_TOKENS_KEY,
     DETAIL_ABORT,

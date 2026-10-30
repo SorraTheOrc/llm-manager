@@ -170,8 +170,15 @@ exceptions are configured via `per-file-ignores` in `.ruff.toml`.
 
 ### Remaining issues
 
-After auto-fix, the remaining warnings are non-auto-fixable issues that
-require manual attention. Run `ruff check .` to see the current count.
+The tracked tree is lint-clean: `ruff check .` at the repo root reports `All
+checks passed!` (exit 0, no findings). Known-defect warnings are limited to
+stderr noise from a pre-existing invalid `# noqa` directive
+(`proxy/proxy/handlers.py:522`, tracked separately) — it is not a finding.
+Verify with:
+
+```bash
+.venv/bin/ruff check .
+```
 
 - Playwright UI tests (requires Node/npm and browser install):
   ```

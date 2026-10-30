@@ -1,9 +1,3 @@
-
-# <!-- REFACTOR-LP-0MVTH2TG5007Z1RY
-# smell: modernization
-# severity: medium
-# description: Use format specifiers instead of percent format
-# -->
 """Per-turn correlation id (``turn=``) on structured proxy log lines.
 
 LP-0MVMBM467005BT4A. The id is generated once per client request and carried
@@ -38,7 +32,9 @@ from proxy.turn_id import (
     turn_field,
 )
 
-TURN_RE = re.compile(r"\bturn=([0-9a-f]{%d})\b" % TURN_ID_LENGTH)
+# Not a logging call: plain pattern construction, so no lazy-formatting
+# semantics are involved in using an f-string here.
+TURN_RE = re.compile(rf"\bturn=([0-9a-f]{{{TURN_ID_LENGTH}}})\b")
 
 
 class _DummyRequest:
@@ -116,7 +112,7 @@ def _fallback_line(caplog) -> str:
 def test_new_turn_id_is_short_hex():
     turn = new_turn_id()
 
-    assert re.fullmatch(r"[0-9a-f]{%d}" % TURN_ID_LENGTH, turn), turn
+    assert re.fullmatch(rf"[0-9a-f]{{{TURN_ID_LENGTH}}}", turn), turn
 
 
 def test_new_turn_ids_differ():

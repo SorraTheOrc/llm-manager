@@ -334,5 +334,5 @@ def decide_measured_cache_abort(
             bound_tokens=effective.bound_tokens,
             min_deficit_ratio=effective.min_deficit_ratio,
         )
-    except Exception:  # noqa: BLE001 - AC5: a decision error must never abort
+    except Exception:  # AC5: a decision error must never abort
         return _continue(DETAIL_ERROR, settings=effective)
