@@ -133,8 +133,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             gpu = data.get("gpu_busy")
             if gpu:
+                # Hardware activity, not served local work (LP-0MVUIM7A50053EFN
+                # AC2): the power figure is supplementary telemetry and must
+                # never read as the local model utilisation figure, which is
+                # the log-derived ``local_busy`` printed above.
                 busy_summary += (
-                    f", GPU busy (power-based, 15s sampling) {gpu['busy_pct']:.1f}% "
+                    f", GPU busy — power-based (hardware, not local model "
+                    f"utilisation) {gpu['busy_pct']:.1f}% "
                     f"({gpu['busy_seconds']:.0f}s)"
                 )
         print(

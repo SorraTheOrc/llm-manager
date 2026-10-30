@@ -30,6 +30,7 @@ import sys
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -7253,6 +7254,40 @@ class TestMachineReadablePrefillAndBusyJson:
         out = capsys.readouterr().out
         assert "local model busy (dispatch → finish)" in out
         assert "decode-only busy (lower bound)" in out
+
+    def test_cli_text_summary_labels_gpu_busy_hardware_only(self, tmp_path, capsys):
+        """AC2/AC4 (LP-0MVUIM7A50053EFN): the stdout summary keeps the
+        log-derived figure as local busy and labels the power figure as
+        hardware activity that is **not** local model utilisation. The GPU
+        source is stubbed — no live Prometheus dependency."""
+        import analyze_proxy_usage as cli
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        stub = gpu_busy.GpuBusyResult(
+            computing_fraction=0.50,
+            total_seconds=3600.0,
+            busy_seconds=1800.0,
+            idle_seconds=1800.0,
+            smoothed_power_values=[],
+        )
+        with patch("reporting.gpu_busy.compute_gpu_busy", return_value=stub):
+            rc = cli.main(
+                [
+                    "--log-dir", str(log_dir),
+                    "--start", "2026-08-02 14:00:00",
+                    "--end", "2026-08-02 15:00:00",
+                    "--output-dir", str(tmp_path / "out"),
+                ]
+            )
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The decision position carries the log-derived figure (7 s of the
+        # 3600 s window = 0.2 %), never the stubbed 50 % hardware figure.
+        assert "local model busy (dispatch → finish) 0.2%" in out
+        assert "GPU busy — power-based (hardware, not local model utilisation) 50.0%" in out
+        assert "GPU busy (power-based, 15s sampling)" not in out
 
 
 # ---------------------------------------------------------------------------

@@ -2395,9 +2395,14 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
         ap("_The **GPU busy** row uses Prometheus power-consumption data "
            "(`avg_over_time(gpu:computing:bool[Nh])`, evaluated every 15 s): "
            "1 while the GPU draws ≥ 90 W (the recording-rule threshold), 0 "
-           "otherwise. It is the authoritative hardware-side busy measure, "
-           "complementary to the log-based slot-occupancy figures above, "
-           "and does not depend on the proxy's stream lifecycle logs._")
+           "otherwise. It is **hardware activity, not local model "
+           "utilisation**: it counts GPU work outside the proxy's slot "
+           "accounting (other workloads, non-local requests) and misses "
+           "proxy-served work during log gaps. The decision figure for local "
+           "model utilisation is the log-derived `local_busy` "
+           "(`dispatch → finish`) above; this row is supplementary hardware "
+           "telemetry and does not depend on the proxy's stream lifecycle "
+           "logs._")
 
 
 def _phase_cell(value: float | None) -> str:
@@ -3669,9 +3674,12 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
 def _gpu_busy_json(gpu: object | None) -> dict | None:
     """JSON-friendly GPU busy-time from Prometheus power consumption.
 
-    Complement to ``local_busy``: measures the authoritative hardware-side
-    busy fraction from GPU power draw (``gpu:computing:bool``), independent
-    of proxy log events. Returns ``None`` when the query fails.
+    Supplementary hardware telemetry, **not** a local-utilisation signal:
+    measures when the GPU drew compute-level power (``gpu:computing:bool``),
+    independent of proxy log events, so it counts GPU work outside the
+    proxy's slot accounting. Decisions use the log-derived ``local_busy``
+    (``dispatch → finish``); this block is its hardware-side complement.
+    Returns ``None`` when the query fails.
     """
     if gpu is None:
         return None
