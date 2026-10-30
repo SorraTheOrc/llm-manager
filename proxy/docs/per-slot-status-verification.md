@@ -524,3 +524,28 @@ python3 scripts/capacity_signal_verification.py \
 # or: python3 ~/proxy-usage-reports/2026-10-29_24h-remeasure/run_remeasure.py
 ```
 
+### Measurement disposition (LP-0MVLNBCTN0084MT0)
+
+What each acceptance criterion of the measurement item stands on, so the
+numbers above can be read against the item that produced them rather than in
+isolation. The measurement, attribution and documentation deliverables are
+delivered on `dev`; the `< 5 %` target itself is a `/slots` read-path target
+that outlived the fixed evidence window and is owned by a follow-up item.
+
+| AC | Disposition | Evidence |
+|---|---|---|
+| AC1 `slots_stale` < 5 % of polls, `saturated` only with live work | **Missed — accepted as a documented miss** (producer decision, 2026-10-30) | 24 h: 7,698 / 26,019 stale (29.59 %), 70 `saturated`-without-live-work polls. Night: 9,278 / 11,654 (79.61 %), 247. The residual is a `/slots` refresh-latency defect (77 % of residual stale polls refreshed in > 2 s against the 1.0 s detail / 2.0 s counts budgets) carried forward to **LP-0MVVCO1N7004TNGY**. |
+| AC2 herdr downtime dispatches ≥ 10/night, same queue | **Met** | 81 durable `herdr-downtime` dispatches in the 24 h window against a target of 10, on the unchanged `own-backlog` queue — `downtime-dispatches-durable.csv`. |
+| AC3 residual stale polls attributable in the nightly usage report | **Met in the measurement artifacts; nightly counterpart tracked separately** | 100 % of stale polls attributed by cache source (detail 7,224 / counts 474 / unknown 0) and 65 of 70 false-`saturated` polls attributed within a 600 s lookback, in `SUMMARY.md` and `saturated_without_live_work_attribution.csv`. The 05:00 nightly generator publishes no stale metric, so the nightly counterpart is owned by **LP-0MVRMHY0F007RWA0** (additive change under `.pi/skills/proxy-usage-analysis/**`, producer-authorised). |
+| AC4 numbers reported on LP-0MVKSXR4P001V0CM | **Met** | Comment `LP-C0MVVCR6FO008R0DG` on the fix item, plus the same numbers on LP-0MVSTQT8V002SPRZ. |
+| AC5 reproducible/validated | **Met** | `scripts/capacity_signal_verification.py` docstring derivation plus the commands above; the 24 h run reproduces every figure in the table. |
+| AC6 documentation reflects the post-fix findings | **Met** | This section; `proxy/README.md`'s measured-effect note. The nightly-report omission is the LP-0MVRMHY0F007RWA0 gap recorded under AC3. |
+| AC7 full suite green | **Met** | Changed-scope validation at `finish`, then the dev-push pre-push gate runs the full suite on the pushed commit. |
+
+Trend across the three measured windows, same tool and semantics: 79.61 %
+(router-serialised `/slots`, `56a3a28a`/`2d2b6b51`) → 53.92 % (+ child-port
+resolver `f58e8964`) → 29.59 % (same build, 24 h cycle). False `saturated`
+falls in step (2.12 % → 1.07 % → 0.27 % of polls), and no stale poll produced
+`saturated` in any window, so the cache-time reconciliation contract above
+still holds.
+
