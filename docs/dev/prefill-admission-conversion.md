@@ -33,9 +33,10 @@ genuinely a pre-change capture.
 ## Window and inputs
 
 - **Window:** `2026-10-27 19:00:00` → `2026-10-28 19:00:00` (24 h, inclusive).
-- **Log files read (6):** `proxy.log`, `proxy.log-2026-10-28_00`,
-  `proxy.log.2026-10-27_16`, `proxy.log.2026-10-27_22`,
-  `proxy.log.2026-10-28_04`, `proxy.log.2026-10-28_10`.
+- **Log files read (6):** `proxy.log-2026-10-28_00.gz`,
+  `proxy.log.2026-10-27_16.gz`, `proxy.log.2026-10-27_22.gz`,
+  `proxy.log.2026-10-28_04.gz`, `proxy.log.2026-10-28_10.gz`,
+  `proxy.log.2026-10-28_16.gz`.
 - **First byte with no admission line:** 6 sessions (reported separately,
   never silently joined to an admission — harness AC2).
 
@@ -60,6 +61,33 @@ Reject reasons are dominated by the flat cold-prefill budget
 (`prefill_eta_exceeds_deadline`: 184), with queue-budget refusals split across
 `eta_exceeds_budget` / `eta_exceeds_budget_direct`.
 
+### `local_eviction_after_acceptance` in the baseline window
+
+The harness's `evictions` block (`LP-0MVV9JWL9003A6XR`) gives the genuine
+pre-change comparator for AC4's second clause:
+
+| Reason | Pre-change (24 h) | Pre / h |
+|---|---|---|
+| `prefill_deadline` | 145 | 6.04 |
+| `idle_timeout` | 3 | 0.13 |
+| `no_progress_watchdog` | 2 | 0.08 |
+| `lease_evicted` | 1 | 0.04 |
+| `orphan_cleanup` | 1 | 0.04 |
+| **Total** | **152** | **6.33** |
+
+`measured_cache_deficit` is **absent** from this window (0 occurrences): the
+running proxy predates the deploy (`52085f09`, serving from 2026-10-29
+00:10:18) of the measured-cache early-abort feature
+(`LP-0MVR7IN0O000DPXN` / `LP-0MVR7HJD0007RFEM`) that emits it — its commits
+were on `dev` by 2026-10-28 05:49 but were not yet serving. The number that
+appears in the earlier revision of the post-change record — **463** — was a
+naive substring count that included **311 `[remote] POST … body={…}`
+request-body lines** quoting the marker in an agent prompt (this window is
+when `LP-0MVQIT9QY007QU27` was being worked).
+The harness now anchors each marker to the start of the logging message, so
+only the 152 genuine records above are counted; the 311 body lines contribute
+zero (`LP-0MVV9JWL9003A6XR`).
+
 ## Comparison to the parent AC4 reference
 
 The parent's 85 % reference figure was measured on 2026-10-19/20 **before** the
@@ -78,9 +106,14 @@ That makes the comparison two-sided, and both are recorded here:
   `LP-0MVS9Z0GY008LCJA`, so the contended-pricing fix is judged against the
   code it actually changes rather than a stale 85 % figure.
 
-The post-change run must also confirm **zero new
-`local_eviction_after_acceptance` events** for within-budget prompts (parent
-AC4) — this page records the pre-change state only.
+The post-change run must also compare its
+`local_eviction_after_acceptance` events against this baseline (parent AC4's
+second clause). Since this window records 152 genuine events (6.3 / h) and
+**no** `measured_cache_deficit`, the clause's "no new events" reading is
+checked against 152, not zero — the later post-change record
+([`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md))
+records 392 events including the genuinely new `measured_cache_deficit` class,
+which is triaged in `LP-0MVV9JWL9003A6XR`.
 
 ## Reproducing
 
@@ -103,6 +136,7 @@ AC4) — this page records the pre-change state only.
 | 4 | `LP-0MVS9YKHL007UBBZ` | Decision-log / usage-report surface for `rate_bucket` |
 | 5 | `LP-0MVS9Z0GY008LCJA` | Post-change 24 h measurement vs this baseline (superseded by `LP-0MVTKTOVI006ZONN`, which delivered [`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md)) |
 | 6 | `LP-0MVS9Z034006MFZ6` | Docs and rollback |
+| 7 | `LP-0MVV9JWL9003A6XR` | Eviction triage that corrected this baseline's `local_eviction_after_acceptance` comparator (152 genuine, not the 463 substring count) and made the harness count only message-anchored eviction records |
 
 Related: [`docs/dev/contended-prefill-pricing.md`](contended-prefill-pricing.md)
 (the contended pricing and rollback page).

@@ -29,7 +29,9 @@ dropping the event, so the tool runs unchanged against today's log format and
 the post-change format.
 
 ``local_eviction_after_acceptance`` events are counted too (AC4's second
-clause: no *new* eviction class after the change). Counts are reported in
+clause: no *new* eviction class after the change). Only lines whose logging
+*message* starts with the marker count, so a proxied request body that merely
+mentions the string can never inflate the count. Counts are reported in
 total and by ``reason``, plus per new-token band (banded by the evicted
 request's own ``new_tokens``, so it is not the same quantity as the admission
 band), so the post-change record needs no hand-rolled log scan.
@@ -81,6 +83,15 @@ BANDS: tuple[tuple[str, int, int | None], ...] = (
 
 UNKNOWN_BAND = "unknown"
 
+#: Prefix of a logging *message body*: ``<asctime> - [<logger> - ]<LEVEL> - ``.
+#: Used to anchor event markers to the start of the message so text that merely
+#: *mentions* a marker (a proxied request body, an agent prompt) is never
+#: mistaken for the event itself (LP-0MVV9JWL9003A6XR).
+_LOG_MESSAGE_PREFIX = re.compile(
+    r"(?:^|\s-\s)(?:[A-Za-z0-9_.]+\s-\s)?"
+    r"(?:DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\s-\s+"
+)
+
 _KV_SESSION = re.compile(r"\bsession=([A-Za-z0-9_.:-]+)")
 _KV_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
 _KV_DECISION = re.compile(r"\bdecision=([A-Za-z_]+)")
@@ -106,6 +117,23 @@ def band_for(new_tokens: int | None) -> str:
         if new_tokens >= lower and (upper is None or new_tokens < upper):
             return label
     return UNKNOWN_BAND
+
+
+def _message_starts_with(line: str, marker: str) -> bool:
+    """Return ``True`` when *marker* begins the line's logging message body.
+
+    Only the **leftmost** message prefix is considered, so a marker embedded
+    inside a message (``- INFO - [remote] POST ... body={"..."}``, an echoed
+    prompt that happens to contain ``- ERROR - <marker> reason=...``) can never
+    satisfy the anchor: whatever follows the real prefix is the message text.
+    A log-format change that stops emitting the ``<asctime> - [<logger> - ]
+    <LEVEL> - `` prefix degrades the count to zero (an undercount) rather than
+    letting unrelated text inflate it.
+    """
+    prefix = _LOG_MESSAGE_PREFIX.search(line)
+    if prefix is None:
+        return False
+    return line[prefix.end():].startswith(marker)
 
 
 def _first(pattern: re.Pattern[str], line: str) -> str | None:
@@ -171,7 +199,10 @@ def parse_event(line: str, ts: datetime) -> Event | None:
     A missing field stays ``None`` rather than dropping the event, so log-format
     drift degrades a metric instead of breaking the report.
     """
-    if "local_eviction_after_acceptance" in line:
+    # Anchored to the message start: request-body echoes of this marker (agent
+    # prompts quoting an eviction line) inflated the pre-change comparator 3x
+    # before this anchor existed (LP-0MVV9JWL9003A6XR).
+    if _message_starts_with(line, "local_eviction_after_acceptance"):
         return Event(
             kind="eviction",
             ts=ts,

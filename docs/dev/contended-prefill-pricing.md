@@ -131,6 +131,11 @@ The 24 h post-change evidence for parent AC4 is recorded by
 [`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md)
 (delivered by `LP-0MVTKTOVI006ZONN`): the abandoned-queue-wait share is **60.7 %**
 (314/517) over `2026-10-29 00:10:18` → `2026-10-30 00:10:18` UTC, below the
-literal 85 % bar, with **no new** `local_eviction_after_acceptance` class. The
+literal 85 % bar. AC4's second clause ("no new `local_eviction_after_acceptance`
+events") is **not** met on the literal reading: the genuine comparator is
+152 events (6.3 / h) pre-change and 392 (16.3 / h) post-change (×2.6), with
+one genuinely new class, `measured_cache_deficit` (0 → 234). That class is
+triaged in `LP-0MVV9JWL9003A6XR` as expected behaviour of the measured-cache
+early-abort feature, not a defect. The
 stricter working baseline (36.9 %) was not cleared — that regression is tracked
 in `LP-0MVV1V213002QAIR`.

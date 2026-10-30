@@ -127,7 +127,7 @@ matter (`prefill_budget_exceeded` 855 / 662).
 | Local rejects | 3954 | 164.8 | 2742 | 114.3 | ×0.69 |
 | Queued local waits | 65 | 2.7 | 517 | 21.5 | **×8.0** |
 | Abandoned queue waits | 24 | 1.0 | 314 | 13.1 | **×13.1** |
-| `local_eviction_after_acceptance` | 463 | 19.3 | 392 | 16.3 | ×0.85 |
+| `local_eviction_after_acceptance` | 152 | 6.3 | 392 | 16.3 | **×2.6** |
 
 The pre-change window is 19:00→19:00 and the post-change window is
 00:10→00:10, and post-change traffic admitted ~3× as many local dispatches per
@@ -136,24 +136,96 @@ Both windows are exactly 24 h, so the per-hour columns are like-for-like in
 duration, but the **mix** is not identical and must be kept in mind when
 reading the share.
 
+> **Comparator correction (2026-10-30, `LP-0MVV9JWL9003A6XR`).** An earlier
+> revision of this page recorded the pre-change eviction comparator as
+> **463 / 19.3 per h** and concluded the eviction rate was **×0.85 (15 %
+> lower)**. That 463 was a substring artefact: 311 of the 463 hits were
+> `[remote] POST … body={…}` request lines whose agent prompt merely
+> *mentioned* `local_eviction_after_acceptance` (the pre-change window is
+> exactly when `LP-0MVQIT9QY007QU27` was being worked). Re-counted with the
+> harness's message-anchored classifier the genuine pre-change total is
+> **152 (6.3 / h)**, so the eviction rate rose **×2.6**, it did not fall. The
+> diurnal-mix caveat still applies to the *share* comparison; the rate change
+> is large enough to survive it.
+
 ## AC4 second clause — `local_eviction_after_acceptance`
 
-Counted by the committed harness over the same window (`evictions` block of
-the JSON):
+Counted by the committed harness over each window (`evictions` block of the
+JSONs). The classifier only counts a line whose logging *message* starts with
+`local_eviction_after_acceptance`, so a proxied request body that merely quotes
+the string can never be counted (`LP-0MVV9JWL9003A6XR`). The pre-change column
+comes from [`prefill-admission-conversion.json`](prefill-admission-conversion.json),
+regenerated with the same classifier over its own 24 h window:
 
-| Reason | Post-change (24 h) | Post / h | Explanation |
-|---|---|---|---|
-| `measured_cache_deficit` | 234 | 9.75 | Measured cache came back materially below `estimated_tokens`, so the dispatch was re-priced/evicted rather than dispatched on a bad estimate. Pre-existing class (same reason dominates the pre-change window). |
-| `no_progress_watchdog` | 82 | 3.42 | Accepted local dispatch made no progress inside the watchdog window (queue/stall), so the lease was released. Pre-existing class. |
-| `prefill_deadline` | 68 | 2.83 | The 120 s `local_prefill_deadline_seconds` bound was hit after acceptance. Pre-existing class. |
-| `lease_evicted` | 7 | 0.29 | The slot lease was taken by another dispatch. Pre-existing class. |
-| `idle_timeout` | 1 | 0.04 | Lease expired while idle. Pre-existing class. |
-| **Total** | **392** | **16.33** | Compare pre-change **463** / 19.3 h → **no new class and a lower rate**. |
+| Reason | Pre-change (24 h) | Pre / h | Post-change (24 h) | Post / h | Class |
+|---|---|---|---|---|---|
+| `measured_cache_deficit` | **0** | 0.00 | **234** | 9.75 | **NEW** |
+| `prefill_deadline` | 145 | 6.04 | 68 | 2.83 | pre-existing |
+| `no_progress_watchdog` | 2 | 0.08 | 82 | 3.42 | pre-existing |
+| `lease_evicted` | 1 | 0.04 | 7 | 0.29 | pre-existing |
+| `idle_timeout` | 3 | 0.13 | 1 | 0.04 | pre-existing |
+| `orphan_cleanup` | 1 | 0.04 | 0 | 0.00 | pre-existing, absent post-change |
+| **Total** | **152** | **6.33** | **392** | **16.33** | **×2.6 higher** |
 
-Every reason class is non-zero but all five are **pre-existing** classes also
-present in the pre-change era, and the absolute rate is 15 % **lower** than
-pre-change. No new `local_eviction_after_acceptance` class appeared, so AC4's
-second clause holds and no triage work item is triggered by it.
+### `measured_cache_deficit` is a new class, not a pre-existing one
+
+- **Pre-change window: 0.** Its first appearance anywhere in the retained logs
+  is **2026-10-29 00:13:30 UTC** — 3 minutes after the deployment window
+  opened.
+- **Post-change window: 234** — 60 % of all 392 evictions, the dominant class.
+- Emitted by `proxy/proxy/measured_cache_abort.py`
+  (`MEASURED_CACHE_DEFICIT_REASON`), landed in `87f238a2` (2026-10-27)
+  and `1908f431` (2026-10-28) — both ancestors of the deployed
+  `52085f09`, so it is part of the code under measurement.
+- The explanation is the feature's: `llama.cpp`'s first `prompt_progress`
+  event reports the ground-truth reused prefix, and when the measured deficit
+  `(total - cache) / total` clears the ratio floor *and* the measured
+  new-token work exceeds the admission-priced `new_tokens` by more than the
+  token bound, the dispatch is released early (rather than waiting out the
+  deadline) with `reason=measured_cache_deficit`. It is **not** a restatement
+  of the 120 s deadline or of a warm-predicate miss at admission time.
+- **Triage item: `LP-0MVV9JWL9003A6XR`** (eviction triage for this class and
+  for the corrected pre-change comparator).
+
+### Verdict on the new class (AC3): expected behaviour of the feature — not a defect
+
+The class fires exactly where its specification says it should, so no blocking
+child item is created:
+
+- **Inside the documented envelope for all 234 events.** The measured deficit
+  ratio never fell below the `min_deficit_ratio` floor (min 0.2521 against a
+  0.25 floor, median 0.617), and the measured new-token work always exceeded
+  the priced value by more than `bound_tokens` (min 2 074 against a 2 000
+  bound, median 14 402). No event fired on a genuinely warm measurement.
+- **It is hitting the population it was built for.** 55 of 234 (23.5 %) measured
+  **zero** cached tokens (`measured_cache=0`) — dispatches whose admission
+  price implied near-total reuse (`new_tokens` ≪ `estimated_tokens`) but which
+  llama-server re-prefilled from scratch, the documented "fake-warm" case.
+  The events span 73 distinct sessions, 107 of them released at the very first
+  measurement (`elapsed_s ≤ 1`).
+- **They are early releases, not deadline rescues.** All 234 carried a
+  predicted prefill ETA below the 120 s `local_prefill_deadline_seconds` bound
+  (median 17 s), so each is the intended trade: abandon wasted prefill now
+  rather than discover the mis-pricing at the deadline.
+- **Nuance recorded rather than hidden:** for 4 of 234 nothing had been priced
+  as reused (`estimated_tokens == new_tokens`), so those fired on a plain
+  under-estimate of the total work. That is still within documented condition
+  4 ("measured work exceeds the priced compute by more than the bound") but it
+  is the mode to watch if the bound is ever tightened.
+- The high firing rate (9.75 /h, 60 % of evictions) is a **monitoring signal**
+  about how much traffic is admitted on a warm prediction the server
+  contradicts — not a defect in the abort path.
+
+### AC4 second clause verdict: not met on the literal reading
+
+Parent AC4's clause is *"with no new `local_eviction_after_acceptance`
+events"*. That is **not met**: 392 ≠ 0 (up from a genuine pre-change 152) and
+one of the five post-change classes, `measured_cache_deficit`, is genuinely
+new (0 → 234). The new class is triaged in `LP-0MVV9JWL9003A6XR` with the
+verdict above (expected behaviour of the measured-cache early-abort feature),
+and the one class that disappeared (`orphan_cleanup`) is recorded here too. The
+earlier "all five classes pre-existing, lower rate" conclusion on this page was
+wrong on both counts and is superseded by this section.
 
 ## Verdict against both bars
 
@@ -161,11 +233,12 @@ second clause holds and no triage work item is triggered by it.
 |---|---|---|---|
 | Literal parent AC4 (2026-10-19/20 reference) | survived share **< 85 %** | **60.7 %** (314/517) | **met** |
 | Stricter working baseline (pre-change code, same harness) | must not regress above **36.9 %** | **60.7 %** (> 36.9 %) | **not met — regression recorded** |
-| AC4 second clause | no new `local_eviction_after_acceptance` class | 5 pre-existing classes, 392 events (16.3/h vs 19.3/h) | **met** |
+| AC4 second clause | no new `local_eviction_after_acceptance` class | 392 events (16.3/h vs a genuine 6.3/h); one new class `measured_cache_deficit` (0 → 234) | **not met — triaged in `LP-0MVV9JWL9003A6XR`** |
 
-- **Parent AC4 (LP-0MVS8T6F4006DGG3) is satisfied by evidence**: the literal
+- **Parent AC4's headline share bar is satisfied by evidence**: the literal
   85 % bar it names is cleared by 24 points with a committed, reproducible
-  record.
+  record. (The clause's second bar — no new eviction events — is a separate
+  row above and is **not** met; it is triaged rather than waived.)
 - **The stricter working bar is *not* cleared.** Against the pre-change code
   measured with the same harness on the same 24 h basis, the abandoned share
   rose from 36.9 % to 60.7 % and the abandoned-wait rate rose from 1.0 /h to
@@ -176,8 +249,14 @@ second clause holds and no triage work item is triggered by it.
 - The regression is **tracked separately** as **`LP-0MVV1V213002QAIR`**
   ("Contended-pricing: abandoned-queue-wait share regressed to 60.7% vs the
   36.9% working baseline"), discovered from this record, rather than silently
-  accepted. It is not a release blocker for the `dev`→`main` promotion (the
-  literal AC4 bar and the no-new-eviction clause both hold).
+  accepted.
+- **Release-blocker status.** The literal AC4 bar (the abandoned-wait share)
+  and the working-baseline regression are unchanged by this correction. What
+  *is* new is that AC4's second clause no longer holds: the eviction rate rose
+  ×2.6 and `measured_cache_deficit` is a genuinely new class. That class is
+  triaged as expected behaviour of a shipped feature (`LP-0MVV9JWL9003A6XR`),
+  so whether a literally-failing clause blocks the `dev`→`main` promotion is a
+  producer decision — the evidence for it is recorded here and on that item.
 
 ## Reproducing
 
@@ -188,8 +267,15 @@ second clause holds and no triage work item is triggered by it.
 3. The harness is unit-tested from synthetic log lines
    ([`tests/test_prefill_admission_conversion.py`](../../tests/test_prefill_admission_conversion.py)),
    including pre-change line shapes without `rate_bucket` /
-   `contended_samples`, the admission→first-byte join, and the
-   `local_eviction_after_acceptance` reason counters.
+   `contended_samples`, the admission→first-byte join, the
+   `local_eviction_after_acceptance` reason counters, and the
+   request-body-echo case that inflated the old comparator.
+4. Both committed JSONs were regenerated with the message-anchored eviction
+   classifier on 2026-10-30 (`LP-0MVV9JWL9003A6XR`); re-running the command at
+   the top of this page and the one in
+   [`prefill-admission-conversion.md`](prefill-admission-conversion.md)
+   reproduces them (modulo the rotation-dependent `log_files_scanned`
+   inventory).
 
 ## Cross-reference
 
@@ -203,6 +289,9 @@ second clause holds and no triage work item is triggered by it.
 | 6 | `LP-0MVS9YKHL007UBBZ` | Decision-log / usage-report surface for `rate_bucket` |
 | 7 | `LP-0MVS9Z0GY008LCJA`, `LP-0MVSSGE21006BSKS` | Superseded time-blocked carriers of this AC |
 | 8 | `LP-0MVV1V213002QAIR` | Working-baseline regression follow-up (discovered from this record) |
+| 9 | `LP-0MVV9JWL9003A6XR` | Eviction triage: `measured_cache_deficit` new-class verdict + corrected pre-change comparator (152, not 463) |
+| 10 | `LP-0MVR7IN0O000DPXN`, `LP-0MVR7HJD0007RFEM` | Measured-cache early-abort feature that introduced the `measured_cache_deficit` class |
+| 11 | `LP-0MVQIT9QY007QU27` | `prefill_deadline` eviction work being done during the pre-change window (source of the 311 request-body false positives) |
 
 Related: [`docs/dev/contended-prefill-pricing.md`](contended-prefill-pricing.md)
 (the contended pricing and rollback page) and

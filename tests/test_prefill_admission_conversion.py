@@ -17,7 +17,8 @@ Covered:
   ``contended_samples``) are absent.
 - AC4 (post-change record): ``local_eviction_after_acceptance`` events counted
   in total and by ``reason``, window-filtered, never leaking into the
-  admission verdict counters.
+  admission verdict counters, and only when the marker starts the logging
+  message (a request body that merely quotes it contributes 0).
 """
 
 from __future__ import annotations
@@ -294,6 +295,53 @@ def test_eviction_events_are_counted_by_reason():
     assert report["bands"]["<8k"]["evictions"] == 4
     assert report["bands"]["<8k"]["admission_verdicts"] == {"admit": 0, "reject": 0}
     assert report["totals"]["evictions"] == 4
+
+
+def _remote_body_post(ts: str, body_text: str) -> str:
+    """A proxied-request log line whose *body* quotes an eviction line."""
+    return (
+        f"{ts} - INFO - [remote] POST http://192.168.0.199:8000/v1/chat/completions"
+        f' -> https://api.example.inference body={{"messages": [{{"role": '
+        f'"user", "content": "{body_text}"}}]}}'
+    )
+
+
+def test_request_body_lines_never_count_as_evictions(tmp_path):
+    """Body echoes of the marker must contribute 0 (LP-0MVV9JWL9003A6XR).
+
+    The pre-change comparator was inflated 463 vs 152 genuine because any line
+    containing the string counted; an agent prompt naming the event (and even
+    one quoting a full eviction record with a ``reason=`` field) is not an
+    eviction.
+    """
+    quoted_record = (
+        "- ERROR - local_eviction_after_acceptance session=s-9 "
+        "reason=prefill_deadline new_tokens=40000"
+    )
+    lines = [
+        _remote_body_post(
+            "2026-10-19 10:00:00,000",
+            "[test-failure] local_eviction_after_acceptance:prefill_deadline",
+        ),
+        _remote_body_post("2026-10-19 10:01:00,000", quoted_record),
+        _remote_body_post(
+            "2026-10-19 10:02:00,000",
+            "local_eviction_after_acceptance session=x reason=idle_timeout",
+        ),
+        _eviction("2026-10-19 10:03:00,000", "s-1", reason="prefill_deadline"),
+    ]
+    log_dir = _write_log(tmp_path, lines)
+    report = analyse(log_dir, SINCE, UNTIL)
+
+    assert report["evictions"] == {
+        "total": 1,
+        "by_reason": {"prefill_deadline": 1},
+    }
+    assert report["totals"]["evictions"] == 1
+    # The only surviving eviction is the genuine line (new_tokens=81 -> <8k);
+    # the body echoes carry no bandable event at all.
+    assert report["bands"]["<8k"]["evictions"] == 1
+    assert "unknown" not in report["bands"]
 
 
 def test_eviction_events_are_window_filtered(tmp_path):
