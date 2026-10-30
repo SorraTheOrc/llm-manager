@@ -15,7 +15,10 @@ re-dispatching the same giant prompt for hours?
 > **LP-0MVSAMS5O006OAIS** — see
 > [Post-deadline re-dispatch fix — deployment anchor, evidence and the pending 24 h gate](#post-deadline-re-dispatch-fix-lp-0mvsamn14001dmty--deployment-anchor-evidence-and-the-pending-24-h-gate-lp-0mvsams5o006oais).
 > That section also explains why a *pushed* commit is not a *deployed* fix and
-> how the measurement anchors on the proxy restart, not on the push.
+> how the measurement anchors on the proxy restart, not on the push. The
+> deployment restart happened at **2026-10-30 23:10:47**, so the 24 h
+> post-deploy window is **2026-10-30 23:10:47 → 2026-10-31 23:10:47**
+> (LP-0MVVJYJQ9001I8QK).
 
 ## Deployment under test
 
@@ -520,15 +523,40 @@ running build keeps the pre-fix behaviour:
 loads the fix, never at the push.** A window anchored on the push measures the
 pre-fix build and would misattribute the fix's effect.
 
+#### Deployment completed — 2026-10-30 23:10:47 (the measurement anchor)
+
+LP-0MVVJYJQ9001I8QK performed the controlled restart
+(`/skill:start-proxy --restart`, i.e.
+`cd proxy && bash scripts/start-proxy.sh --restart`) and anchored the 24 h
+window on it:
+
+| Field | Value |
+|---|---|
+| Deploy (proxy process start) | **2026-10-30 23:10:47** local (GMT) |
+| New proxy process | PID 3797968, `.venv/bin/python3 -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000` |
+| Outgoing (pre-fix) process | PID 3224511, started 2026-10-30 10:35:07 — i.e. 11 h **before** the fix commit, the reason no post-fix window existed |
+| Restart attribution | `Proxy restart attribution: source=manual actor=unknown reason=LP-0MVVJYJQ9001I8QK deploy post-deadline re-dispatch fix (5b35dd80) — 24h measurement anchor` (`proxy.log` 2026-10-30 23:10:49) |
+| llama-server | **preserved** (PID 1934224, still started 2026-10-23 22:04:16): the local-backend config signature is unchanged, so the warm KV / prompt cache survived the proxy-only restart |
+| Logs | the pre-restart log was rotated aside to `proxy.log.2026-10-30_231043`; the fresh `proxy.log` begins 2026-10-30 23:10:48, so the deploy boundary is visible in the log itself |
+| Loaded code | `proxy/proxy/router_helpers.py` mtime 2026-10-30 22:51, **before** the 23:10:47 process start — the new process imported the post-fix module |
+| Window under measurement | **2026-10-30 23:10:47 → 2026-10-31 23:10:47** (>= 24 h) |
+
+Build-live confirmation uses the fix's own evidence line: the first
+`routing_skip_local … reason=post_deadline_terminal` / `… entry=router_dispatch|lease_acquire`
+line written after 23:10:47 proves the deployed process runs the fix (those
+fields do not exist in any pre-fix build). The window stays open until
+2026-10-31 23:10:47; its measurement and the quoted first evidence line are
+recorded by LP-0MVVJYJQ9001I8QK (see the gate below).
+
 ### Artefacts and what each one proves
 
 | Artefact | Window | What it is | What it proves |
 |---|---|---|---|
 | [`prefill-recovery-verification-post-deadline-baseline-2026-10-30.json`](prefill-recovery-verification-post-deadline-baseline-2026-10-30.json) | 2026-10-29 21:50 → 2026-10-30 21:50 | **pre-fix baseline** (window ends at the fix push; the running build had no fix) | the pre-fix build was not wedging in this particular 24 h (`wedge_denials: 0`, longest unproductive hold 195 s, `verdict_met: true`) — it does **not** demonstrate the fix, because the fix was not running |
 | [`prefill-recovery-verification-post-deadline-partial-2026-10-30.json`](prefill-recovery-verification-post-deadline-partial-2026-10-30.json) | 2026-10-30 21:47:02 → 22:35:00 (48 min) | **post-push, pre-deploy** partial window — the same, still pre-fix build | the transition itself: 3 deadline→release pairs all at 0.0 s, `unreleased: []`, 12 denials examined with 0 wedge denials (max unproductive hold 153 s), 24 local finishes after the last release. Useful as continuity evidence, **not** as fix verification |
-| *to be captured* | deploy timestamp → +24 h | the **post-fix** window | the AC1 gate (below) |
+| `prefill-recovery-verification-post-deadline-24h-2026-10-31.json` *(captured by the scheduled follow-up, LP-0MVVJYJQ9001I8QK; linked once committed)* | 2026-10-30 23:10:47 → 2026-10-31 23:10:47 | the **post-deploy** window — the build that loaded `5b35dd80` | the AC1 gate (below) |
 
-### The AC1 measurement gate — status: PENDING (not waived)
+### The AC1 measurement gate — status: PENDING (deployed 2026-10-30 23:10:47; window closes 2026-10-31 23:10:47)
 
 AC1 of LP-0MVSAMS5O006OAIS requires a **>=24 h post-fix** window satisfying:
 
@@ -541,34 +569,44 @@ AC1 of LP-0MVSAMS5O006OAIS requires a **>=24 h post-fix** window satisfying:
 | `coverage.verdict_met` | `true` | no lost log span inside the window (LP-0MVLHMAWV008EKTI) |
 | `ac1.verdict_met` | `true` | the reported AC1 verdict itself |
 
-**Status at the time of writing: PENDING.** The fix is pushed but **not
-deployed** (see the deployment anchor), so no post-fix window exists yet. This
-is the item's declared risky assumption — recorded explicitly here rather
-than silently waived:
+**Status: PENDING — but the deployment blocker is closed.** The fix is
+**deployed** (2026-10-30 23:10:47) and the 24 h window is open; only the
+measurement of that window is outstanding. The gap this note used to record —
+"the fix is pushed but not deployed, so no post-fix window exists" — is
+closed by the restart recorded in
+[Deployment completed](#deployment-completed--2026-10-30-231047-the-measurement-anchor).
+The measurement itself is the remaining step and cannot be produced before the
+window closes (a shorter window would not satisfy AC1's >= 24 h requirement);
+it is scheduled rather than assumed:
 
-- **Deploy first** (controlled restart, in the skill's controlled path):
-  `/skill:start-proxy --restart`, then record the restart timestamp from
-  `ps -eo pid,lstart,cmd | grep uvicorn` and confirm the new build is live with
-  `grep -c 'entry=router_dispatch\|entry=lease_acquire' /var/log/llama-proxy/proxy.log`
-  growing (or `grep -c 'reason=post_deadline_terminal' …` becoming non-zero).
-- **Then measure, anchored on that timestamp:**
+- **Deploy** — done (`/skill:start-proxy --restart`, reason recorded, new PID
+  3797968 at 2026-10-30 23:10:47).
+- **Measure, anchored on that timestamp:**
 
   ```bash
   python3 scripts/prefill_recovery_verification.py --measure \
       --log-dir /var/log/llama-proxy \
-      --since '<deploy timestamp>' --until '<deploy + 24 h>' --json \
+      --since '2026-10-30 23:10:47' --until '2026-10-31 23:10:47' --json \
       > docs/dev/prefill-recovery-verification-post-deadline-24h-2026-10-31.json
   ```
 
-- **Follow-up date: 2026-10-31** (a full 24 h post-deploy window closes at the
-  earliest 24 h after the restart; the push-only anchor would have closed at
-  2026-10-31 21:47, which the deployment finding above invalidates). The
-  follow-up is tracked as **LP-0MVVJYJQ9001I8QK**; when it lands, its artefact
-  is linked here and from the parent work item, and this PENDING note is
-  replaced by the measured verdict.
+- **Scheduled capture (one-shot cron, `# begin-post-deadline-24h`).** A
+  self-removing one-shot parses the closed window at 2026-10-31 23:20 local,
+  writes exactly the artefact above, applies the gate table, comments the
+  headline verdicts on LP-0MVVJYJQ9001I8QK, clears the item's scheduling hold
+  and dispatches the follow-up `implement` session that links the artefact
+  here (and from LP-0MVSAMS5O006OAIS), replaces this status with the measured
+  verdict and opens/keeps the item to `in_review` only on a green gate. The
+  runner is `~/proxy-usage-reports/2026-10-31_post-deadline-24h/run_measurement.py`
+  (read-only with respect to the proxy: it reads `/var/log/llama-proxy` and
+  never signals or restarts a process).
+- **Follow-up date: 2026-10-31** — a full 24 h post-deploy window closes at
+  the earliest 24 h after the restart (the push-only anchor would have closed
+  at 2026-10-31 21:47, which the deployment finding above invalidates).
 
 Until that window is captured and green, the fix's production behaviour is
-**unverified** — the two artefacts above describe the pre-fix build.
+**deployed but not yet measured** — the two earlier artefacts describe the
+pre-fix build; the deploy fact and the window are recorded above.
 
 ## Limitations
 
