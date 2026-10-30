@@ -27,9 +27,11 @@ statement, which no production helper can express (LP-0MVSHXU8E004BL57 AC6).
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -62,6 +64,12 @@ WAIT_BUDGET_REASONS = {
 
 #: Reasons whose timer comes from real expiry state rather than the ETA formula.
 REAL_EXPIRY_REASONS = {"cooldown"}
+
+#: Chain-exhaustion surfaces documented in the same table. They reuse the
+#: refusal retry vocabulary (``Retry-After`` / ``retry_at`` / ``retryable``) but
+#: are not refusal *reasons*: the slot ``429`` is the terminal exhaustion
+#: surface, not a pin-local refusal (LP-0MVUXY1CL005KWCC).
+CHAIN_EXHAUSTION_ROWS = {"all_slots_exhausted"}
 
 #: Real cooldown remainder used to replay a documented non-admission row.
 COOLDOWN_REMAINDER_SECONDS = 90
@@ -124,11 +132,44 @@ def test_documented_reasons_are_exactly_the_emitted_vocabulary():
     """One documented row per emitted reason — no invented, no missing reason."""
     documented = set(_contract_rows())
 
-    assert documented == EMITTED_REFUSAL_REASONS, (
+    assert documented == EMITTED_REFUSAL_REASONS | CHAIN_EXHAUSTION_ROWS, (
         "routing.md's per-reason retry table must document every refusal reason "
-        f"and nothing else; missing={sorted(EMITTED_REFUSAL_REASONS - documented)} "
-        f"unexpected={sorted(documented - EMITTED_REFUSAL_REASONS)}"
+        "(plus the chain-exhaustion slot surface) and nothing else; "
+        f"missing={sorted((EMITTED_REFUSAL_REASONS | CHAIN_EXHAUSTION_ROWS) - documented)} "
+        f"unexpected={sorted(documented - (EMITTED_REFUSAL_REASONS | CHAIN_EXHAUSTION_ROWS))}"
     )
+
+
+def test_documented_slot_exhaustion_row_matches_the_real_builder():
+    """The chain slot ``429`` row must describe what the builder really emits.
+
+    LP-0MVUXY1CL005KWCC: the slot-exhaustion refusal was the last admission
+    surface with no retry timing. Its documented row is replayed through the
+    real builder — with the live occupant probe pinned to "nothing
+    measurable" so the documented fallback (``slot_unavailable_retry_after``)
+    owns the value — so a doc row cannot claim a timer the response omits.
+    """
+    row = _contract_rows()["all_slots_exhausted"]
+    slot_config = {
+        "server": {
+            "max_retry_after_seconds": 3600,
+            "slot_unavailable_retry_after": 5,
+        }
+    }
+    with patch.object(
+        provider, "_local_occupant_prefill_seconds", return_value=0.0
+    ):
+        response = provider._build_exhausted_response(
+            all_local_slot_exhaustion=True, total_slots=1, config=slot_config
+        )
+    body = json.loads(response.body)
+
+    assert row["retryable"].strip("`").lower() == "true"
+    assert row["Retry-After"].lower() != "absent"
+    assert row["retry_at"].lower() != "absent"
+    assert body["retryable"] is True
+    assert body["retry_after"] == 5, "documented fallback is slot_unavailable_retry_after"
+    assert response.headers["retry-after"] == str(body["retry_after"])
 
 
 def test_documented_no_timer_rows_match_the_production_constant():

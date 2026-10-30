@@ -6017,6 +6017,38 @@ def _build_local_admission_reject_response(
     )
 
 
+def _slot_exhaustion_retry_after_seconds(config: dict | None) -> int:
+    """Truthful retry delay for the all-slots-exhausted refusal.
+
+    A busy slot frees when its in-flight request finishes, so the measured
+    remaining service owed by live prefill occupants
+    (:func:`_local_occupant_prefill_seconds`) is the honest wait whenever one
+    is observable. The probe is pool-wide because the builder is not
+    endpoint-scoped: an occupant on another local backend can only make the
+    hint longer, never shorter, and a measured wait may be pessimistic but
+    must never be optimistic. With no measurement (a decoding occupant, an
+    idle-leased slot, or an observability gap — the probe is fail-open and
+    returns ``0``) the configured ``server.slot_unavailable_retry_after``
+    (default ``5``, the knob the router-level slot ``503`` already advertises)
+    is the best available hint, so the two slot surfaces cannot disagree about
+    the order of magnitude. The value is rounded **up**, never down. The 1 s
+    floor and the ``server.max_retry_after_seconds`` cap are applied by
+    :func:`_refusal_retry_timing`, never re-derived here
+    (LP-0MVUXY1CL005KWCC AC2).
+    """
+    measured = 0.0
+    try:
+        measured = float(_local_occupant_prefill_seconds() or 0.0)
+    except Exception:  # pragma: no cover - the probe is already fail-open
+        measured = 0.0
+    if measured > 0.0:
+        return max(1, int(math.ceil(measured)))
+    fallback = _get_slot_unavailable_retry_after(
+        config if isinstance(config, dict) else {}
+    )
+    return max(1, int(math.ceil(fallback)))
+
+
 def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None, config: dict | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
@@ -6043,6 +6075,13 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     retryable 429 carrying ``Retry-After`` plus the ETA guidance headers
     instead of the generic exhaustion body, so the refusal is actionable.
 
+    The slot-exhaustion branch carries retry timing as well
+    (LP-0MVUXY1CL005KWCC): ``Retry-After`` == body ``retry_after``, plus
+    ``retry_at`` and ``retryable: true``, derived from the measured remaining
+    occupant service or ``server.slot_unavailable_retry_after``.
+    ``proxy/tests/test_admission_refusal_retry_contract.py`` pins the builder
+    contract for every client-facing admission refusal.
+
     Verified end-to-end by ``proxy/tests/test_overnight_exhaustion_e2e.py``
     (LP-0MV728XBH00546FB): ``Retry-After`` / ``retry_after`` are identical,
     the stable ``code`` discriminator is present, the advertisement cap is
@@ -6051,15 +6090,37 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     if all_local_slot_exhaustion:
         # total_slots may be 0 if unknown; still format per acceptance criteria.
         # JSON keeps the machine-readable ``code`` alongside the retained prose.
+        #
+        # Retry timing (LP-0MVUXY1CL005KWCC): the last timer-free admission
+        # refusal now answers *when* to retry, using the same vocabulary as the
+        # other refusals — ``Retry-After`` equal to the body ``retry_after``,
+        # plus ``retry_at`` (RFC 3339 UTC) and ``retryable``. The delay is the
+        # measured remaining occupant service, else
+        # ``server.slot_unavailable_retry_after``; the shared
+        # :func:`_refusal_retry_timing` helper owns the 1 s floor and the
+        # ``server.max_retry_after_seconds`` cap so there is no second timer
+        # formula.
+        timing = _refusal_retry_timing(
+            EXHAUSTION_CODE_SLOTS,
+            advertised_retry_after=_slot_exhaustion_retry_after_seconds(config),
+            config=config,
+        )
         slot_payload: dict[str, Any] = {
             "error": "All providers exhausted",
             "code": EXHAUSTION_CODE_SLOTS,
             "message": f"Model server busy: 0/{int(total_slots)} slots available. Retry later.",
+            "retryable": timing.retryable,
+            "retry_after": timing.retry_after,
         }
+        if timing.retry_at is not None:
+            slot_payload["retry_at"] = timing.retry_at
+        slot_headers: dict[str, str] = {"Cache-Control": "no-store"}
+        slot_headers.update(_refusal_timing_headers(timing, None, None))
         return Response(
             content=json.dumps(slot_payload).encode("utf-8"),
             status_code=429,
             media_type="application/json",
+            headers=slot_headers,
         )
 
     admission_reject = _local_admission_reject_payload(diagnostics)

@@ -1683,6 +1683,7 @@ and header a client must honour:
 | `prefill_eta_exceeds_deadline` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
 | `prefill_eta_exceeds_safety_budget` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
 | `cooldown` | real cooldown remainder | `true` | RFC 3339 UTC | wait, then retry |
+| `all_slots_exhausted` | measured occupant remainder, else `slot_unavailable_retry_after`; ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
 
 **Which reasons have no timer — and why.** `prefill_budget_exceeded` is a
 property of the *request*: the prompt is permanently over the flat
@@ -1699,6 +1700,23 @@ compaction (shorten the session history) changes the verdict.
 derived from the *real* expiry state (the cooldown remainder, the lease
 remainder or the queue exit) — never from the ETA formula — so the hint tracks
 when local capacity actually returns.
+
+**Slot exhaustion carries the same vocabulary (LP-0MVUXY1CL005KWCC).** The
+chain-level slot-exhaustion `429` (`code: all_slots_exhausted`, produced when
+every provider in the chain was local and every local slot was busy) is not a
+pin-local refusal — it is the terminal exhaustion surface, so it carries no
+`X-Local-Route` header — but it answers the same two questions in the same
+fields: `Retry-After` equal to the body `retry_after`, an absolute `retry_at`
+(RFC 3339 UTC) and `retryable: true`. The delay is the **measured** remaining
+service owed by the live occupant(s) when the proxy can observe it, otherwise
+`server.slot_unavailable_retry_after` (default `5` s — the knob the
+router-level slot `503` advertises, so the two slot surfaces agree on the order
+of magnitude); it is floored at 1 s and capped by
+`server.max_retry_after_seconds`. The advertised timer also bounds a chain hold
+(`min(chain_hold_seconds, retry_after)`) instead of the legacy full
+`chain_hold_seconds` hold. Client guidance: honour `retry_at` when present and
+retry once when it elapses; the value is a measured remainder or the configured
+short slot default, never an optimistic guess about a decoding occupant.
 
 The real-expiry mapping is the contract of LP-0MVQ23B80009OZ9V. Every
 non-admission exit advertises the expiry of the state that actually blocked
