@@ -913,6 +913,14 @@ async def test_prefill_budget_exceeded_exhaustion_refusal_is_not_time_retryable(
     body = _assert_prefill_budget_refusal_contract(result)
     assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
     assert body["error"] == "All providers exhausted"
+    # AC8 on the queue path: the permanent cold-budget bound keeps its own
+    # token here too (the free-slot path is pinned by
+    # ``test_direct_free_slot_budget_refusal_keeps_its_reason``).
+    assert body["reason"] == "prefill_budget_exceeded"
+    assert (
+        result.headers.get("X-Local-Fallback-Reason")
+        == "prefill_budget_exceeded"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1113,6 +1121,17 @@ _PREFILL_SAFETY_BUDGET_CASE = dict(
     },
 )
 
+#: The deadline refusal on the **free-slot** (direct) dispatch path: the same
+#: governing decision applied one step earlier, so the advertised reason and
+#: timer must not change with the path (AC1/AC6).
+_PREFILL_DEADLINE_DIRECT_CASE = dict(_PREFILL_DEADLINE_CASE, path="direct")
+
+#: The deadline-relative safety-budget refusal on the free-slot path; the
+#: binding bound is still the safety budget, never the ETA/budget label.
+_PREFILL_SAFETY_BUDGET_DIRECT_CASE = dict(
+    _PREFILL_SAFETY_BUDGET_CASE, path="direct"
+)
+
 #: The advertised duration is capped by ``server.max_retry_after_seconds``.
 _CAPPED_CASE = dict(
     reason="eta_exceeds_budget",
@@ -1147,12 +1166,20 @@ _OCCUPANCY_REFUSAL_CASES = [
         id="prefill_eta_exceeds_deadline-exhausted",
     ),
     pytest.param(
+        _OccupancyRefusalCase(**_PREFILL_DEADLINE_DIRECT_CASE),
+        id="prefill_eta_exceeds_deadline-direct",
+    ),
+    pytest.param(
         _OccupancyRefusalCase(**_PREFILL_SAFETY_BUDGET_CASE),
         id="prefill_eta_exceeds_safety_budget-local-only",
     ),
     pytest.param(
         _OccupancyRefusalCase(**_PREFILL_SAFETY_BUDGET_CASE, chain="local_only"),
         id="prefill_eta_exceeds_safety_budget-exhausted",
+    ),
+    pytest.param(
+        _OccupancyRefusalCase(**_PREFILL_SAFETY_BUDGET_DIRECT_CASE),
+        id="prefill_eta_exceeds_safety_budget-direct",
     ),
     pytest.param(
         _OccupancyRefusalCase(**_CAPPED_CASE),
@@ -1237,6 +1264,12 @@ def _assert_occupancy_refusal_contract(result, case: _OccupancyRefusalCase) -> d
     )
 
     body = json.loads(result.body)
+    # AC2: the body names the same governing reason as the header. Asserting
+    # only ``X-Local-Fallback-Reason`` would let the two surfaces drift apart.
+    assert body.get("reason") == case.reason, (
+        "the refusal body must name the same reason as "
+        "X-Local-Fallback-Reason, not only restate it in a header"
+    )
     assert body.get("retryable") is True, "a wait the client can outlast is retryable"
     assert body.get("retry_after") == case.expected_retry_after, (
         "the body must carry the same seconds as the Retry-After header"
@@ -1331,6 +1364,209 @@ async def test_occupancy_refusal_advertises_a_truthful_retry_time(
     )
     body = _assert_occupancy_refusal_contract(result, case)
     assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+
+
+# ---------------------------------------------------------------------------
+# Direct-path reason pass-through (LP-0MVRO3AHN002UM1Q AC1/AC3/AC4)
+#
+# The free-slot branch already records the governing decision reason verbatim
+# for the deadline, deadline-relative safety-budget and flat cold-budget
+# refusals (commit ``0466f5db``), but nothing pinned it on the direct path. The
+# rows below drive each reason through a FREE local slot end-to-end, so a
+# regression that relabels a non-ETA bound as ``eta_exceeds_budget_direct``
+# whenever a slot happens to be free fails here.
+#
+# The cases run without a fallback provider and without an
+# ``X-Local-Preference`` header: the request therefore really falls through
+# (emitting the ``local_admission_guard_direct_fallback`` line) and the chain
+# exhaustion surfaces the recorded ``local_admission_reject`` attempt in the
+# response body, so both AC7 surfaces are asserted from production output
+# rather than re-derived in the test.
+# ---------------------------------------------------------------------------
+
+#: Governing reasons pinned on the free-slot path by the AC7 tests. The cold
+#: prefill budget needs a prompt above the flat cap, so it has its own test.
+_DIRECT_GOVERNING_REASON_CASES = [
+    pytest.param(
+        _OccupancyRefusalCase(
+            **_PREFILL_DEADLINE_DIRECT_CASE, chain="local_only"
+        ),
+        id="prefill_eta_exceeds_deadline-direct",
+    ),
+    pytest.param(
+        _OccupancyRefusalCase(
+            **_PREFILL_SAFETY_BUDGET_DIRECT_CASE, chain="local_only"
+        ),
+        id="prefill_eta_exceeds_safety_budget-direct",
+    ),
+]
+
+#: Reasons whose refusal must never be relabelled as the free-slot ETA/budget
+#: token (AC8); each has a queue row and a direct row in the case table.
+_NON_ETA_GUARD_REASONS = frozenset(
+    {
+        "prefill_eta_exceeds_deadline",
+        "prefill_eta_exceeds_safety_budget",
+    }
+)
+
+_NON_ETA_GUARD_CASES = [
+    param
+    for param in _OCCUPANCY_REFUSAL_CASES
+    if param.values[0].reason in _NON_ETA_GUARD_REASONS
+]
+
+
+def _direct_fallback_lines(caplog) -> list[str]:
+    """Every ``local_admission_guard_direct_fallback`` line in *caplog*."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "local_admission_guard_direct_fallback" in record.getMessage()
+    ]
+
+
+def _guard_decision_lines(caplog) -> list[str]:
+    """Every ``local_admission_guard decision=`` line in *caplog*."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "local_admission_guard decision=" in record.getMessage()
+    ]
+
+
+def _recorded_admission_rejections(body: dict) -> list[dict]:
+    """The ``local_admission_reject`` attempts the refusal body reports."""
+    return [
+        attempt
+        for attempt in (body.get("diagnostics") or [])
+        if isinstance(attempt, dict)
+        and attempt.get("status") == "local_admission_reject"
+    ]
+
+
+@pytest.mark.parametrize("case", _DIRECT_GOVERNING_REASON_CASES)
+@pytest.mark.asyncio
+async def test_direct_path_names_the_governing_reason_end_to_end(
+    case: _OccupancyRefusalCase, mixed_model_config, caplog
+):
+    """AC7/AC8: header, body, attempt diagnostics and dispatch log agree."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    result, dispatched = await _issue_occupancy_refusal(case, mixed_model_config)
+
+    assert dispatched == [], "a refused free-slot request must never dispatch"
+    assert result.status_code == 429
+    assert result.headers.get("X-Local-Fallback-Reason") == case.reason
+    body = json.loads(result.body)
+    assert body.get("reason") == case.reason
+
+    attempts = _recorded_admission_rejections(body)
+    assert [attempt["reason"] for attempt in attempts] == [case.reason], (
+        "the recorded local_admission_reject attempt must name the governing "
+        "decision reason, not the free-slot dispatch label"
+    )
+
+    lines = _direct_fallback_lines(caplog)
+    assert len(lines) == 1, f"expected one direct fallback line, got {lines}"
+    assert f"reason={case.reason}" in lines[0]
+    assert "free_slot=true" in lines[0]
+    assert "reason=eta_exceeds_budget_direct" not in lines[0], (
+        "a non-ETA bound must never be relabelled as the ETA/budget reason"
+    )
+
+    guard_lines = _guard_decision_lines(caplog)
+    assert len(guard_lines) == 1, (
+        f"expected exactly one guard line, got {guard_lines}"
+    )
+    assert f"reason={case.reason}" in guard_lines[0]
+    assert "free_slot=true" in guard_lines[0]
+    assert "reason=eta_exceeds_budget_direct" not in guard_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_direct_free_slot_budget_refusal_keeps_its_reason(
+    mixed_model_config, caplog
+):
+    """AC6/AC7: a free-slot ``prefill_budget_exceeded`` refusal keeps its token.
+
+    The prompt is above the flat cold-prefill cap, so the guard refuses even
+    with a free local slot. The full no-timer / compaction contract for this
+    reason is pinned by LP-0MVT3TB6800010XO; here the pin is the label: the
+    attempt diagnostics and the dispatch log must both say
+    ``prefill_budget_exceeded``.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    async def _local(_req, _path):
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(),
+            "v1/chat/completions",
+            _local_only_model_config(),
+            _cold_budget_cfg(),
+        )
+
+    assert result.status_code == 429
+    assert (
+        result.headers.get("X-Local-Fallback-Reason")
+        == "prefill_budget_exceeded"
+    )
+    body = json.loads(result.body)
+    assert body.get("reason") == "prefill_budget_exceeded"
+    assert result.headers.get("Retry-After") is None, (
+        "waiting cannot heal a permanently over-budget prompt"
+    )
+
+    attempts = _recorded_admission_rejections(body)
+    assert [attempt["reason"] for attempt in attempts] == [
+        "prefill_budget_exceeded"
+    ]
+
+    lines = _direct_fallback_lines(caplog)
+    assert len(lines) == 1, f"expected one direct fallback line, got {lines}"
+    assert "reason=prefill_budget_exceeded" in lines[0]
+    assert "free_slot=true" in lines[0]
+    assert "reason=eta_exceeds_budget_direct" not in lines[0]
+
+    guard_lines = _guard_decision_lines(caplog)
+    assert len(guard_lines) == 1, (
+        f"expected exactly one guard line, got {guard_lines}"
+    )
+    assert "reason=prefill_budget_exceeded" in guard_lines[0]
+    assert "free_slot=true" in guard_lines[0]
+    assert "reason=eta_exceeds_budget_direct" not in guard_lines[0]
+
+
+@pytest.mark.parametrize(
+    "case", _NON_ETA_GUARD_CASES, ids=[param.id for param in _NON_ETA_GUARD_CASES]
+)
+@pytest.mark.asyncio
+async def test_a_non_eta_bound_is_never_relabelled_on_either_path(
+    case: _OccupancyRefusalCase, mixed_model_config
+):
+    """AC8: the free-slot ETA/budget token covers only the ETA/budget bound.
+
+    Both dispatch paths are covered because the case table holds a queue row
+    and a direct row for each of these reasons; a regression that relabels
+    either one fails here.
+    """
+    result, _ = await _issue_occupancy_refusal(case, mixed_model_config)
+    advertised = {
+        result.headers.get("X-Local-Fallback-Reason"),
+        json.loads(result.body).get("reason"),
+    }
+    assert advertised == {case.reason}, (
+        "a non-ETA refusal must be named by its governing reason on both the "
+        f"header and the body; got {advertised!r}"
+    )
+    assert "eta_exceeds_budget_direct" not in advertised
 
 
 # ---------------------------------------------------------------------------
@@ -1568,24 +1804,37 @@ class _RefusalContractRow:
     promoted: bool = False
     #: The AC2 occupancy case that reaches this reason, when applicable.
     occupancy_case: _OccupancyRefusalCase | None = None
+    #: Dispatch path the row drives (``"queue"`` / ``"direct"``). Together
+    #: with *reason* it identifies the row (AC3): the occupancy table pins the
+    #: same governing reason on both paths, while this contract table keeps
+    #: exactly one row per reason.
+    path: str | None = None
     #: ``new_tokens`` the refusal must advertise. Defaults to the shared
     #: ``PROMPT_NEW_TOKENS``; the ``prefill_budget_exceeded`` row reproduces the
     #: 2026-10-25 incident verbatim, so it advertises that prompt's size.
     expected_new_tokens: int = PROMPT_NEW_TOKENS
 
 
-def _occupancy_row(reason: str) -> _RefusalContractRow:
-    """Row for an ETA/occupancy reason, reusing the AC2 case table verbatim."""
+def _occupancy_row(reason: str, path: str) -> _RefusalContractRow:
+    """Row for an ETA/occupancy reason, reusing the AC2 case table verbatim.
+
+    The row is identified by ``(reason, path)`` (AC3): the same governing
+    reason is pinned on both the queue and the free-slot path, so the case
+    must be selected by the path it drives rather than by reason alone.
+    """
     case = next(
         param.values[0]
         for param in _OCCUPANCY_REFUSAL_CASES
-        if param.values[0].reason == reason and param.values[0].chain == "hybrid"
+        if param.values[0].reason == reason
+        and param.values[0].path == path
+        and param.values[0].chain == "hybrid"
     )
     return _RefusalContractRow(
         reason=reason,
         trigger="occupancy",
         time_retryable=True,
         occupancy_case=case,
+        path=path,
     )
 
 
@@ -1593,10 +1842,13 @@ def _occupancy_row(reason: str) -> _RefusalContractRow:
 #: per-reason contract of LP-0MVNTT4X8009IO2X (AC1/AC2/AC3) and the docs item
 #: LP-0MVQ23BH7006HLKB (wait / compact / refuse).
 _REFUSAL_CONTRACT_ROWS = [
-    _occupancy_row("eta_exceeds_budget"),
-    _occupancy_row("eta_exceeds_budget_direct"),
-    _occupancy_row("prefill_eta_exceeds_deadline"),
-    _occupancy_row("prefill_eta_exceeds_safety_budget"),
+    _occupancy_row("eta_exceeds_budget", path="queue"),
+    # Only the free-slot ETA/budget bound keeps this token; the rows below it
+    # are driven through the free-slot path too, so a relabel regression is
+    # observable on the contract table itself (LP-0MVRO3AHN002UM1Q AC1/AC8).
+    _occupancy_row("eta_exceeds_budget_direct", path="direct"),
+    _occupancy_row("prefill_eta_exceeds_deadline", path="direct"),
+    _occupancy_row("prefill_eta_exceeds_safety_budget", path="direct"),
     # Permanently over the flat cold-prefill cap: time cannot heal it. The
     # pin is declined for a too-large verdict (LP-0MVSLZY470051ZB2 AC4), so
     # the row asserts promotion to the remote tiers — the no-timer contract
@@ -1718,6 +1970,13 @@ def test_refusal_contract_table_has_exactly_one_row_per_reason():
     """
     reasons = [row.reason for row in _REFUSAL_CONTRACT_ROWS]
     assert len(reasons) == len(set(reasons)), f"duplicate reason rows: {reasons}"
+    # A row is identified by ``(reason, path)`` (AC3): the occupancy table
+    # holds both paths for the same reason, so a duplicate identity would let
+    # one of them silently go unpinned.
+    identities = [(row.reason, row.path) for row in _REFUSAL_CONTRACT_ROWS]
+    assert len(identities) == len(set(identities)), (
+        f"duplicate (reason, path) rows: {identities}"
+    )
     assert set(reasons) == {
         "eta_exceeds_budget",
         "eta_exceeds_budget_direct",
@@ -1741,6 +2000,9 @@ def test_refusal_contract_table_has_exactly_one_row_per_reason():
             assert row.occupancy_case.reason == row.reason, (
                 "an occupancy row must reuse the AC2 case table, not restate "
                 "its numbers"
+            )
+            assert row.occupancy_case.path == row.path, (
+                "an occupancy row must drive the (reason, path) it names"
             )
 
 
