@@ -168,3 +168,127 @@ live proxy line      : 41395
 child discovery      : 41395         # routes /slots to the child
 resolve target       : (None, 41395) # endpoint=http://localhost:8080 rewritten
 ```
+## Post-fix 24 h window verification (LP-0MVP7HX2S008IU57, 2026-10-27 → 2026-10-28)
+
+**Work item:** LP-0MVP7HX2S008IU57 (verifies the LP-0MVP7525P008RXMF fix)
+**Window:** 2026-10-27T12:00:00Z → 2026-10-28T12:00:00Z (measured
+2026-10-30T19:09Z; raw counts in
+[`router-slots-500-window-2026-10-27-to-28.json`](router-slots-500-window-2026-10-27-to-28.json))
+
+### TL;DR — verdict RED
+
+Direct child-port polling now carries essentially all slot traffic (135,028
+child 200s vs 505 router 200s in the 48 h superset), and the router 500 rate
+fell ~95 % (2,753 on 2026-10-26 → 128 on 2026-10-27). It is **not zero**:
+**1,171 router-responder `GET /slots ... 500` lines** remain in the window
+superset, and they have a *different* root cause from the pre-fix storm.
+
+### Method and window file sets
+
+`llama-server.log` access lines carry **no timestamps**, so the window is
+scoped by file. `logrotate` writes a `copytruncate` copy at 00:00 UTC whose
+name is the rotation date and whose content is the previous 24 h, so the
+window straddles exactly two files (a superset with 12 h of extra traffic on
+each side):
+
+| File | Content range (UTC) | In-window coverage |
+|---|---|---|
+| `llama-server.log-2026-10-28.gz` | 2026-10-27T00:00Z → 2026-10-28T00:00Z | second half of the window (12:00 → 24:00) |
+| `llama-server.log-2026-10-29.gz` | 2026-10-28T00:00Z → 2026-10-29T00:00Z | first half of the window (00:00 → 12:00) |
+
+`proxy.log` **is** timestamped and self-rotates every 6 h, so the window was
+filtered by each file's own observed first/last timestamp. Six files tile the
+window with no overlap:
+`proxy.log.2026-10-27_10.gz`, `proxy.log.2026-10-27_16.gz`,
+`proxy.log-2026-10-28_00.gz`, `proxy.log.2026-10-27_22.gz`,
+`proxy.log.2026-10-28_04.gz`, `proxy.log.2026-10-28_10.gz`
+(15,953 `status_request` polls, 211,192 log lines in total).
+
+```bash
+python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy \
+  --llama-file 'llama-server.log-2026-10-28.gz' --summary
+python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy \
+  --llama-file 'llama-server.log-2026-10-29.gz' --summary
+```
+
+### Router vs child responder split (per file, AC1/AC2)
+
+| File | router 200 | router 400 | router 500 | child 200 | child 400 | child 500 |
+|---|---|---|---|---|---|---|
+| `llama-server.log-2026-10-28.gz` (2026-10-27) | 79 | 243 | **128** | 72,959 (41395: 72,955, 59947: 4) | 0 | 0 |
+| `llama-server.log-2026-10-29.gz` (2026-10-28) | 426 | 2,164 | **1,043** | 62,069 (41395: 31,919, 42051: 30,150) | 0 | 0 |
+| **superset total** | **505** | **2,407** | **1,171** | **135,028** | **0** | **0** |
+
+Every router-responder request came from `127.0.0.1` (the proxy process —
+`ss` sampling over 60 s showed no other local client of `:8080`). Child
+instances answered **only** 200/404: the 500s are purely a router-mode
+proxying artefact, as in the original triage.
+
+Daily router-500 trend (same measurement, one file per UTC day):
+
+| Day | 2026-10-25 | 2026-10-26 | 2026-10-27 | 2026-10-28 | 2026-10-29 | 2026-10-30 (partial) |
+|---|---|---|---|---|---|---|
+| router 500s | 20,134 | 2,753 | 128 | 1,043 | 604 | 140 |
+
+### `slots_stale` share (AC3)
+
+| Figure | Window value | Pre-fix baseline |
+|---|---|---|
+| **Primary:** all `status_request` polls | **5,005 / 15,953 = 31.4 %** | 579 / 899 = 64.4 % (2026-10-26) |
+| Secondary: active-prefill subset (`active_query=true` or `local_active_query=true`) | 3,739 / 5,968 = 62.7 % | — |
+
+### Fallback signals (AC4)
+
+- **Counter delta: unavailable.** The process that served the window
+  (pid 3791954, started 2026-10-27T10:16:11Z) has since been replaced (pid
+  3224511, started 2026-10-30T10:35:07Z), so the monotonic
+  `llama_slots_child_port_fallbacks_total` cannot be read for the window.
+  No proxy restart occurred **inside** the window (zero `Starting LLama Proxy
+  Server` lines across all six window files).
+- **In-window warning lines: 1** (throttled to one per 300 s, so this
+  undercounts) — `model=gpt120` at 2026-10-28T10:45:00.404Z. `gpt120` is a
+  local **chat** model that was not loaded, i.e. a chat-path fallback →
+  `LP-0MVVCY3HQ0009F0K` (filed `discovered-from:LP-0MVP7525P008RXMF`).
+- **`mxbai-embed` fallbacks in-window: 0.**
+
+### Residual router 500s: the `/health` probe, not slot polling
+
+The remaining 1,171 router 500s are explained by the proxy's **`/health`
+reachability probe**, which targets the router by design:
+
+- `proxy/proxy/handlers.py:1170` — `health_check()` calls
+  `srv._probe_backend_reachable(llama_port)` on **every** `/health` request.
+- `proxy/proxy/lifecycle.py:725` — `_probe_backend_reachable()` probes
+  `"/slots?model=<current_model>"` first, then `/models`, `/health`, all on
+  `http://localhost:<router_port>`.
+
+Because that probe never calls `_resolve_local_slots_target()`, it increments
+neither the fallback counter nor the `slots_child_port_unavailable` warning —
+the exact observed shape (1,171 router 500s, ~0 fallback signals).
+
+Live reproduction (2026-10-30T19:18Z): 10 sequential
+`curl -s -o /dev/null localhost:8000/health` calls produced exactly one
+router-responder `GET /slots` line each — **6 × 500**, 3 × 200, 1
+indeterminate. Filed as `LP-0MVVCXUDZ007XID0`
+(`discovered-from:LP-0MVP7525P008RXMF`, priority high).
+
+### Limitations
+
+- `llama-server` lines are timestamp-free, so the two kept files are a
+  **superset** (2026-10-27T00:00Z → 2026-10-29T00:00Z). Zero router 500s
+  across the superset would have proven zero inside the window; a non-zero
+  count does **not** localise the 500s to the window, so the in-window count
+  is bounded (`≤ 1,171`) rather than exact.
+- The pre-window baseline snapshot (2026-10-27T12:00Z) was never taken; the
+  counter-based reconstruction is moot because the serving proxy has since
+  restarted.
+- Fallback WARNING lines are throttled (one per 300 s) and therefore
+  undercount; the counter is authoritative but was unreadable for this window.
+
+### Target signal going forward
+
+`router:500 == 0` remains the regression target, but it is only meaningful
+once the `/health` probe stops polling the router (LP-0MVVCXUDZ007XID0). Until
+then, treat router-responder `/slots` 500s as expected noise and use the
+child-vs-router 200 split plus `llama_slots_child_port_fallbacks_total` as the
+authoritative direct-polling signal.

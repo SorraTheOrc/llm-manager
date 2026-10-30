@@ -1,0 +1,251 @@
+{
+  "work_item": "LP-0MVP7HX2S008IU57",
+  "fix_under_test": "LP-0MVP7525P008RXMF",
+  "measurement_run_utc": "2026-10-30T19:09:00Z",
+  "window": {
+    "start_utc": "2026-10-27T12:00:00Z",
+    "end_utc": "2026-10-28T12:00:00Z",
+    "duration_hours": 24,
+    "verdict": "RED"
+  },
+  "restart_integrity_ac6": {
+    "window_proxy_pid": 3791954,
+    "window_proxy_lstart_utc": "2026-10-27T10:16:11Z",
+    "in_window_startup_lines": 0,
+    "restart_inside_window": false,
+    "current_proxy_pid": 3224511,
+    "current_proxy_lstart_utc": "2026-10-30T10:35:07Z",
+    "post_window_restart": true,
+    "counter_delta_available": false,
+    "counter_delta_unavailable_reason": "The proxy process that served the window (pid 3791954) has been replaced (pid 3224511 started 2026-10-30T10:35:07Z), so the monotonic llama_slots_child_port_fallbacks_total counter for the window can no longer be read. Per AC6 the verdict therefore relies on per-file log counts with this limitation stated."
+  },
+  "llama_server_file_set": [
+    {
+      "file": "llama-server.log-2026-10-28.gz",
+      "mtime_utc": "2026-10-28T00:00:00Z",
+      "content_range_utc": "2026-10-27T00:00:00Z..2026-10-28T00:00:00Z",
+      "intersects_window": true,
+      "in_window_coverage": "2026-10-27T12:00:00Z..2026-10-28T00:00:00Z (half, boundary approximate)",
+      "router": {
+        "200": 79,
+        "400": 243,
+        "500": 128
+      },
+      "child": {
+        "200": 72959,
+        "400": 0,
+        "500": 0,
+        "other": 0
+      },
+      "slots_total": 73409,
+      "router_500_near_proxy_cancel": 128
+    },
+    {
+      "file": "llama-server.log-2026-10-29.gz",
+      "mtime_utc": "2026-10-29T00:00:00Z",
+      "content_range_utc": "2026-10-28T00:00:00Z..2026-10-29T00:00:00Z",
+      "intersects_window": true,
+      "in_window_coverage": "2026-10-28T00:00:00Z..2026-10-28T12:00:00Z (half, boundary approximate)",
+      "router": {
+        "200": 426,
+        "400": 2164,
+        "500": 1043
+      },
+      "child": {
+        "200": 62069,
+        "400": 0,
+        "500": 0,
+        "other": 0
+      },
+      "slots_total": 65702,
+      "router_500_near_proxy_cancel": 1039
+    }
+  ],
+  "excluded_files": [
+    {
+      "file": "llama-server.log-2026-10-27.gz",
+      "mtime_utc": "2026-10-27T00:00:00Z",
+      "reason": "mtime before the window (content 2026-10-26)"
+    },
+    {
+      "file": "llama-server.log-2026-10-30",
+      "mtime_utc": "2026-10-30T00:00:00Z",
+      "reason": "mtime after the window (content 2026-10-29)"
+    }
+  ],
+  "superset": {
+    "content_range_utc": "2026-10-27T00:00:00Z..2026-10-29T00:00:00Z",
+    "router": {
+      "200": 505,
+      "500": 1171,
+      "400": 2407
+    },
+    "child": {
+      "200": 135028,
+      "other": 0,
+      "500": 0,
+      "400": 0
+    },
+    "router_500_total": 1171,
+    "router_400_total": 2407,
+    "router_200_total": 505,
+    "router_500_client_ips": {
+      "127.0.0.1": 1171
+    }
+  },
+  "daily_router_500_trend": {
+    "2026-10-25": 20134,
+    "2026-10-26": 2753,
+    "2026-10-27": 128,
+    "2026-10-28": 1043,
+    "2026-10-29": 604,
+    "2026-10-30_partial_to_19z": 140,
+    "_source": "llama-server.log-YYYY-MM-DD[.gz] copytruncate copies, one per UTC day (suffix = rotation date, content = previous 24 h)"
+  },
+  "proxy_log_window": {
+    "dedupe_rule": "each proxy.log* candidate's own first/last line timestamp derived; files intersecting the window kept; overlapping copytruncate copies deduped by timestamp range. The six kept files tile the window with no overlap.",
+    "files": [
+      {
+        "file": "proxy.log.2026-10-27_10.gz",
+        "first_utc": "2026-10-27T10:16:12Z",
+        "last_utc": "2026-10-27T16:16:11Z",
+        "in_window": "2026-10-27T12:00:00Z..2026-10-27T16:16:11Z",
+        "status_request_polls": 2103,
+        "slots_stale_true": 200,
+        "active_polls": 439,
+        "active_slots_stale_true": 184
+      },
+      {
+        "file": "proxy.log.2026-10-27_16.gz",
+        "first_utc": "2026-10-27T16:16:13Z",
+        "last_utc": "2026-10-27T22:16:12Z",
+        "in_window": "whole file",
+        "status_request_polls": 3020,
+        "slots_stale_true": 895,
+        "active_polls": 1611,
+        "active_slots_stale_true": 784
+      },
+      {
+        "file": "proxy.log-2026-10-28_00.gz",
+        "first_utc": "2026-10-27T22:16:13Z",
+        "last_utc": "2026-10-27T23:59:59Z",
+        "in_window": "whole file",
+        "status_request_polls": 1317,
+        "slots_stale_true": 668,
+        "active_polls": 477,
+        "active_slots_stale_true": 442
+      },
+      {
+        "file": "proxy.log.2026-10-27_22.gz",
+        "first_utc": "2026-10-28T00:00:02Z",
+        "last_utc": "2026-10-28T04:16:11Z",
+        "in_window": "whole file",
+        "status_request_polls": 3433,
+        "slots_stale_true": 800,
+        "active_polls": 1150,
+        "active_slots_stale_true": 622
+      },
+      {
+        "file": "proxy.log.2026-10-28_04.gz",
+        "first_utc": "2026-10-28T04:16:13Z",
+        "last_utc": "2026-10-28T10:16:12Z",
+        "in_window": "whole file",
+        "status_request_polls": 4545,
+        "slots_stale_true": 1345,
+        "active_polls": 1468,
+        "active_slots_stale_true": 951
+      },
+      {
+        "file": "proxy.log.2026-10-28_10.gz",
+        "first_utc": "2026-10-28T10:16:13Z",
+        "last_utc": "2026-10-28T16:16:12Z",
+        "in_window": "2026-10-28T10:16:13Z..2026-10-28T12:00:00Z",
+        "status_request_polls": 1535,
+        "slots_stale_true": 1097,
+        "active_polls": 823,
+        "active_slots_stale_true": 756
+      }
+    ],
+    "totals": {
+      "status_request_polls": 15953,
+      "slots_stale_true": 5005,
+      "slots_stale_false": 10948,
+      "slots_stale_share_all_polls": 0.3137,
+      "active_prefill_polls": 5968,
+      "active_prefill_slots_stale_true": 3739,
+      "active_prefill_slots_stale_share": 0.6265
+    },
+    "pre_fix_baseline": {
+      "slots_stale_true": 579,
+      "polls": 899,
+      "share": 0.644,
+      "source": "2026-10-26 file, all status_request polls (parent intake)"
+    },
+    "fallback_warnings": [
+      {
+        "ts_utc": "2026-10-28T10:45:00.404Z",
+        "model": "gpt120",
+        "line": "slots_child_port_unavailable: no model child port discovered for model=gpt120; falling back to router port 8080"
+      }
+    ],
+    "fallback_warning_count": 1,
+    "embed_model_fallback_warnings": 0,
+    "error_lines": 348
+  },
+  "fallback_counter_ac4": {
+    "window_delta": null,
+    "in_window_warning_lines": 1,
+    "in_window_warning_models": [
+      "gpt120"
+    ],
+    "warn_throttle_seconds": 300,
+    "post_window_reading": {
+      "captured_utc": "2026-10-30T19:19:42Z",
+      "proxy_pid": 3224511,
+      "llama_slots_child_port_fallbacks_total_no_child_port_router_mode": 2.0,
+      "note": "post-window only; not usable as a window delta"
+    }
+  },
+  "root_cause_residual_router_500": {
+    "path": "proxy/proxy/handlers.py:1170 (GET /health) -> proxy/proxy/lifecycle.py:725 _probe_backend_reachable() -> probe_paths ['/slots?model=<current_model>', '/models', '/health'] on the ROUTER port",
+    "why_not_counted": "The probe deliberately targets the router port and does not call _resolve_local_slots_target(), so it increments no fallback counter and logs no slots_child_port_unavailable warning.",
+    "live_reproduction": {
+      "when_utc": "2026-10-30T19:18Z",
+      "method": "10 sequential `curl -s -o /dev/null localhost:8000/health` calls; each produced exactly one router-responder GET /slots line in the live llama-server.log",
+      "results": {
+        "router_slots_500": 6,
+        "router_slots_200": 3,
+        "indeterminate": 1
+      }
+    }
+  },
+  "linked_bugs": [
+    {
+      "id": "LP-0MVVCXUDZ007XID0",
+      "priority": "high",
+      "title": "Proxy /health reachability probe polls router GET /slots?model= \u2014 residual router-responder /slots 500s under prefill"
+    },
+    {
+      "id": "LP-0MVVCY3HQ0009F0K",
+      "priority": "medium",
+      "title": "Chat-model child-port fallback fires for unloaded local models (gpt120) \u2014 polls the router and pollutes the fallback signal"
+    }
+  ],
+  "commands": [
+    "date -u",
+    "ps -o pid,lstart,etime -p \"$(pgrep -f 'uvicorn proxy.server:app' | head -1)\"",
+    "ls -l --time-style=full-iso /var/log/llama-proxy/llama-server*.log*",
+    "python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy --llama-file 'llama-server.log-2026-10-28.gz' --summary",
+    "python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy --llama-file 'llama-server.log-2026-10-29.gz' --summary",
+    "curl -s localhost:8000/metrics | grep llama_slots_child_port_fallbacks_total",
+    "zcat <proxy.log file> | awk 'first/last timestamp per file' (window file-set derivation)",
+    "grep 'status_request' <window files> | grep -o 'slots_stale=[a-z]*' | sort | uniq -c",
+    "curl -s -o /dev/null localhost:8000/health (x10; residual-500 reproduction)"
+  ],
+  "limitations": [
+    "llama-server access lines carry no timestamps: any per-file time attribution is approximate at the rotation boundary (the two kept files are a superset spanning 2026-10-27T00:00Z..2026-10-29T00:00Z, i.e. 12 h outside the window on each side).",
+    "The pre-window baseline snapshot at 2026-10-27T12:00Z was never taken; the window fallback-counter delta is unrecoverable anyway because the serving proxy has since restarted.",
+    "Fallback WARNING lines are throttled to one per 300 s, so warning-line counts undercount actual fallbacks; the counter is authoritative but unavailable for this window.",
+    "Verdict logic: a zero router-500 count across the superset would have proven zero inside the window; a non-zero superset count does not localise the 500s to the window, so AC1 is reported as unproven-and-clearly-non-zero (RED) rather than a precise in-window count."
+  ]
+}
