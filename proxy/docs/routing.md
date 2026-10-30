@@ -2010,6 +2010,21 @@ returns the retryable 503 `backend_error` shape — never
 `local_lease_active`/`no_slots_available`, which would make provider.py queue
 for a slot the gate is refusing to grant.
 
+**Hold bound.** The AC1/AC2 acceptance bound is a **<=300 s (5 min) hold** on
+any local dispatch that never delivers a first byte — the epic's per-hold
+bound (LP-0MVKN9IRP003XJH6 AC1). The terminal marker and the choke-point gate
+hold that bound by construction: a post-deadline cancellation releases its
+lease in the same second (`lease_released … reason=prefill_deadline`, 0.0 s),
+and the same request can no longer re-acquire a fresh lease, so the
+~308 s unproductive hold of the 2026-10-26 incident (311-322 s denials) cannot
+recur. Remaining unproductive holds (new cold prefills, deadline evictions of
+*other* requests, no-progress watchdog) are each bounded: the watchdog fires
+after `local_dispatch_no_progress_timeout_seconds` (180 s) plus the sweep,
+well inside the 300 s bound. The measurement gate that verifies this at
+>=24 h is `scripts/prefill_recovery_verification.py --measure`
+(`--wedge-bound-seconds`, default 300 = the bound), documented in
+[docs/dev/prefill-recovery-verification.md](../../docs/dev/prefill-recovery-verification.md).
+
 Clearing: the router's first-byte success path. The store is in-process (`_prefill_thrash_cooldowns`,
 keyed `(session, fingerprint)`; a proxy restart resets it with the routing
 state it guards) in `proxy/proxy/router_helpers.py`. Unit and routing-level

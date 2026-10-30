@@ -2310,6 +2310,54 @@ Anonymous/non-explicit sessions do **not** receive the prefill-progress
 extension; they rely on the adaptive token-estimate lease
 (LP-0MSEHMMBK0062ZPI).
 
+#### Post-deadline local dispatch gate (terminal detour + thrash cooldown)
+
+When a local dispatch is cancelled by the prefill deadline
+(`prefill_deadline_exceeded`, backstop `local_prefill_deadline_seconds`,
+default 120), the proxy makes two guarantees so the gate recovers in minutes
+instead of holding other sessions for the incident's ~6 min (LP-0MVSAMN14001DMTY
+fix, verified by LP-0MVSAMS5O006OAIS):
+
+1. **Terminal for the request.** The cancellation marks the *request* object,
+   so that same request can never re-acquire a fresh dispatch lease after the
+   release (the 2026-10-26 re-dispatch that re-armed a lease ~150 ms later). A
+   concurrent request from the same session is unaffected.
+2. **Session cooldown.** The session is kept off local for the same prompt for
+   `local_prefill_thrash_cooldown_seconds` (default 600). The gate is enforced
+   at every local-dispatch **acquisition choke point** — `proxy_to_local`
+   before any local resource is acquired and `_try_acquire_local_dispatch`
+   before the lease record is created — so paths that bypass the provider
+   chain (in-request retries, `ui.py` direct dispatch) are covered too.
+
+Both refusals return the retryable **503 `backend_error`** shape (never
+`local_lease_active`/`no_slots_available`, which would make the client queue
+for a slot the gate refuses to grant).
+
+**Rollback knobs** (`server.*` in `proxy/config.yaml`):
+
+| Knob | Default | Rollback meaning |
+|---|---|---|
+| `local_prefill_thrash_cooldown_seconds` | `600` | **`0` disables** the thrash cooldown entirely — restores pre-fix behaviour (no arming, no `routing_skip_local reason=prefill_thrash_cooldown`, no early clear). |
+| `local_prefill_thrash_recovery_fraction` | `0.9` | Size gate on the cooldown's early clear — `0` restores clear-on-any-success (the measured bug). |
+
+Deprecated knobs are not re-tuned without fresh evidence
+(`local_cold_prefill_budget_tokens 25000` etc. remain as deployed).
+
+**Reading the evidence lines in `proxy.log`:**
+
+- `routing_skip_local ... reason=prefill_thrash_cooldown cooldown_remaining=Ns`
+  — the session's post-deadline window is armed for this prompt; the chain
+  falls through to the next provider. `entry=router_dispatch` /
+  `entry=lease_acquire` name which choke point refused.
+- `routing_skip_local ... reason=post_deadline_terminal` — this *request* was
+  already cancelled by the deadline; local is terminal for it.
+- `lease_released ... reason=prefill_deadline` — a cancelled dispatch released
+  its lease (0.0 s is the healthy shape; a long gap is the wedge signature).
+- `local_dispatch_denied session=... owner=... active=...` — a competing
+  session held the gate; classify by the owner's hold duration (the AC bound
+  is <=300 s of unproductive hold, `scripts/prefill_recovery_verification.py
+  --measure`).
+
 #### Automatic Counter Recovery
 
 The proxy includes an automatic recovery mechanism for the `local_active_queries`

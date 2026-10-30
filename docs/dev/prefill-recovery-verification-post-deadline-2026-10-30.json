@@ -1,0 +1,341 @@
+{
+  "window": {
+    "since": "2026-10-29 21:50:00",
+    "until": "2026-10-30 21:50:00",
+    "log_dir": "/var/log/llama-proxy"
+  },
+  "coverage": {
+    "max_gap_seconds": 3600.0,
+    "files": [
+      {
+        "file": "proxy.log-2026-10-30_00",
+        "first": "2026-10-29 21:50:00",
+        "last": "2026-10-29 23:59:58",
+        "lines": 52667
+      },
+      {
+        "file": "proxy.log.2026-10-29_20",
+        "first": "2026-10-30 00:00:00",
+        "last": "2026-10-30 02:09:11",
+        "lines": 30961
+      },
+      {
+        "file": "proxy.log.2026-10-30_02",
+        "first": "2026-10-30 02:09:31",
+        "last": "2026-10-30 08:09:28",
+        "lines": 50625
+      },
+      {
+        "file": "proxy.log.2026-10-30_103503",
+        "first": "2026-10-30 08:09:31",
+        "last": "2026-10-30 10:35:03",
+        "lines": 8654
+      },
+      {
+        "file": "proxy.log.2026-10-30_10",
+        "first": "2026-10-30 10:35:09",
+        "last": "2026-10-30 16:34:59",
+        "lines": 107044
+      },
+      {
+        "file": "proxy.log",
+        "first": "2026-10-30 16:35:14",
+        "last": "2026-10-30 21:50:00",
+        "lines": 103719
+      }
+    ],
+    "gaps": [],
+    "window_start_gap_seconds": 0.0,
+    "window_end_gap_seconds": 0.0,
+    "verdict_met": true
+  },
+  "ac1": {
+    "verdict_basis": "wedge_attribution: a denial caused by a lease owner holding the gate with no client-visible first byte for >= wedge_bound_seconds (restated by LP-0MVLHMCN6003GAMD AC1)",
+    "wedge_bound_seconds": 300,
+    "wedge_denials": 0,
+    "productive_holder_denials": 34,
+    "short_hold_denials": 204,
+    "stale_owner_denials": 135,
+    "unleased_denials": 0,
+    "denials_examined": 373,
+    "max_unproductive_hold_seconds": 195.0,
+    "max_productive_hold_seconds": 365.0,
+    "wedge_examples": [],
+    "diagnostics": {
+      "min_attempts": 10,
+      "thrash_hours": [
+        "2026-10-30 12:00:00"
+      ],
+      "lease_active_fallbacks": 191,
+      "hours_checked": 25,
+      "note": "thrash hours and the lease-active fallback volume are admission-side signals (LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I / LP-0MVOFVCA2008DQVE); they no longer determine this verdict"
+    },
+    "verdict_met": true
+  },
+  "ac2": {
+    "recovery_bound_seconds": 300,
+    "pairs": [
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-parent-9c6e5293",
+        "deadline": "2026-10-29 23:03:36",
+        "release": "2026-10-29 23:03:36",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-parent-70d7436b",
+        "deadline": "2026-10-29 23:39:27",
+        "release": "2026-10-29 23:39:27",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-parent-70d7436b",
+        "deadline": "2026-10-29 23:42:40",
+        "release": "2026-10-29 23:42:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-parent-70d7436b",
+        "deadline": "2026-10-29 23:44:41",
+        "release": "2026-10-29 23:44:41",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-parent-70d7436b",
+        "deadline": "2026-10-29 23:46:42",
+        "release": "2026-10-29 23:46:42",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-parent-70d7436b",
+        "deadline": "2026-10-29 23:50:23",
+        "release": "2026-10-29 23:50:23",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-parent-70d7436b",
+        "deadline": "2026-10-29 23:52:24",
+        "release": "2026-10-29 23:52:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793293272-2511808-23334",
+        "deadline": "2026-10-29 23:54:24",
+        "release": "2026-10-29 23:54:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-phase2_deep-8abaffdc",
+        "deadline": "2026-10-29 23:56:33",
+        "release": "2026-10-29 23:56:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-phase2_deep-8abaffdc",
+        "deadline": "2026-10-29 23:58:33",
+        "release": "2026-10-29 23:58:33",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793353808-2005035-23344",
+        "deadline": "2026-10-30 11:35:12",
+        "release": "2026-10-30 11:35:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793353808-2005035-23344",
+        "deadline": "2026-10-30 11:40:13",
+        "release": "2026-10-30 11:40:13",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793353808-2005035-23344",
+        "deadline": "2026-10-30 11:42:14",
+        "release": "2026-10-30 11:42:14",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793361459-2452208-2049",
+        "deadline": "2026-10-30 12:02:08",
+        "release": "2026-10-30 12:02:08",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793349796-1965536-3148",
+        "deadline": "2026-10-30 12:08:02",
+        "release": "2026-10-30 12:08:02",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793349796-1965536-3148",
+        "deadline": "2026-10-30 12:10:22",
+        "release": "2026-10-30 12:10:22",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793349796-1965536-3148",
+        "deadline": "2026-10-30 12:15:31",
+        "release": "2026-10-30 12:15:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793349796-1965536-3148",
+        "deadline": "2026-10-30 12:17:31",
+        "release": "2026-10-30 12:17:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793349796-1965536-3148",
+        "deadline": "2026-10-30 12:19:32",
+        "release": "2026-10-30 12:19:32",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793349796-1965536-3148",
+        "deadline": "2026-10-30 13:53:46",
+        "release": "2026-10-30 13:53:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793368342-118492-5529",
+        "deadline": "2026-10-30 13:55:46",
+        "release": "2026-10-30 13:55:46",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793368857-9238-2285",
+        "deadline": "2026-10-30 14:08:28",
+        "release": "2026-10-30 14:08:28",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793368857-9238-2285",
+        "deadline": "2026-10-30 14:17:56",
+        "release": "2026-10-30 14:17:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793368857-9238-2285",
+        "deadline": "2026-10-30 14:19:56",
+        "release": "2026-10-30 14:19:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793349796-1965536-3148",
+        "deadline": "2026-10-30 14:21:57",
+        "release": "2026-10-30 14:21:57",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-DIS-0MVU64UBA00367YF-verdict_reask-6e3b7d3d",
+        "deadline": "2026-10-30 14:23:58",
+        "release": "2026-10-30 14:23:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793382642-3432317-22046",
+        "deadline": "2026-10-30 18:02:52",
+        "release": "2026-10-30 18:02:52",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793382642-3432317-22046",
+        "deadline": "2026-10-30 18:04:53",
+        "release": "2026-10-30 18:04:53",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793382642-3432317-22046",
+        "deadline": "2026-10-30 18:07:54",
+        "release": "2026-10-30 18:07:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793382642-3432317-22046",
+        "deadline": "2026-10-30 18:09:55",
+        "release": "2026-10-30 18:09:55",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18e2b-1b89-7199-b987-1cbdca0f88fb",
+        "deadline": "2026-10-30 19:16:24",
+        "release": "2026-10-30 19:16:24",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18e3e-fd56-76f0-915a-a94727a99a40",
+        "deadline": "2026-10-30 19:28:54",
+        "release": "2026-10-30 19:28:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18e3e-fd56-76f0-915a-a94727a99a40",
+        "deadline": "2026-10-30 19:30:54",
+        "release": "2026-10-30 19:30:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18e3e-fd56-76f0-915a-a94727a99a40",
+        "deadline": "2026-10-30 19:34:50",
+        "release": "2026-10-30 19:34:50",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18e3e-fd56-76f0-915a-a94727a99a40",
+        "deadline": "2026-10-30 19:36:51",
+        "release": "2026-10-30 19:36:51",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-SA-0MVS1QS9J009DGPT-parent-a8344db1",
+        "deadline": "2026-10-30 19:38:51",
+        "release": "2026-10-30 19:38:51",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793389955-137733-11552",
+        "deadline": "2026-10-30 19:58:01",
+        "release": "2026-10-30 19:58:01",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-AH-0MVMIGVCE004VSNA-parent-8ebafa4d",
+        "deadline": "2026-10-30 20:02:12",
+        "release": "2026-10-30 20:02:12",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-RISE-0MVPY83CA00335W3-parent-624ecbbe",
+        "deadline": "2026-10-30 20:14:17",
+        "release": "2026-10-30 20:14:17",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18e76-5080-73ad-a3bd-d45332e1844a",
+        "deadline": "2026-10-30 20:20:31",
+        "release": "2026-10-30 20:20:31",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18e7d-b00e-739d-86cb-db2dc730586b",
+        "deadline": "2026-10-30 20:29:56",
+        "release": "2026-10-30 20:29:56",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "01a18ea0-2118-76f7-b270-d80dcda25953",
+        "deadline": "2026-10-30 21:06:23",
+        "release": "2026-10-30 21:06:23",
+        "release_seconds": 0.0
+      }
+    ],
+    "unreleased_sessions": [],
+    "max_release_seconds": 0.0,
+    "verdict_met": true
+  },
+  "ac3": {
+    "resume_window_seconds": 3600,
+    "local_finishes_after_last_release": 32,
+    "verdict_met": true
+  },
+  "all_verdicts_met": true
+}
