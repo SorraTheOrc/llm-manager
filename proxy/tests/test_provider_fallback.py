@@ -730,8 +730,12 @@ async def test_remote_fallback_free_usage_limit_does_not_affect_other_errors(sam
             request, "v1/chat/completions", sample_model_config, cfg
         )
 
-    # 429 rates are returned as-is when all providers hit the same error
-    assert result.status_code == 429
+    # A remote 429 is a rate limit, not local slot pressure, so the exhausted
+    # chain ends in the generic ``all_exhausted`` 503 — never the
+    # ``all_slots_exhausted`` 429, whose message and (since
+    # LP-0MVUXY1CL005KWCC) retry timer describe local slots.
+    assert result.status_code == 503
+    assert json.loads(result.body)["code"] == provider.EXHAUSTION_CODE_ALL
 
     # The provider should have a normal (short) cooldown, not 3h
     now = time.time()

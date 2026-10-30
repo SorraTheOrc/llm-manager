@@ -11861,7 +11861,14 @@ async def _proxy_with_remote_fallback_cycle(
                     attempted_domains.add(_failure_domain_key(provider_cfg))
                 fallback_reason = f"HTTP {response.status_code}"
                 prev_provider = provider_name
-                if response.status_code != 429:
+                # A bare 429 from a LOCAL backend means "slots busy", so the
+                # exhaustion is reported as slot exhaustion. A 429 from a
+                # remote provider is a rate limit, never local slot pressure —
+                # treating it as slot exhaustion advertised an untrue
+                # "Model server busy: 0/N slots available" refusal (and, now
+                # that the slot refusal carries a retry timer, the wrong
+                # wait). LP-0MVUXY1CL005KWCC.
+                if response.status_code != 429 or provider_type != "local":
                     all_slot_exhaustion = False
                 _observe_http_error_400(
                     response, provider_name, provider_type, path, body_text, fallback_reason,
@@ -13938,7 +13945,9 @@ async def _proxy_with_fallback_cycle(
                         attempted_domains.add(_failure_domain_key(provider_cfg))
                     fallback_reason = f"HTTP {response.status_code}"
                     prev_provider = provider_name
-                    if response.status_code != 429:
+                    # See _proxy_with_remote_fallback_cycle: only a LOCAL 429
+                    # is local slot pressure (LP-0MVUXY1CL005KWCC).
+                    if response.status_code != 429 or provider_type != "local":
                         all_slot_exhaustion = False
                     _observe_http_error_400(
                         response, provider_name, provider_type, path, body_text, fallback_reason,

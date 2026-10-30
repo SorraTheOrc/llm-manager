@@ -38,6 +38,7 @@ from unittest.mock import patch
 
 import proxy.provider as provider
 import pytest
+from fastapi import Response
 
 #: Cap used by the contract rows; wide enough that the ETA rows are not clamped.
 CONFIG: dict = {"server": {"max_retry_after_seconds": 3600}}
@@ -235,6 +236,78 @@ def test_slot_exhaustion_timer_is_floored_at_one_second():
             all_local_slot_exhaustion=True, total_slots=1, config=SLOT_CONFIG
         )
     assert json.loads(response.body)["retry_after"] == 1
+
+
+class _Request:
+    """Minimal request stub for the chain cycle."""
+
+    def __init__(self, body: bytes = b'{"model":"test"}'):
+        self._body = body
+        self.headers = {}
+        self.method = "POST"
+        self.url = type("U", (), {"path": "/v1/chat/completions"})()
+
+    async def body(self):
+        return self._body
+
+    async def is_disconnected(self):
+        return False
+
+
+@pytest.fixture
+def _clean_provider_state():
+    provider._provider_unavailable_until.clear()
+    provider._usage_reset_at.clear()
+    yield
+    provider._provider_unavailable_until.clear()
+    provider._usage_reset_at.clear()
+
+
+@pytest.mark.asyncio
+async def test_remote_429_chain_reports_generic_exhaustion_not_slot_exhaustion(
+    _clean_provider_state,
+):
+    """The slot branch is reserved for *local* slot pressure.
+
+    LP-0MVUXY1CL005KWCC: a chain whose only provider is remote and answers a
+    bare quota ``429`` is a rate limit, not a busy local slot. It must end in
+    the generic ``all_exhausted`` 503 (with the provider cooldown as its
+    ``retry_after``), never in the ``all_slots_exhausted`` 429 whose message
+    and timer describe local slots.
+    """
+    model_config = {
+        "providers": [
+            {
+                "name": "remote-quota",
+                "type": "remote",
+                "endpoint": "https://example.invalid/v1",
+            }
+        ]
+    }
+
+    async def _quota_429(_req, _path, _cfg):
+        return Response(
+            content=(
+                b'{"code":"rate_limit_exceeded",'
+                b'"type":"rate_limit_error"}'
+            ),
+            status_code=429,
+            media_type="application/json",
+        )
+
+    with patch("proxy.server.proxy_to_remote", _quota_429):
+        result = await provider.proxy_with_remote_fallback(
+            _Request(),
+            "v1/chat/completions",
+            model_config,
+            {"provider_cooldown_seconds": 30},
+        )
+
+    body = json.loads(result.body)
+    assert result.status_code == 503
+    assert body["code"] == provider.EXHAUSTION_CODE_ALL
+    assert body["retry_after"] >= 1
+    assert "slots available" not in json.dumps(body)
 
 
 def test_slot_429_timer_bounds_the_chain_hold():
