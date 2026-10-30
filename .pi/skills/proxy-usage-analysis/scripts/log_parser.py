@@ -205,6 +205,22 @@ RE_GUARD_NEW_TOKENS = re.compile(r"\bnew_tokens=(\d+)")
 # (LP-0MVGDUVGE0024YAI) published. ETA is ``None`` when the estimate failed
 # fail-open; both fields are absent on pre-change schema lines.
 RE_STATUS_PREFILL_ETA = re.compile(r"\bprefill_eta_seconds=([\d.]+|None)")
+# Calibration context appended to the poll line (LP-0MVSD5RJW008F1IB AC6): the
+# reference prompt size the published bound costed, whether the pricing was
+# calibrated, the rate bucket it was priced from and that window's sample
+# count, plus the cache state the bound assumes. All are absent on pre-change
+# lines and stay ``None`` (never a fabricated default) there, so the metric can
+# tell which reference size produced each published number.
+RE_STATUS_PREFILL_KIND = re.compile(r"\bprefill_eta_kind=([A-Za-z_]+)")
+RE_STATUS_ASSUMED_CACHED_RATIO = re.compile(
+    r"\bprefill_eta_assumed_cached_ratio=([\d.]+|None)"
+)
+RE_STATUS_REFERENCE_TOKENS = re.compile(r"\bprefill_eta_reference_tokens=(\d+|None)")
+RE_STATUS_PREFILL_SAMPLES = re.compile(r"\bprefill_eta_samples=(\d+)")
+RE_STATUS_PREFILL_CALIBRATED = re.compile(
+    r"\bprefill_eta_calibrated=(true|false)"
+)
+RE_STATUS_PREFILL_RATE_BUCKET = re.compile(r"\bprefill_eta_rate_bucket=([A-Za-z_]+)")
 RE_STATUS_CAPACITY_HINT = re.compile(r"\bcapacity_hint=([a-z_]+)")
 RE_STATUS_SCHEMA_VERSION = re.compile(r"\bstatus_schema_version=(\d+)")
 RE_STATUS_AVAILABLE_SLOTS = re.compile(r"\bavailable_slots=(\d+)")
@@ -700,6 +716,16 @@ class LogEvent:
     status_schema_version: int | None = None
     available_slots: int | None = None
     total_slots: int | None = None
+    # Calibration context of the published bound (LP-0MVSD5RJW008F1IB AC6):
+    # the reference prompt size, whether the coefficients were calibrated, the
+    # rate bucket and its sample count, and the cache state the bound assumes.
+    # ``None`` on lines predating the fields — never a fabricated default.
+    prefill_eta_reference_tokens: int | None = None
+    prefill_eta_calibrated: bool | None = None
+    prefill_eta_rate_bucket: str | None = None
+    prefill_eta_samples: int | None = None
+    prefill_eta_kind: str | None = None
+    prefill_eta_assumed_cached_ratio: float | None = None
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J, ``idle_admit`` kind):
     # the idle age at admission and the configured threshold. Populated on
     # ``idle_admit`` events only.
@@ -1214,6 +1240,7 @@ def parse_log_line(line: str) -> LogEvent | None:
         # truthful capacity hint. ``prefill_eta_seconds=None`` is meaningful
         # (estimate unavailable — fail-open), never a zero cost.
         eta = _float(RE_STATUS_PREFILL_ETA, msg)
+        calibrated = _first(RE_STATUS_PREFILL_CALIBRATED, msg)
         return LogEvent(
             STATUS_REQUEST,
             ts,
@@ -1222,6 +1249,22 @@ def parse_log_line(line: str) -> LogEvent | None:
             status_schema_version=_int(RE_STATUS_SCHEMA_VERSION, msg),
             available_slots=_int(RE_STATUS_AVAILABLE_SLOTS, msg),
             total_slots=_int(RE_STATUS_TOTAL_SLOTS, msg),
+            # Calibration context (LP-0MVSD5RJW008F1IB AC6): additive fields;
+            # absent on pre-change lines, where each stays ``None``.
+            prefill_eta_reference_tokens=_int(
+                RE_STATUS_REFERENCE_TOKENS, msg
+            ),
+            prefill_eta_calibrated=(
+                None if calibrated is None else calibrated == "true"
+            ),
+            prefill_eta_rate_bucket=_first(
+                RE_STATUS_PREFILL_RATE_BUCKET, msg
+            ),
+            prefill_eta_samples=_int(RE_STATUS_PREFILL_SAMPLES, msg),
+            prefill_eta_kind=_first(RE_STATUS_PREFILL_KIND, msg),
+            prefill_eta_assumed_cached_ratio=_float(
+                RE_STATUS_ASSUMED_CACHED_RATIO, msg
+            ),
         )
     if msg.startswith(ROUTING_RESIDENT_PREFIX):
         # "routing_resident_prefix provider=local model=Qwen3 decision=admit

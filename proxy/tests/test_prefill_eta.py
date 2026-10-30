@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import math
+from unittest.mock import patch
 
 import pytest
 
@@ -391,3 +392,117 @@ def test_inert_decisions_are_not_logged(caplog):
 
     assert decision.active is False
     assert not [r for r in caplog.records if r.getMessage().startswith("local_admission_guard")]
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVSD5RJW008F1IB AC2: the published number is a labelled cache-cold bound
+# ---------------------------------------------------------------------------
+
+
+def test_status_estimate_labels_the_published_bound_and_prices_that_bound():
+    """The published value is the cache-cold cost of the published reference.
+
+    `prefill_eta_kind` / `prefill_eta_assumed_cached_ratio` /
+    `prefill_eta_reference_tokens` must describe the number they sit next to,
+    so a dispatcher cannot read the bound as its own request's cost.
+    """
+    _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
+    fields = prefill_eta.status_estimate(
+        _cfg(), "Qwen3", total_slots=1, available_slots=1
+    )
+
+    assert fields["prefill_eta_kind"] == "reference_cold_bound"
+    assert fields["prefill_eta_assumed_cached_ratio"] == 0.0
+    reference = fields["prefill_eta_reference_tokens"]
+    assert reference == 100_000
+
+    # Consistency: with no occupancy the published ETA IS the cache-cold price
+    # of exactly that reference prompt (same estimator the guard enforces).
+    expected, _coeffs = prefill_eta.estimate_prefill_seconds(
+        "Qwen3", reference, fields["prefill_eta_assumed_cached_ratio"], _cfg()
+    )
+    assert fields["prefill_eta_seconds"] == pytest.approx(round(expected, 1))
+
+
+def test_status_estimate_fail_open_path_still_labels_the_bound():
+    """A failed estimate keeps the label vocabulary (never an unlabelled None)."""
+    with patch.object(
+        prefill_eta, "reference_tokens", side_effect=RuntimeError("boom")
+    ):
+        fields = prefill_eta.status_estimate(_cfg(), "Qwen3")
+
+    # The fail-open shape that handlers.py copies into the payload still says
+    # WHAT the (missing) number would have been.
+    assert fields["prefill_eta_seconds"] is None
+    assert fields["prefill_eta_kind"] == "reference_cold_bound"
+    assert fields["prefill_eta_assumed_cached_ratio"] == 0.0
+    assert fields["prefill_eta_reference_tokens"] is None
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVSD5RJW008F1IB AC4: the reference prompt cannot be poisoned
+# ---------------------------------------------------------------------------
+
+
+def test_reference_stays_in_the_normal_band_after_a_huge_dispatch():
+    """[1k, 1k, 119k, 1k] must not pin the published reference at 119k."""
+    for tokens in (1_000, 1_000, 119_000, 1_000):
+        prefill_eta.record_dispatch_sample("Qwen3", tokens, 0.0, tokens * 3.9)
+
+    reference = prefill_eta.reference_tokens("Qwen3", _cfg())
+
+    assert reference == 1_000, "a single outlier must not define the reference"
+    assert reference < 119_000
+
+
+def test_reference_window_is_a_configurable_rolling_median():
+    """The statistic is the median of the last N dispatch prompt sizes."""
+    for tokens in (1_000, 1_000, 119_000):
+        prefill_eta.record_dispatch_sample("Qwen3", tokens, 0.0, tokens * 3.9)
+
+    # Last 2 samples are [1k, 119k] -> median 60k: the window, not the whole
+    # history, defines the statistic.
+    assert prefill_eta.reference_tokens(
+        "Qwen3", _cfg(local_admission_guard_reference_window_samples=2)
+    ) == 60_000
+
+
+def test_reference_window_zero_restores_the_last_dispatch_behaviour():
+    """Documented rollback: window 0 = the pre-change single-latest sample."""
+    for tokens in (1_000, 1_000, 119_000):
+        prefill_eta.record_dispatch_sample("Qwen3", tokens, 0.0, tokens * 3.9)
+
+    assert prefill_eta.reference_tokens(
+        "Qwen3", _cfg(local_admission_guard_reference_window_samples=0)
+    ) == 119_000
+    # Absent ceiling + window 0 is byte-for-byte the old behaviour.
+    guard = prefill_eta.resolve_config(
+        _cfg(local_admission_guard_reference_window_samples=0)
+    )
+    assert guard.reference_window_samples == 0
+    assert guard.reference_max_tokens == 0
+
+
+def test_reference_ceiling_caps_the_published_prompt_size():
+    """A configured ceiling bounds the reference even when the median is huge."""
+    for tokens in (119_000, 119_000, 119_000):
+        prefill_eta.record_dispatch_sample("Qwen3", tokens, 0.0, tokens * 3.9)
+
+    assert prefill_eta.reference_tokens(
+        "Qwen3", _cfg(local_admission_guard_reference_max_tokens=40_000)
+    ) == 40_000
+    # The ceiling also bounds the configured fallback (no dispatches observed).
+    assert prefill_eta.reference_tokens(
+        "Other",
+        _cfg(
+            local_admission_guard_reference_tokens=32_000,
+            local_admission_guard_reference_max_tokens=10_000,
+        ),
+    ) == 10_000
+
+
+def test_reference_default_window_is_twenty_samples():
+    guard = prefill_eta.resolve_config(_cfg())
+
+    assert guard.reference_window_samples == 20
+    assert guard.reference_max_tokens == 0

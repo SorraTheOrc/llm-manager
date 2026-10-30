@@ -197,7 +197,9 @@ Per-slot fields (all additive):
 | `lease_state` | `"generating" \| "idle_leased" \| "free"` | `generating` whenever `is_processing` is true (never `free` while a prefill or decode is in flight); `idle_leased` when not processing but a live lease still reserves it; `free` otherwise. |
 | `phase` | `"prefill" \| "decode" \| null` | Inferred proxy-side (see below); `null` when the slot is not processing. |
 | `context_tokens` | `int \| null` | Prompt progress (`max(n_past, n_prompt_tokens_processed)`) when the llama.cpp build reports it, else `null`. |
-| `prefill_eta_seconds` | `float \| null` | Shared calibrated prefill cost of the slot's loaded context, only for a slot in `prefill`; `null` otherwise or when not computable. |
+| `prefill_eta_seconds` | `float \| null` | Shared calibrated prefill cost of the slot's loaded context, only for a slot in `prefill`; `null` otherwise or when not computable. It is a **cache-cold** estimate (`cached_ratio = 0.0`), labelled by `prefill_eta_kind` / `prefill_eta_assumed_cached_ratio` (LP-0MVSD5RJW008F1IB). |
+| `prefill_eta_kind` | `"reference_cold_bound"` | Discriminator: the ETA is a cache-cold bound, not a per-request estimate. |
+| `prefill_eta_assumed_cached_ratio` | `0.0` | The cache state the ETA assumes: nothing served from the prompt cache. |
 | `abandoned` | `bool` | `true` when the proxy gave up on the dispatch occupying this slot (see [Abandoned work](#abandoned-work-lp-0mvr5hk00558tb-ac1)) and llama-server has not released it yet. Always present. |
 | `abandonment_reason` | `str \| null` | Which abandonment gave the slot up: `prefill_deadline`, `session_evicted`, `no_progress_watchdog`, `client_disconnect` (also `orphan_cleanup` / `measured_cache_deficit` from the sweep and the early abort). `null` when `abandoned` is `false`. |
 | `abandoned_session_id` | `str \| null` | The session that was abandoned (the slot's own identity is already `slot_id`). `null` when `abandoned` is `false`. |

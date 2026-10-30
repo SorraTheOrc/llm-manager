@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -99,12 +100,17 @@ CONTENTION_BASELINE = {
     "source": "LP-0MVGR2OXT0096OGK description (pre-change baseline)",
 }
 
-# M3 verdict tolerance: the predicted p50 prefill duration is called a match
-# when it is within this percentage of the observed p50. Wider than the 10%
-# band the calibration itself targets because this compares two differently
-# conditioned distributions (reference-prompt, cache-cold prediction vs the
-# prompt mix that actually ran) at a quantile, not per dispatch.
+# M3 matched per-dispatch tolerance: the guard's priced ETA for a dispatch is
+# called a match when the median relative error against that same dispatch's
+# observed first-byte time is within this percentage (two-sided). It applies
+# ONLY to matched pairs (LP-0MVSD5RJW008F1IB AC1/AC3); the cross-population
+# "bound vs served remainder" comparison is a one-sided bound test below.
 PREFILL_ETA_MATCH_TOLERANCE_PCT = 25.0
+
+# M3 bound test (LP-0MVSD5RJW008F1IB AC3): below this many observed dispatches
+# the window cannot decide whether the published cache-cold bound held, so the
+# verdict is ``inconclusive`` rather than a verdict on noise.
+PREFILL_ETA_BOUND_MIN_SAMPLES = 30
 
 # M1 verdict threshold: the share of attributed denials whose decision block
 # measured zero local work (``idle_leased``) above which the lease/busy signal
@@ -2642,24 +2648,36 @@ def _append_contention_prediction_section(
             f"Only {idle_share:.1f}% of attributed denials fired with the pool "
             "measured idle — most denials tracked genuine prefill/decode work."
         )
-    if eta["verdict"] == "matches_reality":
-        eta_verdict_label = "matches reality"
+    if eta["verdict"] == "bound_holds":
+        eta_verdict_label = "holds"
         eta_sentence = (
-            "the predicted prefill ETA is within tolerance of observed prefill "
-            "durations."
+            "The served p90 stayed within the published cache-cold reference "
+            f"bound (observed p90 {eta['observed']['p90']} s ≤ predicted p50 "
+            f"{eta['predicted']['p50']} s, n={eta['bound']['observed_samples']})."
         )
-    elif eta["verdict"] in ("over_predicts", "under_predicts"):
-        eta_verdict_label = "does not match reality"
+    elif eta["verdict"] == "bound_violated":
+        eta_verdict_label = "was violated"
         eta_sentence = (
-            f"The predicted prefill ETA {eta['verdict']} observed prefill "
-            "durations."
+            "Served prefill durations exceeded the published cache-cold "
+            f"reference bound (observed p90 {eta['observed']['p90']} s > "
+            f"predicted p50 {eta['predicted']['p50']} s, "
+            f"n={eta['bound']['observed_samples']}) — the bound is "
+            "under-stated on real traffic."
         )
     else:
         eta_verdict_label = "inconclusive"
-        eta_sentence = "the prefill ETA comparison is inconclusive."
+        eta_sentence = (
+            "The bound-vs-served comparison is inconclusive (fewer than "
+            f"{eta['bound']['min_samples']} observed dispatches, or no "
+            "published polls) so the bound is neither confirmed nor refuted."
+        )
     ap(f"**Denial signal (`lease_state`): {denial_verdict_label}.** {denial_sentence}")
-    ap(f"**Prefill-ETA signal (`prefill_eta_seconds`): {eta_verdict_label}.** {eta_sentence}")
-    if "does not match reality" in (denial_verdict_label, eta_verdict_label):
+    ap(f"**Prefill-ETA bound (`prefill_eta_seconds`, cache-cold reference bound): "
+       f"{eta_verdict_label}.** {eta_sentence}")
+    if "does not match reality" in denial_verdict_label or eta_verdict_label in (
+        "was violated",
+        "inconclusive",
+    ):
         overall_label = "do not unambiguously match reality"
     else:
         overall_label = "match reality"
@@ -2668,7 +2686,19 @@ def _append_contention_prediction_section(
        f"{baseline['denials']}, denials/hour {now_dph:.1f} vs {base_dph:.1f}, busy "
        f"{busy_pct:.1f}% vs {baseline['busy_pct']}%).**")
     ap("")
-    ap("### M3 — prefill_eta_seconds accuracy (predicted vs observed, p50/p90)")
+    ap("### M3 — prefill_eta_seconds accuracy (bound vs served remainder, p50/p90)")
+    ap("")
+    ap("**Comparison: bound vs served remainder.** The first table is the "
+       "historical quantile-matched comparison. Read it as *does the published "
+       "cache-cold reference bound hold against traffic that actually ran*, not "
+       "as a per-request calibration score: the prediction is a cache-cold "
+       "reference-prompt **bound** while the observation is the **uncached "
+       "remainder** of mostly cache-warm prompts, so a large predicted−observed "
+       "gap is expected by construction (the two populations differ). The "
+       "verdict is therefore one-sided — `bound_holds` when the served p90 "
+       "stays within the published p50, `bound_violated` otherwise, and "
+       f"`inconclusive` below {eta['bound']['min_samples']} observed "
+       "dispatches.")
     ap("")
     ap("| Quantile | Predicted (status polls) | Observed (prompt eval) | "
        "Error (pred−obs) | Relative |")
@@ -2684,15 +2714,49 @@ def _append_contention_prediction_section(
        f"{eta['error_p90'] if eta['error_p90'] is not None else '-'} s | "
        f"{eta['relative_error_p90_pct'] if eta['relative_error_p90_pct'] is not None else '-'}% |")
     ap("")
-    ap("Predicted = the calibrated `prefill_eta_seconds` published on "
+    ap("Predicted = the calibrated cache-cold reference bound published on "
        "`status_request` polls; observed = llama-server `prompt eval time` "
        "durations for dispatches that ran. The two streams cannot be paired "
        "1:1 (llama-server eval lines carry no per-line timestamps), so the "
-       "comparison is quantile-matched: the p50/p90 of each distribution and "
-       "the signed error at both quantiles. The prediction is the cache-cold "
-       "reference-prompt cost, so systematic over-prediction (high predicted "
-       "p50 vs low observed p50) means the ETA over-refuses servable work.")
-    ap(f"**(prefill ETA verdict: {eta['verdict']})**")
+       "comparison is quantile-matched — a cross-population comparison, "
+       "labelled and bounded as above.")
+    ap(f"**(prefill ETA bound verdict: {eta['verdict']}; observed p90 "
+       f"{eta['bound']['observed_p90'] if eta['bound']['observed_p90'] is not None else '-'} s "
+       f"vs predicted p50 "
+       f"{eta['bound']['predicted_p50'] if eta['bound']['predicted_p50'] is not None else '-'} s, "
+       f"margin {'-' if eta['bound']['margin_seconds'] is None else str(eta['bound']['margin_seconds']) + ' s'})**")
+    ap("")
+    matched = eta["matched"]
+    ap("### M3b — matched per-dispatch prefill ETA accuracy (guard decision → "
+       "that dispatch's first byte)")
+    ap("")
+    ap("Predicted = the ETA the admission guard priced **for this dispatch** "
+       "(`eta_prefill_s`, the own-prefill term); observed = that same "
+       "dispatch's `dispatch_to_first_byte_ms`. Joined on the `session=` id, so "
+       "predicted and observed describe the same request — the only comparison "
+       "here where the "
+       f"{eta['matched']['tolerance_pct']:.0f}% tolerance is a calibration score.")
+    ap("")
+    ap("| Metric | Value |")
+    ap("|---|---:|")
+    ap(f"| Matched pairs | {matched['pairs']} "
+       f"(enforced {matched['enforced_pairs']}, observe {matched['observe_pairs']}) |")
+    ap(f"| Unmatched dispatches | {matched['unmatched_dispatches']} "
+       f"of {matched['dispatches']} |")
+    ap(f"| Predicted p50 / p90 | "
+       f"{matched['predicted_p50'] if matched['predicted_p50'] is not None else '-'} s / "
+       f"{matched['predicted_p90'] if matched['predicted_p90'] is not None else '-'} s |")
+    ap(f"| Observed p50 / p90 | "
+       f"{matched['observed_p50'] if matched['observed_p50'] is not None else '-'} s / "
+       f"{matched['observed_p90'] if matched['observed_p90'] is not None else '-'} s |")
+    ap(f"| Relative error p50 / p90 | "
+       f"{matched['relative_error_p50_pct'] if matched['relative_error_p50_pct'] is not None else '-'}% / "
+       f"{matched['relative_error_p90_pct'] if matched['relative_error_p90_pct'] is not None else '-'}% |")
+    ap("")
+    ap("Unmatched dispatches are never folded into the matched figure: an "
+       "inert (uncalibrated) guard, or an inactive `observe`-mode decision, "
+       "logs no priced ETA and therefore cannot be scored. "
+       f"**(matched prefill ETA verdict: {matched['verdict']})**")
     ap("")
 
 
@@ -3698,25 +3762,136 @@ def _gpu_busy_json(gpu: object | None) -> dict | None:
     }
 
 
+def _matched_prefill_eta(summary: AnalysisResult) -> dict:
+    """Matched per-dispatch prefill-ETA accuracy (LP-0MVSD5RJW008F1IB AC1).
+
+    Joins each local dispatch's first byte to the ETA the *admission guard
+    priced for that same dispatch*: predicted = the guard record's
+    ``eta_prefill_s`` (the own-prefill term — not ``projected_wait_s``, which
+    adds occupancy the observed first byte already includes once), observed =
+    that dispatch's ``dispatch_to_first_byte_ms``. The join key is the
+    ``session=`` identifier both lines carry.
+
+    Reporting rules from the brief:
+
+    - a dispatch with no matching guard record is **unmatched** and never
+      folded into the matched figure (the guard is inert for uncalibrated
+      buckets and logs nothing for inactive observe-mode decisions);
+    - ``enforced=false`` (observe rollout) pairs are valid *pricing*
+      measurements and are included, but counted separately so a rollout
+      window stays interpretable;
+    - guard records whose priced ETA is ``0`` (the calibration-independent
+      cold-prefill budget refusal) are not estimates and are skipped.
+    """
+    def _num(value) -> float | None:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    guards: dict[str, list[tuple[datetime, float, str | None]]] = {}
+    for event in getattr(summary, "local_admission_events", []) or []:
+        session = getattr(event, "session", None)
+        eta = _num(getattr(event, "eta_prefill_s", None))
+        if not session or eta is None or eta <= 0.0:
+            continue
+        guards.setdefault(session, []).append(
+            (event.ts, eta, getattr(event, "enforced", None))
+        )
+    for entries in guards.values():
+        entries.sort(key=lambda item: item[0])
+
+    dispatches = 0
+    unmatched = 0
+    pairs: list[tuple[float, float, str | None]] = []
+    for event in getattr(summary, "ttft_events", []) or []:
+        if getattr(event, "ttft_source", None) not in (None, "local"):
+            continue
+        service_ms = _num(getattr(event, "dispatch_to_first_byte_ms", None))
+        session = getattr(event, "session", None)
+        if service_ms is None or service_ms <= 0.0:
+            continue
+        dispatches += 1
+        candidates = guards.get(session) if session else None
+        if not candidates:
+            unmatched += 1
+            continue
+        # The guard fires at admission, before the first byte: take the last
+        # decision at or before it (falling back to the earliest recorded one).
+        chosen = candidates[0]
+        for candidate in candidates:
+            if candidate[0] <= event.ts:
+                chosen = candidate
+        pairs.append((chosen[1], service_ms / 1000.0, chosen[2]))
+
+    predicted = [p for p, _o, _e in pairs]
+    observed = [o for _p, o, _e in pairs]
+    relative = [
+        (p - o) / o * 100.0 for p, o in zip(predicted, observed) if o > 0
+    ]
+    rel_p50 = _percentile(relative, 50)
+    rel_p90 = _percentile(relative, 90)
+    if not pairs or rel_p50 is None:
+        verdict = "inconclusive"
+    elif abs(rel_p50) <= PREFILL_ETA_MATCH_TOLERANCE_PCT:
+        verdict = "matches_reality"
+    elif rel_p50 > 0:
+        verdict = "over_predicts"
+    else:
+        verdict = "under_predicts"
+
+    def _r(value: float | None) -> float | None:
+        return round(value, 2) if value is not None else None
+
+    return {
+        "pairs": len(pairs),
+        "dispatches": dispatches,
+        "unmatched_dispatches": unmatched,
+        "enforced_pairs": sum(1 for _p, _o, e in pairs if e != "false"),
+        "observe_pairs": sum(1 for _p, _o, e in pairs if e == "false"),
+        "predicted_p50": _r(_percentile(predicted, 50)),
+        "predicted_p90": _r(_percentile(predicted, 90)),
+        "observed_p50": _r(_percentile(observed, 50)),
+        "observed_p90": _r(_percentile(observed, 90)),
+        "relative_error_p50_pct": _r(rel_p50),
+        "relative_error_p90_pct": _r(rel_p90),
+        "tolerance_pct": PREFILL_ETA_MATCH_TOLERANCE_PCT,
+        "verdict": verdict,
+    }
+
+
 def prefill_eta_error_json(
     summary: AnalysisResult, speed: llama_log_parser.SpeedStats | None
 ) -> dict:
     """M3 (LP-0MVGR2OXT0096OGK): predicted-vs-observed prefill ETA error.
 
-    Predicted: every non-``None`` ``prefill_eta_seconds`` published on
-    ``status_request`` polls inside the window. Observed: the llama-server
-    ``prompt eval time`` durations (seconds) for the dispatches that ran.
-    The two streams cannot be joined 1:1 (llama-server eval lines carry no
-    per-line timestamps — see REFERENCE.md limitations), so the comparison is
-    quantile-matched: the p50/p90 of each distribution and the signed error at
-    both quantiles, plus the relative error against the observed value.
+    Two comparisons, because a cache-cold reference bound and a per-request
+    estimate answer different questions (LP-0MVSD5RJW008F1IB AC1/AC3):
 
-    The verdict rescues the operator from reading the table:
-    ``matches_reality`` when the predicted p50 is within the tolerance of the
-    observed p50, ``over_predicts`` / ``under_predicts`` when it misses wide
-    in that direction (an over-prediction is the harmful direction — it
-    refuses work that would have been servable), ``inconclusive`` when either
-    side has no samples.
+    - **bound vs served remainder** (the historical quantile-matched table).
+      Predicted: every non-``None`` ``prefill_eta_seconds`` published on
+      ``status_request`` polls inside the window. Observed: the llama-server
+      ``prompt eval time`` durations (seconds) for the dispatches that ran.
+      The two streams cannot be joined 1:1 (llama-server eval lines carry no
+      per-line timestamps — see REFERENCE.md limitations), so the comparison
+      is quantile-matched. The prediction is a cache-cold reference-prompt
+      *bound* while the observation is the *uncached remainder* of mostly-warm
+      prompts, so a large gap is expected; the only meaningful question is
+      whether the bound is **violated** (observed p90 above predicted p50).
+      That is reported one-sided as ``bound_holds`` / ``bound_violated`` /
+      ``inconclusive`` (below :data:`PREFILL_ETA_BOUND_MIN_SAMPLES` observed
+      samples) — never as a two-sided calibration verdict.
+    - **matched per-dispatch accuracy** (``matched``): the ETA the guard priced
+      for a dispatch vs that same dispatch's ``dispatch_to_first_byte_ms``,
+      where the 25 % two-sided tolerance *is* meaningful
+      (:func:`_matched_prefill_eta`).
+
+    The pre-existing keys (``predicted`` / ``observed`` / ``error_p50`` /
+    ``error_p90`` / ``relative_error_*`` / ``tolerance_pct`` / ``verdict``)
+    keep their names and shapes for trend continuity; ``verdict`` now reports
+    the one-sided bound test, and ``comparison`` states which comparison it
+    describes.
     """
     predicted = sorted(
         float(e.prefill_eta_seconds)
@@ -3749,15 +3924,24 @@ def prefill_eta_error_json(
     err_p90 = _error(pred_p90, obs_p90)
     rel_p50 = _relative(pred_p50, obs_p50)
     rel_p90 = _relative(pred_p90, obs_p90)
-    if not predicted or not observed or rel_p50 is None:
-        verdict = "inconclusive"
-    elif abs(rel_p50) <= PREFILL_ETA_MATCH_TOLERANCE_PCT:
-        verdict = "matches_reality"
-    elif rel_p50 > 0:
-        verdict = "over_predicts"
+    # One-sided bound test (Q3 = replace the two-sided tolerance here): the
+    # cache-cold bound must not be exceeded by the served p90. Below the
+    # sample floor the window cannot decide, and ``inconclusive`` says so.
+    if (
+        pred_p50 is None
+        or obs_p90 is None
+        or len(observed) < PREFILL_ETA_BOUND_MIN_SAMPLES
+    ):
+        bound_verdict = "inconclusive"
+        bound_holds: bool | None = None
+    elif obs_p90 <= pred_p50:
+        bound_verdict = "bound_holds"
+        bound_holds = True
     else:
-        verdict = "under_predicts"
+        bound_verdict = "bound_violated"
+        bound_holds = False
     return {
+        "comparison": "bound_vs_served_remainder",
         "predicted": {
             "samples": len(predicted),
             "p50": pred_p50,
@@ -3773,7 +3957,25 @@ def prefill_eta_error_json(
         "relative_error_p50_pct": rel_p50,
         "relative_error_p90_pct": rel_p90,
         "tolerance_pct": PREFILL_ETA_MATCH_TOLERANCE_PCT,
-        "verdict": verdict,
+        # One-sided bound test (AC3): observed p90 must stay within the
+        # published p50 bound.
+        "bound": {
+            "verdict": bound_verdict,
+            "holds": bound_holds,
+            "predicted_p50": pred_p50,
+            "observed_p90": obs_p90,
+            "observed_samples": len(observed),
+            "min_samples": PREFILL_ETA_BOUND_MIN_SAMPLES,
+            "margin_seconds": (
+                round(pred_p50 - obs_p90, 2)
+                if pred_p50 is not None and obs_p90 is not None
+                else None
+            ),
+        },
+        "verdict": bound_verdict,
+        # Matched per-dispatch accuracy (AC1): the 25 % two-sided tolerance
+        # applies here, where predicted and observed describe one dispatch.
+        "matched": _matched_prefill_eta(summary),
     }
 
 

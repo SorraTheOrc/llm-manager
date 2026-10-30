@@ -172,13 +172,35 @@ Outputs written to:
     (`matches_reality` / `does_not_match_reality` / `inconclusive`: the signal
     does not match when ≥50% of attributed denials fired with the pool measured
     idle).
-  - `prefill_eta_error` — M3: predicted `prefill_eta_seconds` (from
-    `status_request` polls) vs observed llama-server `prompt eval time`
-    durations, quantile-matched: `predicted` / `observed` (`samples`, `p50`,
-    `p90`), `error_p50` / `error_p90` (predicted − observed, seconds),
-    `relative_error_p50_pct` / `relative_error_p90_pct`, `tolerance_pct` (25)
-    and `verdict` (`matches_reality` within tolerance, `over_predicts` /
-    `under_predicts`, `inconclusive` when either side has no samples).
+  - `prefill_eta_error` — M3: two comparisons, because a cache-cold bound and
+    a per-request estimate answer different questions
+    (LP-0MVSD5RJW008F1IB). The pre-existing keys keep their names and shapes
+    for trend continuity; `comparison` (`bound_vs_served_remainder`) states
+    which comparison `verdict` describes.
+    - **bound vs served remainder** — predicted `prefill_eta_seconds` (from
+      `status_request` polls) vs observed llama-server `prompt eval time`
+      durations, quantile-matched: `predicted` / `observed` (`samples`, `p50`,
+      `p90`), `error_p50` / `error_p90` (predicted − observed, seconds),
+      `relative_error_p50_pct` / `relative_error_p90_pct`, `tolerance_pct`
+      (25, reported for continuity but **not** applied to this comparison),
+      `bound` (`verdict`, `holds`, `predicted_p50`, `observed_p90`,
+      `observed_samples`, `min_samples` 30, `margin_seconds`) and `verdict` =
+      `bound_holds` when the served p90 ≤ the published p50, `bound_violated`
+      otherwise, `inconclusive` below 30 observed dispatches. The old
+      two-sided `over_predicts` / `under_predicts` wording is **gone** for this
+      comparison: a cross-population comparison cannot score calibration.
+    - **matched per-dispatch accuracy** — `matched`: predicted = the ETA the
+      admission guard priced for that dispatch (`eta_prefill_s`), observed =
+      the same dispatch's `dispatch_to_first_byte_ms`, joined on `session=`.
+      Entries: `pairs`, `dispatches`, `unmatched_dispatches`,
+      `enforced_pairs`, `observe_pairs`, `predicted_p50` / `predicted_p90`,
+      `observed_p50` / `observed_p90`, `relative_error_p50_pct` /
+      `relative_error_p90_pct` (percentiles of the per-pair relative error),
+      `tolerance_pct` (25) and `verdict` (`matches_reality` within tolerance,
+      `over_predicts` / `under_predicts`, `inconclusive` with no pairs). Only
+      matched pairs are scored; a dispatch whose guard logged no priced ETA
+      (inert/uncalibrated, or an inactive observe-mode decision) is counted as
+      unmatched and never folded in.
   - `status_capacity_hint` — the same `capacity_hint` distribution as a
     top-level key (`{idle: n, prefill_bound: n, saturated: n}`), so
     `jq .status_capacity_hint` answers "what did the payload claim while the
@@ -280,10 +302,12 @@ Outputs written to:
   window has a denial or status poll): M1 per-hour denial attribution by
   derived pool state plus the guard-reason and `capacity_hint` splits; M2 the
   window's denials-per-hour and busy fraction compared with the pre-change
-  baseline (2,641 denials / 24 h at 29.3% busy); M3 predicted-vs-observed
-  prefill duration at p50/p90 with the signed and relative error; and one
-  explicit matches/does-not-match-reality verdict for the denial signal and
-  one for the prefill ETA), then
+  baseline (2,641 denials / 24 h at 29.3% busy); M3 the quantile-matched
+  *bound vs served remainder* comparison at p50/p90 with the one-sided
+  `bound_holds` / `bound_violated` verdict, and M3b the *matched per-dispatch*
+  accuracy (guard ETA → that dispatch's first byte); and one explicit
+  matches/does-not-match-reality verdict for the denial signal and one for the
+  cache-cold bound), then
   **Admission verdicts by rate bucket and prompt band** (LP-0MVS9YKHL007UBBZ,
   when the window has any `local_admission_guard` decision): the admit/reject
   verdicts split by the pricing `rate_bucket` (`contended` / `solitary` /
@@ -1129,17 +1153,23 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   majority, ±30 s covers 68.5%, ±60 s 73.9%, ±120 s 82.9%. 60 s is the widest
   bound that stays inside one contention burst; the remainder is reported as
   `unattributed` rather than borrowed from a stale earlier burst.
-- **Prefill ETA is compared at matched quantiles, not per dispatch
-  (LP-0MVGR2OXT0096OGK M3).** llama-server eval-timing lines carry no per-line
-  timestamp (the parser assigns one file-mtime timestamp per log file), so a
-  `prefill_eta_seconds` poll cannot be paired with the specific `prompt eval`
-  it predicted. `prefill_eta_error` therefore compares the p50/p90 of the
-  prediction distribution against the p50/p90 of the observed durations. The
-  prediction is the cache-cold *reference-prompt* cost, so systematic
-  over-prediction is expected when the reference prompt is larger than the
-  median served prompt; read it as "does the published ETA reflect the typical
-  real prefill a dispatcher will face", not as a per-request calibration
-  score.
+- **Prefill ETA is a bound, compared to the served remainder at matched
+  quantiles (LP-0MVGR2OXT0096OGK M3, rescoped by LP-0MVSD5RJW008F1IB).**
+  llama-server eval-timing lines carry no per-line timestamp (the parser
+  assigns one file-mtime timestamp per log file), so a `prefill_eta_seconds`
+  poll cannot be paired with the specific `prompt eval` it predicted.
+  `prefill_eta_error` therefore compares the p50/p90 of the prediction
+  distribution against the p50/p90 of the observed durations. The prediction is
+  the cache-cold *reference-prompt* cost while the observation is the *uncached
+  remainder* of mostly-warm prompts, so a wide gap is expected by construction
+  and is **not evidence of a calibration defect**. The verdict is therefore
+  one-sided (`bound_holds` / `bound_violated` / `inconclusive`: does the served
+  p90 stay within the published p50 bound?), and the calibration question is
+  answered separately by `prefill_eta_error.matched`, which joins the guard's
+  priced ETA to the same dispatch's `dispatch_to_first_byte_ms` via `session=`
+  and applies the 25 % tolerance. A window with no guard records (inert guard,
+  or pre-change logs) reports the matched figure as `inconclusive` with
+  `unmatched_dispatches` counted — never as a fabricated match.
 
 - **Hold-cycle re-emissions are excluded from local-skip demand counters
   (LP-0MUIEO6IP0030CT3).** A held request re-emitted across chain-hold

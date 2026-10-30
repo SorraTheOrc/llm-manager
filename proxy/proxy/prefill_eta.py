@@ -112,6 +112,20 @@ Rollout control
 The published estimate (``prefill_eta_seconds`` / ``queue_eta_seconds`` on
 ``/llama/local/status``) is computed from the same coefficients so dispatchers
 can pace themselves *before* launching a session.
+
+Semantics of the published number (LP-0MVSD5RJW008F1IB)
+--------------------------------------------------------
+
+``prefill_eta_seconds`` is a **cache-cold reference-prompt bound**, not a
+per-request estimate: it costs the reference prompt (a robust recent dispatch
+size, see :func:`reference_tokens`) with ``cached_ratio`` assumed ``0.0``, i.e.
+nothing served from the prompt cache. The payload and the ``status_request``
+log line both publish that context (``prefill_eta_kind`` =
+``reference_cold_bound``, ``prefill_eta_assumed_cached_ratio`` = ``0.0`` and
+``prefill_eta_reference_tokens``), so a dispatcher cannot mistake the bound for
+its own request's cost. A dispatcher that knows its prompt size and cache state
+should price *its own* request with :func:`estimate_prefill_seconds` (the same
+per-request path the admission guard enforces).
 """
 
 from __future__ import annotations
@@ -179,6 +193,34 @@ WINDOW_SAMPLES = 200
 #: dispatch has been observed yet for the current model.
 DEFAULT_REFERENCE_TOKENS = 32_000
 
+#: Discriminator published next to ``prefill_eta_seconds`` (payload and
+#: ``status_request`` log line): the value is a cache-cold reference-prompt
+#: bound, never a per-request estimate (LP-0MVSD5RJW008F1IB AC2).
+PREFILL_ETA_KIND = "reference_cold_bound"
+
+#: The cache state the published bound assumes: nothing cached at all. The
+#: admission guard prices a real request with the request's own
+#: ``cached_ratio``; only the *published* bound is hard-coded cold.
+PREFILL_ETA_ASSUMED_CACHED_RATIO = 0.0
+
+#: Rolling-median window for the published reference prompt
+#: (LP-0MVSD5RJW008F1IB AC4): the reference is the median of the last N
+#: observed dispatch prompt sizes, so one huge dispatch cannot pin the
+#: published bound for the rest of the window. ``0`` restores the pre-change
+#: behaviour exactly (the single most recent dispatch size).
+REFERENCE_WINDOW_KEY = "local_admission_guard_reference_window_samples"
+DEFAULT_REFERENCE_WINDOW_SAMPLES = 20
+
+#: Ceiling applied to the published reference prompt size (tokens;
+#: LP-0MVSD5RJW008F1IB AC4). ``0``/absent = no ceiling (pre-change behaviour).
+REFERENCE_MAX_TOKENS_KEY = "local_admission_guard_reference_max_tokens"
+DEFAULT_REFERENCE_MAX_TOKENS = 0
+
+#: Hard cap on the retained prompt-size history per model, so a long-lived
+#: process cannot grow the reference sample unboundedly. The configured window
+#: is clamped to this value.
+REFERENCE_HISTORY_SAMPLES = 200
+
 #: Applied to *fitted* coefficients: over-estimating the prefill makes the
 #: guard prefer the fast remote call, which is the safe direction.
 CONSERVATISM_FACTOR = 1.2
@@ -242,6 +284,9 @@ _samples: dict[tuple[str, int], deque] = {}
 _contended_samples: dict[tuple[str, int], deque] = {}
 #: ``model -> prompt_tokens`` of the most recent observed dispatch.
 _last_prompt_tokens: dict[str, int] = {}
+#: ``model -> deque[prompt_tokens]`` of recent dispatch prompt sizes, the
+#: robust source of the published reference (LP-0MVSD5RJW008F1IB AC4).
+_recent_prompt_tokens: dict[str, deque] = {}
 
 
 def reset() -> None:
@@ -249,6 +294,7 @@ def reset() -> None:
     _samples.clear()
     _contended_samples.clear()
     _last_prompt_tokens.clear()
+    _recent_prompt_tokens.clear()
 
 
 def bucket_for(prompt_tokens: int) -> int:
@@ -341,6 +387,12 @@ class GuardConfig:
     #: Fraction of the deadline a budgeted prompt's conservative ETA must fit
     #: inside (0.95 x 120 s = 114 s); 0.0 disables the bound.
     budget_safety_fraction: float = DEFAULT_BUDGET_SAFETY_FRACTION
+    #: Rolling-median window for the published reference prompt
+    #: (LP-0MVSD5RJW008F1IB AC4); 0 restores the single-most-recent-dispatch
+    #: behaviour byte-for-byte (documented rollback).
+    reference_window_samples: int = DEFAULT_REFERENCE_WINDOW_SAMPLES
+    #: Ceiling on the published reference prompt size (tokens); 0 = none.
+    reference_max_tokens: int = DEFAULT_REFERENCE_MAX_TOKENS
 
 
 def resolve_config(config: dict | None) -> GuardConfig:
@@ -370,6 +422,22 @@ def resolve_config(config: dict | None) -> GuardConfig:
     reference = max(1, _int_setting(
         server_cfg, "local_admission_guard_reference_tokens",
         DEFAULT_REFERENCE_TOKENS,
+    ))
+    # LP-0MVSD5RJW008F1IB AC4: the reference statistic is a rolling median (so a
+    # single huge dispatch cannot pin the published bound) with an optional
+    # ceiling. ``0`` for either key keeps the pre-change behaviour: window 0 =
+    # the single most recent dispatch size, ceiling 0 = uncapped.
+    _warn_malformed(
+        server_cfg, REFERENCE_WINDOW_KEY, DEFAULT_REFERENCE_WINDOW_SAMPLES
+    )
+    _warn_malformed(
+        server_cfg, REFERENCE_MAX_TOKENS_KEY, DEFAULT_REFERENCE_MAX_TOKENS
+    )
+    reference_window = max(0, _int_setting(
+        server_cfg, REFERENCE_WINDOW_KEY, DEFAULT_REFERENCE_WINDOW_SAMPLES,
+    ))
+    reference_max = max(0, _int_setting(
+        server_cfg, REFERENCE_MAX_TOKENS_KEY, DEFAULT_REFERENCE_MAX_TOKENS,
     ))
     deadline = _float_setting(
         server_cfg, PREFILL_DEADLINE_KEY, float(DEFAULT_PREFILL_DEADLINE_SECONDS),
@@ -435,6 +503,8 @@ def resolve_config(config: dict | None) -> GuardConfig:
         cold_prefill_budget_tokens=budget_tokens,
         eta_percentile_min_tokens=percentile_min_tokens,
         budget_safety_fraction=safety_fraction,
+        reference_window_samples=reference_window,
+        reference_max_tokens=reference_max,
     )
 
 
@@ -555,6 +625,11 @@ def record_dispatch_sample(
             window_map[(model_key, bucket)] = window
         window.append((coded, new, ms))
         _last_prompt_tokens[model_key] = tokens
+        history = _recent_prompt_tokens.get(model_key)
+        if history is None:
+            history = deque(maxlen=REFERENCE_HISTORY_SAMPLES)
+            _recent_prompt_tokens[model_key] = history
+        history.append(tokens)
     except Exception:  # pragma: no cover - defensive
         logger.debug("record_dispatch_sample failed", exc_info=True)
 
@@ -1234,18 +1309,44 @@ def _deadline_budget_seconds(guard_cfg: GuardConfig) -> float:
 # ---------------------------------------------------------------------------
 
 def reference_tokens(model: str | None, config: dict | None = None) -> int:
-    """Prompt size to cost for the published estimate.
+    """Prompt size to cost for the published cache-cold bound.
 
-    The most recent dispatch observed for *model* keeps the published number
-    truthful for the traffic actually being served; without one, the
-    configured reference (default 32k) is used.
+    A robust statistic of recently served traffic keeps the published number
+    truthful without letting one outlier define it
+    (LP-0MVSD5RJW008F1IB AC4): the reference is the **median** of the last
+    ``local_admission_guard_reference_window_samples`` (default 20) observed
+    dispatch prompt sizes for *model*, capped by
+    ``local_admission_guard_reference_max_tokens`` when set. A single 119K
+    dispatch therefore cannot pin the published bound for the rest of the
+    window, while the typical prompt drives it.
+
+    Rollback (documented, no code change):
+    ``local_admission_guard_reference_window_samples: 0`` restores the
+    pre-change behaviour byte-for-byte (the single most recent dispatch size),
+    and leaving ``local_admission_guard_reference_max_tokens`` absent/0 leaves
+    the reference uncapped. Without any observed dispatch the configured
+    ``local_admission_guard_reference_tokens`` (default 32k) is used.
     """
     guard_cfg = resolve_config(config)
+    model_key = str(model or "").strip()
+    observed = 0
     try:
-        observed = int(_last_prompt_tokens.get(str(model or "").strip(), 0) or 0)
+        window = int(guard_cfg.reference_window_samples or 0)
+        if window > 0:
+            history = _recent_prompt_tokens.get(model_key)
+            if history:
+                recent = sorted(float(v) for v in list(history)[-window:])
+                observed = int(round(_median(recent)))
+        else:
+            # Documented rollback: the single most recent dispatch size.
+            observed = int(_last_prompt_tokens.get(model_key, 0) or 0)
     except (TypeError, ValueError):
         observed = 0
-    return observed if observed > 0 else guard_cfg.reference_tokens
+    tokens = observed if observed > 0 else int(guard_cfg.reference_tokens)
+    ceiling = int(guard_cfg.reference_max_tokens or 0)
+    if ceiling > 0:
+        tokens = min(tokens, ceiling)
+    return max(1, tokens)
 
 
 def per_slot_prefill_eta_seconds(
@@ -1286,7 +1387,12 @@ def status_estimate(
     """Published prefill/queue ETA for ``/llama/local/status``.
 
     ``prefill_eta_seconds`` is the cost of prefilling the reference prompt
-    (assumed cache-cold — the conservative case). ``queue_eta_seconds`` is
+    (assumed cache-cold — the conservative case) and is labelled as such:
+    ``prefill_eta_kind`` (``reference_cold_bound``),
+    ``prefill_eta_assumed_cached_ratio`` (``0.0``) and
+    ``prefill_eta_reference_tokens`` publish the semantics and the reference
+    size next to the number (LP-0MVSD5RJW008F1IB AC2), so the bound can never
+    be mistaken for the caller's own request cost. ``queue_eta_seconds`` is
     what a *newcomer* would wait before its first byte: the reference prefill
     repeated for every currently occupied slot, plus its own prefill. It is
     computed by the same :func:`projected_wait_seconds` the admission guard
@@ -1331,6 +1437,10 @@ def status_estimate(
             "queue_eta_seconds": round(queue_eta.projected_seconds, 1),
             "queue_eta_occupancy_seconds": round(queue_eta.occupancy_seconds, 1),
             "queue_eta_busy_slots": queue_eta.busy_slots,
+            # Labelling (AC2): the value is a cache-cold reference-prompt
+            # bound, never the caller's own request cost.
+            "prefill_eta_kind": PREFILL_ETA_KIND,
+            "prefill_eta_assumed_cached_ratio": PREFILL_ETA_ASSUMED_CACHED_RATIO,
             "prefill_eta_reference_tokens": tokens,
             "prefill_eta_samples": coeffs.samples,
             "prefill_eta_calibrated": coeffs.calibrated,
@@ -1345,6 +1455,8 @@ def status_estimate(
             "queue_eta_seconds": None,
             "queue_eta_occupancy_seconds": None,
             "queue_eta_busy_slots": None,
+            "prefill_eta_kind": PREFILL_ETA_KIND,
+            "prefill_eta_assumed_cached_ratio": PREFILL_ETA_ASSUMED_CACHED_RATIO,
             "prefill_eta_reference_tokens": None,
             "prefill_eta_samples": 0,
             "prefill_eta_calibrated": False,

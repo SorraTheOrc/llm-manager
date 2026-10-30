@@ -399,6 +399,9 @@ async def get_llama_local_status(request: Request):
          "local_last_activity_at": str | None,
          "local_last_activity_source": str | None,
          "prefill_eta_seconds": float | None,
+         "prefill_eta_kind": str,
+         "prefill_eta_assumed_cached_ratio": float,
+         "prefill_eta_reference_tokens": int | None,
          "queue_eta_seconds": float | None,
          "prefill_budget_seconds": float | None,
          "capacity_hint": str,
@@ -411,13 +414,23 @@ async def get_llama_local_status(request: Request):
 
     ``prefill_eta_seconds`` and ``queue_eta_seconds`` publish the calibrated
     prefill-ETA estimate (LP-0MVGDUV5E005UWBQ): the projected prefill cost of
-    the reference prompt (the most recent dispatch for the current model, else
-    ``server.local_admission_guard_reference_tokens``, assumed cache-cold) and
-    the wait a *newcomer* would face (the prefills of the currently occupied
-    slots plus its own). Dispatchers can pace themselves from these instead of
+    the reference prompt (the median recent dispatch size for the current
+    model, else ``server.local_admission_guard_reference_tokens``) and the wait
+    a *newcomer* would face (the prefills of the currently occupied slots plus
+    its own). Dispatchers can pace themselves from these instead of
     discovering a contended 120 s wait. ``prefill_eta_calibrated`` reports
     whether the rolling calibration has enough samples; with too few samples
     the guard is inert and the wait behaviour is unchanged.
+
+    **``prefill_eta_seconds`` is a cache-cold reference-prompt bound, not a
+    per-request estimate** (LP-0MVSD5RJW008F1IB AC2): it assumes *nothing* is
+    served from the prompt cache. The semantics are published beside the value
+    so no consumer has to infer them — ``prefill_eta_kind`` is
+    ``"reference_cold_bound"``, ``prefill_eta_assumed_cached_ratio`` is
+    ``0.0`` and ``prefill_eta_reference_tokens`` is the prompt size that was
+    costed. A dispatcher that knows its own prompt size and cache state should
+    price *that* request (the same per-request path the admission guard
+    enforces) rather than read the reference bound as its own cost.
 
     ``available_slots`` and ``total_slots`` reflect the model-serving slot
     state reported by llama-server's ``/slots`` endpoint. When the server is
@@ -770,9 +783,12 @@ async def get_llama_local_status(request: Request):
     # -- prefill / queue ETA estimate (LP-0MVGDUV5E005UWBQ) -----------------
     # Published so a dispatcher can pace BEFORE launching a session instead of
     # discovering a 120 s contended wait. Both fields come from the calibrated
-    # prefill cost of the reference prompt (most recent dispatch for the
-    # current model, else ``local_admission_guard_reference_tokens``); they are
-    # ``None`` only if the estimate itself failed (fail-open payload).
+    # prefill cost of the reference prompt (a robust recent dispatch size for
+    # the current model, else ``local_admission_guard_reference_tokens``); they
+    # are ``None`` only if the estimate itself failed (fail-open payload).
+    # LP-0MVSD5RJW008F1IB AC2: ``prefill_eta_seconds`` is a cache-cold
+    # reference-prompt BOUND, labelled as such in the payload and in the poll
+    # log (``prefill_eta_kind`` / ``prefill_eta_assumed_cached_ratio``).
     prefill_eta: dict = {}
     try:
         from proxy.prefill_eta import status_estimate
@@ -913,6 +929,25 @@ async def get_llama_local_status(request: Request):
         "slots_stale": slots_stale,
         "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
         "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
+        # LP-0MVSD5RJW008F1IB AC6: the calibration context the metric needs is
+        # appended to the poll line (never reordered), so the analysis can see
+        # WHICH reference size and calibration state produced each published
+        # bound. Pre-change parsers are unaffected: every new field is additive
+        # and ``prefill_eta_seconds`` / ``queue_eta_seconds`` keep their names.
+        "prefill_eta_kind": prefill_eta.get("prefill_eta_kind"),
+        "prefill_eta_assumed_cached_ratio": prefill_eta.get(
+            "prefill_eta_assumed_cached_ratio"
+        ),
+        "prefill_eta_reference_tokens": prefill_eta.get(
+            "prefill_eta_reference_tokens"
+        ),
+        "prefill_eta_samples": prefill_eta.get("prefill_eta_samples", 0),
+        "prefill_eta_calibrated": bool(
+            prefill_eta.get("prefill_eta_calibrated", False)
+        ),
+        "prefill_eta_rate_bucket": prefill_eta.get(
+            "prefill_eta_rate_bucket", "solitary"
+        ),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
@@ -964,6 +999,12 @@ async def get_llama_local_status(request: Request):
         # ``None`` when the estimate is unavailable.
         "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
         "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
+        # Labelling (LP-0MVSD5RJW008F1IB AC2): the published ETA is a
+        # cache-cold reference-prompt bound, stated in the payload itself.
+        "prefill_eta_kind": prefill_eta.get("prefill_eta_kind"),
+        "prefill_eta_assumed_cached_ratio": prefill_eta.get(
+            "prefill_eta_assumed_cached_ratio"
+        ),
         "prefill_eta_reference_tokens": prefill_eta.get(
             "prefill_eta_reference_tokens"
         ),

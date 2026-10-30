@@ -1859,7 +1859,9 @@ def annotate_slots_for_status(
     """Annotate compact ``/slots`` dicts with capacity fields (AC2/AC3/AC5).
 
     Adds, per slot: ``owner_session_id``, ``lease_state``, ``phase``,
-    ``context_tokens``, ``prefill_eta_seconds`` and the abandonment annotation
+    ``context_tokens``, ``prefill_eta_seconds``, and its labelling
+    (``prefill_eta_kind`` / ``prefill_eta_assumed_cached_ratio``) plus the
+    abandonment annotation
     (``abandoned`` / ``abandonment_reason`` / ``abandoned_session_id`` /
     ``abandoned_at_seconds_ago``, LP-0MVRMI5HK00558TB AC1). Never mutates the
     input dicts (the per-slot detail cache must stay pristine) and never raises
@@ -1867,13 +1869,31 @@ def annotate_slots_for_status(
     the underlying ``/slots`` poll is stale (AC7) rather than echoing a stale
     number, and the estimate comes from the shared ``prefill_eta`` calibration
     (AC3), never a second estimator.
+
+    The per-slot ETA carries the same labelling as the top-level field
+    (LP-0MVSD5RJW008F1IB AC2): ``per_slot_prefill_eta_seconds`` always prices
+    the slot's prompt with ``cached_ratio = 0.0``, so each slot publishes
+    ``prefill_eta_kind`` (``reference_cold_bound``) and
+    ``prefill_eta_assumed_cached_ratio`` (``0.0``). A slot consumer therefore
+    sees the same cache-cold semantics as a top-level payload reader.
     """
     if not slot_details:
         return []
+    # Fail-open labelling vocabulary: if the shared calibration cannot be
+    # imported the literal values are still emitted (and the ETA is ``None``).
+    eta_kind = "reference_cold_bound"
+    eta_assumed_ratio = 0.0
     try:
-        from proxy.prefill_eta import per_slot_prefill_eta_seconds
+        from proxy.prefill_eta import (
+            PREFILL_ETA_ASSUMED_CACHED_RATIO,
+            PREFILL_ETA_KIND,
+            per_slot_prefill_eta_seconds,
+        )
     except Exception:  # pragma: no cover - defensive
         per_slot_prefill_eta_seconds = None
+    else:
+        eta_kind = PREFILL_ETA_KIND
+        eta_assumed_ratio = PREFILL_ETA_ASSUMED_CACHED_RATIO
 
     try:
         owners = _build_status_slot_owners(srv)
@@ -1924,6 +1944,11 @@ def annotate_slots_for_status(
         # that no longer report prompt progress) so the payload contract is stable.
         entry["context_tokens"] = entry.get("context_tokens")
         entry["prefill_eta_seconds"] = prefill_eta
+        # LP-0MVSD5RJW008F1IB AC2: the per-slot ETA is a cache-cold estimate of
+        # this slot's loaded context, labelled so a slot consumer cannot read
+        # it as a cache-warm expectation.
+        entry["prefill_eta_kind"] = eta_kind
+        entry["prefill_eta_assumed_cached_ratio"] = eta_assumed_ratio
         # AC1 (LP-0MVRMI5HK00558TB): "busy, not ours". A slot the proxy has
         # abandoned (registry match on the slot identity) is annotated so a
         # consumer can tell a ghost from live proxy-owned work. Always present

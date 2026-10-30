@@ -1966,6 +1966,18 @@ server:
   # cold-prefill admission budget below (LP-0MVN4LBEQ005QRVL) so the published
   # status reference and the budget are ONE number, not two.
   local_admission_guard_reference_tokens: 25000
+  # Reference prompt statistic (LP-0MVSD5RJW008F1IB AC4). Once dispatches have
+  # been observed, the published reference is the MEDIAN of the last N prompt
+  # sizes (default 20) instead of the single most recent one, so one huge
+  # dispatch (e.g. a 119k-token prompt) can no longer pin the published
+  # cache-cold bound at ~464 s for the rest of the window. ROLLBACK: set to 0
+  # to restore the pre-change behaviour byte-for-byte (single latest
+  # dispatch size).
+  local_admission_guard_reference_window_samples: 20
+  # Ceiling on the published reference prompt size (tokens; 0/absent = no
+  # ceiling = pre-change behaviour). Bounds what the cache-cold bound can
+  # price even when the rolling median is genuinely large.
+  local_admission_guard_reference_max_tokens: 0
   # Conservative ETA pricing for large prompts (LP-0MVKUKF65008D5UN): the
   # point least-squares estimate is optimistic for large prompts (measured
   # first-byte times p50 16s / p90 189s / max 591s; a 19,940-token prompt was

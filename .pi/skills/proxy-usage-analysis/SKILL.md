@@ -169,13 +169,18 @@ exposes the same numbers under `denial_attribution`, `prefill_eta_error` and
   per-hour busy% (from `BusyStats`) sit beside the denials, and the
   window's denials-per-hour / busy fraction are compared with the pre-change
   baseline (2,641 denials / 24 h at 29.3% busy).
-- **M3 (prefill ETA accuracy).** `prefill_eta_error` compares the
-  `prefill_eta_seconds` published on `status_request` polls against the
-  llama-server `prompt eval time` durations at matched p50/p90 quantiles,
-  with signed/relative error and a `matches_reality` / `over_predicts` /
-  `under_predicts` / `inconclusive` verdict (llama-server lines carry no
-  per-line timestamps, so per-dispatch pairing is impossible — see
-  REFERENCE.md Limitations).
+- **M3 (prefill ETA accuracy).** `prefill_eta_error` answers two questions
+  (LP-0MVSD5RJW008F1IB): (a) *did the published cache-cold reference bound
+  hold?* — the quantile-matched bound vs served-remainder comparison, with a
+  one-sided `bound_holds` / `bound_violated` / `inconclusive` verdict; and
+  (b) *was the per-request pricing right?* — the `matched` figure, which joins
+  the admission guard's priced ETA to the **same** dispatch's
+  `dispatch_to_first_byte_ms` via `session=` and applies the 25 % tolerance
+  (`matches_reality` / `over_predicts` / `under_predicts` / `inconclusive`).
+  A wide predicted−observed gap in (a) is expected by construction and is not
+  evidence of a calibration defect (llama-server lines carry no per-line
+  timestamps, so the quantile comparison cannot pair 1:1 — see REFERENCE.md
+  Limitations).
 
 ## Local-turn coverage (LP-0MVM93DE6009JGBU)
 

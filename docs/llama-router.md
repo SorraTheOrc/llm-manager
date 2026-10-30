@@ -484,6 +484,49 @@ local_dispatch_max_prefill_seconds (900)`. Rollback is the existing
 evidence and the per-child cross-reference:
 [docs/dev/contended-prefill-pricing.md](dev/contended-prefill-pricing.md).
 
+## Published prefill-ETA semantics (LP-0MVSD5RJW008F1IB)
+
+**`prefill_eta_seconds` on `/llama/local/status` is a cache-cold
+reference-prompt worst-case bound, not your request's cost.** It prices a
+reference prompt (the median of the last
+`local_admission_guard_reference_window_samples` observed dispatch sizes,
+default 20, capped by `local_admission_guard_reference_max_tokens` when set;
+falling back to `local_admission_guard_reference_tokens`, shipped 25 000) with
+the prompt cache assumed empty (`cached_ratio = 0.0`), so it is the slowest
+plausible case for traffic like the recently served traffic — useful for
+pacing, wrong as an expected wait for a small or cache-warm prompt.
+
+The payload states this itself and carries the context, so no consumer has to
+infer it:
+
+| Field | Value | Meaning |
+|---|---|---|
+| `prefill_eta_seconds` | seconds | the bound described above |
+| `prefill_eta_kind` | `reference_cold_bound` | discriminator: this is a bound, not a per-request estimate |
+| `prefill_eta_assumed_cached_ratio` | `0.0` | nothing is assumed served from the prompt cache |
+| `prefill_eta_reference_tokens` | tokens | the prompt size that was costed |
+| `prefill_eta_calibrated` | bool | whether the rolling calibration has enough samples |
+| `prefill_eta_samples` | n | samples behind the coefficients |
+| `queue_eta_seconds` | seconds | the same bound repeated for every occupied slot plus its own prefill |
+
+Per-slot `prefill_eta_seconds` carries the same two labelling fields. A
+dispatcher that knows its own prompt size and cache state should price *that*
+request with the guard's per-request path (`estimate_prefill_seconds(model,
+tokens, cached_ratio)`) instead of reading the published bound as its own cost.
+
+The reference statistic is a rolling **median**, so one huge dispatch can no
+longer pin the published bound for the rest of the window. The `status_request`
+log line publishes `prefill_eta_reference_tokens`, `prefill_eta_calibrated`,
+`prefill_eta_rate_bucket`, `prefill_eta_samples`, `prefill_eta_kind` and
+`prefill_eta_assumed_cached_ratio` next to the values (appended, never
+reordered), so the usage report can see which reference size and calibration
+state produced each published number.
+
+**Rollback:** `local_admission_guard_reference_window_samples: 0` restores the
+pre-change behaviour byte-for-byte (the single most recent dispatch size) and
+leaving `local_admission_guard_reference_max_tokens` absent or `0` leaves the
+reference uncapped.
+
 ## Client-dead mid-prefill recovery (LP-0MVLFVY6K003VYEL)
 
 A client that disappears while its local dispatch is still prefilling (agent

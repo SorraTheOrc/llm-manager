@@ -1909,7 +1909,13 @@ deadline-relative knobs:
 
 `local_admission_guard_reference_tokens` (shipped **25 000**, previously
 32 000) aligns the published `/llama/local/status` reference prompt with the
-budget so there is one number instead of two. `cold_threshold` (derived,
+budget so there is one number instead of two. Since LP-0MVSD5RJW008F1IB the
+reference used once dispatches have been observed is the **median** of the last
+`local_admission_guard_reference_window_samples` prompt sizes (shipped **20**;
+`0` restores the single-most-recent-dispatch behaviour byte-for-byte) capped by
+`local_admission_guard_reference_max_tokens` (`0`/absent = uncapped), so one
+huge dispatch cannot pin the published cache-cold bound for a whole window.
+`cold_threshold` (derived,
 38 000) remains a large-context routing bypass and becomes a non-binding upper
 bound once this measured budget exists.
 

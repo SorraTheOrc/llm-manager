@@ -1,10 +1,16 @@
 import asyncio
+import logging
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
 
 pytestmark = pytest.mark.refactor_parity
+
+#: Prompt-size history must be clear of test-local calibration, so this is the
+#: main-checkout repo root for docs assertions (LP-0MVSD5RJW008F1IB AC2).
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.asyncio
@@ -760,11 +766,17 @@ class TestPerSlotDetails:
                 "lease_state",
                 "phase",
                 "prefill_eta_seconds",
+                "prefill_eta_kind",
+                "prefill_eta_assumed_cached_ratio",
                 "abandoned",
                 "abandonment_reason",
                 "abandoned_session_id",
                 "abandoned_at_seconds_ago",
             }
+            # LP-0MVSD5RJW008F1IB AC2: the per-slot ETA is labelled as the
+            # cache-cold estimate it is, on every slot.
+            assert slot["prefill_eta_kind"] == "reference_cold_bound"
+            assert slot["prefill_eta_assumed_cached_ratio"] == 0.0
             # The abandonment annotation is always present and always
             # attributable: a boolean alone is not enough.
             assert slot["abandoned"] is False
@@ -856,6 +868,100 @@ async def test_status_publishes_prefill_and_queue_eta(_eta_calibration):
     assert j["prefill_eta_calibrated"] is True
     assert j["prefill_eta_samples"] == 6
     assert j["prefill_eta_reference_tokens"] == 100_000
+
+
+@pytest.mark.asyncio
+async def test_status_labels_the_prefill_eta_as_a_cache_cold_reference_bound():
+    """AC2 (LP-0MVSD5RJW008F1IB): the published bound is unmistakable.
+
+    A dispatcher must be able to tell, from the payload alone, that
+    ``prefill_eta_seconds`` is a cache-cold *reference-prompt* worst-case bound
+    (not its own request's expected wait) and which reference size produced
+    it. The labelling is asserted against the value it describes: an idle pool
+    publishes exactly the cache-cold price of ``prefill_eta_reference_tokens``.
+    """
+    from proxy import prefill_eta
+
+    prefill_eta.reset()
+    for _ in range(6):
+        prefill_eta.record_dispatch_sample("test-model", 8_000, 0.0, 8_000 * 3.9)
+    server_config = {
+        "server": {
+            "llama_server_port": 8080,
+            "contention_queue_max_wait_seconds": 60,
+        }
+    }
+    try:
+        j = await _EtaStatusHarness().get(server_config)
+        expected, _coeffs = prefill_eta.estimate_prefill_seconds(
+            "test-model",
+            j["prefill_eta_reference_tokens"],
+            j["prefill_eta_assumed_cached_ratio"],
+            server_config,
+        )
+    finally:
+        prefill_eta.reset()
+
+    assert j["prefill_eta_kind"] == "reference_cold_bound"
+    assert j["prefill_eta_assumed_cached_ratio"] == 0.0
+    assert j["prefill_eta_reference_tokens"] == 8_000
+    assert j["prefill_eta_seconds"] == pytest.approx(round(expected, 1))
+
+
+@pytest.mark.asyncio
+async def test_status_request_log_line_carries_the_calibration_context(caplog):
+    """AC6 (LP-0MVSD5RJW008F1IB): the poll line says which reference sized it.
+
+    The M3 metric could not band or correct anything because the
+    ``status_request`` line published only the ETA; the calibration context
+    ``status_estimate`` already computes must be on the line too.
+    """
+    from proxy import prefill_eta
+
+    prefill_eta.reset()
+    for _ in range(6):
+        prefill_eta.record_dispatch_sample("test-model", 8_000, 0.0, 8_000 * 3.9)
+    server_config = {
+        "server": {
+            "llama_server_port": 8080,
+            "contention_queue_max_wait_seconds": 60,
+        }
+    }
+    try:
+        with caplog.at_level(logging.INFO, logger="llama-proxy"):
+            await _EtaStatusHarness().get(server_config)
+    finally:
+        prefill_eta.reset()
+
+    record = next(
+        r for r in caplog.records if r.getMessage() == "status_request"
+    )
+    assert record.prefill_eta_reference_tokens == 8_000
+    assert record.prefill_eta_calibrated is True
+    assert record.prefill_eta_rate_bucket == "solitary"
+    assert record.prefill_eta_samples == 6
+    assert record.prefill_eta_kind == "reference_cold_bound"
+    assert record.prefill_eta_assumed_cached_ratio == 0.0
+    # The pre-existing fields are unchanged on the enriched line.
+    assert record.prefill_eta_seconds is not None
+    assert record.queue_eta_seconds is not None
+
+
+def test_docs_state_the_published_field_is_a_cache_cold_reference_bound():
+    """AC2: the human-facing docs make the same one-sentence statement.
+
+    The payload labelling only helps a consumer that reads it; the router docs
+    are where an operator/dispatcher author learns the semantics, so the
+    statement is pinned here rather than left to prose drift.
+    """
+    docs = (REPO_ROOT / "docs" / "llama-router.md").read_text(encoding="utf-8")
+
+    assert "cache-cold" in docs
+    assert "reference-prompt worst-case bound" in docs
+    assert "not your request's cost" in docs
+    assert "prefill_eta_kind" in docs
+    assert "prefill_eta_assumed_cached_ratio" in docs
+    assert "prefill_eta_reference_tokens" in docs
 
 
 @pytest.mark.asyncio
