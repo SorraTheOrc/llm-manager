@@ -208,6 +208,11 @@ and evaluates the alert rules in `monitoring/*.yaml`.
 > quantified in LP-0MVSQQO910077LYL). `amd-smi`, `rocm-smi` and `amdtop` are
 > not alternatives — see *Why not `amd-smi`, `rocm-smi` or `amdtop`?* in the
 > query cookbook below.
+> This power figure is **hardware** activity, never local model utilisation:
+> it counts any GPU draw at compute power, not just the work the proxy served.
+> The usage report's decision figure — the one gates and alerts quote — is the
+> log-derived `local_busy`; see the
+> [usage-analysis reference](../.pi/skills/proxy-usage-analysis/REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
 > GPU memory pressure is measured on **GTT**, not the
 > 1 GiB VRAM carve-out. See
 > [gpu_compute_rules.yaml](gpu_compute_rules.yaml) and

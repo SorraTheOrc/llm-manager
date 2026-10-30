@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -1656,4 +1657,227 @@ class TestMonitoringReadmeCookbook:
         assert not unpublished, (
             f"monitoring/README.md references gpu series that no exporter "
             f"publishes: {unpublished} (published: {sorted(_sampler_series_names())})"
+        )
+
+# ---------------------------------------------------------------------------
+# The decision-facing busy figure (LP-0MVUIMMX3005KYQ6, parent AC4/AC7)
+# ---------------------------------------------------------------------------
+
+REFERENCE_DOC = USAGE_ANALYSIS_SKILL_DIR / "REFERENCE.md"
+SKILL_DOC = USAGE_ANALYSIS_SKILL_DIR / "SKILL.md"
+
+#: Heading of the decision rule and of the single divergence-cause explanation.
+AUTHORITATIVE_BUSY_HEADING = "#### Which busy figure is authoritative for decisions"
+DIVERGENCE_HEADING = "#### Why the two figures diverge"
+DECISION_ANCHOR = "#which-busy-figure-is-authoritative-for-decisions"
+DIVERGENCE_ANCHOR = "#why-the-two-figures-diverge"
+
+#: Labels the shipped report renders; the docs must quote these, not invent any.
+GPU_BUSY_ROW_LABEL = "GPU busy — power-based (hardware)"
+BUSY_UPPER_ROW_LABEL = "Busy time — upper bound (dispatch → finish)"
+
+#: Docs carrying a busy-figure claim; every anchor link in them must resolve.
+BUSY_FIGURE_DOCS = (REFERENCE_DOC, SKILL_DOC, MONITORING_DIR / "README.md")
+
+
+def _documented_anchors(text: str) -> set[str]:
+    """GitHub-style heading slugs plus explicit ``<a id=...>`` anchors.
+
+    Fenced code blocks are skipped, so shell comments (``# 1. ...``) in the
+    skill docs are not mistaken for headings.
+    """
+    anchors: set[str] = set()
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith(FENCE):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        heading = re.match(r"^#{1,6}\s+(.*\S)\s*$", line)
+        if heading:
+            slug = re.sub(r"[^a-z0-9 \-_]", "", heading.group(1).lower())
+            anchors.add(slug.replace(" ", "-"))
+    anchors.update(re.findall(r'<a\s+(?:id|name)="([^"]+)"', text))
+    return anchors
+
+
+def _reference_section(*, start: str, end: str) -> str:
+    """Normalised ``REFERENCE.md`` prose between two heading lines."""
+    content = (REFERENCE_DOC.read_text()).split(start, 1)
+    assert len(content) == 2, f"REFERENCE.md has no {start!r} heading"
+    return _norm(content[1].split(end, 1)[0])
+
+
+class TestAuthoritativeBusyFigureIsDocumented:
+    """The docs name the decision figure, not just the hardware one.
+
+    Parent AC4/AC7 of LP-0MVSPWLLP008AQXZ, delivered by LP-0MVUIMMX3005KYQ6:
+    the log-derived ``local_busy`` (dispatch → finish slot union) is the figure
+    gates and alerts must quote; the power-based ``gpu_busy`` answers hardware
+    questions only and is never local model utilisation. The causes of the gap
+    stay in one place — the pre-existing divergence explanation — and are
+    linked rather than restated.
+    """
+
+    def test_reference_names_the_log_derived_figure_as_the_decision_figure(self):
+        """AC1: the rule, the consumers and the ``--json`` key are named."""
+        section = _reference_section(
+            start=AUTHORITATIVE_BUSY_HEADING, end=DIVERGENCE_HEADING
+        )
+        assert "decisions use the log-derived `local_busy`" in section, (
+            "REFERENCE.md must state which busy figure is authoritative for "
+            "decisions, not only which is hardware-side"
+        )
+        assert "gates, alerts and threshold comparisons" in section, (
+            "the guidance must name the consumers that quote the figure"
+        )
+        assert "dispatch → finish" in section, (
+            "the guidance must tie the decision figure to its definition"
+        )
+
+    def test_reference_limits_the_power_figure_to_hardware_questions(self):
+        """AC2: prefer ``gpu_busy`` only for hardware questions."""
+        section = _reference_section(
+            start=AUTHORITATIVE_BUSY_HEADING, end=DIVERGENCE_HEADING
+        )
+        assert "prefer `gpu_busy` for hardware questions only" in section
+        assert "hardware activity, not local model utilisation" in section, (
+            "the power figure must be explicitly labelled non-local"
+        )
+        assert "was the gpu computing at all" in section, (
+            "the hardware questions the power figure does answer must be named"
+        )
+
+    def test_reference_keeps_one_divergence_explanation_and_links_it(self):
+        """AC3: the causes live once, in the explanation the rule links to."""
+        reference = _norm(REFERENCE_DOC.read_text())
+        causes = "gpu work outside the proxy's slot accounting"
+        assert reference.count(causes) == 1, (
+            "the gap causes must have a single source in REFERENCE.md"
+        )
+        divergence = _reference_section(
+            start=DIVERGENCE_HEADING, end="## Legacy reason normalisation"
+        )
+        assert causes in divergence, (
+            "the divergence explanation must keep the gap-cause list"
+        )
+        section = _reference_section(
+            start=AUTHORITATIVE_BUSY_HEADING, end=DIVERGENCE_HEADING
+        )
+        assert DIVERGENCE_ANCHOR in section, (
+            "the decision rule must link the divergence explanation instead of "
+            "repeating the causes"
+        )
+        assert causes not in section
+
+    def test_skill_states_the_matching_rule_and_cross_links(self):
+        """AC4: SKILL.md carries the same rule and links the reference."""
+        skill = _norm(SKILL_DOC.read_text())
+        assert "hardware activity, not local model utilisation" in skill
+        assert "decisions use the log-derived `local_busy`" in skill, (
+            "SKILL.md must say decisions use the log-derived figure"
+        )
+        assert f"reference.md{DECISION_ANCHOR}" in skill, (
+            "SKILL.md must cross-link the REFERENCE.md decision guidance"
+        )
+        json_row = next(
+            _norm(line)
+            for line in SKILL_DOC.read_text().splitlines()
+            if line.startswith("| `--json` |")
+        )
+        assert "decision figure" in json_row, (
+            "the --json key table must mark local_busy as the decision figure"
+        )
+        assert "**not** local model utilisation" in json_row, (
+            "the --json key table must flag gpu_busy as hardware-only"
+        )
+
+    def test_monitoring_readme_does_not_leave_power_as_local_utilisation(self):
+        """AC5: the monitoring guide points at the decision figure."""
+        content = _norm((MONITORING_DIR / "README.md").read_text())
+        assert "never local model utilisation" in content, (
+            "monitoring/README.md must not leave the power figure readable as "
+            "local model utilisation"
+        )
+        assert "local_busy" in content
+        assert "gates and alerts quote" in content
+        assert DECISION_ANCHOR in content, (
+            "monitoring/README.md must link the usage-analysis decision rule"
+        )
+
+    def test_documented_labels_and_keys_are_the_shipped_ones(self):
+        """AC6: the labels/keys the docs quote are what the code emits.
+
+        Renders the shipped ``## Local model utilization`` section from the
+        reporting module itself, so a documented label can never drift from the
+        table the operator sees.
+        """
+        sys_path_added = str(USAGE_ANALYSIS_SCRIPTS)
+        if sys_path_added not in sys.path:
+            sys.path.insert(0, sys_path_added)
+        from types import SimpleNamespace
+
+        import reporting
+
+        busy = SimpleNamespace(
+            busy_seconds=453.6,
+            window_seconds=86400.0,
+            fast_busy_seconds=300.0,
+            cheap_busy_seconds=100.0,
+            fast_window_seconds=43200.0,
+            cheap_window_seconds=43200.0,
+            decode_busy_seconds=400.0,
+            decode_fast_busy_seconds=260.0,
+            decode_cheap_busy_seconds=90.0,
+            prefill_busy_seconds=53.6,
+            idle_seconds=85946.4,
+            prefill_extended_streams=0,
+            streams=1,
+            avg_stream_duration=12.0,
+            total_compute_seconds=12.0,
+            avg_concurrency=1.0,
+            peak_concurrency=1,
+            unfinished_streams=0,
+            pre_window_unfinished=0,
+        )
+        summary = SimpleNamespace(
+            busy=busy,
+            gpu_busy=SimpleNamespace(busy_seconds=33955.2, total_seconds=86400.0),
+        )
+        lines: list[str] = []
+        reporting._append_busy_section(lines.append, summary, None)
+        rendered = "\n".join(lines)
+
+        assert GPU_BUSY_ROW_LABEL in rendered
+        assert BUSY_UPPER_ROW_LABEL in rendered
+        assert "local_busy" in rendered and "not local model utilisation" in rendered
+
+        for doc in (REFERENCE_DOC, SKILL_DOC):
+            content = doc.read_text()
+            assert GPU_BUSY_ROW_LABEL in content, (
+                f"{doc.name} must quote the report's hardware row label verbatim"
+            )
+        reference = REFERENCE_DOC.read_text()
+        assert BUSY_UPPER_ROW_LABEL in reference, (
+            "REFERENCE.md must name the table row that carries the decision figure"
+        )
+        for key in ("local_busy", "gpu_busy"):
+            assert key in reference and key in SKILL_DOC.read_text()
+
+    def test_busy_figure_doc_anchors_resolve(self):
+        """AC7: every in-repo anchor link in the busy-figure docs resolves."""
+        unresolved: list[str] = []
+        for doc in BUSY_FIGURE_DOCS:
+            text = doc.read_text()
+            for target, fragment in re.findall(
+                r"\]\(([^)\s]*)#([^)\s]+)\)", text
+            ):
+                linked = doc if not target else (doc.parent / target)
+                if linked.suffix != ".md" or not linked.exists():
+                    continue
+                if fragment not in _documented_anchors(linked.read_text()):
+                    unresolved.append(f"{doc.name} -> {target or doc.name}#{fragment}")
+        assert not unresolved, (
+            f"anchor links that resolve to no heading: {unresolved}"
         )

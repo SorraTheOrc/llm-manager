@@ -238,8 +238,8 @@ Outputs written to:
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Fast / Cheap**
   columns), a **Total tokens** section (Input / Output / Total counts and
-  % share, with fast/cheap and by-model breakdowns; see [Total tokens](#total-tokens)
-  below), fallback-reason and routing-skip breakdowns, a **Provider context
+  % share, with fast/cheap and by-model breakdowns; see [Total
+  tokens](#interpreting-the-report) below), fallback-reason and routing-skip breakdowns, a **Provider context
   skips** section (`routing_skip_provider_context` events rendered only when
   the window has them: count, % of all skip events, Standard/Low split,
   provider/type breakdown and the `limit` ceiling each provider hit, plus the
@@ -881,7 +881,9 @@ proxy logs (the dispatch → finish slot union). Alongside them, when Prometheus
 is reachable, the report adds a **GPU busy — power-based (hardware)** row and
 exposes the same data under `--json`'s `gpu_busy` key. This is the
 **authoritative hardware-side** busy fraction and does **not** depend on the
-proxy's stream-lifecycle logging.
+proxy's stream-lifecycle logging — but it is **not** the local model
+utilisation figure: decisions use the log-derived `local_busy` (see
+[Which busy figure is authoritative for decisions](#which-busy-figure-is-authoritative-for-decisions)).
 
 Why power rather than `gpu_busy_percent`: on this Strix Halo APU that counter
 **saturates at ~20 W** — it responds to load within seconds but reads ~100 % for
@@ -911,11 +913,37 @@ accuracy.
   `gpu:power_watts:avg5m` trace at 1-minute resolution, derived from the 15 s
   raw series by a 5-minute rolling average, for warm-up/cooldown context.
 
-Reading it against the log-based figure: the log union measures *slot
-occupancy* (including queued time and excluding any work the proxy did not
-log); the power figure measures when the *hardware* actually computed. A
-persistent gap between them usually means log gaps, unfinished streams, or GPU
-work outside the proxy's slot accounting.
+#### Which busy figure is authoritative for decisions
+
+**Decisions use the log-derived `local_busy` figure** — the
+`Busy time — upper bound (dispatch → finish)` row and `--json`'s `local_busy`
+key (the dispatch → finish slot union defined under
+[How it works](#how-it-works) step 4). Gates, alerts and threshold
+comparisons quote *that* number: it is the only figure measuring
+**proxy-served** local work (slot occupancy, queued time included), so it is
+what "how busy was the local model?" means when deciding whether local
+capacity is contended (e.g. the `> 60 %` local-busy gate).
+
+**Prefer `gpu_busy` for hardware questions only** — was the GPU computing at
+all, is another workload using it, is it power/thermally limited. The row is
+**hardware activity, not local model utilisation**: it counts any GPU draw
+≥ 90 W (other workloads, requests the proxy never served) and misses
+proxy-served work during log gaps, so it must never be presented as the local
+utilisation figure, and no gate or alert may quote it as the busy %.
+
+The two figures legitimately diverge by design — see [Why the two figures
+diverge](#why-the-two-figures-diverge) for the causes (single source; not
+repeated here).
+
+#### Why the two figures diverge
+
+The log union measures *slot occupancy* (including queued time and excluding
+any work the proxy did not log); the power figure measures when the
+*hardware* actually computed. A persistent gap between them usually means log
+gaps, unfinished streams, or GPU work outside the proxy's slot accounting, so
+the same window can legitimately report `local_busy` 12.6 % next to a
+power-based 39.3 % — and only the former answers whether local capacity was
+contended.
 
 ## Legacy reason normalisation
 
@@ -988,7 +1016,9 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   least one local slot occupied **from dispatch to finish** (prefill +
   decode, LP-0MVJN9H2I00116FP); the retained decode-only figure is its
   labelled lower bound, and a stream with no first-byte line never inflates
-  it. The **Prefill vs decode** section then splits the *phase* slot time
+  it. This is the **decision figure** — gates and alerts quote it, not the
+  power-based `gpu_busy` row (see [Which busy figure is authoritative for
+  decisions](#which-busy-figure-is-authoritative-for-decisions)). The **Prefill vs decode** section then splits the *phase* slot time
   into prefill (dispatch → first byte) and decode (first byte → finish) as
   slot-seconds and as a share of combined phase slot time (always 100%
   together, LP-0MVJNDOUU0059MMO) — read it for where slot time goes (prefill

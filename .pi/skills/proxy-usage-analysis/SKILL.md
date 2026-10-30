@@ -52,7 +52,7 @@ Options:
 | `--start` / `--end` | — | Explicit ISO window (`YYYY-MM-DD HH:MM:SS`); overrides `--hours` |
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — with `computing_fraction`, `busy_pct`, `smoothed_power` from Prometheus power data — `local_prefill`, and `local_busy.prefill_vs_decode`) |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, and `local_busy.prefill_vs_decode`) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
 
 ## Daily cadence (05:00 cron)
@@ -103,6 +103,16 @@ is down the row is omitted and `--json`'s `gpu_busy` is `null` — the report
 never fails. Full pipeline and rationale:
 [monitoring/README.md](../../../monitoring/README.md) and
 [REFERENCE.md](REFERENCE.md#gpu-busy-time-from-power-prometheus).
+
+**This row is hardware activity, not local model utilisation.** It counts any
+GPU draw ≥ 90 W — including work the proxy never served — and misses
+proxy-served work during log gaps, so it must never be read (or quoted) as the
+local model utilisation figure. **Decisions use the log-derived `local_busy`**
+(the `dispatch → finish` slot union: the report's `Busy time — upper bound
+(dispatch → finish)` row and `--json`'s `local_busy` key); quote `gpu_busy`
+only for hardware questions (was the GPU computing at all, thermals, power
+draw). The decision rule, the preference rule and the causes of the gap:
+[REFERENCE.md § Which busy figure is authoritative for decisions](REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
 
 ## Post-acceptance evictions (alert threshold + triage rule)
 
