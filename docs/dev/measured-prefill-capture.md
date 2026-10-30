@@ -246,3 +246,17 @@ Other eviction reasons in the window: `no_progress_watchdog` 60 and
 occurrences, which triple-count each event) with `grep
 local_eviction_after_acceptance | grep -c 'reason=...'`; the
 CSV/report artefacts are in `~/proxy-usage-reports/measured-prefill-postdeploy/`.
+
+### Residual attribution of the same window (LP-0MVRMOT0N005136O)
+
+The 60 residual `prefill_deadline` events of this window are measured and
+attributed per event in
+[prefill-deadline-residual.md](prefill-deadline-residual.md): user/audit split
+(47 / 13), hourly rates against the 22-event and 114-event baselines,
+distributions, and cause attribution (occupancy 9 / capacity 8 /
+predicted-warmth 43). Headline result: **none** of the 60 produced a
+`prefill_progress_measured` line inside its own dispatch window, and 58 of 60
+started inside an abandoned-prefill backlog window — an early release detours
+the client but the backend keeps evaluating the abandoned prompt (1,092
+completed prompt evaluations vs 807 consumed local streams for the aligned day,
+i.e. 285 prefills thrown away). Owned by LP-0MVVEQW5Y00962T2.
