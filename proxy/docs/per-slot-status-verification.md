@@ -472,3 +472,55 @@ durable surface). The two surfaces agree where they overlap:
   a change under `.pi/skills/proxy-usage-analysis/` (agent infrastructure, out
   of scope here) and is recorded as a follow-up rather than made silently.
 
+## Post-fix re-measurements (12 h and 24 h, LP-0MVLNBCTN0084MT0)
+
+Two further windows were measured with the same tool to judge the `< 5 %`
+`slots_stale` target on a build that contains the child-port resolver
+(`f58e8964`, 2026-10-26 12:51 UTC) instead of the router-serialised polling path
+measured above.
+
+| Window (local) | Build | Polls | `slots_stale` | `saturated` w/o live work | herdr downtime dispatches |
+|---|---|---|---|---|---|
+| 2026-10-24 20:00 → 10-25 07:00 (night) | `56a3a28a`/`2d2b6b51` (router path) | 11,654 | 9,278 (79.61 %) | 247 (2.12 %) | 5 |
+| 2026-10-28 09:30 → 21:30 (12 h) | + `f58e8964` | 10,817 | 5,832 (53.92 %) | 116 (1.07 %) | 21 (rolling log; durable 21) |
+| 2026-10-29 01:00 → 10-30 01:00 (24 h) | + `f58e8964`, HEAD `b12a0299` | 26,019 | **7,698 (29.59 %)** | **70 (0.27 %)** | **81 (durable trail)** |
+
+What the 24 h window says:
+
+1. **`slots_stale` still misses the `< 5 %` target (29.59 %), but it is now a
+   latency measurement rather than a router artefact.** 77 % of the residual
+   stale polls were served from cache after a refresh lasting longer than the
+   budget (`STATUS_QUERY_TIMEOUT` 1.0 s detail / 2.0 s counts): ≥ 5 s 2,063,
+   2–5 s 3,888, 1–2 s 1,637, < 1 s 110. The source split is unchanged in
+   character — detail cache 7,224, counts cache 474, unknown 0. Removing the
+   router roughly halved the rate (79.61 % → 53.92 %) and the resolver build
+   roughly halved it again (→ 29.59 %); the remainder belongs to the `/slots`
+   read path under load and is carried forward as LP-0MVVCO1N7004TNGY.
+2. **False saturation is now rare and still fully attributable.** 70 polls
+   (0.27 % of polls, 2.13 % of `saturated` polls) reported `saturated` with no
+   live local work, down from 247; 65 are attributed to an abandonment or
+   restart within the preceding 600 s (`prefill_deadline` 27,
+   `no_progress_watchdog` 20, `session_evicted` 18) and 5 remain unattributable
+   from the proxy log. The cache-time reconciliation contract above is intact:
+   no stale poll produced `saturated`.
+3. **Dispatch recovery is met.** 81 durable herdr downtime dispatches in the
+   24 h window (target ≥ 10; kinds `plan` 31, `audit` 18, `intake` 18,
+   `implement` 13, `effort-and-risk` 1; 53 distinct items). The rolling
+   `.worklog/downtime-dispatches.log` retains only the last 100 rows and does
+   **not** cover a 24 h window — audit the durable comment trail instead.
+4. **Two proxy restarts occurred inside the window** (2026-10-29 12:58:34 and
+   14:09:25); coverage was still `covered` with no internal gaps. Neither
+   restart changed the qualitative result.
+
+Re-derivation: `~/proxy-usage-reports/2026-10-29_24h-remeasure/` (`SUMMARY.md`,
+`measurement.json` / `measurement.txt`, `saturated_without_live_work_attribution.csv`,
+`downtime-dispatches-durable.csv`, `provenance.json`, `run_remeasure.py`):
+
+```bash
+python3 scripts/capacity_signal_verification.py \
+  --since '2026-10-29 01:00' --until '2026-10-30 01:00' --window-closed \
+  --label 24h-remeasure --limit 250 --json \
+  --write-artifacts ~/proxy-usage-reports/2026-10-29_24h-remeasure
+# or: python3 ~/proxy-usage-reports/2026-10-29_24h-remeasure/run_remeasure.py
+```
+
