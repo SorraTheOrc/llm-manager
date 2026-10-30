@@ -1257,6 +1257,40 @@ _prefill_thrash_cancel_tokens: dict[tuple[str, str], int] = {}
 _PREFILL_THRASH_FINGERPRINT_HEX_CHARS = 32
 
 
+def _prefill_thrash_turn_messages(messages: list) -> list:
+    """Return the messages of the *current turn* (the ones being prefilled).
+
+    The arming site and the gate site hold different bodies for the same
+    request (LP-0MVSAMN14001DMTY AC2): when session delta routing is active,
+    ``_handle_session`` rewrites ``body_json["messages"]`` to the delta it is
+    about to prefill, so ``router.py`` arms the window from the *delta* while
+    ``provider.py``'s chain gate fingerprints the *original* client body it
+    parsed. Fingerprinting the whole list therefore produced two different
+    digests for one request and the window never matched — the same
+    non-engagement, one level down (the 2026-10-26 incident logged **zero**
+    ``routing_skip_local reason=prefill_thrash_cooldown`` lines for the
+    affected session across four successive local dispatches).
+
+    The delta is always a *trailing suffix* of the original list (the client
+    appends the new turn), so fingerprinting everything after the last
+    assistant message yields the same digest for both bodies while staying a
+    prompt-scoped identity: a different turn (different content, order or
+    tools) still yields a different digest. A body with no assistant message
+    (a first turn, or the delta itself) keeps the whole list, which is also
+    what makes the two bodies agree.
+    """
+    if not isinstance(messages, list):
+        return []
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, Mapping) and message.get("role") == "assistant":
+            turn = messages[index + 1:]
+            # A trailing assistant message (no new turn) keeps the whole list
+            # rather than fingerprinting "nothing".
+            return turn or messages
+    return messages
+
+
 def _prefill_thrash_fingerprint(body_json) -> str | None:
     """Return a stable, bounded fingerprint of the request's prompt.
 
@@ -1266,24 +1300,32 @@ def _prefill_thrash_fingerprint(body_json) -> str | None:
     compact separators so the same payload always yields the same digest and
     message order is significant.
 
+    The digest covers the **current turn** (:func:`_prefill_thrash_turn_messages`)
+    rather than the whole message list, so the router's post-session delta
+    body and ``provider.py``'s original client body fingerprint identically
+    for the same request (LP-0MVSAMN14001DMTY AC2).
+
     Fail-open: returns ``None`` when the payload carries no usable messages
     (streaming bookkeeping-only bodies, malformed JSON, a non-list
     ``messages``). Callers then fall back to the session-wide window, so a
     site that cannot fingerprint never stops engaging the gate.
 
-    Cost: one ``json.dumps`` + one ``sha256`` over the messages, at the arming
-    site (once per abandoned dispatch) and the gate site (once per local
-    candidate). No body re-read: the router and ``proxy_with_fallback``
-    already hold the parsed payload.
+    Cost: one ``json.dumps`` + one ``sha256`` over the current turn, at the
+    arming site (once per abandoned dispatch) and the gate site (once per
+    local candidate). No body re-read: the router and
+    ``proxy_with_fallback`` already hold the parsed payload.
     """
     if not isinstance(body_json, Mapping):
         return None
     messages = body_json.get("messages")
     if not isinstance(messages, list) or not messages:
         return None
+    turn = _prefill_thrash_turn_messages(messages)
+    if not turn:
+        return None
     try:
         canonical = json.dumps(
-            messages,
+            turn,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
@@ -1624,6 +1666,160 @@ def _reset_prefill_thrash_cooldowns() -> None:
     """Clear every cooldown window (test isolation / explicit reset)."""
     _prefill_thrash_cooldowns.clear()
     _prefill_thrash_cancel_tokens.clear()
+
+
+# ===================================================================
+# Post-deadline local dispatch gate (LP-0MVSAMN14001DMTY AC1/AC2)
+#
+# Measured defect (2026-10-26 10:39-10:47, ``proxy.log.2026-10-26_131429``):
+# a local dispatch cancelled by ``prefill_deadline_exceeded`` released its
+# lease truthfully, and ~150 ms later the *same request* re-dispatched local
+# and acquired a **fresh** lease, which no watchdog progress could ever
+# release until the 180 s no-progress watchdog (≈308 s of unproductive hold,
+# other sessions denied 311-322 s each). The armed 600 s thrash cooldown never
+# engaged: zero ``routing_skip_local reason=prefill_thrash_cooldown`` lines
+# for the affected session across four successive dispatches, because the
+# in-request retry loops re-enter ``proxy_to_local`` *after* provider.py's
+# chain gate has already been passed.
+#
+# Two gates therefore sit at the acquisition choke points themselves, where no
+# dispatch path can skip them:
+#
+# 1. **Session cooldown** (AC1) — the same
+#    ``_prefill_thrash_cooldown_remaining`` provider.py consults, checked in
+#    ``_try_acquire_local_dispatch`` (the lease choke point) and in
+#    ``proxy_to_local`` before *any* local resource is acquired (the gate for
+#    the anonymous ``_increment_local_active_queries`` path and other direct
+#    callers).
+# 2. **Request-scoped terminal marker** (AC2) — ``prefill_deadline_exceeded``
+#    marks the request object, so local is terminal for that request even when
+#    the session cooldown cannot be resolved (a header-less request arms the
+#    window under the session id the router generated, which no gate site can
+#    re-derive from the headers). The marker lives on the ``Request`` object,
+#    so a concurrent unrelated request from the same session is unaffected.
+# ===================================================================
+
+#: ``Request`` attribute holding the monotonic time at which this request had a
+#: local dispatch cancelled by ``prefill_deadline_exceeded`` (or the measured
+#: cache-deficit early abort). Request-scoped by construction: it dies with the
+#: ``Request`` object, so it can never leak across requests or sessions.
+_LOCAL_DISPATCH_TERMINAL_ATTR = "_local_dispatch_post_deadline_ts"
+
+
+def _mark_local_dispatch_terminal(request, now=None) -> float | None:
+    """Mark *request* as terminal for local dispatch for the rest of its life.
+
+    Called by ``router.py`` when a local dispatch is cancelled before its first
+    byte — ``prefill_deadline_exceeded`` (and the measured cache-deficit early
+    abort). The deadline detour is then terminal for local **within that
+    request**: the same request can never acquire a fresh dispatch lease after
+    the release, so the 2026-10-26 in-request re-dispatch (a fresh ``[local]
+    POST`` 147-150 ms after ``lease_released reason=prefill_deadline``) cannot
+    happen.
+
+    Scope is deliberately the request, not the session: the session-wide
+    cooldown is what suppresses *later* requests, while a concurrent request
+    from the same session (a different ``Request`` object) keeps its own
+    admission decision.
+
+    Returns the recorded monotonic timestamp, or ``None`` when the request
+    object cannot carry attributes (``None``, a slotted test double).
+    """
+    if request is None:
+        return None
+    _now = time.monotonic() if now is None else now
+    try:
+        setattr(request, _LOCAL_DISPATCH_TERMINAL_ATTR, _now)
+    except Exception:
+        return None
+    return _now
+
+
+def _local_dispatch_terminal_at(request) -> float | None:
+    """Return when *request* became terminal for local dispatch, else ``None``."""
+    if request is None:
+        return None
+    try:
+        value = getattr(request, _LOCAL_DISPATCH_TERMINAL_ATTR, None)
+    except Exception:
+        return None
+    return value if isinstance(value, (int, float)) else None
+
+
+def _local_dispatch_gate(
+    srv,
+    session_key,
+    *,
+    request=None,
+    config=None,
+    fingerprint=None,
+    entry="router",
+) -> tuple[bool, str, float]:
+    """Consult the post-deadline local gates at a dispatch acquisition point.
+
+    Returns ``(refused, reason, remaining_seconds)``:
+
+    - ``(True, "post_deadline_terminal", 0.0)`` — this request already had a
+      local dispatch cancelled post-deadline: local is terminal for it
+      (LP-0MVSAMN14001DMTY AC2).
+    - ``(True, "prefill_thrash_cooldown", remaining)`` — the session's
+      post-deadline window is armed for this prompt (AC1). ``remaining`` is the
+      seconds left, so a caller can surface ``Retry-After``.
+    - ``(False, "", 0.0)`` — admitted; nothing armed.
+
+    Both refusals log ``routing_skip_local … reason=<reason>`` so the gate is
+    attributable in ``proxy.log`` from the dispatch side (provider.py logs the
+    same event from the chain side; ``entry=`` names the site). The existing
+    log vocabulary is kept — ``routing_skip_local``,
+    ``prefill_thrash_cooldown_started``, ``lease_released``.
+
+    The free-GPU release (:func:`_release_prefill_thrash_cooldown_on_free_gpu`)
+    is deliberately **not** attempted here. It belongs to provider.py's chain
+    entry, which runs before this point for every new request: by the time this
+    choke point is reached the window has already been released when the
+    proxy's own evidence proved the GPU free. Keeping the choke point purely
+    deterministic is what makes it a reliable safety net for the paths that
+    bypass the chain (in-request retries, ``ui.py``'s direct dispatch) instead
+    of a second, racy release site.
+
+    Fail-open by construction: an unknown session, a disabled rollback knob
+    (``local_prefill_thrash_cooldown_seconds: 0``) or an expired window all
+    return ``(False, …, 0.0)``.
+    """
+    terminal_at = _local_dispatch_terminal_at(request)
+    if terminal_at is not None:
+        _log_local_dispatch_gate_skip(
+            srv, session_key, "post_deadline_terminal", 0.0, entry
+        )
+        return (True, "post_deadline_terminal", 0.0)
+    remaining = _prefill_thrash_cooldown_remaining(
+        session_key,
+        config if config is not None else _server_config_of(srv),
+        fingerprint=fingerprint,
+    )
+    if remaining > 0:
+        _log_local_dispatch_gate_skip(
+            srv, session_key, "prefill_thrash_cooldown", remaining, entry
+        )
+        return (True, "prefill_thrash_cooldown", remaining)
+    return (False, "", 0.0)
+
+
+def _log_local_dispatch_gate_skip(
+    srv, session_key, reason: str, remaining: float, entry: str
+) -> None:
+    """Log a dispatch-side gate refusal (never raises; logging is optional)."""
+    try:
+        srv.logger.info(
+            "routing_skip_local session=%s reason=%s cooldown_remaining=%.0fs "
+            "entry=%s → refusing local dispatch, chain falls to next provider",
+            session_key if session_key else "unknown",
+            reason,
+            remaining,
+            entry,
+        )
+    except Exception:
+        pass
 
 
 # ===================================================================
@@ -3283,6 +3479,7 @@ async def _try_acquire_local_dispatch(
     body_json: dict | None = None,
     model_name: str | None = None,
     admission_evidence: dict | None = None,
+    request=None,
 ) -> tuple:
     """Try to acquire the local dispatch for *session_key*.
 
@@ -3323,10 +3520,37 @@ async def _try_acquire_local_dispatch(
     If the server does not have *local_dispatch_records* or
     *local_dispatch_records_lock* attributes (legacy state), the function
     silently returns ``(True, None, 0, 1.0)`` to allow the request.
+
+    Post-deadline thrash gate (LP-0MVSAMN14001DMTY AC1/AC2): this is the
+    **lease acquisition choke point**, so every path that can obtain a local
+    dispatch lease — the provider chain, the provider's in-request local retry
+    loops (``local_slot_exhaustion_retry`` / ``local_http_retry``), ``ui.py``'s
+    direct dispatch, the contention-queue re-dispatch — passes through
+    :func:`_local_dispatch_gate` *before* the record is created. A request
+    whose local dispatch was cancelled by the prefill deadline is refused
+    (``reason=post_deadline_terminal``) and a session whose post-deadline
+    cooldown is armed for this prompt is refused
+    (``reason=prefill_thrash_cooldown``), so the ~150 ms post-release
+    re-acquisition observed on 2026-10-26 is impossible even on the paths that
+    never consult provider.py's chain gate.
     """
     # Guard: skip if dispatch tracking is not initialised
     if not hasattr(srv, "local_dispatch_records") or not hasattr(srv, "local_dispatch_records_lock"):
         return (True, None, 0, 1.0)
+
+    _gate_refused, _gate_reason, _gate_remaining = _local_dispatch_gate(
+        srv,
+        session_key,
+        request=request,
+        fingerprint=(
+            _prefill_thrash_fingerprint(body_json)
+            if isinstance(body_json, dict)
+            else None
+        ),
+        entry="lease_acquire",
+    )
+    if _gate_refused:
+        return (False, None, 0, max(1.0, _gate_remaining))
 
     lease_timeout = _get_adaptive_lease_timeout_seconds(srv, body_json)
     now = time.monotonic()
@@ -3648,7 +3872,16 @@ async def _release_unserved_dispatch(
     Returns ``(removed, released_record)``. Fail-soft: these are exceptional
     paths and must never raise. Wakes the cross-session contention queue when
     state was released.
-    """
+
+    Ordering (LP-0MVSAMN14001DMTY AC3): the dispatch record and this session's
+    ``local_prefill_in_flight`` marker are removed **first**, then the upstream
+    stream is closed and *awaited* (bounded by
+    ``server.disconnect_cleanup_timeout``) before returning. Both halves matter
+    for a retry that lands immediately afterwards (the incident's 147-150 ms):
+    ``_extend_lease_during_prefill`` needs an active record **and** the
+    session's own marker, so nothing can re-extend a cancelled dispatch, and a
+    marker can never outlive the dispatch it marks.
+    """""
     if not session_key:
         return (False, None)
     removed = False
@@ -3744,7 +3977,7 @@ async def _release_unserved_dispatch(
         try:
             await asyncio.wait_for(
                 _close_stream_cm(stream_cm),
-                timeout=_abandoned_stream_close_timeout(),
+                timeout=_abandoned_stream_close_timeout(srv),
             )
         except BaseException:
             pass
@@ -3775,13 +4008,31 @@ async def _release_unserved_dispatch(
     return (removed, released_record)
 
 
-def _abandoned_stream_close_timeout() -> float:
+def _abandoned_stream_close_timeout(srv=None) -> float:
     """Bound on closing an abandoned upstream stream (never wedge a request).
 
     Best effort by construction: a stream that will not close must not delay
     the release path, so the ghost is annotated instead of awaited forever.
+
+    The bound is the request's own ``disconnect_cleanup_timeout`` (default
+    5 s, the value the deadline / measured-abort twins use for the same
+    cleanup steps) so the release path honours one configured budget instead of
+    a hard-coded copy of it (LP-0MVSAMN14001DMTY AC3). A missing, malformed or
+    non-positive value keeps the 5 s default — a config typo must not make the
+    close unbounded.
     """
-    return 5.0
+    default = 5.0
+    if srv is None:
+        try:
+            srv = _srv()
+        except Exception:
+            return default
+    try:
+        raw = _server_config_of(srv).get("disconnect_cleanup_timeout", default)
+        timeout = float(raw)
+    except Exception:
+        return default
+    return timeout if timeout > 0 else default
 
 
 async def _release_prefill_deadline_dispatch(

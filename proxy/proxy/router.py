@@ -187,6 +187,8 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_active_queries,
     _increment_local_active_queries,
     _increment_per_model_query,
+    _local_dispatch_gate,
+    _mark_local_dispatch_terminal,
     _normalize_outgoing_headers,
     _prefetch_measured_cache_abort,
     _prefill_thrash_fingerprint,
@@ -1054,6 +1056,18 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     except Exception:
         body_json = {}
 
+    # LP-0MVSAMN14001DMTY AC2: fingerprint the **client's** prompt here, before
+    # ``_handle_session`` rewrites ``body_json["messages"]`` to the delta it is
+    # about to prefill. provider.py's chain gate fingerprints the original
+    # client body it parsed, so arming the cooldown from the post-delta body
+    # produced a key the gate could never look up — the 2026-10-26 incident's
+    # session logged zero ``routing_skip_local reason=prefill_thrash_cooldown``
+    # lines across four successive local dispatches. The digest is
+    # turn-scoped (``_prefill_thrash_fingerprint``), so the two bodies agree
+    # either way; capturing the original keeps the arming site honest about
+    # which prompt failed.
+    _client_prompt_fingerprint = _prefill_thrash_fingerprint(body_json)
+
     # Session handling – incremental prompt ingestion
     session_result = await _handle_session(
         srv, body_json, server_config, request.headers
@@ -1378,6 +1392,52 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         )
 
     # -------------------------------------------------------------------
+    # Post-deadline local thrash gate (LP-0MVSAMN14001DMTY AC1/AC2)
+    #
+    # Every local dispatch reaches this point — the provider chain, the
+    # provider's in-request local retry loops, ``ui.py``'s direct dispatch and
+    # the contention-queue re-dispatch all end up in ``proxy_to_local``. The
+    # gate therefore sits here, *before* any local resource is acquired (lease,
+    # slot, counters), so it also covers the anonymous/non-explicit path that
+    # acquires its record through ``_increment_local_active_queries`` rather
+    # than through the lease choke point.
+    #
+    # Two refusals, both logged by the helper as ``routing_skip_local``:
+    # - ``post_deadline_terminal``: this very request's local dispatch was
+    #   already cancelled by ``prefill_deadline_exceeded`` — local is terminal
+    #   for it, so the in-request re-dispatch that re-armed a fresh lease 147-150
+    #   ms after the release (2026-10-26 10:39-10:47) cannot recur.
+    # - ``prefill_thrash_cooldown``: the session's post-deadline window is armed
+    #   for this prompt, so the chain falls to the next provider instead of
+    #   burning the prefill again.
+    #
+    # The detour response is the same retryable 503 ``backend_error`` shape the
+    # deadline path returns — deliberately **not** ``local_lease_active``/
+    # ``no_slots_available``, which would make provider.py queue for a local slot
+    # the gate is refusing to grant.
+    _local_gate_refused, _local_gate_reason, _local_gate_remaining = (
+        _local_dispatch_gate(
+            srv,
+            session_id,
+            request=request,
+            config=server_config,
+            fingerprint=_client_prompt_fingerprint,
+            entry="router_dispatch",
+        )
+    )
+    if _local_gate_refused:
+        try:
+            record_http_error(
+                "v1/chat/completions", "5xx", _local_gate_reason
+            )
+        except Exception:
+            pass
+        return _build_backend_error_response(
+            srv, path, session_id, session_created,
+            is_delta_request, session_fallback_reason,
+        )
+
+    # -------------------------------------------------------------------
     # Local dispatch gating — no-preemption lease check
     # Only applies to explicitly-provided sessions (X-Session-Id header).
     # Anonymous/auto-generated sessions are ephemeral and should not
@@ -1406,6 +1466,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             # verbatim on the dispatch record so the post-acceptance eviction
             # event reports the numbers the admission model used.
             admission_evidence=getattr(request, "_local_admission_evidence", None),
+            # LP-0MVSAMN14001DMTY AC2: defence in depth — the lease choke point
+            # re-checks the same gates (the early return above already refused
+            # a request that arrived with either gate armed).
+            request=request,
         )
         if not acquired:
             _cold = cold_start.is_cold(server_config)
@@ -1691,7 +1755,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             session_id,
                             tokens=_estimated_tokens,
                             config=server_config,
-                            fingerprint=_prefill_thrash_fingerprint(body_json),
+                            fingerprint=_client_prompt_fingerprint,
                         )
                         srv.backend_ready = True
                         # LP-0MUGQHPJ50046LV8: pin the stream context manager
@@ -1979,7 +2043,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 session_id,
                                 server_config,
                                 tokens=_estimated_tokens,
-                                fingerprint=_prefill_thrash_fingerprint(body_json),
+                                fingerprint=_client_prompt_fingerprint,
                             )
                             if _abort_cooldown_deadline > 0:
                                 srv.logger.info(
@@ -1994,6 +2058,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             pass
                         # Release the lease/marker/counters exactly like the
                         # deadline path (AC7) and close the upstream stream.
+                        # LP-0MVSAMN14001DMTY AC2: the same measured deficit is
+                        # terminal for local inside this request, for the same
+                        # reason the deadline detour is.
+                        _mark_local_dispatch_terminal(request)
                         try:
                             await _release_measured_cache_abort_dispatch(
                                 srv,
@@ -2115,6 +2183,18 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # the slot is recorded as abandoned for the status
                         # annotation.
                         if _prefill_deadline_fired:
+                            # LP-0MVSAMN14001DMTY AC2: the deadline detour is
+                            # TERMINAL for local inside this request. Marking
+                            # the request object (not the session) is what makes
+                            # the 2026-10-26 re-dispatch impossible: the retry
+                            # loops re-enter ``proxy_to_local`` with the *same*
+                            # ``Request``, and the dispatch gate refuses it
+                            # (``routing_skip_local reason=post_deadline_terminal``)
+                            # instead of arming a fresh lease 147-150 ms after the
+                            # release below. A concurrent request from the same
+                            # session has its own ``Request`` object and is
+                            # covered by the session-wide cooldown instead.
+                            _mark_local_dispatch_terminal(request)
                             try:
                                 await _release_prefill_deadline_dispatch(
                                     srv,

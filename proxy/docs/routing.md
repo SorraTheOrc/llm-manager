@@ -1477,7 +1477,7 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
 | Router skip: residency ladder found too little reusable prefix (an idle-admission denial keeps this token) | `resident_prefix_insufficient` | refusing | `routing_skip_local ... reason=resident_prefix_insufficient ...` |
 | Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | refusing | `routing_skip_local ... reason=tenant_limit ...` |
-| Router skip: (session, prompt) in post-deadline prefill-thrash cooldown | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` |
+| Router skip: (session, prompt) in post-deadline prefill-thrash cooldown — enforced at provider.py's chain entry **and** at the local dispatch choke points (`proxy_to_local` and `_try_acquire_local_dispatch`) | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` (`entry=router_dispatch` / `entry=lease_acquire` at the choke points) |
 | Contention-queue depth cap reached (never queued), or the wait budget expired | `fallback_after_queue` | refusing | `contention_queue_fallback_after_queue ... preference=...` |
 | Local slots busy with the queue disabled (fast-mode fallback policy) | `local_concurrency_limit` | refusing | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
 | Prefill-gate / lease denial (a lease-active 503 after the retry window) | `local_lease_active` | refusing | `contention_queue_fallback_after_queue ... reason=local_lease_active` |
@@ -1935,8 +1935,13 @@ whole prefill burns again (the incident's 41 local POSTs, 35 inside
 
 **What it refuses.** The window is keyed by **(session, prompt fingerprint)**,
 not by session alone. The fingerprint is a 32-hex-char SHA-256 prefix over the
-request's `messages` (sorted keys, compact separators); message order is
-significant, and a body with no usable `messages` yields no fingerprint. So:
+**current turn** of the request's `messages` — everything after the last
+assistant message (sorted keys, compact separators); message order is
+significant, and a body with no usable `messages` yields no fingerprint.
+Turn scoping is what lets the two fingerprinting sites agree on one request
+(LP-0MVSAMN14001DMTY): `router.py` arms from the *delta* body
+`_handle_session` rewrote, while `provider.py` fingerprints the *original*
+client body, and the delta is always a trailing suffix of it. So:
 
 - a re-dispatch of the **failing prompt** is still refused — on every local
   dispatch entry, because the gate sits in `provider.py` *before* the
@@ -1957,7 +1962,14 @@ significant, and a body with no usable `messages` yields no fingerprint. So:
 **When it is released.** Besides expiry and a comparable-size successful first
 byte (`local_prefill_thrash_recovery_fraction`, LP-0MVQITN6P008DPLB), the
 window is released when the proxy's own evidence proves the GPU free
-(`_release_prefill_thrash_cooldown_on_free_gpu`):
+(`_release_prefill_thrash_cooldown_on_free_gpu`).
+
+The first-byte clear stays wired and stays scoped (same fingerprint, ≥ the
+recovery fraction of the armed size), but since the gate now refuses a
+cooling-down session *before* any local dispatch, a request can only be the
+release trigger for a window it does not match. In practice a live window is
+released by expiry or by the free-GPU proof; the table below lists all of
+them:
 
 | Release trigger | Condition (all must hold) | Log line |
 |---|---|---|
@@ -1974,10 +1986,31 @@ below, because a ghost still computing legitimately blocks the release.
 **Wiring.** Arming: `router.py` on `prefill_deadline_exceeded` and on the
 measured-cache-deficit early abort (both log
 `prefill_thrash_cooldown_started session=… cooldown_s=…`), with the request's
-fingerprint and its prompt size. Gating: `provider.py`, which logs
-`routing_skip_local … session=… cooldown_remaining=Ns
-reason=prefill_thrash_cooldown → skipping local`. Clearing: the router's
-first-byte success path. The store is in-process (`_prefill_thrash_cooldowns`,
+**original** prompt fingerprint (captured before `_handle_session` rewrites the
+body to the delta) and the delta's prompt size.
+
+**Terminal for the request.** The same two sites also mark the *request*
+(`_mark_local_dispatch_terminal` — an attribute on the `Request`, so it dies
+with it): after a cancellation, local is terminal for that request, which
+closes the header-less shape where the window is armed under a generated
+session id no gate site can re-derive from the headers. A concurrent request
+from the same session carries its own `Request` object and is covered by the
+session-wide window instead.
+
+**Gating — at the acquisition choke points, not only the chain.**
+`provider.py`'s chain entry logs `routing_skip_local … cooldown_remaining=Ns
+reason=prefill_thrash_cooldown → skipping local`, but the in-request local
+retry loops re-enter `proxy_to_local` *after* that decision, so the same gate
+also sits at every point that can acquire a local dispatch lease
+(`_local_dispatch_gate`, consulted by `proxy_to_local` before any local
+resource is acquired and by `_try_acquire_local_dispatch` before the record is
+created; refusals log `entry=router_dispatch` / `entry=lease_acquire`, with
+`reason=prefill_thrash_cooldown` or `reason=post_deadline_terminal`). A refusal
+returns the retryable 503 `backend_error` shape — never
+`local_lease_active`/`no_slots_available`, which would make provider.py queue
+for a slot the gate is refusing to grant.
+
+Clearing: the router's first-byte success path. The store is in-process (`_prefill_thrash_cooldowns`,
 keyed `(session, fingerprint)`; a proxy restart resets it with the routing
 state it guards) in `proxy/proxy/router_helpers.py`. Unit and routing-level
 behaviour are pinned by `proxy/tests/test_prefill_thrash_cooldown.py`; the skip
@@ -2064,6 +2097,18 @@ and in-flight marker released on the detour, at most one local dispatch
 inside the window — are green: LP-0MVKUKFHH005UDWL added the post-deadline
 thrash cooldown and LP-0MVKUKFSO008GI6O added the truthful lease/marker
 accounting.
+
+The 2026-10-26 10:39-10:47 shape (LP-0MVSAM2AV0077UAE deterministic tests,
+LP-0MVSAMN14001DMTY fix) is a different failure mode on the same gate: the
+lease really is released, yet the *same request* re-dispatches local ~150 ms
+later and arms a fresh lease, and the armed window never yields a skip line
+because the retry loops bypass the chain gate. The same module pins the fix:
+the choke-point gate refuses the re-acquisition, the request-scoped marker
+makes the deadline detour terminal for local inside that request, the
+turn-scoped fingerprint makes the arm and check keys agree, and the release
+clears the record and marker before awaiting the upstream stream close, so
+`_extend_lease_during_prefill … in_flight=True` can never resume for a
+dispatch that never produced a byte.
 
 #### Lease and in-flight truthfulness (LP-0MVKUKFSO008GI6O)
 

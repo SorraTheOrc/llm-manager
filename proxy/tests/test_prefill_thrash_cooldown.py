@@ -783,8 +783,25 @@ async def test_router_deadline_records_the_cooldown(monkeypatch, clock, caplog):
 
 @pytest.mark.asyncio
 async def test_router_successful_first_byte_clears_the_cooldown(monkeypatch, clock):
-    """AC3 (wiring): a successful local first byte clears the session's
-    cooldown, so the next request may route local again."""
+    """AC3 (wiring): a successful local first byte still calls the cooldown
+    clear with the recovery-fraction inputs, so a comparable success keeps
+    releasing the window.
+
+    LP-0MVSAMN14001DMTY (AC1/AC2) moved enforcement to the dispatch choke
+    point: a session whose window is armed for the prompt being dispatched is
+    refused *before* any local dispatch (``proxy_to_local`` and
+    ``_try_acquire_local_dispatch``), so a cooling-down request can no longer
+    be the release trigger for its own window — release now comes from expiry,
+    the free-GPU proof, or this first-byte clear when the admitted dispatch
+    actually matches the armed window. The clear call is therefore pinned by
+    its arguments here (the *original* prompt fingerprint and the dispatch's
+    estimated size — the two inputs the recovery-fraction rule needs, see
+    LP-0MVQITN6P008DPLB), with the rule's semantics still pinned by
+    :class:`TestCooldownScope` above.
+
+    What AC1 changed is asserted below too: an armed window for a *different*
+    prompt neither blocks this dispatch nor is released by its success.
+    """
     from proxy.router import proxy_to_local
 
     from proxy import server as srv
@@ -792,14 +809,37 @@ async def test_router_successful_first_byte_clears_the_cooldown(monkeypatch, clo
     server_cfg = _router_server_cfg()
     router_mod = _install_router_harness(monkeypatch, server_cfg)
 
-    # The session is cooling down from an earlier deadline event.
+    # A window armed by an earlier, *different* prompt: it must neither block
+    # this dispatch nor be cleared by its success (fingerprint scoping).
+    other_prompt_fingerprint = helpers._prefill_thrash_fingerprint(
+        {"messages": [{"role": "user", "content": "a different, larger prompt"}]}
+    )
     helpers._record_prefill_thrash_cooldown(
-        SESSION_A, server_cfg, now=clock.now
+        SESSION_A,
+        server_cfg,
+        now=clock.now,
+        tokens=40_000,
+        fingerprint=other_prompt_fingerprint,
     )
     assert (
-        helpers._prefill_thrash_cooldown_remaining(SESSION_A, server_cfg, now=clock.now)
+        helpers._prefill_thrash_cooldown_remaining(
+            SESSION_A,
+            server_cfg,
+            now=clock.now,
+            fingerprint=other_prompt_fingerprint,
+        )
         > 0
     )
+
+    # Spy on the clear call (wrapping the real helper, so nothing is faked).
+    clear_calls: list[dict] = []
+    real_clear = helpers._clear_prefill_thrash_cooldown
+
+    def _spy_clear(session_id, **kwargs):
+        clear_calls.append({"session_id": session_id, **kwargs})
+        return real_clear(session_id, **kwargs)
+
+    monkeypatch.setattr(router_mod, "_clear_prefill_thrash_cooldown", _spy_clear)
 
     upstream = SimpleNamespace(
         status_code=200,
@@ -845,10 +885,117 @@ async def test_router_successful_first_byte_clears_the_cooldown(monkeypatch, clo
     req = _router_request()
     resp = await proxy_to_local(req, "v1/chat/completions")
     assert resp.status_code == 200
+
+    assert clear_calls, "a successful local first byte must attempt the clear"
+    call = clear_calls[-1]
+    assert call["session_id"] == SESSION_A
+    assert call["fingerprint"] == helpers._prefill_thrash_fingerprint(
+        {"messages": [{"role": "user", "content": "hello"}]}
+    ), "the clear must use the request's (original) prompt fingerprint"
+    assert isinstance(call["tokens"], int) and call["tokens"] > 0, (
+        "the clear must carry the dispatch's size so the recovery-fraction "
+        "rule can compare it against the armed size"
+    )
+
+    # The other prompt's window is untouched by this success.
     assert (
-        helpers._prefill_thrash_cooldown_remaining(SESSION_A, server_cfg, now=clock.now)
+        helpers._prefill_thrash_cooldown_remaining(
+            SESSION_A,
+            server_cfg,
+            now=clock.now,
+            fingerprint=other_prompt_fingerprint,
+        )
+        > 0
+    ), "a success on prompt P must not release the window armed by prompt Q"
+
+
+@pytest.mark.asyncio
+async def test_router_refuses_a_cooling_down_session_before_any_local_resource(
+    monkeypatch, clock, caplog
+):
+    """LP-0MVSAMN14001DMTY AC1 (router entry): a session whose window is armed
+    for this prompt is refused inside ``proxy_to_local`` *before* any local
+    resource is acquired — the gate the in-request local retry loops cannot
+    bypass, because they re-enter ``proxy_to_local`` after provider.py's chain
+    gate has already been passed.
+
+    The refusal is a plain retryable 503 (``backend_error``), deliberately not
+    ``local_lease_active``/``no_slots_available``: provider.py would otherwise
+    queue for a local slot this gate is refusing to grant.
+    """
+    from proxy.router import proxy_to_local
+
+    from proxy import server as srv
+
+    server_cfg = _router_server_cfg()
+    _install_router_harness(monkeypatch, server_cfg)
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    prompt_fingerprint = helpers._prefill_thrash_fingerprint(
+        {"messages": [{"role": "user", "content": "hello"}]}
+    )
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A,
+        server_cfg,
+        now=clock.now,
+        tokens=40_000,
+        fingerprint=prompt_fingerprint,
+    )
+
+    resp = await proxy_to_local(_router_request(), "v1/chat/completions")
+    assert resp.status_code == 503
+    assert b"local_lease_active" not in bytes(resp.body)
+    assert SESSION_A not in srv.local_dispatch_records, (
+        "the gate must refuse before a dispatch record (lease) exists"
+    )
+    assert getattr(srv, "local_active_queries", 0) == 0
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "routing_skip_local" in messages
+    assert "reason=prefill_thrash_cooldown" in messages
+    assert "entry=router_dispatch" in messages
+
+
+@pytest.mark.asyncio
+async def test_router_detours_a_request_marked_post_deadline(monkeypatch, clock, caplog):
+    """LP-0MVSAMN14001DMTY AC2 (router entry): the request-scoped
+    post-deadline marker alone refuses a local dispatch — no session cooldown
+    needed — which is what closes the header-less shape (a generated session
+    id no gate site can re-derive from the headers).
+
+    This is the "terminal in-request detour": the *same* request object that
+    was cancelled at the deadline cannot re-enter local dispatch, while a
+    different request object (another client request) is unaffected.
+    """
+    from proxy.router import proxy_to_local
+
+    from proxy import server as srv
+
+    server_cfg = _router_server_cfg()
+    _install_router_harness(monkeypatch, server_cfg)
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    assert (
+        helpers._prefill_thrash_cooldown_remaining(
+            SESSION_A, server_cfg, now=clock.now
+        )
         == 0
-    ), "a successful local first byte must clear the session's cooldown"
+    ), "the marker must refuse even with no session window armed"
+
+    req = _router_request()
+    helpers._mark_local_dispatch_terminal(req)
+
+    resp = await proxy_to_local(req, "v1/chat/completions")
+    assert resp.status_code == 503
+    assert SESSION_A not in srv.local_dispatch_records
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "routing_skip_local" in messages
+    assert "reason=post_deadline_terminal" in messages
+    assert "entry=router_dispatch" in messages
+
+    # A different request object for the same session is not terminal.
+    other_req = _router_request()
+    assert helpers._local_dispatch_terminal_at(other_req) is None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
