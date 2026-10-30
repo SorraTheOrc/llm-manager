@@ -2478,9 +2478,19 @@ IDLE_OVERRIDABLE_SKIP_REASONS: tuple[str, ...] = (
 
 #: Provenance of a residency measurement, reported in the admission log line.
 RESIDENCY_SOURCE_MEASURED = "measured"       # live context_tokens from /slots
+RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH = "measured_last_dispatch"
+#: ``measured_last_dispatch``: the last local dispatch's measured ``total``
+#: (``proxy.measured_prefill``) for the ``(model, session)`` pair. The next
+#: *measurement* rung when the deployed llama.cpp build reports no per-slot
+#: ``context_tokens`` (LP-0MVT2PY3J00077W6).
 RESIDENCY_SOURCE_SESSION_SLOT = "session_slot"  # owns the slot, size unknown
 RESIDENCY_SOURCE_NON_RESIDENT = "non_resident"  # owns no slot (view is fresh)
 RESIDENCY_SOURCE_UNKNOWN = "unknown"            # no fresh view and no ownership
+
+#: ``measurement=`` provenance value for a decision that *is* measured. The
+#: closed vocabulary for unmeasured decisions (``unavailable:*``) is added by
+#: the sibling item LP-0MVT2Q1SD009JLKD.
+MEASUREMENT_MEASURED = "measured"
 
 
 @dataclass(frozen=True)
@@ -2492,12 +2502,17 @@ class ResidentPrefixFacts:
     slot_owner_session: str | None
     source: str
     view_known: bool = False
+    #: ``measurement=`` provenance: ``MEASUREMENT_MEASURED`` when the ratio
+    #: came from a real measurement, ``None`` when there is none (the
+    #: unmeasured-reason vocabulary lands in LP-0MVT2Q1SD009JLKD).
+    measurement: str | None = None
 
     @property
     def resident(self) -> bool:
         """True when the session owns a slot (measured or restore path)."""
         return self.source in (
             RESIDENCY_SOURCE_MEASURED,
+            RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
             RESIDENCY_SOURCE_SESSION_SLOT,
         )
 
@@ -2549,12 +2564,66 @@ def _session_owns_slot(session_id: str | None, endpoint: str | None = None) -> i
     return None
 
 
+def _measured_capture_enabled(server_config=None) -> bool:
+    """Whether measured-prefill capture is enabled (fail-open to today's rung).
+
+    Reads the ``local_measured_cache_abort_enabled`` rollback switch through
+    :func:`proxy.measured_prefill.capture_enabled`, lazily and fail-open: an
+    unreadable config, an unreadable server module or any other error treats
+    the measurement as unavailable (pre-change behaviour) rather than
+    fabricating one. The config is read per call (never cached) so a
+    ``/config/reload`` takes effect immediately.
+    """
+    try:
+        from proxy.measured_prefill import capture_enabled
+
+        if server_config is None:
+            from proxy.server import config as proxy_config
+
+            server_config = proxy_config if isinstance(proxy_config, dict) else None
+        return bool(capture_enabled(server_config))
+    except Exception:
+        return False
+
+
+def _measured_last_dispatch_total(
+    model_name: str | None, session_id: str | None
+) -> int | None:
+    """The last local dispatch's measured ``total`` for ``(model, session)``.
+
+    llama-server's own ``prompt_progress`` ``total`` is the only measurement of
+    the session's prefix available on a build that reports no per-slot
+    ``context_tokens``. Purely in-process (no ``/slots`` query, so the >15 s
+    ``/slots`` hold cannot stall admission — ``LP-0MUXTW4MD003TVIC``).
+
+    Fail-open by contract: a missing model/session, a missing store entry, a
+    ``None``/``0``/negative/non-finite ``total``, or any exception reads as
+    *no measurement* (``None``) — never as a zero-size or fabricated prefix.
+    """
+    if not model_name or not session_id:
+        return None
+    try:
+        from proxy.measured_prefill import get_measured_prefill
+
+        measured = get_measured_prefill(model_name, session_id)
+    except Exception:
+        return None
+    total = getattr(measured, "total", None)
+    if isinstance(total, bool) or not isinstance(total, (int, float)):
+        return None
+    if not math.isfinite(float(total)) or total <= 0:
+        return None
+    return int(total)
+
+
 def resolve_resident_prefix(
     session_id: str | None,
     estimated_tokens: int,
     *,
     view=None,
     endpoint: str | None = None,
+    model_name: str | None = None,
+    server_config: dict | None = None,
 ) -> ResidentPrefixFacts:
     """Measure the session's reusable prefix and classify its residency.
 
@@ -2562,16 +2631,22 @@ def resolve_resident_prefix(
 
     1. ``context_tokens`` known ⇒ measured ratio
        ``min(context_tokens, estimated_tokens) / estimated_tokens``;
-    2. ``context_tokens`` unknown but the session owns the slot ⇒ treat as
-       resident (the restore path: the slot holds this session's prefix but
-       the build does not report its size — llama.cpp b8782 dropped `n_past`);
-    3. neither ⇒ non-resident (the caller then falls back to today's
+    2. ``context_tokens`` unknown but the session owns a live slot *and* a
+       prior local dispatch was measured ⇒ measured ratio from that dispatch's
+       ``total`` (``measured_last_dispatch``: the deployed llama.cpp b8782
+       build reports no per-slot ``context_tokens``, so rung 1 is unreachable
+       there — LP-0MVT2PY3J00077W6);
+    3. ``context_tokens`` and the store unknown but the session owns the slot ⇒
+       treat as resident (the restore path: the slot holds this session's
+       prefix but nothing measures its size);
+    4. neither ⇒ non-resident (the caller then falls back to today's
        predicted-ratio decision).
 
-    Only the two documented sources are consulted — the cached `/slots`
-    snapshot and the in-process ownership registry. There is deliberately no
-    synchronous `/slots` call here: llama-server holds `/slots` for >15 s while
-    processing a prompt batch (LP-0MUXTW4MD003TVIC).
+    Only already-captured sources are consulted — the cached `/slots`
+    snapshot, the in-process ``proxy.measured_prefill`` store and the
+    ownership registry. There is deliberately no synchronous `/slots` call
+    here: llama-server holds `/slots` for >15 s while processing a prompt
+    batch (LP-0MUXTW4MD003TVIC).
 
     Args:
         session_id: Session whose prefix is being priced.
@@ -2579,6 +2654,11 @@ def resolve_resident_prefix(
         view: Pre-built :class:`proxy.residency.ResidencyView`; built on demand
             when omitted (fail-open: an unknown view is not an error).
         endpoint: Local llama-server endpoint scope when several are in play.
+        model_name: Model the prompt is priced for; scopes the measurement
+            store key (``(model, session)``). ``None`` disables rung 2, so a
+            call site without a model name keeps its pre-change behaviour.
+        server_config: ``server`` config used to read the capture rollback
+            switch; read lazily from the running proxy when omitted.
     """
     if view is None:
         try:
@@ -2609,10 +2689,35 @@ def resolve_resident_prefix(
             slot_owner_session=owner or session_id,
             source=RESIDENCY_SOURCE_MEASURED,
             view_known=known,
+            measurement=MEASUREMENT_MEASURED,
         )
 
-    # Unknown size: ownership is the authoritative signal (restore path).
     owned_slot = _session_owns_slot(session_id, endpoint)
+
+    # Rung 2 — the last measured dispatch for this (model, session). Consulted
+    # only while the session still owns a live slot (a measurement whose slot
+    # has been reclaimed is exactly the stale ratio this ladder must not
+    # fabricate) and only while capture is enabled, so the feature rollback
+    # restores the pre-change ``session_slot`` behaviour end to end. Every
+    # failure mode degrades to rung 3 (ownership-only), never to an error.
+    if (
+        owned_slot is not None
+        and estimated_tokens > 0
+        and _measured_capture_enabled(server_config)
+    ):
+        measured_total = _measured_last_dispatch_total(model_name, session_id)
+        if measured_total is not None:
+            reusable = min(measured_total, int(estimated_tokens))
+            return ResidentPrefixFacts(
+                n_past_actual=measured_total,
+                reuse_ratio=min(1.0, max(0.0, reusable / float(estimated_tokens))),
+                slot_owner_session=owner or session_id,
+                source=RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
+                view_known=known,
+                measurement=MEASUREMENT_MEASURED,
+            )
+
+    # Unknown size: ownership is the authoritative signal (restore path).
     if owned_slot is not None:
         return ResidentPrefixFacts(
             n_past_actual=None,
@@ -2713,6 +2818,7 @@ def _log_residency_decision(
         reuse = getattr(facts, "reuse_ratio", None)
         owner = getattr(facts, "slot_owner_session", None)
         source = getattr(facts, "source", "none")
+        measurement = getattr(facts, "measurement", None)
         occupants = len(getattr(tenancy, "occupants", ()) or ())
         tenant_limit = getattr(tenancy, "tenant_limit", None)
         # ``reuse_ratio`` is a *measurement*, so it must be reported as
@@ -2724,18 +2830,25 @@ def _log_residency_decision(
         # resident/evicted ratio rows (LP-0MVNPZY22008B536). A genuine
         # measured 0 (a slot reporting ``context_tokens=0``) still logs 0.0000.
         measured_ratio = n_past is not None and isinstance(reuse, (int, float))
+        # Additive provenance field, immediately after ``residency_source=``
+        # (LP-0MVT2PY3J00077W6): a measured decision says so; a decision with
+        # no measurement omits the field until the closed unmeasured-reason
+        # vocabulary lands (LP-0MVT2Q1SD009JLKD). Existing keys keep their
+        # relative order so deployed parsers are unaffected.
+        measurement_field = f" measurement={measurement}" if measurement else ""
         logger.info(
             "routing_resident_prefix provider=local model=%s decision=%s "
             "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
-            "slot_owner_session=%s residency_source=%s min_ratio=%s "
+            "slot_owner_session=%s residency_source=%s%s min_ratio=%s "
             "tenants=%s occupants=%d session=%s",
             model_name or "unknown",
             decision,
             n_past if n_past is not None else "none",
             int(estimated_tokens),
-            f"{reuse:.4f}" if measured_ratio else "none",
+            f"{reuse:.6f}" if measured_ratio else "none",
             owner or "none",
             source or "none",
+            measurement_field,
             f"{min_ratio:.2f}" if isinstance(min_ratio, (int, float)) else "none",
             tenant_limit if tenant_limit is not None else "none",
             occupants,
@@ -2805,11 +2918,14 @@ def _should_skip_local(
 
     1. the hard ``context_too_large`` cap above (unchanged, still first);
     2. **resident-prefix gate** — admit only when the session's *measured*
-       reusable prefix is at least ``resident_prefix_min_ratio`` of the
-       prompt, else skip with ``resident_prefix_insufficient``;
-    3. **live-prefix pricing** — price ``new_tokens`` from that same live
-       measurement (never the predicted sidecar ratio), so the cold cap is
-       evaluated against real prefill work;
+       reusable prefix (live `/slots` `context_tokens`, else the session's last
+       measured dispatch — see `resolve_resident_prefix`) is at least
+       `resident_prefix_min_ratio` of the prompt, else skip with
+       `resident_prefix_insufficient`;
+    3. **live-prefix pricing** — price `new_tokens` from that same live
+       measurement (`min(n_past_actual, estimated_tokens)` reusable, never the
+       predicted sidecar ratio and never the ownership rung's implicit "all
+       tokens reused"), so the cold cap is evaluated against real prefill work;
     4. the idle-exempt override is applied by the *caller* after this
        function returns (``IDLE_OVERRIDABLE_SKIP_REASONS``), so an idle GPU
        still serves cold work.
@@ -2873,6 +2989,7 @@ def _should_skip_local(
             estimated_tokens,
             view=residency_view,
             endpoint=endpoint,
+            model_name=model_name,
         )
         if facts.source == RESIDENCY_SOURCE_UNKNOWN:
             # Fail-open: no fresh measurement and no ownership — degrade to

@@ -58,10 +58,48 @@ gate or the tenancy bound never enters the queue (same as today's
 |---|---|---|---|
 | Resident admits vs evicted denials | `## Residency-aware admission` | resident admits dominate for multi-turn sessions | nearly all denials ⇒ either genuine churn or a residency-view bug (check `residency_source`) |
 | `residency_source=unknown` share | same section, per-decision lines | small | large ⇒ stale snapshot (the ~1 s poller is not refreshing) — the gate fails open, so local keeps working, but measurement is lost |
+| `residency_source=measured_last_dispatch` share | same section, per-decision lines | most resident decisions (the deployed b8782 build reports no per-slot `context_tokens`, so `measured` is rare) | `session_slot` dominating ⇒ no prior dispatch was captured (non-streaming clients, or `local_measured_cache_abort_enabled: 0`) |
+| `measurement=measured` share | same section | tracks the two measured sources | absent everywhere ⇒ neither measurement source is live |
 | Tenant-limit denials | `residency_tenant_limit_denials` | present but modest | dominating ⇒ the bound is too tight for the workload; raise `local_session_tenants` or lower the idle-lapse |
 | Evictions | `local_evictions` by reason | roughly tracks disconnects/cancels | `tenancy_lease_expired` dominant ⇒ sessions are being abandoned silently (client-side problem, proxy is doing the right thing) |
 | Remote spend | report summary, local vs remote | no step change | a large local→remote shift ⇒ the 0.5 default is too aggressive for this workload (see Risks in the parent item) |
 | `prefill_deadline_exceeded` | error section | falling | rising ⇒ the 24 h AC4 verification (`LP-0MVN44XB0009M33K`) is the place to measure it properly |
+
+## Measurement sources at admission (LP-0MVT2PY3J00077W6)
+
+The deployed llama.cpp b8782 build no longer reports per-slot
+`context_tokens`, so the live `/slots` measurement is unavailable in
+production. Each `routing_resident_prefix` decision therefore reports the best
+*available* measurement, labelled by `residency_source` and the additive
+`measurement=` field:
+
+| `residency_source` | Source | `n_past_actual` |
+|---|---|---|
+| `measured` | live `/slots` `context_tokens` (cached snapshot, ≤ 5 s old) | the reported context size |
+| `measured_last_dispatch` | llama-server's own `prompt_progress` `total` for the session's most recent local dispatch (`proxy.measured_prefill` store, keyed `(model, session)`) | that dispatch's total |
+| `session_slot` | ownership only — the sentinel rung | `none` (no numeric ratio) |
+| `non_resident` / `unknown` | no slot of this session's / no fresh view | `none` |
+
+Rung order: `measured` → `measured_last_dispatch` → `session_slot` →
+`non_resident`/`unknown`. The middle rung fires only while the session still
+owns a live slot and while capture is enabled, and it prices admission from
+`min(n_past_actual, estimated_tokens)` reusable tokens rather than the old
+implicit "everything is reused" assumption — so a **grown** prompt whose
+measured reuse fell below `local_resident_prefix_min_ratio` is now denied with
+`resident_prefix_insufficient`. That is the intended AC4 rule (a) signal (a
+visible cold-prefill admission), not a regression.
+
+**Known limits.** A buffered (non-streaming) local dispatch carries no
+`prompt_progress` events, so it records no measurement; and a measurement
+survives until the sibling invalidation work (LP-0MVT2QFAP0082BKR) clears it on
+eviction / slot release / model switch — until then admission additionally
+requires live ownership, so a reclaimed slot's stale `total` cannot be reused
+as a ratio.
+
+**Rollback.** `local_resident_prefix_min_ratio: 0` restores the predicted-ratio
+decision (the gate off, this rung never consulted);
+`local_measured_cache_abort_enabled: 0` restores the pre-change
+`session_slot` behaviour while leaving the residency gate itself on.
 
 ## Rollback
 

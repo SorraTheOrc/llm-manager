@@ -38,6 +38,12 @@ tokens for a "fake-warm" prompt, versus ~200 for a genuinely warm one.
 Decisions are **unchanged** by this item: the early-abort that consumes the
 measurement is F4 (LP-0MVR7IN0O000DPXN).
 
+Consumers of the store (added later): the admission ladder's
+`measured_last_dispatch` rung (LP-0MVT2PY3J00077W6) reads the session's last
+dispatch `total` to report a numeric reusable prefix in
+`routing_resident_prefix` when the deployed build reports no per-slot
+`context_tokens`; F4's early abort reads `cache`/`total` for the same dispatch.
+
 ## Invariants
 
 - **Client-visible stream is byte-for-byte unchanged.** `prompt_progress`

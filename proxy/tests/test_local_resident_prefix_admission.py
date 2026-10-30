@@ -1294,6 +1294,9 @@ def test_admission_decision_logging_is_parseable(caplog, monkeypatch):
     assert event.reuse_ratio == pytest.approx(1.0)
     assert event.slot_owner_session == "sess-a"
     assert event.residency_source == "measured"
+    # LP-0MVT2PY3J00077W6: provenance is auditable — a live measurement says
+    # so, in the additive field that follows ``residency_source=``.
+    assert _measurement_field(caplog) == MEASUREMENT_MEASURED
 
 
 def test_evicted_denial_logging_is_parseable(caplog, monkeypatch):
@@ -1800,7 +1803,6 @@ def _measurement_field(caplog, needle: str = "routing_resident_prefix") -> str |
     return match.group(1) if match else None
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_MEASUREMENT_RUNG)
 def test_session_slot_admission_uses_the_last_measured_dispatch(caplog, monkeypatch):
     """AC3(i): ownership + a prior measurement ⇒ a *numeric* reusable prefix.
 
@@ -1993,3 +1995,204 @@ def test_model_switch_does_not_reuse_the_previous_models_measurement(caplog, mon
     assert switched.n_past_actual is None
     assert switched.reuse_ratio is None
     assert _measurement_field(caplog) == MEASUREMENT_NO_PRIOR
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVT2PY3J00077W6 — the measured-last-dispatch rung's guard rails
+#
+# The rung is the only place a *measurement* (rather than the ownership
+# sentinel) drives the gate, so its guards are pinned one by one: it may only
+# fire for a session that still owns a slot, only while capture is enabled,
+# only for a usable ``total``, and never by raising into the request path.
+# Anything else must degrade to the pre-change ``session_slot`` behaviour.
+# ---------------------------------------------------------------------------
+
+
+def _assert_degraded_to_session_slot(caplog) -> None:
+    """The rung did not fire: ownership only, no fabricated measurement."""
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == "session_slot"
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None
+    assert _measurement_field(caplog) is None
+
+
+@pytest.mark.parametrize(
+    "total",
+    [None, 0, -1, float("nan"), float("inf")],
+    ids=["none", "zero", "negative", "nan", "inf"],
+)
+def test_unusable_measured_total_degrades_to_session_slot(
+    caplog, monkeypatch, total
+):
+    """AC fail-open: ``None``/``0``/non-finite totals are not measurements."""
+    import logging
+
+    measured_prefill.set_measured_prefill(
+        MODEL,
+        "sess-a",
+        MeasuredPrefill(total=total, cache=None, processed=None, time_ms=None),
+    )
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    _assert_degraded_to_session_slot(caplog)
+
+
+def test_measured_rung_is_not_used_when_the_session_owns_no_slot(
+    caplog, monkeypatch
+):
+    """Ownership is the guard: a stale measurement must not resurrect a ratio.
+
+    The session has a captured dispatch but the pool now holds another
+    session's prefix, so the ladder must report the fresh-view non-resident
+    measurement fact rather than the stale ``total``.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL, session="sess-a")
+    view = _view(
+        slots=[_slot(0, EST_TOKENS)],
+        owners={("", 0): "sess-other"},
+        monkeypatch=monkeypatch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.residency_source == "non_resident"
+    assert event.n_past_actual is None
+    assert event.reuse_ratio is None
+
+
+def test_measured_rung_is_guarded_by_the_capture_rollback(caplog, monkeypatch):
+    """The feature switch restores the pre-change rung end to end."""
+    import logging
+
+    import proxy.server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "config",
+        {"server": {"local_measured_cache_abort_enabled": 0}},
+    )
+    _prime_measurement(MEASURED_TOTAL)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    _assert_degraded_to_session_slot(caplog)
+
+
+def test_measured_rung_degrades_when_the_store_raises(caplog, monkeypatch):
+    """An unreadable store is "no measurement", never a request-path error."""
+    import logging
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(measured_prefill, "get_measured_prefill", _boom)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    _assert_degraded_to_session_slot(caplog)
+
+
+def test_measured_rung_degrades_when_the_config_cannot_be_read(
+    caplog, monkeypatch
+):
+    """An unreadable config falls back to today's rung, not to a measurement."""
+    import logging
+
+    import proxy.server as server_module
+
+    class _BrokenConfig(dict):
+        def get(self, *_args, **_kwargs):
+            raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr(server_module, "config", _BrokenConfig())
+    _prime_measurement(MEASURED_TOTAL)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, monkeypatch=monkeypatch)
+
+    assert (skip, reason) == (False, None)
+    _assert_degraded_to_session_slot(caplog)
+
+
+def test_grown_prompt_is_denied_on_the_measured_ratio(caplog, monkeypatch):
+    """A grown prompt's *measured* reuse is below the gate ⇒ deny (AC4 rule (a)).
+
+    ``MEASURED_TOTAL`` is 30k against a 100k prompt (ratio 0.30 < 0.5), so the
+    decision is a denial with a numeric ratio — the signal AC4 rule (a) needs
+    and that the ownership sentinel (implicit ratio 1.0) could never produce.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(
+            view=view, estimated_tokens=100_000, cold_threshold=60_000,
+            monkeypatch=monkeypatch,
+        )
+
+    assert skip is True
+    assert reason == SKIP_RESIDENT_PREFIX
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == SKIP_RESIDENT_PREFIX
+    assert event.residency_source == "measured_last_dispatch"
+    assert event.n_past_actual == MEASURED_TOTAL
+    assert event.reuse_ratio == pytest.approx(MEASURED_TOTAL / 100_000)
+    assert _measurement_field(caplog) == MEASUREMENT_MEASURED
+
+
+def test_pricing_uses_the_measured_prefix_not_the_ownership_sentinel(
+    caplog, monkeypatch
+):
+    """AC: pricing reads ``min(n_past_actual, estimated_tokens)`` reusable.
+
+    The measured dispatch only explains 30k of a 49k prompt, so 19k new tokens
+    exceed a 10k cold cap and local is bypassed. The old ``session_slot``
+    rung's implicit "everything is reusable" assumption would have priced this
+    at zero new tokens and admitted it.
+    """
+    import logging
+
+    _prime_measurement(MEASURED_TOTAL)
+    view = _view(
+        slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
+    )
+
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        skip, reason = _gate(view=view, cold_threshold=10_000, monkeypatch=monkeypatch)
+
+    assert skip is True
+    assert reason == "large_context_bypass"
+    event = _parse_logged_caught(caplog, "routing_resident_prefix")
+    assert event.decision == "large_context_bypass"
+    assert event.n_past_actual == MEASURED_TOTAL
+    assert event.reuse_ratio == pytest.approx(MEASURED_TOTAL / EST_TOKENS)

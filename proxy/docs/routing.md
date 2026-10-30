@@ -932,7 +932,26 @@ client restores warm instead of prefilling cold, and the shared
 ### Observability
 
 Every decision logs
-`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|session_slot|non_resident|unknown> min_ratio=… tenants=… occupants=… session=…`.
+`routing_resident_prefix provider=… model=… decision=<admit|resident_prefix_insufficient|tenant_limit|large_context_bypass> n_past_actual=… estimated_tokens=… reuse_ratio=… slot_owner_session=… residency_source=<measured|measured_last_dispatch|session_slot|non_resident|unknown> [measurement=measured] min_ratio=… tenants=… occupants=… session=…`.
+
+`measurement=` is the additive provenance field (immediately after
+`residency_source=`) that distinguishes a real measurement from the ownership
+sentinel: this item emits `measurement=measured` for both measured sources and
+omits the field where nothing was measured (`reuse_ratio=none` remains the
+numeric-absent form). The closed unmeasured-reason vocabulary
+(`unavailable:no_slot`, `unavailable:no_prior_measurement`, …) is
+LP-0MVT2Q1SD009JLKD.
+
+**Measurement sources** (rung order): `measured` is the live `/slots`
+`context_tokens`; when the deployed build does not report it (llama.cpp b8782
+dropped `n_past`) `measured_last_dispatch` uses the session's most recent local
+dispatch from the in-process `proxy.measured_prefill` store — llama-server's own
+`prompt_progress` `total` for the `(model, session)` pair — before falling back
+to the ownership-only `session_slot` sentinel. The rung is guarded by live
+ownership and the capture rollback switch, and prices admission from
+`min(n_past_actual, estimated_tokens)` reusable tokens, so a *grown* prompt can
+be denied with `resident_prefix_insufficient` (the intended AC4 rule (a)
+signal, not a regression).
 `proxy-usage-analysis` renders the resident-vs-evicted reuse split and
 per-session slot-owner churn in its `## Residency-aware admission` section.
 
