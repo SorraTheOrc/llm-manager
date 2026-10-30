@@ -2582,3 +2582,267 @@ async def test_deferral_exit_refuses_before_resolving_a_remote_candidate(
         f"{trigger}: the refusal must come from the queue exit itself, before "
         f"the next candidate is resolved (resolved={resolutions})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Truthful fallback accounting + attributable refusal context
+# (LP-0MVNTJQVB007QWEZ)
+#
+# The 2026-10-25 diagnosis of session ``herdr-1792897705-4039879-16152``
+# needed to tell "local refused the request by design" from "the chain really
+# ran out". Two things broke that:
+#
+# - the ``local_admission_guard_direct_fallback … → routing to next provider``
+#   line was emitted *before* the pin-local branch returned the 429, so the
+#   log claimed routing that never happened (AC1);
+# - the refusal line named the reason and the intent but not the dispatch
+#   context or the decision evidence, so counting refusals per session /
+#   provider / priority needed other lines (AC2).
+#
+# Every test below greps the same public log contract an operator does: one
+# ``local_only_refused`` line per refused request, no false fallback line.
+# ---------------------------------------------------------------------------
+
+#: The 2026-10-25 refusal's session id — the AC5 reproduction case.
+INCIDENT_REFUSAL_SESSION = "herdr-1792897705-4039879-16152"
+
+
+def _log_messages(caplog) -> list[str]:
+    """Every captured message, in emission order."""
+    return [record.getMessage() for record in caplog.records]
+
+
+async def _issue_direct_guard_refusal(
+    mixed_model_config, preference: str
+) -> tuple:
+    """Drive the direct (free-slot) guard path for *preference*.
+
+    A 100k-token cache-cold prompt is priced at ~468 s against the 60 s wait
+    budget while a local slot is free, so the direct guard refuses. A
+    pin-local client gets the 429; ``prefer-local`` falls through to remote.
+    Returns ``(response, dispatches)``.
+    """
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    # Cache-cold 100k prompt at ~3.9 ms/token ≈ 468 s ≫ 60 s budget.
+    _seed_calibration(tokens=100_000, ms_per_token=3.9)
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=100_000),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(
+                headers={
+                    "x-local-preference": preference,
+                    "x-session-id": INCIDENT_REFUSAL_SESSION,
+                }
+            ),
+            "v1/chat/completions",
+            mixed_model_config,
+            _free_slot_cfg(),
+        )
+    return result, calls
+
+
+@pytest.mark.asyncio
+async def test_direct_guard_pin_refusal_is_attributable_and_claims_no_fallback(
+    mixed_model_config, caplog
+):
+    """AC1/AC2/AC5: the 2026-10-25 refusal, reproduced end-to-end.
+
+    The refused ``local-preferred`` request must leave exactly one greppable
+    ``local_only_refused`` line carrying the dispatch context (session,
+    provider, priority, ``route=refused``) and the admission decision's own
+    evidence (tokens, ETA, budget) — and the log must not claim it routed to
+    the next provider, because it did not.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    result, calls = await _issue_direct_guard_refusal(
+        mixed_model_config, "local-preferred"
+    )
+
+    assert result.status_code == 429, (
+        f"a pin-local refusal is the retryable 429, got {result.status_code}"
+    )
+    assert calls == [], (
+        f"a refused pin-local request never dispatches, got {calls}"
+    )
+
+    messages = _log_messages(caplog)
+    # AC2: exactly one countable refusal line, and it names everything the
+    # operator needs to attribute the 429 from the log alone.
+    lines = [m for m in messages if m.startswith("local_only_refused ")]
+    assert len(lines) == 1, f"exactly one refusal line per request; got {lines!r}"
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("reason") == "eta_exceeds_budget_direct"
+    assert fields.get("preference") == "local-preferred"
+    assert fields.get("session") == INCIDENT_REFUSAL_SESSION, (
+        f"the refusal must name the session it refused; got {fields!r}"
+    )
+    assert fields.get("provider") == "local-llama", (
+        f"the refusal must name the provider it refused; got {fields!r}"
+    )
+    assert fields.get("priority") == "low"
+    assert fields.get("route") == "refused"
+    # The numbers are the admission decision's own (never re-derived here).
+    assert int(fields.get("new_tokens", -1)) == 100_000
+    assert int(fields.get("budget_tokens", -1)) == (
+        provider._cold_prefill_budget_tokens(_free_slot_cfg())
+    )
+    assert float(fields.get("eta_prefill_seconds", 0.0)) > 0.0
+    assert float(fields.get("budget_seconds", 0.0)) > 0.0
+
+    # AC1: nothing was routed, so nothing may claim it was.
+    assert [
+        m
+        for m in messages
+        if m.startswith("local_admission_guard_direct_fallback")
+    ] == [], (
+        "a refused local-only request must not log '→ routing to next "
+        f"provider'; got {messages!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefer_local_direct_fall_through_keeps_the_fallback_line(
+    mixed_model_config, caplog
+):
+    """AC1/AC4: the truthful half — a real fall-through still says so.
+
+    Regression guard: moving the line behind the pin check must not silence it
+    for the ``prefer-local`` client that genuinely moves to the next provider.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    result, calls = await _issue_direct_guard_refusal(
+        mixed_model_config, "prefer-local"
+    )
+
+    assert result.status_code == 200, "prefer-local keeps the remote answer"
+    assert calls == ["remote"], f"prefer-local falls through; got {calls}"
+
+    messages = _log_messages(caplog)
+    fallback = [
+        m for m in messages if m.startswith("local_admission_guard_direct_fallback")
+    ]
+    assert len(fallback) == 1, (
+        f"a real fall-through logs the line exactly once; got {fallback!r}"
+    )
+    assert "→ routing to next provider" in fallback[0]
+    assert "reason=eta_exceeds_budget_direct" in fallback[0]
+    assert f"session={INCIDENT_REFUSAL_SESSION}" in fallback[0], (
+        f"the fall-through line names its session; got {fallback[0]!r}"
+    )
+    assert [m for m in messages if m.startswith("local_only_refused ")] == [], (
+        "a served request is not a refusal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_contention_queue_pin_refusal_carries_dispatch_context(
+    mixed_model_config, caplog
+):
+    """AC2/AC4: the contention-queue refusal path logs the same context.
+
+    Every slot is busy, so the request reaches the queue-entry guard, which
+    refuses a ``local-preferred`` client with a deferrable verdict. The
+    refusal line must name the session, provider, priority and route exactly as
+    the direct path does.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    case = _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_CASE)
+
+    dispatched: list[str] = []
+
+    async def _local(_req, _path):
+        dispatched.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):  # pragma: no cover - must never run
+        dispatched.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=PROMPT_NEW_TOKENS),
+        _fixed_wait_projection(case),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(
+                headers={
+                    "x-local-preference": "local-preferred",
+                    "x-session-id": INCIDENT_REFUSAL_SESSION,
+                }
+            ),
+            "v1/chat/completions",
+            mixed_model_config,
+            _case_cfg(case),
+        )
+
+    assert result.status_code == 429, f"got {result.status_code}"
+    assert dispatched == [], f"a refused request never dispatches; got {dispatched}"
+
+    lines = [m for m in _log_messages(caplog) if m.startswith("local_only_refused ")]
+    assert len(lines) == 1, f"exactly one refusal line per request; got {lines!r}"
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("reason") == case.reason
+    assert fields.get("session") == INCIDENT_REFUSAL_SESSION
+    assert fields.get("provider") == "local-llama"
+    assert fields.get("priority") == "low"
+    assert fields.get("route") == "refused"
+    assert int(fields.get("new_tokens", -1)) == PROMPT_NEW_TOKENS
+    assert float(fields.get("eta_prefill_seconds", 0.0)) == pytest.approx(
+        case.eta_prefill_seconds, abs=0.1
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger",
+    ["queue_depth_cap", "queue_wait_expiry", "lease_active_fallback"],
+)
+async def test_deferral_exit_pin_refusal_logs_the_dispatch_context(
+    mixed_model_config, caplog, trigger
+):
+    """AC2/AC4: the queue exits and the lease path log the same context.
+
+    Both the spent-deferral exits and the ``local_lease_active`` exit refuse a
+    ``local-preferred`` client; each must leave exactly one countable refusal
+    line naming the session, the provider, the priority and the refused route.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    result, _dispatches, _waits = await _issue_deferral_exit(
+        mixed_model_config, trigger
+    )
+
+    assert result.status_code == 429, f"{trigger}: got {result.status_code}"
+    lines = [m for m in _log_messages(caplog) if m.startswith("local_only_refused ")]
+    assert len(lines) == 1, (
+        f"{trigger}: exactly one refusal line per request; got {lines!r}"
+    )
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("session") == "unknown", (
+        f"{trigger}: the refusal names the session (``unknown`` when the "
+        f"request carried none); got {fields!r}"
+    )
+    assert fields.get("provider") == "local-llama", (
+        f"{trigger}: the refusal must name the provider; got {fields!r}"
+    )
+    assert fields.get("priority") == "low"
+    assert fields.get("route") == "refused"

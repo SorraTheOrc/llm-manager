@@ -338,3 +338,48 @@ def test_response_headers_document_promotion_and_the_unstrippable_chain():
         "the X-Local-Route section must state that a chain with no non-local "
         "entry is never stripped (it keeps deferring/refusing)"
     )
+
+
+def test_refusal_line_fields_and_the_fallback_claim_are_documented():
+    """LP-0MVNTJQVB007QWEZ AC2/AC3: the countable token, its context fields and
+    the truthful fallback claim are documented where operators look.
+
+    An operator counts this failure class by one token, so the prose must name
+    that token and the fields that make a refusal attributable; and it must
+    state that the ``… → routing to next provider`` line belongs to a real
+    fall-through only — otherwise the docs would bless the false claim this
+    item removed.
+    """
+    section = _section(ROUTING_DOC.read_text())
+
+    for field in (
+        "local_only_refused",
+        "route=refused",
+        "session=",
+        "provider=",
+        "priority=",
+        "new_tokens=",
+        "budget_tokens=",
+        "eta_prefill_seconds=",
+        "budget_seconds=",
+    ):
+        assert field in section, (
+            f"the refusal-line contract must document {field!r} — an operator "
+            "cannot count what the docs do not name (AC2/AC3)"
+        )
+
+    fallback_lines = [
+        line
+        for line in section.splitlines()
+        if "local_admission_guard_direct_fallback" in line
+    ]
+    assert fallback_lines, (
+        "the direct-guard dispatch line must stay documented"
+    )
+    assert any("real fall-through" in line for line in fallback_lines) or any(
+        "only" in line.lower() and "fall" in line.lower()
+        for line in fallback_lines
+    ), (
+        "the docs must state that the '→ routing to next provider' line is "
+        "emitted only on a real fall-through (AC1)"
+    )

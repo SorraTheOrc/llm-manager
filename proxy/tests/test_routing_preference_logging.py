@@ -160,6 +160,12 @@ class _NotLocalLineRow:
     existing_keys: tuple[str, ...]
     contains: tuple[str, ...] = ()
     description: str = ""
+    #: Wire preferences the row applies to (``None`` = every case).
+    #: ``local_admission_guard_free_slot`` is the one exit whose *line* depends
+    #: on the preference: a fall-through logs the fallback line, a pin-local
+    #: refusal logs ``local_only_refused`` instead and must never claim it
+    #: routed onwards (LP-0MVNTJQVB007QWEZ AC1).
+    preferences: tuple[str | None, ...] | None = None
 
 
 _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
@@ -207,6 +213,29 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
         prefix="local_admission_guard_direct_fallback",
         existing_keys=("provider", "model", "session", "reason", "free_slot"),
         description="prefill-gate denial on the free-slot (direct dispatch) path",
+        # Only the clients that really move on to the next provider: a
+        # pin-local refusal is an exit, not a fall-through
+        # (LP-0MVNTJQVB007QWEZ AC1).
+        preferences=(PREFER_LOCAL, None),
+    ),
+    _NotLocalLineRow(
+        trigger="admission_guard_free_slot_refused",
+        prefix="local_only_refused ",
+        existing_keys=(
+            "provider",
+            "session",
+            "priority",
+            "reason",
+            "route",
+        ),
+        contains=("route=refused",),
+        description=(
+            "prefill-gate refusal of a pin-local client on the free-slot "
+            "(direct dispatch) path"
+        ),
+        # The pin-local wire values: the refusal line replaces the fallback
+        # line for exactly these clients (LP-0MVNTJQVB007QWEZ AC1/AC2).
+        preferences=(LOCAL_ONLY, LOCAL_PREFERRED),
     ),
     _NotLocalLineRow(
         trigger="chain_cooldown",
@@ -318,6 +347,27 @@ def _preference_params() -> list:
         (None, "absent-header"),
     )
     return [pytest.param(value, id=cid) for value, cid in cases]
+
+
+def _exit_line_cases() -> list:
+    """``(row, preference)`` pairs, honouring each row's applicable values.
+
+    A row may restrict the wire preferences it applies to (the direct-guard
+    exit logs a different line for a pin-local refusal than for a real
+    fall-through — LP-0MVNTJQVB007QWEZ AC1), so the matrix is built as an
+    explicit product instead of two independent parametrisations.
+    """
+    cases: list = []
+    for row in _NOT_LOCAL_LINE_ROWS:
+        allowed = row.preferences
+        for param in _preference_params():
+            value = param.values[0]
+            if allowed is not None and value not in allowed:
+                continue
+            cases.append(
+                pytest.param(row, value, id=f"{row.trigger}-{param.id}")
+            )
+    return cases
 
 
 class _DummyRequest:
@@ -569,7 +619,7 @@ def _row_patches(row: _NotLocalLineRow) -> list:
         )
     elif trigger == "queue_depth_cap":
         _occupy_the_only_queue_slot()
-    elif trigger == "admission_guard_free_slot":
+    elif trigger in ("admission_guard_free_slot", "admission_guard_free_slot_refused"):
         _seed_calibration(ADMISSION_PROMPT_TOKENS)
         patches.append(_estimate_patches(ADMISSION_PROMPT_TOKENS))
     elif trigger == "chain_cooldown":
@@ -696,10 +746,7 @@ def _assert_line_present(messages: list[str], row: _NotLocalLineRow) -> str:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "row", _NOT_LOCAL_LINE_ROWS, ids=[r.trigger for r in _NOT_LOCAL_LINE_ROWS]
-)
-@pytest.mark.parametrize("preference", _preference_params())
+@pytest.mark.parametrize(("row", "preference"), _exit_line_cases())
 async def test_not_local_line_keeps_every_pre_existing_key(row, preference, caplog):
     """An additive change must not drop a field log-grep tooling depends on.
 
@@ -754,10 +801,7 @@ async def test_routing_skip_line_carries_the_per_turn_id(row, preference, caplog
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "row", _NOT_LOCAL_LINE_ROWS, ids=[r.trigger for r in _NOT_LOCAL_LINE_ROWS]
-)
-@pytest.mark.parametrize("preference", _preference_params())
+@pytest.mark.parametrize(("row", "preference"), _exit_line_cases())
 async def test_not_local_line_names_the_parsed_preference(row, preference, caplog):
     """Each exit line carries ``preference=<parsed value>``; absent ⇒ default.
 

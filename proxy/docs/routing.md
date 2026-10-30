@@ -1471,7 +1471,7 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Admission guard, queue path — projected first byte reaches `local_prefill_deadline_seconds` | `prefill_eta_exceeds_deadline` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_deadline ...` |
 | Admission guard, queue path — safety-budget bound of the deadline | `prefill_eta_exceeds_safety_budget` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_safety_budget ...` |
 | Admission guard, queue path — flat cold-prefill token cap (`local_cold_prefill_budget_tokens`): the prompt outgrows the local serving envelope | `prefill_budget_exceeded` | promoting | `local_admission_guard ... reason=prefill_budget_exceeded ...` |
-| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` (the deadline/safety/budget reasons keep their own token) | refusing | `local_admission_guard ... free_slot=true ...` / `local_admission_guard_direct_fallback ... reason=...` |
+| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` (the deadline/safety/budget reasons keep their own token) | refusing | `local_admission_guard ... free_slot=true ...` plus, for a pin-local client, `local_only_refused reason=<token> ... route=refused`. The `local_admission_guard_direct_fallback ... → routing to next provider` line is emitted **only** when the request really falls through to the next provider (`prefer-local` / `remote-ok` / absent header) |
 | Local entry in cooldown (chain resolution) | `local_provider_cooldown` | refusing | `Skipping provider=<local>: ... in cooldown (...s remaining) reason=local_provider_cooldown preference=...` |
 | Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap — the prompt can never fit local, however long it waits | `context_too_large` | promoting | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
 | Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
@@ -1501,6 +1501,36 @@ legacy alias header is normalised to `local-preferred`), and the `verdict`
 (`deferrable` / `too_large`) is the same classification the 429 body carries,
 computed once by `admission_reserve.local_capacity_verdict`
 (LP-0MVSMINPR006SWT6).
+
+**Counting refusals.** `local_only_refused` is the countable token for this
+failure class: the guard's own `local_admission_guard decision=reject …` line is
+shared with a `prefer-local` request that is refused locally and *then served
+remotely*, so `decision=reject` alone cannot distinguish the two. The refusal
+line always names its dispatch context and the admission evidence it was built
+from (LP-0MVNTJQVB007QWEZ):
+
+```
+local_only_refused reason=<token> preference=<parsed> verdict=<verdict> \
+  session=<id> provider=<local entry> priority=<priority> \
+  new_tokens=<n> budget_tokens=<n> eta_prefill_seconds=<s> budget_seconds=<s> \
+  route=refused
+```
+
+Every optional key is appended only when the refusal actually carries that
+value (e.g. a chain-resolution exit has no admission decision, so the token
+fields are absent); `route=refused` is constant and mirrors the
+`X-Local-Route: refused` response header. `session` is resolved from the
+request's session header (`unknown` when it carried none) and `provider` is the
+local entry the refusal was taken on — the same values the guard decision line
+reports. So `grep 'local_only_refused ' proxy.log | grep 'session=<id>'` answers
+"was this client's 429 a local-only refusal, and why" without correlating
+headers, and `grep -c 'local_only_refused route=refused'` counts the class.
+
+Conversely, no log line may claim routing that did not happen: for a pin-local
+refusal the direct-guard dispatch point emits `local_only_refused` and **not**
+`local_admission_guard_direct_fallback … → routing to next provider`, which is
+reserved for a real fall-through (the `prefer-local` / `remote-ok` / absent
+header clients that are served by the next provider).
 
 #### Promoted: a too-large request leaves the local chain
 

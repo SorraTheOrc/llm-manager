@@ -7223,6 +7223,14 @@ def _log_local_only_refusal(
     reason: str | None,
     preference: str | None = None,
     verdict: str | None = None,
+    *,
+    session: str | None = None,
+    provider: str | None = None,
+    priority: str | None = None,
+    new_tokens: int | None = None,
+    budget_tokens: int | None = None,
+    eta_prefill_seconds: float | None = None,
+    budget_seconds: float | None = None,
 ) -> None:
     """One attributable line per pin-local refusal (parent AC4/AC5).
 
@@ -7236,36 +7244,82 @@ def _log_local_only_refusal(
     LP-0MVSMINPR006SWT6: the refusal builder also passes the capacity
     ``verdict`` (``deferrable`` / ``too_large``) computed once by
     :func:`admission_reserve.local_capacity_verdict`, so the line reports the
-    same classification as the 429 body rather than a second guess. The key is
-    appended only when supplied: the free-slot/exhausted caller keeps its
-    two-key line byte-identical.
+    same classification as the 429 body rather than a second guess.
+
+    LP-0MVNTJQVB007QWEZ: the line is the *countable* token for this failure
+    class (``decision=reject`` is shared with the ``prefer-local`` fall-through
+    that is served remotely), so it also carries the dispatch context
+    (``session`` / ``provider`` / ``priority``) and the admission decision's own
+    evidence (``new_tokens`` / ``budget_tokens`` / ``eta_prefill_seconds`` /
+    ``budget_seconds``) plus the constant ``route=refused``. Every optional key
+    is appended only when supplied — a missing value is omitted, never guessed.
 
     ``preference`` is the *parsed* intent threaded in by the call sites; it
     defaults to ``PREF_LOCAL_ONLY`` so a direct builder caller (and the
     pre-existing log contract) keeps its current spelling.
     """
     try:
-        if verdict is None:
-            logger.info(
-                "local_only_refused reason=%s preference=%s",
-                reason or LOCAL_ROUTE_UNAVAILABLE,
-                preference or PREF_LOCAL_ONLY,
-            )
-        else:
-            logger.info(
-                "local_only_refused reason=%s preference=%s verdict=%s",
-                reason or LOCAL_ROUTE_UNAVAILABLE,
-                preference or PREF_LOCAL_ONLY,
-                verdict,
-            )
+        fields = [
+            f"reason={reason or LOCAL_ROUTE_UNAVAILABLE}",
+            f"preference={preference or PREF_LOCAL_ONLY}",
+        ]
+        if verdict is not None:
+            fields.append(f"verdict={verdict}")
+        if session:
+            fields.append(f"session={session}")
+        if provider:
+            fields.append(f"provider={provider}")
+        if priority:
+            fields.append(f"priority={priority}")
+        if new_tokens is not None:
+            fields.append(f"new_tokens={int(new_tokens)}")
+        if budget_tokens is not None:
+            fields.append(f"budget_tokens={int(budget_tokens)}")
+        if eta_prefill_seconds is not None:
+            fields.append(f"eta_prefill_seconds={round(float(eta_prefill_seconds), 1)}")
+        if budget_seconds is not None:
+            fields.append(f"budget_seconds={round(float(budget_seconds), 1)}")
+        fields.append("route=refused")
+        logger.info("local_only_refused %s", " ".join(fields))
     except Exception:  # pragma: no cover - observability is best-effort
         pass
+
+
+def _refusal_dispatch_context(
+    request: Any,
+    provider: str | None = None,
+    priority: str | None = None,
+) -> dict[str, str]:
+    """Dispatch context fields for the ``local_only_refused`` line (AC2).
+
+    LP-0MVNTJQVB007QWEZ: a refusal is only attributable if the line names the
+    request it refused and the provider that could not serve it. The session is
+    resolved from the same ``X-Session-Id`` chain every other line uses; a
+    request without one reports ``unknown`` (never an empty value). Best-effort:
+    observability must never break a refusal.
+    """
+    context: dict[str, str] = {}
+    try:
+        from proxy.session import _resolve_session_id_header
+
+        session_id, _ = _resolve_session_id_header(
+            getattr(request, "headers", {}) or {}
+        )
+        context["session"] = session_id or "unknown"
+    except Exception:  # pragma: no cover - attribution is best-effort
+        context["session"] = "unknown"
+    if provider:
+        context["provider"] = provider
+    if priority:
+        context["priority"] = priority
+    return context
 
 
 def _build_local_only_refusal_response(
     attempt: dict[str, Any] | None,
     config: dict | None = None,
     preference: str | None = None,
+    context: dict[str, str] | None = None,
 ) -> Response:
     """429 for a pin-local request that could not be served locally (AC4).
 
@@ -7375,7 +7429,16 @@ def _build_local_only_refusal_response(
     # One line per refusal, naming the reason the client is told about, the
     # intent that produced it and the verdict computed above (parent AC4).
     _log_local_only_refusal(
-        reason, preference=preference, verdict=capacity.verdict
+        reason,
+        preference=preference,
+        verdict=capacity.verdict,
+        session=(context or {}).get("session"),
+        provider=(context or {}).get("provider"),
+        priority=(context or {}).get("priority"),
+        new_tokens=new_tokens,
+        budget_tokens=budget_tokens,
+        eta_prefill_seconds=eta,
+        budget_seconds=budget,
     )
     return Response(
         content=json.dumps(payload).encode("utf-8"),
@@ -7864,6 +7927,8 @@ def _build_deferral_refusal_response(
     *,
     retry_after_s: int | float | None = None,
     elapsed_wait_seconds: float | None = None,
+    provider: str | None = None,
+    priority: str | None = None,
 ) -> Response | None:
     """End a spent local deferral in the retryable 429 (parent AC3/AC6).
 
@@ -7901,7 +7966,14 @@ def _build_deferral_refusal_response(
     if elapsed_wait_seconds is not None:
         attempt["elapsed_wait_seconds"] = round(float(elapsed_wait_seconds), 3)
     response = _build_local_only_refusal_response(
-        attempt, config, preference=preference
+        attempt,
+        config,
+        preference=preference,
+        # A spent deferral has no provider in scope by name, but the session
+        # still attributes the refusal (LP-0MVNTJQVB007QWEZ AC2).
+        context=_refusal_dispatch_context(
+            request, provider=provider, priority=priority
+        ),
     )
     # The deferral outcome is stamped where the deferral ends, so the single
     # per-request line can tell a spent deferral (``deferred``) from chain
@@ -8012,8 +8084,16 @@ async def _build_local_only_refusal_for_remote(
     # The parsed intent is threaded through so the single refusal line names the
     # preference that actually caused the refusal (LP-0MVSMINPR006SWT6 AC4);
     # the builder computes the verdict exactly once and never re-derives it.
+    # The dispatch context (session + the provider the chain resolved) is
+    # threaded too, so the refusal is attributable from the log line alone
+    # (LP-0MVNTJQVB007QWEZ AC2).
     response = _build_local_only_refusal_response(
-        attempt, config, preference=preference
+        attempt,
+        config,
+        preference=preference,
+        context=_refusal_dispatch_context(
+            request, provider=(provider_cfg or {}).get("name")
+        ),
     )
     # Pin refusal: the client's intent was honoured and the request was not
     # promoted (LP-0MVSM06Z8003UQTM).
@@ -12303,6 +12383,7 @@ async def _proxy_with_fallback_cycle(
                 retry_after_s=_local_refusal_retry_after_s(
                     request, SKIP_REASON_LOCAL_LEASE_ACTIVE, model_config, config
                 ),
+                priority=_priority,
             )
             if _lease_refusal is not None:
                 return _lease_refusal
@@ -12533,6 +12614,8 @@ async def _proxy_with_fallback_cycle(
                             request, config, _preference, fallback_reason,
                             retry_after_s=_cq_remaining_s,
                             elapsed_wait_seconds=_cq_elapsed,
+                            provider=provider_name,
+                            priority=_priority,
                         )
                         if _deferral_refusal is not None:
                             return _deferral_refusal
@@ -12592,9 +12675,18 @@ async def _proxy_with_fallback_cycle(
                         # The verdict and the preference named on the single
                         # refusal line come from the shared builder / the parsed
                         # intent (LP-0MVSMINPR006SWT6 AC1/AC4) — never re-derived
-                        # on this branch.
+                        # on this branch. The dispatch context is threaded so
+                        # the line names the session, provider and priority
+                        # the refusal happened on (LP-0MVNTJQVB007QWEZ AC2).
                         return _build_local_only_refusal_response(
-                            _refusal_attempt, config, preference=_preference
+                            _refusal_attempt,
+                            config,
+                            preference=_preference,
+                            context={
+                                "session": _session_id or "unknown",
+                                "provider": provider_name,
+                                "priority": _priority,
+                            },
                         )
                     else:  # fallback_policy — fast mode unchanged
                         _record_attempt(
@@ -13183,19 +13275,6 @@ async def _proxy_with_fallback_cycle(
                         reason=_direct_reason,
                         **_local_admission_evidence(_direct_admission),
                     )
-                    try:
-                        logger.info(
-                            "local_admission_guard_direct_fallback "
-                            "provider=%s model=%s session=%s preference=%s "
-                            "reason=%s free_slot=true → routing to next provider",
-                            provider_name,
-                            _llama_model or "unknown",
-                            _session_id or "unknown",
-                            _preference,
-                            _direct_reason,
-                        )
-                    except Exception:
-                        pass
                     # Explicit client intent (LP-0MVIKPCSG002B0NL AC4 / pin
                     # slice LP-0MVSLZY470051ZB2 AC1/AC2): the single pin
                     # predicate. A pin-local client (``local-preferred`` or
@@ -13218,14 +13297,16 @@ async def _proxy_with_fallback_cycle(
                         # treat a recoverable refusal as terminal.
                         #
                         # Both pin-local refusal paths therefore share the one
-                        # refusal builder (the queue/lease ``refused_local_only``
+                        # refusal builder (the queue/lease ``refused_only``
                         # branches above). It also emits the single
                         # ``local_only_refused`` line, naming ``_direct_reason``
-                        # with the parsed intent and the capacity verdict — so
-                        # this branch no longer logs its own line. The
-                        # exhaustion builder keeps its admission-refusal variant
-                        # for the genuinely exhausted chain a ``prefer-local``
-                        # request reaches after the guard refused it.
+                        # with the parsed intent, the capacity verdict and — via
+                        # ``context`` — the dispatch context, so this branch
+                        # emits no line of its own and never claims it routed
+                        # onwards (LP-0MVNTJQVB007QWEZ AC1/AC2). The exhaustion
+                        # builder keeps its admission-refusal variant for the
+                        # genuinely exhausted chain a ``prefer-local`` request
+                        # reaches after the guard refused it.
                         return _build_local_only_refusal_response(
                             {
                                 "status": "local_admission_reject",
@@ -13234,7 +13315,30 @@ async def _proxy_with_fallback_cycle(
                             },
                             config,
                             preference=_preference,
+                            context={
+                                "session": _session_id or "unknown",
+                                "provider": provider_name,
+                                "priority": _priority,
+                            },
                         )
+                    # Only reached on a REAL fall-through: the next provider
+                    # will be tried, so the line may say so
+                    # (LP-0MVNTJQVB007QWEZ AC1 — it used to be emitted before
+                    # the pin-local branch above, claiming routing that never
+                    # happened).
+                    try:
+                        logger.info(
+                            "local_admission_guard_direct_fallback "
+                            "provider=%s model=%s session=%s preference=%s "
+                            "reason=%s free_slot=true → routing to next provider",
+                            provider_name,
+                            _llama_model or "unknown",
+                            _session_id or "unknown",
+                            _preference,
+                            _direct_reason,
+                        )
+                    except Exception:
+                        pass
                     fallback_reason = "local_admission_guard"
                     prev_provider = provider_name
                     all_slot_exhaustion = False
@@ -13617,6 +13721,8 @@ async def _proxy_with_fallback_cycle(
                             SKIP_REASON_LOCAL_LEASE_ACTIVE,
                             retry_after_s=_lease_remaining_s,
                             elapsed_wait_seconds=_lease_elapsed,
+                            provider=provider_name,
+                            priority=_priority,
                         )
                         if _deferral_refusal is not None:
                             return _deferral_refusal
@@ -13670,10 +13776,18 @@ async def _proxy_with_fallback_cycle(
                         }
                         # Same single-implementation contract as the queue
                         # branch above: the builder classifies, the parsed
-                        # preference is only threaded for the log line
-                        # (LP-0MVSMINPR006SWT6 AC1/AC4).
+                        # preference and the dispatch context are only threaded
+                        # for the log line (LP-0MVSMINPR006SWT6 AC1/AC4,
+                        # LP-0MVNTJQVB007QWEZ AC2).
                         return _build_local_only_refusal_response(
-                            _refusal_attempt, config, preference=_preference
+                            _refusal_attempt,
+                            config,
+                            preference=_preference,
+                            context={
+                                "session": _session_id or "unknown",
+                                "provider": provider_name,
+                                "priority": _priority,
+                            },
                         )
                     else:
                         # Queue disabled / fallback policy: preserve the
