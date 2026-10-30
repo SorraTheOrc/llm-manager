@@ -1080,9 +1080,23 @@ def _free_slot_assignment(session_id: str, endpoint: str | None = None) -> None:
 
     When *endpoint* is None (legacy single-server mode), the first matching
     assignment is released for backward compatibility.
+
+    Releasing the assignment is also where a slot changes hands, so the
+    session's measured prefill is forgotten with it (LP-0MVT2QFAP0082BKR AC
+    slot release/reassignment): the next owner of that slot must never inherit
+    the previous tenant's prefix size as a numeric reuse ratio. The clear is
+    unconditional and idempotent — the measurement is only ever valid while
+    the session still owns a slot, and the routed model is not known here, so
+    every model's entry for the session goes. Fail-open: clearing never raises.
     """
     if not session_id:
         return
+    try:
+        from proxy.measured_prefill import clear_measured_prefill
+
+        clear_measured_prefill(None, session_id)
+    except Exception:
+        pass
     ep = endpoint or ""
     for key, owner in list(_slot_owners.items()):
         if owner == session_id and (

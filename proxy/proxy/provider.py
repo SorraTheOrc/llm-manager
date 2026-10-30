@@ -2729,6 +2729,14 @@ def resolve_resident_prefix(
     here: llama-server holds `/slots` for >15 s while processing a prompt
     batch (LP-0MUXTW4MD003TVIC).
 
+    A stored measurement is only valid while its session still owns the slot
+    it was captured against: rung 2 is gated on live ownership, and the
+    invalidation paths clear the entry when that ownership ends — eviction
+    (``router_helpers._record_local_eviction``), slot release/reassignment
+    (``session._free_slot_assignment``) and a model switch
+    (``lifecycle.ensure_model_loaded``, LP-0MVT2QFAP0082BKR). The ownership
+    gate is the backstop for any clear that was missed.
+
     Each rung also sets exactly one ``measurement=`` reason via
     :func:`measurement_reason`: ``measured`` for rungs 1–2,
     ``unavailable:capture_disabled`` / ``unavailable:no_prior_measurement`` for

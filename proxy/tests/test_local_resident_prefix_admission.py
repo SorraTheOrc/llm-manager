@@ -59,14 +59,6 @@ SKIP_TENANT_LIMIT = "tenant_limit"
 PENDING_VIEW = "pending LP-0MVN4L7AG003PC80 (shared residency view)"
 PENDING_GATE = "pending LP-0MVN4L7KT003XUBA (resident-prefix gate / live pricing)"
 
-# LP-0MVT2PB6U007PKD1 — the failing-first pins for the admission-time
-# measurement work. Each marker names the implementation child that turns the
-# assertion green (strict, so a marker cannot be forgotten).
-PENDING_INVALIDATION = (
-    "pending LP-0MVT2QFAP0082BKR (measurement invalidation on eviction / "
-    "slot release / model switch)"
-)
-
 #: Model the ladder is driven with (``_gate``); the measurement store is keyed
 #: ``(model, session)``, so the constant is part of the pin.
 MODEL = "Qwen3"
@@ -1901,21 +1893,26 @@ def test_non_resident_decision_is_labelled_no_slot(caplog, monkeypatch):
     assert "reuse_ratio=0.0000" not in record.getMessage()
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_INVALIDATION)
 def test_eviction_invalidates_a_stored_measurement(caplog, monkeypatch):
     """AC3(iv) eviction: a reclaimed slot's measurement is not reused.
 
     ``_record_local_eviction`` is the single reclaim chokepoint, so clearing
-    the ``(model, session)`` measurement there covers every eviction reason.
-    The slot registry still names the session afterwards here, which is
-    exactly the stale-measurement case: ownership alone must not resurrect the
-    old dispatch's ``total`` as a numeric ratio.
+    the measurement there covers every eviction reason. The slot registry
+    still names the session afterwards here, which is exactly the
+    stale-measurement case: ownership alone must not resurrect the old
+    dispatch's ``total`` as a numeric ratio.
+
+    The chokepoint knows the session but not the routed model name, so the
+    clear is model-agnostic: a measurement stored under *any* model for the
+    session must go (a partial clear would leave an orphan the next dispatch
+    could read as warm).
     """
     import logging
 
     from proxy import admission_events
 
     _prime_measurement(MEASURED_TOTAL)
+    _prime_measurement(MEASURED_TOTAL, model="Qwen3-Next")
     srv = _SrvStub()
     router_helpers._record_local_eviction(
         srv,
@@ -1925,6 +1922,7 @@ def test_eviction_invalidates_a_stored_measurement(caplog, monkeypatch):
     )
 
     assert measured_prefill.get_measured_prefill(MODEL, "sess-a") is None
+    assert measured_prefill.get_measured_prefill("Qwen3-Next", "sess-a") is None
 
     view = _view(
         slots=[_slot(0, None)], owners={("", 0): "sess-a"}, monkeypatch=monkeypatch
@@ -1938,21 +1936,24 @@ def test_eviction_invalidates_a_stored_measurement(caplog, monkeypatch):
     assert (_measurement_field(caplog) or "").startswith("unavailable:")
 
 
-@pytest.mark.xfail(strict=True, reason=PENDING_INVALIDATION)
 def test_slot_reassignment_invalidates_only_that_sessions_measurement():
     """AC3(iv) slot reassignment: freeing a slot forgets its measurement.
 
     ``session._free_slot_assignment`` is where a slot changes hands, so the
     measurement for that session must go with it — otherwise the next owner's
     decision would read the previous tenant's prompt size. Other sessions'
-    measurements are untouched (the store stays per ``(model, session)``).
+    measurements are untouched (the clear is session-scoped, not a reset), and
+    the clear is model-agnostic because the release path does not know which
+    model the session was routed under.
     """
     _prime_measurement(MEASURED_TOTAL, session="sess-a")
+    _prime_measurement(MEASURED_TOTAL, model="Qwen3-Next", session="sess-a")
     _prime_measurement(MEASURED_TOTAL, session="sess-b")
 
     session_registry._free_slot_assignment("sess-a")
 
     assert measured_prefill.get_measured_prefill(MODEL, "sess-a") is None
+    assert measured_prefill.get_measured_prefill("Qwen3-Next", "sess-a") is None
     assert measured_prefill.get_measured_prefill(MODEL, "sess-b") is not None
 
 

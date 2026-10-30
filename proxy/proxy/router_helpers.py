@@ -3128,6 +3128,21 @@ def _record_local_eviction(
     except Exception:
         pass
 
+    # LP-0MVT2QFAP0082BKR (AC eviction): the reclaimed slot no longer holds this
+    # session's prefix, so its captured measurement is stale. Every reclaim
+    # reason funnels through this chokepoint, so clearing here covers them all:
+    # the next admission for the session must report
+    # ``unavailable:no_prior_measurement`` instead of reusing a ratio measured
+    # against a prefix the pool has dropped. The routed model is deliberately
+    # not known here, so every model's measurement for the session goes.
+    # Fail-open: clearing never raises and never changes a decision.
+    try:
+        from proxy.measured_prefill import clear_measured_prefill
+
+        clear_measured_prefill(None, session_key)
+    except Exception:
+        pass
+
     if plan is not None:
         _spawn_detached_release(
             _save_evicted_snapshot(

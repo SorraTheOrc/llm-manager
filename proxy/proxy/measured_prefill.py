@@ -34,11 +34,17 @@ What this module provides (purely additive — no decision changes here)
     and ``measured_new_tokens`` (``total - cache``). ``as_dict`` is what the
     dispatch record exposes (AC3).
 
-``set_measured_prefill`` / ``get_measured_prefill``
+``set_measured_prefill`` / ``get_measured_prefill`` / ``clear_measured_prefill``
     Per-``(model, session)`` store of the latest measurement (capped like the
     cached-ratio table), so consumers can read the measured reuse of the most
     recent local dispatch without reaching into the transient dispatch-lease
-    record (which is released at the end of the stream).
+    record (which is released at the end of the stream). A measurement is only
+    valid while its session still owns the slot it was captured against, so
+    the invalidation paths (eviction, slot release/reassignment, model switch)
+    clear it — ``clear_measured_prefill`` forgets one pair, every model for a
+    session, or every session for a model, and
+    ``clear_measured_prefill_for_other_models`` forgets everything a switch
+    cannot prove belongs to the target model (LP-0MVT2QFAP0082BKR).
 
 ``PREFILL_PROGRESS_EVENT`` / ``MeasurePrefill.log_fields``
     The ``prefill_progress_measured`` log grammar (AC6): ``total``, ``cache``,
@@ -306,10 +312,70 @@ def clear_measured_prefill(
     model_name: str | None,
     session_id: str | None,
 ) -> None:
-    """Forget the measurement for a ``(model, session)`` pair."""
-    if not model_name or not session_id:
-        return
-    _measured_prefill.pop((model_name, session_id), None)
+    """Forget measurements matching the identity the caller actually knows.
+
+    Invalidation call sites know different halves of the key
+    (LP-0MVT2QFAP0082BKR), so the clear is dimensioned by what is supplied:
+
+    - ``(model, session)`` — forget exactly that pair;
+    - ``(None, session)`` — forget **every** model for that session, in a
+      single pass over the store. The reclaim chokepoints
+      (``router_helpers._record_local_eviction``,
+      ``session._free_slot_assignment``) know the session but not the routed
+      model name, and a partial clear would leave an orphan that a later
+      dispatch could read as warm;
+    - ``(model, None)`` — forget **every** session for that model (the
+      model-switch path: the model's slots are torn down, so no session's
+      measurement for it may survive);
+    - ``(None, None)`` / blank keys — a no-op (nothing to identify).
+
+    Never raises: every caller is an invalidation path (eviction, slot
+    release, model switch) that must not turn residency bookkeeping into a
+    request-path, eviction-path or switch-path failure (AC fail-open).
+    """
+    try:
+        if session_id:
+            if model_name:
+                _measured_prefill.pop((model_name, session_id), None)
+                return
+            for key in [k for k in _measured_prefill if k[1] == session_id]:
+                _measured_prefill.pop(key, None)
+            return
+        if model_name:
+            for key in [k for k in _measured_prefill if k[0] == model_name]:
+                _measured_prefill.pop(key, None)
+    except Exception:
+        pass
+
+
+def clear_measured_prefill_for_other_models(*keep_model_names: str | None) -> None:
+    """Forget every measurement except those recorded under a *keep* name.
+
+    The model-switch path (``lifecycle.ensure_model_loaded``) observes a
+    switch between local models. A measurement captured against the model
+    being switched away from is stale — its slots are torn down — and the
+    store key is the name the *dispatch* used, which is the llama name in
+    router mode but the client-facing model name (an alias such as ``code``)
+    in single-model mode. Enumerating a departing model's aliases is not
+    possible (aliases may be wildcards), so the switch keeps only the names
+    it can prove belong to the target model and forgets everything else.
+
+    Over-clearing is the safe direction: a dropped entry degrades an
+    admission to the ownership rung (``unavailable:no_prior_measurement``),
+    while a retained stale entry would fabricate a ratio — the defect this
+    invalidation exists to prevent. With no usable *keep* name nothing is
+    cleared (no evidence of what the target is; never invent a decision).
+
+    Never raises.
+    """
+    try:
+        keep = {name for name in keep_model_names if name}
+        if not keep:
+            return
+        for key in [k for k in _measured_prefill if k[0] not in keep]:
+            _measured_prefill.pop(key, None)
+    except Exception:
+        pass
 
 
 def reset_measured_prefill() -> None:

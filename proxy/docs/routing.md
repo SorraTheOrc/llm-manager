@@ -970,7 +970,11 @@ to the ownership-only `session_slot` sentinel. The rung is guarded by live
 ownership and the capture rollback switch, and prices admission from
 `min(n_past_actual, estimated_tokens)` reusable tokens, so a *grown* prompt can
 be denied with `resident_prefix_insufficient` (the intended AC4 rule (a)
-signal, not a regression).
+signal, not a regression). The stored measurement is invalidated where the
+session loses its slot — eviction, slot release/reassignment and a model
+switch (`LP-0MVT2QFAP0082BKR`) — so the next decision for that pair reports
+`measurement=unavailable:no_prior_measurement` rather than a stale ratio;
+live ownership remains the backstop.
 `proxy-usage-analysis` renders the resident-vs-evicted reuse split and
 per-session slot-owner churn in its `## Residency-aware admission` section.
 

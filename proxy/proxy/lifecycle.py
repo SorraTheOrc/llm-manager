@@ -368,6 +368,46 @@ def _note_model_loaded_cold_start() -> None:
         pass
 
 
+def _forget_switched_model_measurements(
+    requested_model: str | None,
+    target_model: str | None,
+    *,
+    backend_restarted: bool = False,
+) -> None:
+    """Forget measured-prefill entries a model switch makes stale.
+
+    LP-0MVT2QFAP0082BKR (AC model switch): a switch between local models tears
+    down the departing model's slot pool, so any measurement captured against
+    it describes prefixes that no longer exist. The store is keyed by
+    ``(model, session)`` so an admission only ever reads the request's own
+    model; keeping only the target model's names closes the switch-back case
+    (A → B → A) as well, where the key would otherwise match again.
+
+    Both the requested (client-facing) name and the resolved llama name are
+    kept, because the store key is the name the *dispatch* used: the llama name
+    in router mode, the requested alias (e.g. ``code``) in single-model mode.
+
+    *backend_restarted* is the ``llama-server process died`` case: the restart
+    discards **every** slot, including the target model's, so nothing may be
+    kept.
+
+    Best-effort and behaviour-neutral: clearing never raises and never changes
+    a residency decision — it only stops a stale ratio being reported.
+    """
+    try:
+        from proxy.measured_prefill import (
+            clear_measured_prefill_for_other_models,
+            reset_measured_prefill,
+        )
+
+        if backend_restarted:
+            reset_measured_prefill()
+            return
+        clear_measured_prefill_for_other_models(requested_model, target_model)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Lazy server import — avoids circular imports when server.py imports us
 # ---------------------------------------------------------------------------
@@ -2231,6 +2271,7 @@ async def ensure_model_loaded(requested_model: str | None) -> bool:
     incremented_here = False
     try:
        async with srv.model_switch_lock:
+           backend_restarted = False
            if srv.current_model == llama_model and srv.llama_process is not None:
                # Check if process is still running
                if srv.llama_process.poll() is None:
@@ -2238,6 +2279,19 @@ async def ensure_model_loaded(requested_model: str | None) -> bool:
                    return True
                else:
                    srv.logger.warning("llama-server process died, restarting...")
+                   backend_restarted = True
+
+           # LP-0MVT2QFAP0082BKR (AC model switch): this is a genuine switch
+           # (the already-loaded early return above did not fire), so the
+           # previous slot pool is torn down below. Forget the measured prefill
+           # captured against it so a switch back cannot reuse a prefix size
+           # that no longer exists; the store's ``(model, session)`` key remains
+           # the primary guarantee.
+           _forget_switched_model_measurements(
+               requested_model,
+               llama_model,
+               backend_restarted=backend_restarted,
+           )
 
            # If no background load marker exists for this model then this
            # synchronous path should increment the refcount so status

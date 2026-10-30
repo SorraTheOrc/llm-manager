@@ -50,6 +50,7 @@ from proxy.measured_prefill import (
     MeasuredPrefill,
     capture_enabled,
     clear_measured_prefill,
+    clear_measured_prefill_for_other_models,
     get_measured_prefill,
     inject_return_progress,
     set_measured_prefill,
@@ -286,6 +287,70 @@ class TestStoreSemantics:
         clear_measured_prefill(MODEL, SESSION)
         clear_measured_prefill("", "")
         clear_measured_prefill(None, None)
+
+    def test_clear_without_a_model_forgets_every_model_for_the_session(self):
+        """``(None, session)``: the eviction / slot-release dimension.
+
+        Those chokepoints know the session but not the routed model name, so a
+        partial clear would leave an orphan under another model that a later
+        admission could read as warm. Other sessions are untouched.
+        """
+        set_measured_prefill(MODEL, SESSION, self._measurement(40_000))
+        set_measured_prefill("Qwen3-Next", SESSION, self._measurement(30_000))
+        set_measured_prefill(MODEL, "sess-other", self._measurement(20_000))
+
+        clear_measured_prefill(None, SESSION)
+
+        assert get_measured_prefill(MODEL, SESSION) is None
+        assert get_measured_prefill("Qwen3-Next", SESSION) is None
+        assert get_measured_prefill(MODEL, "sess-other") is not None
+
+    def test_clear_without_a_session_forgets_every_session_for_the_model(self):
+        """``(model, None)``: the model-switch dimension.
+
+        A switch tears the model's slot pool down, so no session's measurement
+        for it may survive; measurements for other models are untouched.
+        """
+        set_measured_prefill(MODEL, SESSION, self._measurement(40_000))
+        set_measured_prefill(MODEL, "sess-other", self._measurement(30_000))
+        set_measured_prefill("Qwen3-Next", SESSION, self._measurement(20_000))
+
+        clear_measured_prefill(MODEL, None)
+
+        assert get_measured_prefill(MODEL, SESSION) is None
+        assert get_measured_prefill(MODEL, "sess-other") is None
+        assert get_measured_prefill("Qwen3-Next", SESSION) is not None
+
+    def test_switch_clear_keeps_only_the_target_models_names(self):
+        """The model-switch clear keeps the target names and drops the rest.
+
+        The store key is the name the dispatch used (the llama name in router
+        mode, the client-facing alias in single-model mode), so a switch keeps
+        both names of the target model and forgets every other key — including
+        the departing model's aliases, which cannot be enumerated because
+        aliases may be wildcards. Dropping is the safe direction: an admission
+        degrades to ``unavailable:no_prior_measurement`` instead of reporting a
+        stale ratio.
+        """
+        set_measured_prefill("code", SESSION, self._measurement(40_000))
+        set_measured_prefill("author", SESSION, self._measurement(35_000))
+        set_measured_prefill("gemma4", SESSION, self._measurement(20_000))
+        set_measured_prefill(MODEL, SESSION, self._measurement(30_000))
+
+        clear_measured_prefill_for_other_models("code", MODEL)
+
+        assert get_measured_prefill("code", SESSION) is not None
+        assert get_measured_prefill(MODEL, SESSION) is not None
+        assert get_measured_prefill("author", SESSION) is None
+        assert get_measured_prefill("gemma4", SESSION) is None
+
+    def test_switch_clear_without_a_target_name_is_a_no_op(self):
+        """No usable target name ⇒ no evidence of what to keep: keep it all."""
+        set_measured_prefill(MODEL, SESSION, self._measurement(40_000))
+
+        clear_measured_prefill_for_other_models(None, "")
+
+        assert get_measured_prefill(MODEL, SESSION) is not None
 
     def test_a_missing_measurement_is_not_stored(self):
         set_measured_prefill(MODEL, SESSION, None)  # type: ignore[arg-type]

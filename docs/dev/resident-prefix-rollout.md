@@ -91,11 +91,26 @@ measured reuse fell below `local_resident_prefix_min_ratio` is now denied with
 visible cold-prefill admission), not a regression.
 
 **Known limits.** A buffered (non-streaming) local dispatch carries no
-`prompt_progress` events, so it records no measurement; and a measurement
-survives until the sibling invalidation work (LP-0MVT2QFAP0082BKR) clears it on
-eviction / slot release / model switch — until then admission additionally
-requires live ownership, so a reclaimed slot's stale `total` cannot be reused
-as a ratio.
+`prompt_progress` events, so it records no measurement; and the stored
+measurement is only valid while its session still owns the slot it was
+captured against.
+
+**Invalidation (LP-0MVT2QFAP0082BKR).** The `(model, session)` entry is
+cleared wherever that ownership ends, so a stale `total` cannot be re-reported
+as a numeric reuse ratio:
+
+| Event | Where | Scope cleared |
+|---|---|---|
+| eviction (every reclaim reason) | `router_helpers._record_local_eviction` | all models for the session |
+| slot release / reassignment | `session._free_slot_assignment` | all models for the session |
+| model switch (and a crashed-backend restart) | `lifecycle.ensure_model_loaded` | everything except the target model's names; **all** entries on a restart |
+
+Clearing never raises and never changes a non-residency decision. Two
+backstops remain: admission still requires live slot ownership, and the store
+is keyed by `(model, session)` so a decision only ever reads the request's own
+model. After an invalidation the next decision for that session reports
+`measurement=unavailable:no_prior_measurement` instead of a ratio — the
+honest non-measurement, not a fabricated one.
 
 **Rollback.** `local_resident_prefix_min_ratio: 0` restores the predicted-ratio
 decision (the gate off, this rung never consulted);
