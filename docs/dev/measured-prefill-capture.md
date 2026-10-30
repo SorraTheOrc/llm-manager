@@ -176,8 +176,12 @@ python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
   --hours 24 --output-dir ~/proxy-usage-reports/measured-prefill-postdeploy --json
 
 # 3. reason counts: measured_cache_deficit vs the residual prefill_deadline
-grep -o 'reason=measured_cache_deficit' /var/log/llama-proxy/proxy.log | wc -l
-grep -o 'reason=prefill_deadline' /var/log/llama-proxy/proxy.log | wc -l
+#    (eviction records only: the same reason also appears on the
+#    measured_cache_abort and lease_released lines of the same event)
+grep 'local_eviction_after_acceptance' /var/log/llama-proxy/proxy.log \
+  | grep -o 'reason=measured_cache_deficit' | wc -l
+grep 'local_eviction_after_acceptance' /var/log/llama-proxy/proxy.log \
+  | grep -o 'reason=prefill_deadline' | wc -l
 ```
 
 Compare against the reference window's baseline: 120 deadline evictions
@@ -185,3 +189,60 @@ Compare against the reference window's baseline: 120 deadline evictions
 result is `measured_cache_deficit` replacing the fake-warm share of
 `prefill_deadline` while the large warm completions (≥ 20k, first byte < 10 s)
 hold their count.
+
+### Measured result — first post-deploy window
+
+Window `2026-10-29T14:08:10Z → 2026-10-30T14:08:10Z` (24 h), entirely after the
+post-F4 restart at `2026-10-29T00:10:19Z` (dev tip `52085f09`, which contains
+F4 `1908f431`). The first `prefill_progress_measured` line ever recorded is
+`2026-10-29T00:10:30Z`, and every log file covering earlier dates contains
+zero, so the restart — not the commit — is what started capture. Measured
+2026-10-30 (LP-0MVS03KCV005BTGE); the reference column is the same parser run
+over the 2026-10-26/27 baseline window, which reproduces the parent's figures
+exactly (114 evictions, 648,008 tokens, 252 large prefills, 177 < 10 s).
+
+| Metric (24 h) | Reference (pre-F4) | Post-deploy |
+|---|---|---|
+| `prefill_progress_measured` lines | 0 | 1,098 (345 distinct dispatches ≥ 20k) |
+| `reason=prefill_deadline` evictions (priced new tokens) | 114 (648,008) | 60 (292,466, **−54.9 %**) |
+| `reason=measured_cache_deficit` evictions | — | 248 (858,903 priced tokens released early) |
+| Measured-deficit `cache/total` (p50 / max) | — | 0.324 / 0.748 — no warm abort |
+| Early-release latency (p50 / p90 / max) | — | 3.8 s / 64.2 s / 118 s (51.6 % < 5 s) |
+| Large local attempts / completions (≥ 20k) | 334 / 252 | 381 / 170 |
+| Large warm completions (≥ 20k, first byte < 10 s) | 118 of 149 | 48 of 59 (81.4 % vs 79.2 %) |
+
+Reading it:
+
+- **The new reason replaces the fake-warm share of the deadline class.** The
+  baseline-comparable wasted-token metric (admission-priced `new_tokens` of
+  `prefill_deadline` evictions) falls 54.9 %. Counting the early releases'
+  partial prefill too (Σ `min(measured_deficit, elapsed × 43.1 tok/s)` =
+  208,470), all-in discarded prefill compute is 500,936 vs 648,008 (−22.7 %).
+  239 of the 248 releases needed more than the whole 120 s budget at the
+  43.1 tok/s prompt-eval p10, i.e. they were doomed to the deadline before F4.
+- **No warm dispatch is aborted.** The measured `cache/total` of every release
+  is ≤ 0.748 (the 0.25 deficit-ratio floor makes that structural); none is
+  near the ≥ 0.99 warm band. Warm large latencies are unchanged to better
+  (service p50 2.67 s → 3.13 s, p90 26.8 s → 15.0 s) and the share reaching a
+  first byte under 10 s is flat (79.2 % → 81.4 %).
+- **The absolute warm-large count falls for compositional reasons, not
+  regression.** The predicted-warm label is over-optimistic: measurement shows
+  only 88 of 345 large dispatches (25.5 %) are genuinely warm, while the
+  pre-F4 prediction labelled 149 of 252 completions (59 %) warm. Large local
+  attempts rose 334 → 381 (+14 %) on 34 % more local streams, and 211 of those
+  attempts were released early (144 measured deficit, 54 deadline, 12
+  `no_progress_watchdog`, 1 lease) versus 82 evictions before — so doomed
+  dispatches leave the completed population instead of being counted in it.
+- **The early abort is not always fast.** The tail is real: 26 of 248 releases
+  took ≥ 60 s because the *first* `prompt_progress` event itself arrives late
+  for very large prompts (that subset's prompt p50 is 67,849 tokens). It is
+  still a bounded improvement over the 120 s deadline, but the "seconds, not
+  120 s" claim only holds for the ~52 % of releases under 5 s.
+
+Other eviction reasons in the window: `no_progress_watchdog` 60 and
+`lease_evicted` 7. Reproduction: build the window with `zcat -f
+/var/log/llama-proxy/proxy.log* | awk '$0 >= "2026-10-29 14:08:10" && $0 <
+"2026-10-30 14:08:10"'`, then count eviction records (not raw reason
+occurrences, which triple-count each event) with `grep
+local_eviction_after_acceptance | grep -c 'reason=...'`; the
+CSV/report artefacts are in `~/proxy-usage-reports/measured-prefill-postdeploy/`.
