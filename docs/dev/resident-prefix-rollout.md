@@ -190,6 +190,77 @@ are not being captured (or are all non-streaming); `capture_disabled` means the
 rollback switch is off; `stale_view` means the `/slots` snapshot is not being
 refreshed; `no_slot` is genuine non-residency.
 
+## Re-arming the 24 h AC4 window (re-arm #3, LP-0MVT2QYXI0025U6C)
+
+The measurement gap is closed on `dev`, so the 24 h AC4 verification
+(`LP-0MVN44XB0009M33K`) is unblocked and enters **re-arm #3**. Its window is
+anchored to a **restart that loads the fix** — landing on `dev` does not start
+that clock, because a running uvicorn does not reload code (see *Staged
+rollout* above).
+
+| Slice | Work item | Commit on `dev` |
+|---|---|---|
+| Admission measurement rung + `measurement=` grammar | `LP-0MVT2PY3J00077W6`, `LP-0MVT2Q1SD009JLKD` | `0e270c1f`, `0ff1d7fe` |
+| Measurement invalidation (eviction / slot release / model switch) | `LP-0MVT2QFAP0082BKR` | `d463a35a` |
+| Usage-report measured/unmeasured breakdown | `LP-0MVT2QHMU0008F2V` | `2d91ab27` |
+| This document | `LP-0MVT2QW9P0054LX2` | `07d0ef40` |
+| Regression + grammar suites | `LP-0MVT2PB6U007PKD1`, `LP-0MVT2PF1C008LAPB` | `5b2d5fb5`, `77291663` |
+
+**Arming rule (authoritative).** The window starts at the **first whole minute
+after the arming restart** (so the restart line itself stays outside the
+window), runs exactly 24 h, and the run instant is the window end. A restart
+*inside* the window invalidates it and re-arms against the next restart — the
+same convention as re-arms #1 and #2 on `LP-0MVN44XB0009M33K`. Restart only
+through the start-proxy skill (`/skill/start-proxy --restart`); never by
+killing the proxy process, which also serves every other consumer.
+
+**Check 1 — is the fix loaded?** A process started before the last fix commit
+runs pre-fix code, and its decision lines carry **no** `measurement=` field at
+all (the additive field simply does not exist in that process):
+
+```bash
+ps -eo lstart= -p "$(pgrep -f 'uvicorn proxy.server:app' | head -1)"   # process start
+latest=$(git -C /home/rgardler/projects/llm log -1 --format=%cI origin/dev)
+# process start older than $latest  =>  restart required before arming
+grep -c 'measurement=' /tmp/proxy-startup.log   # 0 => pre-fix code is live
+```
+
+**Check 2 — the window is armed on fixed code.** After the restart, decisions
+must carry the new grammar and the deployed config must show the capture
+switch on:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/health        # 200
+grep -c 'residency_source=[a-z_]* measurement=' /tmp/proxy-startup.log        # > 0
+grep -n 'local_measured_cache_abort_enabled:' proxy/config.yaml               # true
+```
+
+**Expected measurement shape (what a healthy window looks like).**
+
+```bash
+grep -o 'residency_source=[a-z_]* measurement=[a-z:_]*' proxy.log | sort | uniq -c
+```
+
+- at least some resident decisions report `residency_source=measured_last_dispatch
+  measurement=measured` with a **non-zero numeric** `reuse_ratio` (not `none`,
+  and not a fabricated `0.0000`/`1.0000`);
+- the remaining unmeasured share is attributable — dominated by
+  `measurement=unavailable:no_prior_measurement` while capture ramps up, with
+  `unavailable:no_slot` for genuine non-residency, `unavailable:stale_view` if
+  the `/slots` snapshot stops refreshing, and `unavailable:capture_disabled` if
+  the rollback switch is off;
+- in the report, `residency_decisions` equals
+  `residency_measured_decisions` plus the sum of
+  `residency_unmeasured_reasons`, and a window whose measured count is **0**
+  is reported as an all-unmeasured finding rather than a silent zero.
+
+A decision count that is non-zero while the measured count stays at **0** means
+the rung is not reaching a captured dispatch — check that the workload is
+streaming (buffered dispatches carry no `prompt_progress`) and that
+`local_measured_cache_abort_enabled` is on. The soak itself, the verdict and
+the classifier rewrite stay with `LP-0MVN44XB0009M33K` and
+`LP-0MVQ4X1S30034BQ1`.
+
 ## Rollback
 
 Single knob, no restart needed for the *decision* (config reload picks it up):
