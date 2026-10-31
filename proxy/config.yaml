@@ -1994,7 +1994,13 @@ server:
   #     or the prompt over the local context limit derived from
   #     ``local_model_ctx_size``) is never deferred and never refused for local
   #     capacity: the local entry leaves the chain and a remote tier serves it.
-  #   remote-ok — removes the local provider from the chain.
+  #   remote-ok — local allowed, remote acceptable. The local route stays in
+  #     the chain and is attempted exactly as an absent header attempts it,
+  #     and a request that cannot be served locally RIGHT NOW steps straight
+  #     to the next provider: it never enters the contention queue, never
+  #     defers and never receives a local-capacity 429. The name is historic
+  #     (it once removed the local provider from the chain); no preference
+  #     value strips a local entry any more.
   # The legacy spelling ``local-only`` is a DEPRECATED alias: it is still
   # accepted and normalised to ``local-preferred`` at parse time (one
   # deprecation line per request), so an un-migrated client keeps pin-local

@@ -21,9 +21,10 @@ is one row of :data:`_EXIT_ROWS`, and every row asserts the same two outcomes:
 - ``prefer-local`` and an absent header ⇒ today's remote dispatch, with no
   refusal and no refusal body (AC3 byte-compatibility).
 
-The structural counter-case closes the loop: ``remote-ok`` still strips local
-entries from the chain, and an all-local chain under ``remote-ok`` still
-answers today's exhaustion response.
+The structural counter-case closes the loop: no preference strips local entries
+from the chain (LP-0MVUH9OYZ007GMWF AC1 — ``remote-ok`` means "local allowed,
+remote acceptable"), so a remote-less chain under ``remote-ok`` is served
+locally rather than answered with the exhaustion response.
 
 Rows are pinned, not the prose: nothing here asserts the human-readable
 ``error``/``detail`` text — the stable ``code``/header contract is what clients
@@ -1101,20 +1102,25 @@ async def test_prefer_local_keeps_todays_remote_fall_through(
 
 
 # ---------------------------------------------------------------------------
-# Regression: remote-ok is enforced structurally and stays as it is
+# Regression: no preference strips local entries (LP-0MVUH9OYZ007GMWF AC1)
 # ---------------------------------------------------------------------------
 
 
-def test_remote_ok_still_strips_local_entries():
-    """AC5: ``remote-ok`` removes local entries; the other two keep the chain."""
+def test_no_preference_strips_local_entries():
+    """AC1: only a capacity verdict strips; a preference value never does.
+
+    ``remote-ok`` used to remove every local entry, which is the opposite of
+    what the value means ("local allowed, remote acceptable"). Its name is
+    historic, so this row is what stops a future reader restoring the strip.
+    """
     chain = [
         {"name": LOCAL_PROVIDER_NAME, "type": "local", "llama_model": "Qwen3"},
         {"name": REMOTE_PROVIDER_NAME, "type": "remote",
          "endpoint": "https://api.example.com/v1"},
     ]
 
-    assert apply_local_preference(chain, REMOTE_OK) == [chain[1]], (
-        "remote-ok must strip every local entry from the chain"
+    assert apply_local_preference(chain, REMOTE_OK) == chain, (
+        "remote-ok must keep the local entry in the chain"
     )
     assert apply_local_preference(chain, PREFER_LOCAL) == chain, (
         "prefer-local keeps the chain intact (its fall-through is the contract)"
@@ -1125,11 +1131,12 @@ def test_remote_ok_still_strips_local_entries():
 
 
 @pytest.mark.asyncio
-async def test_remote_ok_with_no_remote_entry_returns_todays_exhaustion():
-    """AC5: an all-local chain under ``remote-ok`` exhausts, it does not refuse.
+async def test_remote_ok_with_no_remote_entry_serves_locally():
+    """AC1/AC3: an all-local chain under ``remote-ok`` is served locally.
 
-    ``remote-ok`` is filtered structurally (never a 429 refusal): the chain
-    becomes genuinely empty and the pre-existing exhaustion path answers.
+    A preference may never empty a chain: filtering the only local entry out
+    would manufacture an empty chain and answer "all providers exhausted" to a
+    model that can serve the request perfectly well locally.
     """
     calls: list[str] = []
 
@@ -1160,11 +1167,15 @@ async def test_remote_ok_with_no_remote_entry_returns_todays_exhaustion():
             {"provider_cooldown_seconds": 60, "server": {"session_slot_pool_size": 1}},
         )
 
-    assert calls == [], "remote-ok: the local route is never attempted"
-    assert result.status_code == 503, (
-        f"an empty chain exhausts as today, got {result.status_code}"
+    assert calls == ["local"], (
+        f"remote-ok: the local route serves a remote-less chain, got {calls}"
     )
-    assert json.loads(result.body).get("code") == provider.EXHAUSTION_CODE_ALL
+    assert result.status_code == 200, (
+        f"an empty chain must never be manufactured from a preference, got "
+        f"{result.status_code}"
+    )
+    assert result.headers.get("X-Local-Route") == "local"
+    assert json.loads(result.body).get("code") != provider.EXHAUSTION_CODE_ALL
 
 
 # ---------------------------------------------------------------------------
@@ -1720,13 +1731,11 @@ _BEHAVIOUR_MATRIX = (
     ),
     pytest.param(
         _BehaviourMatrixRow(
-            behaviour="remote-ok-free-slot-strips-local",
+            behaviour="remote-ok-free-slot-serves-local",
             preference=REMOTE_OK,
-            expected_route="remote",
-            expected_provider=REMOTE_PROVIDER_NAME,
-            expected_dispatches=("remote",),
+            expected_dispatches=("local",),
         ),
-        id="remote-ok-free-slot-strips-local",
+        id="remote-ok-free-slot-serves-local",
     ),
     pytest.param(
         _BehaviourMatrixRow(
@@ -1932,7 +1941,7 @@ def test_behaviour_matrix_covers_every_documented_behaviour():
         "prefer-local-free-slot-serves-local",
         "absent-free-slot-serves-local",
         "prefer-local-busy-deferrable-falls-through-remote",
-        "remote-ok-free-slot-strips-local",
+        "remote-ok-free-slot-serves-local",
         "local-preferred-free-slot-serves-local",
         "local-preferred-busy-deferrable-refuses",
         "local-preferred-busy-too-large-promotes-remote",

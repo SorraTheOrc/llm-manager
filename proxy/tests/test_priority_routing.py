@@ -450,9 +450,9 @@ class TestCompactionGatePriority:
 # ---------------------------------------------------------------------------
 # Verdict-aware chain filter (LP-0MVSM06LB001PRU4 AC4)
 #
-# The chain filter serves two stripping reasons — ``remote-ok`` by preference
-# and ``too_large`` by capacity — through ONE comprehension. These unit tests
-# pin the filter contract itself; the dispatch-cycle behaviour is asserted in
+# The chain filter has exactly ONE stripping reason — ``too_large`` by capacity
+# — and no preference strips (LP-0MVUH9OYZ007GMWF AC1). These unit tests pin
+# the filter contract itself; the dispatch-cycle behaviour is asserted in
 # ``test_local_only_refusal_matrix.py``.
 # ---------------------------------------------------------------------------
 
@@ -464,20 +464,28 @@ class TestVerdictAwareChainFilter:
         {"name": "remote-b", "type": "remote", "endpoint": "https://b.example"},
     ]
 
-    def test_too_large_strips_local_exactly_like_remote_ok(self):
-        """AC4: same input ⇒ the two stripping reasons produce one chain."""
+    def test_too_large_strips_the_local_entry(self):
+        """AC4: the capacity verdict is the one and only strip."""
         capacity = prio.apply_local_preference(
             self.CHAIN,
             admission_reserve.PREF_LOCAL_PREFERRED,
             verdict=admission_reserve.CAPACITY_TOO_LARGE,
         )
-        preference = prio.apply_local_preference(
-            self.CHAIN, admission_reserve.PREF_REMOTE_OK
-        )
-        assert capacity == preference, (
-            "the verdict strip must reuse the remote-ok filter, not re-derive it"
-        )
         assert [entry["name"] for entry in capacity] == ["remote-a", "remote-b"]
+
+    def test_no_preference_strips_the_local_entry(self):
+        """AC1: no preference removes a local entry — ``remote-ok`` included.
+
+        ``remote-ok`` means "local allowed, remote acceptable"; a preference
+        strip used to remove every local entry, which is the opposite of the
+        value's documented meaning.
+        """
+        for preference in admission_reserve.VALID_PREFERENCES:
+            filtered = prio.apply_local_preference(self.CHAIN, preference)
+            assert filtered is self.CHAIN, (
+                f"{preference}: no preference may strip the local entry, got "
+                f"{filtered}"
+            )
 
     def test_a_deferrable_verdict_keeps_the_chain_intact(self):
         """A fits-local request is never promoted: waiting can still help."""
@@ -516,13 +524,3 @@ class TestVerdictAwareChainFilter:
             )
             is remote_less
         ), "capacity stripping must never manufacture an empty chain"
-
-    def test_remote_ok_still_filters_a_remote_less_chain_to_empty(self):
-        """``remote-ok`` emptiness is the client's intent, not a strip artefact."""
-        remote_less = [self.CHAIN[0]]
-        assert (
-            prio.apply_local_preference(
-                remote_less, admission_reserve.PREF_REMOTE_OK
-            )
-            == []
-        )

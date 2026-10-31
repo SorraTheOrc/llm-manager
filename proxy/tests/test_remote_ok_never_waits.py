@@ -24,18 +24,19 @@ consulted rather than skipped by a preference filter.
 Red phase
 ---------
 
-The ``xfail(strict=True)`` specs are red today (the strip is still there) and
-are turned green by LP-0MVUH9OYZ007GMWF, *before* the default inversion lands
-so the suite never sees a headerless caller on the new semantics. The unmarked
-specs are guards: the ``private`` model's absent-header behaviour, the two live
-values' byte-compatibility and the local-down fall-through hold today and must
-keep holding.
+This module was written red-first by LP-0MVUH9OMY004MQ3U and is turned green by
+LP-0MVUH9OYZ007GMWF, *before* the default inversion lands so the suite never
+sees a headerless caller on the new semantics. The unmarked specs are guards:
+the ``private`` model's absent-header behaviour, the two live values'
+byte-compatibility and the local-down fall-through held before the change and
+must keep holding.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
+from unittest.mock import patch
 
 import local_preference_v2_support as support
 import proxy.provider as provider
@@ -43,7 +44,7 @@ import pytest
 from fastapi import Response
 from local_preference_v2_support import LOCAL_PREFERRED, REMOTE_OK
 
-from proxy import priority
+from proxy import contention_queue, priority
 
 #: A free local slot: the row that proves ``remote-ok`` *attempts* local.
 _HEALTHY_ROW = support.matrix._HEALTHY_ROW
@@ -103,6 +104,16 @@ REMOTE_OK_EXIT_ROWS: tuple[RemoteOkExitRow, ...] = (
         row=support.matrix._row("queue_depth_cap"),
     ),
     RemoteOkExitRow(
+        # The same saturated-slot cause in its strongest form: this row's queue
+        # *would* admit (depth available, a 1 s clamped budget), so the path is
+        # genuinely exercised — that the wait really is zero is asserted by
+        # ``test_remote_ok_never_enters_the_contention_queue``, which spies on
+        # the queue itself (``queue_wait_of`` can only observe a wait that ended
+        # in a local dispatch, so it cannot prove the queue was never entered).
+        cause="slot saturated, queue depth available (a wait would be spent)",
+        row=support.matrix._row("queue_wait_expiry"),
+    ),
+    RemoteOkExitRow(
         cause="prefill-ETA over the wait budget",
         row=support.matrix._row("admission_guard_free_slot"),
     ),
@@ -127,6 +138,31 @@ REMOTE_OK_EXIT_ROWS: tuple[RemoteOkExitRow, ...] = (
 
 REMOTE_OK_EXIT_IDS = [row.row.trigger for row in REMOTE_OK_EXIT_ROWS]
 
+#: The local-exit tokens a ``remote-ok`` fall-through may stamp. Membership is
+#: the assertion that the local route was **consulted**: a preference-stripped
+#: chain can only ever report ``no_local_provider``, which is deliberately
+#: absent here. Each token names the exit that was taken instead of a local
+#: dispatch, and every one is documented in ``proxy/docs/routing.md``.
+REMOTE_OK_EXIT_TOKENS = frozenset(
+    {
+        # Local slots saturated and the queue declined (the ``fallback_policy``
+        # outcome this preference always takes instead of queueing).
+        "local_concurrency_limit",
+        # Prefill-ETA admission guard on the direct free-slot path.
+        "local_admission_guard",
+        # Chain resolution: the local entry is cooling down.
+        "local_provider_cooldown",
+        # Residency ladder found too little reusable prefix.
+        "resident_prefix_insufficient",
+        # Post-deadline prefill-thrash cooldown.
+        "prefill_thrash_cooldown",
+        # Capacity strip: the prompt outgrows the local serving envelope.
+        "context_too_large",
+        # Dispatch lease held by another session.
+        "local_lease_active",
+    }
+)
+
 
 @pytest.fixture(autouse=True)
 def _clean_state():
@@ -141,13 +177,6 @@ def _clean_state():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9OYZ007GMWF: remote-ok still strips the local entry, so a "
-        "free local slot is never used"
-    ),
-)
 async def test_remote_ok_serves_locally_when_a_slot_is_free():
     """The value means "local allowed": a free slot is served locally.
 
@@ -172,21 +201,11 @@ async def test_remote_ok_serves_locally_when_a_slot_is_free():
     )
 
 
-#: Red-first rows for the chain filter: ``remote-ok`` still strips today, the
-#: other live value does not. The split is per-parameter so the guard half
-#: cannot silently xfail along with the red half.
+#: The chain-filter rows: **no** live preference strips today, and none may
+#: start doing so. One row per live value, so a regression that re-introduces a
+#: preference strip for either value fails on its own row.
 _STRIP_ROWS = (
-    pytest.param(
-        REMOTE_OK,
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason=(
-                "LP-0MVUH9OYZ007GMWF: apply_local_preference still strips local "
-                "entries for PREF_REMOTE_OK"
-            ),
-        ),
-        id=REMOTE_OK,
-    ),
+    pytest.param(REMOTE_OK, id=REMOTE_OK),
     pytest.param(LOCAL_PREFERRED, id=LOCAL_PREFERRED),
 )
 
@@ -220,13 +239,6 @@ def test_no_live_preference_strips_the_local_route(preference: str):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9OYZ007GMWF: effective_chain_for_request() still applies the "
-        "remote-ok strip"
-    ),
-)
 def test_effective_chain_keeps_the_local_entry_for_remote_ok():
     """The convenience used by both dispatch cycles keeps the local route."""
     request = support.build_request(preference=REMOTE_OK)
@@ -250,32 +262,24 @@ def test_effective_chain_keeps_the_local_entry_for_remote_ok():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9OYZ007GMWF: remote-ok never consults the local route, so no "
-        "exit is taken and no canonical fall-through reason is recorded"
-    ),
-)
 @pytest.mark.parametrize("exit_row", REMOTE_OK_EXIT_ROWS, ids=REMOTE_OK_EXIT_IDS)
 async def test_remote_ok_steps_to_the_next_provider_without_waiting(
     exit_row: RemoteOkExitRow,
 ):
     """One row per exit: served remotely, zero queue wait, no deferral.
 
-    *calls* distinguishes the pre-dispatch exits (one remote dispatch) from the
-    post-dispatch lease exit (the doomed local attempt is expected, exactly as
-    the refusal matrix models it). The recorded fall-through reason is the
-    proof that the local route was *consulted*: a preference-stripped chain
-    would report ``no_local_provider`` because no exit was ever taken.
+    *calls* proves the exit was really taken: the pre-dispatch exits dispatch
+    the remote entry once and nothing else, while the post-dispatch lease exit
+    has already spent a doomed local attempt (the same one the refusal matrix
+    models) before stepping over. Either way exactly **one** remote dispatch
+    serves the request. The recorded fall-through reason is the other proof
+    that the local route was *consulted*: a preference-stripped chain would
+    report ``no_local_provider`` because no exit was ever taken.
     """
     row = exit_row.row
     result, calls, request = await support.issue(row, preference=REMOTE_OK)
     context = f"remote-ok / {exit_row.cause}"
 
-    expected_calls = ["local", "remote"] if row.local_response is not None else [
-        "remote"
-    ]
     assert result.status_code == 200, (
         f"{context}: the request must be served by the next provider, got "
         f"{result.status_code}"
@@ -284,21 +288,30 @@ async def test_remote_ok_steps_to_the_next_provider_without_waiting(
         f"{context}: X-Local-Route must be 'remote', got "
         f"{support.route_of(result)!r}"
     )
-    assert calls == expected_calls, (
-        f"{context}: expected exactly one upstream dispatch beyond any doomed "
-        f"local attempt ({expected_calls}), got {calls}"
+    assert calls.count("remote") == 1 and calls[-1] == "remote", (
+        f"{context}: exactly one upstream dispatch to the remote entry serves "
+        f"the request, got {calls}"
     )
+    if row.local_response is None:
+        assert calls == ["remote"], (
+            f"{context}: a pre-dispatch exit never reaches the local stub, "
+            f"got {calls}"
+        )
     assert support.queue_wait_of(request) == 0.0, (
         f"{context}: a remote-ok request never waits for a local slot "
         f"(waited {support.queue_wait_of(request)}s)"
     )
 
     reason = support.fallback_reason_of(result)
-    support.assert_canonical_fallback_reason(reason, context=context)
+    assert reason, f"{context}: a remote fall-through must stamp a reason token"
     assert reason != support.NO_LOCAL_PROVIDER, (
         f"{context}: the local route was skipped by the preference instead of "
         "being consulted — a preference-based strip is exactly what AC15 "
         f"removes (reason={reason!r})"
+    )
+    assert reason in REMOTE_OK_EXIT_TOKENS, (
+        f"{context}: reason={reason!r} is not one of the documented local-exit "
+        f"tokens a remote-ok fall-through may stamp ({sorted(REMOTE_OK_EXIT_TOKENS)})"
     )
 
 
@@ -329,13 +342,6 @@ async def test_private_model_with_absent_header_is_served_locally():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9OYZ007GMWF: an explicit remote-ok on a remote-less chain is "
-        "stripped to an empty chain and answered with exhaustion"
-    ),
-)
 async def test_private_model_with_explicit_remote_ok_is_served_locally():
     """A remote-less chain is never emptied by a preference (parent AC16).
 
@@ -372,3 +378,65 @@ async def test_remote_ok_uses_the_remote_entry_when_the_chain_has_no_local_route
     assert calls == ["remote"], f"the only entry must serve, got {calls}"
     assert support.route_of(result) == "remote"
     assert support.queue_wait_of(request) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_remote_less_chain_is_not_emptied_on_the_remote_only_cycle():
+    """The second dispatch cycle has no ``remote-ok`` empty-chain branch (AC3).
+
+    Both cycles used to carry an ``elif _preference == PREF_REMOTE_OK: …
+    providers: []`` branch that made an emptied chain deliberate. Removing the
+    preference strip makes those branches dead, and this row is the behavioural
+    form of "gone": a remote-less chain under an explicit ``remote-ok`` is
+    still served instead of collapsing into chain exhaustion.
+    """
+    result, _calls, _request = await support.issue(
+        _HEALTHY_ROW,
+        preference=REMOTE_OK,
+        model_config=support.private_model_config(),
+        entry_point="remote_only",
+    )
+
+    assert result.status_code == 200, (
+        "a remote-ok request on a remote-less chain must still be served on "
+        f"the remote-only cycle, got {result.status_code}"
+    )
+    body = support.body_of(result)
+    assert body.get("code") != provider.EXHAUSTION_CODE_ALL, (
+        "no preference may empty a chain — the empty-chain branch that made "
+        f"this deliberate is gone (body code={body.get('code')!r})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_ok_never_enters_the_contention_queue():
+    """The queue is never entered — not merely "the wait is short" (AC4).
+
+    ``queue_wait_of`` can only observe a wait that ended in a local dispatch,
+    so a fall-through row reports ``0`` for *every* preference and cannot prove
+    the queue was skipped. This row spies on the queue's own entry point
+    instead, and re-issues the identical request with ``local-preferred`` to
+    prove the spy is live (that client really does queue).
+    """
+    waits: list[float] = []
+    real_wait = contention_queue.wait_for_local_slot
+
+    async def _spy(**kwargs):
+        waits.append(float(kwargs.get("max_wait_seconds") or 0.0))
+        return await real_wait(**kwargs)
+
+    row = support.matrix._row("queue_wait_expiry")
+    with patch.object(contention_queue, "wait_for_local_slot", _spy):
+        result, calls, _request = await support.issue(row, preference=REMOTE_OK)
+        assert waits == [], (
+            "a remote-ok request must never enter the contention queue "
+            f"(queued {len(waits)} time(s))"
+        )
+        assert result.status_code == 200 and calls == ["remote"]
+
+        # Liveness: the same row *does* queue for the pin-local value, so the
+        # empty ``waits`` above is the policy, not a broken spy.
+        support.reset_state()
+        await support.issue(row, preference=LOCAL_PREFERRED)
+
+    assert waits, "the spy must observe the pin-local client's queue entry"

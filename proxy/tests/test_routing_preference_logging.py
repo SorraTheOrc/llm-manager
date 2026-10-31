@@ -16,8 +16,9 @@ Two properties are pinned here:
    (LP-0MVTF2WLQ008BNYK), and the remaining chain-resolution skips — same
    failure domain, same usage-limit account and proactive quota state
    (LP-0MVTI957W006KS0P). The last three are also pinned directly against
-   ``_resolve_provider_with_exclusions`` so all three parsed values (including
-   ``remote-ok``, whose local route never reaches a dispatch loop) are covered.
+   ``_resolve_provider_with_exclusions`` so every parsed value (``remote-ok``
+   included — it keeps the local route, so it reaches these lines like any
+   other value) is covered.
 2. **Attribution** (parent AC5): ``priority_routing`` on **both** dispatch
    cycles carries the request's session id, so a preference can be tied to a
    specific request without correlation heuristics.
@@ -122,6 +123,7 @@ _PARSED_PREFERENCE = {
     LOCAL_ONLY: LOCAL_PREFERRED,
     LOCAL_PREFERRED: LOCAL_PREFERRED,
     PREFER_LOCAL: PREFER_LOCAL,
+    REMOTE_OK: REMOTE_OK,
     None: DEFAULT_PREFERENCE,
 }
 
@@ -207,6 +209,13 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
         prefix="contention_queue_fallback_after_queue",
         existing_keys=("provider", "session", "queued_duration"),
         description="contention-queue depth cap reached (never queued)",
+        # Only the preferences that can enter the queue. ``remote-ok`` never
+        # queues (LP-0MVUH9OYZ007GMWF AC4), so the same saturated-slot exit is
+        # named ``local_concurrency_limit`` on the generic fallback line and on
+        # ``local_preference_resolved`` instead — asserted by
+        # ``test_remote_ok_never_waits.py``, which pins that exit's route,
+        # zero queue wait and reason per local-exit cause.
+        preferences=(LOCAL_ONLY, LOCAL_PREFERRED, PREFER_LOCAL, None),
     ),
     _NotLocalLineRow(
         trigger="admission_guard_free_slot",
@@ -292,8 +301,7 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
 #: The chain-resolution skip rows that the dispatch loops can reach only in
 #: narrow circumstances (a second local entry, a 429 account event, a polled
 #: quota snapshot) — pinned directly against the resolver, which is where the
-#: lines are emitted. ``remote-ok`` is included here: it strips the local route
-#: before dispatch, so no end-to-end row can reach these lines with that value.
+#: lines are emitted.
 _CHAIN_SKIP_ROWS: tuple[_NotLocalLineRow, ...] = (
     _NotLocalLineRow(
         trigger="failure_domain",
@@ -334,9 +342,9 @@ _PRIORITY_ROUTING_CYCLES = (
 def _preference_params() -> list:
     """``X-Local-Preference`` cases: each accepted wire value plus no header.
 
-    ``remote-ok`` is excluded by design — see the module docstring: it strips
-    the local route before dispatch, so a local-route exit line cannot fire for
-    it. Its value coverage lives on ``priority_routing`` instead. The legacy
+    ``remote-ok`` is included: it keeps the local route and is attempted exactly
+    as an absent header is (LP-0MVUH9OYZ007GMWF AC1), so it takes the same
+    local-route exits and must name them on the same lines. The legacy
     ``local-only`` case is kept deliberately: it is the deployed wire value and
     must take exactly the same exits as the canonical ``local-preferred``.
     """
@@ -344,6 +352,7 @@ def _preference_params() -> list:
         (LOCAL_ONLY, "local-only-legacy-alias"),
         (LOCAL_PREFERRED, "local-preferred"),
         (PREFER_LOCAL, "prefer-local"),
+        (REMOTE_OK, "remote-ok"),
         (None, "absent-header"),
     )
     return [pytest.param(value, id=cid) for value, cid in cases]
@@ -1146,17 +1155,20 @@ async def test_absent_header_logs_the_default_preference(caplog):
 
 
 # ---------------------------------------------------------------------------
-# Three-value coverage: remote-ok is visible on priority_routing only
+# Three-value coverage: remote-ok is visible on priority_routing
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_remote_ok_preference_is_logged_and_takes_no_local_exit(caplog):
-    """``remote-ok`` is loggable, but it never decides "not local".
+async def test_remote_ok_preference_is_logged_and_enters_the_local_route(caplog):
+    """``remote-ok`` is loggable *and* consults the local route.
 
-    ``apply_local_preference()`` strips local from the chain before dispatch, so
-    there is no local-route exit to log. The preference must still be visible —
-    on ``priority_routing`` — and no "not local" line may claim otherwise.
+    The value means "local allowed, remote acceptable" (LP-0MVUH9OYZ007GMWF
+    AC1), so no chain filter removes the local entry: the router evaluates it
+    exactly as it does for an absent header, and its own decision line for the
+    local entry therefore appears. The preference must stay visible on
+    ``priority_routing`` (and on the router's line) so a request is still
+    attributable to the intent it declared.
     """
     line = await _issue_priority_routing("local_remote", REMOTE_OK, caplog)
     kv = _parse_kv(line)
@@ -1166,10 +1178,10 @@ async def test_remote_ok_preference_is_logged_and_takes_no_local_exit(caplog):
     )
 
     messages = _messages(caplog)
-    emitted = [row.trigger for row in _NOT_LOCAL_LINE_ROWS if _find_line(messages, row)]
-    assert emitted == [], (
-        "a remote-ok request never enters the local route, so no not-local "
-        f"decision line can exist; got {emitted}. Lines:\n" + "\n".join(messages)
+    local_line = _assert_line_present(messages, _row("clean"))
+    assert f"preference={REMOTE_OK}" in local_line, (
+        "the local route's own decision line must name the parsed preference; "
+        f"Line: {local_line!r}"
     )
 
 
@@ -1918,8 +1930,8 @@ async def test_remote_only_cycle_refuses_a_pin_local_client_before_the_ceiling(c
     A pin-local client on a chain with no local entry has nothing to pin to, so
     the choke point refuses it (429, ``X-Local-Route: refused``) before the
     per-entry ceiling is consulted. No ``routing_skip_provider_context`` line is
-    emitted, exactly as for the ``remote-ok`` strip: the line reports entries the
-    request actually walked past.
+    emitted: the line reports entries the request actually walked past, and a
+    refused request walks past none.
     """
     result = await _issue_remote_only(LOCAL_PREFERRED)
 

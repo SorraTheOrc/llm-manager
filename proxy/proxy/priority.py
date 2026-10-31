@@ -385,11 +385,19 @@ def provider_chain_for_priority(
 
 
 def local_preference_for_request(request) -> str:
-    """Return the request's ``X-Local-Preference`` (default ``prefer-local``).
+    """Return the request's resolved ``X-Local-Preference`` value.
 
-    LP-0MVIKPCSG002B0NL: the header is additive — missing or unknown values
-    keep today's behaviour (AC8). The parsed value is cached on the request so
-    every routing decision in the same request agrees.
+    LP-0MVIKPCSG002B0NL: the header is additive — a missing or unknown value
+    resolves to ``admission_reserve.DEFAULT_PREFERENCE`` rather than being
+    rejected (AC8). The parsed value is cached on the request so every routing
+    decision in the same request agrees.
+
+    The resolved value selects *pinning*, never *stripping*
+    (LP-0MVUH9OYZ007GMWF AC1): ``local-preferred`` pins a deferrable request to
+    the local route, and every other live value — including ``remote-ok`` —
+    lets the request fall through to the next provider. ``remote-ok`` is a
+    historic name: it means *"local allowed, remote acceptable"*, not
+    *"remote only"*.
     """
     cached = getattr(request, "_local_preference", None)
     if cached:
@@ -413,42 +421,46 @@ def local_preference_for_request(request) -> str:
 def apply_local_preference(
     chain: list[dict], preference: str, verdict: str | None = None
 ) -> list[dict]:
-    """Filter *chain* by the client's preference **and** the capacity verdict.
+    """Filter *chain* by the request's **capacity verdict**.
 
     This is the single chain filter: exactly one comprehension removes
-    ``type: local`` entries, and it serves both stripping reasons
+    ``type: local`` entries, and there is exactly one stripping reason
     (LP-0MVSM06LB001PRU4 AC4).
 
-    * **``remote-ok`` (by preference).** The client asked for no local route,
-      so every ``type: local`` entry is removed (LP-0MVIKPCSG002B0NL AC5).
-      ``local-preferred`` (and its normalised legacy alias ``local-only``) and
-      ``prefer-local`` keep the chain intact *here*: their difference is
-      enforced at the admission decision — a pinned, ``deferrable``
-      ``local-preferred`` request is answered with the retryable 429 instead of
-      falling through to a remote provider (LP-0MVSHXTLS000VMLE), and a
-      ``too_large`` one is stripped by the capacity rule below.
     * **``too_large`` (by capacity).** A verdict of
       :data:`proxy.admission_reserve.CAPACITY_TOO_LARGE` means the prompt
       outgrows the local serving envelope, so waiting cannot help: the local
-      entry is removed — exactly as ``remote-ok`` removes it — and the remote
-      tiers serve the request with no local attempt, no queueing and no local
-      capacity 429 (parent AC4). Any other verdict (``deferrable``, ``None``)
-      leaves the chain untouched: a fits-local request is never promoted to a
-      paid provider.
+      entry is removed and the remote tiers serve the request with no local
+      attempt, no queueing and no local capacity 429 (parent AC4). Any other
+      verdict (``deferrable``, ``None``) leaves the chain untouched: a
+      fits-local request is never promoted to a paid provider.
+    * **No preference strips** (LP-0MVUH9OYZ007GMWF AC1). ``remote-ok`` keeps
+      the local entry: the value means *"local allowed, remote acceptable"*,
+      not *"remote only"*, and the historic name records the opposite of the
+      shipped behaviour — a preference strip used to remove every local entry
+      here. Do not restore one: a preference may never empty a chain (parent
+      AC16), and the local route must be attempted exactly as a headerless
+      request attempts it. The difference between the live values is enforced
+      at the admission decision instead: a pinned, ``deferrable``
+      ``local-preferred`` request is answered with the retryable 429 rather
+      than falling through to a remote provider (LP-0MVSHXTLS000VMLE), and a
+      ``remote-ok`` request that cannot be served locally *right now* steps to
+      the next provider without queueing (parent AC20).
 
     Remote-less carve-out: capacity stripping never *manufactures* an empty
     chain. When every entry is ``type: local`` (a ``private`` model) the chain
     is returned intact, so its existing local attempt / deferral / refusal
     behaviour applies and the exhaustion path is never reached through this
-    filter (parent assumption A5). ``remote-ok`` keeps its existing behaviour
-    of filtering to an empty chain — that emptiness is the client's intent,
-    not an artefact of stripping.
+    filter (parent assumption A5/A6).
 
     Args:
         chain: The priority-selected provider chain.
-        preference: The resolved ``X-Local-Preference`` value.
+        preference: The resolved ``X-Local-Preference`` value. Retained so the
+            filter stays the single chain-filtering entry point for every
+            caller and its routing decision remains attributable to the
+            parsed intent; it no longer selects a strip.
         verdict: The request's capacity verdict, when one has been computed.
-            ``None`` keeps the preference-only behaviour of
+            ``None`` keeps the verdict-free behaviour of
             :func:`effective_chain_for_request` (the verdict needs the routing
             estimate, which only the dispatch cycle can produce).
 
@@ -456,18 +468,16 @@ def apply_local_preference(
         The (possibly filtered) chain. An unchanged chain is returned as the
         *same list object*, so a caller can detect "nothing stripped".
     """
-    from proxy.admission_reserve import CAPACITY_TOO_LARGE, PREF_REMOTE_OK
+    from proxy.admission_reserve import CAPACITY_TOO_LARGE
 
-    strip_by_preference = preference == PREF_REMOTE_OK
-    strip_by_capacity = verdict == CAPACITY_TOO_LARGE
-    if not (strip_by_preference or strip_by_capacity):
+    if verdict != CAPACITY_TOO_LARGE:
         return chain
     filtered = [
         entry
         for entry in chain
         if not (isinstance(entry, dict) and entry.get("type") == "local")
     ]
-    if strip_by_capacity and not strip_by_preference and not filtered:
+    if not filtered:
         # Remote-less chain: stripping would leave nothing to serve the
         # request, so keep the local route and its existing exit behaviour.
         return chain
@@ -481,9 +491,10 @@ def effective_chain_for_request(
 
     Convenience used by the dispatch cycles: computes the effective priority
     (cheap-window capped), stamps it on the request, and returns the
-    priority-selected provider chain. The client's ``X-Local-Preference`` is
-    applied last so ``remote-ok`` never attempts the local route
-    (LP-0MVIKPCSG002B0NL AC5).
+    priority-selected provider chain. The chain filter is applied last, and it
+    strips only for capacity: **no** ``X-Local-Preference`` value removes a
+    local entry (LP-0MVUH9OYZ007GMWF AC1), so a ``remote-ok`` request sees the
+    same chain a headerless request sees.
 
     No capacity verdict is applied here: classifying a request as
     ``too_large`` needs the routing estimate, which is built after this call.

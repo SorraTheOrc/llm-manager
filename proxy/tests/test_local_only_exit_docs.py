@@ -197,7 +197,13 @@ def test_no_local_route_is_documented_as_a_refusal_not_a_fall_through():
 
 
 def test_response_headers_section_keeps_the_other_two_preferences_accurate():
-    """prefer-local unchanged / remote-ok structural, per the X-Local-Route docs."""
+    """prefer-local unchanged / no preference strips, per the X-Local-Route docs.
+
+    The section must state that ``prefer-local`` falls through exactly as
+    before **and** that the only chain-level strip is the capacity filter — a
+    ``remote-ok`` request keeps the local route (LP-0MVUH9OYZ007GMWF AC1/AC5),
+    so a sentence claiming the preference removes local entries fails here.
+    """
     text = ROUTING_DOC.read_text()
 
     headers = text[text.index("### Response headers") :]
@@ -208,9 +214,13 @@ def test_response_headers_section_keeps_the_other_two_preferences_accurate():
         "the response-header section must state that prefer-local falls through "
         "exactly as before"
     )
-    assert "removed from the chain *before* dispatch" in plain, (
-        "the response-header section must state that remote-ok strips local "
-        "structurally"
+    assert "The only chain-level strip that exists is the capacity filter" in plain, (
+        "the response-header section must re-anchor stripping on the capacity "
+        "verdict — no preference removes a local entry"
+    )
+    assert "so a `remote-ok` request reaches a local-route exit exactly like an " in plain, (
+        "the response-header section must state that remote-ok keeps the local "
+        "route (its name is historic)"
     )
 
 

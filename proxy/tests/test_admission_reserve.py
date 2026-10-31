@@ -14,7 +14,8 @@ Covers:
   ticket.
 - AC4: ``X-Local-Preference: local-only`` turns a would-be remote fallback
   into the retryable 429, even while remote providers are available.
-- AC5: ``remote-ok`` never attempts the local route.
+- AC5: ``remote-ok`` keeps the local route ("local allowed, remote
+  acceptable") and never waits for it.
 - AC6: route headers ``X-Local-Route: local|remote|refused`` and
   ``X-Local-Fallback-Reason``.
 - AC7: the reserve verdict and the admission-guard verdict are computed by the
@@ -806,11 +807,16 @@ async def test_prefer_local_still_falls_back_remote_when_refused(caplog):
 
 
 # ---------------------------------------------------------------------------
-# AC5 — remote-ok never attempts the local route
+# AC5 — remote-ok keeps the local route and never waits for it
+#
+# LP-0MVUH9OYZ007GMWF AC1: the value's name is historic. It used to strip every
+# local entry from the chain; it now means "local allowed, remote acceptable",
+# so a free local slot is used and a busy one falls through without queueing.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_remote_ok_never_attempts_local(caplog):
+async def test_remote_ok_attempts_the_local_route_when_a_slot_is_free(caplog):
+    """AC5/AC1: a free local slot is served locally under ``remote-ok``."""
     _seed_calibration()
     calls: list[str] = []
 
@@ -818,7 +824,7 @@ async def test_remote_ok_never_attempts_local(caplog):
         calls.append("local")
         return _ok_response()
 
-    async def _remote(_req, _path, _pc):
+    async def _remote(_req, _path, _pc):  # pragma: no cover - must never run
         calls.append("remote")
         return _ok_response()
 
@@ -842,15 +848,19 @@ async def test_remote_ok_never_attempts_local(caplog):
             request, "v1/chat/completions", config, _cfg()
         )
 
-    assert calls == ["remote"]
-    assert "local" not in calls
+    assert calls == ["local"], (
+        f"remote-ok must attempt the local route (parent AC15); got {calls}"
+    )
     assert result.status_code == 200
-    assert result.headers.get("X-Local-Route") == "remote"
+    assert result.headers.get("X-Local-Route") == "local"
+    assert "X-Local-Fallback-Reason" not in result.headers, (
+        "a locally served request has nothing to fall through to"
+    )
 
 
 @pytest.mark.asyncio
-async def test_remote_ok_with_local_only_chain_never_calls_local(caplog):
-    """AC5: even a local-only chain is not attempted under remote-ok."""
+async def test_remote_ok_on_a_remote_less_chain_is_served_locally(caplog):
+    """AC5/AC3: a remote-less chain is never emptied by a preference."""
     calls: list[str] = []
 
     async def _local(_req, _path):
@@ -875,9 +885,14 @@ async def test_remote_ok_with_local_only_chain_never_calls_local(caplog):
             request, "v1/chat/completions", config, _cfg()
         )
 
-    assert calls == [], "local must never be attempted under remote-ok"
-    # The empty chain exhausts: 503 all_exhausted, not a local call.
-    assert result.status_code in (503, 429)
+    assert calls == ["local"], (
+        f"no remote tier exists to step to; the local route serves, got {calls}"
+    )
+    assert result.status_code == 200, (
+        f"an empty chain must never be manufactured from a preference, got "
+        f"{result.status_code}"
+    )
+    assert result.headers.get("X-Local-Route") == "local"
 
 
 # ---------------------------------------------------------------------------

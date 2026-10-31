@@ -7152,8 +7152,8 @@ async def _promote_too_large_local_request(
     Called once per cycle, after the authoritative routing estimate exists and
     **before** the dispatch loop. A ``too_large`` verdict means the prompt
     outgrows the local serving envelope, so waiting cannot help: the local
-    entry is removed from the chain at resolution time (the same filter
-    ``remote-ok`` uses, :func:`proxy.priority.apply_local_preference`) and the
+    entry is removed from the chain at resolution time (the capacity filter
+    :func:`proxy.priority.apply_local_preference`) and the
     remote tiers serve the request with no local attempt, no queue entry, no
     lease and no local-capacity 429 (parent AC4). A ``deferrable`` verdict
     leaves the chain untouched — a fits-local request stays pinned.
@@ -8073,7 +8073,7 @@ async def _build_local_only_refusal_for_remote(
     header normalised to it by :func:`admission_reserve.parse_preference`
     (LP-0MVSHWYVE005MS16 AC5) — the dispatch loop must NEVER hand the request
     to a non-local provider, regardless of which skip branch the local route
-    took — the structural analogue of ``remote-ok`` being enforced by
+    took — the structural analogue of the capacity promotion being enforced by
     ``apply_local_preference()`` (intent enforced by structure, not by
     remembering to patch each ``continue``). Called at the head of both
     dispatch cycles immediately after the next candidate provider is resolved;
@@ -8092,8 +8092,10 @@ async def _build_local_only_refusal_for_remote(
     Inert for a local candidate (the request still completes locally) and,
     through the single pin predicate
     :func:`_local_preference_pins_local`, for ``prefer-local`` / absent header /
-    ``remote-ok`` clients, so AC3 byte-compatibility and the ``remote-ok``
-    strip are preserved. The predicate also declines the pin when the request's
+    ``remote-ok`` clients, so AC3 byte-compatibility is preserved and a
+    ``remote-ok`` request keeps the local route (it falls through at the
+    admission decision instead — LP-0MVUH9OYZ007GMWF AC1/AC4). The predicate
+    also declines the pin when the request's
     capacity verdict is ``too_large`` (LP-0MVSLZY470051ZB2 AC4): a prompt that
     outgrows the local serving envelope is never refused for local capacity —
     it falls through to the remote tiers. The refusal is terminal for the
@@ -8533,9 +8535,10 @@ async def _maybe_queue_for_local_slot(
       - ``"context_bypass"`` — the request cannot fit a KV slot; it was
         never queued; the caller records ``cached_tokens_skip`` with the
         returned *reason*.
-      - ``"fallback_policy"`` — policy is fallback / high priority never
-        queues; the caller keeps today's ``local_concurrency_limit``
-        behavior.
+      - ``"fallback_policy"`` — no queue applies to this request: the policy
+        is fallback, the priority is ``high`` (never queues), or the
+        preference is ``remote-ok`` (see below). The caller keeps today's
+        ``local_concurrency_limit`` fall-through behaviour.
       - ``"admission_reject"`` — the prefill-ETA admission guard refused
         local admission because the projected prefill cannot finish inside
         the wait budget; the caller falls through to the next provider
@@ -8547,10 +8550,31 @@ async def _maybe_queue_for_local_slot(
         admission response instead of falling back to a remote provider
         (LP-0MVIKPCSG002B0NL AC4).
 
+    ``remote-ok`` never waits (LP-0MVUH9OYZ007GMWF AC4 / parent AC20). The
+    value means *"local allowed, remote acceptable"* — its name is historic,
+    it used to *strip* the local route from the chain — so when the local slot
+    is saturated the request steps straight to the next provider instead of
+    queueing: this function declines before the reservation ticket is consumed
+    and before any queue state is written, so no ticket is spent and no
+    ``contention_queue_*`` wait (and no local-capacity ``429``) is produced for
+    a request that will not wait. ``high`` priority keeps its existing
+    never-queue semantics.
+
     A valid ``X-Local-Reservation`` ticket is consumed first: a reservation is
     a pre-granted admission, so the follow-up request dispatches without
     re-checking or queueing (LP-0MVIKPCSG002B0NL AC1).
     """
+    # ``remote-ok`` declines to queue *before* the reservation ticket is
+    # consumed and before any queue bookkeeping: the value promises an
+    # immediate step to the next provider, so spending a single-use ticket (or
+    # a queue slot) on a request that will not wait would waste a resource the
+    # next request needs (LP-0MVUH9OYZ007GMWF AC4). The returned action is the
+    # pre-existing ``fallback_policy`` outcome, so both dispatch cycles fall
+    # through exactly as they do for a never-queue policy — no new branch and
+    # no new reason token.
+    if _request_local_preference(request) == PREF_REMOTE_OK:
+        return ("fallback_policy", None, None)
+
     # Atomic local-admission reservation (LP-0MVIKPCSG002B0NL): a ticket
     # claimed via POST /llama/local/reserve is a pre-granted admission. It is
     # single-use and TTL-bound, so consuming it here is what makes the
@@ -11783,11 +11807,6 @@ async def _proxy_with_remote_fallback_cycle(
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
-    elif _preference == PREF_REMOTE_OK:
-        # ``remote-ok`` with no remote-capable provider in the chain: the
-        # client asked for no local route, so the chain is genuinely empty
-        # (AC5).
-        model_config = {**model_config, "providers": []}
     logger.info(
         "priority_routing model=%s priority=%s providers=%d preference=%s "
         "session=%s",
@@ -12487,11 +12506,6 @@ async def _proxy_with_fallback_cycle(
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
-    elif _preference == PREF_REMOTE_OK:
-        # ``remote-ok`` with no remote-capable provider in the chain: the
-        # client asked for no local route, so the chain is genuinely empty
-        # (AC5).
-        model_config = {**model_config, "providers": []}
     logger.info(
         "priority_routing model=%s priority=%s providers=%d preference=%s "
         "session=%s",
@@ -13798,6 +13812,20 @@ async def _proxy_with_fallback_cycle(
                     prev_provider = provider_name
                     total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
                     available_slots_sum += int(slot_info.get("available_slots", 0) or 0)
+                    # Name the exit before deciding whether to queue: the
+                    # lease denial is the reason local was not used, and it is
+                    # the only exit a ``remote-ok`` request can take here
+                    # (that preference never queues, so the
+                    # ``fallback_policy`` outcome below leaves no later note
+                    # behind — LP-0MVUH9OYZ007GMWF AC4). A queued request that
+                    # later falls through overwrites this with its own
+                    # measured reason, and a local re-dispatch is served with
+                    # ``X-Local-Route: local``, which carries no reason at all.
+                    _note_local_fallback_reason(
+                        request,
+                        SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                        _local_lease_retry_after_seconds(config, local_endpoint),
+                    )
                     _record_attempt(
                         attempts,
                         provider=provider_name,

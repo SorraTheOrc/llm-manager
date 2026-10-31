@@ -413,18 +413,6 @@ def assert_no_queue_or_lease_writes(dispatches: list[str], *, context: str) -> N
     )
 
 
-def assert_canonical_fallback_reason(reason: str | None, *, context: str) -> None:
-    """A stamped reason must come from the one canonical token table."""
-    from proxy import admission_reserve
-
-    assert reason, f"{context}: a remote fall-through must stamp a reason token"
-    assert reason in admission_reserve.LOCAL_FALLBACK_REASON_TOKENS, (
-        f"{context}: reason={reason!r} is not in "
-        "admission_reserve.LOCAL_FALLBACK_REASON_TOKENS — the header, the "
-        "body and the log field must draw from one table"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Deterministic clock / TTL knob
 # ---------------------------------------------------------------------------

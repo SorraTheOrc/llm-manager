@@ -1362,7 +1362,7 @@ reserved dispatch does not consume queue depth.
 |-------|-----------|
 | `prefer-local` (default) | Today's behaviour: use local when it can serve within the budget, else fall through to the next provider |
 | `local-preferred` | **Local while the request fits local capacity, remote beyond it.** Pin local **while the request can still fit**. A *deferrable* request — the block is temporal, so waiting can help — waits for local capacity and, when the wait budget runs out, receives the retryable `429` deferral (`X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`, `Retry-After` / `retry_at`) instead of being moved to a paid provider. A *too-large* request — one that outgrows the local serving envelope, so waiting cannot help — is **never deferred and never refused for local capacity**: the local entry leaves the chain and a remote tier serves it (`200`, `X-Local-Route: remote`, no `Retry-After`). See [`local-preferred`: pinned while deferrable, promoted when too large](#local-preferred-pinned-while-deferrable-promoted-when-too-large) and the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
-| `remote-ok` | Skip the local route entirely (background / low-priority work). The local provider is removed from the chain |
+| `remote-ok` | **Local allowed, remote acceptable.** The local route stays in the chain and is attempted exactly as an absent header attempts it, so a free local slot is used. When local cannot serve the request **right now** — the slot is saturated, the prefill ETA is over the wait budget, the local entry is in cooldown, the residency ladder skipped it, the lease is held, or the per-entry context cap excludes it — the request **steps straight to the next provider**: it does **not** enter the contention queue, does not defer, and never receives a local-capacity `429`, so its queue wait is always `0`. The value's name is **historic**: it once meant "remove the local route from the chain", which is the opposite of the behaviour above and must not be restored |
 
 Wire compatibility (LP-0MVSHWYVE005MS16): `local-only` is the **legacy,
 deprecated** alias of `local-preferred`. It is still accepted and normalised to
@@ -1390,7 +1390,7 @@ dispatcher. Two verdicts exist, and each decides what a pinned request does:
 | Verdict | Meaning | What `local-preferred` does |
 |---|---|---|
 | `deferrable` | The block is temporal: a slot, a lease or a queue is busy and will free. Waiting can help. | **Pinned.** The request is never dispatched to a non-local provider. It waits for local capacity and, when the wait cannot help it, is answered with the retryable `429` deferral. |
-| `too_large` | The request itself outgrows the local serving envelope, so no amount of waiting helps. | **Promoted.** The local entry leaves the effective chain *before* the dispatch loop (the same filter `remote-ok` uses) and a remote tier serves the request: no local attempt, no queue entry, no lease, no local-capacity `429`. |
+| `too_large` | The request itself outgrows the local serving envelope, so no amount of waiting helps. | **Promoted.** The local entry leaves the effective chain *before* the dispatch loop (the capacity filter — the only filter that ever removes a local entry) and a remote tier serves the request: no local attempt, no queue entry, no lease, no local-capacity `429`. |
 
 #### Pinned: a deferrable request never goes remote
 
@@ -1403,9 +1403,10 @@ whenever the candidate is not a local entry and the request is pinned — the
 pin-local preference (canonical `local-preferred`, including the alias
 normalised to it) **and** a non-`too_large` verdict — the request is answered
 with the `429` (`X-Local-Route: refused`) instead of ever reaching that
-candidate. It is the mirror of `remote-ok`: where `remote-ok` removes the local
-route from the chain *before* dispatch, a pinned request refuses *before* any
-remote entry is dispatched (LP-0MVRMC1L3006F0F3). The admission guard is still
+candidate. It is the mirror of the capacity promotion: where a `too_large`
+verdict removes the local route from the chain *before* dispatch, a pinned
+request refuses *before* any remote entry is dispatched
+(LP-0MVRMC1L3006F0F3). The admission guard is still
 there; it is simply no longer the only line of defence.
 
 The pin is **not** one universal outcome per exit — it is a split decided by
@@ -1479,7 +1480,7 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Router skip: per-tenant residency cap (`session_tenants`) | `tenant_limit` | refusing | `routing_skip_local ... reason=tenant_limit ...` |
 | Router skip: (session, prompt) in post-deadline prefill-thrash cooldown — enforced at provider.py's chain entry **and** at the local dispatch choke points (`proxy_to_local` and `_try_acquire_local_dispatch`) | `prefill_thrash_cooldown` | refusing | `routing_skip_local ... reason=prefill_thrash_cooldown ...` (`entry=router_dispatch` / `entry=lease_acquire` at the choke points) |
 | Contention-queue depth cap reached (never queued), or the wait budget expired | `fallback_after_queue` | refusing | `contention_queue_fallback_after_queue ... preference=...` |
-| Local slots busy with the queue disabled (fast-mode fallback policy) | `local_concurrency_limit` | refusing | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
+| Local slots busy and the request did not queue (queue disabled, `high` priority, or a `remote-ok` request, which never waits) | `local_concurrency_limit` | refusing | attempt record `status=local_concurrency_limit`; the refusal line `local_only_refused reason=local_concurrency_limit ...` |
 | Prefill-gate / lease denial (a lease-active 503 after the retry window) | `local_lease_active` | refusing | `contention_queue_fallback_after_queue ... reason=local_lease_active` |
 | Quota hard stop (chain resolution) | `quota_hard_stop` | refusing | `Skipping provider=<local>: ... reason=quota_hard_stop preference=...` |
 | Usage-limit reset pending (chain resolution) | `usage_limit_reset_pending` | refusing | `Skipping provider=<local>: usage_limit_reset_pending ... reason=usage_limit_reset_pending ...` |
@@ -1554,11 +1555,11 @@ this request was refused, never routed onwards.
 A `too_large` verdict is never deferred and never refused for local capacity.
 It is decided **before** the dispatch loop, once the authoritative routing
 estimate exists, by `_promote_too_large_local_request()`: the local entry is
-filtered out with the same `apply_local_preference()` filter `remote-ok` uses,
-so the remote tiers serve the request exactly as if the client had sent
-`remote-ok` — no local attempt, no queue entry, no lease. The per-request
+filtered out with the same `apply_local_preference()` capacity filter used for
+every other promotion, so the remote tiers serve the request with no local
+attempt, no queue entry and no lease. The per-request
 routing line reports `outcome=promoted`, which is how an operator tells a
-capacity promotion from a client asking for remote.
+capacity promotion from a client that never had a local route.
 
 Two thresholds define the local serving envelope:
 
@@ -1649,9 +1650,9 @@ Every response carries `X-Local-Route`:
 - `remote` — served by a remote provider; `X-Local-Fallback-Reason` names why
   local was not used — one of the exit tokens in the
   [pin-local section](#local-preferred-pinned-while-deferrable-promoted-when-too-large),
-  or `no_local_provider` when the local route was never attempted (a
-  `remote-ok` chain strip that removed every local entry, or a chain that
-  never had one). A `local-preferred` request promoted because it is
+  or `no_local_provider` when the local route was never attempted (a chain
+  that never had a local entry, or a labelled chain with no entry for the
+  request's priority). A `local-preferred` request promoted because it is
   `too_large` also lands here, with the capacity reason as its token: no
   `Retry-After`, no local-capacity `429`. Promotion never manufactures an empty
   chain — a chain with **no non-local entry** (the `private` model) is never
@@ -1669,9 +1670,12 @@ Every response carries `X-Local-Route`:
 of the exits above it falls through to the next provider exactly as before.
 The pin adds the deferral for `local-preferred` while its verdict is
 `deferrable`, and drops the local entry entirely when the verdict is
-`too_large`. `remote-ok`, by contrast, is enforced structurally: the local
-route is removed from the chain *before* dispatch (`apply_local_preference`),
-so a `remote-ok` request never reaches a local-route exit at all.
+`too_large`. `remote-ok` keeps the local route and is enforced at the
+**admission** decision rather than at the chain: the local entry is never
+removed from the chain *before* dispatch, so a `remote-ok` request reaches a
+local-route exit exactly like an absent header does — it simply never waits at
+one. The only chain-level strip that exists is the capacity filter, and no
+preference value can trigger it.
 
 ### Per-reason retry contract (LP-0MVNTT4X8009IO2X)
 
@@ -1747,7 +1751,7 @@ and header a client must honour:
   context ceiling) and resend; no amount of waiting makes this request fit
   local capacity.
 - To let a remote provider serve such a request instead, send
-  `X-Local-Preference: prefer-local` (or `remote-ok`): both stop pinning, so the
+  `X-Local-Preference: prefer-local` (or `remote-ok`): neither pins, so the
   remote fallback is reachable again. A client that cannot change its routing
   must read the refusal as "local cannot serve this request now", never as "all
   providers are down" — the two are different `code` values and different
