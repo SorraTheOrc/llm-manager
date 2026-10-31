@@ -159,6 +159,19 @@ HEADER_RESERVATION = "x-local-reservation"
 HEADER_ROUTE = "X-Local-Route"
 HEADER_FALLBACK_REASON = "X-Local-Fallback-Reason"
 
+#: Marker a local 5xx carries when the router released the dispatch for a
+#: *reason* that says nothing about local's health (LP-0MVWFKESK0005G61). The
+#: value is a canonical token from :data:`LOCAL_FALLBACK_REASON_TOKENS`, so the
+#: fallback loop can defer the one request instead of quarantining the whole
+#: local entry for every session. Additive: the header is absent from every
+#: other backend error, which therefore stays byte-identical.
+HEADER_LOCAL_DISPATCH_REASON = "X-Local-Dispatch-Reason"
+
+#: Attribute carrying the same marker on the response object itself, so a
+#: response whose header was dropped in transit (proxy hop, response rebuild)
+#: stays attributable instead of silently re-enabling the entry quarantine.
+LOCAL_DISPATCH_REASON_ATTR = "local_dispatch_reason"
+
 # ---------------------------------------------------------------------------
 # Canonical local-route-exit reason tokens (LP-0MVRMC1W6003MV3Y AC1)
 #
@@ -189,11 +202,53 @@ LOCAL_FALLBACK_REASON_TOKENS: frozenset[str] = frozenset(
         "outside_available_window",
         # Lease-active continue: expected contention, not a provider failure.
         "local_lease_active",
+        # Reason-scoped local 5xx release (LP-0MVWFKESK0005G61): the measured
+        # cache-deficit abort is a verdict on the *prompt*, not on local's
+        # health, so it is deferred rather than quarantined. Mirrors
+        # ``measured_cache_abort.MEASURED_CACHE_DEFICIT_REASON``.
+        "measured_cache_deficit",
         # Structural refusals.
         "local_only_no_local_route",
         "local_route_unavailable",
     }
 )
+
+
+def local_dispatch_reason(response: Any) -> str | None:
+    """Return the local-dispatch reason marker carried by *response*, if any.
+
+    The router stamps the marker twice — as
+    :data:`HEADER_LOCAL_DISPATCH_REASON` on the wire and as
+    :data:`LOCAL_DISPATCH_REASON_ATTR` on the response object — so a header lost
+    in transit can never silently re-enable an entry quarantine the reason does
+    not justify. The in-process half is read first.
+
+    Never raises: marker sniffing must not break fallback routing.
+    """
+    try:
+        marker = getattr(response, LOCAL_DISPATCH_REASON_ATTR, None)
+    except Exception:  # pragma: no cover - exotic response stand-ins
+        marker = None
+    if isinstance(marker, str) and marker:
+        return marker
+
+    try:
+        headers = getattr(response, "headers", None) or {}
+    except Exception:  # pragma: no cover - exotic response stand-ins
+        return None
+    try:
+        marker = headers.get(HEADER_LOCAL_DISPATCH_REASON)
+    except Exception:  # pragma: no cover - exotic header containers
+        marker = None
+    if isinstance(marker, str) and marker:
+        return marker
+    try:
+        for key, value in dict(headers).items():
+            if str(key).lower() == HEADER_LOCAL_DISPATCH_REASON.lower():
+                return value if isinstance(value, str) and value else None
+    except Exception:  # pragma: no cover - exotic header containers
+        return None
+    return None
 
 
 def canonical_local_fallback_reason(token: str) -> str:

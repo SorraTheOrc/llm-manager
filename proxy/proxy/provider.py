@@ -41,7 +41,7 @@ import httpx
 from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from proxy import cold_start, quota_pacing, quota_state
+from proxy import admission_reserve, cold_start, quota_pacing, quota_state
 
 #: The single source of truth for the ``X-Local-Preference`` vocabulary and its
 #: parser (LP-0MVSHWYVE005MS16 AC4). ``PREF_LOCAL_ONLY`` is imported only as the
@@ -59,6 +59,7 @@ from proxy.admission_reserve import (
     parse_preference,
     retired_preference_body,
 )
+from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
 from proxy.observability import _record_backend_signal
 from proxy.priority import (
     PRIORITY_HIGH,
@@ -7819,6 +7820,15 @@ SKIP_REASON_LOCAL_LEASE_ACTIVE = _canonical_local_fallback_reason(
     "local_lease_active"
 )
 
+#: Reason-scoped local 5xx release (LP-0MVWFKESK0005G61): the measured
+#: cache-deficit abort released the dispatch because this *prompt* cannot be
+#: served in time, not because local is unhealthy. The token names that detour
+#: on the request so a log reader can tell it apart from a genuine local fault
+#: and from the entry-wide ``local_provider_cooldown`` it replaces.
+SKIP_REASON_MEASURED_CACHE_DEFICIT = _canonical_local_fallback_reason(
+    MEASURED_CACHE_DEFICIT_REASON
+)
+
 #: Local-route exits whose retry hint is a *real* availability expiry rather
 #: than the ETA formula (LP-0MVQ23B80009OZ9V AC1–AC4). An exit records the
 #: expiry it measured via ``_note_local_fallback_reason(..., retry_after_s=)``;
@@ -10806,6 +10816,36 @@ def _build_fallback_success_response(
     return result
 
 
+def _local_dispatch_deferral_reason(
+    response: Response, provider_type: str
+) -> str | None:
+    """Return the reason marker when *response* is a deferrable local 503.
+
+    Only a local **503** carrying the measured-cache-deficit marker is
+    deferrable (LP-0MVWFKESK0005G61). The marker names a verdict on the prompt
+    — the measured ``prompt_progress`` proved this dispatch was re-prefilling
+    far more than admission priced, so it was released before it could be
+    served — which says nothing about local's health for any *other* session.
+
+    The exemption is **reason-scoped**, never "any 503 from local": an
+    unmarked local 503, another status code, or a 503 carrying a different
+    marker all keep the pre-change quarantine. The marker is read from the
+    response's in-process attribute as well as its header, so a header lost in
+    transit cannot silently re-enable the entry cooldown.
+    """
+    if provider_type != "local":
+        return None
+    try:
+        if int(getattr(response, "status_code", 0) or 0) != 503:
+            return None
+    except Exception:  # pragma: no cover - response stand-ins
+        return None
+    marker = admission_reserve.local_dispatch_reason(response)
+    if marker == MEASURED_CACHE_DEFICIT_REASON:
+        return SKIP_REASON_MEASURED_CACHE_DEFICIT
+    return None
+
+
 def _handle_connection_error_in_fallback(
     exc: Exception,
     provider_name: str,
@@ -10894,6 +10934,19 @@ def _handle_http_error_with_cooldown(
     surface Retry-After.  Any other status code during the window still
     quarantines normally so genuine faults are not masked.
 
+    Reason-scoped deferral (LP-0MVWFKESK0005G61): a local 503 carrying the
+    measured-cache-deficit marker means the router released *this dispatch*
+    because the measured prefix deficit proved the prompt could not be served
+    in time — not that local is unhealthy. Quarantining the entry starved every
+    other session's ``prefer-local`` work while the GPU idled (measured
+    2026-10-31: 217 arms / 5.5 h, local share 2.8 %). Such a 503 is DEFERRED the
+    same way: recorded as ``local_dispatch_deferral``, no entry cooldown, no
+    failure-counter bump, and the response's own ``Retry-After`` returned as
+    the hint. The aborting prompt is still refused for the configured
+    ``local_prefill_thrash_cooldown_seconds`` by the per-session/per-prompt
+    window the router armed before returning the 503. The cold-start branch
+    keeps precedence (AC3), and an unmarked 503 is untouched.
+
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
     ``continue``.
@@ -10911,6 +10964,25 @@ def _handle_http_error_with_cooldown(
             status="cold_start_deferral",
             status_code=int(response.status_code),
             retry_after_seconds=retry_hint,
+        )
+        return float(retry_hint)
+
+    local_deferral_reason = _local_dispatch_deferral_reason(
+        response, provider_type
+    )
+    if local_deferral_reason is not None:
+        # The response's own Retry-After is the only hint: the deferral applies
+        # no cooldown (nothing is quarantined), so an absent header means "no
+        # wait enforced" rather than the configured provider cooldown.
+        retry_hint = _parse_retry_after(response) or 0.0
+        _record_attempt(
+            attempts,
+            provider=provider_name,
+            type=provider_type,
+            status="local_dispatch_deferral",
+            status_code=int(response.status_code),
+            retry_after_seconds=retry_hint,
+            reason=local_deferral_reason,
         )
         return float(retry_hint)
 
@@ -14475,7 +14547,20 @@ async def _proxy_with_fallback_cycle(
                         attempted_domains.add(_usage_limit_account_key(provider_cfg))
                     else:
                         attempted_domains.add(_failure_domain_key(provider_cfg))
-                    fallback_reason = f"HTTP {response.status_code}"
+                    # LP-0MVWFKESK0005G61 AC5: a reason-scoped deferral names
+                    # itself on the request (``X-Local-Fallback-Reason`` and the
+                    # routing-outcome line) and on the fallback line, so the
+                    # detour is attributable as ``measured_cache_deficit``
+                    # instead of the generic ``HTTP 503`` a genuine local fault
+                    # carries.
+                    _deferral_reason = _local_dispatch_deferral_reason(
+                        response, provider_type
+                    )
+                    if _deferral_reason is not None:
+                        _note_local_fallback_reason(request, _deferral_reason)
+                    fallback_reason = (
+                        _deferral_reason or f"HTTP {response.status_code}"
+                    )
                     prev_provider = provider_name
                     # See _proxy_with_remote_fallback_cycle: only a LOCAL 429
                     # is local slot pressure (LP-0MVUXY1CL005KWCC).

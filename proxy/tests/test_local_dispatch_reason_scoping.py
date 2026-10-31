@@ -22,7 +22,7 @@ session/prompt that lost the cache. With concurrent sessions the entry
 cooldown is re-armed before it expires, starving ``prefer-local`` work while
 the GPU idles (measured 2026-10-31: 217 arms / 5.5 h, local share 2.8 %).
 
-These tests pin the post-fix contract **before** the implementation lands:
+These tests pin the post-fix contract (green since LP-0MVWFKESK0005G61):
 
 * **AC1 — no entry quarantine from a deficit abort.** A deficit-marked local
   503 is DEFERRED: no ``mark_provider_unavailable`` for the entry, no
@@ -46,7 +46,8 @@ Contract pinned here (shared with the implementation child)
 -----------------------------------------------------------
 The router's deficit ``_build_backend_error_response`` carries the marker as
 the response header ``X-Local-Dispatch-Reason: measured_cache_deficit`` (the
-token is ``measured_cache_abort.MEASURED_CACHE_DEFICIT_REASON``).
+token is ``measured_cache_abort.MEASURED_CACHE_DEFICIT_REASON``), plus the same
+value as an in-process attribute on the response object.
 ``provider._handle_http_error_with_cooldown`` therefore takes the
 cold-start-style deferral branch for a **local 503 carrying that marker** —
 recording ``status=local_dispatch_deferral``, applying no entry cooldown and
@@ -89,21 +90,6 @@ DEFICIT_MARKER_HEADER = "X-Local-Dispatch-Reason"
 
 #: The canonical deficit token reused as the marker value / fallback reason.
 DEFICIT_REASON = MEASURED_CACHE_DEFICIT_REASON
-
-#: The implementation child that makes the red rows pass; it must delete the
-#: ``xfail(strict=True)`` markers below when the reason-scoped deferral lands.
-IMPL_ITEM = "LP-0MVWFKESK0005G61"
-
-#: Why the red rows are marked ``xfail(strict=True)`` today (test-first):
-#: they must FAIL on the pre-fix tree (the entry is still quarantined and the
-#: deficit token is not yet canonical), while the changed-scope gate has to
-#: stay green for this test-only item to land. ``strict=True`` turns a row that
-#: starts passing into a hard failure, so the implementation child must delete
-#: the marker rather than leave the contract half-pinned.
-RED_REASON = (
-    "red until %s lands: the deficit-marked local 503 is still quarantined on "
-    "the provider entry and the deficit token is not yet canonical" % IMPL_ITEM
-)
 
 #: The local provider ENTRY name these tests quarantine (or refuse to).
 ENTRY = "local-llama"
@@ -326,7 +312,6 @@ async def _run(request, cfg=None):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_marked_deficit_503_defers_without_quarantine():
     """AC1: `_handle_http_error_with_cooldown` defers the marked local 503.
 
@@ -355,7 +340,6 @@ def test_marked_deficit_503_defers_without_quarantine():
     assert attempts and attempts[0]["status"] == "local_dispatch_deferral", attempts
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 @pytest.mark.asyncio
 async def test_neighbour_session_is_not_skipped_after_a_deficit_abort(
     monkeypatch, fallback_chain, caplog
@@ -504,6 +488,34 @@ def test_unmarked_local_5xx_still_quarantines(case):
     assert attempts and attempts[0]["status"] == "http_error"
 
 
+def test_foreign_dispatch_reason_marker_still_quarantines():
+    """AC1b: the deferral is reason-scoped, not marker-scoped.
+
+    A local 503 carrying a *different* ``X-Local-Dispatch-Reason`` value is not
+    a measured-cache-deficit abort, so it keeps the pre-change quarantine: the
+    exemption may never widen into "any marked local 503".
+    """
+    attempts: list[dict] = []
+    response = _unmarked_503()
+    response.headers[DEFICIT_MARKER_HEADER] = "some_other_local_reason"
+
+    cooldown = provider._handle_http_error_with_cooldown(
+        response,
+        ENTRY,
+        "local",
+        PROVIDER_COOLDOWN_SECONDS,
+        attempts,
+        "a different reason",
+        config=_server_config(),
+    )
+
+    assert cooldown == PROVIDER_COOLDOWN_SECONDS
+    assert provider._is_provider_unavailable(ENTRY), (
+        "only the measured-cache-deficit marker may defer a local 503"
+    )
+    assert attempts and attempts[0]["status"] == "http_error"
+
+
 def test_connection_error_after_grace_window_still_quarantines():
     """AC3: the connection-error path is unchanged after the cold window.
 
@@ -568,7 +580,6 @@ async def test_slot_exhaustion_still_applies_its_short_cooldown(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 def test_deficit_token_is_canonical():
     """AC5: the marker/fallback token is accepted by the canonical table.
 
@@ -582,7 +593,6 @@ def test_deficit_token_is_canonical():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=RED_REASON)
 @pytest.mark.asyncio
 async def test_aborting_request_names_the_deficit_token_not_generic_503(
     monkeypatch, fallback_chain, caplog
@@ -590,9 +600,10 @@ async def test_aborting_request_names_the_deficit_token_not_generic_503(
     """AC5: the detour is attributable as a deficit abort, not ``HTTP 503``.
 
     When the marked 503 detours to a streaming remote provider the
-    ``Fallback triggered`` line must name the canonical deficit token, so a
-    log reader can tell the reason-scoped deferral apart from a genuine local
-    fault.
+    ``Fallback triggered`` line must name the canonical deficit token, and the
+    returned response must carry it as ``X-Local-Fallback-Reason``, so a log
+    reader and a client can both tell the reason-scoped deferral apart from a
+    genuine local fault (and from the generic ``local_provider_cooldown``).
     """
     install, _calls = fallback_chain
     install(lambda session, body: _deficit_503())
@@ -601,6 +612,9 @@ async def test_aborting_request_names_the_deficit_token_not_generic_503(
     response = await _run(_SessionRequest(SESSION_A))
     assert response.status_code == 200
     assert response.headers.get("X-Provider") == "remote-fallback"
+    assert response.headers.get(admission_reserve.HEADER_FALLBACK_REASON) == (
+        DEFICIT_REASON
+    ), dict(response.headers)
 
     fallback_lines = [
         record.getMessage()

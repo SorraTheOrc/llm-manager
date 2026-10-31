@@ -2133,6 +2133,13 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         return _build_backend_error_response(
                             srv, path, session_id, session_created,
                             is_delta_request, session_fallback_reason,
+                            # LP-0MVWFKESK0005G61 AC1b: name the reason on the
+                            # response (header + in-process marker) so the
+                            # fallback loop defers *this* 503 instead of
+                            # quarantining the whole local entry for every
+                            # session. The abort is a verdict on the prompt, not
+                            # on local's health.
+                            local_dispatch_reason=MEASURED_CACHE_DEFICIT_REASON,
                         )
                     except Exception as _exc:
                         # LP-0MUCEFB8E003YVFF: distinct, observable log line

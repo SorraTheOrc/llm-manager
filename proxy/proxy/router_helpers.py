@@ -814,20 +814,38 @@ def _build_backend_error_response(
     is_delta_request: bool,
     session_fallback_reason: str | None,
     retry_after: int | None = None,
+    local_dispatch_reason: str | None = None,
 ) -> JSONResponse:
     """Build a 503 error response with session information headers.
 
     Used by both streaming and non-streaming paths in proxy_to_local
     when the backend is unavailable or returns an error.
+
+    *local_dispatch_reason* names why local released the dispatch when that
+    reason says nothing about local's health (LP-0MVWFKESK0005G61). It is
+    stamped twice — as ``X-Local-Dispatch-Reason`` on the wire and as an
+    in-process attribute on the response object — so the fallback loop can
+    defer this one request instead of quarantining the whole local entry, and
+    a header lost in transit cannot silently re-enable that quarantine. The
+    default (``None``) emits nothing, leaving every other backend error
+    byte-identical.
     """
     if retry_after is None:
         from proxy.backend_health import _self_heal_retry_after_seconds
         retry_after = _self_heal_retry_after_seconds()
 
+    if local_dispatch_reason:
+        from proxy.admission_reserve import (
+            HEADER_LOCAL_DISPATCH_REASON,
+            LOCAL_DISPATCH_REASON_ATTR,
+        )
+
     headers = {
         "Retry-After": str(retry_after),
         "Cache-Control": "no-store",
     }
+    if local_dispatch_reason:
+        headers[HEADER_LOCAL_DISPATCH_REASON] = local_dispatch_reason
     if session_id:
         headers["X-Session-Id"] = session_id
         headers["X-Session-Created"] = "true" if session_created else "false"
@@ -845,7 +863,13 @@ def _build_backend_error_response(
         "path": f"/{path}",
         "retry_after": retry_after,
     }
-    return JSONResponse(status_code=503, content=payload, headers=headers)
+    response = JSONResponse(status_code=503, content=payload, headers=headers)
+    if local_dispatch_reason:
+        try:
+            setattr(response, LOCAL_DISPATCH_REASON_ATTR, local_dispatch_reason)
+        except Exception:  # pragma: no cover - response stand-ins
+            pass
+    return response
 
 
 def _build_backend_unavailable_response(

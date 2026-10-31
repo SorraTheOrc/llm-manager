@@ -909,14 +909,6 @@ async def test_release_helper_is_idempotent(monkeypatch):
 #: ``mark_provider_unavailable("local-qwen3", provider_cooldown_seconds)``.
 DEFICIT_MARKER_HEADER = "X-Local-Dispatch-Reason"
 
-#: The implementation child that makes these red rows pass; it must delete the
-#: ``xfail(strict=True)`` markers when the reason-scoped deferral lands.
-_IMPL_ITEM = "LP-0MVWFKESK0005G61"
-_RED_REASON = (
-    "red until %s lands: the deficit 503 carries no marker yet and still "
-    "quarantines the local entry" % _IMPL_ITEM
-)
-
 
 async def _drive_deficit_abort(monkeypatch):
     """Drive one measured-cache-deficit abort through the real router."""
@@ -934,7 +926,6 @@ def _provider_config() -> dict:
     return {"server": dict(SERVER_CONFIG["server"]), "provider_cooldown_seconds": 60}
 
 
-@pytest.mark.xfail(strict=True, reason=_RED_REASON)
 @pytest.mark.asyncio
 async def test_deficit_503_carries_the_marker_header(monkeypatch):
     """AC5: the deficit 503 names its reason on the response itself.
@@ -965,7 +956,6 @@ async def test_deficit_503_carries_the_marker_header(monkeypatch):
     assert headers.get("Cache-Control") == "no-store"
 
 
-@pytest.mark.xfail(strict=True, reason=_RED_REASON)
 @pytest.mark.asyncio
 async def test_deficit_marker_survives_header_loss(monkeypatch):
     """AC5/AC1b: the in-process marker defers the 503 even without the header.
