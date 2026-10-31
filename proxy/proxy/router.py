@@ -73,6 +73,18 @@ class MeasuredCacheAbortDetourError(Exception):
         super().__init__("measured_cache_deficit")
 
 
+def _format_abort_seconds(value) -> str:
+    """Format a benefit-gate seconds value for the abort log line.
+
+    Unusable values (``None`` / non-numeric) render as ``unknown``: the
+    ``measured_cache_abort`` line is diagnostics and must never break dispatch
+    by raising inside the format call.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "unknown"
+    return f"{value:.1f}"
+
+
 def _log_measured_prefill(srv, session_id, model_name, measured) -> None:
     """Emit the one-per-dispatch ``prefill_progress_measured`` line (F2 AC6).
 
@@ -119,6 +131,7 @@ from proxy.lifecycle import (  # noqa: E402
     _self_healing_response,
 )
 from proxy.measured_cache_abort import (  # noqa: E402
+    DETAIL_WITHIN_ETA_BUDGET,
     MEASURED_CACHE_DEFICIT_REASON,
     AbortSettings,
 )
@@ -1309,7 +1322,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     _estimated_tokens,
                 )
                 _resolved_abort_settings = AbortSettings.from_config(
-                    server_config
+                    server_config, model=model_name
                 )
                 if _resolved_abort_settings.enabled:
                     _measured_abort_settings = _resolved_abort_settings
@@ -1917,6 +1930,60 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     raise MeasuredCacheAbortDetourError(
                                         _prefetch.decision, _prefetch.measured
                                     )
+                                # ── Benefit gate declined (LP-0MVWDZ22I005A26B) ──
+                                # The gate priced the measured deficit inside the
+                                # request's own prefill-deadline budget, so the
+                                # dispatch keeps running. Report the gate's own
+                                # evidence (``measured_eta_s`` / ``budget_s`` /
+                                # ``detail``) on the same ``measured_cache_abort``
+                                # line the abort uses, so an operator can see why
+                                # the deficit was tolerated (parent AC5). Nothing
+                                # else changes: no release, no detour, no
+                                # cooldown (the arming site is inside the abort
+                                # branch below and is never reached).
+                                _continue_decision = _prefetch.decision
+                                if (
+                                    _continue_decision is not None
+                                    and _continue_decision.detail
+                                    == DETAIL_WITHIN_ETA_BUDGET
+                                ):
+                                    _continue_eta_s = (
+                                        _continue_decision.measured_eta_s
+                                    )
+                                    _continue_budget_s = _continue_decision.budget_s
+                                    try:
+                                        srv.logger.warning(
+                                            "measured_cache_abort session=%s "
+                                            "model=%s detail=%s total=%s "
+                                            "cache=%s measured_new_tokens=%s "
+                                            "priced_new_tokens=%s "
+                                            "deficit_ratio=%s bound_tokens=%s "
+                                            "measured_eta_s=%s budget_s=%s "
+                                            "→ measured deficit fits the "
+                                            "prefill budget, continuing local "
+                                            "dispatch",
+                                            session_id or "unknown",
+                                            model_name or "unknown",
+                                            _continue_decision.detail,
+                                            _prefetch.measured.total
+                                            if _prefetch.measured is not None
+                                            else "unknown",
+                                            _prefetch.measured.cache
+                                            if _prefetch.measured is not None
+                                            else "unknown",
+                                            _continue_decision.measured_new_tokens,
+                                            _continue_decision.priced_new_tokens,
+                                            _continue_decision.deficit_ratio,
+                                            _continue_decision.bound_tokens,
+                                            _format_abort_seconds(
+                                                _continue_eta_s
+                                            ),
+                                            _format_abort_seconds(
+                                                _continue_budget_s
+                                            ),
+                                        )
+                                    except Exception:
+                                        pass
                             except MeasuredCacheAbortDetourError:
                                 raise
                             except TimeoutError:
@@ -2037,14 +2104,16 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         try:
                             srv.logger.warning(
                                 "measured_cache_abort session=%s model=%s "
-                                "reason=%s total=%s cache=%s "
+                                "reason=%s detail=%s total=%s cache=%s "
                                 "measured_new_tokens=%s priced_new_tokens=%s "
                                 "deficit_ratio=%s bound_tokens=%s "
+                                "measured_eta_s=%s budget_s=%s "
                                 "elapsed_s=%.1f → cancelling local dispatch "
                                 "early and detouring to the next provider",
                                 session_id or "unknown",
                                 model_name or "unknown",
                                 MEASURED_CACHE_DEFICIT_REASON,
+                                _abort_decision.detail,
                                 _abort_measured.total
                                 if _abort_measured is not None else "unknown",
                                 _abort_measured.cache
@@ -2053,6 +2122,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 _abort_decision.priced_new_tokens,
                                 _abort_decision.deficit_ratio,
                                 _abort_decision.bound_tokens,
+                                _format_abort_seconds(
+                                    _abort_decision.measured_eta_s
+                                ),
+                                _format_abort_seconds(_abort_decision.budget_s),
                                 _abort_elapsed,
                             )
                         except Exception:

@@ -224,6 +224,24 @@ class _Request:
         return False
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_prefill_eta():
+    """Start every row from an uncalibrated prefill-ETA window.
+
+    The benefit gate prices the measured deficit through the calibrated model
+    (LP-0MVWDZ22I005A26B) and every *served* dispatch records its own
+    first-byte sample (``record_dispatch_sample``). The fake upstream streams
+    here serve in microseconds, so without this reset a served row would poison
+    the ``(Qwen3, ~56k)`` bucket for every row after it and the abort rows would
+    silently stop aborting — order-dependent, and different under xdist
+    distribution. Each row therefore starts from the shipped default fit
+    (3.9 ms/token); rows that state their own rate basis do so explicitly.
+    """
+    prefill_eta.reset()
+    yield
+    prefill_eta.reset()
+
+
 def _install_server(monkeypatch, server_config_extra: dict | None = None) -> None:
     """Install the ``proxy.server`` state the real lease bookkeeping touches."""
     config = json.loads(json.dumps(SERVER_CONFIG))
@@ -793,7 +811,15 @@ async def test_prefetch_first_progress_event_alone_decides_the_abort(first_abort
         # replays every consumed chunk; the later fake-warm event is ignored.
         assert aiter.consumed == 3
         assert prefetch.chunks == [first, later, _CONTENT_CHUNK]
-        assert prefetch.decision is None
+        # Changed by LP-0MVWDZ22I005A26B (wiring): the *declined* decision now
+        # travels with the outcome so the router can report the benefit gate's
+        # evidence (``detail`` / ``measured_eta_s`` / ``budget_s``) on the
+        # ``measured_cache_abort`` line. The verdict, the consumed chunks and
+        # the replayed bytes are unchanged — this row still pins that no abort
+        # fired and that the later contradicting event never decided anything.
+        assert prefetch.decision is not None
+        assert prefetch.decision.abort is False
+        assert prefetch.decision.detail == "below_deficit_ratio_floor"
 
 
 @pytest.mark.asyncio
@@ -1024,16 +1050,12 @@ async def test_prefill_deadline_503_has_no_deficit_marker(monkeypatch):
 # Benefit-gate wiring (LP-0MVWDZ1RH006HTFS) — parent AC3, AC4, AC7, AC8
 # ---------------------------------------------------------------------------
 
-#: Rows still red-first: they pin the *wiring* observability/output surface that
-#: lands in LP-0MVWDZ22I005A26B (the ``measured_cache_abort`` decision log line
-#: carrying ``detail=within_eta_budget`` / ``budget_s=114``). The gate decision
-#: itself landed in LP-0MVWDZ1GG004UGIK, which is why the three decision/serving
-#: rows below no longer carry the marker: they pass outright now, and a
-#: regression must fail the gate loudly rather than hide behind an xfail.
-_BENEFIT_GATE_WIRING_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="benefit-gate wiring lands in LP-0MVWDZ22I005A26B",
-)
+#: The benefit-gate **wiring** landed in LP-0MVWDZ22I005A26B: the
+#: ``measured_cache_abort`` decision log line now carries ``detail`` /
+#: ``measured_eta_s`` / ``budget_s`` (the comparator actually enforced, 114 s
+#: under the shipped config). The red-first ``xfail(strict=True)`` marker that
+#: pinned these rows has therefore been removed — a regression must fail the
+#: gate loudly rather than hide behind an xfail.
 
 #: The five recorded aborts (parent AC8): a 14 380-token **cold** prompt the
 #: admission guard priced at 48 new tokens, under a 60 s wait budget and a
@@ -1193,15 +1215,74 @@ async def test_incident_pin_local_turn_is_served_locally(monkeypatch):
 
     # Observability (wiring AC2): the decision line, when the wiring emits one,
     # must state the continue verdict and the comparator *actually enforced*.
-    # The strict pin on that line belongs to LP-0MVWDZ22I005A26B; this row only
-    # requires that no line reports an abort (parent AC8: zero aborts).
+    # The strict pin on that line is
+    # ``test_declined_abort_line_reports_the_gate_evidence`` below; this row
+    # only requires that no line reports an abort (parent AC8: zero aborts).
     decision_lines = [line for line in warnings if "measured_cache_abort" in line]
     for line in decision_lines:
         assert "detail=within_eta_budget" in line, line
         assert "budget_s=114" in line, line
 
 
-@_BENEFIT_GATE_WIRING_XFAIL
+@pytest.mark.asyncio
+async def test_declined_abort_line_reports_the_gate_evidence(monkeypatch):
+    """AC2: a declined abort is observable, with the comparator enforced.
+
+    The incident dispatch is served locally *and* the decline is explained on
+    the same ``measured_cache_abort`` line the abort uses: ``detail=within_eta_budget``,
+    ``measured_eta_s`` priced from the measured deficit (38.8-84.6 s across the
+    measured host rate, never the ~8 s a 49-token price produces) and
+    ``budget_s=114`` — the prefill-deadline budget, never the 60 s admission
+    wait budget. No new response header, no new reason token and no change to
+    the refusal body (that surface is owned by LP-0MVSS435600370D6).
+    """
+    prefill_eta.reset()
+    helpers._reset_prefill_thrash_cooldowns()
+    _stamp_admission_evidence(
+        monkeypatch, total=INCIDENT_TOTAL, priced=INCIDENT_PRICED
+    )
+
+    result, _received, _sent = await _drive_local(
+        [_progress_event(INCIDENT_TOTAL, 0), _CONTENT_CHUNK, _FINISH_CHUNK, _DONE],
+        monkeypatch=monkeypatch,
+        server_config_extra=_benefit_gate_server_config(),
+    )
+
+    assert isinstance(result, StreamingResponse), type(result).__name__
+    assert result.status_code == 200
+
+    decision_lines = [
+        line
+        for line in _all_log_lines("warning")
+        if "measured_cache_abort" in line
+    ]
+    assert len(decision_lines) == 1, decision_lines
+    line = decision_lines[0]
+    assert f"session={SESSION}" in line, line
+    assert "detail=within_eta_budget" in line, line
+    assert f"budget_s={SHIPPED_BUDGET_S}" in line, line
+    # The admission *wait* budget is not the comparator (parent D1(a)).
+    assert f"budget_s={INCIDENT_WAIT_BUDGET_S}" not in line, line
+    assert f"total={INCIDENT_TOTAL}" in line, line
+    assert "cache=0" in line, line
+    assert f"priced_new_tokens={INCIDENT_PRICED}" in line, line
+
+    measured_eta_s = float(line.split("measured_eta_s=", 1)[1].split()[0])
+    assert 30.0 < measured_eta_s < SHIPPED_BUDGET_S, (
+        f"the ETA must be priced from the measured 14 380-token deficit "
+        f"({INCIDENT_ETA_RANGE}), got {measured_eta_s} s: {line}"
+    )
+
+    # The decline is not a detour: no release, no cooldown, no refusal marker.
+    assert not any(
+        "measured_cache_deficit" in ln for ln in _all_log_lines("error")
+    )
+    assert not any(
+        "prefill_thrash_cooldown" in ln
+        for ln in _all_log_lines("info") + _all_log_lines("warning")
+    )
+
+
 @pytest.mark.asyncio
 async def test_gate_allowed_abort_arms_exactly_one_thrash_cooldown(monkeypatch):
     """AC3/AC4: an abort the gate allows still detours, and arms one cooldown.

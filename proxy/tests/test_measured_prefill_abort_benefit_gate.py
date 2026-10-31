@@ -453,6 +453,38 @@ def test_the_gate_prices_with_the_calibrated_model_and_config() -> None:
     assert shipped.abort is rolled_back.abort is True
 
 
+def test_resolved_settings_price_with_the_dispatch_model() -> None:
+    """``from_config(model=...)`` carries the wiring's ETA input (AC1).
+
+    The router resolves the abort settings once, so the calibration key the
+    dispatch targets is resolved there too: with the seeded 56 000-token window
+    the resolved ETA is the calibrated p75 (135 s), while omitting the model
+    prices the same deficit from the uncalibrated default fit (218.4 s). Both
+    exceed the 114 s comparator, so the *ETA* is what moves — this row pins the
+    wiring's input provenance, not the verdict.
+    """
+    _seed_huge_prompt_window()
+
+    resolved = AbortSettings.from_config(_shipped_config(), model=MODELLED_MODEL)
+    assert resolved.model == MODELLED_MODEL
+    assert resolved.budget_seconds == pytest.approx(SHIPPED_BUDGET_S)
+
+    without_model = AbortSettings.from_config(_shipped_config())
+    assert without_model.model is None
+
+    with_model = decide_measured_cache_abort(
+        _progress(HUGE_TOTAL, 0), HUGE_PRICED, resolved
+    )
+    model_less = decide_measured_cache_abort(
+        _progress(HUGE_TOTAL, 0), HUGE_PRICED, without_model
+    )
+
+    assert with_model.measured_eta_s == pytest.approx(135.0, abs=0.5)
+    assert model_less.measured_eta_s == pytest.approx(218.4, abs=0.5)
+    assert with_model.abort is model_less.abort is True
+    assert with_model.measured_eta_s < model_less.measured_eta_s
+
+
 def test_the_estimator_receives_the_measured_deficit_tokens() -> None:
     """A recording estimator sees ``total - cache`` once, never the price."""
     seen_tokens: list[int] = []

@@ -244,7 +244,12 @@ class AbortSettings:
     )
 
     @classmethod
-    def from_config(cls, config: Mapping[str, Any] | None) -> AbortSettings:
+    def from_config(
+        cls,
+        config: Mapping[str, Any] | None,
+        *,
+        model: str | None = None,
+    ) -> AbortSettings:
         """Read the ``server`` keys, tolerating a flat dict and ``None``.
 
         An absent config (``None``) resolves to the documented defaults
@@ -253,6 +258,13 @@ class AbortSettings:
         A readable config whose deadline budget is unusable resolves the benefit
         gate as *configured but unusable* (``budget_seconds=0``), which is a
         per-verdict fail-open rather than a disabled feature.
+
+        *model* is the calibration key the measured ETA is priced with — the
+        model the dispatch targets. It is resolved here (LP-0MVWDZ22I005A26B)
+        so the gate prices with the same calibrated bucket the admission guard
+        used; ``None`` prices from the uncalibrated shipped defaults, which is
+        the fail-open direction for this gate (a laxer ETA continues the
+        dispatch instead of cancelling it).
         """
         if config is None:
             return cls()
@@ -285,6 +297,7 @@ class AbortSettings:
             enabled=True,
             bound_tokens=bound,
             min_deficit_ratio=ratio,
+            model=model,
             config=config,
             # ``None`` from the helper means "configured, but unusable": 0 is
             # the falsy budget the decision fails open on (never an abort).

@@ -5155,6 +5155,12 @@ class MeasuredAbortPrefetch:
     The router replays ``chunks`` (the raw upstream reads already consumed,
     in order) through its normal stream loop before reading anything new, so
     the peek never loses bytes and never changes the client-visible stream.
+
+    A non-abort ``decision`` is the benefit-gate verdict that *declined* the
+    abort (LP-0MVWDZ22I005A26B): the router reports it on the
+    ``measured_cache_abort`` line (``detail``/``measured_eta_s``/``budget_s``)
+    so a tolerated deficit is explainable. ``None`` when no decision was taken
+    (no measurement, or the peek ended before one).
     """
 
     chunks: list[bytes]
@@ -5230,6 +5236,7 @@ async def _prefetch_measured_cache_abort(
     chunks: list[bytes] = [] if chunks_sink is None else chunks_sink
     capture = PromptProgressCapture()
     decided_measured = None
+    decided_decision = None
     deadline_at = time.monotonic() + timeout if timeout > 0 else None
 
     while len(chunks) < max_chunks:
@@ -5258,11 +5265,15 @@ async def _prefetch_measured_cache_abort(
         try:
             chunk = read_task.result()
         except StopAsyncIteration:
-            return MeasuredAbortPrefetch(chunks=chunks, complete=True)
+            return MeasuredAbortPrefetch(
+                chunks=chunks, complete=True, decision=decided_decision
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # read error — fail open, replay + raise later
-            return MeasuredAbortPrefetch(chunks=chunks, error=exc)
+            return MeasuredAbortPrefetch(
+                chunks=chunks, error=exc, decision=decided_decision
+            )
         chunks.append(chunk)
 
         try:
@@ -5272,7 +5283,9 @@ async def _prefetch_measured_cache_abort(
                     # First complete client-visible event: stop peeking so the
                     # replay releases it immediately (AC2 latency).
                     return MeasuredAbortPrefetch(
-                        chunks=chunks, measured=decided_measured
+                        chunks=chunks,
+                        measured=decided_measured,
+                        decision=decided_decision,
                     )
                 if decided_measured is not None:
                     # Only the FIRST progress event decides (its ``cache`` is
@@ -5286,20 +5299,29 @@ async def _prefetch_measured_cache_abort(
                 decision = decide_measured_cache_abort(
                     progress, priced_new_tokens, effective
                 )
+                decided_decision = decision
                 if decision.abort:
                     return MeasuredAbortPrefetch(
                         chunks=chunks, abort=True, decision=decision, measured=measured
                     )
                 # No abort: keep peeking so ``local_prefill_deadline_seconds``
-                # keeps bounding the whole pre-first-byte wait.
+                # keeps bounding the whole pre-first-byte wait. The declined
+                # decision travels with the outcome so the caller can report
+                # the benefit-gate evidence (LP-0MVWDZ22I005A26B).
         except asyncio.CancelledError:
             raise
         except TimeoutError:
             raise
         except Exception:  # AC5: an observation error degrades
-            return MeasuredAbortPrefetch(chunks=chunks, measured=decided_measured)
+            return MeasuredAbortPrefetch(
+                chunks=chunks,
+                measured=decided_measured,
+                decision=decided_decision,
+            )
         # No complete event yet (partial/empty read): keep reading.
-    return MeasuredAbortPrefetch(chunks=chunks, measured=decided_measured)
+    return MeasuredAbortPrefetch(
+        chunks=chunks, measured=decided_measured, decision=decided_decision
+    )
 
 
 class ClientDisconnectedDuringPrefillError(Exception):
