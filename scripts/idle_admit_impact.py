@@ -19,6 +19,11 @@ metrics for LP-0MVGHXD59008UOUD:
 **AC1 — window aggregates next to the baselines.** ``local_idle_admit`` count,
 local serve share, ``large_context_bypass`` count and remote fallback count for
 both windows, plus ``local_dispatch_denied`` and local prefill slot-seconds.
+``routing_idle_admit`` (the override admitting) and
+``routing_idle_admit_refused`` (admit-time prefill-feasibility pricing refusing
+before dispatch, LP-0MVRCLPVI0057116) are **distinct** events: refusals are
+counted separately and never inflate the admitted population, so pairing,
+conversion and the per-bucket comparison are measured against real admissions.
 
 **AC1 (LP-0MVK16GME007EYUW) — lease-gate shape attribution.** Every
 ``local_dispatch_denied`` line whose ``cold_start=False`` is a
@@ -415,6 +420,24 @@ def parse_event(line: str, ts: dt.datetime) -> dict | None:
             "prefill_eta_seconds": prefill_eta,
             "in_flight": _int(_KV_IN_FLIGHT, line),
         }
+    if "routing_idle_admit_refused" in line:
+        # Admit-time prefill-feasibility refusal (LP-0MVRCLPVI0057116): the
+        # override priced the prompt and refused BEFORE dispatch. It is not an
+        # admission — counting it as one inflated the admitted population ~70x
+        # in post-fix windows and made every "unpaired admit" a phantom.
+        return {
+            "kind": "idle_admit_refused",
+            "ts": ts,
+            "session": _first(_KV_SESSION, line),
+            "model": _first(_KV_MODEL, line),
+            "reason": _first(_SKIP_REASON, line),
+            "idle_seconds": _num(_KV_IDLE_SECONDS, line),
+            "threshold_seconds": _num(_KV_THRESHOLD, line),
+            "estimated_tokens": _int(_KV_ESTIMATED, line),
+            "new_tokens": _int(_KV_NEW_TOKENS, line),
+            "cached_ratio": _num(_KV_CACHED_RATIO, line),
+            "cache_state": _first(_KV_CACHE_STATE, line),
+        }
     if "routing_idle_admit" in line:
         return {
             "kind": "idle_admit",
@@ -776,6 +799,7 @@ def summarise_window(
     fallbacks = [e for e in events if e["kind"] == "fallback"]
     skips = [e for e in events if e["kind"] == "routing_skip"]
     idle_admits = [e for e in events if e["kind"] == "idle_admit"]
+    idle_admit_refusals = [e for e in events if e["kind"] == "idle_admit_refused"]
     denials = [e for e in events if e["kind"] == "dispatch_denied"]
     releases = [e for e in events if e["kind"] == "lease_released"]
     statuses = [e for e in events if e["kind"] == "status_request"]
@@ -802,11 +826,20 @@ def summarise_window(
     fallback_reasons: dict[str, int] = defaultdict(int)
     for event in fallbacks:
         fallback_reasons[event.get("reason") or "unknown"] += 1
+    admit_refusal_reasons: dict[str, int] = defaultdict(int)
+    for event in idle_admit_refusals:
+        admit_refusal_reasons[event.get("reason") or "unknown"] += 1
 
     local_service_ms = [e["service_ms"] for e in local_dispatches if e.get("service_ms") is not None]
 
     ac1 = {
         "local_idle_admit": len(idle_admits),
+        # Admit-time prefill-feasibility refusals are a separate population:
+        # they never dispatched, so they are neither admits nor idle samples.
+        "local_idle_admit_refused": len(idle_admit_refusals),
+        "idle_admit_refused_by_reason": dict(
+            sorted(admit_refusal_reasons.items(), key=lambda kv: -kv[1])
+        ),
         "local_streams": local_streams,
         "remote_streams": remote_streams,
         "local_serve_share_pct": round(100.0 * local_streams / served_total, 2) if served_total else 0.0,
@@ -1085,6 +1118,7 @@ def summarise_window(
             "routing_skip": len(skips),
             "routing_check": len(checks),
             "idle_admit": len(idle_admits),
+            "idle_admit_refused": len(idle_admit_refusals),
             "dispatch_denied": len(denials),
             "lease_released": len(releases),
             "status_request": len(statuses),
@@ -1807,6 +1841,7 @@ def render(meta: dict, windows: dict, verdict: dict) -> str:
     out.append(f"{'metric':<34}{'before':>15}{'after':>15}")
     for key, title in (
         ("local_idle_admit", "local_idle_admit"),
+        ("local_idle_admit_refused", "local_idle_admit_refused (pre-dispatch)"),
         ("local_serve_share_pct", "local serve share %"),
         ("large_context_bypass", "large_context_bypass"),
         ("remote_fallback_events", "remote fallback events"),
@@ -2005,6 +2040,7 @@ def render_markdown(meta: dict, windows: dict, verdict: dict) -> str:
     out.append("|---|---:|---:|")
     for key, title in (
         ("local_idle_admit", "`local_idle_admit`"),
+        ("local_idle_admit_refused", "`local_idle_admit_refused` (pre-dispatch)"),
         ("local_serve_share_pct", "Local serve share %"),
         ("large_context_bypass", "`large_context_bypass`"),
         ("remote_fallback_events", "Remote fallback events"),

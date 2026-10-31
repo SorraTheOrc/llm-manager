@@ -19,6 +19,16 @@ downstream lease-gate reading and the recorded decision are in
 below; the machine artifact is
 `docs/dev/idle-window-measurement-2026-10-22-to-2026-10-23.json`.
 
+That window cannot answer AC2/AC4 (0 idle-admitted conversions, and no
+`priority=`-instrumented baseline), so both are measured on a **second window
+pair** — the override live, before vs after the eligibility fix
+(LP-0MVRCLPVI0057116, live 2026-10-25 23:00): artifact
+`docs/dev/idle-window-measurement-2026-10-22-to-2026-10-31.json`. Results: 7
+paired idle-admitted dispatches (p50 first byte 26.2 s vs non-idle 3.3 s — the
+trade), and the interactive tier **improved** (p50 −77.8 %, p90 −41.2 %) with
+0 of 648 interactive dispatches starting inside an idle-admitted prefill. See
+[AC2 / AC4 measured](#ac2--ac4-measured-on-the-eligibility-fix-windows-2026-10-22-2148--10-31-1000).
+
 ## Tool
 
 `scripts/idle_admit_impact.py` scans the proxy log stream
@@ -335,7 +345,6 @@ over-estimates for a different reason than the lease gate: the admitted prompts
 deadline at all.
 
 ### AC2 / AC4 — what this window can and cannot measure
-
 Both rows are **unmeasurable in this window, and the artifact now records them
 that way** (re-derived 2026-10-31 from the artifact's own window aggregates,
 since the before window's raw logs have aged out of retention — the same path
@@ -351,6 +360,89 @@ Previously AC4 reported `observed_p50_pct_change: 999.0` here — the tool's
 missing before-window instrumentation, not a measured regression, and the note
 that accompanied it named no same-tier admits and examined no cross-tier
 overlap.
+
+Both rows **are** measured on a second window pair — see the next section.
+## AC2 / AC4 measured, on the eligibility-fix windows (2026-10-22 21:48 → 10-31 10:00)
+
+AC2 and AC4 need data this window does not contain: at least 5 idle-admitted
+requests that reached a first byte, and interactive-tier samples on **both**
+sides of the comparison. Neither exists in 2026-10-22→23 (0 conversions; the
+before side predates the `priority=` instrumentation). Both are therefore
+measured on a second pair, with the override live throughout: **before**
+2026-10-22 21:48 → 2026-10-25 23:00 (73.2 h, pre-eligibility-fix) vs **after**
+2026-10-25 23:00 → 2026-10-31 10:00 (131.0 h, eligibility fix live). Machine
+artifact: `docs/dev/idle-window-measurement-2026-10-22-to-2026-10-31.json`;
+reproduce with:
+
+```bash
+./scripts/idle_admit_impact.py \
+    --before-start '2026-10-22 21:48' --before-end '2026-10-25 23:00' \
+    --after-start '2026-10-25 23:00' --after-end '2026-10-31 10:00' \
+    --deployed-at '2026-10-22 21:48' --window-closed --json
+```
+
+**A parser defect had to be fixed first (LP-0MVGHXD59008UOUD).**
+`routing_idle_admit_refused` (the admit-time prefill-feasibility refusal shipped
+by LP-0MVRCLPVI0057116) contains `routing_idle_admit` as a substring, so the
+tool counted refusals as admissions. In the after window below that is 9,186
+refusals against **76** real admissions — a 120× over-count — and every refusal
+became a phantom "unpaired admit", which is why AC2 read as unmeasurable even
+where convertible requests existed. Refusals are now a separate event
+(`ac1.local_idle_admit_refused`, `event_counts.idle_admit_refused`, with
+`idle_admit_refused_by_reason`), never admissions.
+
+### AC2 — idle-admitted vs non-idle, same context bucket (76 admits, **7 paired**)
+
+Idle-admitted requests that reached a local first byte in the after window, next
+to the non-idle control in the same prompt-token bucket:
+
+| Bucket (tokens) | idle n | idle p50 / p90 (ms) | idle slot-s | non-idle n | non-idle p50 / p90 (ms) | non-idle slot-s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0–16,384 | 0 | — | — | 2,133 | 2,946.0 / 16,300.1 | 13,529.3 |
+| 16,384–32,768 | 0 | — | — | 1,312 | 4,352.8 / 51,684.2 | 18,473.3 |
+| 32,768–65,536 | 5 | 26,193.9 / 44,161.7 | 115.3 | 272 | 4,795.2 / 35,547.2 | 3,988.2 |
+| 65,536–131,072 | 2 | 17,850.8 / 29,275.7 | 35.7 | 33 | 2,225.6 / 5,405.4 | 109.0 |
+| **all** | **7** | **26,193.9 / 42,941.2** | **151.0** | **3,750** | **3,276.6** | **36,099.8** |
+
+This is the trade AC2 asks to be stated, now measured: an idle-admitted request
+holds the slot **~8× longer** to first byte (26.2 s vs 3.3 s) and consumes
+151 s of slot time for 7 requests, in exchange for serving them locally instead
+of paying a remote provider. The 7 samples are all in the two largest buckets
+(the override only admits economic large-context bypasses), the bucket edges
+are `16,384 / 32,768 / 65,536 / 131,072` tokens, and 69 of the 76 admits never
+reached a local dispatch inside the 60 s correlation window (refused later,
+cancelled by the client, or detoured) — stated so the sample is not
+over-read.
+
+### AC4 — interactive tier (before n=63, after n=648): no harm, no overlap
+
+| Interactive (`priority=high`) | before | after | change |
+| --- | ---: | ---: | ---: |
+| dispatches (n) | 63 | 648 | — |
+| p50 first byte | 16,161.5 ms | 3,589.1 ms | **−77.8 %** |
+| p90 first byte | 74,058.2 ms | 43,526.6 ms | **−41.2 %** |
+
+Interactive latency **improved** rather than regressed — the eligibility fix
+stopped dispatching prompts that could never reach a first byte, which had been
+occupying local slots ahead of interactive work. AC4's noise band is a
+one-sided harm test (a decrease is not harm), so the check passes.
+
+The causal check is explicit: idle-admitted prefills are reconstructed from
+their dispatch to first byte (7 intervals in the after window, 2 same-tier and
+5 cross-tier by the admitting request's priority), and **0 of 648
+interactive-tier dispatches started inside one** (`ac4.overlap`,
+`interactive_samples_overlapped: 0`) — including the two `high`-tier admits, so
+no interactive request waited behind an idle-admitted prefill. So there is
+neither a measured regression nor overlapping evidence to attribute one to —
+and the report says so instead of implying a same-tier cause.
+
+**AC3/AC5 on this pair (informational, not a re-decision).**
+`local_dispatch_denied` fell **45.9 % per bypass+fallback event** (0.0432 →
+0.0234; raw per-hour 20.2 → 14.2, −29.7 %), with 0 timeouts attributable to
+idle-admitted requests (12 coincident, 629 unrelated). The tool's AC5
+recommendation on this pair is `tune` — the after window carried 30.5 % *more*
+remote fallbacks (a heavier window), so the fallback-materiality bar is not met;
+the AC5 outcome of record stays `measure` + LP-0MVRCLPVI0057116.
 
 ### AC1 — which blocking shape accounts for the refusals
 
@@ -515,6 +607,10 @@ note), that a measurable regression names the **cross-tier** idle-admitted
 prefill that was in flight when the interactive dispatch started (and states
 "no in-flight overlap" when none was), and that the AC5 reasons say
 `unmeasurable` rather than printing a percentage for a missing tier.
+The idle-admit event suite asserts that `routing_idle_admit_refused` is counted
+as a refusal (`ac1.local_idle_admit_refused`,
+`idle_admit_refused_by_reason`, `event_counts`) and never as an admission —
+including the case where the refusal is the only idle-admit line in the window.
 The AC3 denial suite asserts the load-normalised verdict against the exact
 recorded window numbers (0.181 → 0.104, −42 %), that a raw per-hour increase
 driven purely by a heavier window passes while a synthetic per-event increase

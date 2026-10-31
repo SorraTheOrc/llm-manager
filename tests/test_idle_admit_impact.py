@@ -77,6 +77,21 @@ def _idle_admit(ts, session, tokens=90000, idle=412.3):
     )
 
 
+def _idle_admit_refused(ts, session, tokens=98485, idle=101.9,
+                        reason="prefill_budget_exceeded"):
+    """Admit-time prefill-feasibility refusal (LP-0MVRCLPVI0057116).
+
+    Different event from an admission: the override priced the prompt and
+    refused BEFORE dispatch, so nothing reaches a slot.
+    """
+    return (
+        f"{ts} - INFO - routing_idle_admit_refused provider=local-qwen3 model=Qwen3 "
+        f"reason={reason} idle_seconds={idle} threshold_seconds=60.0 "
+        f"estimated_tokens={tokens} new_tokens={tokens} cached_ratio=0.00 "
+        f"cache_state=cold session={session}\n"
+    )
+
+
 def _dispatch(ts, session, total_ms=61000.0, service_ms=60900.0, qwait=100.0,
               cache_state="cold", priority=None, tokens=None):
     fields = (
@@ -363,8 +378,59 @@ def test_ac1_session_bearing_fallback_lines_keep_their_reason(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# AC2 — idle vs non-idle dispatches at the same context bucket
+# AC1 — window aggregates
 # ---------------------------------------------------------------------------
+
+
+def test_ac1_idle_admit_refusals_are_not_counted_as_admissions(tmp_path):
+    """`routing_idle_admit_refused` must not inflate the admitted population.
+
+    The refusal line (LP-0MVRCLPVI0057116 admit-time pricing) is a prefix match
+    for `routing_idle_admit`, so a naive substring parse counts every refusal as
+    an admission — in a post-fix window that is ~70x the real admits and turns
+    every one of them into a phantom "unpaired admit", which is what made AC2
+    look unmeasurable.
+    """
+    lines = _baseline_lines() + [
+        _idle_admit("2026-10-20 01:00:00,000", "idle-real", tokens=90000),
+        _dispatch("2026-10-20 01:00:02,000", "idle-real", 60200.0, 60000.0,
+                  priority="high", tokens=90000),
+        _idle_admit_refused("2026-10-20 02:00:00,000", "idle-refused"),
+        _idle_admit_refused("2026-10-20 02:10:00,000", "idle-refused-2",
+                            reason="eta_exceeds_budget"),
+    ]
+    data, _ = _result(_write_log(tmp_path, lines))
+    ac1 = data["windows"]["after"]["ac1"]
+    assert ac1["local_idle_admit"] == 1
+    assert ac1["local_idle_admit_refused"] == 2
+    assert ac1["idle_admit_refused_by_reason"] == {
+        "prefill_budget_exceeded": 1,
+        "eta_exceeds_budget": 1,
+    }
+    counts = data["windows"]["after"]["ac2"]["idle_admitted_sample_counts"]
+    assert counts == {
+        "idle_admit_events": 1,
+        "paired_local_dispatches": 1,
+        "unpaired_admits": 0,
+    }
+    event_counts = data["windows"]["after"]["event_counts"]
+    assert event_counts["idle_admit"] == 1
+    assert event_counts["idle_admit_refused"] == 2
+
+
+def test_ac1_pairs_idle_admit_before_its_refusal_prefix(tmp_path):
+    """A refusal must not be counted even when it is the only idle line."""
+    lines = _baseline_lines() + [
+        _idle_admit_refused("2026-10-20 02:00:00,000", "idle-refused"),
+    ]
+    data, _ = _result(_write_log(tmp_path, lines))
+    ac1 = data["windows"]["after"]["ac1"]
+    assert ac1["local_idle_admit"] == 0
+    assert ac1["local_idle_admit_refused"] == 1
+    assert data["verdict"]["recommendation"]["decision"] == "measure"
+    assert any(
+        "No `routing_idle_admit` events" in note for note in data["verdict"]["notes"]
+    )
 
 
 def test_ac2_pairs_idle_admits_with_their_dispatch(tmp_path):
@@ -1047,7 +1113,7 @@ def test_lease_gate_absent_leaves_existing_output_unchanged(tmp_path):
     lines = [line for line in _baseline_lines() if "local_dispatch_denied" not in line]
     data, _ = _result(_write_log(tmp_path, lines))
     before = data["windows"]["before"]
-    assert before["ac1"] == {
+    expected = {
         "local_idle_admit": 0,
         "local_streams": 1,
         "remote_streams": 1,
@@ -1060,6 +1126,10 @@ def test_lease_gate_absent_leaves_existing_output_unchanged(tmp_path):
         "local_prefill_slot_seconds": 39.9,
         "timeout_events": 0,
     }
+    # Every pre-existing field keeps its value; the idle-admit refusal counter
+    # (LP-0MVRCLPVI0057116) is additive and zero on a log without refusals.
+    assert {key: before["ac1"][key] for key in expected} == expected
+    assert before["ac1"]["local_idle_admit_refused"] == 0
     assert before["ac2"]["idle_admitted_sample_counts"] == {
         "idle_admit_events": 0,
         "paired_local_dispatches": 0,
