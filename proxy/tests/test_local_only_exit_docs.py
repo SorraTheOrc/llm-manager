@@ -71,6 +71,9 @@ DOCUMENTED_EXIT_TOKENS = {
     "resident_prefix_insufficient",
     "tenant_limit",
     "prefill_thrash_cooldown",
+    # Reason-scoped local 5xx release (LP-0MVWFKESK0005G61): the measured
+    # cache-deficit abort detours the request without quarantining the entry.
+    "measured_cache_deficit",
     # Contention queue.
     "fallback_after_queue",
     "local_concurrency_limit",
