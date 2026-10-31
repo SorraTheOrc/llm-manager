@@ -98,13 +98,20 @@ def _gauge_value(gauge) -> float:
 def _labelled_value(gauge, **labels) -> float:
     """Read a labelled gauge under either prometheus_client flavour.
 
-    The real client returns a child metric exposing ``_value``; the repo-root
-    test stub keeps plain ints in ``_store``.
+    The real client returns a child metric exposing ``_value.get()``; the
+    repo-root test stub keeps a child object whose value lives in
+    ``_value.v`` (LP-0MVT1O0VG00905EL made the stub return a child so repeated
+    ``labels(...).set(...)`` calls update the same series, as the real client
+    does). An unlabelled stub keeps a plain int.
     """
     store = getattr(gauge, "_store", None)
     if isinstance(store, dict):
         key = tuple(labels.get(name) for name in gauge._labelnames)
-        return float(store.get(key, 0))
+        value = store.get(key, 0)
+        inner = getattr(value, "_value", None)
+        if inner is not None:
+            return float(getattr(inner, "v", 0))
+        return float(value)
     return float(gauge.labels(**labels)._value.get())
 
 

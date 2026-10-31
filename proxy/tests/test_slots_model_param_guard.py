@@ -95,6 +95,11 @@ ALLOWLIST: dict[tuple[str, str], str] = {
         "LP-0MVU7ZZIA0092AXW (slice 4): same conditional appender as "
         "_query_slots (AC1 audit site #2)."
     ),
+    ("observability.py", "_sample_slot_occupancy"): (
+        "LP-0MVU7ZZIA0092AXW (slice 4): the slot-occupancy sampler "
+        "(LP-0MVT1O0VG00905EL) appends '?model=' only behind `if model:`; "
+        "slice 4 guarantees a resolved model id for every /slots caller."
+    ),
     ("observability.py", "_query_slots_progress"): (
         "LP-0MVU7ZZIA0092AXW (slice 4): same conditional appender as "
         "_query_slots (AC1 audit site #3); _query_prefill_progress defaults "

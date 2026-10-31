@@ -19,7 +19,7 @@ of the production helper, not a hand calculation.
 
 ## 1. Every behaviour `session_slot_pool_size` controls today
 
-`session_slot_pool_size` is set once in `proxy/config.yaml:1680` (currently `2`). It is
+`session_slot_pool_size` is set once in `proxy/config.yaml:1753` (currently `2`). It is
 read by **nine** distinct mechanisms. The config comment already warns that it must
 match llama-server's `--parallel` (`proxy/config.yaml:1660-1679`).
 
@@ -90,7 +90,7 @@ parent AC it violates or satisfies, and the item that owns it.
 
 ### Candidate A — `session_slot_pool_size: 4` literally (config-only)
 
-- **Config delta:** `proxy/config.yaml:1680` `session_slot_pool_size: 2 → 4`
+- **Config delta:** `proxy/config.yaml:1753` `session_slot_pool_size: 2 → 4`
   (+ llama-server restart, since it is exported as `--parallel`).
 - **Live slots:** 2 → **4** (llama-server `--parallel 4`, four GPU contexts).
 - **Per-slot ctx:** 126,976 → **61,440** (clamp).
