@@ -13,12 +13,14 @@ re-dispatching the same giant prompt for hours?
 > **Later measurements live in their own sections.** The 2026-10-30
 > post-deadline **re-dispatch** fix (LP-0MVSAMN14001DMTY) is verified by
 > **LP-0MVSAMS5O006OAIS** — see
-> [Post-deadline re-dispatch fix — deployment anchor, evidence and the pending 24 h gate](#post-deadline-re-dispatch-fix-lp-0mvsamn14001dmty--deployment-anchor-evidence-and-the-pending-24-h-gate-lp-0mvsams5o006oais).
+> [Post-deadline re-dispatch fix — deployment anchor, evidence and the 24 h post-deploy measurement](#post-deadline-re-dispatch-fix-lp-0mvsamn14001dmty--deployment-anchor-evidence-and-the-24-h-post-deploy-measurement-lp-0mvsams5o006oais).
 > That section also explains why a *pushed* commit is not a *deployed* fix and
 > how the measurement anchors on the proxy restart, not on the push. The
-> deployment restart happened at **2026-10-30 23:10:47**, so the 24 h
-> post-deploy window is **2026-10-30 23:10:47 → 2026-10-31 23:10:47**
-> (LP-0MVVJYJQ9001I8QK).
+> deployment restart happened at **2026-10-30 23:10:47** and the resulting
+> window (**2026-10-30 23:10:47 → 2026-10-31 23:10:47**, a full 24 h) was
+> measured on 2026-10-31: **every AC1 gate field is met**
+> ([artefact](prefill-recovery-verification-post-deadline-24h-2026-10-31.json),
+> LP-0MVVJYJQ9001I8QK).
 
 ## Deployment under test
 
@@ -443,7 +445,7 @@ local busy 3.7 % (2,238.8 s of 86,400 s).**
   C6 after that measurement, so the pre-fix figure used a weaker signal
   (attempts>0 with zero local streams only, no llama-server eval check).
 
-## Post-deadline re-dispatch fix (LP-0MVSAMN14001DMTY) — deployment anchor, evidence and the pending 24 h gate (LP-0MVSAMS5O006OAIS)
+## Post-deadline re-dispatch fix (LP-0MVSAMN14001DMTY) — deployment anchor, evidence and the 24 h post-deploy measurement (LP-0MVSAMS5O006OAIS)
 
 This section covers a **different** fix from the C1-C5 chain above, verified by
 **LP-0MVSAMS5O006OAIS** (parent LP-0MVPUBQLQ008GJOV): the 2026-10-26 shape where
@@ -544,9 +546,9 @@ window on it:
 Build-live confirmation uses the fix's own evidence line: the first
 `routing_skip_local … reason=post_deadline_terminal` / `… entry=router_dispatch|lease_acquire`
 line written after 23:10:47 proves the deployed process runs the fix (those
-fields do not exist in any pre-fix build). The window stays open until
-2026-10-31 23:10:47; its measurement and the quoted first evidence line are
-recorded by LP-0MVVJYJQ9001I8QK (see the gate below).
+fields do not exist in any pre-fix build). The window closed at 2026-10-31
+23:10:47; LP-0MVVJYJQ9001I8QK measured it and quoted the first evidence line
+in [the gate below](#the-ac1-measurement-gate--met-over-the-24-h-post-deploy-window-2026-10-30-231047--2026-10-31-231047).
 
 ### Artefacts and what each one proves
 
@@ -554,9 +556,9 @@ recorded by LP-0MVVJYJQ9001I8QK (see the gate below).
 |---|---|---|---|
 | [`prefill-recovery-verification-post-deadline-baseline-2026-10-30.json`](prefill-recovery-verification-post-deadline-baseline-2026-10-30.json) | 2026-10-29 21:50 → 2026-10-30 21:50 | **pre-fix baseline** (window ends at the fix push; the running build had no fix) | the pre-fix build was not wedging in this particular 24 h (`wedge_denials: 0`, longest unproductive hold 195 s, `verdict_met: true`) — it does **not** demonstrate the fix, because the fix was not running |
 | [`prefill-recovery-verification-post-deadline-partial-2026-10-30.json`](prefill-recovery-verification-post-deadline-partial-2026-10-30.json) | 2026-10-30 21:47:02 → 22:35:00 (48 min) | **post-push, pre-deploy** partial window — the same, still pre-fix build | the transition itself: 3 deadline→release pairs all at 0.0 s, `unreleased: []`, 12 denials examined with 0 wedge denials (max unproductive hold 153 s), 24 local finishes after the last release. Useful as continuity evidence, **not** as fix verification |
-| `prefill-recovery-verification-post-deadline-24h-2026-10-31.json` *(captured by the scheduled follow-up, LP-0MVVJYJQ9001I8QK; linked once committed)* | 2026-10-30 23:10:47 → 2026-10-31 23:10:47 | the **post-deploy** window — the build that loaded `5b35dd80` | the AC1 gate (below) |
+| [`prefill-recovery-verification-post-deadline-24h-2026-10-31.json`](prefill-recovery-verification-post-deadline-24h-2026-10-31.json) | 2026-10-30 23:10:47 → 2026-10-31 23:10:47 (24 h) | **post-deploy** window — the build that loaded `5b35dd80`, anchored on the 23:10:47 restart | the AC1 gate (below): **MET** — 0 wedge denials, longest unproductive hold 116 s, all 6 deadline→release pairs at 0.0 s, `unreleased: []`, 45 local finishes after the last release, coverage met |
 
-### The AC1 measurement gate — status: PENDING (deployed 2026-10-30 23:10:47; window closes 2026-10-31 23:10:47)
+### The AC1 measurement gate — MET over the 24 h post-deploy window (2026-10-30 23:10:47 → 2026-10-31 23:10:47)
 
 AC1 of LP-0MVSAMS5O006OAIS requires a **>=24 h post-fix** window satisfying:
 
@@ -569,44 +571,72 @@ AC1 of LP-0MVSAMS5O006OAIS requires a **>=24 h post-fix** window satisfying:
 | `coverage.verdict_met` | `true` | no lost log span inside the window (LP-0MVLHMAWV008EKTI) |
 | `ac1.verdict_met` | `true` | the reported AC1 verdict itself |
 
-**Status: PENDING — but the deployment blocker is closed.** The fix is
-**deployed** (2026-10-30 23:10:47) and the 24 h window is open; only the
-measurement of that window is outstanding. The gap this note used to record —
-"the fix is pushed but not deployed, so no post-fix window exists" — is
-closed by the restart recorded in
-[Deployment completed](#deployment-completed--2026-10-30-231047-the-measurement-anchor).
-The measurement itself is the remaining step and cannot be produced before the
-window closes (a shorter window would not satisfy AC1's >= 24 h requirement);
-it is scheduled rather than assumed:
+**Status: MET** — the window closed at 2026-10-31 23:10:47 and was measured
+later the same evening (23:31, once the AC3 resume window had elapsed;
+LP-0MVVJYJQ9001I8QK). The artefact is
+[`prefill-recovery-verification-post-deadline-24h-2026-10-31.json`](prefill-recovery-verification-post-deadline-24h-2026-10-31.json).
 
-- **Deploy** — done (`/skill:start-proxy --restart`, reason recorded, new PID
-  3797968 at 2026-10-30 23:10:47).
-- **Measure, anchored on that timestamp:**
+| Field | Required | Measured | Verdict |
+|---|---|---|---|
+| `ac1.wedge_denials` | `0` | `0` (of 362 denials examined: 195 stale-owner, 148 short-hold, 19 productive-holder, 0 unleased) | **MET** |
+| `ac1.max_unproductive_hold_seconds` | `< 300` | `116.0` | **MET** |
+| `ac2.max_release_seconds` | `<= 300` | `0.0` (all 6 deadline→release pairs at 0.0 s) | **MET** |
+| `ac2.unreleased_sessions` | `[]` | `[]` | **MET** |
+| `ac3.local_finishes_after_last_release` | `> 0` | `45` | **MET** |
+| `coverage.verdict_met` | `true` | `true` (10 log files, `gaps: []`, 1 s window-start gap) | **MET** |
+| `ac1.verdict_met` | `true` | `true` | **MET** |
 
-  ```bash
-  python3 scripts/prefill_recovery_verification.py --measure \
-      --log-dir /var/log/llama-proxy \
-      --since '2026-10-30 23:10:47' --until '2026-10-31 23:10:47' --json \
-      > docs/dev/prefill-recovery-verification-post-deadline-24h-2026-10-31.json
-  ```
+`all_verdicts_met: true`. The two earlier artefacts remain in place as the
+pre-fix control and the transition sample; neither is presented as fix
+verification.
 
-- **Scheduled capture (one-shot cron, `# begin-post-deadline-24h`).** A
-  self-removing one-shot parses the closed window at 2026-10-31 23:20 local,
-  writes exactly the artefact above, applies the gate table, comments the
-  headline verdicts on LP-0MVVJYJQ9001I8QK, clears the item's scheduling hold
-  and dispatches the follow-up `implement` session that links the artefact
-  here (and from LP-0MVSAMS5O006OAIS), replaces this status with the measured
-  verdict and opens/keeps the item to `in_review` only on a green gate. The
-  runner is `~/proxy-usage-reports/2026-10-31_post-deadline-24h/run_measurement.py`
-  (read-only with respect to the proxy: it reads `/var/log/llama-proxy` and
-  never signals or restarts a process).
-- **Follow-up date: 2026-10-31** — a full 24 h post-deploy window closes at
-  the earliest 24 h after the restart (the push-only anchor would have closed
-  at 2026-10-31 21:47, which the deployment finding above invalidates).
+**Build-live confirmation (AC1).** The fix's own evidence line —
+`reason=post_deadline_terminal` on the `routing_skip_local` line, with
+`entry=router_dispatch` — does not exist in any pre-fix build. It first
+appears in the post-deploy log at **2026-10-30 23:32:52**, 22 min after the
+23:10:47 restart (the first admitted local dispatch to cross the prefill
+deadline), and the 24 h window carries **871** such lines (all
+`entry=router_dispatch`), against **0** in the pre-restart log rotated aside
+to `proxy.log.2026-10-30_231043`:
 
-Until that window is captured and green, the fix's production behaviour is
-**deployed but not yet measured** — the two earlier artefacts describe the
-pre-fix build; the deploy fact and the window are recorded above.
+```
+2026-10-30 23:32:52,016 - INFO - routing_skip_local session=01a18f25-334d-724f-abec-fb739f5550c5 reason=post_deadline_terminal cooldown_remaining=0s entry=router_dispatch → refusing local dispatch, chain falls to next provider
+```
+
+An `--stall-test` was deliberately **not** injected inside the window: it
+would have added a self-inflicted hold and denial to the very window the gate
+judges. The confirmation above comes from live traffic only.
+
+**How the window was captured.** A self-removing one-shot cron
+(`# begin-post-deadline-24h`) parsed the closed window at 2026-10-31 23:20
+local with the command below; the follow-up `implement` session
+(LP-0MVVJYJQ9001I8QK) re-ran it once the AC3 resume window had elapsed, linked
+the result here and from LP-0MVSAMS5O006OAIS, and committed it. The runner is
+read-only with respect to the proxy — it reads `/var/log/llama-proxy` and
+never signals or restarts a process. The window is closed and the log files
+are retained, so re-running the same command reproduces the committed
+artefact.
+
+One caveat is worth knowing when reproducing it:
+`ac3.local_finishes_after_last_release` tallies local finishes over the fixed
+1 h resume window that opens at the **last** deadline→release pair
+(`resume_window_seconds: 3600`) — here 2026-10-31 22:30:16 → 23:30:16, i.e. it
+extends 20 min **past** `until`. A measurement taken before that hour has
+fully elapsed under-counts (the 23:21 cron run recorded 28; the committed
+artefact records the settled tally). The bound is `> 0`, so the drift can only
+make AC3 look worse than it is, never better.
+
+```bash
+python3 scripts/prefill_recovery_verification.py --measure \
+    --log-dir /var/log/llama-proxy \
+    --since '2026-10-30 23:10:47' --until '2026-10-31 23:10:47' --json \
+    > docs/dev/prefill-recovery-verification-post-deadline-24h-2026-10-31.json
+```
+
+This closes the deployment finding above: the fix's production behaviour is
+now **verified over a full 24 h window anchored on the deploy**, not on the
+push. No deployed knob was re-tuned for it (`local_cold_prefill_budget_tokens`
+and the other admission settings remain as deployed).
 
 ## Limitations
 

@@ -27,6 +27,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCS_DIR = REPO_ROOT / "docs" / "dev"
 DOC_PATH = DOCS_DIR / "prefill-recovery-verification.md"
@@ -51,6 +53,9 @@ GATE_FIELDS = {
 
 #: Nullable numeric field: ``None`` when the window contains no denials.
 NULLABLE_NUMERIC_FIELDS = ("ac1.max_unproductive_hold_seconds",)
+
+#: AC1's minimum window length (a shorter window would not satisfy the gate).
+MIN_WINDOW_SECONDS = 24 * 60 * 60
 
 
 def _resolve(document: dict, dotted: str):
@@ -122,3 +127,53 @@ def test_pending_gate_status_tracks_the_post_deploy_artefact():
             "no post-deploy measurement artefact exists yet, so the doc must "
             "record the AC1 gate as status: PENDING (never silently waived)"
         )
+
+
+def test_post_deploy_artefact_satisfies_the_documented_ac1_gate():
+    """The committed post-deploy artefact meets every bound the doc publishes.
+
+    The doc reports the gate as MET once the post-deploy artefact exists, so
+    the claim has to be checkable in CI: an artefact (new or hand-edited)
+    that reports a wedge denial, an over-bound hold or release, a lost
+    coverage span, or a window shorter than 24 h fails here instead of
+    leaving an unsupported MET in the document.
+    """
+    paths = sorted(DOCS_DIR.glob(POST_DEPLOY_GLOB))
+    if not paths:
+        pytest.skip("no post-deploy >=24 h artefact committed yet")
+    path = paths[-1]
+    document = json.loads(path.read_text())
+
+    since = datetime.strptime(document["window"]["since"], "%Y-%m-%d %H:%M:%S")
+    until = datetime.strptime(document["window"]["until"], "%Y-%m-%d %H:%M:%S")
+    measured_seconds = (until - since).total_seconds()
+    assert measured_seconds >= MIN_WINDOW_SECONDS, (
+        f"{path.name}: window is {measured_seconds:.0f} s, shorter than the "
+        f"{MIN_WINDOW_SECONDS} s (24 h) AC1 requires"
+    )
+
+    assert document["coverage"]["verdict_met"] is True, (
+        f"{path.name}: log coverage inside the window is not intact"
+    )
+    assert document["ac1"]["wedge_denials"] == 0, (
+        f"{path.name}: {document['ac1']['wedge_denials']} wedge denial(s)"
+    )
+    max_unproductive_hold = document["ac1"]["max_unproductive_hold_seconds"]
+    assert max_unproductive_hold is None or max_unproductive_hold < 300, (
+        f"{path.name}: longest unproductive hold {max_unproductive_hold} s "
+        "is not under the 300 s bound"
+    )
+    max_release = document["ac2"]["max_release_seconds"]
+    assert max_release is None or max_release <= 300, (
+        f"{path.name}: slowest deadline release {max_release} s is over the "
+        "300 s bound"
+    )
+    assert document["ac2"]["unreleased_sessions"] == [], (
+        f"{path.name}: {len(document['ac2']['unreleased_sessions'])} "
+        "deadline cancellation(s) never released their lease"
+    )
+    assert document["ac3"]["local_finishes_after_last_release"] > 0, (
+        f"{path.name}: local serving never resumed after the last release"
+    )
+    assert document["ac1"]["verdict_met"] is True, f"{path.name}: ac1.verdict_met is false"
+    assert document["all_verdicts_met"] is True, f"{path.name}: not all verdicts are met"

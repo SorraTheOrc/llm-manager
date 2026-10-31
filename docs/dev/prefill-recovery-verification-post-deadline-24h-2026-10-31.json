@@ -1,0 +1,147 @@
+{
+  "window": {
+    "since": "2026-10-30 23:10:47",
+    "until": "2026-10-31 23:10:47",
+    "log_dir": "/var/log/llama-proxy"
+  },
+  "coverage": {
+    "max_gap_seconds": 3600.0,
+    "files": [
+      {
+        "file": "proxy.log-2026-10-31_00",
+        "first": "2026-10-30 23:10:48",
+        "last": "2026-10-31 00:00:00",
+        "lines": 28903
+      },
+      {
+        "file": "proxy.log.2026-10-31_003749",
+        "first": "2026-10-31 00:00:00",
+        "last": "2026-10-31 00:37:49",
+        "lines": 25967
+      },
+      {
+        "file": "proxy.log.2026-10-31_004152",
+        "first": "2026-10-31 00:37:53",
+        "last": "2026-10-31 00:41:52",
+        "lines": 2323
+      },
+      {
+        "file": "proxy.log.2026-10-31_00",
+        "first": "2026-10-31 00:41:57",
+        "last": "2026-10-31 06:41:53",
+        "lines": 120781
+      },
+      {
+        "file": "proxy.log.2026-10-31_06",
+        "first": "2026-10-31 06:42:00",
+        "last": "2026-10-31 12:41:54",
+        "lines": 110386
+      },
+      {
+        "file": "proxy.log.2026-10-31_142242",
+        "first": "2026-10-31 12:42:00",
+        "last": "2026-10-31 14:22:42",
+        "lines": 43196
+      },
+      {
+        "file": "proxy.log.2026-10-31_170536",
+        "first": "2026-10-31 14:36:12",
+        "last": "2026-10-31 17:05:36",
+        "lines": 86167
+      },
+      {
+        "file": "proxy.log.2026-10-31_17",
+        "first": "2026-10-31 17:05:40",
+        "last": "2026-10-31 23:05:38",
+        "lines": 133578
+      },
+      {
+        "file": "proxy.log.2026-10-31_231004",
+        "first": "2026-10-31 23:05:40",
+        "last": "2026-10-31 23:10:04",
+        "lines": 1827
+      },
+      {
+        "file": "proxy.log",
+        "first": "2026-10-31 23:10:08",
+        "last": "2026-10-31 23:10:47",
+        "lines": 323
+      }
+    ],
+    "gaps": [],
+    "window_start_gap_seconds": 1.0,
+    "window_end_gap_seconds": 0.0,
+    "verdict_met": true
+  },
+  "ac1": {
+    "verdict_basis": "wedge_attribution: a denial caused by a lease owner holding the gate with no client-visible first byte for >= wedge_bound_seconds (restated by LP-0MVLHMCN6003GAMD AC1)",
+    "wedge_bound_seconds": 300,
+    "wedge_denials": 0,
+    "productive_holder_denials": 19,
+    "short_hold_denials": 148,
+    "stale_owner_denials": 195,
+    "unleased_denials": 0,
+    "denials_examined": 362,
+    "max_unproductive_hold_seconds": 116.0,
+    "max_productive_hold_seconds": 209.0,
+    "wedge_examples": [],
+    "diagnostics": {
+      "min_attempts": 10,
+      "thrash_hours": [],
+      "lease_active_fallbacks": 144,
+      "hours_checked": 25,
+      "note": "thrash hours and the lease-active fallback volume are admission-side signals (LP-0MVN1IQTF0037WTG / LP-0MVO8H7VQ003B12I / LP-0MVOFVCA2008DQVE); they no longer determine this verdict"
+    },
+    "verdict_met": true
+  },
+  "ac2": {
+    "recovery_bound_seconds": 300,
+    "pairs": [
+      {
+        "session": "audit-RISE-0MVUWCAMF006KGWH-parent-fed5efd0",
+        "deadline": "2026-10-30 23:42:40",
+        "release": "2026-10-30 23:42:40",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793430632-2069774-29959",
+        "deadline": "2026-10-31 12:01:58",
+        "release": "2026-10-31 12:01:58",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793453898-1428679-31402",
+        "deadline": "2026-10-31 13:40:19",
+        "release": "2026-10-31 13:40:19",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793460910-1064268-25397",
+        "deadline": "2026-10-31 15:38:54",
+        "release": "2026-10-31 15:38:54",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "audit-AH-0MVVNKP1B00701HR-parent-71c0b994",
+        "deadline": "2026-10-31 15:55:25",
+        "release": "2026-10-31 15:55:25",
+        "release_seconds": 0.0
+      },
+      {
+        "session": "herdr-1793485196-576591-19493",
+        "deadline": "2026-10-31 22:30:16",
+        "release": "2026-10-31 22:30:16",
+        "release_seconds": 0.0
+      }
+    ],
+    "unreleased_sessions": [],
+    "max_release_seconds": 0.0,
+    "verdict_met": true
+  },
+  "ac3": {
+    "resume_window_seconds": 3600,
+    "local_finishes_after_last_release": 45,
+    "verdict_met": true
+  },
+  "all_verdicts_met": true
+}
