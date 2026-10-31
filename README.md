@@ -23,7 +23,7 @@ Key features
 ### Session & Slot Management
 - **Job-level slot scheduler** — configurable slot pool with queueing, per-job timeouts, and load-aware skip to avoid ReadTimeouts under concurrency.
 - **Dispatch leases** — per-session reservation of the local backend with adaptive timeouts and prefill-progress polling.
-- **Priority-based routing** — per-request `X-Priority: low|medium|high` selects the provider chain and gates the routing knobs (queueing, economic-bypass, local-vs-remote); during the configured cheap window every request routes as `low`. The slot pool is fixed at 2 and no routing-policy change ever restarts the proxy.
+- **Priority-based routing** — per-request `X-Priority: low|medium|high` selects the provider chain and gates the routing knobs (queueing, economic-bypass, local-vs-remote); during the configured cheap window every request routes as `low`. The slot pool size is `session_slot_pool_size` (shipped as 2; the slot count is a config value, not a structural constant — see [the single-slot impact audit](docs/dev/single-slot-impact.md)) and no routing-policy change ever restarts the proxy.
 - **Session tracking** — active session list with preview text, model, and provider; sessions can be deleted via the admin API.
 - **Session recording retention** — automatic pruning of old recordings with configurable retention days and background intervals.
 - **Grandfathering** — legacy session migration for in-flight requests across proxy restarts.
@@ -268,7 +268,7 @@ configured policy. The caps bound the queue for every priority:
 | `contention_queue_max_depth` | Max queued requests | `[1, 16]` |
 | `contention_queue_max_wait_seconds` | Max seconds to wait for a local slot | `[1, session_guardrail_max_runtime_seconds]` |
 
-**Shipped defaults (unified config, slot pool fixed at 2):**
+**Shipped defaults (unified config, slot pool `session_slot_pool_size: 2`):**
 
 | Priority | Policy | Depth | Max wait | Rationale |
 |---|---|---|---|---|

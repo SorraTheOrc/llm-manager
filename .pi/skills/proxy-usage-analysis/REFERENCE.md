@@ -5,6 +5,14 @@ inputs, report outputs, the report interpretation guide, and known
 limitations. The skill itself is a thin, CLI-focused wrapper — see
 [SKILL.md](SKILL.md) for invocation, options, and the daily cron.
 
+> **Slot geometry.** The report's slot figures follow the live
+> `server.session_slot_pool_size` (shipped value 2; there is no fixed 2-slot
+> assumption anywhere in the analysis). What changes — and what does not —
+> when that value goes to 1 is analysed in
+> [`docs/dev/single-slot-impact.md`](../../../docs/dev/single-slot-impact.md)
+> (LP-0MVTF26NP003KXKJ), which includes this report's own metric catalogue in
+> its inventory (§3.5) and its metrics-gap list (§6).
+
 ## Inputs
 
 - Log source (read-only): `/var/log/llama-proxy/proxy.log` plus rotated
@@ -804,6 +812,10 @@ entry is a local runtime edit, not a committed artifact.
       config profile (`config-fast.yaml`: 3 slots @ 131072; `config-cheap.yaml`:
       2 slots @ 262144) — the CSV `slots`/`ctx_size` columns and the report's
       per-slot context figures reflect the profile that was actually active.
+      These are ARCHIVED windows: the per-mode profiles are retired
+      (LP-0MVDT94F0003VHUA), so current windows use the single
+      `session_slot_pool_size` value instead, and a single-slot deployment
+      would report 1 slot rather than 2 — the report has no fixed slot count.
       This source **wins** whenever the logs carry the evidence, so archived
       windows keep their historical attribution.
    2. **Priority window** (the current deployment) — the fast/cheap mode

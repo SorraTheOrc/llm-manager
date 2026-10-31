@@ -11,6 +11,12 @@
 
 ## References
 
+- [Single-slot impact audit](single-slot-impact.md) — what the slot count drives
+  automatically, what must be changed by hand, and the predicted throughput cost
+  (LP-0MVTF26NP003KXKJ). Nothing in that report changes this design; it is the
+  empirical footing for the cache-preservation arguments below.
+- [Slot-geometry A/B protocol](slot-geometry-ab.md) — the measurement that
+  decides between 1 x 262,144 and 2 x 131,072.
 - [F1: Slot Thrashing Evidence](../slot-thrashing-investigation/findings.md) —
   empirical confirmation of 95–98% steal rate with `pool_size=1`
 - Session Routing Regression Suite (LP-0MPU11WBN004MFQ8)

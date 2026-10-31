@@ -1364,11 +1364,16 @@ def _get_local_model_ctx_size(config: dict) -> int:
 def _get_active_local_slots(config: dict) -> int:
     """Return the number of currently active local slots.
 
-    The slot count is a single per-mode definition: the active mode-profile
-    config's ``session_slot_pool_size`` (default/fast: 3, cheap: 2). The
-    time-based slot scheduler was removed (operator-directed simplification
-    LP-0MTZRM5HV0007S0V) — there is no schedule-aware live slot count.
-    Returns 1 as a safe default when nothing is configured.
+    The slot count is a single definition: the ``server`` block's
+    ``session_slot_pool_size`` (shipped value 2). The per-mode profiles are
+    retired (LP-0MVDT94F0003VHUA), so there is no fast/cheap distinction left;
+    the historical "default/fast: 3, cheap: 2" pairs described profiles that no
+    longer exist. The time-based slot scheduler was removed (operator-directed
+    simplification LP-0MTZRM5HV0007S0V) — there is no schedule-aware live slot
+    count. Returns 1 as a safe default when nothing is configured.
+
+    A single-slot switch changes exactly this value; see
+    ``docs/dev/single-slot-impact.md`` for what follows it and what does not.
     """
     server_cfg = config.get("server", config)
     try:
@@ -2069,8 +2074,10 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
         # single source as ``session_slot_max_prompt_tokens`` persistence.
         # No circularity: ``compute_hard_routing_cap`` derives its denominator
         # from the RAW warm config + per-slot threshold, not this clamped warm.
-        # The per-mode ratios are retired (0 → disabled) and the slot pool is
-        # fixed at 2, so the unified profile is used unconditionally.
+        # The per-mode ratios are retired (0 → disabled) and the mode axis is
+        # gone (LP-0MVDT94F0003VHUA), so one unified ratio profile applies at
+        # ANY slot count — the pool size (``session_slot_pool_size``, currently
+        # 2) does not select a ratio set.
         try:
             _hard_cap = compute_hard_routing_cap("fast", config)
         except Exception:

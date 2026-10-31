@@ -1754,9 +1754,15 @@ server:
   #
   #
   # Server restart required to change this value (no hot reload).
-  # Slot pool is FIXED at 2 (the N=2 verdict LP-0MV9UNGEB009XUZ5 /
-  # LP-0MVCGYAI80084PCZ); bursts are absorbed by the bounded contention
-  # queue below. No routing policy change ever restarts the proxy or
+  # This value IS the slot geometry — it is the only place the pool size is
+  # set, and it is not structurally pinned to 2. It currently reads 2 on the
+  # strength of the N=2 verdict (LP-0MV9UNGEB009XUZ5 / LP-0MVCGYAI80084PCZ);
+  # bursts are absorbed by the bounded contention queue below. A switch to a
+  # single slot is a config change analysed in
+  # docs/dev/single-slot-impact.md (LP-0MVTF26NP003KXKJ), which lists the
+  # keys a *coherent* switch must change together — this one alone leaves the
+  # effective warm ceiling at 120000, so the doubled per-slot context routes
+  # nothing extra. No routing policy change ever restarts the proxy or
   # llama-server again (LP-0MVDT94F0003VHUA AC4).
   session_slot_pool_size: 2
 
