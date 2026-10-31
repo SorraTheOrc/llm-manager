@@ -374,9 +374,9 @@ curl -s 'http://127.0.0.1:9090/api/v1/targets?state=active' \
 # expected: llama-proxy up http://localhost:8000/metrics
 #           node-exporter up http://localhost:9100/metrics
 
-# 5. Rules loaded: 5 groups, 10 rules
+# 5. Rules loaded: 5 groups, 11 rules
 curl -s http://127.0.0.1:9090/api/v1/rules | jq -r '.data.groups[] | "\(.name) \(.rules|length)"'
-# expected: gpu-compute.rules 4
+# expected: gpu-compute.rules 5
 #           gpu-memory.rules 2
 #           proxy-5xx.rules 1
 #           llama-remote-stream.rules 1
@@ -426,6 +426,46 @@ gpu:power_watts:amdgpu
 Sanity note: the sample values depend on the machine's state. Verified
 2026-10-25 on this host: `avg_over_time(gpu:computing:bool[2h])` → 0.5,
 `sum_over_time(...[24h:15s]) * 15` → 4605 s, `gpu:power_watts:avg5m` → 67.7 W.
+
+### GPU workload fraction (power **and** a busy llama slot)
+
+`gpu:computing:bool` answers "is the GPU at compute power?", which includes
+work another process is doing. `gpu:computing_workload:bool` is the one shared
+definition of "the GPU is doing **our** local model's work": 1 while power is
+at or above the 90 W compute threshold **and** at least one llama-server slot is
+processing, 0 otherwise. The CLI, the alert rules and ad-hoc queries all read
+this series instead of re-deriving the condition.
+
+```promql
+# Share of the last 2h the GPU spent on OUR work (0..1)
+avg_over_time(gpu:computing_workload:bool[2h])
+
+# Our computing seconds in the last 24h
+sum_over_time(gpu:computing_workload:bool[24h:15s]) * 15
+
+# How much compute power we owned (power-only), for comparison
+gpu:computing:bool
+```
+
+Three properties matter when querying it:
+
+- **The join is label-agnostic.** The power series comes from the
+  `node-exporter` job (`instance="localhost:9100"`) and `llama_slots_busy` from
+  the `llama-proxy` job (`instance="localhost:8000"`), so the rule multiplies
+  with `on()` (empty label set) rather than matching on any label. A naive
+  `and on(instance)` join matches nothing and records no series at all — which
+  looks like "unknown" forever, or like "never computing" on a dashboard.
+- **Absence stays absent.** With `llama_slots_busy` missing (sampler or proxy
+  down) or the power series missing (node_exporter down) the rule records **no
+  series**, never 0. Absence is *unknown*; 0 is *idle*. Do not `or vector(0)`
+  in a query unless you deliberately want unknown reported as idle.
+- **The recorded labels are the power series' labels**
+  (`instance="localhost:9100"`, `job="node-exporter"`); no llama-proxy labels
+  leak into the combined series.
+
+The behavioural cases (0/1 values, the 90 W boundary, and both missing-input
+cases) live in `monitoring/tests/gpu_rules_test.yml`
+(LP-0MVT1O4O1004ND6L).
 
 ### Why not `amd-smi`, `rocm-smi` or `amdtop`?
 
@@ -544,8 +584,10 @@ min(timestamp(up))
 | `LlamaSlotsQueryFailuresCritical` | critical | `rate(llama_slots_query_failures_total[5m]) > 10` | 10m | [slots_query_alerts.yaml](slots_query_alerts.yaml) |
 | `RemoteStreamWatchdogTerminated` | warning | `rate(llama_remote_stream_terminated_total[5m]) > 0` | 5m | [remote_stream_alerts.yaml](remote_stream_alerts.yaml) |
 
-There are also three **recording** rules in `gpu_compute_rules.yaml`:
-`gpu:power_watts:amdgpu`, `gpu:computing:bool`, `gpu:power_watts:avg5m`.
+There are also four **recording** rules in `gpu_compute_rules.yaml`:
+`gpu:power_watts:amdgpu`, `gpu:computing:bool`, `gpu:computing_workload:bool`
+(power ≥ 90 W **and** ≥ 1 busy llama slot — the shared definition of our local
+model's work) and `gpu:power_watts:avg5m`.
 
 Alerts are visible in the UI (`/alerts`) and API (`/api/v1/rules`). Notification
 routing (email, webhook) needs Alertmanager, which is **not deployed** — alerts

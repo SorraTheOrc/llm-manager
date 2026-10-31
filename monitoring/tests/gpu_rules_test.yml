@@ -138,3 +138,107 @@ tests:
             exp_annotations:
               summary: "GPU GTT memory usage > 90% of the 128 GiB pool (critical)"
               description: "GTT on localhost:9100 is above 90% of the 128 GiB pool (124GiB in use). A further model load, or a large-context session, is likely to fail. Unload an idle model or reduce local context immediately."
+
+  # ---------------------------------------------------------------------------
+  # Combined computing-workload rule: power >= 90 W AND >= 1 busy llama slot
+  # ---------------------------------------------------------------------------
+  # The two inputs come from DIFFERENT scrape jobs: the power series carries
+  # instance="localhost:9100" (node_exporter) and llama_slots_busy carries
+  # instance="localhost:8000" (llama-proxy). The series below deliberately keep
+  # those distinct instance labels, so a label-matching regression (e.g.
+  # `and on(instance)`, or any default matching) yields no series at all and
+  # fails here instead of shipping a rule that can never be 1.
+  #
+  # Timeline (1m steps): power 45 W with slots busy is idle, 115 W without slots
+  # busy is some other GPU consumer, and only 115 W with slots busy is OUR work.
+  - interval: 1m
+    input_series:
+      - series: 'node_hwmon_power_average_watt{chip="0000:c5:00_0",sensor="power1",instance="localhost:9100",job="node-exporter"}'
+        values: '45 45 115 115 115 115 115 115 115 115 90 90'
+      - series: 'node_hwmon_chip_names{chip="0000:c5:00_0",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+        values: '1x12'
+      # 2 busy slots is still "at least one" — the rule is >= 1, not == 1.
+      - series: 'llama_slots_busy{instance="localhost:8000",job="llama-proxy"}'
+        values: '2 2 2 0 0 1 1 1 1 1 1 1'
+
+    promql_expr_test:
+      # power >= 90 W AND 2 busy slots -> 1. The output keeps the power series'
+      # labels (no llama-proxy labels leak into the recorded series).
+      - expr: 'gpu:computing_workload:bool'
+        eval_time: 2m
+        exp_samples:
+          - labels: 'gpu:computing_workload:bool{chip="0000:c5:00_0",sensor="power1",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+            value: 1
+      # power >= 90 W but 0 busy slots -> 0, even though the power-only rule is 1
+      # (another process is drawing compute-level power).
+      - expr: 'gpu:computing_workload:bool'
+        eval_time: 3m
+        exp_samples:
+          - labels: 'gpu:computing_workload:bool{chip="0000:c5:00_0",sensor="power1",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+            value: 0
+      - expr: 'gpu:computing:bool'
+        eval_time: 3m
+        exp_samples:
+          - labels: 'gpu:computing:bool{chip="0000:c5:00_0",sensor="power1",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+            value: 1
+      # power < 90 W with busy slots -> 0 (a live stream at low power is not
+      # compute-level work).
+      - expr: 'gpu:computing_workload:bool'
+        eval_time: 0m
+        exp_samples:
+          - labels: 'gpu:computing_workload:bool{chip="0000:c5:00_0",sensor="power1",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+            value: 0
+      # Boundary: exactly 90 W with a busy slot is computing (>= 90 W).
+      - expr: 'gpu:computing_workload:bool'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'gpu:computing_workload:bool{chip="0000:c5:00_0",sensor="power1",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+            value: 1
+
+  # ---------------------------------------------------------------------------
+  # Missing llama_slots_busy (sampler/proxy down) -> the recorded series is
+  # ABSENT, never 0: absence is "unknown", 0 is "idle".
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'node_hwmon_power_average_watt{chip="0000:c5:00_0",sensor="power1",instance="localhost:9100",job="node-exporter"}'
+        values: '115x6'
+      - series: 'node_hwmon_chip_names{chip="0000:c5:00_0",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+        values: '1x6'
+
+    promql_expr_test:
+      # Positive control: the power-only rule is still 1 here, so the absence
+      # below comes from the missing join input and not from a dead rule chain.
+      - expr: 'gpu:computing:bool'
+        eval_time: 3m
+        exp_samples:
+          - labels: 'gpu:computing:bool{chip="0000:c5:00_0",sensor="power1",chip_name="amdgpu",instance="localhost:9100",job="node-exporter"}'
+            value: 1
+      # No llama_slots_busy series at all: nothing is recorded (a fabricated 0
+      # would silently turn "unknown" into "idle").
+      - expr: 'gpu:computing_workload:bool'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'absent(gpu:computing_workload:bool)'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # ---------------------------------------------------------------------------
+  # Missing power series (node_exporter down) -> the recorded series is absent.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'llama_slots_busy{instance="localhost:8000",job="llama-proxy"}'
+        values: '2x6'
+
+    promql_expr_test:
+      - expr: 'gpu:computing_workload:bool'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'absent(gpu:computing_workload:bool)'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{}'
+            value: 1
