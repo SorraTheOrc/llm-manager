@@ -12,7 +12,9 @@
 #      than --min-age-days (default 1) to protect active sessions.
 #   3. ORPHAN SIDECARS: delete `.ratio.json` files whose snapshot is gone and
 #      that are older than --min-age-days (default 1), so an in-flight save is
-#      never swept mid-write. The seed path can only ever report them as
+#      never swept mid-write. Newer orphans are kept and reported as kept in
+#      the summary; `--min-age-days 0` disables that protection, exactly as it
+#      does for the size rule. The seed path can only ever report orphans as
 #      `slot_ratio_seed outcome=missing_snapshot`, and 139 of them had
 #      accumulated against 0 snapshots before this rule existed
 #      (LP-0MVK0E80C009HUQC, LP-0MVUJBFRL005VDNA).

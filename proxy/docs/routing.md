@@ -801,6 +801,15 @@ Before this, it globbed `"$SLOT_CACHE_DIR"/slot_*.bin` only, so with every live
 snapshot in `localhost-8080/` it printed `No slot files found` and never touched
 an orphan.
 
+The orphan sweep is **age-bounded like the other two rules**
+(LP-0MVUJBFRL005VDNA). A sidecar that lost its snapshot moments ago may belong
+to a save still in flight, or to a save that failed between writing the sidecar
+and the snapshot, so recent orphans (newer than `--min-age-days`, default 1 day)
+are kept and reported as kept in the summary, while aged orphans are pruned.
+`--min-age-days 0` disables the protection, exactly as it does for the size
+rule — so all three deletion rules share one mental model: age-bounded, never
+deleting anything inside the protective window.
+
 ## Capacity-based local admission (LP-0MVGDUVS6003T2IX)
 
 The economic gate (`local_large_context_cold_cache_threshold`, 38 000 new

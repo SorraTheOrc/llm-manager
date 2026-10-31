@@ -3259,6 +3259,11 @@ to prevent disk-space exhaustion:
   prune orphan sidecars whose snapshot is gone — the scan covers the cache root
   **and** any legacy per-endpoint `{host}-{port}/` subdirectories
   (LP-0MVK0E80C009HUQC, LP-0MVVI8TEU006KTOZ)
+- Never delete anything newer than **1 day** (`--min-age-days`, default: `1`):
+  the size rule protects recent snapshots and the orphan sweep protects recent
+  sidecars, keeping them and reporting them as kept in the summary. Aged
+  orphans are still pruned, and `--min-age-days 0` disables this protection
+  (LP-0MVUJBFRL005VDNA)
 
 **Usage:**
 
