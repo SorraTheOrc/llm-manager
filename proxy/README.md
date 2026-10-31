@@ -2231,6 +2231,68 @@ stayed at 79.61 %, because that build predated the child-port resolver
 Figures, per-poll attribution and the re-derivation commands are in the
 [per-slot status contract](docs/per-slot-status-verification.md).
 
+#### Model resolution rule
+
+Every proxy-initiated `/slots` query sends an explicit `?model=` — the query
+helpers append it unconditionally, so a model-less request is unreachable
+(fenced by the guard test, see below). The id is resolved from the router's
+`/models` ids/presets by `resolve_local_model_id()`
+(`proxy/proxy/router_helpers.py`), in this order:
+
+1. **Explicit caller model** — a model the caller already knows (e.g. the
+   embed child `mxbai-embed`) is used verbatim (`source=explicit`).
+2. **`srv.current_model`** — the model the proxy itself loaded/manages
+   (`source=current_model`).
+3. **Sole non-embed `/models` preset** — when `GET /models` lists exactly one
+   non-embedding id, that id is used. Router ids are *presets*, never assumed:
+   `Qwen3`, `Qwen3-32B`, `Qwen2.5-7B`, `Qwen/Qwen3-Coder-Next-GGUF:Q5_K_M`, …
+   (`source=models_snapshot`).
+4. **Live child-port log signal, canonicalised** — the model named by the
+   newest `proxying request to model <model> on port <port>` line is matched
+   case-insensitively against the `/models` ids, so the emitted `?model=` is
+   the router's own spelling even when the log only names an alias
+   (`Qwen3` → `Qwen3-32B`, ``source=log_signal+models_snapshot``).
+5. **Live child-port log signal verbatim** — that signal is the id the router
+   itself reported, so it is resolvable by definition
+   (`source=log_signal`).
+6. **`"Qwen3"` as a logged last resort** (`LAST_RESORT_MODEL_ID`) — used only
+   when nothing above exists; the fallback is never silent, logging
+   `slots_model_resolution_last_resort: ...` (throttled) (`source=last_resort`).
+
+The sole-preset `/models` match (rule 3) deliberately precedes the live log
+signal: when `/models` names exactly one non-embed model there is nothing to
+disambiguate, while the log signal is still used both to canonicalise a preset
+alias (rule 4) and, absent `/models`, verbatim (rule 5).
+
+The `/models` snapshot is fetched once per llama-server pid/model and cached
+with the same TTL as the child-port cache; the sync discovery path never
+blocks on HTTP (`ensure_router_model_ids()` warms the cache on the async
+dispatch path). The resolved **id** and the resolved **port** are independent:
+a preset alias mismatch (`Qwen3-32B` vs the log's `Qwen3`) still resolves the
+child port, so every query targets the discovered child port and never
+traverses the router under load.
+
+**Router `/slots` HTTP 400 classes.** The router answers `GET /slots` with a
+400 in three situations, and only the third is expected:
+
+| Class | `?model=` sent | Meaning | Action |
+|---|---|---|---|
+| **Missing** | none | Proxy defect: a construction site forgot the parameter | Fenced by the guard test — a model-less `/slots` URL fails the suite |
+| **Unknown / unresolvable** | an id/preset the router does not list | Proxy defect: the id was not resolved from `/models` | Fix the resolution — the id must come from rules 1–5 above |
+| **Unloaded** | a valid id whose model has no live instance (idle unload, preload window) | Expected truth: the router's definitive "model absent" answer | Fail open — cached counts are not substituted (`slots_failure_is_definitive_model_absent`) |
+
+The rule is enforced by
+[`proxy/tests/test_slots_model_param_guard.py`](tests/test_slots_model_param_guard.py)
+(a static fence: every `/slots` URL carries `?model=` inline or is extended by
+an unconditional appender) and the resolution order by
+[`proxy/tests/test_slots_model_id_resolution.py`](tests/test_slots_model_id_resolution.py).
+Per-query attribution of individual router 400s (a caller tag plus a
+`http_400` failure metric on the detail/progress paths) is deferred to
+LP-0MVTDMXXH005D5D5: llama.cpp's router access line omits the query string, so
+a historical 400 cannot be attributed from `llama-server.log`. The full class
+split and its triage commands are in
+[docs/dev/slots-500-triage.md](../docs/dev/slots-500-triage.md).
+
 #### List Models
 ```bash
 curl http://localhost:8000/v1/models

@@ -313,6 +313,37 @@ Consequences when reading these figures:
 - The post-fix 24 h confirmation window is AC3 of LP-0MVVCXUDZ007XID0, using
 the recipe in this document.
 
+## The three router `/slots` 400 classes
+
+A router-responder `GET /slots ... 400` line **cannot be attributed from
+`llama-server.log`**: llama.cpp's router access line omits the query string, so
+`srv log_server_r: done request: GET /slots 127.0.0.1 400` is identical with
+and without `?model=` (measured 2026-10-29). Per-query attribution (a caller
+tag plus a `http_400` failure metric on the detail/progress paths) is deferred
+to LP-0MVTDMXXH005D5D5; until then the proxy distinguishes the classes by
+construction:
+
+| Class | Request | Interpretation | Proxy response |
+|---|---|---|---|
+| **Missing** `?model=` | `GET /slots` with no model | Proxy defect: a `/slots` construction site dropped the parameter | Not reachable: the query helpers append `?model=` unconditionally, and the static fence `proxy/tests/test_slots_model_param_guard.py` fails the suite on any model-less construction |
+| **Unknown / unresolvable** | `GET /slots?model=<id>` where `<id>` is not a `/models` id/preset | Proxy defect: a hard-coded or guessed default instead of a resolved id | Not reachable through the rule: `resolve_local_model_id()` (`proxy/proxy/router_helpers.py`) resolves explicit → `srv.current_model` → the sole non-embed `/models` preset → the canonicalised live child-port log signal → the log id verbatim → a *logged* `"Qwen3"` last resort. Guarded by `proxy/tests/test_slots_model_id_resolution.py` |
+| **Unloaded** | `GET /slots?model=<valid id>` with no live instance | **Expected truth**: idle-model unload, or the window before a preload finishes | The definitive "model absent" signal: `slots_failure_is_definitive_model_absent()` (`proxy/proxy/observability.py`) returns True for `http_400`/`http_404`, and callers fail open instead of substituting cached slot counts — a fossil snapshot of the last request (LP-0MSVP7XJ6008QPKX, LP-0MVKSXR4P001V0CM AC3) |
+
+Reading a 400 in a triage window:
+
+- `router:400` counts in the responder split are **bounded, not attributed**:
+a non-zero count is acceptable only when each event is explained by the
+unloaded-model class or by a call site removed in LP-0MVP7HV7Q001AJF8. An
+unexplained event reopens the item.
+- The proxy-side metric `llama_slots_query_failures_total{reason="http_400"}`
+records the class for the status path (`_query_slots`); the detail and progress
+paths record no failure metric yet — that gap is LP-0MVTDMXXH005D5D5.
+- A **missing** or **unknown** 400 is a defect even when the request would
+succeed on retry: the `?model=` is what the router resolves, so a wrong id
+degrades silently to "0/0 slots" through fail-open.
+- The README states the same rule for operators
+(`proxy/README.md` → *Child-port discovery* → *Model resolution rule*).
+
 ## The responder split counts *every* status code (LP-0MVVWTWGY004BO5H)
 
 The tool used to pre-seed a fixed set of status counters
