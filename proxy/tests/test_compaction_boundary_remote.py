@@ -4,14 +4,14 @@ Feature: LP-0MVRBQBDF0037OZ5 ("Compact before moving from local to remote").
 This module: LP-0MVTDU4P8001L4II — the TDD-red contract for the boundary
 decision (LP-0MVTDU6Y1004ZCGX), the slot pin plus immediate lease release
 (LP-0MVTDU91C003Q9YZ) and the dispatch hook that consumes them
-(LP-0MVTDUBR00038ZRL).
+(LP-0MVTDUBR00038ZRL), plus LP-0MVTDUEF5007A1SP — the end-to-end integration
+and default-off regression tests at the bottom of the file.
 
 The point of this module is that the *trigger*, the *slot pin* and the
-*release ordering* are specified by executable assertions before any
-production code exists: every test here fails only because the boundary
-symbols are absent (``missing boundary-compaction symbol …``), never because
-of an unrelated import error, and it turns green only when the contract below
-is implemented.
+*release ordering* were specified by executable assertions before any
+production code existed: every test here failed only because the boundary
+symbols were absent (``missing boundary-compaction symbol …``), never because
+of an unrelated import error, and it turned green only as each child landed.
 
 Contract pinned by this module
 ------------------------------
@@ -83,31 +83,29 @@ Machine-readable reason tokens (parent AC4 — logged at WARNING by the hook)::
     boundary_summarizer_failed  the summariser ran and failed open
                                 (blank / ``EmptySummary`` / any other raise)
 
-TDD-red convention
-------------------
+TDD-red convention (retired)
+----------------------------
 
-The not-yet-implemented contract is pinned with ``pytest.mark.xfail(
-strict=True)`` — the established test-first convention in this suite
+The contract was pinned with ``pytest.mark.xfail(strict=True)`` — the
+established test-first convention in this suite
 (``test_local_only_refusal_matrix.py``, ``test_compaction_headers_contract.py``,
-``test_local_resident_prefix_admission.py``): the rows stay red without
-breaking the green tree, and ``strict`` means the implementing children cannot
-land without flipping the marker off with the behaviour. LP-0MVTDU6Y1004ZCGX
-has removed the decision/config markers (see ``TestBoundaryDecision``,
-``TestBoundaryConfig``, plus this session's ``TestLocalProvenance``,
-``TestBoundaryConfigValidation`` and ``TestLocalCompletionProvenanceWiring``
-below); LP-0MVTDU91C003Q9YZ removed the slot-pin and release-ordering markers
-(``TestSlotPinnedSummariser``, ``TestSlotReleaseOrdering``) when
-``build_slot_pinned_summarizer`` and ``summarise_on_session_slot`` landed, so
-the only remaining markers belong to the not-yet-wired dispatch hook. A red
-row afterwards is a real failure.
+``test_local_resident_prefix_admission.py``). Every marker has since been
+flipped off with the behaviour it pinned: LP-0MVTDU6Y1004ZCGX (decision and
+config plus ``TestLocalProvenance``, ``TestBoundaryConfigValidation`` and
+``TestLocalCompletionProvenanceWiring``), LP-0MVTDU91C003Q9YZ
+(``TestSlotPinnedSummariser``, ``TestSlotReleaseOrdering``) and
+LP-0MVTDUBR00038ZRL (``TestBoundaryCompactionHook``,
+``TestBoundaryCompactionDispatchWiring``,
+``TestBoundaryHookDirectRemoteDispatch``). No ``xfail`` marker remains, so a
+red row is a real failure.
 
 The one config assertion that already holds (``compaction_trigger_ratio`` stays
 ``0`` — the boundary knob never re-enables assembly-time compaction) is
 **not** marked: it is the regression guard that stops the knob being folded
 into the assembly trigger.
 
-Constraints honoured here: injected fakes only — no live llama-server, GPU or
-network access, no sleeps, deterministic.
+Constraints honoured here: injected fakes and stubbed ``httpx`` transports
+only — no live llama-server, GPU or network access, no sleeps, deterministic.
 """
 
 from __future__ import annotations
@@ -1775,3 +1773,619 @@ class TestBoundaryHookDirectRemoteDispatch:
         await ui._evaluate_boundary_compaction_before_remote(
             self._srv(), request, {"type": "remote"}, {"messages": []}
         )
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVTDUEF5007A1SP — integration: a locally-served session escalates remote
+#
+# Everything below drives production code end to end: the mixed and
+# remote-only dispatch cycles, ``evaluate_boundary_compaction``, the real
+# slot-pinned summariser (``build_slot_pinned_summarizer``), the real lease
+# release and the real session store. Only the two HTTP transports are
+# stubbed — the local summariser POST and the remote POST each run through an
+# ``httpx.MockTransport``, so every body assertion below reads the bytes that
+# would leave the process rather than an in-memory dict.
+# ---------------------------------------------------------------------------
+
+_INT_SESSION = "sess-boundary-integration"
+_INT_LOCAL_MODEL = "Qwen3"
+_INT_SUMMARY = "INTEGRATION BOUNDARY SUMMARY"
+_INT_LOCAL_PROVIDER = {
+    "name": "local-qwen3",
+    "type": "local",
+    "llama_model": _INT_LOCAL_MODEL,
+}
+_INT_REMOTE_PROVIDER = {
+    "name": "remote-integration",
+    "type": "remote",
+    "endpoint": "https://remote.invalid/v1",
+}
+#: Sibling remote used only by the in-cycle retry case.
+_INT_SECOND_REMOTE_PROVIDER = {
+    "name": "remote-integration-2",
+    "type": "remote",
+    "endpoint": "https://remote2.invalid/v1",
+}
+#: Turns/size that clear the planner's 38 000-token fast target with room to
+#: fold several turns (deterministic: only the routing estimator is involved,
+#: which falls back to a character heuristic for an unknown model).
+_INT_TURNS = 10
+_INT_TURN_CHARS = 12000
+#: A guard small enough that the large history always clears it.
+_INT_GUARD_TOKENS = 200
+
+
+def _integration_config(*, enabled: bool = True, min_tokens: int = _INT_GUARD_TOKENS) -> dict:
+    """Boundary config wired for the integration harness."""
+    cfg = _boundary_config(enabled=enabled, min_tokens=min_tokens)
+    cfg["server"].update(
+        {
+            "session_slot_pool_size": 4,
+            "compaction_summarizer_timeout": 5,
+            # No retry waits: the harness must stay in the sub-second range
+            # and a single summariser attempt is what the assertions count.
+            "compaction_summarizer_retries": 0,
+            "compaction_summarizer_retry_delay_seconds": 0,
+        }
+    )
+    cfg["provider_cooldown_seconds"] = 60
+    return cfg
+
+
+class _BoundaryTrace:
+    """Ordered record of the boundary: local turn, summariser, remote POST."""
+
+    def __init__(self) -> None:
+        self.entries: list[tuple[str, dict]] = []
+
+    def add(self, kind: str, **payload) -> None:
+        self.entries.append((kind, payload))
+
+    def kinds(self) -> list[str]:
+        return [kind for kind, _ in self.entries]
+
+    def payloads(self, kind: str) -> list[dict]:
+        return [payload for observed, payload in self.entries if observed == kind]
+
+    def order(self, kind: str) -> int:
+        return self.kinds().index(kind)
+
+
+@pytest.fixture
+def boundary_world(monkeypatch):
+    """A proxy runtime with real session, slot and lease registries.
+
+    ``proxy.server``'s module globals are what the boundary hook reads at
+    dispatch time, so they are swapped for fresh per-test state: the store
+    that records provenance, the dispatch-lease registry the release removes
+    from, and the slot registry the summariser is pinned to.
+    """
+    import proxy.router as router
+    import proxy.server as server
+    import proxy.session as session_mod
+    from proxy.session_manager import SessionManager
+
+    manager = SessionManager()
+    monkeypatch.setattr(server, "session_manager", manager)
+    monkeypatch.setattr(server, "local_dispatch_records", {})
+    monkeypatch.setattr(server, "local_prefill_in_flight", {})
+    # No local llama-server is running: the cached-ratio/save blocks are
+    # skipped (paid only when ``current_model`` is set) and the restore-signal
+    # probe has no log to read.
+    monkeypatch.setattr(server, "current_model", None)
+    monkeypatch.setattr(
+        router, "_detect_restore_signal_from_llama_log", lambda *a, **k: False
+    )
+    monkeypatch.setattr(session_mod, "_slot_owners", {})
+
+    # Routing/provider side effects that are orthogonal to the boundary path.
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    provider._usage_reset_at.clear()
+    provider._sibling_failure_count.clear()
+    provider._sibling_failure_streak_start.clear()
+    monkeypatch.setattr(provider, "request_priority", lambda *a, **k: "medium")
+    monkeypatch.setattr("proxy.priority.request_priority", lambda *a, **k: "medium")
+    monkeypatch.setattr(provider, "acquire_provider_budget", _allow_budget())
+    # Assembly-time compaction is off in the shipped profile; keep the bypass
+    # evaluation a no-op so only the boundary trigger can act.
+    monkeypatch.setattr(
+        provider,
+        "_evaluate_compaction_for_bypass",
+        AsyncMock(
+            return_value={
+                "evaluated": True,
+                "action": "noop",
+                "applied": False,
+                "estimated_before": 0,
+                "estimated_after": 0,
+                "reason": "compaction_disabled",
+                "messages": None,
+            }
+        ),
+    )
+
+    return SimpleNamespace(
+        server=server,
+        manager=manager,
+        session=session_mod,
+        trace=_BoundaryTrace(),
+    )
+
+
+def _install_local_summariser_transport(
+    monkeypatch, trace: _BoundaryTrace, *, status: int = 200, content: str = _INT_SUMMARY
+) -> None:
+    """Route the local summariser POST through a stubbed httpx transport.
+
+    The real ``build_slot_pinned_summarizer`` → ``build_local_summarizer``
+    code path runs; only the socket is replaced, so the recorded request is
+    the exact body the summariser would send to the session's own slot.
+    """
+    import proxy.compaction_summarizer as summarizer_mod
+
+    real_client = httpx.Client
+
+    def _factory(*args, **kwargs):
+        def _handler(request: httpx.Request) -> httpx.Response:
+            trace.add(
+                "summariser_request",
+                url=str(request.url),
+                body=json.loads(request.content or b"{}"),
+            )
+            if status != 200:
+                return httpx.Response(status, json={"error": "summariser down"})
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"role": "assistant", "content": content}}
+                    ]
+                },
+            )
+
+        kwargs["transport"] = httpx.MockTransport(_handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(summarizer_mod.httpx, "Client", _factory)
+
+
+def _install_remote_transport(
+    monkeypatch,
+    trace: _BoundaryTrace,
+    world,
+    session_id: str,
+    *,
+    status_by_name: dict[str, int] | None = None,
+) -> None:
+    """Dispatch the remote provider over a stubbed httpx transport.
+
+    The recorded request is the post-boundary body — i.e. what the remote
+    provider would receive. Lease/slot state is snapshotted *inside* the
+    transport handler, which is the moment the remote stream would start.
+    """
+
+    async def _dispatch(request, path, provider_cfg):
+        body = await request.body()
+
+        def _handler(remote_request: httpx.Request) -> httpx.Response:
+            trace.add(
+                "remote_request",
+                url=str(remote_request.url),
+                provider=provider_cfg.get("name"),
+                raw=remote_request.content,
+                body=json.loads(remote_request.content or b"{}"),
+                leases_at_start=dict(world.server.local_dispatch_records),
+                slot_at_start=world.session._assigned_slot_for_session(session_id),
+            )
+            status = (status_by_name or {}).get(provider_cfg.get("name"), 200)
+            if status != 200:
+                return httpx.Response(status, json={"error": f"upstream {status}"})
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "remote ok"}}
+                    ]
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler)
+        ) as client:
+            response = await client.post(
+                f"{provider_cfg['endpoint']}/{path}",
+                content=body,
+                headers={"content-type": "application/json"},
+            )
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(provider, "_get_proxy_to_remote", lambda: _dispatch)
+
+
+def _install_local_dispatch(monkeypatch, trace: _BoundaryTrace) -> None:
+    """Stub the local backend (no llama-server in the integration harness)."""
+
+    async def _dispatch(request, path, endpoint=None):
+        trace.add("local_dispatch", endpoint=endpoint)
+        return Response(
+            content=json.dumps(
+                {"choices": [{"message": {"role": "assistant", "content": "local ok"}}]}
+            ),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(provider, "_get_proxy_to_local", lambda: _dispatch)
+
+
+async def _serve_local_turn(
+    world, monkeypatch, session_id: str, messages: list[dict]
+) -> None:
+    """Serve one turn locally and record its provenance in the session store.
+
+    The turn goes through the production mixed cycle with the local backend
+    stubbed; the router's own completion hook then records the served turn,
+    which is the provenance signal the boundary decision reads. The slot and
+    dispatch lease the local dispatch would hold are seeded afterwards — the
+    real bookkeeping lives in ``proxy_to_local``, which is the one piece
+    stubbed out.
+    """
+    import proxy.router as router
+
+    # The proxy's request path creates the session; the cycle below is driven
+    # directly, so create it here before its completion hook runs.
+    await world.manager.get_or_create(session_id)
+    _install_local_dispatch(monkeypatch, world.trace)
+    monkeypatch.setattr(provider, "_should_skip_local", lambda *a, **k: (False, None))
+    request = _WiringRequest(
+        {"model": "integration", "messages": messages}, session_id=session_id
+    )
+    response = await provider._proxy_with_fallback_cycle(
+        request,
+        "v1/chat/completions",
+        {"name": "integration", "providers": [dict(_INT_LOCAL_PROVIDER), dict(_INT_REMOTE_PROVIDER)]},
+        _integration_config(),
+    )
+    assert response.status_code == 200
+
+    await router._update_session_and_slot(
+        world.server,
+        session_id,
+        {"messages": messages},
+        False,
+        [],
+        len(messages),
+        response,
+        llama_port=8080,
+        slot_id=None,
+        slot_filename=None,
+        slot_timeout=1.0,
+        slot_model_payload=_INT_LOCAL_MODEL,
+        slot_enabled=False,
+        upstream_status=200,
+    )
+    assert await world.manager.has_local_provenance(session_id) is True
+
+    # The session still owns its slot + dispatch lease at the boundary.
+    slot_id = world.session._slot_id_for_session(session_id, pool_size=4)
+    assert slot_id is not None
+    world.server.local_dispatch_records[
+        router_helpers._dispatch_lease_key(None, session_id)
+    ] = {"session_id": session_id}
+    world.trace.add("local_turn_complete", slot=slot_id)
+
+
+async def _dispatch_remote_turn(
+    world,
+    monkeypatch,
+    session_id: str,
+    messages: list[dict],
+    *,
+    config: dict | None = None,
+    remote_only: bool = False,
+    remote_providers: list[dict] | None = None,
+    status_by_name: dict[str, int] | None = None,
+):
+    """Send the next request remote, bypassing local.
+
+    Returns ``(response, request, raw_body_before)`` so a regression test can
+    compare the dispatched bytes against the pre-change body.
+    """
+    _install_remote_transport(
+        monkeypatch, world.trace, world, session_id, status_by_name=status_by_name
+    )
+    if remote_providers is not None:
+        # A remote-only chain with more than one entry exercises the
+        # in-cycle provider retry (the second provider is the fallback).
+        monkeypatch.setattr(
+            provider, "_should_skip_local", lambda *a, **k: (True, "remote_only_chain")
+        )
+        model_config = {
+            "name": "integration",
+            "providers": [dict(cfg) for cfg in remote_providers],
+        }
+    elif remote_only:
+        monkeypatch.setattr(
+            provider, "_should_skip_local", lambda *a, **k: (True, "remote_only_chain")
+        )
+        model_config = {"name": "integration", "providers": [dict(_INT_REMOTE_PROVIDER)]}
+    else:
+        # The real local→remote boundary: local is skipped on size and the
+        # chain continues to the remote provider.
+        monkeypatch.setattr(
+            provider, "_should_skip_local", lambda *a, **k: (True, "context_too_large")
+        )
+        model_config = {
+            "name": "integration",
+            "providers": [dict(_INT_LOCAL_PROVIDER), dict(_INT_REMOTE_PROVIDER)],
+        }
+    request = _WiringRequest(
+        {"model": "integration", "messages": list(messages)}, session_id=session_id
+    )
+    raw_before = request._body
+    # A remote-only chain — whether declared as one provider or several —
+    # runs the remote-only cycle; the mixed cycle is only for a chain that
+    # also contains a local provider.
+    cycle = (
+        provider._proxy_with_remote_fallback_cycle
+        if remote_only or remote_providers is not None
+        else provider._proxy_with_fallback_cycle
+    )
+    response = await cycle(
+        request,
+        "v1/chat/completions",
+        model_config,
+        config if config is not None else _integration_config(),
+    )
+    return response, request, raw_before
+
+
+def _big_integration_messages() -> list[dict]:
+    return _big_messages(_INT_TURNS, size=_INT_TURN_CHARS)
+
+
+class TestBoundaryCompactionIntegration:
+    """Local→remote escalation, proven on the wire with stubbed transports."""
+
+    @pytest.mark.asyncio
+    async def test_locally_served_session_compacts_once_before_the_remote_post(
+        self, boundary_world, monkeypatch, caplog
+    ):
+        """AC1/AC2/AC3: one summarisation, compacted wire body, released lease."""
+        world = boundary_world
+        messages = _big_integration_messages()
+        _install_local_summariser_transport(monkeypatch, world.trace)
+
+        # (b) served locally first — that is what makes provenance real.
+        await _serve_local_turn(world, monkeypatch, _INT_SESSION, _messages(2))
+        slot_id = world.trace.payloads("local_turn_complete")[0]["slot"]
+
+        # (c) the next request bypasses local and routes remote.
+        with caplog.at_level("INFO"):
+            response, _request, _raw_before = await _dispatch_remote_turn(
+                world, monkeypatch, _INT_SESSION, messages
+            )
+
+        assert response.status_code == 200
+
+        # AC1 — exactly one summarisation call for the boundary evaluation.
+        summariser_calls = world.trace.payloads("summariser_request")
+        assert len(summariser_calls) == 1
+        # AC2 — pinned to the session's own local slot and its own model.
+        assert summariser_calls[0]["url"].startswith("http://localhost:8080/")
+        assert summariser_calls[0]["body"]["id_slot"] == slot_id
+        assert summariser_calls[0]["body"]["model"] == _INT_LOCAL_MODEL
+        assert summariser_calls[0]["body"]["stream"] is False
+        # The retention set is never handed to the summariser.
+        assert messages[1]["content"] not in json.dumps(summariser_calls[0]["body"])
+
+        # AC2 — the compacted body is what reached the remote provider.
+        remote_calls = world.trace.payloads("remote_request")
+        assert len(remote_calls) == 1
+        remote = remote_calls[0]
+        assert remote["url"].startswith("https://remote.invalid/v1/")
+        dispatched = remote["body"]
+        assert dispatched["cache_prompt"] is True
+        assert dispatched["messages"] != messages
+        assert len(dispatched["messages"]) < len(messages)
+        # Retention invariant: system prompt + first user message verbatim.
+        assert dispatched["messages"][0] == messages[0]
+        assert dispatched["messages"][1] == messages[1]
+        # The marked summary replaces the folded turns.
+        summary_message = dispatched["messages"][2]
+        assert summary_message["role"] == "user"
+        assert _INT_SUMMARY in summary_message["content"]
+        assert (
+            "The conversation history before this point was compacted"
+            in summary_message["content"]
+        )
+        # The most recent turns are kept whole and verbatim.
+        assert dispatched["messages"][-2:] == messages[-2:]
+
+        # AC3 — the release precedes the remote stream start.
+        assert world.trace.order("summariser_request") < world.trace.order(
+            "remote_request"
+        )
+        assert remote["leases_at_start"] == {}
+        assert remote["slot_at_start"] is None
+        # ... and no lease leaks afterwards.
+        assert _INT_SESSION not in world.server.local_dispatch_records
+        assert world.session._assigned_slot_for_session(_INT_SESSION) is None
+
+        # The stored history is what went on the wire (delta heal sees it).
+        session = await world.manager.get(_INT_SESSION)
+        assert session is not None
+        assert session.messages == dispatched["messages"]
+
+        # AC4 — exactly one structured boundary event for the evaluation.
+        events = _boundary_event_records(caplog)
+        assert len(events) == 1
+        line = events[0].getMessage()
+        assert f"session={_INT_SESSION}" in line
+        assert f"slot={slot_id}" in line
+        assert "outcome=boundary_compact" in line
+        assert "est_before=" in line and "est_after=" in line
+        assert "turns_summarized=" in line and "duration_ms=" in line
+
+    @pytest.mark.asyncio
+    async def test_remote_only_chain_compacts_at_the_same_boundary(
+        self, boundary_world, monkeypatch
+    ):
+        """The second remote dispatch point runs the same hook end to end."""
+        world = boundary_world
+        _install_local_summariser_transport(monkeypatch, world.trace)
+        await _serve_local_turn(world, monkeypatch, _INT_SESSION, _messages(2))
+
+        response, _request, _raw = await _dispatch_remote_turn(
+            world,
+            monkeypatch,
+            _INT_SESSION,
+            _big_integration_messages(),
+            remote_only=True,
+        )
+
+        assert response.status_code == 200
+        assert len(world.trace.payloads("summariser_request")) == 1
+        remote = world.trace.payloads("remote_request")[0]
+        assert _INT_SUMMARY in json.dumps(remote["body"])
+        assert remote["leases_at_start"] == {}
+        assert world.session._assigned_slot_for_session(_INT_SESSION) is None
+
+    @pytest.mark.asyncio
+    async def test_an_in_cycle_provider_retry_never_re_summarises(
+        self, boundary_world, monkeypatch
+    ):
+        """AC1: a failed remote provider retries with the same compacted history."""
+        world = boundary_world
+        _install_local_summariser_transport(monkeypatch, world.trace)
+        await _serve_local_turn(world, monkeypatch, _INT_SESSION, _messages(2))
+
+        response, request, _raw = await _dispatch_remote_turn(
+            world,
+            monkeypatch,
+            _INT_SESSION,
+            _big_integration_messages(),
+            remote_providers=[
+                dict(_INT_REMOTE_PROVIDER),
+                dict(_INT_SECOND_REMOTE_PROVIDER),
+            ],
+            status_by_name={_INT_REMOTE_PROVIDER["name"]: 500},
+        )
+
+        assert response.status_code == 200, "the sibling provider serves the retry"
+        # Exactly one summarisation for the whole cycle, not one per attempt.
+        assert len(world.trace.payloads("summariser_request")) == 1
+        posts = world.trace.payloads("remote_request")
+        assert [post["provider"] for post in posts] == [
+            _INT_REMOTE_PROVIDER["name"],
+            _INT_SECOND_REMOTE_PROVIDER["name"],
+        ]
+        # Both attempts carry the identical compacted history.
+        assert posts[0]["body"]["messages"] == posts[1]["body"]["messages"]
+        assert _INT_SUMMARY in posts[1]["body"]["messages"][2]["content"]
+        assert request._boundary_compaction_result["reason"] == "boundary_compact"
+
+    @pytest.mark.asyncio
+    async def test_knob_off_dispatches_a_byte_identical_body_without_summarising(
+        self, boundary_world, monkeypatch, caplog
+    ):
+        """AC4 regression: the shipped default changes nothing on the wire."""
+        world = boundary_world
+        _install_local_summariser_transport(monkeypatch, world.trace)
+        await _serve_local_turn(world, monkeypatch, _INT_SESSION, _messages(2))
+
+        with caplog.at_level("INFO"):
+            response, _request, raw_before = await _dispatch_remote_turn(
+                world,
+                monkeypatch,
+                _INT_SESSION,
+                _big_integration_messages(),
+                config=_integration_config(enabled=False),
+            )
+
+        assert response.status_code == 200
+        # No summariser call, no boundary event, no lease release.
+        assert world.trace.payloads("summariser_request") == []
+        assert _boundary_event_records(caplog) == []
+        remote = world.trace.payloads("remote_request")[0]
+        assert remote["raw"] == raw_before, "the dispatched body must be unchanged"
+        assert remote["body"]["messages"] == json.loads(raw_before)["messages"]
+        assert remote["leases_at_start"] != {}, "no side effect when the knob is off"
+        assert _INT_SESSION in world.server.local_dispatch_records
+
+    @pytest.mark.asyncio
+    async def test_session_without_local_service_dispatches_unchanged(
+        self, boundary_world, monkeypatch
+    ):
+        """AC5: a session never served locally is untouched, even knob-on."""
+        world = boundary_world
+        _install_local_summariser_transport(monkeypatch, world.trace)
+        # No local turn: the session store records no local provenance.
+        session_id = "sess-boundary-never-local"
+        await world.manager.get_or_create(session_id)
+
+        response, request, raw_before = await _dispatch_remote_turn(
+            world, monkeypatch, session_id, _big_integration_messages()
+        )
+
+        assert response.status_code == 200
+        assert world.trace.payloads("summariser_request") == []
+        assert world.trace.payloads("remote_request")[0]["raw"] == raw_before
+        assert request._boundary_compaction_result["reason"] == (
+            "boundary_no_local_provenance"
+        )
+
+    @pytest.mark.asyncio
+    async def test_below_the_size_guard_dispatches_unchanged(
+        self, boundary_world, monkeypatch
+    ):
+        """AC5: a locally-served session under the guard is left alone."""
+        world = boundary_world
+        _install_local_summariser_transport(monkeypatch, world.trace)
+        await _serve_local_turn(world, monkeypatch, _INT_SESSION, _messages(2))
+
+        response, request, raw_before = await _dispatch_remote_turn(
+            world,
+            monkeypatch,
+            _INT_SESSION,
+            _big_integration_messages(),
+            config=_integration_config(min_tokens=10_000_000),
+        )
+
+        assert response.status_code == 200
+        assert world.trace.payloads("summariser_request") == []
+        assert world.trace.payloads("remote_request")[0]["raw"] == raw_before
+        assert request._boundary_compaction_result["reason"] == "boundary_below_guard"
+        # A below-guard skip is not a boundary evaluation: the lease survives.
+        assert _INT_SESSION in world.server.local_dispatch_records
+
+    @pytest.mark.asyncio
+    async def test_summariser_failure_fails_open_and_still_releases_the_lease(
+        self, boundary_world, monkeypatch
+    ):
+        """AC4: a failing summariser leaves the body untouched, dispatch continues."""
+        world = boundary_world
+        _install_local_summariser_transport(
+            monkeypatch, world.trace, status=500
+        )
+        await _serve_local_turn(world, monkeypatch, _INT_SESSION, _messages(2))
+
+        response, request, raw_before = await _dispatch_remote_turn(
+            world, monkeypatch, _INT_SESSION, _big_integration_messages()
+        )
+
+        assert response.status_code == 200
+        assert len(world.trace.payloads("summariser_request")) == 1
+        remote = world.trace.payloads("remote_request")[0]
+        assert remote["raw"] == raw_before, "history is byte-identical on failure"
+        assert request._boundary_compaction_result["reason"] == (
+            "boundary_summarizer_failed"
+        )
+        # Subsequent turns still release: the slot must not stay pinned.
+        assert _INT_SESSION not in world.server.local_dispatch_records
+        assert world.session._assigned_slot_for_session(_INT_SESSION) is None
