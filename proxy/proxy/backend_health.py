@@ -222,12 +222,22 @@ def _detect_gpu_oom_in_text(text: str) -> bool:
     return False
 
 
-async def _probe_local_endpoint_http(endpoint: str, timeout: float = 5.0) -> bool:
+async def _probe_local_endpoint_http(
+    endpoint: str,
+    model_name: str | None = None,
+    timeout: float = 5.0,
+) -> bool:
     """HTTP health probe for a single local llama-server endpoint.
 
     Returns True when the endpoint responds with HTTP 200 to ``/health``
     (falls back to ``/slots`` when ``/health`` is unavailable/404). Best-effort:
     any exception or non-200 is treated as unhealthy (False).
+
+    Many llama-server instances require ``?model=...`` on ``/slots``
+    (LP-0MSHFGO0M003Q5BL) and the router answers a model-less query with HTTP
+    400 (LP-0MVP7HV7Q001AJF8 AC2), so the fallback carries *model_name* and is
+    skipped entirely when no model is known — the ``/health`` verdict is then
+    returned unchanged.
     """
     if not endpoint:
         return False
@@ -238,8 +248,12 @@ async def _probe_local_endpoint_http(endpoint: str, timeout: float = 5.0) -> boo
             response = await client.get(url, timeout=timeout)
             if response.status_code == 200:
                 return True
+            # A model-less /slots request would be answered with HTTP 400 by
+            # the router; without a resolved model keep the /health verdict.
+            if not model_name:
+                return False
             # Some llama-server builds do not expose /health; probe /slots.
-            slots_url = f"{endpoint.rstrip('/')}/slots"
+            slots_url = f"{endpoint.rstrip('/')}/slots?model={model_name}"
             response = await client.get(slots_url, timeout=timeout)
             return response.status_code == 200
         finally:
@@ -259,16 +273,16 @@ async def _probe_local_slot_capacity(
     failure (endpoint unreachable, HTTP error, timeout, unexpected shape) so
     callers can distinguish "unknown capacity" from a genuinely exhausted
     server. Many llama-server instances require ``?model=...`` on ``/slots``
-    (LP-0MSHFGO0M003Q5BL), so *model_name* is appended when provided.
+    (LP-0MSHFGO0M003Q5BL) and the router answers a model-less query with HTTP
+    400 (LP-0MVP7HV7Q001AJF8 AC2), so the ``?model=`` component is always sent
+    and the query is skipped when no model is known.
     """
-    if not endpoint:
+    if not endpoint or not model_name:
         return 0, 0
     try:
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
         try:
-            url = f"{endpoint.rstrip('/')}/slots"
-            if model_name:
-                url = f"{url}?model={model_name}"
+            url = f"{endpoint.rstrip('/')}/slots?model={model_name}"
             response = await client.get(url, timeout=timeout)
             if response.status_code == 200:
                 slots_data = response.json()
@@ -309,7 +323,9 @@ async def probe_local_backend(
     stderr/stdout which is out of scope for pre-existing instances (lifecycle
     management is excluded from this work item).
     """
-    http_ok = await _probe_local_endpoint_http(endpoint, timeout=timeout)
+    http_ok = await _probe_local_endpoint_http(
+        endpoint, model_name=model_name, timeout=timeout
+    )
     available, total = await _probe_local_slot_capacity(
         endpoint, model_name=model_name, timeout=timeout
     )

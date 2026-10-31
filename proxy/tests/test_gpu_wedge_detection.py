@@ -282,10 +282,13 @@ class TestProbeGpuWedge:
 
             async def get(self, url, timeout=None):
                 assert "/slots" in url
+                assert "?model=" in url
                 return FakeResp()
 
         monkeypatch.setattr("proxy.backends.llama.httpx.AsyncClient", FakeClient)
-        busy, idle, power = await _probe_gpu_wedge("127.0.0.1", 8080)
+        busy, idle, power = await _probe_gpu_wedge(
+            "127.0.0.1", 8080, model="Qwen3"
+        )
         assert busy == 100.0
         assert idle is True
         assert power == 54.0
@@ -313,7 +316,9 @@ class TestProbeGpuWedge:
                 raise RuntimeError("connection refused")
 
         monkeypatch.setattr("proxy.backends.llama.httpx.AsyncClient", BoomClient)
-        busy, idle, power = await _probe_gpu_wedge("127.0.0.1", 8080)
+        busy, idle, power = await _probe_gpu_wedge(
+            "127.0.0.1", 8080, model="Qwen3"
+        )
         assert busy == 100.0
         assert idle is False
         assert power is None

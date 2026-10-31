@@ -37,8 +37,9 @@ The allowlist
 the fence is green on landing (slice 2, LP-0MVU7ZYWS002RDYM) and each later
 slice provably closes its own entry:
 
-* slice 3 (LP-0MVU7ZZ7M002D9GT) threads a resolved model through the four
-  model-less probes;
+* slice 3 (LP-0MVU7ZZ7M002D9GT) threaded a resolved model through the four
+  model-less probes (its entries are removed: the URLs now carry `?model=`
+  inline, or the site skips the query when no model is known);
 * slice 4 (LP-0MVU7ZZIA0092AXW) guarantees a resolved model id everywhere,
   which removes the three conditional-appender constructors and empties the
   allowlist.
@@ -98,27 +99,6 @@ ALLOWLIST: dict[tuple[str, str], str] = {
         "LP-0MVU7ZZIA0092AXW (slice 4): same conditional appender as "
         "_query_slots (AC1 audit site #3); _query_prefill_progress defaults "
         "model_name to None."
-    ),
-    # ── slice 3 (LP-0MVU7ZZ7M002D9GT): thread the resolved model through the
-    # model-less probes (AC1 audit sites #6-#9).
-    ("backend_health.py", "_probe_local_endpoint_http"): (
-        "LP-0MVU7ZZ7M002D9GT (slice 3): model-less /slots health fallback; "
-        "inert today (probe_local_backend has no production caller) but the "
-        "rule is violated, so a future caller would emit router 400s."
-    ),
-    ("backend_health.py", "_probe_local_slot_capacity"): (
-        "LP-0MVU7ZZ7M002D9GT (slice 3): appends '?model=' only behind "
-        "`if model_name:` (conditional appender), so a capacity probe without "
-        "a model is model-less."
-    ),
-    ("backends/llama.py", "_probe_gpu_wedge"): (
-        "LP-0MVU7ZZ7M002D9GT (slice 3): model-less probe; inert today "
-        "(llama_gpu_wedge_detection_enabled is false) and child-targeted, but "
-        "the model must still be passed."
-    ),
-    ("compaction_summarizer.py", "_probe_slot_capacity_sync"): (
-        "LP-0MVU7ZZ7M002D9GT (slice 3): model-less probe pointed at the "
-        "router port; unreachable only while models.compact is configured."
     ),
 }
 

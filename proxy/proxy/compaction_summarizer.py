@@ -42,18 +42,58 @@ def _transport_failure_kind(exc: BaseException) -> str:
 # currently busy — useful diagnostic context for timeout logs (AC2).
 # ---------------------------------------------------------------------------
 
-def _probe_slot_capacity_sync(llama_port: int) -> tuple[int, int]:
+def _summarizer_srv():
+    """Lazily resolve the server module for ``/slots`` target resolution.
+
+    The summarizer is built from plain config dicts, so it has no server
+    handle of its own. Importing ``proxy.server`` lazily (the same pattern as
+    ``backend_health._srv()``) keeps the import cycle broken and lets unit
+    tests inject a stub ``srv`` instead.
+    """
+    try:
+        import proxy.server as _m
+
+        return _m
+    except Exception:
+        return None
+
+
+def _probe_slot_capacity_sync(
+    llama_port: int,
+    model_name: str | None = None,
+    srv: Any | None = None,
+) -> tuple[int, int]:
     """Probe the llama-server ``/slots`` endpoint for available/total slots.
 
     Returns ``(available, total)``. Both default to ``0`` on any failure
     (endpoint unreachable, HTTP error, unexpected JSON shape) so the
     diagnostic log never crashes the summarizer.
+
+    The request always carries ``?model=<model_name>``: llama-server's router
+    answers a model-less ``/slots`` with HTTP 400 (LP-0MVP7HV7Q001AJF8 AC2), so
+    the probe is skipped when no model is known. The target is resolved
+    through the shared
+    :func:`proxy.router_helpers._resolve_local_slots_target` path, so the probe
+    hits the discovered child port instead of defaulting to the router port
+    (LP-0MVP7525P008RXMF AC2).
     """
+    if not model_name:
+        return 0, 0
     try:
-        with httpx.Client(timeout=httpx.Timeout(2.0)) as client:
-            response = client.get(
-                f"http://localhost:{llama_port}/slots",
+        from proxy.observability import _build_llama_url
+        from proxy.router_helpers import _resolve_local_slots_target
+
+        target_srv = srv if srv is not None else _summarizer_srv()
+        endpoint: str | None = None
+        port = int(llama_port)
+        if target_srv is not None:
+            endpoint, port = _resolve_local_slots_target(
+                target_srv, model=model_name, router_port=llama_port
             )
+        url = _build_llama_url(port, "/slots", base_url=endpoint)
+        url = f"{url}?model={model_name}"
+        with httpx.Client(timeout=httpx.Timeout(2.0)) as client:
+            response = client.get(url)
             if response.status_code == 200:
                 slots_data = response.json()
                 if isinstance(slots_data, list):
@@ -506,7 +546,11 @@ def build_local_summarizer(
                                 transcript, _system_prompt,
                                 _format_template, previous_summary,
                             ),
-                            *(_probe_slot_capacity_sync(llama_port) if attempt == 0 else (0, 0)),
+                            *(
+                            _probe_slot_capacity_sync(llama_port, model_name)
+                            if attempt == 0
+                            else (0, 0)
+                        ),
                             attempt + 1, attempts,
                         )
                         logger.warning(
@@ -526,7 +570,7 @@ def build_local_summarizer(
                             transcript, _system_prompt,
                             _format_template, previous_summary,
                         ),
-                        *(_probe_slot_capacity_sync(llama_port)),
+                        *(_probe_slot_capacity_sync(llama_port, model_name)),
                         attempts, attempts,
                     )
                     logger.warning(
@@ -584,7 +628,7 @@ def build_local_summarizer(
                     transcript, _system_prompt,
                     _format_template, previous_summary,
                 ),
-                *(_probe_slot_capacity_sync(llama_port)),
+                *(_probe_slot_capacity_sync(llama_port, model_name)),
                 attempts, attempts,
             )
             logger.warning(

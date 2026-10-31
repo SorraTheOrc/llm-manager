@@ -365,7 +365,9 @@ async def test_probe_local_backend_http_and_capacity(monkeypatch):
     """AC5: probe combines HTTP health + slot capacity awareness."""
     from proxy import backend_health
 
-    async def fake_http(endpoint, timeout=5.0):
+    async def fake_http(endpoint, model_name=None, timeout=5.0):
+        # AC2 (LP-0MVP7HV7Q001AJF8): the /slots fallback must carry the model.
+        assert model_name == "Qwen3"
         return True
 
     async def fake_slots(endpoint, model_name=None, timeout=5.0):
@@ -389,7 +391,7 @@ async def test_probe_local_backend_unreachable(monkeypatch):
     """AC5: an unreachable endpoint fails open with unknown capacity."""
     from proxy import backend_health
 
-    async def fake_http(endpoint, timeout=5.0):
+    async def fake_http(endpoint, model_name=None, timeout=5.0):
         return False
 
     async def fake_slots(endpoint, model_name=None, timeout=5.0):

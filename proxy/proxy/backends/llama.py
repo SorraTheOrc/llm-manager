@@ -200,16 +200,30 @@ def _gpu_wedge_discriminate(
 
 
 async def _probe_gpu_wedge(
-    host: str, port: int, timeout: float = 5.0
+    host: str,
+    port: int,
+    timeout: float = 5.0,
+    model: str | None = None,
 ) -> tuple[float | None, bool, float | None]:
-    """Return ``(gpu_busy_percent, all_slots_idle, gpu_power_watts)`` for a model instance."""
+    """Return ``(gpu_busy_percent, all_slots_idle, gpu_power_watts)`` for a model instance.
+
+    *model* is the router model id the probed instance serves and is sent as
+    ``?model=``: llama-server requires it and its router answers a model-less
+    ``/slots`` with HTTP 400 (LP-0MVP7HV7Q001AJF8 AC2). When no model is known
+    the slot query is skipped and ``all_slots_idle`` stays False — fail-open,
+    never an exception, and never a wedge verdict derived from missing data.
+    """
     busy = _read_gpu_busy_percent()
     power = _read_gpu_power_draw()
     slots_idle = False
+    if not model:
+        return busy, slots_idle, power
     try:
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
         try:
-            resp = await client.get(f"http://{host}:{port}/slots", timeout=timeout)
+            resp = await client.get(
+                f"http://{host}:{port}/slots?model={model}", timeout=timeout
+            )
             if resp.status_code == 200:
                 slots_idle = _slots_all_idle(resp.json())
         finally:
@@ -733,7 +747,10 @@ async def _router_model_health_loop() -> None:
                         and "--embeddings" not in args
                     ):
                         busy_pct, slots_idle, power_watts = await _probe_gpu_wedge(
-                            router_host, port, timeout=probe_timeout
+                            router_host,
+                            port,
+                            timeout=probe_timeout,
+                            model=model_id,
                         )
                         if busy_pct is None:
                             if not gpu_wedge_source_logged:
