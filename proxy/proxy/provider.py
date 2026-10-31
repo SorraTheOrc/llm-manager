@@ -8351,6 +8351,79 @@ def _set_queue_wait_on_request(request, elapsed: float) -> None:
         pass
 
 
+#: Request attribute holding the queued request's OWN priced new-token count,
+#: stamped when it enters the contention queue (LP-0MVV29WR0009DY1A AC2). The
+#: ``contention_queue_dispatch`` / ``contention_queue_fallback_after_queue``
+#: lines that end the same wait read it back, so all three lines of one queue
+#: wait carry identical, own-request evidence and the conversion harness never
+#: has to join a wait to another request's admission.
+CONTENTION_QUEUE_NEW_TOKENS_ATTR = "_contention_queue_new_tokens"
+
+
+def _queue_own_new_tokens(
+    config: dict,
+    provider_cfg: dict,
+    session_id: str | None,
+    estimated_tokens: int | None,
+    messages: list | None,
+    decision=None,
+) -> int | None:
+    """Return *this request's* priced new (uncached) token count.
+
+    The admission guard's own decision is preferred — it priced this exact
+    prompt against this exact prefix ratio. When the guard is inert the prompt is
+    priced from the routing ratio exactly as the dispatch path does
+    (``int(estimated_tokens * (1 - expected_cached_ratio(...)))``), so the
+    enqueue, dispatch and fallback lines of one wait band identically.
+
+    ``None`` (logged by callers as ``new_tokens=unknown``) when the prompt cannot
+    be priced — an absent field is honest, a guessed band is not.
+    """
+    if decision is not None:
+        value = getattr(decision, "new_tokens", None)
+        if value is not None:
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                pass
+    try:
+        tokens = max(0, int(estimated_tokens or 0))
+        if tokens <= 0:
+            return None
+        model_name = (
+            provider_cfg.get("llama_model", "")
+            if isinstance(provider_cfg, dict)
+            else ""
+        )
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        ratio = expected_cached_ratio(
+            model_name, session_id, tokens, messages, server_config=server_cfg
+        )
+        return max(0, int(round(tokens * (1.0 - ratio))))
+    except Exception:
+        logger.debug("queue-wait new_tokens pricing failed", exc_info=True)
+        return None
+
+
+def _stamp_queue_new_tokens(request, value: int | None) -> None:
+    """Best-effort stamp of :data:`CONTENTION_QUEUE_NEW_TOKENS_ATTR`."""
+    if value is None:
+        return
+    try:
+        setattr(request, CONTENTION_QUEUE_NEW_TOKENS_ATTR, int(value))
+    except Exception:
+        pass
+
+
+def _queue_new_tokens_from_request(request) -> int | None:
+    """Read back the enqueue-time pricing stamped on *request*, if any."""
+    try:
+        value = getattr(request, CONTENTION_QUEUE_NEW_TOKENS_ATTR, None)
+    except Exception:
+        return None
+    return value if isinstance(value, int) else None
+
+
 #: Attribute name on the request holding the admission-time pricing snapshot.
 #: LP-0MVODJ3P6000AIUM AC1: stamped once by :func:`_stamp_local_admission_evidence`
 #: before the first local dispatch so every dispatch-record creation path
@@ -8511,6 +8584,19 @@ async def _maybe_queue_for_local_slot(
         _ticket = None
     if _ticket is not None:
         _note_local_fallback_reason(request, None)
+        # Own-request evidence for the dispatch line that follows: a
+        # reservation is a pre-granted admission, so its estimated size is the
+        # only pricing available.
+        _stamp_queue_new_tokens(
+            request,
+            _queue_own_new_tokens(
+                config,
+                provider_cfg,
+                session_id,
+                _ticket.estimated_tokens,
+                body_json.get("messages") if isinstance(body_json, dict) else None,
+            ),
+        )
         logger.info(
             "local_admission_reserve_claimed ticket=%s session=%s tokens=%d",
             _ticket.ticket_id,
@@ -8588,9 +8674,31 @@ async def _maybe_queue_for_local_slot(
         setattr(request, "_local_queue_saturation", _saturation)
     except Exception:
         pass
+    # Own-request enqueue evidence (LP-0MVV29WR0009DY1A AC2): the wait is logged
+    # with the request's own session and pricing, so banding the wait never
+    # depends on joining it to an admission (which could be another request's).
+    # The same numbers are stamped on the request for the dispatch/fallback line
+    # that ends this wait.
+    _enqueue_new_tokens = _queue_own_new_tokens(
+        config,
+        provider_cfg,
+        session_id,
+        _estimated_tokens,
+        body_json.get("messages") if isinstance(body_json, dict) else None,
+        decision=_admission,
+    )
+    _stamp_queue_new_tokens(request, _enqueue_new_tokens)
+    _enqueue_rate_bucket = getattr(_admission, "rate_bucket", None) or "unknown"
     logger.info(
-        "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s",
-        cq["max_wait_seconds"], cq["max_depth"], _saturation or "none",
+        "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s "
+        "session=%s new_tokens=%s rate_bucket=%s trigger=%s",
+        cq["max_wait_seconds"],
+        cq["max_depth"],
+        _saturation or "none",
+        session_id or "unknown",
+        _enqueue_new_tokens if _enqueue_new_tokens is not None else "unknown",
+        _enqueue_rate_bucket,
+        _saturation or "concurrency_limit",
     )
 
     _wait_started = _time.monotonic()
@@ -12635,12 +12743,17 @@ async def _proxy_with_fallback_cycle(
                             _cq_depth = contention_queue.queue_depth()
                         except Exception:
                             _cq_depth = 0
+                        _cq_new_tokens = _queue_new_tokens_from_request(request)
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
-                            "queued_duration=%.2fs policy=queue depth=%d",
+                            "queued_duration=%.2fs policy=queue depth=%d "
+                            "new_tokens=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                             _cq_depth,
+                            _cq_new_tokens
+                            if _cq_new_tokens is not None
+                            else "unknown",
                         )
                     elif _cq_action == "fallback":
                         # Caps exceeded — the request never got a local slot:
@@ -12670,12 +12783,17 @@ async def _proxy_with_fallback_cycle(
                             fallback_reason,
                             _cq_remaining_s,
                         )
+                        _cq_new_tokens = _queue_new_tokens_from_request(request)
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
-                            "session=%s queued_duration=%.2fs preference=%s",
+                            "session=%s queued_duration=%.2fs preference=%s "
+                            "new_tokens=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                             _preference,
+                            _cq_new_tokens
+                            if _cq_new_tokens is not None
+                            else "unknown",
                         )
                         # Deferral (LP-0MVSM06BK008FZUE): a pin-local
                         # ``deferrable`` request must never be promoted — the
@@ -13713,14 +13831,18 @@ async def _proxy_with_fallback_cycle(
                             _lease_depth = _cq_mod.queue_depth()
                         except Exception:
                             _lease_depth = 0
+                        _cq_new_tokens = _queue_new_tokens_from_request(request)
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
                             "queued_duration=%.2fs policy=queue depth=%d "
-                            "reason=local_lease_active",
+                            "reason=local_lease_active new_tokens=%s",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
                             _lease_depth,
+                            _cq_new_tokens
+                            if _cq_new_tokens is not None
+                            else "unknown",
                         )
                         _record_attempt(
                             attempts,
@@ -13761,14 +13883,18 @@ async def _proxy_with_fallback_cycle(
                             status="fallback_after_queue",
                             elapsed_wait_seconds=round(_lease_elapsed or 0.0, 3),
                         )
+                        _cq_new_tokens = _queue_new_tokens_from_request(request)
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
                             "session=%s queued_duration=%.2fs preference=%s "
-                            "reason=local_lease_active",
+                            "reason=local_lease_active new_tokens=%s",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
                             _preference,
+                            _cq_new_tokens
+                            if _cq_new_tokens is not None
+                            else "unknown",
                         )
                         all_slot_exhaustion = False
                         # The token matches the log's reason= field verbatim.

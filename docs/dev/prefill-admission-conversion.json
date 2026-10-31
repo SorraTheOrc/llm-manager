@@ -11,6 +11,7 @@
       "evictions": 6,
       "queue_abandoned": 0,
       "queue_dispatched": 0,
+      "queue_enqueued": 0,
       "queue_wait_seconds": 0.0,
       "queued_waits": 0,
       "rate_buckets": {
@@ -36,6 +37,7 @@
       "evictions": 0,
       "queue_abandoned": 0,
       "queue_dispatched": 0,
+      "queue_enqueued": 0,
       "queue_wait_seconds": 0.0,
       "queued_waits": 0,
       "rate_buckets": {
@@ -48,7 +50,7 @@
       "unconverted": 0
     },
     "8k-20k": {
-      "abandoned_share": 0.5,
+      "abandoned_share": 0.5714,
       "admission_verdicts": {
         "admit": 24,
         "reject": 152
@@ -57,9 +59,10 @@
       "converted": 10,
       "evictions": 38,
       "queue_abandoned": 4,
-      "queue_dispatched": 4,
-      "queue_wait_seconds": 408.92,
-      "queued_waits": 8,
+      "queue_dispatched": 3,
+      "queue_enqueued": 0,
+      "queue_wait_seconds": 391.8,
+      "queued_waits": 7,
       "rate_buckets": {
         "unknown": 176
       },
@@ -72,7 +75,7 @@
       "unconverted": 5
     },
     "<8k": {
-      "abandoned_share": 0.3509,
+      "abandoned_share": 0.3636,
       "admission_verdicts": {
         "admit": 397,
         "reject": 36
@@ -81,9 +84,10 @@
       "converted": 27,
       "evictions": 108,
       "queue_abandoned": 20,
-      "queue_dispatched": 37,
-      "queue_wait_seconds": 2236.77,
-      "queued_waits": 57,
+      "queue_dispatched": 35,
+      "queue_enqueued": 0,
+      "queue_wait_seconds": 2193.73,
+      "queued_waits": 55,
       "rate_buckets": {
         "unknown": 433
       },
@@ -105,6 +109,7 @@
       "evictions": 0,
       "queue_abandoned": 0,
       "queue_dispatched": 0,
+      "queue_enqueued": 0,
       "queue_wait_seconds": 0.0,
       "queued_waits": 0,
       "rate_buckets": {
@@ -113,6 +118,25 @@
       "reject_reasons": {
         "prefill_budget_exceeded": 1983
       },
+      "sessions_admitted": 0,
+      "unconverted": 0
+    },
+    "unknown": {
+      "abandoned_share": 0.0,
+      "admission_verdicts": {
+        "admit": 0,
+        "reject": 0
+      },
+      "conversion_share": 0.0,
+      "converted": 0,
+      "evictions": 0,
+      "queue_abandoned": 0,
+      "queue_dispatched": 3,
+      "queue_enqueued": 0,
+      "queue_wait_seconds": 60.16,
+      "queued_waits": 3,
+      "rate_buckets": {},
+      "reject_reasons": {},
       "sessions_admitted": 0,
       "unconverted": 0
     }
@@ -140,15 +164,13 @@
   ],
   "log_files_scanned": [
     "proxy.log",
-    "proxy.log-2026-10-24_00.gz",
     "proxy.log-2026-10-25_00.gz",
     "proxy.log-2026-10-26_00.gz",
     "proxy.log-2026-10-27_00.gz",
     "proxy.log-2026-10-28_00.gz",
     "proxy.log-2026-10-29_00.gz",
-    "proxy.log-2026-10-30_00",
-    "proxy.log.2026-10-23_12.gz",
-    "proxy.log.2026-10-23_234827.gz",
+    "proxy.log-2026-10-30_00.gz",
+    "proxy.log-2026-10-31_00",
     "proxy.log.2026-10-24_00.gz",
     "proxy.log.2026-10-24_000838.gz",
     "proxy.log.2026-10-24_003357.gz",
@@ -184,14 +206,26 @@
     "proxy.log.2026-10-29_00.gz",
     "proxy.log.2026-10-29_001015.gz",
     "proxy.log.2026-10-29_06.gz",
-    "proxy.log.2026-10-29_125828",
-    "proxy.log.2026-10-29_14",
-    "proxy.log.2026-10-29_140921",
-    "proxy.log.2026-10-29_20",
+    "proxy.log.2026-10-29_125828.gz",
+    "proxy.log.2026-10-29_14.gz",
+    "proxy.log.2026-10-29_140921.gz",
+    "proxy.log.2026-10-29_20.gz",
     "proxy.log.2026-10-30_02",
     "proxy.log.2026-10-30_10",
-    "proxy.log.2026-10-30_103503"
+    "proxy.log.2026-10-30_103503",
+    "proxy.log.2026-10-30_16",
+    "proxy.log.2026-10-30_231043",
+    "proxy.log.2026-10-31_003749",
+    "proxy.log.2026-10-31_004152"
   ],
+  "queue_banding": {
+    "own_enqueue": 0,
+    "own_outcome": 0,
+    "session_chain": 62,
+    "unknown": 3
+  },
+  "queued_waits_enqueued": 65,
+  "queued_waits_enqueued_unbanded": 65,
   "since": "2026-10-27 19:00:00",
   "totals": {
     "abandoned_share": 0.3692,
@@ -204,6 +238,7 @@
     "evictions": 152,
     "queue_abandoned": 24,
     "queue_dispatched": 41,
+    "queue_enqueued": 0,
     "queue_wait_seconds": 2645.69,
     "queued_waits": 65,
     "rate_buckets": {},

@@ -19,6 +19,11 @@ Covered:
   in total and by ``reason``, window-filtered, never leaking into the
   admission verdict counters, and only when the marker starts the logging
   message (a request body that merely quotes it contributes 0).
+- LP-0MVV29WR0009DY1A: queue waits are banded **only** from evidence belonging
+  to their own request — the outcome line's own ``new_tokens``, else the
+  enqueue line's, else an admission for the same session in the same wait
+  chain, else ``unknown`` (a later admission is never borrowed), plus the
+  explicit ``queued_waits_enqueued`` denominator.
 """
 
 from __future__ import annotations
@@ -80,20 +85,61 @@ def _first_byte(ts: str, session: str = "s-1") -> str:
     )
 
 
-def _queue_fallback(ts: str, session: str, queued: float = 60.0) -> str:
-    return (
-        f"{ts} - llama-proxy - INFO - contention_queue_fallback_after_queue "
-        f"provider=local session={session} queued_duration={queued:.2f}s "
-        f"reason=local_lease_active"
-    )
+def _queue_fallback(
+    ts: str, session: str, queued: float = 60.0, new_tokens: int | None = None
+) -> str:
+    fields = [
+        "contention_queue_fallback_after_queue",
+        "provider=local",
+        f"session={session}",
+        f"queued_duration={queued:.2f}s",
+        "reason=local_lease_active",
+    ]
+    if new_tokens is not None:
+        fields.append(f"new_tokens={new_tokens}")
+    return f"{ts} - llama-proxy - INFO - " + " ".join(fields)
 
 
-def _queue_dispatch(ts: str, session: str, queued: float = 12.0) -> str:
-    return (
-        f"{ts} - llama-proxy - INFO - contention_queue_dispatch "
-        f"provider=local session={session} queued_duration={queued:.2f}s "
-        f"policy=queue depth=1"
-    )
+def _queue_dispatch(
+    ts: str, session: str, queued: float = 12.0, new_tokens: int | None = None
+) -> str:
+    fields = [
+        "contention_queue_dispatch",
+        "provider=local",
+        f"session={session}",
+        f"queued_duration={queued:.2f}s",
+        "policy=queue depth=1",
+    ]
+    if new_tokens is not None:
+        fields.append(f"new_tokens={new_tokens}")
+    return f"{ts} - llama-proxy - INFO - " + " ".join(fields)
+
+
+def _queue_wait(
+    ts: str,
+    *,
+    session: str | None = None,
+    new_tokens: int | None = None,
+    rate_bucket: str | None = None,
+    trigger: str | None = None,
+    max_wait: float = 60.0,
+) -> str:
+    """An enqueue line — legacy shape (no session/pricing) or post-fix shape."""
+    fields = [
+        "contention_queue_wait",
+        f"max_wait={max_wait:.1f}s",
+        "max_depth=8",
+        "saturation=prefill",
+    ]
+    if session is not None:
+        fields.append(f"session={session}")
+    if new_tokens is not None:
+        fields.append(f"new_tokens={new_tokens}")
+    if rate_bucket is not None:
+        fields.append(f"rate_bucket={rate_bucket}")
+    if trigger is not None:
+        fields.append(f"trigger={trigger}")
+    return f"{ts} - INFO - " + " ".join(fields)
 
 
 def _eviction(ts: str, session: str, reason: str | None = "measured_cache_deficit") -> str:
@@ -117,6 +163,237 @@ def _write_log(tmp_path: Path, lines: list[str], name: str = "proxy.log") -> Pat
 # ---------------------------------------------------------------------------
 # AC2 — banding
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Queue-wait banding (LP-0MVV29WR0009DY1A AC1): own request only
+# ---------------------------------------------------------------------------
+
+def _report_of(lines: list[str]) -> dict:
+    events = [
+        event
+        for event in (parse_event(line, parse_line_timestamp(line)) for line in lines)
+        if event is not None
+    ]
+    return build_report(events, files=[])
+
+
+def test_queue_wait_line_is_parsed_with_its_own_evidence():
+    """The post-fix enqueue line carries the request's own pricing."""
+    line = _queue_wait(
+        "2026-10-19 14:56:57,000",
+        session="herdr-1793285755-177798-1619",
+        new_tokens=35077,
+        rate_bucket="solitary",
+        trigger="prefill",
+    )
+    event = parse_event(line, parse_line_timestamp(line))
+
+    assert event is not None
+    assert event.kind == "queue_wait"
+    assert event.session == "herdr-1793285755-177798-1619"
+    assert event.new_tokens == 35077
+    assert event.rate_bucket == "solitary"
+    assert event.trigger == "prefill"
+
+
+def test_queue_line_with_unknown_pricing_is_not_banded():
+    """``new_tokens=unknown`` (logged when pricing fails) is an absence, not a
+    number: it must never be parsed into a band."""
+    line = (
+        "2026-10-19 10:00:00,000 - INFO - contention_queue_wait "
+        "max_wait=60.0s max_depth=8 saturation=prefill session=s-1 "
+        "new_tokens=unknown rate_bucket=unknown trigger=prefill"
+    )
+    event = parse_event(line, parse_line_timestamp(line))
+
+    assert event is not None
+    assert event.kind == "queue_wait"
+    assert event.session == "s-1"
+    assert event.new_tokens is None
+    assert event.trigger == "prefill"
+
+
+def test_queue_wait_is_never_banded_from_a_later_admission():
+    """AC1 defect reproduction: the phantom ``32k-64k`` row.
+
+    Session ``herdr-1793285755-177798-1619`` queued for 60 s at 14:56:57 and
+    the *only* admission evidence in that session is a 35 077-token reject at
+    15:01:35 — 4 m 38 s **after** the wait. The old ``(preceding or
+    candidates)[-1:]`` fallback banded the wait as ``32k-64k``; the wait must
+    now be ``unknown``.
+    """
+    report = _report_of(
+        [
+            _queue_wait("2026-10-19 14:56:57,000"),
+            _queue_fallback(
+                "2026-10-19 14:57:57,000", "herdr-1793285755-177798-1619"
+            ),
+            _admission(
+                "2026-10-19 15:01:35,000",
+                session="herdr-1793285755-177798-1619",
+                new_tokens=35077,
+                decision="reject",
+                reason="prefill_budget_exceeded",
+            ),
+        ]
+    )
+
+    assert "32k-64k" in report["bands"]  # the reject itself, not the wait
+    assert report["bands"]["32k-64k"]["queued_waits"] == 0
+    assert report["bands"][UNKNOWN_BAND]["queue_abandoned"] == 1
+    assert report["bands"][UNKNOWN_BAND]["admission_verdicts"] == {
+        "admit": 0,
+        "reject": 0,
+    }
+    # The reject is still counted in its own band — banding the wait moved, the
+    # verdict did not.
+    assert report["bands"]["32k-64k"]["admission_verdicts"]["reject"] == 1
+    assert report["totals"]["queued_waits"] == 1
+    assert report["queued_waits_enqueued"] == 1
+
+
+def test_queue_wait_bands_from_its_own_outcome_line():
+    """The outcome line's own ``new_tokens`` wins over an earlier admission."""
+    report = _report_of(
+        [
+            _admission(
+                "2026-10-19 10:00:00,000", session="s-1", new_tokens=25000
+            ),
+            _queue_wait("2026-10-19 10:00:05,000", session="s-1", new_tokens=6000),
+            _queue_fallback(
+                "2026-10-19 10:01:05,000", "s-1", new_tokens=6000
+            ),
+        ]
+    )
+
+    assert report["bands"]["<8k"]["queue_abandoned"] == 1
+    assert report["bands"]["20k-32k"]["queued_waits"] == 0
+    assert report["queue_banding"] == {
+        "own_outcome": 1,
+        "own_enqueue": 0,
+        "session_chain": 0,
+        "unknown": 0,
+    }
+
+
+def test_queue_wait_bands_from_its_own_enqueue_line():
+    """An enqueue line's own pricing bands the outcome that ends that wait."""
+    report = _report_of(
+        [
+            # A prior, already-concluded wait chain in the same session.
+            _admission(
+                "2026-10-19 09:00:00,000", session="s-1", new_tokens=25000
+            ),
+            _queue_dispatch("2026-10-19 09:00:12,000", "s-1"),
+            # This wait carries its own evidence on the enqueue line only.
+            _queue_wait("2026-10-19 10:00:00,000", session="s-1", new_tokens=6000),
+            _queue_dispatch("2026-10-19 10:00:12,000", "s-1"),
+        ]
+    )
+
+    assert report["bands"]["20k-32k"]["queue_dispatched"] == 1
+    assert report["bands"]["<8k"]["queue_dispatched"] == 1
+    assert report["bands"]["<8k"]["queue_enqueued"] == 1
+    assert report["queue_banding"] == {
+        "own_outcome": 0,
+        "own_enqueue": 1,
+        "session_chain": 1,
+        "unknown": 0,
+    }
+
+
+def test_a_concluded_chain_admission_is_not_reused():
+    """The second wait of a session without its own evidence is ``unknown``,
+    not a re-band from the admission that already banded the first wait."""
+    report = _report_of(
+        [
+            _admission(
+                "2026-10-19 10:00:00,000", session="s-1", new_tokens=25000
+            ),
+            _queue_wait("2026-10-19 10:00:05,000"),
+            _queue_dispatch("2026-10-19 10:00:17,000", "s-1"),
+            _queue_wait("2026-10-19 11:00:00,000"),
+            _queue_fallback("2026-10-19 11:01:00,000", "s-1"),
+        ]
+    )
+
+    assert report["bands"]["20k-32k"]["queue_dispatched"] == 1
+    assert report["bands"]["20k-32k"]["queue_abandoned"] == 0
+    assert report["bands"][UNKNOWN_BAND]["queue_abandoned"] == 1
+    assert report["queue_banding"] == {
+        "own_outcome": 0,
+        "own_enqueue": 0,
+        "session_chain": 1,
+        "unknown": 1,
+    }
+
+
+def test_same_chain_admission_bands_a_legacy_outcome():
+    """Legacy waits (no pricing on either queue line) keep the same-chain
+    admission join; a different session's admission is never borrowed."""
+    report = _report_of(
+        [
+            _admission(
+                "2026-10-19 10:00:00,000", session="s-1", new_tokens=25000
+            ),
+            _queue_wait("2026-10-19 10:00:05,000"),
+            _queue_fallback("2026-10-19 10:01:05,000", "s-1"),
+            # s-2 has an admission, s-3 does not: s-3 must stay unknown.
+            _admission(
+                "2026-10-19 11:00:00,000", session="s-2", new_tokens=6000
+            ),
+            _queue_wait("2026-10-19 11:00:05,000"),
+            _queue_fallback("2026-10-19 11:01:05,000", "s-3"),
+        ]
+    )
+
+    assert report["bands"]["20k-32k"]["queue_abandoned"] == 1
+    assert report["bands"][UNKNOWN_BAND]["queue_abandoned"] == 1
+    assert report["bands"]["<8k"].get("queued_waits", 0) == 0
+    assert report["queue_banding"] == {
+        "own_outcome": 0,
+        "own_enqueue": 0,
+        "session_chain": 1,
+        "unknown": 1,
+    }
+
+
+def test_queued_waits_enqueued_is_reported_alongside_outcomes():
+    """AC3: the enqueue count makes the abandoned-share denominator auditable."""
+    report = _report_of(
+        [
+            _queue_wait("2026-10-19 10:00:00,000", session="s-1", new_tokens=6000),
+            _queue_wait("2026-10-19 10:01:00,000"),
+            _queue_dispatch("2026-10-19 10:00:12,000", "s-1"),
+            _queue_fallback("2026-10-19 10:02:00,000", "s-1"),
+        ]
+    )
+
+    assert report["queued_waits_enqueued"] == 2
+    assert report["queued_waits_enqueued_unbanded"] == 1
+    assert report["totals"]["queued_waits"] == 2
+    assert report["bands"]["<8k"]["queue_enqueued"] == 1
+    assert report["bands"]["<8k"]["queued_waits"] == 1
+    # The sessionless enqueue cannot open a chain, so its outcome is unknown.
+    assert report["bands"][UNKNOWN_BAND]["queued_waits"] == 1
+
+
+def test_queue_wait_body_echoes_are_not_enqueues(tmp_path):
+    """Only a line whose message starts with the marker is an enqueue."""
+    log_dir = _write_log(
+        tmp_path,
+        [
+            _remote_body_post(
+                "2026-10-19 10:00:00,000",
+                "contention_queue_wait max_wait=60.0s max_depth=8",
+            ),
+            _queue_wait("2026-10-19 10:01:00,000", session="s-1", new_tokens=6000),
+        ],
+    )
+    report = analyse(log_dir, SINCE, UNTIL)
+
+    assert report["queued_waits_enqueued"] == 1
+
 
 @pytest.mark.parametrize(
     ("tokens", "expected"),

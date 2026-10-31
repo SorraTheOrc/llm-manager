@@ -257,6 +257,100 @@ async def test_queue_logs_generating_saturation(caplog):
 
 
 # ---------------------------------------------------------------------------
+# LP-0MVV29WR0009DY1A AC2: the enqueue line carries its own request evidence
+# ---------------------------------------------------------------------------
+
+def _wait_lines(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("contention_queue_wait")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_queue_wait_log_carries_the_admission_decisions_own_pricing(caplog):
+    """The guard already priced this exact prompt: log those numbers, not a
+    join to some other request's admission."""
+    from types import SimpleNamespace
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    cfg = _cfg(max_wait=0.05)
+    decision = SimpleNamespace(
+        admit=True, reason="within_budget", new_tokens=35077,
+        rate_bucket="contended", eta_prefill_seconds=12.0,
+    )
+    request = _DummyRequest()
+
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+        patch(
+            "proxy.provider._prefill_admission_guard",
+            new=AsyncMock(return_value=decision),
+        ),
+    ):
+        await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, request, {}, {}, {}, "herdr-1",
+        )
+
+    lines = _wait_lines(caplog)
+    assert lines, "the enqueue line must be logged"
+    line = lines[0]
+    assert "session=herdr-1" in line
+    assert "new_tokens=35077" in line
+    assert "rate_bucket=contended" in line
+    assert "trigger=generating" in line
+    # The dispatch/fallback lines that end this wait read the same evidence
+    # back off the request, so all three lines of one wait agree.
+    assert (
+        getattr(request, provider.CONTENTION_QUEUE_NEW_TOKENS_ATTR)
+        == 35077
+    )
+
+
+@pytest.mark.asyncio
+async def test_queue_wait_log_prices_an_inert_guard_from_the_routing_estimate(
+    caplog,
+):
+    """With no guard decision the prompt is priced exactly as the dispatch
+    path does it (``estimated_tokens * (1 - cached ratio)``)."""
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    cfg = _cfg(max_wait=0.05)
+    request = _DummyRequest()
+
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
+        patch(
+            "proxy.provider._queue_context_bypass",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+        patch(
+            "proxy.provider._prefill_admission_guard",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "proxy.provider._effective_routing_tokens",
+            new=AsyncMock(return_value=35077),
+        ),
+        patch("proxy.provider.expected_cached_ratio", return_value=0.3),
+    ):
+        await provider._maybe_queue_for_local_slot(
+            cfg, 1, 1, request, {}, {}, {}, "s2",
+        )
+
+    line = _wait_lines(caplog)[0]
+    assert "new_tokens=24554" in line  # round(35077 * 0.7)
+    assert "rate_bucket=unknown" in line
+    assert (
+        getattr(request, provider.CONTENTION_QUEUE_NEW_TOKENS_ATTR) == 24554
+    )
+
+
+# ---------------------------------------------------------------------------
 # AC2/AC6: end-to-end — post-dispatch lease denial queues on prefill, then
 # dispatches local (instead of falling back as local_lease_active)
 # ---------------------------------------------------------------------------

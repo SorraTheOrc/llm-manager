@@ -39,6 +39,11 @@ genuinely a pre-change capture.
   `proxy.log.2026-10-28_16.gz`.
 - **First byte with no admission line:** 6 sessions (reported separately,
   never silently joined to an admission — harness AC2).
+- **Queued waits enqueued:** 65 (`contention_queue_wait`) against 65 outcomes
+  (41 dispatched + 24 abandoned). None of the enqueue lines carries its own
+  pricing (they predate the field added in `LP-0MVV29WR0009DY1A`), so waits are
+  banded by the same-session join when that evidence is unused and otherwise
+  reported as `unknown` (3 waits here).
 
 Bands are on the **priced new (uncached) tokens** of a local dispatch:
 `<8k`, `8k-20k`, `20k-32k`, `32k-64k`, `>=64k` (the `20k`/`32k` boundaries
@@ -47,13 +52,20 @@ mirror `local_admission_guard_eta_percentile_min_tokens` and
 
 ## Per-band baseline
 
+Re-banded on 2026-10-31 with the own-request queue-wait join rule
+(`LP-0MVV29WR0009DY1A`, documented in
+[the post-change record](prefill-admission-conversion-postchange.md#queue-wait-attribution-lp-0mvv29wr0009dy1a)):
+five waits that the earlier rule had banded from a consumed or later admission
+now sit in `unknown`. Verdicts and the 36.9 % headline are unchanged.
+
 | Band | Admits | Rejects | Converted | Unconverted | Conv % | Queued waits | Abandoned | Abandoned % | Queue-wait s |
 |---|---|---|---|---|---|---|---|---|---|
-| `<8k` | 397 | 36 | 27 | 15 | 64.3 % | 57 | 20 | 35.1 % | 2236.8 |
-| `8k-20k` | 24 | 152 | 10 | 5 | 66.7 % | 8 | 4 | 50.0 % | 408.9 |
+| `<8k` | 397 | 36 | 27 | 15 | 64.3 % | 55 | 20 | 36.4 % | 2193.7 |
+| `8k-20k` | 24 | 152 | 10 | 5 | 66.7 % | 7 | 4 | 57.1 % | 391.8 |
 | `20k-32k` | 2 | 692 | 1 | 1 | 50.0 % | 0 | 0 | 0.0 % | 0.0 |
 | `32k-64k` | 0 | 1091 | 0 | 0 | — | 0 | 0 | 0.0 % | 0.0 |
 | `>=64k` | 0 | 1983 | 0 | 0 | — | 0 | 0 | 0.0 % | 0.0 |
+| `unknown` | 0 | 0 | 0 | 0 | — | 3 | 0 | 0.0 % | 60.2 |
 | **Total** | **423** | **3954** | **38** | **21** | **64.4 %** | **65** | **24** | **36.9 %** | **2645.7** |
 
 Reject reasons are dominated by the flat cold-prefill budget
@@ -101,8 +113,8 @@ That makes the comparison two-sided, and both are recorded here:
 - **Literal parent AC4:** the post-change share must be **below 85 %**. A
   36.9 % baseline already satisfies that, so the AC4 measurement must not
   regress above 36.9 % / the 85 % reference.
-- **Stricter working baseline:** use the captured **36.9 %** (and 35.1 % in
-  `<8k`, 50.0 % in `8k-20k`) as the pre-change bar for child
+- **Stricter working baseline:** use the captured **36.9 %** (and 36.4 % in
+  `<8k`, 57.1 % in `8k-20k`) as the pre-change bar for child
   `LP-0MVS9Z0GY008LCJA`, so the contended-pricing fix is judged against the
   code it actually changes rather than a stale 85 % figure.
 
@@ -124,7 +136,8 @@ which is triaged in `LP-0MVV9JWL9003A6XR`.
 3. The harness is unit-tested from synthetic log lines
    ([`tests/test_prefill_admission_conversion.py`](../../tests/test_prefill_admission_conversion.py)),
    including pre-change line shapes without the newer `rate_bucket` /
-   `contended_samples` fields.
+   `contended_samples` fields and the own-request queue-wait banding rule
+   (`LP-0MVV29WR0009DY1A`).
 
 ## Cross-reference
 
@@ -137,6 +150,7 @@ which is triaged in `LP-0MVV9JWL9003A6XR`.
 | 5 | `LP-0MVS9Z0GY008LCJA` | Post-change 24 h measurement vs this baseline (superseded by `LP-0MVTKTOVI006ZONN`, which delivered [`prefill-admission-conversion-postchange.md`](prefill-admission-conversion-postchange.md)) |
 | 6 | `LP-0MVS9Z034006MFZ6` | Docs and rollback |
 | 7 | `LP-0MVV9JWL9003A6XR` | Eviction triage that corrected this baseline's `local_eviction_after_acceptance` comparator (152 genuine, not the 463 substring count) and made the harness count only message-anchored eviction records |
+| 8 | `LP-0MVV29WR0009DY1A` | Own-request queue-wait banding — re-banded this baseline (5 waits moved to `unknown`; verdicts unchanged) |
 
 Related: [`docs/dev/contended-prefill-pricing.md`](contended-prefill-pricing.md)
 (the contended pricing and rollback page).

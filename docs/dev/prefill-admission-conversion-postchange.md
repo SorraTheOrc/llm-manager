@@ -43,16 +43,20 @@ and per band), so AC4's second clause needs no separate log scan.
 
 - **Window:** `2026-10-29 00:10:18` → `2026-10-30 00:10:18` (24 h, inclusive).
 - **Log files read (7):** `proxy.log.2026-10-29_00.gz`,
-  `proxy.log.2026-10-29_06.gz`, `proxy.log.2026-10-29_125828`,
-  `proxy.log.2026-10-29_14`, `proxy.log.2026-10-29_140921`,
-  `proxy.log.2026-10-29_20`, `proxy.log-2026-10-30_00`.
+  `proxy.log.2026-10-29_06.gz`, `proxy.log.2026-10-29_125828.gz`,
+  `proxy.log.2026-10-29_14.gz`, `proxy.log.2026-10-29_140921.gz`,
+  `proxy.log.2026-10-29_20.gz`, `proxy.log-2026-10-30_00.gz`.
 - **First byte with no admission line:** 16 sessions (reported separately,
   never silently joined to an admission — harness AC2).
-- **`unknown` band:** 89 queued waits whose session had no bandable admission
-  evidence at or before the queue event (no `new_tokens` on the admit line).
-  It carries no admission verdicts, so it does not distort the conversion or
-  verdict counts — but its abandoned share (75.3 %) is reported rather than
-  hidden.
+- **Queued waits enqueued:** 517 (`contention_queue_wait`), against 517 queue
+  outcomes (203 dispatched + 314 abandoned) — the denominator of every share on
+  this page is now reported explicitly, not inferred from the outcome lines.
+- **`unknown` band:** 211 queued waits that carry no own-request pricing (all
+  517 enqueue lines in this window predate the `new_tokens=` enqueue field, so
+  none is self-bandable). It carries no admission verdicts, so it does not
+  distort the conversion or verdict counts — but its abandoned share (78.2 %)
+  is reported rather than hidden, and its per-wait evidence is itemised in
+  [Queue-wait attribution](#queue-wait-attribution-lp-0mvv29wr0009dy1a) below.
 
 Bands are on the **priced new (uncached) tokens** of a local dispatch:
 `<8k`, `8k-20k`, `20k-32k`, `32k-64k`, `>=64k` (the `20k`/`32k` boundaries
@@ -86,37 +90,46 @@ matter (`prefill_budget_exceeded` 855 / 662).
 
 ### Pre-change (2026-10-27 19:00 → 2026-10-28 19:00, 24 h, pre-fix code)
 
+Re-banded with the same own-request join rule (5 waits the earlier rule had
+banded from a consumed or later admission now sit in `unknown`; verdicts and
+the 36.9 % total are unchanged).
+
 | Band | Admits | Rejects | Converted | Unconverted | Conv % | Queued waits | Abandoned | Abandoned % | Queue-wait s |
 |---|---|---|---|---|---|---|---|---|---|
-| `<8k` | 397 | 36 | 27 | 15 | 64.3 % | 57 | 20 | 35.1 % | 2236.8 |
-| `8k-20k` | 24 | 152 | 10 | 5 | 66.7 % | 8 | 4 | 50.0 % | 408.9 |
+| `<8k` | 397 | 36 | 27 | 15 | 64.3 % | 55 | 20 | 36.4 % | 2193.7 |
+| `8k-20k` | 24 | 152 | 10 | 5 | 66.7 % | 7 | 4 | 57.1 % | 391.8 |
 | `20k-32k` | 2 | 692 | 1 | 1 | 50.0 % | 0 | 0 | 0.0 % | 0.0 |
 | `32k-64k` | 0 | 1091 | 0 | 0 | 0.0 % | 0 | 0 | 0.0 % | 0.0 |
 | `>=64k` | 0 | 1983 | 0 | 0 | 0.0 % | 0 | 0 | 0.0 % | 0.0 |
+| `unknown` | 0 | 0 | 0 | 0 | 0.0 % | 3 | 0 | 0.0 % | 60.2 |
 | **Total** | **423** | **3954** | **38** | **21** | **64.4 %** | **65** | **24** | **36.9 %** | **2645.7** |
 
 ### Post-change (2026-10-29 00:10:18 → 2026-10-30 00:10:18, 24 h, `52085f09`)
 
+Re-banded on 2026-10-31 by the own-request join rule
+([`LP-0MVV29WR0009DY1A`](#queue-wait-attribution-lp-0mvv29wr0009dy1a)); the
+verdict totals are unchanged, the per-band queue columns moved.
+
 | Band | Admits | Rejects | Converted | Unconverted | Conv % | Queued waits | Abandoned | Abandoned % | Queue-wait s |
 |---|---|---|---|---|---|---|---|---|---|
-| `<8k` | 1132 | 396 | 99 | 62 | 61.5 % | 301 | 149 | 49.5 % | 12833.5 |
-| `8k-20k` | 97 | 221 | 26 | 18 | 59.1 % | 48 | 31 | 64.6 % | 2299.3 |
-| `20k-32k` | 49 | 608 | 5 | 11 | 31.2 % | 33 | 26 | 78.8 % | 1808.3 |
-| `32k-64k` | 0 | 855 | 0 | 0 | 0.0 % | 45 | 41 | 91.1 % | 2527.7 |
-| `>=64k` | 0 | 662 | 0 | 0 | 0.0 % | 1 | 0 | 0.0 % | 51.6 |
-| `unknown` | 0 | 0 | 0 | 0 | 0.0 % | 89 | 67 | 75.3 % | 4800.3 |
+| `<8k` | 1132 | 396 | 99 | 62 | 61.5 % | 236 | 101 | 42.8 % | 9383.0 |
+| `8k-20k` | 97 | 221 | 26 | 18 | 59.1 % | 44 | 29 | 65.9 % | 2138.6 |
+| `20k-32k` | 49 | 608 | 5 | 11 | 31.2 % | 26 | 19 | 73.1 % | 1386.4 |
+| `32k-64k` | 0 | 855 | 0 | 0 | 0.0 % | 0 | 0 | 0.0 % | 0.0 |
+| `>=64k` | 0 | 662 | 0 | 0 | 0.0 % | 0 | 0 | 0.0 % | 0.0 |
+| `unknown` | 0 | 0 | 0 | 0 | 0.0 % | 211 | 165 | 78.2 % | 11412.8 |
 | **Total** | **1278** | **2742** | **130** | **91** | **58.8 %** | **517** | **314** | **60.7 %** | **24320.7** |
 
 ### Abandoned-queue-wait share, side by side
 
 | Band | Pre-change abandoned % (24 h) | Post-change abandoned % (24 h) | Pre queued | Post queued |
 |---|---|---|---|---|
-| `<8k` | 35.1 % | 49.5 % | 57 | 301 |
-| `8k-20k` | 50.0 % | 64.6 % | 8 | 48 |
-| `20k-32k` | 0.0 % | 78.8 % | 0 | 33 |
-| `32k-64k` | 0.0 % | 91.1 % | 0 | 45 |
-| `>=64k` | 0.0 % | 0.0 % | 0 | 1 |
-| `unknown` | — | 75.3 % | — | 89 |
+| `<8k` | 36.4 % | 42.8 % | 55 | 236 |
+| `8k-20k` | 57.1 % | 65.9 % | 7 | 44 |
+| `20k-32k` | 0.0 % | 73.1 % | 0 | 26 |
+| `32k-64k` | 0.0 % | — (no queued waits) | 0 | 0 |
+| `>=64k` | 0.0 % | — (no queued waits) | 0 | 0 |
+| `unknown` | — | 78.2 % | — | 211 |
 | **Total** | **36.9 %** (24/65) | **60.7 %** (314/517) | **65** | **517** |
 
 ### Per-hour rates (the fairer comparison — the two windows differ in diurnal mix)
@@ -147,6 +160,90 @@ reading the share.
 > **152 (6.3 / h)**, so the eviction rate rose **×2.6**, it did not fall. The
 > diurnal-mix caveat still applies to the *share* comparison; the rate change
 > is large enough to survive it.
+
+## Queue-wait attribution (`LP-0MVV29WR0009DY1A`)
+
+The pre-fix harness banded a queue wait by the session's nearest *preceding*
+admission and — when none preceded it — by that session's **latest** admission,
+even one hours after the queue event. That is how this record came to show a
+`32k-64k` row with 45 queued waits, 41 abandoned and **0 admits**:
+a `<8k`-class wait in session `herdr-1793285755-177798-1619` queued at
+`14:56:57` and was banded by a 35 077-token reject that arrived at `15:01:35`,
+4 m 38 s **later**. The abandoned-share totals (60.7 %, 314/517) were never
+affected — banding does not change them — but every per-band claim was
+contaminated. The parent item's "the share grew in four of five bands" is the
+clearest casualty: after re-banding the share grew in **both** bands that carry
+queued waits in both windows (`<8k` 36.4 → 42.8 %, `8k-20k` 57.1 → 65.9 %),
+`20k-32k` has queued waits only in the post-change window (0 → 26, 73.1 %), and
+`32k-64k` / `>=64k` no longer carry a queued wait in the post-change window at
+all.
+
+### The rule now
+
+A queue wait is banded only from evidence belonging to **its own request**:
+
+1. the outcome line's own `new_tokens` (post-fix log shape);
+2. the `contention_queue_wait` enqueue line's own `new_tokens` for the same wait
+   chain — the enqueue line now carries `session=`, `new_tokens=`,
+   `rate_bucket=`, `trigger=`;
+3. otherwise an admission for the same session that precedes the wait **and**
+   has not already banded an earlier wait in that session (the legacy join —
+   the only option for this window, where all 517 enqueue lines predate the new
+   fields);
+4. otherwise `unknown`. A *later* admission is never borrowed, and an admission
+   that already concluded one wait is never reused for the next.
+
+The harness reports how each of the 517 waits was banded (`queue_banding` in
+the JSON): `own_outcome=0`, `own_enqueue=0`, `session_chain=306`,
+`unknown=211`. The two zeroes are the
+pre-deployment signature: no queue line in this window carries its own pricing
+yet (the enqueue line gained `new_tokens=` only with this change).
+
+### The phantom band is gone
+
+`32k-64k` and `>=64k` now carry **zero** queued waits (their 46 waits moved to
+the bands their own evidence supports), and no band shows queued waits with
+zero admission verdicts except `unknown`, which is documented below. 122 of the
+517 waits had no own-request evidence and were previously banded anyway:
+
+| Band the old rule used | Waits | Of which from a **later** admission |
+|---|---|---|
+| `<8k` | 65 | 32 |
+| `8k-20k` | 4 | 1 |
+| `20k-32k` | 7 | 7 |
+| `32k-64k` | 45 | 45 |
+| `>=64k` | 1 | 1 |
+| **Total** | **122** | **86** |
+
+The remaining 36 came from an earlier admission that had already banded a
+previous wait in the same session — the same attribution error, one step
+closer.
+
+### The retained `unknown` row, with per-wait evidence
+
+All 211 `unknown` waits carry no own-request pricing (every enqueue line in
+this window predates the `new_tokens=` field), so they split by why no
+admission could band them:
+
+| Cause | Waits | Meaning |
+|---|---|---|
+| No admission line for that session precedes the wait | 175 | the admission guard logged no decision for that request, so there is no verdict to band it from |
+| The session's admission already banded an earlier wait | 36 | the admission belongs to a previous wait chain; reusing it would repeat the attribution error being fixed |
+
+The row is retained deliberately rather than dropped: silently discarding
+unbandable waits would shrink the abandoned-share denominator. Reporting the
+enqueue count keeps `517 enqueues = 517 outcomes` auditable instead. From the
+next deployment the enqueue line carries its own `new_tokens=`, so this class
+should collapse to genuinely unpricable waits (the field is omitted — logged as
+`new_tokens=unknown` — never guessed, when pricing fails).
+
+### What did not change
+
+- **The verdict counts and the headline share.** 1278 admits / 2742 rejects and
+  314/517 = 60.7 % abandoned are identical to the pre-re-banding record; the
+  regression against the 36.9 % working baseline stands and is still tracked in
+  `LP-0MVV1V213002QAIR`.
+- **The eviction counts.** 392 total, unchanged by this re-banding.
 
 ## AC4 second clause — `local_eviction_after_acceptance`
 
@@ -271,11 +368,16 @@ wrong on both counts and is superseded by this section.
    `local_eviction_after_acceptance` reason counters, and the
    request-body-echo case that inflated the old comparator.
 4. Both committed JSONs were regenerated with the message-anchored eviction
-   classifier on 2026-10-30 (`LP-0MVV9JWL9003A6XR`); re-running the command at
-   the top of this page and the one in
+   classifier on 2026-10-30 (`LP-0MVV9JWL9003A6XR`); the post-change JSON was
+   re-banded on 2026-10-31 with the own-request queue-wait join rule
+   (`LP-0MVV29WR0009DY1A`, unit-tested from synthetic lines in the same file).
+   Re-running the command at the top of this page and the one in
    [`prefill-admission-conversion.md`](prefill-admission-conversion.md)
    reproduces them (modulo the rotation-dependent `log_files_scanned`
-   inventory).
+   inventory). The queue denominator and the banding provenance are readable
+   without post-processing: `queued_waits_enqueued`,
+   `queued_waits_enqueued_unbanded` and `queue_banding`
+   (`own_outcome`/`own_enqueue`/`session_chain`/`unknown`).
 
 ## Cross-reference
 
@@ -292,6 +394,8 @@ wrong on both counts and is superseded by this section.
 | 9 | `LP-0MVV9JWL9003A6XR` | Eviction triage: `measured_cache_deficit` new-class verdict + corrected pre-change comparator (152, not 463) |
 | 10 | `LP-0MVR7IN0O000DPXN`, `LP-0MVR7HJD0007RFEM` | Measured-cache early-abort feature that introduced the `measured_cache_deficit` class |
 | 11 | `LP-0MVQIT9QY007QU27` | `prefill_deadline` eviction work being done during the pre-change window (source of the 311 request-body false positives) |
+| 12 | `LP-0MVV29WR0009DY1A` | Own-request queue-wait banding (this re-banding) + enqueue-line pricing fields |
+| 13 | `LP-0MVT110PJ003XYLP` | Standalone contention-queue residual report (consumer of the harness join and log fields) |
 
 Related: [`docs/dev/contended-prefill-pricing.md`](contended-prefill-pricing.md)
 (the contended pricing and rollback page) and

@@ -1171,6 +1171,125 @@ async def test_lease_denied_queue_budget_expires_falls_back_to_remote(lease_stat
 
 
 @pytest.mark.asyncio
+async def test_lease_denied_dispatch_log_carries_own_new_tokens(lease_state, caplog):
+    """AC2: the dispatch line that ends a queue wait carries the wait's own
+    ``new_tokens`` (stamped at enqueue), never a join to another request."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [{"name": "local-llama", "type": "local", "llama_model": "Qwen3"}]
+    }
+    local_calls = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        local_calls.append(1)
+        if len(local_calls) == 1:
+            return _lease_active_response()
+        return _ok_response()
+
+    request = _DummyRequest()
+    setattr(request, provider.CONTENTION_QUEUE_NEW_TOKENS_ATTR, 35077)
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("dispatch", None, 0.5)),
+        ),
+    ):
+        await provider.proxy_with_fallback(
+            request, "v1/chat/completions", config, _queue_cfg()
+        )
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_dispatch" in messages
+    assert "new_tokens=35077" in messages
+
+
+@pytest.mark.asyncio
+async def test_lease_denied_fallback_log_carries_own_new_tokens(lease_state, caplog):
+    """AC2: the abandon line carries the same own-request ``new_tokens``."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-ok", "type": "remote",
+             "endpoint": "https://api.example.com/v1"},
+        ]
+    }
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        return _ok_response()
+
+    request = _DummyRequest()
+    setattr(request, provider.CONTENTION_QUEUE_NEW_TOKENS_ATTR, 6000)
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("fallback", None, 300.0)),
+        ),
+    ):
+        await provider.proxy_with_fallback(
+            request, "v1/chat/completions", config, _queue_cfg()
+        )
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_fallback_after_queue" in messages
+    assert "new_tokens=6000" in messages
+
+
+@pytest.mark.asyncio
+async def test_lease_denied_dispatch_log_degrades_without_enqueue_evidence(
+    lease_state, caplog
+):
+    """Missing enqueue evidence logs ``new_tokens=unknown`` — a parseable
+    absence, never a guessed band."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [{"name": "local-llama", "type": "local", "llama_model": "Qwen3"}]
+    }
+    local_calls = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        local_calls.append(1)
+        if len(local_calls) == 1:
+            return _lease_active_response()
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("dispatch", None, 0.5)),
+        ),
+    ):
+        await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", config, _queue_cfg()
+        )
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_dispatch" in messages
+    assert "new_tokens=unknown" in messages
+
+
+@pytest.mark.asyncio
 async def test_lease_denied_budget_expires_all_remotes_out_of_window_terminal(lease_state, caplog):
     """AC3/AC4: lease denial + budget expiry + all remotes out of window
     yields a prompt terminal error (with a stable code), never a silent
