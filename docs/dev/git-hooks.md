@@ -107,7 +107,27 @@ the push — that is the regression guard verified by
 |---|---|
 | `pre-push` | branch policy, context budget, full-suite gate on `dev`/`main`, worklog sync |
 | `post-checkout` | worklog sync after branch checkout (main checkout only) |
-| `post-merge`, `post-rewrite`, `worklog-post-pull` | worklog sync after pulls/merges (main checkout only) |
+| `post-merge` | worklog sync after a pull/merge; delegates to the repo-local `.githooks/worklog-post-pull` (main checkout only) |
+| `post-rewrite` | worklog sync after an amend/rebase; delegates to the repo-local `.githooks/worklog-post-pull` (main checkout only, stdin forwarded) |
+| `worklog-post-pull` | the post-pull sync implementation the two wrappers above delegate to |
 
 All non-`pre-push` hooks are worklog plumbing and skip inside linked
 worktrees and temp sync worktrees.
+
+## The hook files are repo-owned
+
+Everything under `.githooks/` belongs to **this** repository: the hook bodies
+are committed here and delegate only to scripts committed here. `post-merge`
+and `post-rewrite` are thin wrappers that resolve their delegate from the
+repository root
+(`exec "$(git rev-parse --show-toplevel)/.githooks/worklog-post-pull" "$@"`),
+so they keep working when the checkout moves and cannot silently break because
+another project was renamed or deleted. Their marker line
+(`worklog:post-pull-hook:v2`) makes a stale `v1` wrapper — the template copies
+that pointed at the `llm-manager` checkout and emitted
+`exec: ... not found` on every merge — identifiable at a glance.
+
+Never point a hook at another checkout's path, and never generate or copy hook
+bodies from a template: `scripts/install_git_hooks.sh` deliberately touches only
+`core.hooksPath` and the executable bit, so a broken hook body can only be
+fixed in the committed file itself.

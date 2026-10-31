@@ -36,7 +36,7 @@ ZERO_SHA = "0" * 40
 #: Fake runner: records its invocation and exits with a scripted status. It
 #: also stands in for the real runner's cache write (an entry under the git
 #: dir's ``test-cache``), which the hook mirrors to the main checkout.
-FAKE_RUNNER = '''#!/usr/bin/env python3
+FAKE_RUNNER = """#!/usr/bin/env python3
 import os
 import subprocess
 import sys
@@ -57,7 +57,7 @@ if cache_entry:
     os.makedirs(os.path.join(git_dir, "test-cache", cache_entry), exist_ok=True)
 
 sys.exit(int(os.environ.get("PRE_PUSH_TEST_EXIT", "0")))
-'''
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +102,7 @@ def _git_env() -> dict[str, str]:
     not be attributed to the would-be-commit tree and the gate rejects it.
     A fixture therefore drops the repository overrides.
     """
-    return {
-        name: value
-        for name, value in os.environ.items()
-        if name not in _GIT_OVERRIDE_VARS
-    }
+    return {name: value for name, value in os.environ.items() if name not in _GIT_OVERRIDE_VARS}
 
 
 def _sandbox(tmp_path: Path) -> Path:
@@ -329,9 +325,7 @@ def test_test_scope_skip_bypasses_the_gate(tmp_path: Path) -> None:
     root = _sandbox(tmp_path)
     _install_runner(root, exit_code=1)
 
-    result = _hook(
-        root, "refs/heads/dev", tmp_path=tmp_path, extra_env={"TEST_SCOPE_SKIP": "1"}
-    )
+    result = _hook(root, "refs/heads/dev", tmp_path=tmp_path, extra_env={"TEST_SCOPE_SKIP": "1"})
 
     assert result.returncode == 0, result.stderr
     assert _marker(tmp_path) == "", "the runner must not be invoked when bypassed"
@@ -377,9 +371,7 @@ def test_repo_local_runner_takes_precedence(tmp_path: Path) -> None:
     home = tmp_path / "home"
     global_runner = home / ".pi/agent/skills/test/scripts/run_tests.py"
     global_runner.parent.mkdir(parents=True)
-    global_runner.write_text(
-        FAKE_RUNNER + "\nraise SystemExit(9)  # must never run\n", encoding="utf-8"
-    )
+    global_runner.write_text(FAKE_RUNNER + "\nraise SystemExit(9)  # must never run\n", encoding="utf-8")
 
     result = _hook(root, "refs/heads/dev", tmp_path=tmp_path, home=home)
 
@@ -536,9 +528,7 @@ def test_deletion_push_on_dev_is_not_a_sha_mismatch(tmp_path: Path) -> None:
     _install_runner(root, exit_code=0)
     remote = _git(root, "rev-parse", "HEAD").strip()
 
-    result = _hook(
-        root, "refs/heads/dev", tmp_path=tmp_path, local_sha=ZERO_SHA, remote_sha=remote
-    )
+    result = _hook(root, "refs/heads/dev", tmp_path=tmp_path, local_sha=ZERO_SHA, remote_sha=remote)
 
     assert result.returncode == 0, result.stderr
     assert "--scope full" in _marker(tmp_path), "the gate must still run for a deletion push"
@@ -560,3 +550,208 @@ def test_test_scope_skip_bypasses_the_pushed_commit_guard(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     assert _marker(tmp_path) == ""
+
+
+# ---------------------------------------------------------------------------
+# post-merge / post-rewrite delegation (LP-0MVK6XGOF000C45C)
+#
+# The two post-pull wrappers must delegate to *this* repository's
+# ``.githooks/worklog-post-pull``, never to a hard-coded path in another
+# checkout. The wrappers shipped as template copies that pointed at the
+# ``llm-manager`` checkout and printed ``exec: ... not found`` on every pull
+# while the sync silently did not run. The helpers below keep this block
+# self-contained so it never depends on the pre-push fixtures' shape, and the
+# behaviours asserted are purely behavioural (delegate invoked, argv/stdin
+# forwarded, stderr clean) — never a grep of the hook source.
+# ---------------------------------------------------------------------------
+
+POST_PULL_HOOKS = ("post-merge", "post-rewrite")
+POST_PULL_DELEGATE = Path(".githooks/worklog-post-pull")
+
+#: Fake ``.githooks/worklog-post-pull`` installed into the sandbox so the real
+#: ``wl sync`` never runs in tests. Records argv and stdin, then exits with a
+#: scripted status.
+FAKE_POST_PULL = """#!/bin/sh
+if [ -n "$POST_PULL_ARGS_MARKER" ]; then
+  : > "$POST_PULL_ARGS_MARKER"
+  for arg in "$@"; do
+    printf '%s\\n' "$arg" >> "$POST_PULL_ARGS_MARKER"
+  done
+fi
+if [ -n "$POST_PULL_STDIN_MARKER" ]; then
+  cat > "$POST_PULL_STDIN_MARKER"
+fi
+exit "${POST_PULL_EXIT:-0}"
+"""
+
+#: The v1 wrapper body this repo shipped while it pointed at the
+#: ``llm-manager`` template checkout. Used to prove the post-pull assertions
+#: fail loudly when a hook delegates outside its own repository.
+TEMPLATE_POST_PULL_HOOK = """#!/bin/sh
+# worklog:post-pull-hook:v1
+# Wrapper that delegates to central Worklog post-pull script (committed hooks).
+exec "/nonexistent-llm-manager-checkout/.githooks/worklog-post-pull" "$@"
+"""
+
+
+def _install_fake_post_pull(root: Path) -> None:
+    """Replace the sandbox post-pull delegate with a marker-writing fake."""
+    delegate = root / POST_PULL_DELEGATE
+    delegate.write_text(FAKE_POST_PULL, encoding="utf-8")
+    delegate.chmod(0o755)
+
+
+def _post_pull_env(tmp_path: Path) -> dict[str, str]:
+    """Hermetic environment for the post-* hooks and their fake delegate.
+
+    Repository overrides are dropped: ``implement.py finish`` exports a
+    temporary ``GIT_INDEX_FILE`` while it gates the suite, and an inherited
+    value would redirect the sandbox's git calls at the gate's index.
+    """
+    (tmp_path / "home").mkdir(exist_ok=True)
+    env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    env.update(
+        {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "HOME": str(tmp_path / "home"),
+            "POST_PULL_ARGS_MARKER": str(tmp_path / "post-pull-args.log"),
+            "POST_PULL_STDIN_MARKER": str(tmp_path / "post-pull-stdin.log"),
+        }
+    )
+    return env
+
+
+def _delegate_args(tmp_path: Path) -> list[str]:
+    path = tmp_path / "post-pull-args.log"
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+def _delegate_stdin(tmp_path: Path) -> str:
+    path = tmp_path / "post-pull-stdin.log"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def _run_post_hook(
+    root: Path, hook: str, *args: str, stdin: str = "", tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run a post-* hook directly, the way git would (args + stdin)."""
+    return subprocess.run(
+        ["sh", str(root / ".githooks" / hook), *args],
+        cwd=root,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        env=_post_pull_env(tmp_path),
+        check=False,
+    )
+
+
+def _run_fixture_git(root: Path, tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run git in the sandbox with the fake delegate's markers configured."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        env=_post_pull_env(tmp_path),
+        check=False,
+    )
+
+
+def _post_pull_case(tmp_path: Path, hook: str) -> Path:
+    """A per-hook sandbox directory, so both wrappers run in one test."""
+    case = tmp_path / hook
+    case.mkdir(parents=True, exist_ok=True)
+    return case
+
+
+def test_post_pull_hooks_delegate_to_repo_local_script(tmp_path: Path) -> None:
+    """Both wrappers run this repository's delegate with the hook's arguments."""
+    for hook in POST_PULL_HOOKS:
+        case = _post_pull_case(tmp_path, hook)
+        root = _sandbox(case)
+        _install_fake_post_pull(root)
+
+        result = _run_post_hook(root, hook, "some-arg", "another-arg", tmp_path=case)
+
+        assert result.returncode == 0, f"{hook}: {result.stderr}"
+        assert _delegate_args(case) == ["some-arg", "another-arg"], hook
+        assert result.stderr == "", f"{hook} stderr is not clean: {result.stderr!r}"
+        assert "not found" not in result.stderr, hook
+
+
+def test_post_pull_hooks_forward_stdin(tmp_path: Path) -> None:
+    """post-rewrite's rewritten-commit list on stdin reaches the delegate."""
+    payload = f"{'a' * 40} {'b' * 40}\n{'c' * 40} {'d' * 40}\n"
+    for hook in POST_PULL_HOOKS:
+        case = _post_pull_case(tmp_path, hook)
+        root = _sandbox(case)
+        _install_fake_post_pull(root)
+
+        result = _run_post_hook(root, hook, "rebase", stdin=payload, tmp_path=case)
+
+        assert result.returncode == 0, f"{hook}: {result.stderr}"
+        assert _delegate_args(case) == ["rebase"], hook
+        assert _delegate_stdin(case) == payload, hook
+
+
+def test_post_pull_hook_pointing_outside_the_sandbox_fails_this_suite(
+    tmp_path: Path,
+) -> None:
+    """Guard the guard: the v1 template wrapper must fail these assertions.
+
+    A hook that delegates to an absolute path outside the repository runs no
+    repo-local delegate and prints ``exec: ... not found``. This is exactly the
+    defect LP-0MVK6XGOF000C45C fixes, and it must remain visible to the tests
+    above (which assert the delegate ran and stderr stayed clean).
+    """
+    root = _sandbox(tmp_path)
+    _install_fake_post_pull(root)
+    stale = root / ".githooks/post-merge"
+    stale.write_text(TEMPLATE_POST_PULL_HOOK, encoding="utf-8")
+    stale.chmod(0o755)
+
+    result = _run_post_hook(root, "post-merge", "0", tmp_path=tmp_path)
+
+    assert result.returncode != 0, "a delegate outside the repository must fail"
+    assert _delegate_args(tmp_path) == [], "no repo-local delegate should run"
+    assert "not found" in result.stderr, "the v1 template hook must surface its broken delegation on stderr"
+
+
+def test_git_fast_forward_merge_runs_repo_local_delegate(tmp_path: Path) -> None:
+    """A real ``git merge --ff-only`` runs the sync with no shell noise."""
+    root = _sandbox(tmp_path)
+    _install(root)
+    _install_fake_post_pull(root)
+    _git(root, "checkout", "-q", "-b", "ff-source")
+    (root / "ff.txt").write_text("ff\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "ff commit")
+    _git(root, "checkout", "-q", "feat")
+
+    result = _run_fixture_git(root, tmp_path, "merge", "--ff-only", "ff-source")
+
+    assert result.returncode == 0, result.stderr
+    assert "not found" not in result.stderr
+    assert _delegate_args(tmp_path) == ["0"], "git passes the squash flag (0 = not a squash merge) to post-merge"
+
+
+def test_git_commit_amend_runs_repo_local_delegate_with_rewritten_shas(
+    tmp_path: Path,
+) -> None:
+    """A real ``git commit --amend`` drives post-rewrite, stdin forwarded."""
+    root = _sandbox(tmp_path)
+    _install(root)
+    _install_fake_post_pull(root)
+    old_sha = _git(root, "rev-parse", "HEAD").strip()
+    (root / "amend.txt").write_text("amend\n", encoding="utf-8")
+    _git(root, "add", "-A")
+
+    result = _run_fixture_git(root, tmp_path, "commit", "-q", "--amend", "--no-edit")
+
+    assert result.returncode == 0, result.stderr
+    assert "not found" not in result.stderr
+    new_sha = _git(root, "rev-parse", "HEAD").strip()
+    assert new_sha != old_sha, "the amend must rewrite the commit"
+    assert _delegate_args(tmp_path) == ["amend"]
+    assert _delegate_stdin(tmp_path) == f"{old_sha} {new_sha}\n"
