@@ -34,12 +34,15 @@ import test_measured_cache_abort_wiring as wiring
 from fastapi.responses import JSONResponse, StreamingResponse
 from test_local_resident_prefix_admission import _install_slot_state, _slot
 from test_measured_cache_abort_wiring import (
+    _BENEFIT_GATE_WIRING_XFAIL,
     _CONTENT_CHUNK,
     _DONE,
     _FINISH_CHUNK,
     _drive_local,
     _progress_event,
 )
+
+from proxy import prefill_eta
 
 MODEL = "Qwen3"
 #: The documented defaults the shipped configuration resolves to.
@@ -48,6 +51,15 @@ DEFAULT_MIN_DEFICIT_RATIO = 0.25
 #: The parent's measured deadline; the early release must beat it by an order
 #: of magnitude (the replay asserts < 10 s, i.e. ≪ 120 s).
 PREFILL_DEADLINE_SECONDS = 120
+
+#: The shipped comparator the benefit gate enforces (parent decision D1(a)):
+#: ``local_admission_guard_budget_safety_fraction x
+#: local_prefill_deadline_seconds`` = 0.95 x 120 s.
+SHIPPED_BUDGET_S = 0.95 * PREFILL_DEADLINE_SECONDS
+#: Shipped default prefill fit (``DEFAULT_PREFILL_MS_PER_TOKEN``): the fixture's
+#: prompt-size buckets are uncalibrated, so this is the honest rate basis for
+#: the partition below (``_drive_signature`` pins the same window).
+PREFILL_MS_PER_TOKEN = 3.9
 
 #: The warm-path signature the parent measured: 56k prompt, reuse ≈ 0.999.
 WARM_TOTAL_TOKENS = 56_000
@@ -69,6 +81,58 @@ SERVER_CONFIG_ON = {
 def _fixture_records() -> list[dict]:
     _meta, records = window.load_fixture()
     return records
+
+
+#: Every fake-warm cluster of the reference window, keyed by prompt size.
+FAKE_WARM_CLUSTERS: tuple[tuple[int, int], ...] = tuple(
+    sorted(
+        {
+            (event["estimated_tokens"], event["new_tokens"])
+            for event in window.fake_warm(_fixture_records())
+        }
+    )
+)
+
+
+def _measured_eta_s(total: int) -> float:
+    """Measured cold-prefill ETA for *total* at the shipped default fit.
+
+    Uses the same ``reprefill`` measured cache class the rows replay with, so
+    the partition below is the decision input, not a second model.
+    """
+    measured = window.measured_cache(
+        total, window.evidence(_fixture_records()), window.MODE_REPREFILL
+    )
+    assert measured is not None
+    return (total - measured.cache_tokens) * PREFILL_MS_PER_TOKEN / 1000.0
+
+
+#: Clusters whose measured prefill exceeds the benefit budget: still detoured.
+BUDGET_ALLOWED_CLUSTERS = tuple(
+    cluster
+    for cluster in FAKE_WARM_CLUSTERS
+    if _measured_eta_s(cluster[0]) > SHIPPED_BUDGET_S
+)
+#: Clusters whose measured prefill fits it: served locally once the gate lands.
+BUDGET_NEUTRAL_CLUSTERS = tuple(
+    cluster
+    for cluster in FAKE_WARM_CLUSTERS
+    if _measured_eta_s(cluster[0]) <= SHIPPED_BUDGET_S
+)
+
+
+def test_the_replay_clusters_partition_at_the_benefit_budget():
+    """The 114 s comparator splits the window: 2 clusters fit, 10 do not.
+
+    Pinned so a fixture or fit change cannot silently empty one side of the
+    split (which would turn the two rows below into no-ops).
+    """
+    assert BUDGET_NEUTRAL_CLUSTERS == ((18_878, 17), (22_973, 175))
+    assert len(BUDGET_ALLOWED_CLUSTERS) == len(FAKE_WARM_CLUSTERS) - 2 == 10
+    for total, _priced in BUDGET_ALLOWED_CLUSTERS:
+        assert _measured_eta_s(total) > SHIPPED_BUDGET_S
+    for total, _priced in BUDGET_NEUTRAL_CLUSTERS:
+        assert _measured_eta_s(total) < SHIPPED_BUDGET_S
 
 
 def _ladder_inputs(config: dict) -> dict:
@@ -118,7 +182,14 @@ async def _drive_signature(
     cache: int,
     enabled: bool = True,
 ):
-    """Drive one measured signature through the real ``proxy_to_local``."""
+    """Drive one measured signature through the real ``proxy_to_local``.
+
+    The calibration window is **reset** first: every row here asserts the
+    shipped default prefill fit (3.9 ms/token), which is also what makes the
+    benefit gate's verdict for the row deterministic instead of depending on
+    whatever samples an earlier test module left behind.
+    """
+    prefill_eta.reset()
     monkeypatch.setattr(wiring, "PROMPT_TOKENS", total)
     monkeypatch.setattr(
         wiring._Request,
@@ -326,24 +397,37 @@ def test_reference_window_matches_the_parent_measurement():
 
 
 def test_replay_classifies_fake_warm_events_as_measured_cache_deficit():
-    """AC2: 29/29 fake-warm events abort at their admission-priced tokens.
+    """AC2: every fake-warm event whose measured prefill overruns still aborts.
+
+    The 26 events of the ten clusters whose measured cold prefill exceeds the
+    shipped 114 s comparator (``_measured_eta_s``: 115-284 s at the default
+    fit) abort at their admission-priced tokens. The remaining three events
+    live in the two mid-size clusters (18 878 / 22 973 tokens, 72-88 s) that
+    the benefit gate now **serves** — that half is asserted end to end by
+    ``test_replay_events_within_the_budget_are_served_locally``.
 
     The measured re-prefill floor for each prompt size comes from llama-server's
-    own ``n_past`` observations in the same window (356–6 919 reused tokens on
-    18k–78k prompts). At that measurement every fake-warm event exceeds its
+    own ``n_past`` observations in the same window (356-6 919 reused tokens on
+    18k-78k prompts). At that measurement every event here exceeds its
     admission price by far more than the configured bound and sits far above
     the deficit-ratio floor — the exact combination the decision targets.
     """
     result = window.replay(_fixture_records(), mode=window.MODE_REPREFILL)
 
     assert result.totals["fake_warm"] == 29
-    assert result.totals["abortable_fake_warm"] == 29
-    assert result.totals["abort_reasons"] == ["measured_cache_deficit"]
-    assert result.totals["waste_reclaimed_tokens"] > 150_000
+    # 29 pre-gate; 26 once the benefit gate declines the two mid-size clusters.
+    assert result.totals["abortable_fake_warm"] >= 26
+    assert "measured_cache_deficit" in result.totals["abort_reasons"]
 
-    for event in result.events:
-        if not event.fake_warm:
-            continue
+    beyond_budget = [
+        event
+        for event in result.events
+        if event.fake_warm and _measured_eta_s(event.total) > SHIPPED_BUDGET_S
+    ]
+    assert len(beyond_budget) == 26
+    assert sum(event.waste_before for event in beyond_budget) > 130_000
+
+    for event in beyond_budget:
         assert event.abortable, event
         assert event.reason == window.MEASURED_CACHE_DEFICIT_REASON
         assert event.decision.measured_new_tokens is not None
@@ -359,12 +443,13 @@ def test_replay_classifies_fake_warm_events_as_measured_cache_deficit():
         assert event.waste_before > 0.0
 
     report = window.replay_result_to_json(result)
-    assert report["totals"]["abortable_fake_warm"] == 29
-    assert all(
-        entry["reason"] == "measured_cache_deficit"
+    assert report["totals"]["abortable_fake_warm"] >= 26
+    reported_aborts = {
+        entry["ts"]
         for entry in report["events"]
-        if entry["fake_warm"]
-    )
+        if entry["fake_warm"] and entry["reason"] == "measured_cache_deficit"
+    }
+    assert {event.ts for event in beyond_budget} <= reported_aborts
 
 
 def test_full_reuse_measurement_never_aborts_a_fake_warm_priced_event():
@@ -395,25 +480,31 @@ def test_best_case_replay_protects_the_measured_reuse_ceiling():
         "below_deficit_ratio_floor",
         "within_bound",
         "invalid_measurement",
+        # The benefit gate's continue token: a best-case-reuse event that still
+        # reached the bound check but fits the 114 s comparator now continues
+        # here instead of aborting.
+        "within_eta_budget",
     }
 
 
 @pytest.mark.parametrize(
     "cluster",
-    sorted(
-        {
-            (event["estimated_tokens"], event["new_tokens"])
-            for event in window.fake_warm(_fixture_records())
-        }
-    ),
+    BUDGET_ALLOWED_CLUSTERS,
     ids=lambda cluster: f"{cluster[0]}tok-{cluster[1]}priced",
 )
 @pytest.mark.asyncio
-async def test_replay_events_release_in_seconds_not_at_the_deadline(
+async def test_replay_events_beyond_the_budget_release_in_seconds(
     monkeypatch, cluster
 ):
-    """AC2: each measured signature detours in seconds, never after 120 s."""
+    """AC2/AC4: a measured prefill that overruns the budget still detours.
+
+    Once the benefit gate is wired (parent LP-0MVWBD91Z004U135 AC1) only the
+    clusters whose **measured** cold prefill exceeds the shipped comparator
+    detour; they keep today's seconds-scale release, never a 120 s deadline
+    wait.
+    """
     total, priced = cluster
+    assert _measured_eta_s(total) > SHIPPED_BUDGET_S, cluster
     measured = window.measured_cache(
         total, window.evidence(_fixture_records()), window.MODE_REPREFILL
     )
@@ -442,6 +533,56 @@ async def test_replay_events_release_in_seconds_not_at_the_deadline(
         for line in errors
     ), errors
     assert not any("reason=prefill_deadline" in line for line in errors)
+
+
+@pytest.mark.parametrize(
+    "cluster",
+    BUDGET_NEUTRAL_CLUSTERS,
+    ids=lambda cluster: f"{cluster[0]}tok-{cluster[1]}priced",
+)
+@_BENEFIT_GATE_WIRING_XFAIL
+@pytest.mark.asyncio
+async def test_replay_events_within_the_budget_are_served_locally(
+    monkeypatch, cluster
+):
+    """AC4 (parent AC1/AC4): a mid-size fake-warm cluster is **served**.
+
+    These are the reference-window clusters whose measured cold prefill fits the
+    shipped comparator (72-88 s against 114 s), i.e. the same shape as the
+    pin-local incident. They must complete locally: no
+    ``local_eviction_after_acceptance``, no thrash cooldown, and the client gets
+    the whole stream. Red-first until the gate is wired
+    (LP-0MVWDZ1GG004UGIK / LP-0MVWDZ22I005A26B).
+    """
+    total, priced = cluster
+    eta_s = _measured_eta_s(total)
+    assert eta_s <= SHIPPED_BUDGET_S, cluster
+    measured = window.measured_cache(
+        total, window.evidence(_fixture_records()), window.MODE_REPREFILL
+    )
+    assert measured is not None
+
+    result, received, _sent = await _drive_signature(
+        monkeypatch,
+        total=total,
+        priced=priced,
+        cache=measured.cache_tokens,
+    )
+
+    assert isinstance(result, StreamingResponse), (
+        f"{total}-token cluster: the measured cold prefill needs {eta_s:.1f} s "
+        f"at the shipped fit, inside the {SHIPPED_BUDGET_S:.0f} s prefill-deadline "
+        "budget (the incident's measured range is 38.8-84.6 s), so the "
+        f"dispatch must be served locally (got {type(result).__name__})"
+    )
+    assert result.status_code == 200
+    assert received == _CONTENT_CHUNK + _FINISH_CHUNK + _DONE
+
+    errors = wiring._all_log_lines("error")
+    infos = wiring._all_log_lines("info")
+    assert not any("local_eviction_after_acceptance" in line for line in errors), errors
+    assert not any("measured_cache_deficit" in line for line in errors), errors
+    assert not any("prefill_thrash_cooldown" in line for line in infos + errors)
 
 
 # ---------------------------------------------------------------------------

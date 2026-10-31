@@ -45,15 +45,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sys
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import measured_prefill_window_replay as window
 import proxy.router as router
 import proxy.router_helpers as helpers
 import proxy.server as server
 import pytest
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from proxy import prefill_eta
 
 MODEL = "Qwen3"
 SESSION = "sess-measured-cache-abort-1"
@@ -75,6 +80,12 @@ SERVER_CONFIG = {
         "local_dispatch_max_prefill_seconds": 900,
         # The feature must beat this by a wide margin (AC1).
         "local_prefill_deadline_seconds": 120,
+        # The benefit gate's comparator is the *prefill-deadline* budget
+        # (``budget_safety_fraction x local_prefill_deadline_seconds``), which
+        # is what the shipped ``proxy/config.yaml`` sets. Declared here so the
+        # harness runs the shipped comparator instead of resolving to the
+        # fail-open "no usable budget" case (parent decision D1(a)).
+        "local_admission_guard_budget_safety_fraction": 0.95,
         "local_dispatch_first_byte_timeout_seconds": 840,
         "local_dispatch_prefill_observability_warn_seconds": 0,
         "session_single_flight_mode": "bypass",
@@ -1017,3 +1028,356 @@ async def test_prefill_deadline_503_has_no_deficit_marker(monkeypatch):
     assert DEFICIT_MARKER_HEADER not in result.headers, (
         "a deadline detour must not carry the deficit marker"
     )
+
+
+# ---------------------------------------------------------------------------
+# Benefit-gate wiring (LP-0MVWDZ1RH006HTFS) — parent AC3, AC4, AC7, AC8
+# ---------------------------------------------------------------------------
+
+#: Every row below is red-first: it pins the *benefit gate* decision reached
+#: through the **wired** peek (``_prefetch_measured_cache_abort`` fed the
+#: router's resolved settings), which lands in LP-0MVWDZ22I005A26B. Until then
+#: the rows fail on purpose and ``xfail(strict=True)`` keeps the changed-scope
+#: gate green — while turning each row into a hard failure the moment it starts
+#: passing, so the wiring child must delete this marker rather than leave the
+#: rows silently unfixed.
+_BENEFIT_GATE_WIRING_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason="benefit-gate wiring lands in LP-0MVWDZ22I005A26B",
+)
+
+#: The five recorded aborts (parent AC8): a 14 380-token **cold** prompt the
+#: admission guard priced at 48 new tokens, under a 60 s wait budget and a
+#: 120 s prefill deadline, dispatched with ``X-Local-Preference:
+#: local-preferred``.
+INCIDENT_TOTAL = 14_380
+INCIDENT_PRICED = 48
+INCIDENT_WAIT_BUDGET_S = 60.0
+INCIDENT_DEADLINE_S = 120.0
+
+#: The population the gate must keep aborting: a huge cold prompt priced warm.
+HUGE_TOTAL = 56_000
+HUGE_PRICED = 100
+
+#: Shipped comparator (``0.95 x 120 s``) and the incident row's measured
+#: numbers, recorded so a future tuning change that re-breaks the case fails
+#: loudly instead of silently.
+SHIPPED_BUDGET_S = 114.0
+INCIDENT_ETA_SHIPPED_FIT_S = 56.08  # 14 380 x 3.9 ms/token
+INCIDENT_ETA_RANGE = (
+    "38.8-84.6 s across the measured host rate (371 tok/s median .. "
+    "170 tok/s p25); the shipped default fit prices 56.08 s"
+)
+
+#: The cooldown the arming site is asserted against. Set explicitly so the row
+#: pins the ``local_prefill_thrash_cooldown_seconds`` plumbing rather than
+#: whatever today's default happens to be.
+GATE_COOLDOWN_S = 600
+
+
+def _benefit_gate_server_config(**extra) -> dict:
+    """Incident-shape config: shipped comparator + an explicit cooldown."""
+    config = {
+        "local_admission_guard_budget_safety_fraction": 0.95,
+        "local_prefill_deadline_seconds": INCIDENT_DEADLINE_S,
+        "local_prefill_thrash_cooldown_seconds": GATE_COOLDOWN_S,
+    }
+    config.update(extra)
+    return config
+
+
+def _stamp_admission_evidence(monkeypatch, *, total: int, priced: int) -> None:
+    """Price the dispatch exactly like the recorded incident.
+
+    ``_local_admission_evidence['new_tokens']`` is the admission-priced compute
+    the router hands to the decision (the 48 that caused the incident), and the
+    routing estimate is the *measured* prompt size (14 380).
+    """
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "PROMPT_TOKENS", total)
+    monkeypatch.setattr(module, "PRICED_NEW_TOKENS", priced)
+    monkeypatch.setattr(
+        _Request,
+        "_local_admission_evidence",
+        {
+            "estimated_tokens": total,
+            "cached_ratio": (total - priced) / total,
+            "new_tokens": priced,
+        },
+    )
+
+
+@_BENEFIT_GATE_WIRING_XFAIL
+def test_incident_replay_never_aborts_and_arms_no_cooldown():
+    """AC1 (parent AC8): the five recorded aborts all continue under the gate.
+
+    Pre-gate every row aborts (measured deficit 14 380 tokens priced at 48) and
+    arms a 600 s thrash cooldown; with the gate the measured cold ETA fits the
+    prefill-deadline budget. The numbers are pinned explicitly — measured ETA
+    ~56 s (shipped fit) against ``budget_s = 114``, with the measured rate range
+    (38.8-84.6 s) named in the failure message — so a future recalibration or
+    comparator change that re-breaks the incident fails loudly.
+    """
+    # The incident's 14 380-token bucket was uncalibrated, so the shipped
+    # default fit (3.9 ms/token) is the honest rate basis for this row.
+    prefill_eta.reset()
+
+    meta, records = window.load_incident_fixture()
+    aborts = window.incident_aborts(records)
+    assert len(aborts) == meta["counts"]["aborts"] == 5, records
+    assert {record["total"] for record in aborts} == {INCIDENT_TOTAL}
+    assert {record["cache"] for record in aborts} == {0}
+    assert {record["priced_new_tokens"] for record in aborts} == {INCIDENT_PRICED}
+    assert {record["preference"] for record in aborts} == {"local-preferred"}
+    assert {record["wait_budget_s"] for record in aborts} == {INCIDENT_WAIT_BUDGET_S}
+    assert {record["deadline_s"] for record in aborts} == {INCIDENT_DEADLINE_S}
+
+    replay = window.replay_incident(records)
+    totals = replay.totals
+    assert totals["aborts"] == 0, (
+        f"the incident prompt must continue: measured ETA {totals['measured_eta_s']} s "
+        f"vs budget {totals['budget_s']} s (measured range {INCIDENT_ETA_RANGE})"
+    )
+    assert totals["cooldowns_armed"] == 0, totals
+    assert totals["continued"] == 5
+    assert totals["details"] == ["within_eta_budget"]
+    assert totals["budget_s"] == [pytest.approx(SHIPPED_BUDGET_S)]
+    # The recorded admission wait budget is NOT the comparator (parent D1(a)).
+    assert totals["wait_budget_s"] == [INCIDENT_WAIT_BUDGET_S]
+
+    for row in replay.records:
+        assert row.budget_s == pytest.approx(SHIPPED_BUDGET_S)
+        assert row.budget_s != pytest.approx(INCIDENT_WAIT_BUDGET_S)
+        assert row.measured_eta_s == pytest.approx(
+            INCIDENT_ETA_SHIPPED_FIT_S, abs=0.5
+        ), (
+            f"{row.ts}: measured ETA {row.measured_eta_s} s vs budget "
+            f"{row.budget_s} s (measured range {INCIDENT_ETA_RANGE})"
+        )
+        # The p25-rate ETA (84.6 s) still fits, which is what makes this row
+        # robust to a recalibration rather than an artefact of the default fit.
+        assert row.eta_at_p25_s == pytest.approx(84.6, abs=0.1)
+        assert row.measured_eta_s < row.budget_s
+
+
+@_BENEFIT_GATE_WIRING_XFAIL
+@pytest.mark.asyncio
+async def test_incident_pin_local_turn_is_served_locally(monkeypatch):
+    """AC1/AC2: the incident turn completes locally — no eviction, no cooldown.
+
+    The real ``proxy_to_local`` peek sees ``cache=0`` on a 14 380-token prompt
+    priced at 48 and, with the gate wired, keeps the dispatch running to a
+    complete ``200``. No ``local_eviction_after_acceptance`` fires, and — the
+    parent's AC3 — no ``prefill_thrash_cooldown_*`` line is emitted because the
+    arming site sits inside the (now declined) abort branch.
+    """
+    prefill_eta.reset()
+    helpers._reset_prefill_thrash_cooldowns()
+    _stamp_admission_evidence(
+        monkeypatch, total=INCIDENT_TOTAL, priced=INCIDENT_PRICED
+    )
+
+    result, received, sent = await _drive_local(
+        [_progress_event(INCIDENT_TOTAL, 0), _CONTENT_CHUNK, _FINISH_CHUNK, _DONE],
+        monkeypatch=monkeypatch,
+        server_config_extra=_benefit_gate_server_config(),
+    )
+
+    assert sent.get("return_progress") is True, "the peek must be able to measure"
+    assert isinstance(result, StreamingResponse), (
+        "a benefit-neutral deficit must not release the dispatch "
+        f"(got {type(result).__name__})"
+    )
+    assert result.status_code == 200
+    assert received == _CONTENT_CHUNK + _FINISH_CHUNK + _DONE
+
+    infos = _all_log_lines("info")
+    warnings = _all_log_lines("warning")
+    errors = _all_log_lines("error")
+
+    assert not any("local_eviction_after_acceptance" in line for line in errors), errors
+    assert not any("measured_cache_deficit" in line for line in errors), errors
+    assert not any("prefill_deadline" in line for line in errors), errors
+    cooldown_lines = [
+        line for line in infos + warnings if "prefill_thrash_cooldown" in line
+    ]
+    assert cooldown_lines == [], cooldown_lines
+    assert helpers._prefill_thrash_cooldown_remaining(SESSION, server.config) == 0.0
+
+    # Observability (wiring AC2): the decision line, when the wiring emits one,
+    # must state the continue verdict and the comparator *actually enforced*.
+    # The strict pin on that line belongs to LP-0MVWDZ22I005A26B; this row only
+    # requires that no line reports an abort (parent AC8: zero aborts).
+    decision_lines = [line for line in warnings if "measured_cache_abort" in line]
+    for line in decision_lines:
+        assert "detail=within_eta_budget" in line, line
+        assert "budget_s=114" in line, line
+
+
+@_BENEFIT_GATE_WIRING_XFAIL
+@pytest.mark.asyncio
+async def test_gate_allowed_abort_arms_exactly_one_thrash_cooldown(monkeypatch):
+    """AC3/AC4: an abort the gate allows still detours, and arms one cooldown.
+
+    A 56 000-token cold prompt priced at 100 measures 218.4 s at the shipped
+    fit (> 114 s), so today's early release stands: one retryable ``503``, one
+    ``local_eviction_after_acceptance reason=measured_cache_deficit`` carrying
+    the unchanged snapshot fields, exactly one
+    ``prefill_thrash_cooldown_started`` whose ``cooldown_s`` comes from
+    ``local_prefill_thrash_cooldown_seconds``, and the real arming site armed.
+    """
+    prefill_eta.reset()
+    helpers._reset_prefill_thrash_cooldowns()
+    _stamp_admission_evidence(monkeypatch, total=HUGE_TOTAL, priced=HUGE_PRICED)
+
+    result, received, _sent = await _drive_local(
+        [_progress_event(HUGE_TOTAL, 0), _CONTENT_CHUNK, _FINISH_CHUNK, _DONE],
+        monkeypatch=monkeypatch,
+        server_config_extra=_benefit_gate_server_config(),
+    )
+
+    assert isinstance(result, JSONResponse), type(result).__name__
+    assert result.status_code == 503
+    assert received == b""
+
+    errors = _all_log_lines("error")
+    evictions = [line for line in errors if "local_eviction_after_acceptance" in line]
+    assert len(evictions) == 1, evictions
+    eviction = evictions[0]
+    assert "reason=measured_cache_deficit" in eviction
+    # AC4: the snapshot contract is unchanged for a gate-allowed abort.
+    assert f"total={HUGE_TOTAL}" in eviction
+    assert "measured_cache=0" in eviction
+    assert f"priced_new_tokens={HUGE_PRICED}" in eviction
+    assert "elapsed_s=" in eviction
+    assert not any("reason=prefill_deadline" in line for line in errors), errors
+
+    # The abort must be the *gate's* verdict (measured 218.4 s > 114 s), not the
+    # old token-bound verdict: the decision line carries the measured ETA and
+    # the comparator the wiring adds (wiring AC2), which is also what makes
+    # this row red until the gate is wired.
+    abort_lines = [
+        line for line in _all_log_lines("warning") if "measured_cache_abort" in line
+    ]
+    assert len(abort_lines) == 1, abort_lines
+    assert "budget_s=114" in abort_lines[0], abort_lines[0]
+    assert "measured_eta_s=" in abort_lines[0], abort_lines[0]
+
+    cooldowns = [
+        line
+        for line in _all_log_lines("info")
+        if "prefill_thrash_cooldown_started" in line
+    ]
+    assert len(cooldowns) == 1, cooldowns
+    assert f"cooldown_s={GATE_COOLDOWN_S}" in cooldowns[0], cooldowns[0]
+    assert f"session={SESSION}" in cooldowns[0], cooldowns[0]
+    remaining = helpers._prefill_thrash_cooldown_remaining(SESSION, server.config)
+    assert 0 < remaining <= GATE_COOLDOWN_S, remaining
+
+
+@_BENEFIT_GATE_WIRING_XFAIL
+@pytest.mark.asyncio
+async def test_pinned_incident_turn_is_served_locally_end_to_end(
+    monkeypatch, caplog
+):
+    """AC2: ``local-preferred`` + ``cache=0`` ⇒ ``200`` ``X-Local-Route: local``.
+
+    The incident's own shape, driven through the real fallback entry point: the
+    admission guard admits (60 s wait budget), the pin-local preference must
+    not be turned into a ``429``, and the dispatch is served locally with no
+    ``local_only_refused`` line, no remote dispatch, no eviction and no
+    cooldown.
+    """
+    import proxy.provider as provider
+
+    prefill_eta.reset()
+    helpers._reset_prefill_thrash_cooldowns()
+    _install_server(monkeypatch, _benefit_gate_server_config())
+    _stamp_admission_evidence(
+        monkeypatch, total=INCIDENT_TOTAL, priced=INCIDENT_PRICED
+    )
+    monkeypatch.setattr(
+        _Request,
+        "headers",
+        {
+            "host": "localhost",
+            "x-session-id": SESSION,
+            "x-local-preference": "local-preferred",
+        },
+    )
+
+    remote_calls: list[str] = []
+
+    async def _local_via_router(request, path, endpoint=None):
+        _patch_router(
+            monkeypatch,
+            _StreamResponse(
+                [
+                    _progress_event(INCIDENT_TOTAL, 0),
+                    _CONTENT_CHUNK,
+                    _FINISH_CHUNK,
+                    _DONE,
+                ]
+            ),
+            sent_body_sink=[],
+        )
+        return await router.proxy_to_local(request, path)
+
+    async def _remote(request, path, provider_cfg):
+        remote_calls.append(provider_cfg.get("name"))
+        return StreamingResponse(
+            iter([_CONTENT_CHUNK, _FINISH_CHUNK, _DONE]),
+            media_type="text/event-stream",
+            status_code=200,
+        )
+
+    model_cfg = {
+        "name": MODEL,
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": MODEL},
+            {
+                "name": "remote-fallback",
+                "type": "remote",
+                "endpoint": "https://api.openai.com/v1",
+            },
+        ],
+    }
+    monkeypatch.setattr(provider, "_get_local_concurrency_info", lambda *a, **k: (0, 1))
+    monkeypatch.setattr(server, "proxy_to_local", _local_via_router)
+    monkeypatch.setattr(server, "proxy_to_remote", _remote)
+
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+    with caplog.at_level(logging.INFO, logger="llama-proxy.provider"):
+        result = await provider.proxy_with_fallback(
+            _Request(body), "v1/chat/completions", model_cfg, server.config
+        )
+
+    received = b""
+    if isinstance(result, StreamingResponse):
+        async for chunk in result.body_iterator:
+            received += chunk
+
+    assert result.status_code == 200, (
+        "a pinned turn that fits the budget must be served, never refused "
+        f"(got {result.status_code})"
+    )
+    assert result.headers.get("X-Local-Route") == "local"
+    assert remote_calls == [], remote_calls
+    assert received == _CONTENT_CHUNK + _FINISH_CHUNK + _DONE
+    assert "local_only_refused" not in caplog.text, caplog.text
+
+    infos = _all_log_lines("info")
+    warnings = _all_log_lines("warning")
+    errors = _all_log_lines("error")
+    assert not any("prefill_thrash_cooldown" in line for line in infos + warnings)
+    assert not any("local_eviction_after_acceptance" in line for line in errors)
+    assert not any("measured_cache_deficit" in line for line in errors)
+    assert helpers._prefill_thrash_cooldown_remaining(SESSION, server.config) == 0.0
+    assert "local_preference_resolved" in caplog.text, (
+        "the pinned outcome must still be attributable"
+    )
+    assert "route=refused" not in caplog.text, caplog.text
