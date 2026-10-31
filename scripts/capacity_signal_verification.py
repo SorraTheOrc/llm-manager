@@ -302,6 +302,20 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from lib.capacity_signals import (  # noqa: E402
+    LATENCY_BANDS,
+    has_live_local_work,
+    in_window,
+    is_status_poll,
+    latency_band,
+    parse_int,
+    parse_latency_ms,
+    stale_flag,
+    stale_rate,
+    stale_rate_check,
+    status_fields,
+    tally_stale,
+)
 from lib.proxy_logs import (  # noqa: E402
     discover_proxy_log_files,
     measure_log_coverage,
@@ -352,14 +366,11 @@ WORK_ITEM = "LP-0MVOG6YRA000T9PK"
 
 _TS_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")
 
-#: The structured status surface: one line per ``GET /llama/local/status``.
-_STATUS_POLL_RE = re.compile(r"\bstatus_request\b")
-#: Fields read off a status poll line (``key=value``, value is non-space).
-_STATUS_FIELD_RE = re.compile(
-    r"\b(?P<key>capacity_hint|slots_stale|slots_detail_stale|available_slots|"
-    r"local_active_query|active_query|local_in_flight_requests|"
-    r"status_schema_version|latency_ms)=(?P<value>[^\s]+)"
-)
+#: Status-poll detection, field extraction and the stale-rate derivation live
+#: in ``scripts/lib/capacity_signals.py`` and are imported above: the nightly
+#: report imports the same module, so the two surfaces cannot disagree
+#: (LP-0MVU8O4EL005IYP9 AC1.1).
+
 #: A local dispatch lease release (``proxy/proxy/handlers.py`` → the
 #: ``local_dispatch_records`` registry). ``reason=`` names why the proxy
 #: stopped tracking the dispatch.
@@ -379,10 +390,6 @@ _PROXY_RESTART_RE = re.compile(
     r"Rotated previous proxy log aside|application startup|Started server process|"
     r"Uvicorn running"
 )
-#: ``latency_ms`` bands separating a fast fresh poll (< 1 s) from one that
-#: exhausted the ``/slots`` query budget (2.0 s counts / 1.0 s detail) and
-#: beyond.
-_LATENCY_BANDS = ("lt_1s", "1s_to_2s", "2s_to_5s", "gte_5s", "unknown")
 #: A completed local dispatch (emitted only on the local streaming path).
 _LOCAL_DISPATCH_RE = re.compile(
     r"\bdispatch_first_byte_ms=(?P<first_byte>[0-9.]+)\b"
@@ -446,87 +453,6 @@ def parse_bound(text: str) -> dt.datetime:
     )
 
 
-def _status_fields(line: str) -> dict[str, str]:
-    """Return the ``key=value`` status fields present on *line*."""
-    return {
-        match.group("key"): match.group("value")
-        for match in _STATUS_FIELD_RE.finditer(line)
-    }
-
-
-def _parse_latency_ms(value: str | None) -> int | None:
-    """Parse the handler's ``latency_ms=`` field (``None`` when absent)."""
-    if value is None:
-        return None
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return None
-
-
-def _parse_int(value: str | None) -> int | None:
-    """Parse a non-negative integer log field (``None`` when absent/bogus)."""
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _latency_band(latency_ms: int | None) -> str:
-    """Bucket a status-poll ``latency_ms`` (``unknown`` when absent)."""
-    if latency_ms is None:
-        return "unknown"
-    if latency_ms < 1000:
-        return "lt_1s"
-    if latency_ms < 2000:
-        return "1s_to_2s"
-    if latency_ms < 5000:
-        return "2s_to_5s"
-    return "gte_5s"
-
-
-def is_status_poll(line: str) -> bool:
-    """True for a structured ``status_request`` line (the poll surface)."""
-    return bool(_STATUS_POLL_RE.search(line)) and "capacity_hint=" in line
-
-
-def has_live_local_work(fields: dict[str, str]) -> bool:
-    """True when a status poll reports concurrent live local work.
-
-    Schema 3 polls carry ``local_in_flight_requests`` (authoritative: derived
-    from live dispatch records). Schema 2 polls do not, so the
-    ``local_active_query`` / ``active_query`` flags are the fallback — which is
-    exactly the pair the pre-fix false-``saturated`` incident was about.
-    Any single positive signal counts as live work: a violating poll must show
-    none of them.
-    """
-    in_flight = fields.get("local_in_flight_requests")
-    if in_flight is not None:
-        try:
-            if int(in_flight) > 0:
-                return True
-        except ValueError:
-            pass
-    return (
-        fields.get("local_active_query") == "true"
-        or fields.get("active_query") == "true"
-    )
-
-
-def _in_window(ts: dt.datetime | None, since: dt.datetime | None,
-               until: dt.datetime | None) -> bool:
-    """``since`` inclusive, ``until`` exclusive (adjacent windows never overlap)."""
-    if ts is None:
-        return False
-    if since is not None and ts < since:
-        return False
-    if until is not None and ts >= until:
-        return False
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Status polls + local dispatches
 # ---------------------------------------------------------------------------
@@ -547,10 +473,12 @@ def analyse_status_stream(
     """
     log_dir = Path(log_dir)
     polls = 0
-    slots_stale = 0
-    slots_stale_denominator = 0
+    # One tri-state entry per poll (``None`` = no ``slots_stale`` field); the
+    # denominator rule lives in ``capacity_signals.tally_stale`` so the nightly
+    # analyzer applies exactly the same one (LP-0MVU8O4EL005IYP9 AC1.1).
+    stale_flags: list[bool | None] = []
     stale_by_source = {"detail_cache": 0, "counts_cache": 0, "unknown": 0}
-    stale_by_latency_band: dict[str, int] = {band: 0 for band in _LATENCY_BANDS}
+    stale_by_latency_band: dict[str, int] = {band: 0 for band in LATENCY_BANDS}
     hints: dict[str, int] = {}
     saturated = 0
     saturated_without_live_work = 0
@@ -569,7 +497,7 @@ def analyse_status_stream(
         with open_proxy_log_text(path) as handle:
             for line in handle:
                 ts = parse_line_timestamp(line)
-                if not _in_window(ts, since, until):
+                if not in_window(ts, since, until):
                     continue
                 if first_ts is None or ts < first_ts:
                     first_ts = ts
@@ -578,27 +506,25 @@ def analyse_status_stream(
 
                 if is_status_poll(line):
                     polls += 1
-                    fields = _status_fields(line)
+                    fields = status_fields(line)
                     hint = fields.get("capacity_hint")
                     if hint is not None:
                         hints[hint] = hints.get(hint, 0) + 1
-                    stale = fields.get("slots_stale")
-                    if stale is not None:
-                        slots_stale_denominator += 1
-                        if stale == "true":
-                            slots_stale += 1
-                            # Attribute the poll to the cache that served it
-                            # (counts vs per-slot detail) and to the response
-                            # latency that shows the upstream query failing.
-                            detail_flag = fields.get("slots_detail_stale")
-                            if detail_flag == "true":
-                                stale_by_source["detail_cache"] += 1
-                            elif detail_flag == "false":
-                                stale_by_source["counts_cache"] += 1
-                            else:
-                                stale_by_source["unknown"] += 1
-                            latency = _parse_latency_ms(fields.get("latency_ms"))
-                            stale_by_latency_band[_latency_band(latency)] += 1
+                    stale = stale_flag(fields)
+                    stale_flags.append(stale)
+                    if stale:
+                        # Attribute the poll to the cache that served it
+                        # (counts vs per-slot detail) and to the response
+                        # latency that shows the upstream query failing.
+                        detail_flag = fields.get("slots_detail_stale")
+                        if detail_flag == "true":
+                            stale_by_source["detail_cache"] += 1
+                        elif detail_flag == "false":
+                            stale_by_source["counts_cache"] += 1
+                        else:
+                            stale_by_source["unknown"] += 1
+                        latency = parse_latency_ms(fields.get("latency_ms"))
+                        stale_by_latency_band[latency_band(latency)] += 1
                     if hint == "saturated":
                         saturated += 1
                         if fields.get("available_slots") == "0":
@@ -615,13 +541,13 @@ def analyse_status_stream(
                             violating_rows.append(
                                 {
                                     "timestamp": timestamp,
-                                    "latency_ms": _parse_latency_ms(
+                                    "latency_ms": parse_latency_ms(
                                         fields.get("latency_ms")
                                     ),
                                     "slots_detail_stale": (
                                         fields.get("slots_detail_stale") == "true"
                                     ),
-                                    "available_slots": _parse_int(
+                                    "available_slots": parse_int(
                                         fields.get("available_slots")
                                     ),
                                 }
@@ -646,6 +572,11 @@ def analyse_status_stream(
     def _rate(count: int, denominator: int) -> float:
         return round(count / denominator, 4) if denominator else 0.0
 
+    # Stale count and denominator from the shared rule (LP-0MVU8O4EL005IYP9
+    # AC1.1): polls with no ``slots_stale`` field are excluded, never counted
+    # as fresh.
+    slots_stale, slots_stale_denominator = tally_stale(stale_flags)
+
     worst = sorted(
         violating_minutes.items(), key=lambda item: (-item[1], item[0])
     )[:limit]
@@ -656,7 +587,7 @@ def analyse_status_stream(
         "slots_stale": {
             "count": slots_stale,
             "denominator": slots_stale_denominator,
-            "rate": _rate(slots_stale, slots_stale_denominator),
+            "rate": stale_rate(slots_stale, slots_stale_denominator),
         },
         "slots_stale_attribution": {
             "by_source": dict(stale_by_source),
@@ -709,7 +640,7 @@ def _strip_seconds_suffix(value: str | None) -> int | None:
     """Parse ``cooldown_remaining=600s`` (the log carries a trailing unit)."""
     if not value:
         return None
-    return _parse_int(value[:-1] if value.endswith("s") else value)
+    return parse_int(value[:-1] if value.endswith("s") else value)
 
 
 def _nearest_status_poll(
@@ -788,11 +719,11 @@ def analyse_prefill_thrash_skips(
         with open_proxy_log_text(path) as handle:
             for line in handle:
                 ts = parse_line_timestamp(line)
-                if not _in_window(ts, since, until):
+                if not in_window(ts, since, until):
                     continue
                 stamp = ts.strftime("%Y-%m-%d %H:%M:%S")
                 if is_status_poll(line):
-                    fields = _status_fields(line)
+                    fields = status_fields(line)
                     polls.append(
                         {
                             "timestamp": stamp,
@@ -945,7 +876,7 @@ def analyse_abandonment_events(
         with open_proxy_log_text(path) as handle:
             for line in handle:
                 ts = parse_line_timestamp(line)
-                if not _in_window(ts, since, until):
+                if not in_window(ts, since, until):
                     continue
                 release = _LEASE_RELEASED_RE.search(line)
                 if release and release.group("reason") in _ABANDON_REASONS:
@@ -1135,7 +1066,7 @@ def load_downtime_dispatches(
                 first = local_ts
             if last is None or local_ts > last:
                 last = local_ts
-            if not _in_window(local_ts, since, until):
+            if not in_window(local_ts, since, until):
                 continue
             item_id = str(row.get("itemId") or "")
             key = (item_id, str(dispatched_at))
@@ -1318,12 +1249,18 @@ def evaluate(
         notes.append("no status polls in the window (empty window, not an error)")
         return {"verdict": VERDICT_EMPTY, "checks": checks, "notes": notes}
 
-    stale_rate = metrics["slots_stale"]["rate"]
+    # The target check is the shared one (LP-0MVU8O4EL005IYP9 AC1.1), so the
+    # nightly report's met/unmet verdict cannot drift from this tool's.
+    stale_check = stale_rate_check(
+        metrics["slots_stale"]["count"],
+        metrics["slots_stale"]["denominator"],
+        stale_rate_target,
+    )
     checks.append(
         {
             "target": f"slots_stale rate < {stale_rate_target:.1%} of status polls",
-            "observed": stale_rate,
-            "pass": stale_rate < stale_rate_target,
+            "observed": stale_check["observed"],
+            "pass": stale_check["passed"],
         }
     )
     violations = metrics["saturated_without_live_work"]["count"]

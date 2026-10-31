@@ -20,6 +20,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import capacity_signals
 import config_loader
 import reporting
 
@@ -50,6 +51,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--end", help="window end, ISO 'YYYY-MM-DD HH:MM:SS' (defaults to now)")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help=f"output directory (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--config", help="path to proxy/config.yaml (default: auto-discovered)")
+    parser.add_argument(
+        "--stale-rate-target",
+        type=float,
+        default=capacity_signals.DEFAULT_STALE_RATE_TARGET,
+        help=(
+            "target share of status polls allowed to report slots_stale=true, "
+            "evaluated in the report's 'Local capacity signals' section and in "
+            "--json (default: %(default)s, i.e. 5%%); mirrors "
+            "scripts/capacity_signal_verification.py --stale-rate-target"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="print a JSON summary instead of the text summary")
     parser.add_argument("--quiet", action="store_true", help="suppress the stdout summary")
     return parser.parse_args(argv)
@@ -101,16 +113,27 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=out_dir,
             config=config,
             llama_log_dir=Path(args.llama_log_dir),
+            stale_rate_target=args.stale_rate_target,
         )
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if args.json:
-        print(json.dumps(reporting.summary_to_json(run.summary, run.mode_map, config), indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                reporting.summary_to_json(
+                    run.summary, run.mode_map, config, run.stale_rate_target
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
     if not args.quiet:
-        data = reporting.summary_to_json(run.summary, run.mode_map, config)
+        data = reporting.summary_to_json(
+            run.summary, run.mode_map, config, run.stale_rate_target
+        )
         decode = data.get("decode_speed") or {}
         decode_summary = (
             f", decode speed {decode.get('samples', 0)} samples "

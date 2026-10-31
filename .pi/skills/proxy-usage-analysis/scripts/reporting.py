@@ -26,6 +26,7 @@ from pathlib import Path
 
 import aggregation
 import bucketing
+import capacity_signals
 import config_loader
 import engine_cross_check
 import gpu_busy
@@ -127,6 +128,10 @@ class AnalysisRun:
     # Fast/cheap mode schedule map (per-mode profiles + mode timeline from the
     # logs); None when not built (e.g. no config discovered).
     mode_map: object | None = None
+    # Configured ``slots_stale`` rate target this run was generated with
+    # (LP-0MVU8O4EL005IYP9): carried so the ``--json`` output is built with the
+    # same target the rendered section used.
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET
 
 
 def _fmt_ts(ts: datetime | None) -> str:
@@ -831,6 +836,7 @@ def build_report(
     speed: llama_log_parser.SpeedStats | None = None,
     mode_map: bucketing.ModeScheduleMap | None = None,
     profiles: dict | None = None,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
 ) -> str:
     recs = recommendations.generate_recommendations(summary, config, mode_map)
     hours = (summary.window_end - summary.window_start).total_seconds() / 3600.0
@@ -1028,6 +1034,10 @@ def build_report(
     _append_prefill_vs_decode_section(ap, summary)
     _append_engine_cross_check_section(ap, summary, config)
     _append_contention_prediction_section(ap, summary, speed)
+    # Local capacity signals (LP-0MVU8O4EL005IYP9 AC1.4): the stale-poll rate
+    # against its configurable target, immediately after the contention
+    # prediction it explains. Omitted when the window has no status polls.
+    _append_capacity_signals_section(ap, summary, stale_rate_target)
 
     _append_mode_timeline_section(ap, summary, mode_map)
 
@@ -2871,6 +2881,105 @@ def _append_contention_prediction_section(
     ap("")
 
 
+def capacity_signals_json(
+    summary: AnalysisResult,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+) -> dict:
+    """The additive ``capacity_signals`` block of the ``--json`` summary.
+
+    LP-0MVU8O4EL005IYP9 AC1.5: mirrors the ``## Local capacity signals``
+    section (``slots_stale`` sub-key) so automation can read what the Markdown
+    shows. The rate and the target verdict come from the shared derivation
+    (``scripts/lib/capacity_signals.py``), so this block and the section can
+    never disagree. Only ``slots_stale`` is populated by this work item; the
+    sibling item widens the same block additively.
+
+    ``passed`` is ``null`` when the window has no status polls: the Markdown
+    section is omitted in that case (no zero-fill, AC1.4/AC1.8), so there is no
+    outcome to report and a consumer must not read a silent ``true`` as an
+    all-clear. The counts stay present so the key's shape is stable.
+    """
+    signals = summary.capacity_signals
+    check = capacity_signals.stale_rate_check(
+        signals.slots_stale,
+        signals.slots_stale_denominator,
+        stale_rate_target,
+    )
+    return {
+        "slots_stale": {
+            "status_polls": signals.status_polls,
+            "count": signals.slots_stale,
+            "denominator": signals.slots_stale_denominator,
+            "rate": check["observed"],
+            "target": check["target"],
+            "passed": check["passed"] if signals.status_polls else None,
+        }
+    }
+
+
+def _append_capacity_signals_section(
+    ap,
+    summary: AnalysisResult,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+) -> None:
+    """Append the ``## Local capacity signals`` section (AC1.4).
+
+    LP-0MVU8O4EL005IYP9: publishes the ``slots_stale`` (stale-poll) rate for the
+    report's own window against its configurable target, immediately after the
+    contention-prediction section, so the operator can judge polling-path health
+    from the nightly report alone instead of running
+    ``scripts/capacity_signal_verification.py`` by hand.
+
+    Omitted entirely — no heading, no zero-fill — when the window has no status
+    polls, so a night with no polls (or no logs at all) renders exactly as it
+    did before and the unattended 05:00 run cannot fail on an empty window
+    (AC1.8). The figures come from the aggregation's half-open status-poll
+    window, which uses the same shared derivation as the standalone tool
+    (AC1.1/AC1.3).
+    """
+    signals = summary.capacity_signals
+    if not signals.status_polls:
+        return
+    check = capacity_signals.stale_rate_check(
+        signals.slots_stale,
+        signals.slots_stale_denominator,
+        stale_rate_target,
+    )
+    excluded = signals.status_polls - signals.slots_stale_denominator
+    ap("")
+    ap("## Local capacity signals")
+    ap("")
+    ap("Health of the local status surface (`GET /llama/local/status`) over this "
+       "window, measured from the proxy log. Derived by the same implementation "
+       "the standalone `scripts/capacity_signal_verification.py` tool uses "
+       "(LP-0MVU8O4EL005IYP9), so the two surfaces cannot disagree.")
+    ap("")
+    ap("### slots_stale — stale-poll rate vs target")
+    ap("")
+    ap("| Metric | Value |")
+    ap("|---|---:|")
+    ap(f"| Status polls (`status_request` with `capacity_hint=`) | "
+       f"{signals.status_polls:,} |")
+    ap(f"| Polls with `slots_stale=true` | {signals.slots_stale:,} |")
+    ap(f"| Stale-rate denominator (polls carrying `slots_stale`) | "
+       f"{signals.slots_stale_denominator:,} |")
+    ap(f"| Stale rate | {check['observed']:.2%} |")
+    ap(f"| Target | < {check['target']:.2%} of status polls |")
+    ap(f"| Outcome | **{'met' if check['passed'] else 'unmet'}** |")
+    ap("")
+    if excluded:
+        ap(f"{excluded:,} poll(s) carry no `slots_stale` field (schema 1) and "
+           "are excluded from the rate rather than counted as fresh.")
+        ap("")
+    ap("`slots_stale` means the served slot counts *or* the per-slot detail came "
+       "from the last-known cache because the fresh `/slots` query failed. It is "
+       "a **polling-path** signal, not a capacity verdict: it says whether the "
+       "status surface was telling the truth, and it is only comparable between "
+       "nights measured on the same build. A stale poll served in under a second "
+       "is normally a failure-backoff cache hit.")
+    ap("")
+
+
 def _fmt_tokens(n: int) -> str:
     """Format a token count with comma separators."""
     return f"{n:,}"
@@ -3340,6 +3449,7 @@ def run_analysis(
     config: dict | None = None,
     llama_log_dir: Path | None = None,
     mode_map: bucketing.ModeScheduleMap | None = None,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
 ) -> AnalysisRun:
     """Discover log files, stream-parse them, aggregate sessions, and write
     the CSVs and report into ``output_dir``.
@@ -3360,6 +3470,11 @@ def run_analysis(
     configured ``server.priority_window`` supplies the fast/cheap schedule
     (LP-0MVKSXXIR006OBI2), and only a window with neither signal falls back to
     the legacy slot-schedule attribution.
+
+    ``stale_rate_target`` is the configurable ``slots_stale`` rate target
+    (LP-0MVU8O4EL005IYP9 AC1.6, default 5 %): it is threaded into the rendered
+    ``## Local capacity signals`` section and carried on the returned
+    :class:`AnalysisRun` so ``--json`` evaluates the same target.
     """
     log_dir = Path(log_dir)
     output_dir = Path(output_dir)
@@ -3408,10 +3523,23 @@ def run_analysis(
     write_error_artifacts(summary, output_dir)
     report_path = output_dir / "report.md"
     report_path.write_text(
-        build_report(summary, config, summary.speed, mode_map, profiles=profiles),
+        build_report(
+            summary,
+            config,
+            summary.speed,
+            mode_map,
+            profiles=profiles,
+            stale_rate_target=stale_rate_target,
+        ),
         encoding="utf-8",
     )
-    return AnalysisRun(summary=summary, files=files, archived_to=archived_to, mode_map=mode_map)
+    return AnalysisRun(
+        summary=summary,
+        files=files,
+        archived_to=archived_to,
+        mode_map=mode_map,
+        stale_rate_target=stale_rate_target,
+    )
 
 
 def provider_context_skips_json(
@@ -3454,12 +3582,17 @@ def summary_to_json(
     summary: AnalysisResult,
     mode_map: bucketing.ModeScheduleMap | None = None,
     config: dict | None = None,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
 ) -> dict:
     """Machine-readable summary of the analysis (one dict; JSON-serialisable).
 
     ``config`` is optional and only used for the config-driven thresholds
     (currently the engine cross-check divergence threshold); passing it keeps
     ``--json``'s figures identical to the Markdown report's.
+
+    ``stale_rate_target`` is the configured ``slots_stale`` rate target the
+    ``capacity_signals`` block is evaluated against (LP-0MVU8O4EL005IYP9 AC1.6);
+    it defaults to the reference tool's 5 %.
     """
     sessions = list(summary.sessions.values())
     local_only = sum(1 for s in sessions if s.remote_requests == 0)
@@ -3643,6 +3776,10 @@ def summary_to_json(
         # Local-turn coverage (LP-0MVM93DE6009JGBU): the same derivation the
         # Markdown section renders, so `--json` consumers need not scrape it.
         "local_turn_coverage": local_turn_coverage(summary),
+        # Local capacity signals (LP-0MVU8O4EL005IYP9 AC1.5): the same
+        # ``slots_stale`` figures and target verdict the Markdown section
+        # renders. ADDITIVE — every key above keeps its value and meaning.
+        "capacity_signals": capacity_signals_json(summary, stale_rate_target),
     }
 
 

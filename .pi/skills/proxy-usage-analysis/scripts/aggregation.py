@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import bucketing
+import capacity_signals
 from bucketing import ModeTransition
 from log_parser import (
     BUSY_WINDOW_MARGIN,
@@ -653,6 +654,27 @@ class SessionStats:
         return round(self.local_requests / total * 100.0, 1)
 
 
+@dataclass(frozen=True)
+class StatusPollSignals:
+    """Status-poll aggregation behind the nightly ``slots_stale`` rate.
+
+    LP-0MVU8O4EL005IYP9 AC1.3. Status polls are aggregated with the reference
+    tool's **half-open** ``[window_start, window_end)`` semantics (every other
+    section of this module keeps its historical closed interval), because the
+    published figure has to reproduce
+    ``scripts/capacity_signal_verification.py`` exactly. ``denominator`` counts
+    only polls that carry the ``slots_stale`` field: a schema-1 poll has no
+    freshness field and is excluded from the rate rather than counted as
+    fresh (the derivation itself lives in
+    ``scripts/lib/capacity_signals.py``).
+    """
+
+    status_polls: int = 0
+    slots_stale: int = 0
+    slots_stale_denominator: int = 0
+    slots_stale_rate: float = 0.0
+
+
 @dataclass
 class AnalysisResult:
     window_start: datetime
@@ -680,6 +702,9 @@ class AnalysisResult:
     # ``status_request`` line inside the window, carrying the calibrated
     # ``prefill_eta_seconds`` prediction and the published ``capacity_hint``.
     status_request_events: list[LogEvent] = field(default_factory=list)
+    # Status-poll capacity signals (LP-0MVU8O4EL005IYP9): the half-open
+    # stale-rate aggregation the nightly report publishes next to its target.
+    capacity_signals: StatusPollSignals = field(default_factory=StatusPollSignals)
     # Denial → guard attribution (LP-0MVGR2OXT0096OGK M1): each
     # ``dispatch_denied`` joined to its decision-block guard reject, with the
     # derived pool-state verdict. The join is lossless (unmatched denials are
@@ -2477,6 +2502,29 @@ def aggregate(
         (e for e in local_admission_events if e.decision == "reject"),
     )
 
+    # Status-poll capacity signals (LP-0MVU8O4EL005IYP9 AC1.3): the events were
+    # collected with the closed window filter above, so the half-open rule is
+    # applied here — a poll exactly at ``window_end`` belongs to the next
+    # window, matching the reference tool's ``[since, until)``. The stale count
+    # and denominator come from the shared derivation so the nightly figure and
+    # ``scripts/capacity_signal_verification.py`` cannot diverge.
+    windowed_status_events = [
+        ev
+        for ev in status_request_events
+        if capacity_signals.in_window(ev.ts, window_start, window_end)
+    ]
+    stale_count, stale_denominator = capacity_signals.tally_stale(
+        ev.slots_stale for ev in windowed_status_events
+    )
+    capacity_signal_aggregate = StatusPollSignals(
+        status_polls=len(windowed_status_events),
+        slots_stale=stale_count,
+        slots_stale_denominator=stale_denominator,
+        slots_stale_rate=capacity_signals.stale_rate(
+            stale_count, stale_denominator
+        ),
+    )
+
     return AnalysisResult(
         window_start=window_start,
         window_end=window_end,
@@ -2493,6 +2541,7 @@ def aggregate(
         contention_fallback_events=contention_fallback_events,
         local_admission_events=local_admission_events,
         status_request_events=status_request_events,
+        capacity_signals=capacity_signal_aggregate,
         denial_attributions=denial_attributions,
         idle_admit_events=idle_admit_events,
         residency_events=residency_events,

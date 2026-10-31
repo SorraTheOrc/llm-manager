@@ -225,6 +225,21 @@ Outputs written to:
     top-level key (`{idle: n, prefill_bound: n, saturated: n}`), so
     `jq .status_capacity_hint` answers "what did the payload claim while the
     denials happened?" without parsing Markdown.
+- **Local capacity signals key (LP-0MVU8O4EL005IYP9).** One additive key
+  mirrors the **Local capacity signals** section, so automation reads exactly
+  what the Markdown shows:
+  - `capacity_signals.slots_stale` — `{status_polls, count, denominator, rate,
+    target, passed}`: the status-poll count, the polls with
+    `slots_stale=true`, the denominator (polls that carry the `slots_stale`
+    field — schema-1 polls are excluded, never counted as fresh), the rate,
+    the configured target (`--stale-rate-target`, default `0.05`) and the
+    strict `rate < target` verdict. `passed` is `null` when the window has no
+    status polls: the Markdown section is omitted then, so a consumer must not
+    read a silent `true` as an all-clear. The derivation and the target check
+    are shared with `scripts/capacity_signal_verification.py`
+    (`scripts/lib/capacity_signals.py`), and status polls use the reference
+    tool's half-open `[window_start, window_end)` window while every other
+    section keeps its historical closed interval.
 - **Contended-pricing split keys (LP-0MVS9YKHL007UBBZ, parent
   LP-0MVS8T6F4006DGG3).** Two additive keys split the same
   `local_admission_reject` / `local_admission_admit` verdicts, so a regression
@@ -328,6 +343,14 @@ Outputs written to:
   accuracy (guard ETA → that dispatch's first byte); and one explicit
   matches/does-not-match-reality verdict for the denial signal and one for the
   cache-cold bound), then
+  **Local capacity signals** (LP-0MVU8O4EL005IYP9, omitted when the window has
+  no status polls): the `slots_stale` stale-poll rate for the window — status
+  polls, polls with `slots_stale=true`, the schema-aware denominator, the rate,
+  the configurable target (`--stale-rate-target`, default < 5 %) and an
+  explicit met/unmet outcome, with the excluded schema-1 poll count stated —
+  derived by the same implementation as
+  `scripts/capacity_signal_verification.py` and exposed as
+  `--json`'s `capacity_signals.slots_stale`, then
   **Admission verdicts by rate bucket and prompt band** (LP-0MVS9YKHL007UBBZ,
   when the window has any `local_admission_guard` decision): the admit/reject
   verdicts split by the pricing `rate_bucket` (`contended` / `solitary` /

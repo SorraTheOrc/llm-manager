@@ -52,6 +52,7 @@ Options:
 | `--start` / `--end` | — | Explicit ISO window (`YYYY-MM-DD HH:MM:SS`); overrides `--hours` |
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
+| `--stale-rate-target` | `0.05` | Target share of status polls allowed to report `slots_stale=true`; drives the **Local capacity signals** section's met/unmet outcome and `--json`'s `capacity_signals.slots_stale.passed`. Mirrors `scripts/capacity_signal_verification.py --stale-rate-target` |
 | `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
 
@@ -238,6 +239,44 @@ exposes the same numbers under `denial_attribution`, `prefill_eta_error` and
   evidence of a calibration defect (llama-server lines carry no per-line
   timestamps, so the quantile comparison cannot pair 1:1 — see REFERENCE.md
   Limitations).
+
+## Local capacity signals (LP-0MVU8O4EL005IYP9)
+
+The report renders a **Local capacity signals** section immediately after
+**Local contention prediction vs reality**, publishing the `slots_stale`
+(stale-poll) rate for the report's own window so polling-path health is
+visible nightly without running `scripts/capacity_signal_verification.py` by
+hand and cross-checking two surfaces:
+
+- **`slots_stale` — stale-poll rate vs target.** The status-poll count
+  (`status_request` lines carrying `capacity_hint=`), the polls with
+  `slots_stale=true`, the rate, the configured target (default < 5 %) and an
+  explicit **met** / **unmet** outcome. The denominator is the polls that
+  carry the `slots_stale` field at all: a schema-1 poll has no freshness field
+  and is **excluded from the rate**, never counted as fresh (the excluded
+  count is stated in the section). `slots_stale` means the served slot counts
+  *or* the per-slot detail came from the last-known cache because the fresh
+  `/slots` query failed — a **polling-path** signal, not a capacity verdict,
+  and only comparable between nights measured on the same build.
+- **Configurable target.** `--stale-rate-target` (default `0.05`) overrides
+  it for both the rendered outcome and the `--json` verdict, so the cron line
+  can carry a new target without a code change.
+- **Shared derivation.** The status-poll detection, field extraction, the
+  denominator, the rate and the target check live once, in
+  `scripts/lib/capacity_signals.py`, and are imported by both this skill
+  (through `scripts/capacity_signals.py`, a documented path-based shim) and
+  `scripts/capacity_signal_verification.py` — the two surfaces cannot
+  disagree. Status polls are aggregated with the reference tool's half-open
+  `[window_start, window_end)` window, so a poll exactly at the window end
+  belongs to the next night.
+- **Unattended safety.** The section is **omitted** (no heading, no zero-fill)
+  when the window has no status polls, so an empty window — or a log directory
+  with no logs at all — renders a clean report and the 05:00 cron exits 0. In
+  that case `--json` reports `capacity_signals.slots_stale.passed: null`
+  rather than a misleading `true`.
+
+`--json` exposes the same figures under `capacity_signals.slots_stale`
+(`status_polls`, `count`, `denominator`, `rate`, `target`, `passed`).
 
 ## Local-turn coverage (LP-0MVM93DE6009JGBU)
 

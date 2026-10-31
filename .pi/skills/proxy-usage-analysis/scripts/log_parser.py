@@ -225,6 +225,18 @@ RE_STATUS_CAPACITY_HINT = re.compile(r"\bcapacity_hint=([a-z_]+)")
 RE_STATUS_SCHEMA_VERSION = re.compile(r"\bstatus_schema_version=(\d+)")
 RE_STATUS_AVAILABLE_SLOTS = re.compile(r"\bavailable_slots=(\d+)")
 RE_STATUS_TOTAL_SLOTS = re.compile(r"\btotal_slots=(\d+)")
+# Freshness of the served status payload (LP-0MVU8O4EL005IYP9 AC1.2):
+# ``slots_stale`` is the union flag (counts *or* per-slot detail served from
+# cache because the fresh ``/slots`` query failed), ``slots_detail_stale`` the
+# per-source flag for the detail half. Both are emitted at schema >= 2 and are
+# absent on schema-1 lines, where each stays ``None`` (never a fabricated
+# ``false`` — an absent field must not be counted as a fresh poll).
+RE_STATUS_SLOTS_STALE = re.compile(r"\bslots_stale=(true|false)")
+RE_STATUS_SLOTS_DETAIL_STALE = re.compile(r"\bslots_detail_stale=(true|false)")
+# Response latency of the poll (``proxy/proxy/handlers.py``): the elapsed time
+# the status handler spent serving the request, including a timed-out
+# ``/slots`` query. Absent on pre-change lines, so ``None`` there.
+RE_STATUS_LATENCY_MS = re.compile(r"\blatency_ms=(\d+)")
 
 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): the proxy emits
 # ``routing_idle_admit provider=... model=... reason=economic_bypass_idle
@@ -726,6 +738,15 @@ class LogEvent:
     prefill_eta_samples: int | None = None
     prefill_eta_kind: str | None = None
     prefill_eta_assumed_cached_ratio: float | None = None
+    # Status-payload freshness and response latency (LP-0MVU8O4EL005IYP9 AC1.2):
+    # ``slots_stale`` (the union flag) and ``slots_detail_stale`` (the per-source
+    # detail half) are tri-state — ``None`` on schema-1 lines that predate the
+    # fields, which is why an absent field is excluded from the stale-rate
+    # denominator instead of being counted as fresh. ``latency_ms`` is the
+    # handler's own response latency (``None`` when the line predates it).
+    slots_stale: bool | None = None
+    slots_detail_stale: bool | None = None
+    latency_ms: int | None = None
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J, ``idle_admit`` kind):
     # the idle age at admission and the configured threshold. Populated on
     # ``idle_admit`` events only.
@@ -818,6 +839,19 @@ def _int(pattern: re.Pattern, text: str) -> int | None:
         return int(token)
     except ValueError:
         return None
+
+
+def _bool(pattern: re.Pattern, text: str) -> bool | None:
+    """Tri-state boolean extraction for a ``key=true|false`` field.
+
+    ``None`` means the field is absent (a pre-change line), which callers must
+    keep distinct from ``False`` — an absent freshness field is not a fresh
+    poll (LP-0MVU8O4EL005IYP9 AC1.2).
+    """
+    token = _first(pattern, text)
+    if token is None:
+        return None
+    return token == "true"
 
 
 def _session_from(text: str) -> str | None:
@@ -1269,6 +1303,11 @@ def parse_log_line(line: str) -> LogEvent | None:
             prefill_eta_assumed_cached_ratio=_float(
                 RE_STATUS_ASSUMED_CACHED_RATIO, msg
             ),
+            # Payload freshness and latency (LP-0MVU8O4EL005IYP9 AC1.2):
+            # additive fields, ``None`` on lines predating them.
+            slots_stale=_bool(RE_STATUS_SLOTS_STALE, msg),
+            slots_detail_stale=_bool(RE_STATUS_SLOTS_DETAIL_STALE, msg),
+            latency_ms=_int(RE_STATUS_LATENCY_MS, msg),
         )
     if msg.startswith(ROUTING_RESIDENT_PREFIX):
         # "routing_resident_prefix provider=local model=Qwen3 decision=admit
