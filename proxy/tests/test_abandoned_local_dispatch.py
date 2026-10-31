@@ -467,10 +467,12 @@ class TestAbandonedSlotRegistry:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def _annotate(slots: list[dict], srv=None, *, model: str = "Qwen3") -> list[dict]:
+def _annotate(
+    slots: list[dict], srv=None, *, model: str = "Qwen3", stale: bool = False
+) -> list[dict]:
     from proxy.observability import annotate_slots_for_status
 
-    return annotate_slots_for_status(slots, srv, model, config={}, stale=False)
+    return annotate_slots_for_status(slots, srv, model, config={}, stale=stale)
 
 
 class TestStatusAnnotation:
@@ -1005,3 +1007,419 @@ class TestOtherAbandonmentPaths:
         assert entry is not None
         assert entry["reason"] == "session_evicted"
         assert entry["session_id"] == "sess-evicted"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Endpoint-wide (slot-less) abandonment entries — LP-0MVUVHA55009EU4B
+#
+# Two shapes of the remaining post-cancel release lag
+# (LP-0MVT2KW5A008X037, 12 polls / 0.11 % of a comparable night):
+#
+# 1. **Attributable, but unmatched** — the release recorded an identity that no
+#    longer matches the slot llama-server is draining (the exact lookup misses
+#    and ``local_abandoned_slots`` stays 0).
+# 2. **Unattributable** — the release had no slot identity at all
+#    (``measured_cache_deficit``), so ``_record_abandoned_slot`` dropped it.
+#
+# Both become annotatable only if an *endpoint-wide* entry exists and the status
+# builder matches it to a processing slot that **no** live dispatch record owns.
+# Shape 1 additionally needs the endpoint-wide entry recorded alongside the
+# mismatching exact one, so a recorded-vs-observed mismatch still annotates.
+#
+# Red-first encoding (the repository convention — see the module docstring and
+# ``test_prefill_thrash_cooldown.py``): every assertion pinning behaviour that
+# does not exist yet is marked ``pytest.mark.xfail(strict=True)`` so this
+# test-only item lands on ``dev`` with a green suite. ``strict`` makes the
+# assertion fail the suite the moment it starts passing, so the paired
+# implementation items (LP-0MVUVHAQP001IRKK records the entry,
+# LP-0MVUVHB1V006HA5I matches and clears it) cannot forget to remove the
+# marker. Controls that already hold run unmarked.
+#
+# ``ENDPOINT`` is the label the release paths carry for the local backend (the
+# dispatch record's ``endpoint`` field). The status payload describes that same
+# local backend without a label of its own, so the endpoint-wide lookup must
+# fall back across endpoint labels exactly as the exact-match lookup already
+# does (``TestAbandonedSlotRegistry.test_entry_is_unknown_endpoint_fallback``).
+# ═════════════════════════════════════════════════════════════════════════════
+
+#: Endpoint label the local backend's dispatch records carry.
+ENDPOINT = "local-llama"
+
+#: Reason a release with no slot identity carries today
+#: (``proxy/proxy/measured_cache_abort.py`` ``MEASURED_CACHE_DEFICIT_REASON``).
+ENDPOINT_WIDE_REASON = "measured_cache_deficit"
+
+_SENTINEL_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "endpoint-wide abandonment entry is not implemented yet "
+        "(LP-0MVUVHAQP001IRKK / LP-0MVUVHB1V006HA5I)"
+    ),
+)
+
+
+def _record_endpoint_wide(
+    *,
+    endpoint: str | None = ENDPOINT,
+    reason: str = ENDPOINT_WIDE_REASON,
+    session_id: str | None = "herdr-ghost",
+    now: float | None = None,
+) -> dict | None:
+    """Record an abandonment with no slot identity (shape 2)."""
+    from proxy.router_helpers import _record_abandoned_slot
+
+    return _record_abandoned_slot(
+        None,
+        endpoint=endpoint,
+        reason=reason,
+        session_id=session_id,
+        now=now,
+    )
+
+
+def _live_dispatch_records(session_id: str = "live-session") -> dict:
+    """A genuinely active dispatch lease (live proxy-owned work)."""
+    return {
+        session_id: {
+            "active": True,
+            "started_at": 0.0,
+            "expires_at": time.monotonic() + 60.0,
+            "first_byte_seen": True,
+        }
+    }
+
+
+class TestEndpointWideRegistry:
+    """AC: a slot-less abandonment is stored, bounded and never collides."""
+
+    @_SENTINEL_XFAIL
+    def test_sentinel_cannot_collide_with_a_real_slot_id(self):
+        """The "endpoint-wide" key is a documented sentinel that is not a
+        non-negative integer, so it can never be mistaken for a real slot."""
+        from proxy.router_helpers import ABANDONED_SLOT_ENDPOINT_WIDE
+
+        assert isinstance(ABANDONED_SLOT_ENDPOINT_WIDE, int)
+        assert ABANDONED_SLOT_ENDPOINT_WIDE < 0
+
+    @_SENTINEL_XFAIL
+    def test_recording_without_a_slot_yields_one_endpoint_wide_entry(self):
+        """``_record_abandoned_slot(None, ...)`` records instead of silently
+        dropping: one entry, attributable, keyed by the sentinel."""
+        from proxy.router_helpers import (
+            ABANDONED_SLOT_ENDPOINT_WIDE,
+            DEFAULT_ABANDONED_SLOT_TTL_SECONDS,
+        )
+
+        from proxy import router_helpers as helpers
+
+        entry = _record_endpoint_wide(now=0.0)
+
+        assert entry is not None
+        assert entry["scope"] == "endpoint"
+        assert entry["slot_id"] is None
+        assert entry["endpoint"] == ENDPOINT
+        assert entry["session_id"] == "herdr-ghost"
+        assert entry["reason"] == ENDPOINT_WIDE_REASON
+        assert entry["abandoned_at"] == 0.0
+        assert entry["ttl_seconds"] == DEFAULT_ABANDONED_SLOT_TTL_SECONDS
+        # Exactly one entry, keyed by the sentinel under the recorded endpoint.
+        assert list(helpers._abandoned_slots) == [
+            (ENDPOINT, ABANDONED_SLOT_ENDPOINT_WIDE)
+        ]
+
+    @_SENTINEL_XFAIL
+    def test_endpoint_wide_entry_never_matches_a_real_slot(self):
+        """The fallback must be an explicit endpoint-wide lookup, never a
+        match on a real slot id: an exact lookup for any slot stays empty, so
+        the endpoint-wide entry can only be applied by the guarded path."""
+        from proxy.router_helpers import _abandoned_slot_for
+
+        assert _record_endpoint_wide(now=0.0) is not None
+
+        for slot_id in (0, 1, 2, 7):
+            assert _abandoned_slot_for(slot_id, endpoint=ENDPOINT, now=0.0) is None
+        # ...including the legacy/default endpoint label.
+        assert _abandoned_slot_for(0, now=0.0) is None
+
+    @_SENTINEL_XFAIL
+    def test_rerecording_refreshes_rather_than_duplicates(self, clock):
+        """A second slot-less abandonment refreshes the single entry (no
+        growth, latest reason) instead of appending a duplicate."""
+        from proxy.router_helpers import _abandoned_slot_count
+
+        first = _record_endpoint_wide(
+            reason=ENDPOINT_WIDE_REASON, now=clock.now
+        )
+        assert first is not None
+        clock.advance(first["ttl_seconds"] - 1.0)
+        _record_endpoint_wide(reason="client_disconnect", now=clock.now)
+
+        assert _abandoned_slot_count(endpoint=ENDPOINT, now=clock.now) == 1
+        refreshed = _record_endpoint_wide(
+            reason="prefill_deadline", now=clock.now
+        )
+        assert refreshed["reason"] == "prefill_deadline"
+        assert refreshed["abandoned_at"] == clock.now
+
+    @_SENTINEL_XFAIL
+    def test_entry_is_scoped_per_endpoint(self):
+        """One entry per endpoint — the bound stays
+        ``(endpoint, slot)`` pairs plus one endpoint-wide entry per endpoint."""
+        from proxy.router_helpers import _abandoned_slot_count
+
+        _record_endpoint_wide(endpoint=ENDPOINT, now=0.0)
+        _record_endpoint_wide(endpoint="remote-backend", now=0.0)
+
+        assert _abandoned_slot_count(endpoint=ENDPOINT, now=0.0) == 1
+        assert _abandoned_slot_count(endpoint="remote-backend", now=0.0) == 1
+
+    @_SENTINEL_XFAIL
+    def test_entry_expires_at_the_default_ttl(self, clock):
+        """The endpoint-wide entry is TTL-bounded like every other entry."""
+        from proxy.router_helpers import (
+            DEFAULT_ABANDONED_SLOT_TTL_SECONDS,
+            _abandoned_slot_count,
+        )
+
+        entry = _record_endpoint_wide(now=clock.now)
+        assert entry is not None
+        assert entry["ttl_seconds"] == DEFAULT_ABANDONED_SLOT_TTL_SECONDS
+
+        clock.advance(DEFAULT_ABANDONED_SLOT_TTL_SECONDS - 1.0)
+        assert _abandoned_slot_count(endpoint=ENDPOINT, now=clock.now) == 1
+
+        clock.advance(2.0)
+        assert _abandoned_slot_count(endpoint=ENDPOINT, now=clock.now) == 0
+
+
+class TestEndpointWideAnnotation:
+    """AC: the draining slot is annotated, truthfully, from the entry."""
+
+    @_SENTINEL_XFAIL
+    def test_shape2_no_identity_slot_is_annotated(self):
+        """Shape 2 (no slot identity): a fresh slot is ``is_processing`` with
+        no lease owner and no live dispatch record, so the endpoint-wide entry
+        annotates it — attributable, with an explicit endpoint scope."""
+        _record_endpoint_wide(now=0.0)
+
+        slot = _annotate([_raw_slot(1, is_processing=True, n_decoded=5)])[0]
+
+        assert slot["abandoned"] is True
+        assert slot["abandonment_reason"] == ENDPOINT_WIDE_REASON
+        assert slot["abandoned_session_id"] == "herdr-ghost"
+        assert slot["abandoned_scope"] == "endpoint"
+
+    @_SENTINEL_XFAIL
+    def test_shape1_identity_mismatch_resolves_through_endpoint_wide(self):
+        """Shape 1: the recorded id (7) differs from the observed slot id (1),
+        so the exact lookup misses; the endpoint-wide entry recorded alongside
+        it still annotates the draining slot."""
+        from proxy.router_helpers import _abandoned_slot_for, _record_abandoned_slot
+
+        assert (
+            _record_abandoned_slot(
+                7, endpoint=ENDPOINT, reason="session_evicted", session_id="herdr-ghost", now=0.0
+            )
+            is not None
+        )
+        assert _record_endpoint_wide(
+            endpoint=ENDPOINT, reason="session_evicted", now=0.0
+        ) is not None
+        # The exact lookup genuinely misses for the observed slot.
+        assert _abandoned_slot_for(1, endpoint=ENDPOINT, now=0.0) is None
+
+        slot = _annotate([_raw_slot(1, is_processing=True, n_decoded=5)])[0]
+
+        assert slot["abandoned"] is True
+        assert slot["abandonment_reason"] == "session_evicted"
+        assert slot["abandoned_scope"] == "endpoint"
+
+    @_SENTINEL_XFAIL
+    def test_exact_entry_reports_slot_scope(self):
+        """Control on the new additive field: an exact match reports
+        ``abandoned_scope="slot"``, not ``"endpoint"``."""
+        from proxy.router_helpers import _record_abandoned_slot
+
+        assert (
+            _record_abandoned_slot(
+                1, endpoint=ENDPOINT, reason="prefill_deadline", session_id="s", now=0.0
+            )
+            is not None
+        )
+
+        slot = _annotate([_raw_slot(1, is_processing=True, n_decoded=5)])[0]
+
+        assert slot["abandoned"] is True
+        assert slot["abandoned_scope"] == "slot"
+
+    @_SENTINEL_XFAIL
+    def test_live_lease_owner_is_never_annotated(self):
+        """Truthful status (LP-0MVKSXR4P001V0CM): an endpoint-wide entry must
+        not annotate a processing slot a live dispatch lease owns."""
+        from proxy.observability import CAPACITY_SATURATED, compute_capacity_hint
+        from proxy.session import _slot_registry_key
+
+        assert _record_endpoint_wide(now=0.0) is not None
+        srv = _server_stub(records=_live_dispatch_records())
+
+        with patch.dict(
+            "proxy.session._slot_owners",
+            {_slot_registry_key(None, 1): "live-session"},
+            clear=True,
+        ):
+            annotated = _annotate(
+                [_raw_slot(1, is_processing=True, n_decoded=42)], srv
+            )
+
+        assert annotated[0].get("abandoned") is not True
+        assert annotated[0].get("abandoned_scope") is None
+        assert compute_capacity_hint(annotated) == CAPACITY_SATURATED
+
+    @_SENTINEL_XFAIL
+    def test_live_dispatch_record_without_a_slot_binding_is_never_annotated(self):
+        """The guard covers the dispatch-record binding too: an active record
+        matched to the processing slot (no persistence binding) is live work,
+        so the endpoint-wide entry must not annotate it."""
+        from proxy.observability import CAPACITY_SATURATED, compute_capacity_hint
+
+        from proxy import observability as obs
+
+        assert _record_endpoint_wide(now=0.0) is not None
+        srv = _server_stub(records=_live_dispatch_records())
+
+        with patch.object(obs, "_processing_slot_assignments", {}):
+            with patch.dict("proxy.session._slot_owners", {}, clear=True):
+                annotated = _annotate(
+                    [_raw_slot(0, is_processing=True, n_decoded=42)], srv
+                )
+
+        assert annotated[0]["owner_session_id"] == "live-session"
+        assert annotated[0].get("abandoned") is not True
+        assert compute_capacity_hint(annotated) == CAPACITY_SATURATED
+
+    @_SENTINEL_XFAIL
+    def test_all_draining_pool_is_abandoned_busy(self):
+        """Every generating slot draining (annotated from the endpoint-wide
+        entry) → ``abandoned_busy``, never ``saturated``, never ``idle``."""
+        from proxy.observability import (
+            CAPACITY_ABANDONED_BUSY,
+            CAPACITY_IDLE,
+            CAPACITY_SATURATED,
+            compute_capacity_hint,
+        )
+
+        _record_endpoint_wide(now=0.0)
+
+        annotated = _annotate(
+            [
+                _raw_slot(0, is_processing=True, n_decoded=1),
+                _raw_slot(1, is_processing=True, n_decoded=2),
+            ]
+        )
+
+        assert [s["abandoned_scope"] for s in annotated] == ["endpoint", "endpoint"]
+        hint = compute_capacity_hint(annotated)
+        assert hint == CAPACITY_ABANDONED_BUSY
+        assert hint != CAPACITY_SATURATED
+        assert hint != CAPACITY_IDLE
+
+
+class TestEndpointWideClearOnObservedFree:
+    """AC: the marker survives until llama-server reports the slot free."""
+
+    @_SENTINEL_XFAIL
+    def test_fresh_snapshot_reporting_the_slot_free_clears_the_entry(self):
+        """A *fresh* ``is_processing=False`` reading is trustworthy, so it
+        drops the entry: a later poll cannot resurrect the annotation."""
+        _record_endpoint_wide(now=0.0)
+
+        draining = _annotate([_raw_slot(1, is_processing=True, n_decoded=9)])
+        assert draining[0]["abandoned"] is True
+
+        freed = _annotate([_raw_slot(1, is_processing=False)])
+        assert freed[0]["abandoned"] is False
+        assert freed[0]["abandoned_scope"] is None
+
+        again = _annotate([_raw_slot(1, is_processing=True, n_decoded=9)])
+        assert again[0]["abandoned"] is False
+
+    @_SENTINEL_XFAIL
+    def test_fresh_free_reading_also_clears_the_exact_entry(self):
+        """The clear applies to the exact entry for the observed slot as well,
+        so a freed slot cannot keep a stale exact annotation."""
+        from proxy.router_helpers import _abandoned_slot_for, _record_abandoned_slot
+
+        assert (
+            _record_abandoned_slot(
+                1, endpoint=ENDPOINT, reason="client_disconnect", session_id="s", now=0.0
+            )
+            is not None
+        )
+
+        assert _annotate([_raw_slot(1, is_processing=False)])[0]["abandoned"] is False
+        assert _abandoned_slot_for(1, endpoint=ENDPOINT, now=0.0) is None
+
+    @_SENTINEL_XFAIL
+    def test_stale_snapshot_never_clears_the_entry(self):
+        """Stale detail is not evidence of freedom: a cached "free" reading
+        must not drop a live annotation (only fresh readings clear)."""
+        _record_endpoint_wide(now=0.0)
+
+        stale_free = _annotate([_raw_slot(1, is_processing=False)], stale=True)
+        assert stale_free[0]["abandoned"] is False  # nothing to annotate free
+
+        still_draining = _annotate([_raw_slot(1, is_processing=True, n_decoded=9)])
+        assert still_draining[0]["abandoned"] is True
+
+    @_SENTINEL_XFAIL
+    def test_one_free_slot_does_not_clear_a_draining_sibling(self):
+        """Multi-slot pool guard: the entry is cleared only when the fresh
+        snapshot reports *nothing* processing — a free sibling must not drop
+        the annotation of the slot that is still draining."""
+        _record_endpoint_wide(now=0.0)
+
+        annotated = _annotate(
+            [
+                _raw_slot(0, is_processing=True, n_decoded=4),
+                _raw_slot(1, is_processing=False),
+            ]
+        )
+
+        assert annotated[0]["abandoned"] is True
+        assert annotated[0]["abandoned_scope"] == "endpoint"
+        assert annotated[1]["abandoned"] is False
+
+
+class TestEndpointWideAnnotationIsReadOnly:
+    """AC: annotating and clearing is decoration — never capacity mutation."""
+
+    @_SENTINEL_XFAIL
+    def test_annotation_never_touches_dispatch_or_lease_state(self):
+        from proxy.router_helpers import _abandoned_slot_count
+        from proxy.session import _slot_registry_key
+
+        from proxy import session as session_mod
+
+        assert _record_endpoint_wide(now=0.0) is not None
+        assert _abandoned_slot_count() == 1
+
+        srv = _server_stub(records=_live_dispatch_records())
+        records_before = {k: dict(v) for k, v in srv.local_dispatch_records.items()}
+        prefill_before = dict(srv.local_prefill_in_flight)
+
+        with patch.dict(
+            "proxy.session._slot_owners",
+            {_slot_registry_key(None, 1): "live-session"},
+            clear=True,
+        ):
+            owners_before = dict(session_mod._slot_owners)
+            _annotate([_raw_slot(0, is_processing=True, n_decoded=1)], srv)
+            _annotate([_raw_slot(0, is_processing=False)], srv)
+            owners_after = dict(session_mod._slot_owners)
+
+        assert srv.local_dispatch_records == records_before
+        assert srv.local_prefill_in_flight == prefill_before
+        assert srv.local_active_queries == 0
+        assert owners_after == owners_before
+        # Clearing dropped the registry entry without re-recording anything.
+        assert _abandoned_slot_count() == 0

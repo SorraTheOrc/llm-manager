@@ -742,6 +742,13 @@ class TestPerSlotDetails:
         assert j["slots"] == []
         detail_mock.assert_not_awaited()
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "abandoned_scope is additive-pending (LP-0MVUVHA55009EU4B pins it, "
+            "LP-0MVUVHB1V006HA5I publishes it)"
+        ),
+    )
     @pytest.mark.asyncio
     async def test_slot_dicts_carry_capacity_fields(self):
         """AC1/AC2/AC5: each slot dict is compact but carries the additive
@@ -772,16 +779,21 @@ class TestPerSlotDetails:
                 "abandonment_reason",
                 "abandoned_session_id",
                 "abandoned_at_seconds_ago",
+                "abandoned_scope",
             }
             # LP-0MVSD5RJW008F1IB AC2: the per-slot ETA is labelled as the
             # cache-cold estimate it is, on every slot.
             assert slot["prefill_eta_kind"] == "reference_cold_bound"
             assert slot["prefill_eta_assumed_cached_ratio"] == 0.0
             # The abandonment annotation is always present and always
-            # attributable: a boolean alone is not enough.
+            # attributable: a boolean alone is not enough. ``abandoned_scope``
+            # is ``None`` unless the slot is abandoned (LP-0MVUVHA55009EU4B) and
+            # then names which registry entry matched (``"slot"`` |
+            # ``"endpoint"``).
             assert slot["abandoned"] is False
             assert slot["abandonment_reason"] is None
             assert slot["abandoned_session_id"] is None
+            assert slot["abandoned_scope"] is None
             assert isinstance(slot["slot_id"], int)
             assert isinstance(slot["is_processing"], bool)
             assert slot["n_decoded"] is None or isinstance(slot["n_decoded"], int)
@@ -1642,3 +1654,138 @@ async def test_query_slots_reports_outcome_for_definitive_absence():
         available, total = await _query_slots(None, 8080, model="m", status_out=outcome)
     assert (available, total) == (1, 2)
     assert outcome == {"status": 200, "reason": None}
+
+
+# ======================================================================
+# Endpoint-wide abandonment annotation (LP-0MVUVHA55009EU4B, test-first)
+#
+# The residual post-cancel release lag has two shapes: a recorded slot id that
+# no longer matches the draining slot (shape 1) and a release with no slot
+# identity at all (shape 2). Both must be annotated from an endpoint-wide
+# registry entry, so `/llama/local/status` reports `abandoned_busy` rather than
+# `saturated` while a ghost drains — without ever annotating live work.
+#
+# These are the payload-contract assertions; the registry and annotation
+# mechanics are pinned in `test_abandoned_local_dispatch.py`. The assertions
+# that do not hold yet are `xfail(strict=True)` (the repository's red-first
+# convention) so this test-only item lands green; the implementation item
+# LP-0MVUVHB1V006HA5I removes the markers as it turns them green.
+# ======================================================================
+
+_ENDPOINT = "local-llama"
+_ENDPOINT_WIDE_REASON = "measured_cache_deficit"
+
+@pytest.fixture
+def endpoint_wide_abandonment():
+    """Record one slot-less abandonment, isolated to the test that uses it."""
+    import time as _time
+
+    from proxy.router_helpers import _record_abandoned_slot, _reset_abandoned_slots
+
+    _reset_abandoned_slots()
+    entry = _record_abandoned_slot(
+        None,
+        endpoint=_ENDPOINT,
+        reason=_ENDPOINT_WIDE_REASON,
+        session_id="herdr-ghost",
+        now=_time.monotonic(),
+    )
+    assert entry is not None
+    try:
+        yield entry
+    finally:
+        _reset_abandoned_slots()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "endpoint-wide abandonment annotation is not implemented yet "
+        "(LP-0MVUVHB1V006HA5I)"
+    ),
+)
+@pytest.mark.asyncio
+async def test_endpoint_wide_entry_annotates_the_draining_slot(
+    endpoint_wide_abandonment,
+):
+    """Shape 2 end-to-end: fresh detail, one processing slot, no live dispatch
+    — ``abandoned_busy`` with one annotated slot, and the schema stays v4."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(1, is_processing=True, n_decoded=7)],
+    )
+
+    assert j["status_schema_version"] == 4
+    assert j["capacity_hint"] == "abandoned_busy"
+    assert j["capacity_hint"] != "saturated"
+    assert j["capacity_hint"] != "idle"
+    assert j["local_abandoned_slots"] == 1
+    slot = j["slots"][0]
+    assert slot["abandoned"] is True
+    assert slot["abandonment_reason"] == _ENDPOINT_WIDE_REASON
+    assert slot["abandoned_session_id"] == "herdr-ghost"
+    assert slot["abandoned_scope"] == "endpoint"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "endpoint-wide abandonment annotation is not implemented yet "
+        "(LP-0MVUVHB1V006HA5I)"
+    ),
+)
+@pytest.mark.asyncio
+async def test_local_abandoned_slots_counts_annotated_slots_not_entries(
+    endpoint_wide_abandonment,
+):
+    """One endpoint-wide entry matching two draining slots is reported as
+    **two** abandoned slots: the count mirrors the ``slots`` array a consumer
+    reads, not the raw registry size."""
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[
+            _slot(0, is_processing=True, n_decoded=3),
+            _slot(1, is_processing=True, n_decoded=4),
+        ],
+    )
+
+    assert [s["abandoned"] for s in j["slots"]] == [True, True]
+    assert [s["abandoned_scope"] for s in j["slots"]] == ["endpoint", "endpoint"]
+    assert j["local_abandoned_slots"] == 2
+    assert j["capacity_hint"] == "abandoned_busy"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "endpoint-wide abandonment annotation is not implemented yet "
+        "(LP-0MVUVHB1V006HA5I)"
+    ),
+)
+@pytest.mark.asyncio
+async def test_endpoint_wide_entry_never_annotates_live_owned_work(
+    endpoint_wide_abandonment,
+):
+    """Truthful status (LP-0MVKSXR4P001V0CM): the entry is present, but the
+    processing slot is owned by a live dispatch lease, so the pool must still
+    read ``saturated`` with nothing annotated."""
+    import time as _time
+
+    from proxy.session import _slot_registry_key
+
+    dispatch_records = {
+        "live-session": {
+            "active": True,
+            "expires_at": _time.monotonic() + 60.0,
+            "first_byte_seen": True,
+        }
+    }
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[_slot(1, is_processing=True, n_decoded=99)],
+        slot_owners={_slot_registry_key(None, 1): "live-session"},
+        dispatch_records=dispatch_records,
+    )
+
+    assert j["capacity_hint"] == "saturated"
+    assert j["local_abandoned_slots"] == 0
+    slot = j["slots"][0]
+    assert slot.get("abandoned") is not True
+    assert slot.get("abandoned_scope") is None
