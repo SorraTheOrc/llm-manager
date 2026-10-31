@@ -17,13 +17,8 @@ all, and the arguments it received — never a grep of the hook source.
 The pushed-commit guard suite (LP-0MVSJUM3O003C0H9) rides on the same sandbox:
 the gate must verify the commit it is pushing, so a tree that is *not* the
 pushed commit (stale ``HEAD``) or a tree that is dirty at it never produces a
-green gate. Red-first encoding (the repository convention — see the module
-docstring of ``proxy/tests/test_abandoned_local_dispatch.py``): the assertions
-pinning behaviour that the hook does not implement yet are marked
-``pytest.mark.xfail(strict=True)`` so this test-only item lands on ``dev`` with
-a green suite. ``strict`` fails the suite the moment one starts passing, so the
-implementing child cannot forget to remove the marker. Controls that already
-hold (clean tree, feature branch, deletion push, escape hatch) run unmarked.
+green gate. The refusals are asserted alongside the controls that must keep
+working (clean tree, feature branch, deletion push, escape hatch).
 """
 
 from __future__ import annotations
@@ -32,11 +27,6 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-
-import pytest
-
-#: Reason shared by the red-first markers: removed by the guard child.
-GUARD_PENDING = "pushed-commit guard lands in the sibling feature child"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOK = Path(".githooks/pre-push")
@@ -448,7 +438,6 @@ def test_worktree_run_mirrors_cache_entry_into_main_checkout(tmp_path: Path) -> 
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=GUARD_PENDING)
 def test_stale_dev_push_is_refused(tmp_path: Path) -> None:
     """A skipped fast-forward must never be gated against the stale checkout."""
     root = _sandbox(tmp_path)
@@ -466,7 +455,6 @@ def test_stale_dev_push_is_refused(tmp_path: Path) -> None:
     assert _marker(tmp_path) == "", "the runner must never run for another tree"
 
 
-@pytest.mark.xfail(strict=True, reason=GUARD_PENDING)
 def test_stale_main_push_is_refused(tmp_path: Path) -> None:
     """``main`` is gated on the same pushed-commit terms as ``dev``."""
     root = _sandbox(tmp_path)
@@ -482,7 +470,6 @@ def test_stale_main_push_is_refused(tmp_path: Path) -> None:
     assert _marker(tmp_path) == ""
 
 
-@pytest.mark.xfail(strict=True, reason=GUARD_PENDING)
 def test_dirty_tree_at_matching_sha_is_refused(tmp_path: Path) -> None:
     """A dirty fingerprint is never evidence about the pushed commit."""
     root = _sandbox(tmp_path)
@@ -497,7 +484,6 @@ def test_dirty_tree_at_matching_sha_is_refused(tmp_path: Path) -> None:
     assert _marker(tmp_path) == ""
 
 
-@pytest.mark.xfail(strict=True, reason=GUARD_PENDING)
 def test_conflicting_gated_shas_in_one_push_are_refused(tmp_path: Path) -> None:
     """One tree cannot be the pushed commit for two different gated shas."""
     root = _sandbox(tmp_path)
