@@ -95,6 +95,21 @@ Outputs written to:
   A `% local turns` of 100 means the session never used remote; a null
   `context_at_fallback` means the logs carried no token evidence (the report
   renders `n/a`, never an estimate).
+- `--json` summary field `engine_cross_check` — the engine cross-check
+  (LP-0MVNWULLI006ZYXX): proxy-inferred phase slot-time vs llama-server's own
+  summed per-task eval durations. `{"unit": "slot-seconds",
+  "engine_metric": "sum of per-task eval durations (slot-seconds, not
+  wall-clock)", "metric_caveat": str, "interpretation": str,
+  "window_approximation": str, "threshold_pct": f,
+  "threshold_enabled": bool, "status": "ok"|"partial"|"unavailable",
+  "prefill": {"phase", "proxy_slot_seconds", "proxy_samples",
+  "proxy_streams", "engine_seconds", "engine_samples", "delta_seconds",
+  "delta_pct", "available", "reason", "divergent"}, "decode": {…same…},
+  "available_phases": [phase], "divergent_phases": [phase],
+  "engine_unavailable_reasons": [str]}`. `delta` is proxy − engine and
+  `delta_pct` is of the engine figure; an unavailable phase carries `null`
+  deltas plus a named `reason` — never `0`/`100`. Additive: every pre-existing
+  key is unchanged.
 - `--json` summary field `provider_context_skips` — provider context-ceiling
   skips (LP-0MVMBM1Y3001TPRT): `{"total": N, "share_of_skips": f,
   "standard": N, "low": N, "by_provider": {provider: count},
@@ -323,6 +338,16 @@ Outputs written to:
   vs decode first byte → finish, each as slot-seconds and % of combined phase
   slot time summing to 100%, with p10/p50/p90/max per phase and unknown-stream
   counts; the `--json` summary exposes it as `local_busy.prefill_vs_decode`),
+  **Engine cross-check** (LP-0MVNWULLI006ZYXX: the proxy-inferred prefill /
+  decode slot-seconds compared against llama-server's own summed per-task eval
+  durations — `prompt eval time` and `eval time` — with the absolute delta and
+  the delta as a percentage of the engine figure, the explicit slot-seconds
+  (not wall-clock, not comparable with `busy_seconds`) caveat, the window
+  boundedness caveat, and an `Unavailable — <phase>: <reason>` note when the
+  engine or proxy samples are missing; a phase above
+  `local_engine_cross_check_threshold_pct` raises a warning recommendation and
+  the `--json` summary exposes it as the additive top-level
+  `engine_cross_check` key),
   **Time to first
   token** (p10 / median / p90 of dispatch → first-token latency, split into
   **Total / Fast / Cheap** rows using the same three-tier fast/cheap bucketing
@@ -686,6 +711,23 @@ entry is a local runtime edit, not a committed artifact.
    unattributed blank (a window with no local traffic prints a named "no
    local traffic" reason). The same split is in the JSON summary at
    `local_busy.prefill_vs_decode`.
+   **Engine cross-check** (LP-0MVNWULLI006ZYXX) validates that split against the
+   engine's own accounting: `SpeedStats.engine_seconds` sums the
+   Qwen3-attributed, in-window `prompt eval time` / `eval time` durations
+   (produced inside the same attribution loop as the speed percentiles, so the
+   port rules are inherited verbatim) and the `## Engine cross-check` section
+   compares them with `PrefillStats.total_seconds` / `DecodeStats.total_seconds`
+   — absolute delta and percentage of the engine figure. Both sides are
+   **sums of per-task durations (slot-seconds)**, never wall-clock, so neither
+   is comparable with `BusyStats.busy_seconds` / `busy_pct` (a merged union)
+   and no arithmetic mixes them. A phase with no engine samples (or no proxy
+   samples) renders an explicit `Unavailable — <phase>: <reason>` note reusing
+   the parser's named diagnostics, with `null` deltas in JSON — never a
+   fabricated `0` or `100 %`. A phase whose absolute percentage delta exceeds
+   `local_engine_cross_check_threshold_pct` (default 25 %, `0` disables) raises
+   a warning recommendation (`medium`, `high` at twice the threshold). The
+   JSON summary carries the whole comparison under the additive top-level
+   `engine_cross_check` key.
 5. **Fast/cheap bucketing** — a session is bucketed by the **profile active
    at its first in-window stream**, from three sources in precedence order
    (LP-0MVKSXXIR006OBI2):
@@ -812,7 +854,13 @@ entry is a local runtime edit, not a committed artifact.
    `eval_lines_total`, `eval_lines_matched`, `file_diagnostics`, and
    `empty_window_reasons` when the window is empty). The per-session CSV
    `decode_tok_s` column is derived from proxy.log instead (local completion
-   tokens ÷ local active span) and stays empty when not derivable.
+   tokens ÷ local active span) and stays empty when not derivable. The same
+   attribution loop also sums the per-kind **engine seconds**
+   (`SpeedStats.engine_seconds`, from `prompt_eval_seconds` /
+   `decode_seconds`) for the `## Engine cross-check` section
+   (LP-0MVNWULLI006ZYXX) — the engine's own per-task duration totals, summed
+   (never wall-clock) and therefore comparable with the proxy's phase
+   slot-seconds but not with `busy_seconds`.
 
 ### Local token reporting and the cold-cache cap
 
@@ -1029,7 +1077,21 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   together, LP-0MVJNDOUU0059MMO) — read it for where slot time goes (prefill
   rarely dominates at 46% local occupancy, but it does on large cold
   prompts), not for window occupancy: phase slot-seconds sum per-stream
-  durations and are not comparable with the wall-clock busy %. A low busy % with high fallback volume
+  durations and are not comparable with the wall-clock busy %. **Engine
+  cross-check** then validates that phase split against llama-server's own
+  per-task eval durations (LP-0MVNWULLI006ZYXX). Read a divergence as a
+  *direction*, not a defect: **proxy above engine** means the proxy accounted
+  for phase time the engine never (fully) performed (queueing, retries,
+  cancelled work), while **engine above proxy** means unattributed local
+  traffic (unlogged or partially-logged streams, or eval lines whose proxy
+  events fell outside the window). Two caveats always apply: (a) both figures
+  are sums of durations (slot-seconds), never wall-clock, so neither is
+  comparable with `busy_seconds`/`busy_pct`; and (b) llama-server lines carry
+  no timestamps, so a window much shorter than the live `llama-server.log`
+  compares an in-window proxy figure against the file's whole span and shows
+  engine ≫ proxy as a windowing artefact. Absolute percentage deltas above
+  `local_engine_cross_check_threshold_pct` (default 25 %, `0` disables) raise a
+  warning recommendation. A low busy % with high fallback volume
   means the router is diverting requests before they reach local (see
   fallback reasons), not that local is underprovisioned. The **Summary by
   hour** table at the top of the report shows per-hour busy % and per-hour
@@ -1206,6 +1268,19 @@ healthy provider (see [Interpreting the report](#interpreting-the-report)).
   or pre-change logs) reports the matched figure as `inconclusive` with
   `unmatched_dispatches` counted — never as a fabricated match.
 
+- **Engine eval timings are summed, never placed in time
+  (LP-0MVNWULLI006ZYXX).** llama-server writes no per-line timestamps
+  (`grep -cE "[0-9]{2}:[0-9]{2}:[0-9]{2}" llama-server.log` → 0), so the
+  `## Engine cross-check` figures are **sums of per-task durations** and cannot
+  be turned into a time series, an hour, or a wall-clock union. Two
+  consequences follow: the totals are comparable with the proxy's phase
+  **slot-seconds** but never with `busy_seconds`/`busy_pct`; and window
+  attribution is per file — a whole log file counts if its last write falls in
+  the window, so a window shorter than the live `llama-server.log` yields an
+  engine total that covers more than the window (engine ≫ proxy, a windowing
+  artefact rather than unattributed traffic). Deriving wall-clock GPU busy time
+  from these logs is impossible by construction and is out of scope (the
+  power-based `gpu_busy` telemetry covers hardware utilisation).
 - **Hold-cycle re-emissions are excluded from local-skip demand counters
   (LP-0MUIEO6IP0030CT3).** A held request re-emitted across chain-hold
   cycles (`chain_hold_cycle>0`) counts once (its cycle-0 occurrence) in the

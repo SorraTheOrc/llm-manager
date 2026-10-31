@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -39,7 +40,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import aggregation
 import bucketing
 import config_loader
+import engine_cross_check
 import gpu_busy
+import llama_log_parser
 import log_parser
 import recommendations
 import reporting
@@ -8564,3 +8567,376 @@ class TestTokensMissingMarker:
         row = next(r for r in rows if r["session_id"] == "sess-mix")
         assert row["streams_with_usage"] == "1"
         assert row["streams_without_usage"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# Engine cross-check: proxy slot-time vs llama-server eval timings
+# (LP-0MVNWULLI006ZYXX)
+# ---------------------------------------------------------------------------
+# The report's proxy-inferred per-phase slot-seconds are compared against
+# llama-server's own summed per-task eval durations. Engine figures are sums of
+# durations (slot-seconds), never wall-clock, and never comparable with the
+# merged wall-clock `busy_seconds` union. Missing engine (or proxy) samples
+# render an explicit "unavailable" reason with `-` deltas — never 0/100%.
+
+
+class TestEngineCrossCheck:
+    PROXY_START = (
+        "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+        "model=Qwen3 session=s1 request=[]"
+    )
+    PROXY_FINISH = (
+        "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+        "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]"
+    )
+
+    @staticmethod
+    def _proxy_lines(prefill_s: float = 30.0) -> list[str]:
+        """One local stream: ``prefill_s`` prefill, then a 10 s decode."""
+        return [
+            TestEngineCrossCheck.PROXY_START,
+            TestEngineCrossCheck.PROXY_FINISH,
+            f"2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms={prefill_s * 1000} "
+            f"dispatch_to_first_byte_ms={prefill_s * 1000 - 1.0} cache_state=warm "
+            "cached_ratio=0.900 queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+
+    @staticmethod
+    def _engine_lines(prompt_eval_ms: float, decode_ms: float) -> list[str]:
+        """Real-format Qwen3 eval-timing lines (from /var/log/llama-proxy)."""
+        return [
+            fixtures.QWEN3_SPAWN_LINE,
+            f"[32999] prompt eval time = {prompt_eval_ms:9.2f} ms / 11449 tokens "
+            f"(    2.58 ms per token,   388.05 tokens per second)",
+            f"[32999]        eval time = {decode_ms:9.2f} ms /   153 tokens "
+            f"(   24.68 ms per token,    40.51 tokens per second)",
+        ]
+
+    def _summary(
+        self,
+        tmp_path: Path,
+        proxy_lines: list[str] | None = None,
+        llama_lines: list[str] | None = None,
+    ) -> aggregation.AnalysisResult:
+        summary = aggregation.aggregate(
+            _events(proxy_lines if proxy_lines is not None else self._proxy_lines()),
+            WINDOW_START,
+            WINDOW_END,
+            _schedule(),
+        )
+        llama_dir = tmp_path / "llama"
+        llama_dir.mkdir()
+        if llama_lines:
+            log = llama_dir / "llama-server.log"
+            log.write_text("\n".join(llama_lines) + "\n")
+            mtime = datetime(2026, 8, 2, 14, 30, 0).timestamp()
+            os.utime(log, (mtime, mtime))
+        files = llama_log_parser.discover_llama_logs(llama_dir, WINDOW_START)
+        summary.speed = llama_log_parser.build_speed_stats(
+            files, WINDOW_START, WINDOW_END, _schedule(), log_dir=llama_dir
+        )
+        return summary
+
+    @staticmethod
+    def _section(md: str) -> str:
+        return md.split("## Engine cross-check", 1)[1].split("\n## ", 1)[0]
+
+    # -- delta arithmetic --------------------------------------------------
+
+    def test_delta_arithmetic_both_directions(self, tmp_path):
+        """AC1: absolute delta and percentage delta per phase, both directions.
+
+        Proxy prefill 30 s vs engine 24 s -> +6 s / +25.0 % (proxy above);
+        proxy decode 10 s vs engine 12 s -> -2 s / -16.7 % (engine above).
+        """
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        check = engine_cross_check.compute(summary)
+        prefill = check["prefill"]
+        decode = check["decode"]
+        assert prefill["proxy_slot_seconds"] == pytest.approx(30.0)
+        assert prefill["engine_seconds"] == pytest.approx(24.0)
+        assert prefill["delta_seconds"] == pytest.approx(6.0)
+        assert prefill["delta_pct"] == pytest.approx(25.0)
+        assert decode["proxy_slot_seconds"] == pytest.approx(10.0)
+        assert decode["engine_seconds"] == pytest.approx(12.0)
+        assert decode["delta_seconds"] == pytest.approx(-2.0)
+        assert decode["delta_pct"] == pytest.approx(-16.7)
+        assert check["available_phases"] == ["prefill", "decode"]
+        assert check["status"] == "ok"
+        assert check["unit"] == "slot-seconds"
+
+    def test_engine_samples_come_from_the_qwen3_attribution(self, tmp_path):
+        """AC2: the engine sample counts are the matched Qwen3 eval lines only;
+        an mxbai-embed port's lines are excluded."""
+        summary = self._summary(
+            tmp_path,
+            llama_lines=self._engine_lines(24000.0, 12000.0)
+            + [
+                fixtures.SRV_LOAD_IGNORED,
+                "[51973] prompt eval time =   9999.00 ms /  100 tokens "
+                "(   99.99 ms per token,    10.00 tokens per second)",
+            ],
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["prefill"]["engine_samples"] == 1
+        assert check["decode"]["engine_samples"] == 1
+        assert check["prefill"]["engine_seconds"] == pytest.approx(24.0)
+
+    # -- report rendering --------------------------------------------------
+
+    def test_section_renders_comparison_and_metric_caveat(self, tmp_path):
+        """AC1/AC3: the section shows both phases with deltas and states that
+        engine figures are summed per-task durations, not wall-clock, and not
+        comparable with ``busy_seconds``."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        section = self._section(reporting.build_report(summary, None))
+        assert "Prefill (`prompt eval time`)" in section
+        assert "Decode (`eval time`)" in section
+        assert "+6.0" in section and "+25.0%" in section
+        assert "-2.0" in section and "-16.7%" in section
+        flattened = " ".join(section.split())
+        assert "sums of llama-server's per-task eval durations" in flattened
+        assert "slot-seconds" in flattened
+        assert "not wall-clock" in flattened
+        assert "busy_seconds" in flattened
+        # The caveat must not be accompanied by any busy-seconds arithmetic.
+        assert "busy_pct" in flattened
+        # Window boundedness of the engine side (no per-line timestamps).
+        assert "Window boundedness" in flattened
+        assert "windowing artefact" in flattened
+
+    def test_section_documents_direction_interpretation(self, tmp_path):
+        """AC8: the section explains what a divergence means in each direction."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        flattened = " ".join(self._section(reporting.build_report(summary, None)).split())
+        assert "proxy above engine" in flattened
+        assert "engine above proxy" in flattened
+        assert "queueing" in flattened
+        assert "unattributed" in flattened
+
+    # -- honest degradation ------------------------------------------------
+
+    def test_unavailable_when_llama_logs_are_missing(self, tmp_path):
+        """AC4: no llama logs -> unavailable with the parser's named reason and
+        ``-`` deltas, never a fabricated 0 or 100 %."""
+        summary = self._summary(tmp_path)
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "unavailable"
+        assert check["prefill"]["delta_pct"] is None
+        assert check["prefill"]["delta_seconds"] is None
+        assert "no llama-server log files" in check["prefill"]["reason"]
+        assert any("no llama-server log files" in r for r in check["engine_unavailable_reasons"])
+        section = self._section(reporting.build_report(summary, None))
+        assert "_Unavailable — prefill:" in section
+        assert "_Unavailable — decode:" in section
+        assert "100.0%" not in section
+
+    def test_unavailable_when_no_eval_lines_in_window(self, tmp_path):
+        """AC4: files parsed but no eval-timing lines (verbosity/build)."""
+        summary = self._summary(
+            tmp_path, llama_lines=fixtures.LLAMA_LOG_NO_EVAL_LINES.splitlines()
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "unavailable"
+        assert "verbosity/build" in check["prefill"]["reason"]
+        assert check["prefill"]["delta_pct"] is None
+
+    def test_unavailable_for_non_qwen3_ports(self, tmp_path):
+        """AC4: eval lines exist but only on a non-Qwen3 port (attribution
+        failure) -> unavailable with the named attribution reason."""
+        summary = self._summary(
+            tmp_path,
+            llama_lines=fixtures.LLAMA_LOG_UNDISCOVERABLE_QWEN3_PORT.splitlines(),
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "unavailable"
+        assert "attribution" in check["prefill"]["reason"]
+        assert "51973" in check["prefill"]["reason"]
+        assert check["decode"]["delta_pct"] is None
+        section = self._section(reporting.build_report(summary, None))
+        assert "attribution" in section.lower()
+        assert "100.0%" not in section
+
+    def test_phase_without_lines_but_other_phase_available(self, tmp_path):
+        """A window with decode eval lines but no prompt-eval lines reports the
+        prefill phase unavailable (and the decode phase measured) rather than
+        borrowing the generic empty-window reason."""
+        summary = self._summary(
+            tmp_path,
+            llama_lines=[
+                fixtures.QWEN3_SPAWN_LINE,
+                f"[32999]        eval time =  12000.00 ms /   153 tokens "
+                "(   24.68 ms per token,    40.51 tokens per second)",
+            ],
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "partial"
+        assert check["decode"]["available"] is True
+        assert check["prefill"]["available"] is False
+        assert "`prompt eval time`" in check["prefill"]["reason"]
+
+    def test_unavailable_when_proxy_has_no_phase_samples(self, tmp_path):
+        """AC4: engine data present but no proxy-side phase samples -> the phase
+        is unavailable with a proxy-side reason, never a 100 % delta."""
+        summary = self._summary(
+            tmp_path, proxy_lines=[], llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "unavailable"
+        assert "no measurable prefill phase" in check["prefill"]["reason"]
+        assert check["prefill"]["delta_pct"] is None
+
+    # -- threshold warning -------------------------------------------------
+
+    def test_threshold_recommendation_fires_above_threshold(self, tmp_path):
+        """AC6: a 25 % prefill divergence exceeds a 10 % threshold."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        config = {"local_engine_cross_check_threshold_pct": 10.0}
+        recs = recommendations.generate_recommendations(summary, config)
+        engine_recs = [r for r in recs if "Engine cross-check" in r.title]
+        assert len(engine_recs) == 1
+        assert engine_recs[0].severity == "high"  # 25 % >= 2 x 10 %
+        assert "prefill" in engine_recs[0].evidence
+        assert "+25.0%" in engine_recs[0].evidence
+
+    def test_threshold_recommendation_silent_below_threshold(self, tmp_path):
+        """AC6: a 50 % threshold is not crossed by a 25 % / 16.7 % divergence."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        config = {"local_engine_cross_check_threshold_pct": 50.0}
+        recs = recommendations.generate_recommendations(summary, config)
+        assert not [r for r in recs if "Engine cross-check" in r.title]
+
+    def test_threshold_boundary_is_strict(self, tmp_path):
+        """AC6: the threshold is a strict bound — a delta exactly equal to it
+        does not warn (only ``|delta| > threshold`` does)."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        # prefill delta is exactly 25.0 %; decode is 16.7 %.
+        at_boundary = recommendations.generate_recommendations(
+            summary, {"local_engine_cross_check_threshold_pct": 25.0}
+        )
+        assert not [r for r in at_boundary if "Engine cross-check" in r.title]
+        just_below = recommendations.generate_recommendations(
+            summary, {"local_engine_cross_check_threshold_pct": 24.9}
+        )
+        assert [r for r in just_below if "Engine cross-check" in r.title]
+
+    def test_threshold_zero_disables_the_warning(self, tmp_path):
+        """AC6: ``0`` disables the divergence warning (documented contract)."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        recs = recommendations.generate_recommendations(
+            summary, {"local_engine_cross_check_threshold_pct": 0}
+        )
+        assert not [r for r in recs if "Engine cross-check" in r.title]
+
+    def test_default_threshold_is_twenty_five_percent(self, tmp_path):
+        """AC6: without configuration the shipped default (25 %) applies."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        check = engine_cross_check.compute(summary, None)
+        assert check["threshold_pct"] == pytest.approx(25.0)
+        assert check["threshold_enabled"] is True
+
+    def test_configured_threshold_reaches_the_report_and_json(self, tmp_path):
+        """The configured threshold is rendered and mirrored in ``--json``."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        config = {"local_engine_cross_check_threshold_pct": 12.5}
+        md = reporting.build_report(summary, config)
+        section = self._section(md)
+        assert "12.5%" in section
+        data = reporting.summary_to_json(summary, None, config)
+        assert data["engine_cross_check"]["threshold_pct"] == pytest.approx(12.5)
+
+    def test_fractional_threshold_survives_config_loading(self):
+        """The config loader coerces the percentage scalar as a float, so
+        ``12.5`` is not silently truncated to ``12``."""
+        text = "server:\n  local_engine_cross_check_threshold_pct: 12.5\n"
+        assert config_loader.parse_config_text(text)["local_engine_cross_check_threshold_pct"] == pytest.approx(12.5)
+        assert config_loader._parse_config_text_regex(text)["local_engine_cross_check_threshold_pct"] == pytest.approx(12.5)
+
+    # -- JSON contract -----------------------------------------------------
+
+    def test_json_exposes_engine_cross_check_and_keeps_existing_keys(self, tmp_path):
+        """AC5: the comparison is an additive ``engine_cross_check`` key; every
+        pre-existing key keeps its value."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        data = reporting.summary_to_json(summary)
+        assert "engine_cross_check" in data
+        assert data["engine_cross_check"]["prefill"]["proxy_slot_seconds"] == pytest.approx(30.0)
+        assert data["engine_cross_check"]["prefill"]["engine_seconds"] == pytest.approx(24.0)
+        assert data["engine_cross_check"]["decode"]["delta_pct"] == pytest.approx(-16.7)
+        legacy_keys = {
+            "window_start",
+            "window_end",
+            "sessions",
+            "total_requests",
+            "local_requests",
+            "remote_requests",
+            "fallback_events",
+            "local_busy",
+            "local_prefill",
+            "decode_speed",
+            "prompt_eval_speed",
+            "ttft",
+            "recommendations",
+            "errors",
+            "compaction",
+            "local_turn_coverage",
+        }
+        assert legacy_keys <= set(data)
+        assert data["local_busy"]["prefill_vs_decode"]["prefill"]["slot_seconds"] == pytest.approx(30.0)
+
+    def test_engine_cross_check_json_is_sorted_key_stable(self, tmp_path):
+        """The key set is deterministic for an empty window (unavailable)."""
+        summary = self._summary(tmp_path)
+        check = reporting.summary_to_json(summary)["engine_cross_check"]
+        assert set(check) == {
+            "unit",
+            "engine_metric",
+            "metric_caveat",
+            "interpretation",
+            "window_approximation",
+            "threshold_pct",
+            "threshold_enabled",
+            "status",
+            "prefill",
+            "decode",
+            "available_phases",
+            "divergent_phases",
+            "engine_unavailable_reasons",
+        }
+
+    def test_json_recommendations_count_matches_the_report(self, tmp_path):
+        """``--json``'s ``recommendations`` count is computed with the same
+        config as the Markdown report, so the two never disagree about whether
+        the cross-check warning fired."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        config = {"local_engine_cross_check_threshold_pct": 10.0}
+        md = reporting.build_report(summary, config)
+        recommendations_section = md.split("## Recommendations", 1)[1].split(
+            "## Notes and limitations", 1
+        )[0]
+        headings = recommendations_section.count("### [")
+        data = reporting.summary_to_json(summary, None, config)
+        assert headings >= 1
+        assert data["recommendations"] == headings

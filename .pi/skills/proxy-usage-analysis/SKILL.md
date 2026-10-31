@@ -52,7 +52,7 @@ Options:
 | `--start` / `--end` | — | Explicit ISO window (`YYYY-MM-DD HH:MM:SS`); overrides `--hours` |
 | `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
-| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, and `local_busy.prefill_vs_decode`) |
+| `--json` | off | Print a machine-readable JSON summary instead of the text summary (includes `local_busy` — the **decision figure**, with `definition`, `decode_busy_seconds`, `prefill_busy_seconds` and the labelled bounds — `gpu_busy` — hardware-only power data (`computing_fraction`, `busy_pct`, `smoothed_power`), **not** local model utilisation — `local_prefill`, `local_busy.prefill_vs_decode`, and `engine_cross_check` — proxy slot-time vs llama-server eval timings) |
 | `--quiet` | off | Suppress the stdout summary (including the corrected `busy (dispatch → finish)` line); use `--json` for the same figures) |
 
 ## Daily cadence (05:00 cron)
@@ -113,6 +113,53 @@ local model utilisation figure. **Decisions use the log-derived `local_busy`**
 only for hardware questions (was the GPU computing at all, thermals, power
 draw). The decision rule, the preference rule and the causes of the gap:
 [REFERENCE.md § Which busy figure is authoritative for decisions](REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
+
+## Engine cross-check (slot-time vs llama-server eval timings)
+
+The **Engine cross-check** section (LP-0MVNWULLI006ZYXX) independently
+validates the report's most consequential local figures: the proxy-inferred
+prefill/decode slot-seconds from **Prefill vs decode** are compared against
+llama-server's own per-task eval timings — summed `prompt eval time` seconds
+vs proxy prefill slot-seconds, and summed `eval time` seconds vs proxy decode
+slot-seconds — each with the absolute delta and the delta as a percentage of
+the engine figure. Engine seconds come from the same Qwen3-port attributed,
+in-window eval lines that feed **Decode speed** / **Prompt eval speed**, so the
+port-attribution rules (spawn-line port, `mxbai-embed` excluded, ambiguous
+multi-port files skipped) are reused, never reimplemented.
+
+**Metric types (read this before comparing anything).** Both figures are
+**slot-seconds** — sums of durations, i.e. total phase work, not wall-clock.
+They are therefore *not* comparable with the wall-clock `busy_seconds` /
+`busy_pct` union in **Local model utilization**, and no arithmetic in the
+report mixes the two. Engine lines carry no timestamps, so the engine total
+can only be summed; the section also states that a window much shorter than
+the live `llama-server.log` compares an in-window proxy figure against the
+file's whole span (engine ≫ proxy is then a windowing artefact).
+
+**Interpreting a divergence.** A non-zero delta is expected — the proxy counts
+per-stream phases plus its own queueing, retries and cancellations, the engine
+counts per-task eval calls. Direction is the signal:
+
+- **proxy above engine** — queueing, retries or cancelled work: phase time the
+  proxy accounted for that the engine never (fully) performed;
+- **engine above proxy** — unattributed local traffic (unlogged or
+  partially-logged streams, or eval lines whose proxy events fell outside the
+  window).
+
+**Threshold.** A phase whose **absolute** percentage delta exceeds
+`local_engine_cross_check_threshold_pct` (in `proxy/config.yaml`, default
+**25.0 %**, `0` disables) raises a warning recommendation — `medium`, escalated
+to `high` at twice the threshold. The default exists because the structural
+per-stream vs per-task skew is normal; only a large divergence signals an
+accounting problem. Fractional values are supported (the loader coerces the
+scalar as a float).
+
+**Honest degradation.** When the llama logs are absent, unreadable, or carry no
+Qwen3-attributed eval lines for the window, the section renders an explicit
+`Unavailable — <phase>: <reason>` note (reusing the parser's named
+`verbosity/build` / `rotation` / `attribution failure` diagnostics) with `-`
+deltas — never a misleading `0` or `100 %`. `--json` exposes the same
+comparison additively under `engine_cross_check`.
 
 ## Post-acceptance evictions (alert threshold + triage rule)
 

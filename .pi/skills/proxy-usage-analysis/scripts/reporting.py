@@ -27,6 +27,7 @@ from pathlib import Path
 import aggregation
 import bucketing
 import config_loader
+import engine_cross_check
 import gpu_busy
 import llama_log_parser
 import log_parser
@@ -1025,6 +1026,7 @@ def build_report(
 
     _append_busy_section(ap, summary, schedule)
     _append_prefill_vs_decode_section(ap, summary)
+    _append_engine_cross_check_section(ap, summary, config)
     _append_contention_prediction_section(ap, summary, speed)
 
     _append_mode_timeline_section(ap, summary, mode_map)
@@ -2544,6 +2546,108 @@ def _append_prefill_vs_decode_section(ap, summary: AnalysisResult) -> None:
         )
 
 
+def _delta_cell(value: float | None, *, as_percent: bool = False) -> str:
+    """Format a cross-check delta (one decimal, always signed).
+
+    ``None`` renders as ``-`` so an unavailable phase never shows a fabricated
+    ``0`` or ``100%`` (LP-0MVNWULLI006ZYXX AC4).
+    """
+    if value is None:
+        return "-"
+    return f"{value:+,.1f}%" if as_percent else f"{value:+,.1f}"
+
+
+def _append_engine_cross_check_section(
+    ap, summary: AnalysisResult, config: dict | None
+) -> None:
+    """Append the ``## Engine cross-check`` section to the report.
+
+    Independently validates the report's most consequential local figures: the
+    proxy-inferred per-phase slot-seconds from ``## Prefill vs decode`` are
+    compared against llama-server's own summed per-task eval durations
+    (``prompt eval time`` for prefill, ``eval time`` for decode), with the
+    absolute delta and the percentage delta of the engine figure. The engine
+    totals come from the same Qwen3-attributed, in-window eval lines that feed
+    the speed sections, so the port-attribution rules are reused unchanged.
+
+    The section states explicitly that engine figures are **sums of per-task
+    durations (slot-seconds), not wall-clock**, and therefore not comparable
+    with ``busy_seconds`` / ``busy_pct`` (a merged union) — no arithmetic here
+    mixes the two. A phase whose engine or proxy samples are missing renders an
+    explicit "unavailable" note with the reason (reusing the parser's named
+    empty-window diagnostics) and ``-`` deltas, never a misleading ``0`` or
+    ``100%`` (AC 3 / AC 4).
+    """
+    check = engine_cross_check.compute(summary, config)
+    ap("")
+    ap("## Engine cross-check")
+    ap("")
+    ap(
+        "Independent validation of the local phase slot-time above: the "
+        "proxy-inferred prefill/decode slot-seconds compared against "
+        "llama-server's own per-task eval timings, from the same Qwen3-port "
+        "attributed eval lines that feed `## Decode speed` / `## Prompt eval "
+        "speed`."
+    )
+    ap("")
+    ap(engine_cross_check.METRIC_CAVEAT)
+    ap("")
+    ap(engine_cross_check.WINDOW_APPROXIMATION)
+    ap("")
+    ap(
+        "| Phase | Proxy-inferred slot-seconds | Engine seconds (summed per task) "
+        "| Delta (s) | Delta (%) | Samples proxy/engine |"
+    )
+    ap("|---|---|---|---|---|---|")
+    for phase, label in (
+        (engine_cross_check.PHASE_PREFILL, "Prefill (`prompt eval time`)"),
+        (engine_cross_check.PHASE_DECODE, "Decode (`eval time`)"),
+    ):
+        entry = check[phase]
+        # A phase with no samples on either side renders ``-``, never a 0.
+        proxy_cell = f"{entry['proxy_slot_seconds']:,.1f}" if entry["proxy_samples"] else "-"
+        engine_cell = f"{entry['engine_seconds']:,.1f}" if entry["engine_samples"] else "-"
+        samples_cell = f"{entry['proxy_samples']}/{entry['engine_samples']}"
+        ap(
+            f"| {label} | {proxy_cell} | {engine_cell} | "
+            f"{_delta_cell(entry['delta_seconds'])} | "
+            f"{_delta_cell(entry['delta_pct'], as_percent=True)} | {samples_cell} |"
+        )
+    ap("")
+    if check["threshold_enabled"]:
+        ap(
+            f"Delta is proxy − engine; the percentage is of the engine figure (the "
+            f"independent reference). Divergence threshold: **{check['threshold_pct']:.1f}%** "
+            "absolute per phase (`local_engine_cross_check_threshold_pct` in "
+            "`proxy/config.yaml`); a phase above it raises a warning recommendation."
+        )
+    else:
+        ap(
+            "Delta is proxy − engine; the percentage is of the engine figure (the "
+            "independent reference). Divergence warnings are disabled "
+            "(`local_engine_cross_check_threshold_pct: 0`)."
+        )
+    ap("")
+    ap(engine_cross_check.INTERPRETATION)
+    unavailable = [
+        (phase, check[phase])
+        for phase in engine_cross_check.PHASES
+        if not check[phase]["available"]
+    ]
+    if unavailable:
+        ap("")
+        for phase, entry in unavailable:
+            ap(f"_Unavailable — {phase}: {entry['reason']}._")
+    if check["divergent_phases"]:
+        ap("")
+        ap(
+            "_Divergent phase(s): "
+            + ", ".join(check["divergent_phases"])
+            + f" — above the {check['threshold_pct']:.1f}% threshold."
+            " See the recommendation in `## Recommendations`._"
+        )
+
+
 def _append_contention_prediction_section(
     ap, summary: AnalysisResult, speed: llama_log_parser.SpeedStats | None
 ) -> None:
@@ -3346,8 +3450,17 @@ def provider_context_skips_json(
     }
 
 
-def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None = None) -> dict:
-    """Machine-readable summary of the analysis (one dict; JSON-serialisable)."""
+def summary_to_json(
+    summary: AnalysisResult,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+    config: dict | None = None,
+) -> dict:
+    """Machine-readable summary of the analysis (one dict; JSON-serialisable).
+
+    ``config`` is optional and only used for the config-driven thresholds
+    (currently the engine cross-check divergence threshold); passing it keeps
+    ``--json``'s figures identical to the Markdown report's.
+    """
     sessions = list(summary.sessions.values())
     local_only = sum(1 for s in sessions if s.remote_requests == 0)
     fell_back = sum(1 for s in sessions if s.fell_back)
@@ -3513,8 +3626,15 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "errors_by_provider_model": error_provider_model_json(summary),
         "errors_by_root_cause": root_cause_json(summary),
         "compaction": compaction_json(summary),
-        "recommendations": len(recommendations.generate_recommendations(summary, None, mode_map)),
+        "recommendations": len(
+            recommendations.generate_recommendations(summary, config, mode_map)
+        ),
         "local_busy": _busy_json(summary.busy),
+        # Engine cross-check (LP-0MVNWULLI006ZYXX): proxy-inferred phase
+        # slot-seconds vs llama-server's summed per-task eval durations, with
+        # per-phase availability/reason and the divergent phases. ADDITIVE —
+        # every key above keeps its value and meaning.
+        "engine_cross_check": engine_cross_check.compute(summary, config),
         "gpu_busy": _gpu_busy_json(summary.gpu_busy) if summary.gpu_busy else None,
         "local_prefill": _prefill_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,

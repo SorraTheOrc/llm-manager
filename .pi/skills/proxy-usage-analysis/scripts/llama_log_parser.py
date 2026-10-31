@@ -435,12 +435,35 @@ class SpeedStats:
     # the wall-clock duration distribution is retained separately to compare
     # against the proxy's ``prefill_eta_seconds`` prediction.
     prompt_eval_seconds: list[float] = field(default_factory=list)
+    # Raw observed decode durations in seconds (``eval time`` ms / 1000 for
+    # every Qwen3 decode sample in the window — LP-0MVNWULLI006ZYXX). Retained
+    # so :attr:`engine_seconds` can report the engine's own per-task duration
+    # total for the decode phase, the counterpart of ``prompt_eval_seconds``
+    # for prefill.
+    decode_seconds: list[float] = field(default_factory=list)
     log_dir: str | None = None
     files_discovered: list[str] = field(default_factory=list)
     file_diagnostics: list[FileDiagnostic] = field(default_factory=list)
     outside_window_files: list[str] = field(default_factory=list)
     ignored_logs: list[str] = field(default_factory=list)
     qwen3_ports: list[int] = field(default_factory=list)
+
+    @property
+    def engine_seconds(self) -> dict[str, float]:
+        """Summed per-task engine durations in seconds, keyed by eval kind.
+
+        These are the engine's own accounting of the work performed: the sum of
+        every Qwen3-attributed, in-window ``prompt eval time`` / ``eval time``
+        duration. The lines carry no timestamps, so the total is a **sum of
+        per-task durations (slot-seconds), never a wall-clock union** — it is
+        comparable with the proxy's phase slot-seconds (``## Prefill vs
+        decode``) but *not* with ``BusyStats.busy_seconds``
+        (LP-0MVNWULLI006ZYXX).
+        """
+        return {
+            KIND_PROMPT_EVAL: sum(self.prompt_eval_seconds),
+            KIND_DECODE: sum(self.decode_seconds),
+        }
 
 
 def _percentile(sorted_values: list[float], p: float) -> float | None:
@@ -505,8 +528,10 @@ def build_speed_stats(
         KIND_DECODE: {key: [] for key in _BUCKET_KEYS},
         KIND_PROMPT_EVAL: {key: [] for key in _BUCKET_KEYS},
     }
-    # Raw observed prefill durations (s) for M3 (LP-0MVGR2OXT0096OGK).
+    # Raw observed prefill durations (s) for M3 (LP-0MVGR2OXT0096OGK) and the
+    # decode counterpart for the engine cross-check (LP-0MVNWULLI006ZYXX).
     prompt_eval_seconds: list[float] = []
+    decode_seconds: list[float] = []
     files_parsed = 0
     files_skipped = 0
     diagnostics: list[FileDiagnostic] = []
@@ -661,6 +686,11 @@ def build_speed_stats(
                 # M3 observed durations (ms → s) for the predicted-vs-observed
                 # prefill ETA comparison.
                 prompt_eval_seconds.append(ev.ms / 1000.0)
+            else:
+                # Decode counterpart: the engine's own per-task durations, summed
+                # by ``SpeedStats.engine_seconds`` for the cross-check
+                # (LP-0MVNWULLI006ZYXX).
+                decode_seconds.append(ev.ms / 1000.0)
         diagnostics.append(
             FileDiagnostic(
                 name=name,
@@ -685,6 +715,7 @@ def build_speed_stats(
         files_parsed=files_parsed,
         files_skipped=files_skipped,
         prompt_eval_seconds=prompt_eval_seconds,
+        decode_seconds=decode_seconds,
         log_dir=str(log_dir_p) if log_dir_p is not None else None,
         files_discovered=[p.name for p in candidates],
         file_diagnostics=diagnostics,

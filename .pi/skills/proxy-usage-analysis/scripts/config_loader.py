@@ -25,6 +25,11 @@ SCALAR_KEYS = (
     "local_model_ctx_size",
 )
 
+# Scalar keys that are naturally fractional (percentage thresholds). They are
+# coerced with ``float`` rather than ``int`` so a value such as ``12.5`` is not
+# silently truncated to ``12`` (LP-0MVNWULLI006ZYXX).
+FLOAT_SCALAR_KEYS = ("local_engine_cross_check_threshold_pct",)
+
 
 def _find_nested(cfg: dict, key: str):
     """Return the first value of ``key`` found at any depth (or ``None``)."""
@@ -47,6 +52,14 @@ def _normalize(cfg: dict | None) -> dict | None:
         value = _find_nested(cfg, key)
         if value is not None:
             result[key] = int(value)
+    for key in FLOAT_SCALAR_KEYS:
+        value = _find_nested(cfg, key)
+        if value is not None:
+            try:
+                result[key] = float(value)
+            except (TypeError, ValueError):
+                # Malformed value: leave it out so the consumer's default wins.
+                continue
     priority_window = normalize_priority_window(_find_nested(cfg, "priority_window"))
     if priority_window is not None:
         result["priority_window"] = priority_window
@@ -203,6 +216,10 @@ def _parse_config_text_regex(text: str) -> dict:
         m = re.search(rf"^\s*{re.escape(key)}:\s*(\d+)\s*$", body, re.M)
         if m:
             cfg[key] = int(m.group(1))
+    for key in FLOAT_SCALAR_KEYS:
+        m = re.search(rf"^\s*{re.escape(key)}:\s*(\d+(?:\.\d+)?)\s*$", body, re.M)
+        if m:
+            cfg[key] = float(m.group(1))
 
     matches = [i for i, line in enumerate(lines) if re.match(r"^\s*slot_schedule:\s*$", line)]
     if matches:

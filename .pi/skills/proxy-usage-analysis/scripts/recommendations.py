@@ -33,6 +33,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 import bucketing
+import engine_cross_check
 from aggregation import (
     FALLBACK_ATTRIBUTION_LEASE_DENIED,
     FALLBACK_ATTRIBUTION_UNATTRIBUTED,
@@ -240,6 +241,7 @@ def generate_recommendations(
     attribution_note = _attribution_coverage(result)
 
     recs.extend(_error_recommendations(result))
+    recs.extend(_engine_cross_check_recommendations(result, config))
 
     # --- 1. Slot pool contention ------------------------------------------
     contention = sum(reason_counts[r] for r in SLOT_CONTENTION_REASONS)
@@ -837,6 +839,65 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
         )
 
     return recs
+
+
+def _engine_cross_check_recommendations(
+    result: AnalysisResult, config: dict | None
+) -> list[Recommendation]:
+    """Warn when proxy slot-time and engine eval timings diverge (AC 6).
+
+    The cross-check compares the report's proxy-inferred phase slot-seconds
+    with llama-server's own summed per-task eval durations
+    (``engine_cross_check``, LP-0MVNWULLI006ZYXX). A structural skew is
+    expected, so the warning only fires when a phase's **absolute** percentage
+    delta exceeds ``local_engine_cross_check_threshold_pct`` (default 25 %,
+    ``0`` disables). A phase diverging by at least twice the threshold is
+    escalated to ``high``: at that size the gap is no longer the expected
+    per-stream vs per-task difference and points at an accounting problem.
+    """
+    check = engine_cross_check.compute(result, config)
+    divergent = check.get("divergent_phases") or []
+    if not divergent:
+        return []
+
+    threshold = check["threshold_pct"]
+    rows = []
+    escalated = False
+    for phase in divergent:
+        entry = check[phase]
+        delta_pct = entry["delta_pct"]
+        escalated = escalated or abs(delta_pct) >= threshold * engine_cross_check.HIGH_SEVERITY_MULTIPLIER
+        rows.append(
+            f"{phase}: proxy {entry['proxy_slot_seconds']:.1f}s vs engine "
+            f"{entry['engine_seconds']:.1f}s ({delta_pct:+.1f}%)"
+        )
+
+    return [
+        Recommendation(
+            severity="high" if escalated else "medium",
+            title=(
+                "Engine cross-check divergence: proxy slot-time and "
+                "llama-server eval timings disagree"
+            ),
+            detail=(
+                "The report's proxy-inferred phase slot-seconds and llama-server's "
+                "own summed per-task eval durations diverge beyond the configured "
+                "threshold. Both figures are slot-seconds (sums of durations), not "
+                "wall-clock, and neither is comparable with `busy_seconds`. "
+                f"{engine_cross_check.INTERPRETATION} "
+                "If the divergence persists across windows, check for queueing/"
+                "retries/cancelled work on the proxy side or unattributed local "
+                "traffic on the engine side; tune "
+                "`local_engine_cross_check_threshold_pct` in proxy/config.yaml "
+                "only once the expected structural skew is understood."
+            ),
+            evidence=(
+                f"{', '.join(rows)} — absolute percentage delta above the "
+                f"{threshold:.1f}% threshold "
+                "(`local_engine_cross_check_threshold_pct`)."
+            ),
+        )
+    ]
 
 
 def _slot_counts_str(fast_slots: int | None, cheap_slots: int | None) -> str:

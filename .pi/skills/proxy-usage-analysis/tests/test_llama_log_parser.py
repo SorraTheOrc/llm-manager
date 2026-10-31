@@ -412,6 +412,142 @@ class TestSpeedStats:
 
 
 # ---------------------------------------------------------------------------
+# Engine second totals (LP-0MVNWULLI006ZYXX)
+# ---------------------------------------------------------------------------
+# ``SpeedStats.engine_seconds`` sums the same Qwen3-attributed, in-window
+# eval-timing durations that feed the speed percentiles, so it inherits the
+# parser's port-attribution rules unchanged: only the Qwen3 child port counts,
+# an mxbai-embed port announced in a spawn line is excluded, an ambiguous
+# multi-port file is not attributed at all, and a file whose single
+# otherwise-unannounced port is unambiguous keeps its samples.
+
+
+class TestEngineSecondTotals:
+    def _log_dir(
+        self, tmp_path: Path, lines: list[str], name: str = "llama-server.log"
+    ) -> Path:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / name).write_text("\n".join(lines) + "\n")
+        _set_mtime(log_dir / name, MOCK_MTIME)
+        return log_dir
+
+    def _stats(
+        self,
+        log_dir: Path,
+        window_start: datetime = WINDOW_START,
+        window_end: datetime = WINDOW_END,
+    ) -> llama_log_parser.SpeedStats:
+        files = llama_log_parser.discover_llama_logs(log_dir, window_start)
+        return llama_log_parser.build_speed_stats(
+            files, window_start, window_end, _schedule(), log_dir=log_dir
+        )
+
+    def test_totals_sum_in_window_qwen3_lines(self, tmp_path):
+        """AC1/AC2: per-kind totals are the sums of the attributed durations
+        (ms -> s), matching the retained raw duration lists."""
+        log_dir = self._log_dir(
+            tmp_path,
+            [
+                fixtures.QWEN3_SPAWN_LINE,
+                fixtures.PROMPT_EVAL_REAL,     # 29504.01 ms
+                fixtures.DECODE_EVAL_REAL,     # 3776.71 ms
+                fixtures.PROMPT_EVAL_REAL2,    # 190.91 ms
+                fixtures.DECODE_EVAL_REAL2,    # 1868.57 ms
+            ],
+        )
+        stats = self._stats(log_dir)
+        totals = stats.engine_seconds
+        assert totals["prompt_eval"] == pytest.approx(29.69492, abs=1e-6)
+        assert totals["decode"] == pytest.approx(5.64528, abs=1e-6)
+        assert len(stats.prompt_eval_seconds) == 2
+        assert len(stats.decode_seconds) == 2
+        # The totals are exactly the sums of the retained raw durations, so the
+        # two views can never drift.
+        assert totals["prompt_eval"] == pytest.approx(sum(stats.prompt_eval_seconds))
+        assert totals["decode"] == pytest.approx(sum(stats.decode_seconds))
+
+    def test_mxbai_embed_port_excluded(self, tmp_path):
+        """AC2: eval lines of a non-Qwen3 child port (mxbai-embed, announced in
+        its own spawn line) never enter the engine totals."""
+        log_dir = self._log_dir(
+            tmp_path,
+            [
+                fixtures.QWEN3_SPAWN_LINE,      # name=Qwen3 on port 32999
+                fixtures.SRV_LOAD_IGNORED,       # name=mxbai-embed on port 51973
+                fixtures.PROMPT_EVAL_REAL,
+                "[51973] prompt eval time =   9999.00 ms /  100 tokens "
+                "(   99.99 ms per token,    10.00 tokens per second)",
+                "[51973]        eval time =   8888.00 ms /  100 tokens "
+                "(   88.88 ms per token,    11.00 tokens per second)",
+            ],
+        )
+        stats = self._stats(log_dir)
+        assert stats.engine_seconds["prompt_eval"] == pytest.approx(29.50401, abs=1e-6)
+        assert stats.engine_seconds["decode"] == pytest.approx(0.0)
+
+    def test_ambiguous_multi_port_file_contributes_nothing(self, tmp_path):
+        """AC2: a file with several unannounced ports is not attributed, so it
+        contributes no engine seconds (and is diagnosed, not silently used)."""
+        log_dir = self._log_dir(
+            tmp_path,
+            [
+                "[50193] prompt eval time =  1000.00 ms /  100 tokens "
+                "(   10.00 ms per token,   100.00 tokens per second)",
+                "[51973]        eval time =  2000.00 ms /  100 tokens "
+                "(   20.00 ms per token,    50.00 tokens per second)",
+            ],
+        )
+        stats = self._stats(log_dir)
+        assert stats.engine_seconds == {"prompt_eval": 0.0, "decode": 0.0}
+        assert stats.files_skipped == 1
+        assert stats.file_diagnostics[0].status == llama_log_parser.STATUS_MISSING_PORT
+
+    def test_inferred_port_file_is_attributed(self, tmp_path):
+        """AC2: no spawn line, but a single otherwise-unannounced port — the
+        rotation-split case — is inferred and its seconds are counted."""
+        log_dir = self._log_dir(
+            tmp_path,
+            [
+                "[50193] prompt eval time =  2000.00 ms /  100 tokens "
+                "(   20.00 ms per token,    50.00 tokens per second)",
+                "[50193]        eval time =  4000.00 ms /  100 tokens "
+                "(   40.00 ms per token,    25.00 tokens per second)",
+            ],
+        )
+        stats = self._stats(log_dir)
+        assert stats.engine_seconds["prompt_eval"] == pytest.approx(2.0)
+        assert stats.engine_seconds["decode"] == pytest.approx(4.0)
+        assert stats.file_diagnostics[0].port_source == "inferred"
+
+    def test_file_outside_window_contributes_nothing(self, tmp_path):
+        """AC4: an in-window *filter* is applied — a rotated file whose last
+        write is outside the window yields no engine seconds."""
+        log_dir = self._log_dir(
+            tmp_path,
+            [fixtures.QWEN3_SPAWN_LINE, fixtures.PROMPT_EVAL_REAL, fixtures.DECODE_EVAL_REAL],
+            name="llama-server.1.log",
+        )
+        _set_mtime(log_dir / "llama-server.1.log", datetime(2026, 8, 2, 17, 0))
+        stats = self._stats(log_dir)
+        assert stats.engine_seconds == {"prompt_eval": 0.0, "decode": 0.0}
+
+    def test_file_without_eval_lines_has_zero_totals(self, tmp_path):
+        log_dir = self._log_dir(tmp_path, [fixtures.LLAMA_LOG_NO_EVAL_LINES])
+        stats = self._stats(log_dir)
+        assert stats.engine_seconds == {"prompt_eval": 0.0, "decode": 0.0}
+        assert stats.files_parsed == 1
+
+    def test_missing_log_dir_has_zero_totals(self, tmp_path):
+        stats = llama_log_parser.build_speed_stats(
+            [], WINDOW_START, WINDOW_END, _schedule()
+        )
+        assert stats.engine_seconds == {"prompt_eval": 0.0, "decode": 0.0}
+        assert stats.prompt_eval_seconds == []
+        assert stats.decode_seconds == []
+
+
+# ---------------------------------------------------------------------------
 # Date-named rotation discovery (LP-0MVJNIZRO008S031)
 # ---------------------------------------------------------------------------
 # The live log is rotated daily into ``llama-server.log-YYYY-MM-DD`` and then

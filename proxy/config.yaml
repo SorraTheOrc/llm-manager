@@ -1334,6 +1334,35 @@ server:
   # at 3 slots.
   local_large_context_warm_cache_threshold: 120000
 
+  # Engine cross-check divergence threshold, in percent
+  # (LP-0MVNWULLI006ZYXX). The proxy-usage-analysis report compares its
+  # proxy-inferred per-phase slot-seconds (prefill / decode, from the proxy
+  # log's stream and first-byte events) against llama-server's own summed
+  # per-task eval durations (`prompt eval time` / `eval time`, attributed to
+  # the Qwen3 child port). When a phase's ABSOLUTE percentage delta exceeds
+  # this value the report raises a warning recommendation (severity medium;
+  # high at >= 2x the threshold).
+  #
+  # Default: 25.0 %. Rationale: a structural skew is expected — the proxy
+  # counts per-stream phases plus its own queueing/retries/cancellations, the
+  # engine counts per-task eval calls — so only a LARGE divergence signals an
+  # accounting problem rather than the normal difference between the two
+  # accounting schemes. Direction is the diagnostic: proxy above engine
+  # suggests queueing/retries/cancelled work; engine above proxy suggests
+  # unattributed local traffic. Both figures are sums of durations
+  # (slot-seconds), never wall-clock, so neither is comparable with
+  # `busy_seconds`.
+  #
+  # Set to 0 to disable the divergence warning. Fractional values are
+  # allowed (e.g. 12.5). Read by the proxy-usage-analysis skill via
+  # config_loader (FLOAT_SCALAR_KEYS); the proxy runtime ignores it.
+  #
+  # Calibration evidence (2026-10-31 24 h window, engine above proxy):
+  # prefill -27.3 %, decode -19.4 %. A 25 % threshold therefore surfaces the
+  # prefill skew without firing on ordinary decode variation; a much higher
+  # threshold would be blind to it.
+  local_engine_cross_check_threshold_pct: 25.0
+
   # Resident-prefix admission gate (LP-0MVN1IQTF0037WTG AC1/AC3). Local
   # admission used to be priced purely from a *prediction* (`cached_ratio`
   # from the session's snapshot sidecar). Under contention that prediction is
