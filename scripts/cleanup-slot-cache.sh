@@ -10,11 +10,12 @@
 #   2. SIZE: if the cache still exceeds --max-size-gb (default 20), delete
 #      the oldest pairs until under the cap, but never delete pairs newer
 #      than --min-age-days (default 1) to protect active sessions.
-#   3. ORPHAN SIDECARS: delete `.ratio.json` files whose snapshot is gone.
-#      The seed path can only ever report them as
+#   3. ORPHAN SIDECARS: delete `.ratio.json` files whose snapshot is gone and
+#      that are older than --min-age-days (default 1), so an in-flight save is
+#      never swept mid-write. The seed path can only ever report them as
 #      `slot_ratio_seed outcome=missing_snapshot`, and 139 of them had
 #      accumulated against 0 snapshots before this rule existed
-#      (LP-0MVK0E80C009HUQC).
+#      (LP-0MVK0E80C009HUQC, LP-0MVUJBFRL005VDNA).
 #
 # Snapshots live in the cache root (legacy layout) and in one level of
 # per-endpoint subdirectories ("{host}-{port}/", LP-0MRPILSMW004T4H8); both
@@ -206,11 +207,22 @@ fi
 #    artefact that no longer exists. The seed path reports it as
 #    `slot_ratio_seed outcome=missing_snapshot` on every subsequent request and
 #    can never credit it, so prune it (LP-0MVK0E80C009HUQC AC3).
+#    A sidecar written moments ago may still belong to a save in flight, or to
+#    a save that failed between writing the sidecar and the snapshot, so the
+#    same --min-age-days protection the size rule applies to snapshots also
+#    covers orphan sidecars (LP-0MVUJBFRL005VDNA).
 orphans_deleted=0
+orphans_kept=0
 for sidecar in "${all_sidecars[@]}"; do
   [[ -f "$sidecar" ]] || continue
   snapshot="${sidecar%"$SIDECAR_SUFFIX"}"
   [[ -f "$snapshot" ]] && continue
+  sidecar_mtime=$(stat -c '%Y' "$sidecar" 2>/dev/null || echo "0")
+  sidecar_age_seconds=$((now_epoch - sidecar_mtime))
+  if [[ $sidecar_age_seconds -lt $min_age_seconds ]]; then
+    orphans_kept=$((orphans_kept + 1))
+    continue
+  fi
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY RUN] Would delete orphan sidecar: $sidecar"
     echo "  reason: its slot snapshot is gone"
@@ -232,10 +244,16 @@ if [[ $DRY_RUN -eq 1 ]]; then
   if [[ $orphans_deleted -gt 0 ]]; then
     echo "DRY-RUN SUMMARY: $orphans_deleted orphan sidecar(s) would be pruned"
   fi
+  if [[ $orphans_kept -gt 0 ]]; then
+    echo "DRY-RUN SUMMARY: $orphans_kept orphan sidecar(s) kept (newer than --min-age-days)"
+  fi
 else
   echo "SUMMARY: $deleted files deleted; cache is now $((remaining_bytes / 1073741824)) GB (was $((total_bytes / 1073741824)) GB)"
   if [[ $orphans_deleted -gt 0 ]]; then
     echo "SUMMARY: $orphans_deleted orphan sidecar(s) pruned"
+  fi
+  if [[ $orphans_kept -gt 0 ]]; then
+    echo "SUMMARY: $orphans_kept orphan sidecar(s) kept (newer than --min-age-days)"
   fi
 fi
 

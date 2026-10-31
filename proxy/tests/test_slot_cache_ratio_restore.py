@@ -1218,22 +1218,107 @@ class TestCleanupScriptRetention:
         assert recent.exists()
         assert Path(str(recent) + ".ratio.json").exists()
 
+    @staticmethod
+    def _make_orphan(cache: Path, relative: str, *, age_days: int) -> Path:
+        """A sidecar with no matching snapshot, mtime ``age_days`` ago."""
+        path = cache / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        stamp = (datetime.now(UTC) - timedelta(days=age_days)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        subprocess.run(["touch", "-d", stamp, str(path)], check=True)
+        return path
+
     def test_orphan_sidecars_are_pruned_with_no_snapshots_present(self, tmp_path):
-        """The observed 139-orphan/0-snapshot state must not be a no-op."""
+        """The observed 139-orphan/0-snapshot state must not be a no-op.
+
+        The orphans are aged beyond ``--min-age-days`` so this still pins the
+        orphan sweep itself rather than the recent-orphan guard.
+        """
         cache = tmp_path / "slot-cache"
-        cache.mkdir(parents=True)
-        root_orphan = cache / "slot_gone.bin.ratio.json"
-        root_orphan.write_text("{}", encoding="utf-8")
-        nested = cache / "localhost-8080"
-        nested.mkdir()
-        nested_orphan = nested / "slot_gone_too.bin.ratio.json"
-        nested_orphan.write_text("{}", encoding="utf-8")
+        root_orphan = self._make_orphan(
+            cache, "slot_gone.bin.ratio.json", age_days=10
+        )
+        nested_orphan = self._make_orphan(
+            cache, "localhost-8080/slot_gone_too.bin.ratio.json", age_days=10
+        )
 
         result = self._run(cache)
 
         assert result.returncode == 0, result.stderr
         assert not root_orphan.exists()
         assert not nested_orphan.exists()
+
+    def test_stale_orphan_sidecar_is_deleted(self, tmp_path):
+        """An orphan older than ``--min-age-days`` is still pruned."""
+        cache = tmp_path / "slot-cache"
+        orphan = self._make_orphan(cache, "slot_stale.bin.ratio.json", age_days=3)
+
+        result = self._run(cache)
+
+        assert result.returncode == 0, result.stderr
+        assert not orphan.exists()
+        assert "Deleted orphan sidecar" in result.stdout
+        assert "orphan sidecar(s) kept" not in result.stdout
+
+    def test_recent_orphan_sidecar_is_kept_and_reported(self, tmp_path):
+        """LP-0MVUJBFRL005VDNA: ``--min-age-days`` protects fresh orphans.
+
+        A sidecar written moments ago may belong to a save in flight, or to a
+        save that failed between writing the sidecar and the snapshot, so it
+        must survive one cleanup cycle instead of being swept while its
+        snapshot is transiently absent.
+        """
+        cache = tmp_path / "slot-cache"
+        orphan = self._make_orphan(
+            cache, "localhost-8080/slot_fresh.bin.ratio.json", age_days=0
+        )
+
+        result = self._run(cache)
+
+        assert result.returncode == 0, result.stderr
+        assert orphan.exists()
+        assert "Deleted orphan sidecar" not in result.stdout
+        assert (
+            "SUMMARY: 1 orphan sidecar(s) kept (newer than --min-age-days)"
+            in result.stdout
+        )
+
+    def test_min_age_days_zero_deletes_recent_orphans(self, tmp_path):
+        """``--min-age-days 0`` disables the guard, as it does for the size rule."""
+        cache = tmp_path / "slot-cache"
+        orphan = self._make_orphan(cache, "slot_fresh.bin.ratio.json", age_days=0)
+
+        result = self._run(cache, "--min-age-days", "0")
+
+        assert result.returncode == 0, result.stderr
+        assert not orphan.exists()
+        assert "Deleted orphan sidecar" in result.stdout
+
+    def test_dry_run_reports_both_orphan_categories_and_deletes_nothing(
+        self, tmp_path
+    ):
+        """A dry run reports the deletable and the kept-recent orphan."""
+        cache = tmp_path / "slot-cache"
+        stale = self._make_orphan(cache, "slot_stale.bin.ratio.json", age_days=3)
+        fresh = self._make_orphan(
+            cache, "localhost-8080/slot_fresh.bin.ratio.json", age_days=0
+        )
+
+        result = self._run(cache, "--dry-run")
+
+        assert result.returncode == 0, result.stderr
+        assert stale.exists()
+        assert fresh.exists()
+        assert "Would delete orphan sidecar" in result.stdout
+        assert (
+            "DRY-RUN SUMMARY: 1 orphan sidecar(s) would be pruned" in result.stdout
+        )
+        assert (
+            "DRY-RUN SUMMARY: 1 orphan sidecar(s) kept (newer than --min-age-days)"
+            in result.stdout
+        )
 
     def test_paired_sidecar_survives_retention(self, tmp_path):
         cache = tmp_path / "slot-cache"
