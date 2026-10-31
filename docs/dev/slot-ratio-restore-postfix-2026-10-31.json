@@ -1,0 +1,1200 @@
+{
+  "meta": {
+    "generated_at": "2026-10-31T04:10:03",
+    "log_dir": "/var/log/llama-proxy",
+    "glob": "proxy.log*",
+    "slot_cache_dir": "/home/rgardler/projects/llm/slot-cache"
+  },
+  "windows": [
+    {
+      "window": {
+        "name": "post-fix",
+        "start": "2026-10-29 12:58:32",
+        "end": "2026-10-30 12:58:32",
+        "hours": 24.0
+      },
+      "lines": 373956,
+      "streams": {
+        "total": 20156,
+        "local": 881,
+        "local_share_pct": 4.37
+      },
+      "routing": {
+        "decisions": 10248,
+        "cached_ratio_zero": 8127,
+        "cached_ratio_zero_pct": 79.3,
+        "mean_cached_ratio": 0.1632,
+        "by_cache_state": {
+          "cold": 8519,
+          "warm": 1729
+        }
+      },
+      "local_skip": {
+        "total": 7678,
+        "routing_skip_local": 7626,
+        "economic_bypass": 52,
+        "large_context_bypass": 1325,
+        "reasons": {
+          "resident_prefix_insufficient": 3632,
+          "context_too_large": 2663,
+          "large_context_bypass": 1325,
+          "prefill_thrash_cooldown": 6
+        }
+      },
+      "local_prefill_ms": {
+        "all": {
+          "count": 881,
+          "p10": 0.53,
+          "p50": 3.52,
+          "p90": 21.75,
+          "max": 112.17,
+          "sum_hours": 2.093
+        },
+        "by_cache_state": {
+          "cold": {
+            "count": 270,
+            "p10": 1.83,
+            "p50": 6.44,
+            "p90": 47.12,
+            "max": 112.17,
+            "sum_hours": 1.222
+          },
+          "warm": {
+            "count": 611,
+            "p10": 0.48,
+            "p50": 2.39,
+            "p90": 11.53,
+            "max": 99.0,
+            "sum_hours": 0.872
+          }
+        },
+        "by_context_bucket": {
+          "edges": [
+            38000,
+            120000
+          ],
+          "by_bucket": {
+            "38,000-120,000": {
+              "cold": {
+                "count": 1,
+                "p10": 47.0,
+                "p50": 47.0,
+                "p90": 47.0,
+                "max": 47.0,
+                "sum_hours": 0.013
+              },
+              "warm": {
+                "count": 2,
+                "p10": 47.37,
+                "p50": 70.32,
+                "p90": 93.27,
+                "max": 99.0,
+                "sum_hours": 0.039
+              }
+            },
+            "<= 38,000": {
+              "cold": {
+                "count": 269,
+                "p10": 1.82,
+                "p50": 6.41,
+                "p90": 47.07,
+                "max": 112.17,
+                "sum_hours": 1.209
+              },
+              "warm": {
+                "count": 609,
+                "p10": 0.48,
+                "p50": 2.39,
+                "p90": 11.21,
+                "max": 67.49,
+                "sum_hours": 0.832
+              }
+            }
+          }
+        }
+      },
+      "slots": {
+        "save_ok": 34,
+        "save_failed": 65,
+        "save_failure_pct": 65.66,
+        "restore_failed": 0,
+        "ratio_restored_events": 0,
+        "cache_state_restored_lines": 0,
+        "save_eviction_ok": 42,
+        "save_eviction_failed": 64,
+        "eviction_save_sessions": 10,
+        "persistence_skipped_reasons": {
+          "slot_busy": 260
+        }
+      },
+      "seed_outcomes": {
+        "total": 617,
+        "by_outcome": {
+          "found": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "missing_sidecar": {
+            "count": 605,
+            "pct": 98.06,
+            "sessions": 9,
+            "age_s": {
+              "count": 605,
+              "p10": 0.0,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 0.0,
+              "sum_hours": 0.0
+            },
+            "message_pairs": [
+              {
+                "stored": 0,
+                "incoming": 6,
+                "count": 29
+              },
+              {
+                "stored": 0,
+                "incoming": 8,
+                "count": 27
+              },
+              {
+                "stored": 0,
+                "incoming": 4,
+                "count": 25
+              },
+              {
+                "stored": 0,
+                "incoming": 10,
+                "count": 24
+              },
+              {
+                "stored": 0,
+                "incoming": 12,
+                "count": 24
+              }
+            ]
+          },
+          "missing_snapshot": {
+            "count": 12,
+            "pct": 1.94,
+            "sessions": 2,
+            "age_s": {
+              "count": 12,
+              "p10": 268.8,
+              "p50": 1539.0,
+              "p90": 11072.1,
+              "max": 11119.0,
+              "sum_hours": 12.084
+            },
+            "message_pairs": [
+              {
+                "stored": 46,
+                "incoming": 50,
+                "count": 4
+              },
+              {
+                "stored": 46,
+                "incoming": 48,
+                "count": 2
+              },
+              {
+                "stored": 20,
+                "incoming": 24,
+                "count": 1
+              },
+              {
+                "stored": 33,
+                "incoming": 171,
+                "count": 1
+              },
+              {
+                "stored": 33,
+                "incoming": 173,
+                "count": 1
+              }
+            ]
+          },
+          "expired": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "model_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "prefix_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "empty_ratio": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          }
+        },
+        "guard_outcomes_total": 0,
+        "lookup_outcomes_total": 617,
+        "sessions": {
+          "missing_sidecar": [
+            "01a187be",
+            "01a187fc",
+            "01a18ac0",
+            "audit-AH",
+            "audit-LP",
+            "audit-MS",
+            "audit-RI",
+            "audit-SA",
+            "herdr-17"
+          ],
+          "missing_snapshot": [
+            "audit-MS",
+            "herdr-17"
+          ]
+        }
+      }
+    },
+    {
+      "window": {
+        "name": "pre-fix",
+        "start": "2026-10-28 12:58:32",
+        "end": "2026-10-29 12:58:32",
+        "hours": 24.0
+      },
+      "lines": 428516,
+      "streams": {
+        "total": 27699,
+        "local": 745,
+        "local_share_pct": 2.69
+      },
+      "routing": {
+        "decisions": 14087,
+        "cached_ratio_zero": 11680,
+        "cached_ratio_zero_pct": 82.91,
+        "mean_cached_ratio": 0.1212,
+        "by_cache_state": {
+          "cold": 12429,
+          "warm": 1658
+        }
+      },
+      "local_skip": {
+        "total": 12332,
+        "routing_skip_local": 12172,
+        "economic_bypass": 160,
+        "large_context_bypass": 2227,
+        "reasons": {
+          "resident_prefix_insufficient": 4856,
+          "context_too_large": 4296,
+          "large_context_bypass": 2227,
+          "prefill_thrash_cooldown": 793
+        }
+      },
+      "local_prefill_ms": {
+        "all": {
+          "count": 745,
+          "p10": 0.53,
+          "p50": 4.52,
+          "p90": 29.43,
+          "max": 117.69,
+          "sum_hours": 2.374
+        },
+        "by_cache_state": {
+          "cold": {
+            "count": 205,
+            "p10": 1.95,
+            "p50": 9.45,
+            "p90": 51.82,
+            "max": 117.69,
+            "sum_hours": 1.063
+          },
+          "warm": {
+            "count": 540,
+            "p10": 0.46,
+            "p50": 2.8,
+            "p90": 20.82,
+            "max": 116.19,
+            "sum_hours": 1.311
+          }
+        },
+        "by_context_bucket": {
+          "edges": [
+            38000,
+            120000
+          ],
+          "by_bucket": {
+            "38,000-120,000": {
+              "warm": {
+                "count": 86,
+                "p10": 1.16,
+                "p50": 5.45,
+                "p90": 18.73,
+                "max": 116.19,
+                "sum_hours": 0.229
+              }
+            },
+            "<= 38,000": {
+              "cold": {
+                "count": 205,
+                "p10": 1.95,
+                "p50": 9.45,
+                "p90": 51.82,
+                "max": 117.69,
+                "sum_hours": 1.063
+              },
+              "warm": {
+                "count": 454,
+                "p10": 0.44,
+                "p50": 2.73,
+                "p90": 21.27,
+                "max": 114.39,
+                "sum_hours": 1.082
+              }
+            }
+          }
+        }
+      },
+      "slots": {
+        "save_ok": 103,
+        "save_failed": 33,
+        "save_failure_pct": 24.26,
+        "restore_failed": 0,
+        "ratio_restored_events": 0,
+        "cache_state_restored_lines": 0,
+        "save_eviction_ok": 9,
+        "save_eviction_failed": 33,
+        "eviction_save_sessions": 3,
+        "persistence_skipped_reasons": {
+          "slot_busy": 155
+        }
+      },
+      "seed_outcomes": {
+        "total": 695,
+        "by_outcome": {
+          "found": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "missing_sidecar": {
+            "count": 303,
+            "pct": 43.6,
+            "sessions": 5,
+            "age_s": {
+              "count": 303,
+              "p10": 0.0,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 0.0,
+              "sum_hours": 0.0
+            },
+            "message_pairs": [
+              {
+                "stored": 0,
+                "incoming": 4,
+                "count": 9
+              },
+              {
+                "stored": 0,
+                "incoming": 6,
+                "count": 8
+              },
+              {
+                "stored": 0,
+                "incoming": 8,
+                "count": 7
+              },
+              {
+                "stored": 0,
+                "incoming": 12,
+                "count": 7
+              },
+              {
+                "stored": 0,
+                "incoming": 20,
+                "count": 7
+              }
+            ]
+          },
+          "missing_snapshot": {
+            "count": 392,
+            "pct": 56.4,
+            "sessions": 2,
+            "age_s": {
+              "count": 392,
+              "p10": 2545.3,
+              "p50": 3343.0,
+              "p90": 6707.5,
+              "max": 9696.0,
+              "sum_hours": 432.504
+            },
+            "message_pairs": [
+              {
+                "stored": 40,
+                "incoming": 119,
+                "count": 67
+              },
+              {
+                "stored": 40,
+                "incoming": 127,
+                "count": 38
+              },
+              {
+                "stored": 40,
+                "incoming": 125,
+                "count": 36
+              },
+              {
+                "stored": 40,
+                "incoming": 121,
+                "count": 21
+              },
+              {
+                "stored": 40,
+                "incoming": 117,
+                "count": 19
+              }
+            ]
+          },
+          "expired": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "model_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "prefix_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "empty_ratio": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          }
+        },
+        "guard_outcomes_total": 0,
+        "lookup_outcomes_total": 695,
+        "sessions": {
+          "missing_sidecar": [
+            "01a185da",
+            "01a18722",
+            "audit-CG",
+            "audit-WL",
+            "herdr-17"
+          ],
+          "missing_snapshot": [
+            "01a18722",
+            "herdr-17"
+          ]
+        }
+      }
+    },
+    {
+      "window": {
+        "name": "post-fix-latest-24h",
+        "start": "2026-10-30 04:09:00",
+        "end": "2026-10-31 04:09:00",
+        "hours": 24.0
+      },
+      "lines": 397352,
+      "streams": {
+        "total": 23353,
+        "local": 815,
+        "local_share_pct": 3.49
+      },
+      "routing": {
+        "decisions": 11983,
+        "cached_ratio_zero": 10168,
+        "cached_ratio_zero_pct": 84.85,
+        "mean_cached_ratio": 0.1127,
+        "by_cache_state": {
+          "cold": 10585,
+          "warm": 1398
+        }
+      },
+      "local_skip": {
+        "total": 9677,
+        "routing_skip_local": 9629,
+        "economic_bypass": 48,
+        "large_context_bypass": 1503,
+        "reasons": {
+          "resident_prefix_insufficient": 4897,
+          "context_too_large": 3145,
+          "large_context_bypass": 1503,
+          "post_deadline_terminal": 81,
+          "prefill_thrash_cooldown": 3
+        }
+      },
+      "local_prefill_ms": {
+        "all": {
+          "count": 815,
+          "p10": 0.47,
+          "p50": 3.22,
+          "p90": 21.44,
+          "max": 110.74,
+          "sum_hours": 1.941
+        },
+        "by_cache_state": {
+          "cold": {
+            "count": 266,
+            "p10": 0.63,
+            "p50": 5.57,
+            "p90": 48.22,
+            "max": 110.74,
+            "sum_hours": 1.14
+          },
+          "warm": {
+            "count": 549,
+            "p10": 0.46,
+            "p50": 2.42,
+            "p90": 11.92,
+            "max": 84.44,
+            "sum_hours": 0.801
+          }
+        },
+        "by_context_bucket": {
+          "edges": [
+            38000,
+            120000
+          ],
+          "by_bucket": {
+            "38,000-120,000": {
+              "warm": {
+                "count": 1,
+                "p10": 84.44,
+                "p50": 84.44,
+                "p90": 84.44,
+                "max": 84.44,
+                "sum_hours": 0.023
+              }
+            },
+            "<= 38,000": {
+              "cold": {
+                "count": 266,
+                "p10": 0.63,
+                "p50": 5.57,
+                "p90": 48.22,
+                "max": 110.74,
+                "sum_hours": 1.14
+              },
+              "warm": {
+                "count": 548,
+                "p10": 0.46,
+                "p50": 2.42,
+                "p90": 11.81,
+                "max": 72.63,
+                "sum_hours": 0.777
+              }
+            }
+          }
+        }
+      },
+      "slots": {
+        "save_ok": 22,
+        "save_failed": 54,
+        "save_failure_pct": 71.05,
+        "restore_failed": 0,
+        "ratio_restored_events": 0,
+        "cache_state_restored_lines": 0,
+        "save_eviction_ok": 31,
+        "save_eviction_failed": 54,
+        "eviction_save_sessions": 7,
+        "persistence_skipped_reasons": {
+          "slot_busy": 191
+        }
+      },
+      "seed_outcomes": {
+        "total": 475,
+        "by_outcome": {
+          "found": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "missing_sidecar": {
+            "count": 455,
+            "pct": 95.79,
+            "sessions": 8,
+            "age_s": {
+              "count": 455,
+              "p10": 0.0,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 0.0,
+              "sum_hours": 0.0
+            },
+            "message_pairs": [
+              {
+                "stored": 0,
+                "incoming": 6,
+                "count": 25
+              },
+              {
+                "stored": 0,
+                "incoming": 4,
+                "count": 22
+              },
+              {
+                "stored": 0,
+                "incoming": 14,
+                "count": 16
+              },
+              {
+                "stored": 0,
+                "incoming": 10,
+                "count": 15
+              },
+              {
+                "stored": 0,
+                "incoming": 16,
+                "count": 15
+              }
+            ]
+          },
+          "missing_snapshot": {
+            "count": 20,
+            "pct": 4.21,
+            "sessions": 1,
+            "age_s": {
+              "count": 20,
+              "p10": 436.5,
+              "p50": 482.0,
+              "p90": 561.4,
+              "max": 569.0,
+              "sum_hours": 2.719
+            },
+            "message_pairs": [
+              {
+                "stored": 2,
+                "incoming": 62,
+                "count": 1
+              },
+              {
+                "stored": 2,
+                "incoming": 64,
+                "count": 1
+              },
+              {
+                "stored": 2,
+                "incoming": 66,
+                "count": 1
+              },
+              {
+                "stored": 2,
+                "incoming": 68,
+                "count": 1
+              },
+              {
+                "stored": 2,
+                "incoming": 70,
+                "count": 1
+              }
+            ]
+          },
+          "expired": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "model_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "prefix_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "empty_ratio": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          }
+        },
+        "guard_outcomes_total": 0,
+        "lookup_outcomes_total": 475,
+        "sessions": {
+          "missing_sidecar": [
+            "01a18e2b",
+            "01a18f14",
+            "01a18f25",
+            "audit-AH",
+            "audit-LP",
+            "audit-RI",
+            "audit-SA",
+            "herdr-17"
+          ],
+          "missing_snapshot": [
+            "audit-RI"
+          ]
+        }
+      }
+    },
+    {
+      "window": {
+        "name": "post-fix-extended",
+        "start": "2026-10-29 12:58:32",
+        "end": "2026-10-31 04:09:00",
+        "hours": 39.17
+      },
+      "lines": 673452,
+      "streams": {
+        "total": 37799,
+        "local": 1405,
+        "local_share_pct": 3.72
+      },
+      "routing": {
+        "decisions": 19704,
+        "cached_ratio_zero": 16383,
+        "cached_ratio_zero_pct": 83.15,
+        "mean_cached_ratio": 0.1324,
+        "by_cache_state": {
+          "cold": 16981,
+          "warm": 2723
+        }
+      },
+      "local_skip": {
+        "total": 15526,
+        "routing_skip_local": 15472,
+        "economic_bypass": 54,
+        "large_context_bypass": 2490,
+        "reasons": {
+          "resident_prefix_insufficient": 7547,
+          "context_too_large": 5348,
+          "large_context_bypass": 2490,
+          "post_deadline_terminal": 81,
+          "prefill_thrash_cooldown": 6
+        }
+      },
+      "local_prefill_ms": {
+        "all": {
+          "count": 1405,
+          "p10": 0.49,
+          "p50": 3.29,
+          "p90": 21.68,
+          "max": 112.17,
+          "sum_hours": 3.395
+        },
+        "by_cache_state": {
+          "cold": {
+            "count": 441,
+            "p10": 0.88,
+            "p50": 6.17,
+            "p90": 49.26,
+            "max": 112.17,
+            "sum_hours": 2.005
+          },
+          "warm": {
+            "count": 964,
+            "p10": 0.47,
+            "p50": 2.29,
+            "p90": 11.56,
+            "max": 99.0,
+            "sum_hours": 1.389
+          }
+        },
+        "by_context_bucket": {
+          "edges": [
+            38000,
+            120000
+          ],
+          "by_bucket": {
+            "38,000-120,000": {
+              "cold": {
+                "count": 1,
+                "p10": 47.0,
+                "p50": 47.0,
+                "p90": 47.0,
+                "max": 47.0,
+                "sum_hours": 0.013
+              },
+              "warm": {
+                "count": 3,
+                "p10": 50.19,
+                "p50": 84.44,
+                "p90": 96.09,
+                "max": 99.0,
+                "sum_hours": 0.063
+              }
+            },
+            "<= 38,000": {
+              "cold": {
+                "count": 440,
+                "p10": 0.88,
+                "p50": 6.17,
+                "p90": 49.3,
+                "max": 112.17,
+                "sum_hours": 1.992
+              },
+              "warm": {
+                "count": 961,
+                "p10": 0.47,
+                "p50": 2.27,
+                "p90": 11.17,
+                "max": 72.63,
+                "sum_hours": 1.327
+              }
+            }
+          }
+        }
+      },
+      "slots": {
+        "save_ok": 46,
+        "save_failed": 94,
+        "save_failure_pct": 67.14,
+        "restore_failed": 0,
+        "ratio_restored_events": 0,
+        "cache_state_restored_lines": 0,
+        "save_eviction_ok": 60,
+        "save_eviction_failed": 93,
+        "eviction_save_sessions": 12,
+        "persistence_skipped_reasons": {
+          "slot_busy": 375
+        }
+      },
+      "seed_outcomes": {
+        "total": 895,
+        "by_outcome": {
+          "found": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "missing_sidecar": {
+            "count": 863,
+            "pct": 96.42,
+            "sessions": 12,
+            "age_s": {
+              "count": 863,
+              "p10": 0.0,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 0.0,
+              "sum_hours": 0.0
+            },
+            "message_pairs": [
+              {
+                "stored": 0,
+                "incoming": 6,
+                "count": 39
+              },
+              {
+                "stored": 0,
+                "incoming": 4,
+                "count": 33
+              },
+              {
+                "stored": 0,
+                "incoming": 8,
+                "count": 33
+              },
+              {
+                "stored": 0,
+                "incoming": 10,
+                "count": 33
+              },
+              {
+                "stored": 0,
+                "incoming": 12,
+                "count": 28
+              }
+            ]
+          },
+          "missing_snapshot": {
+            "count": 32,
+            "pct": 3.58,
+            "sessions": 3,
+            "age_s": {
+              "count": 32,
+              "p10": 432.5,
+              "p50": 511.0,
+              "p90": 2116.9,
+              "max": 11119.0,
+              "sum_hours": 14.804
+            },
+            "message_pairs": [
+              {
+                "stored": 46,
+                "incoming": 50,
+                "count": 4
+              },
+              {
+                "stored": 46,
+                "incoming": 48,
+                "count": 2
+              },
+              {
+                "stored": 20,
+                "incoming": 24,
+                "count": 1
+              },
+              {
+                "stored": 33,
+                "incoming": 171,
+                "count": 1
+              },
+              {
+                "stored": 33,
+                "incoming": 173,
+                "count": 1
+              }
+            ]
+          },
+          "expired": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "model_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "prefix_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "empty_ratio": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          }
+        },
+        "guard_outcomes_total": 0,
+        "lookup_outcomes_total": 895,
+        "sessions": {
+          "missing_sidecar": [
+            "01a187be",
+            "01a187fc",
+            "01a18ac0",
+            "01a18e2b",
+            "01a18f14",
+            "01a18f25",
+            "audit-AH",
+            "audit-LP",
+            "audit-MS",
+            "audit-RI",
+            "audit-SA",
+            "herdr-17"
+          ],
+          "missing_snapshot": [
+            "audit-MS",
+            "audit-RI",
+            "herdr-17"
+          ]
+        }
+      }
+    },
+    {
+      "window": {
+        "name": "post-restart2",
+        "start": "2026-10-31 00:41:55",
+        "end": "2026-10-31 04:09:00",
+        "hours": 3.45
+      },
+      "lines": 18960,
+      "streams": {
+        "total": 670,
+        "local": 89,
+        "local_share_pct": 13.28
+      },
+      "routing": {
+        "decisions": 562,
+        "cached_ratio_zero": 446,
+        "cached_ratio_zero_pct": 79.36,
+        "mean_cached_ratio": 0.182,
+        "by_cache_state": {
+          "cold": 449,
+          "warm": 113
+        }
+      },
+      "local_skip": {
+        "total": 394,
+        "routing_skip_local": 392,
+        "economic_bypass": 2,
+        "large_context_bypass": 16,
+        "reasons": {
+          "context_too_large": 218,
+          "resident_prefix_insufficient": 98,
+          "post_deadline_terminal": 60,
+          "large_context_bypass": 16
+        }
+      },
+      "local_prefill_ms": {
+        "all": {
+          "count": 89,
+          "p10": 0.38,
+          "p50": 2.93,
+          "p90": 24.07,
+          "max": 53.1,
+          "sum_hours": 0.181
+        },
+        "by_cache_state": {
+          "cold": {
+            "count": 38,
+            "p10": 2.55,
+            "p50": 3.01,
+            "p90": 36.5,
+            "max": 53.1,
+            "sum_hours": 0.132
+          },
+          "warm": {
+            "count": 51,
+            "p10": 0.35,
+            "p50": 1.95,
+            "p90": 7.54,
+            "max": 18.6,
+            "sum_hours": 0.049
+          }
+        },
+        "by_context_bucket": {
+          "edges": [
+            38000,
+            120000
+          ],
+          "by_bucket": {
+            "<= 38,000": {
+              "cold": {
+                "count": 38,
+                "p10": 2.55,
+                "p50": 3.01,
+                "p90": 36.5,
+                "max": 53.1,
+                "sum_hours": 0.132
+              },
+              "warm": {
+                "count": 51,
+                "p10": 0.35,
+                "p50": 1.95,
+                "p90": 7.54,
+                "max": 18.6,
+                "sum_hours": 0.049
+              }
+            }
+          }
+        }
+      },
+      "slots": {
+        "save_ok": 0,
+        "save_failed": 4,
+        "save_failure_pct": 100.0,
+        "restore_failed": 0,
+        "ratio_restored_events": 0,
+        "cache_state_restored_lines": 0,
+        "save_eviction_ok": 1,
+        "save_eviction_failed": 4,
+        "eviction_save_sessions": 1,
+        "persistence_skipped_reasons": {
+          "slot_busy": 28
+        }
+      },
+      "seed_outcomes": {
+        "total": 45,
+        "by_outcome": {
+          "found": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "missing_sidecar": {
+            "count": 45,
+            "pct": 100.0,
+            "sessions": 2,
+            "age_s": {
+              "count": 45,
+              "p10": 0.0,
+              "p50": 0.0,
+              "p90": 0.0,
+              "max": 0.0,
+              "sum_hours": 0.0
+            },
+            "message_pairs": [
+              {
+                "stored": 0,
+                "incoming": 10,
+                "count": 5
+              },
+              {
+                "stored": 0,
+                "incoming": 14,
+                "count": 5
+              },
+              {
+                "stored": 0,
+                "incoming": 6,
+                "count": 4
+              },
+              {
+                "stored": 0,
+                "incoming": 4,
+                "count": 2
+              },
+              {
+                "stored": 0,
+                "incoming": 8,
+                "count": 2
+              }
+            ]
+          },
+          "missing_snapshot": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "expired": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "model_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "prefix_mismatch": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          },
+          "empty_ratio": {
+            "count": 0,
+            "pct": 0.0,
+            "sessions": 0
+          }
+        },
+        "guard_outcomes_total": 0,
+        "lookup_outcomes_total": 45,
+        "sessions": {
+          "missing_sidecar": [
+            "audit-LP",
+            "herdr-17"
+          ]
+        }
+      }
+    }
+  ],
+  "sidecars": {
+    "root": "/home/rgardler/projects/llm/slot-cache",
+    "count": 1,
+    "newest": "2026-10-31 04:09:08",
+    "oldest": "2026-10-31 04:09:08",
+    "by_model": {
+      "Qwen3": 1
+    }
+  },
+  "restored_engagement": {
+    "ratio_restored_events": 0,
+    "cache_state_restored_lines": 0,
+    "sidecars_on_disk": 1,
+    "engaged": false
+  }
+}

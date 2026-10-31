@@ -14,6 +14,12 @@ sidecar) now dominates at 98 % of seed decisions. AC1/AC2/AC3/AC6 are unmet;
 AC4 is this report; AC5's honest verdict is below with a follow-up work item
 filed. **The epic's AC3 stays unmet.**
 
+The verdict was **re-confirmed on 2026-10-31T04:10Z** over a 39.17 h post-fix
+window (895 seed decisions) with an independent `zgrep` over the whole log
+history — see [Addendum: 2026-10-31 re-measurement](#addendum-2026-10-31-re-measurement-extended-window).
+The only movement is on AC6: orphan sidecars fell to 0 and the first cleanly
+**paired** snapshot+sidecar save is on disk.
+
 ## Command lines (exact, reproducible)
 
 Primary 24 h pair (pinned timestamps, no `now` shorthand):
@@ -175,6 +181,122 @@ save-failure cliff).
 - supersedes: LP-0MVK0E8NH007XCV3 (closed)
 - validates: LP-0MVK0E80C009HUQC (`5502ee44`), LP-0MVK0E8C40035FG3 (`97b95fb6`)
 - JSON: `docs/dev/slot-ratio-restore-postfix-2026-10-30.json` (24 h pair),
-  `docs/dev/slot-ratio-restore-postfix-2026-10-30-full.json` (full + post-restart)
+  `docs/dev/slot-ratio-restore-postfix-2026-10-30-full.json` (full + post-restart),
+  `docs/dev/slot-ratio-restore-postfix-2026-10-31.json` (extended re-measurement)
+
+## Addendum: 2026-10-31 re-measurement (extended window)
+
+Purpose: the 2026-10-30 report answered the 24 h requirement; this addendum
+extends the post-fix window to the full span available at
+`2026-10-31T04:09Z` (39.17 h, i.e. 15 h beyond AC1's ≥24 h minimum) so the
+zero-result verdict rests on a larger sample, and re-runs the AC6 pairing check
+against the current disk state. **The verdict is unchanged.**
+
+### Command line (exact, reproducible)
+
+```bash
+python3 scripts/analyse_slot_ratio_restore.py \
+  --log-dir /var/log/llama-proxy \
+  --slot-cache-dir /home/rgardler/projects/llm/slot-cache \
+  --window "post-fix=2026-10-29T12:58:32,2026-10-30T12:58:32" \
+  --window "pre-fix=2026-10-28T12:58:32,2026-10-29T12:58:32" \
+  --window "post-fix-latest-24h=2026-10-30T04:09:00,2026-10-31T04:09:00" \
+  --window "post-fix-extended=2026-10-29T12:58:32,2026-10-31T04:09:00" \
+  --window "post-restart2=2026-10-31T00:41:55,2026-10-31T04:09:00" \
+  --json > docs/dev/slot-ratio-restore-postfix-2026-10-31.json
+```
+
+Independent cross-check (gz-aware, whole log history, no tool involved):
+
+```bash
+cd /var/log/llama-proxy
+zgrep -oh "slot_ratio_restored" proxy.log* | wc -l          # -> 0
+zgrep -oh "cache_state=restored" proxy.log* | wc -l        # -> 0
+zgrep -oh "slot_ratio_seed outcome=[a-z_]*" proxy.log* | sort | uniq -c
+#  3863 slot_ratio_seed outcome=missing_sidecar
+#  1130 slot_ratio_seed outcome=missing_snapshot
+#     0 found / expired / model_mismatch / prefix_mismatch / empty_ratio
+```
+
+### Headline counts (extended windows)
+
+| Metric | post-fix 24 h | latest 24 h (10-30T04:09 → 10-31T04:09) | post-fix extended (39.17 h) | post-restart2 (3.45 h) |
+|---|---|---|---|---|
+| `cache_state=restored` dispatches | **0** | **0** | **0** | **0** |
+| `slot_ratio_restored` seed events | **0** | **0** | **0** | **0** |
+| `slot_ratio_seed outcome=found` | **0 (0 %)** | **0 (0 %)** | **0 (0 %)** | **0 (0 %)** |
+| `missing_sidecar` | 605 (98.1 %) | 455 (95.8 %) | **863 (96.4 %)** | 45 (100 %) |
+| `missing_snapshot` | 12 (1.9 %) | 20 (4.2 %) | 32 (3.6 %) | 0 |
+| `expired` / `model_mismatch` / `prefix_mismatch` / `empty_ratio` | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| guard outcomes (seed past lookup) | 0 | 0 | **0** | 0 |
+| seed decisions (total) | 617 | 475 | **895** | 45 |
+| routing decisions | 10,248 | 11,983 | 19,704 | 562 |
+| slot saves ok / failed | 34 / 65 (65.7 %) | 22 / 54 (71.1 %) | 46 / 94 (**67.1 % fail**) | 0 / 4 |
+| `slot persistence skipped reason=slot_busy` | 260 | 191 | 375 | 28 |
+| `slot_restore failed` | 0 | 0 | 0 | 0 |
+
+Across the whole log history the guard outcomes (`expired`,
+`model_mismatch`, `prefix_mismatch`, `empty_ratio`) remain **0**: the seed path
+never reaches the guard because it never gets past `read_slot_ratio_sidecar()`.
+That is the defining signature of the writer-side gap, not of a TTL or prefix
+guard rejecting good sidecars.
+
+### AC2 restated (`dispatch_first_byte_ms`, the `dispatch_to_first_byte_ms` field of the AC)
+
+The field is `dispatch_first_byte_ms` in the log and in
+`scripts/analyse_slot_ratio_restore.py`; the AC's `dispatch_to_first_byte_ms`
+names the same measurement. Restored group **n=0** in every window and bucket,
+so the restored-vs-cold comparison cannot be stated. Cold/warm reference, same
+context buckets, extended window:
+
+| Bucket | cold | warm | restored |
+|---|---|---|---|
+| ≤ 38,000 | n=440, p50 6.17 / p90 49.30 | n=961, p50 2.27 / p90 11.17 | n=0 |
+| 38,000–120,000 | n=1, p50 47.00 / p90 47.00 | n=3, p50 84.44 / p90 96.09 | n=0 |
+
+### AC6 pairing check at 2026-10-31T04:12Z
+
+Exact item command, re-run:
+
+```bash
+cd /home/rgardler/projects/llm/slot-cache
+echo "snapshots=$(find . -name '*.bin' | wc -l) sidecars=$(find . -name '*.bin.ratio.json' | wc -l)"
+# snapshots=3 sidecars=1
+find . -name '*.bin' -exec basename {} \; | sed 's/\.bin$//' | sort > /tmp/snaps
+find . -name '*.bin.ratio.json' -exec basename {} \; | sed 's/\.bin\.ratio\.json$//' | sort > /tmp/sides
+comm -13 /tmp/snaps /tmp/sides | wc -l   # orphan sidecars -> 0
+comm -23 /tmp/snaps /tmp/sides | wc -l   # orphan snapshots -> 2
+comm -12 /tmp/snaps /tmp/sides | wc -l   # paired -> 1
+```
+
+| Report time | snapshots | sidecars | paired | orphan sidecars | orphan snapshots |
+|---|---|---|---|---|---|
+| plan-time baseline (2026-10-29T17:40Z) | 6 | 144 | 2 | 142 | 4 |
+| first report (2026-10-30T21:40Z) | 0 | 28 | 0 | 28 | 0 |
+| **this addendum (2026-10-31T04:12Z)** | 3 | 1 | **1** | **0** | 2 |
+
+What changed, and what it means for AC6:
+
+- The legacy orphan-sidecar pile (142 → 28 → **0**) is fully cleared by the
+  recursive `cleanup-slot-cache.sh` retirement path, so the writer-side fix's
+  *retirement* half is demonstrably working.
+- For the first time since the deploy there is a **paired** save on disk:
+  `slot_herdr-1793415813-4139491-4538.bin` +
+  `localhost-8080/slot_herdr-1793415813-4139491-4538.bin.ratio.json`, written
+  2026-10-31T04:09:08Z, carrying `cached_tokens=20824`, `prompt_tokens=20824`
+  and 4 message fingerprints. That is direct evidence the writer path *can*
+  produce a complete, seedable sidecar on the deployed tree.
+- The 2 orphan snapshots are both post-deploy and both recent:
+  `slot_audit-LP-0MVSD5RJW008F1IB-parent-7caeb9ce.bin` (01:14:50Z) and
+  `slot_herdr-1793415438-4119054-16480.bin` (04:09:37Z, a session still live
+  at report time, so its sidecar may yet be written).
+- AC6 asks for "paired files present, no orphan growth": *paired files
+  present* is now satisfied, but orphan growth for post-deploy saves is **not**
+  eliminated (2 orphan snapshots; the audit-session one is a genuine orphan).
+  AC6 therefore remains **partially met** rather than met.
+- The pairing gap is also why `missing_sidecar` still dominates at seed time:
+  a snapshot exists for the session, `read_slot_ratio_sidecar()` returns
+  `None`, and the seed aborts before the guard. Root-cause work continues in
+  LP-0MVVI8TEU006KTOZ, which was updated with these new on-disk observations.
 - Extends: `docs/dev/slot-prefix-warmness-measurement-LP-0MVGGPSVM003W35K.md`,
   `docs/dev/slot-ratio-seed-verdict-LP-0MVK0E8C40035FG3.md`
