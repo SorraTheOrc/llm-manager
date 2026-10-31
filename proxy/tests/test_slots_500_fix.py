@@ -307,27 +307,47 @@ class TestLastKnownFallback:
         assert cached_total == 2
         assert cached_available == 2
 
-    def test_last_known_expires_after_stale_period(self):
-        """last_known_slot_counts returns None after the stale period."""
+    def test_last_known_expires_after_stale_period(self, monkeypatch):
+        """last_known_slot_counts returns None after the stale period.
+
+        The age of the cached counts is aged directly instead of faking
+        ``time.monotonic``: a call-count-based fake mixed a faked timestamp
+        with the real clock after the patch exited, so the assertion only held
+        once the host's monotonic clock was far enough past the faked value —
+        it failed for hours after every reboot (LP-0MVWINB8O000ZXI6).
+
+        The staleness bound is pinned here rather than inherited from the
+        ambient environment: ``SLOT_COUNTS_STALE_AFTER_SECONDS`` is read from
+        ``os.environ`` on every call, so a leaked ``0`` (or a tiny value from
+        another test) made the *just recorded* entry already stale and failed
+        the first assertion — the same failure signature, from a different
+        cause, and only in the full suite where test order decides what has
+        leaked.
+        """
+        from proxy import observability as _obs
+
+        monkeypatch.setenv("SLOT_COUNTS_STALE_AFTER_SECONDS", "3600")
+
         slots_data = [{"id": 0, "is_processing": False}]
         mock_client = _FakeClient([(200, slots_data)])
+        asyncio.run(_query_slots(mock_client, llama_port=8080, model="Qwen3"))
 
-        # Patch time.monotonic: first call (cache record) returns 0,
-        # second call (stale check) returns past stale period.
-        stale_seconds = 3600  # default stale period
-        call_count = [0]
+        # A fresh successful query must be servable ...
+        assert last_known_slot_counts() is not None
 
-        def fake_monotonic():
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return 0.0  # cache record time
-            return stale_seconds + 10.0  # stale check time
+        # ... but the same entry, backdated beyond the staleness bound, is not.
+        stale_seconds = _obs._slots_counts_stale_after_seconds()
+        assert stale_seconds == 3600.0, (
+            "the bound must be the pinned value, not an ambient env leak"
+        )
+        available, total, recorded_at = _obs._last_slot_counts_cache
+        monkeypatch.setattr(
+            _obs,
+            "_last_slot_counts_cache",
+            (available, total, recorded_at - stale_seconds - 10.0),
+        )
 
-        with patch.object(time, "monotonic", fake_monotonic):
-            asyncio.run(_query_slots(mock_client, llama_port=8080, model="Qwen3"))
-
-        result = last_known_slot_counts()
-        assert result is None
+        assert last_known_slot_counts() is None
 
     def test_last_known_not_updated_on_failure(self):
         """Failed queries do NOT update the last-known cache."""
