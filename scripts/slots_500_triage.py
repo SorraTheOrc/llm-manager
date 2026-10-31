@@ -17,6 +17,11 @@ Key mechanism (from llama-server access-log evidence):
 Produced outputs (JSON):
   - classification: 500s/400s by responder (router vs model instance) and
     proximate cause (router-proxy-cancel, transient-busy, restart-race)
+  - status handling: every status the access log reports is counted
+    (`slots_<status>`) and attributed in the responder split (`<responder>:
+    <status>`); an unfamiliar code (503, 502, 429, ...) is reported, never
+    fatal. A /slots line whose status cannot be parsed is reported as
+    `unknown:?` and counted in `stats.slots_unparsed`.
   - correlation: 500-window ↔ prefill/checkpoint/cancel density
   - fix_options: ranked by expected impact
 
@@ -88,13 +93,19 @@ def analyze_slots_500(log_dir: Path, llama_file_glob: str | None = None) -> dict
 
     five_hundred_windows: list[dict] = []
 
-    stats = {
+    # Open key space (LP-0MVVWTWGY004BO5H): the access log reports statuses the
+    # tool never anticipated (503 from a child instance, 502/429, ...). A plain
+    # dict raised KeyError on any of them and aborted the whole analysis, so the
+    # slots_<status> counters default to 0 (a status code can never crash the
+    # tool) while these known keys stay present for downstream readers.
+    stats: defaultdict = defaultdict(int)
+    stats.update({
         "slots_total": 0, "slots_200": 0, "slots_400": 0, "slots_500": 0,
         "cancel_events": 0, "model_400_events": 0,
         "proxying_events": 0, "prefill_events": 0, "checkpoint_events": 0,
         "near_proxy_500s": 0, "near_cancel_500s": 0, "near_prefill_500s": 0,
         "near_checkpoint_500s": 0,
-    }
+    })
 
     # We buffer the last N lines to build ±window context for each 500.
     ctx_buf: list[str] = []
@@ -117,6 +128,11 @@ def analyze_slots_500(log_dir: Path, llama_file_glob: str | None = None) -> dict
                 slots_status[(responder, status)] += 1
                 stats[f"slots_{status}"] += 1
                 stats["slots_total"] += 1
+            else:
+                # Unparsed /slots line: report it under the responder split
+                # rather than dropping it from the classification silently.
+                slots_status[("unknown", "?")] += 1
+                stats["slots_unparsed"] += 1
 
             if status == "500":
                 window = "\n".join(ctx_buf)

@@ -312,3 +312,64 @@ Consequences when reading these figures:
   split) tells you which path regressed.
 - The post-fix 24 h confirmation window is AC3 of LP-0MVVCXUDZ007XID0, using
 the recipe in this document.
+
+## The responder split counts *every* status code (LP-0MVVWTWGY004BO5H)
+
+The tool used to pre-seed a fixed set of status counters
+(`slots_200`/`slots_400`/`slots_500`) and then index it with whatever status
+the access log reported, so the **first non-200/400/500 `/slots` line aborted
+the entire run**:
+
+```text
+error: analysis failed: 'slots_503'
+KeyError: 'slots_503'
+```
+
+Since `llama-server` child instances do answer `/slots` with other codes
+(`503` while a child is shutting down or saturated), the documented
+`--log-dir` invocation over the live corpus failed outright.
+
+Fixed behaviour — read the split as an **open** key space:
+
+- the per-status counters are defaulting (`Counter`/`defaultdict`), so any
+  status the corpus reports appears as `slots_<status>` in
+  `classification.stats` (`slots_503`, `slots_502`, `slots_429`, …) instead of
+  raising `KeyError`;
+- `classification.responder_status` carries one key per
+  `<responder>:<status>` pair actually seen, so an unexpected status is
+  attributed to the responder that produced it (`router:503`, `<pid>:503`)
+  rather than dropped;
+- a `/slots` line whose status cannot be parsed (a shape `_ACCESS_RE` does not
+  match) is reported as `unknown:?` and counted in
+  `classification.stats.slots_unparsed`. It is **not** added to
+  `slots_total`, which remains the sum of statuses the tool could parse (the
+  denominator of the 500 rate);
+- `per_file_slots` keeps its per-file status tally, `?` for unparsed lines.
+
+The `router` vs child classification (`router` = no `[pid]` prefix, otherwise
+the child pid) is unchanged, so the F3 numbers above stay reproducible.
+
+### Live corpus run (2026-10-31, `--summary`)
+
+```text
+python3 scripts/slots_500_triage.py --log-dir /var/log/llama-proxy --summary
+```
+
+exits 0 and reports the child 503s that previously crashed the run:
+
+```text
+slots_total 871,519   slots_200 756,429   slots_400 13,563
+slots_500   101,510   slots_503      17   slots_unparsed 10
+router:200  126,405   router:400  13,563   router:500  101,510
+child 503 keys: 36521, 38029, 41395, 43181, 43957, 44791, 50193,
+                52221, 54265 (×2), 54457 (×2), 56105, 56943, 59057,
+                60939, 60965 (×2)  → 17 attributed child 503s
+unknown:?   10       (9 child 503 lines concatenated after `llama-server`
+                      progress-dot output, plus one `GET /slots/1 … 404`)
+```
+
+Reading caveat: those dotted 503 lines are real child responses whose line
+prefix defeats `_ACCESS_RE`, so they land in `unknown:?` rather than being
+attributed to their pid — the responder split therefore *under*-counts child
+503s while still reporting them. Tracked separately
+(`discovered-from:LP-0MVVWTWGY004BO5H`).
