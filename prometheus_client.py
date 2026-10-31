@@ -33,6 +33,24 @@ class Counter:
             self._store[key] = _Label()
         return self._store[key]
 
+class _GaugeChild:
+    """A labelled gauge child — the stub's counterpart of a real client child.
+
+    The value lives in ``_value`` (like ``Counter``'s ``_Label``) so repeated
+    ``Gauge.labels(...)`` calls keep returning a *child*, as the real
+    ``prometheus_client`` does. Storing the raw int in the label map instead
+    made the second ``labels(...).set(...)`` raise ``AttributeError``, so a
+    gauge refreshed on an interval silently stopped updating under the stub
+    (LP-0MVT1O0VG00905EL discovered this while publishing slot occupancy).
+    """
+
+    def __init__(self):
+        self._value = _Value()
+
+    def set(self, value):
+        self._value.v = int(value)
+
+
 class Gauge:
     def __init__(self, name: str, desc: str, labelnames: list[str] | None = None):
         self._name = name
@@ -50,14 +68,21 @@ class Gauge:
     def labels(self, **kw):
         key = tuple(kw.get(k) for k in self._labelnames)
         if key not in self._store:
-            class GObj:
-                def __init__(self, store, key):
-                    self._store = store
-                    self._key = key
-                def set(self, value):
-                    self._store[self._key] = int(value)
-            self._store[key] = GObj(self._store, key)
+            self._store[key] = _GaugeChild()
         return self._store[key]
+
+    def remove(self, *labelvalues):
+        """Drop one label-value combination, like the real client.
+
+        Needed by the slot-occupancy publisher to retire a ``slot=`` series
+        whose slot no longer exists; without it the stub silently kept ghost
+        series, so that behaviour could only be tested against the real
+        library.
+        """
+        key = tuple(labelvalues)
+        if key not in self._store:
+            raise KeyError(labelvalues)
+        del self._store[key]
 
 
 def generate_latest():

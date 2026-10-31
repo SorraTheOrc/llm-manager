@@ -21,6 +21,16 @@ Two things this unit is **not**:
   or computing. Utilisation is derived from **power draw**
   (`node_hwmon_power_average_watt`, from node_exporter's hwmon collector) — see
   [monitoring/gpu_compute_rules.yaml](../../monitoring/gpu_compute_rules.yaml).
+- It is not the workload signal either. Slot occupancy — how many llama-server
+  slots exist, how many are processing a task, the per-slot 0/1 state, the
+  in-flight task count and a last-successful-sample heartbeat — is published by
+  the **proxy** on its own `/metrics` endpoint
+  (`llama_slots_total`, `llama_slots_busy`, `llama_slot_busy{slot}`,
+  `llama_slots_in_flight_tasks`, `llama_slots_sample_timestamp_seconds`), because
+  the proxy already owns the only working `/slots` path (child-port discovery,
+  coalescing, failure counter). See
+  [docs/systemd/llama-proxy.service](llama-proxy.service) for the sample cadence
+  (`server.llama_slot_metrics_interval_seconds`, default 10 s).
 - It is not a VRAM reporter in any useful sense: the VRAM carve-out is 1 GiB of
   BIOS-reserved memory while models live in **GTT**. GTT is the pool the memory
   alerts watch ([monitoring/gpu_memory_alerts.yaml](../../monitoring/gpu_memory_alerts.yaml)).
@@ -181,6 +191,9 @@ rocm-smi --showmeminfo vram
 
 - [docs/systemd/node_exporter.service](node_exporter.service) — the textfile
   collector that serves these series.
+- [docs/systemd/llama-proxy.service](llama-proxy.service) — the proxy whose
+  `/metrics` publishes llama-server slot occupancy (the workload half of the
+  picture this unit cannot see).
 - [monitoring/gpu_compute_rules.yaml](../../monitoring/gpu_compute_rules.yaml) —
   why utilisation comes from power, not `gpu_busy_percent`.
 - [monitoring/gpu_memory_alerts.yaml](../../monitoring/gpu_memory_alerts.yaml) —

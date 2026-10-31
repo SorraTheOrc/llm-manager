@@ -16,8 +16,12 @@ Two payload shapes exist in the wild and both must be covered:
 
 * **rich** — older/other builds carry ``id_task`` (``-1`` when the slot has no
   task) and ``next_token``, which is what the sampler sibling
-  (LP-0MVT1O0VG00905EL) prefers when counting in-flight tasks, falling back to
-  ``is_processing`` when ``id_task`` is absent.
+  (LP-0MVT1O0VG00905EL) uses for the in-flight task count when the field is
+  published. Caveat measured live 2026-10-31: the deployed build publishes
+  ``id_task`` for the *chat* child (verified 2026-10-29 on the embed child, which
+  is lean) and an **idle** slot keeps the id of the last task it ran, so the
+  count must require ``is_processing`` as well — see
+  ``expected_in_flight_tasks()``.
 
 Failure modes are modelled as **clients**, not payloads, because that is what
 the consumer sees: ``_fetch_slots_payload()`` returns
@@ -134,13 +138,27 @@ def rich_slots_payload() -> list[dict]:
 def expected_in_flight_tasks(payload: list[dict]) -> int:
     """In-flight task count a consumer must derive from *payload*.
 
-    ``len([s for s in payload if s.get("id_task", -1) >= 0])`` when the build
-    publishes ``id_task``, else the ``is_processing`` count (the documented
-    fallback for the deployed lean build). Kept next to the builders so a test
-    asserts the *contract* rather than re-deriving it inline.
+    A task is in flight only when its slot is **both** processing and reports an
+    assigned task id (``is_processing`` and ``id_task >= 0``); builds that
+    publish no ``id_task`` fall back to the ``is_processing`` count. The
+    conjunction is required, not cosmetic: measured live 2026-10-31 on this host
+    (LP-0MVT1O0VG00905EL), the deployed build *does* publish ``id_task`` for the
+    Qwen3 child and an **idle** slot keeps the id of the last task it ran
+    (``is_processing: false, id_task: 20026``), so counting ``id_task >= 0``
+    alone reported two in-flight tasks while one slot was working.
+
+    Kept next to the builders so a test asserts the *contract* rather than
+    re-deriving it inline. On these fixtures both rules coincide (only busy
+    slots carry a non-negative ``id_task``), so this helper stays valid for
+    cases that were written against the older wording.
     """
     if any("id_task" in entry for entry in payload):
-        return sum(1 for entry in payload if entry.get("id_task", -1) >= 0)
+        return sum(
+            1
+            for entry in payload
+            if entry.get("is_processing") is True
+            and entry.get("id_task", -1) >= 0
+        )
     return sum(1 for entry in payload if entry.get("is_processing") is True)
 
 

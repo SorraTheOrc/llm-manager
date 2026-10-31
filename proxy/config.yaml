@@ -1034,6 +1034,21 @@ server:
   # Consecutive pinned-counter observations (busy high + idle + low power)
   # before GPU-wedge detection is disabled for the process lifetime.
   llama_gpu_wedge_pinned_checks_required: 4
+  # --- Slot-occupancy sampler (LP-0MVT1O0VG00905EL) ---
+  # Cadence (seconds) of the proxy's slot-occupancy sample onto /metrics:
+  # llama_slots_total, llama_slots_busy, llama_slot_busy{slot},
+  # llama_slots_in_flight_tasks and the heartbeat
+  # llama_slots_sample_timestamp_seconds. Together with the node_exporter power
+  # series this is what turns "the GPU drew 115 W" into attributed llama-server
+  # work. The sample reuses the coalesced /slots path (1 s TTL, single-flight,
+  # 5 s failure backoff) against the discovered child port with the existing
+  # 2 s timeout, so the upstream request volume stays bounded by this interval.
+  # Default 10 s matches the model-health loop and is below the 15 s Prometheus
+  # scrape, so no resolution is wasted. A failed /slots query publishes NOTHING
+  # (never llama_slots_busy 0) and the heartbeat stops advancing, so a gap is
+  # queryable; the failure stays counted in llama_slots_query_failures_total.
+  # Set to 0 to disable sampling without removing the metrics library.
+  llama_slot_metrics_interval_seconds: 10
   llama_model_load_timeout: 600
   llama_models_max: 2
   llama_request_timeout: 1500

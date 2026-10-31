@@ -40,6 +40,13 @@ HTTP JSON parsing and URL building patterns found in both
   liveness signal llama.cpp b8782 still exposes), used by the
   prefill-progress dispatch-lease extension (LP-0MSE05J53004C6EL,
   LP-0MSUO5Z0K007HBSS).
+- ``_sample_slot_occupancy(srv)`` / ``_slot_metrics_loop()`` — slot-occupancy
+  sampler (LP-0MVT1O0VG00905EL): publishes total/busy/per-slot/in-flight slot
+  gauges and a last-successful-sample heartbeat on the proxy's ``/metrics``,
+  sampling through the coalesced path at
+  ``server.llama_slot_metrics_interval_seconds`` (default 10 s). A failed
+  ``/slots`` query publishes nothing, so a gap is visible instead of looking
+  like an idle GPU.
 
 See LP-0MR6Y11OP005UHIH for the consolidation rationale.
 """
@@ -735,6 +742,214 @@ async def _query_slots_detail(
             model or "(none)", exc,
         )
     return []
+
+
+# ===================================================================
+# Slot-occupancy sampling for Prometheus (LP-0MVT1O0VG00905EL)
+#
+# Power/VRAM/GTT reach Prometheus through node_exporter, but nothing published
+# llama-server *workload*, so "the GPU drew 115 W" could not be attributed to
+# llama-server. The proxy is the only component with a working /slots path
+# (child-port discovery, single-flight coalescing, failure counter), so the
+# sampler lives here rather than in a second host-side poller.
+#
+# Two hard requirements shape this code:
+#
+#   1. **Reuse the coalesced path.** A dedicated /slots client would multiply
+#      upstream requests on an endpoint that has already produced 1 392 timeout
+#      failures on this host, so every sample goes through
+#      ``_fetch_slots_payload()`` (1 s TTL, single-flight, 5 s failure backoff)
+#      targeting the discovered child port via ``_resolve_local_slots_target()``.
+#   2. **A failed query publishes nothing.** ``record_slot_occupancy(None)``
+#      leaves every gauge untouched; the heartbeat
+#      ``llama_slots_sample_timestamp_seconds`` therefore stops advancing, which
+#      is what makes a gap queryable instead of invisible.
+# ===================================================================
+
+DEFAULT_SLOT_METRICS_INTERVAL_SECONDS = 10.0
+"""Default sampler cadence (``server.llama_slot_metrics_interval_seconds``).
+
+One sample per 10 s bounds the added upstream load to less than the existing
+model-health loop's cadence, and Prometheus scrapes at 15 s so the extra
+resolution is not wasted.
+"""
+
+_SLOT_METRICS_TIMEOUT_SECONDS = 2.0
+"""``/slots`` budget for one sampler fetch — the existing 2 s default.
+
+Deliberately not configurable: the sampler must never extend the timeout budget
+of the status/progress paths that share the coalesced fetch.
+"""
+
+
+def _slot_metrics_interval_seconds(server_cfg: dict | None = None) -> float:
+    """Resolve the sampler cadence from the ``server`` config section.
+
+    Args:
+        server_cfg: The config's ``server`` mapping (or ``None``/``{}`` when
+            absent).
+
+    Returns:
+        The configured interval in seconds. An absent or malformed value falls
+        back to :data:`DEFAULT_SLOT_METRICS_INTERVAL_SECONDS`; a value ``<= 0``
+        means "disabled" and is returned as ``0.0`` (distinguishable from the
+        default so an explicit opt-out is honoured rather than silently
+        replaced by 10 s).
+    """
+    if not isinstance(server_cfg, dict):
+        return DEFAULT_SLOT_METRICS_INTERVAL_SECONDS
+    raw = server_cfg.get("llama_slot_metrics_interval_seconds")
+    if raw is None:
+        return DEFAULT_SLOT_METRICS_INTERVAL_SECONDS
+    try:
+        interval = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SLOT_METRICS_INTERVAL_SECONDS
+    return max(0.0, interval)
+
+
+async def _fetch_slots_payload_for_sampler(
+    url: str, timeout: float
+) -> tuple[list | None, str | None]:
+    """Fetch one ``/slots`` payload for the sampler, classifying failures.
+
+    Returns ``(payload, None)`` on a healthy 200 list body, else
+    ``(None, reason)`` where *reason* is the label the existing
+    ``llama_slots_query_failures_total{reason=...}`` counter uses
+    (``http_<code>``, ``timeout``, ``connection_error``, ``invalid_payload``,
+    ``unknown``).
+
+    The classification mirrors ``_query_slots()`` on purpose: the sampler needs
+    the raw list (per-slot ``is_processing`` / ``id_task``) rather than the
+    ``(available, total)`` tuple, so it calls the shared coalesced fetch itself
+    and must keep the failure vocabulary identical for the alert to work.
+    """
+    try:
+        status, data = await _fetch_slots_payload(url, timeout, None)
+    except TimeoutError:
+        return None, "timeout"
+    except Exception as exc:
+        if isinstance(exc, (ConnectionError, OSError)):
+            return None, "connection_error"
+        return None, "unknown"
+    if status != 200:
+        return None, f"http_{status}"
+    if not isinstance(data, list):
+        return None, "invalid_payload"
+    return data, None
+
+
+async def _sample_slot_occupancy(srv) -> dict | None:
+    """Take one slot-occupancy sample, or ``None`` when ``/slots`` failed.
+
+    Targets the discovered local child port (the router serialises
+    ``/slots?model=...`` behind the busy child and answers 500 to a cancelled
+    proxied poll) and goes through the coalesced fetch, so the sampler adds no
+    new HTTP client and no new request volume beyond its interval.
+
+    On failure the existing failure counter is incremented and ``None`` is
+    returned — the caller must publish nothing (never zero busy slots).
+    """
+    from proxy.metrics import summarise_slot_occupancy
+
+    config = getattr(srv, "config", None) or {}
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    try:
+        llama_port = int(server_cfg.get("llama_server_port", 8080) or 8080)
+    except (TypeError, ValueError):
+        llama_port = 8080
+    model = getattr(srv, "current_model", None) or None
+
+    try:
+        from proxy.router_helpers import _resolve_local_slots_target
+
+        # Filter to the current model so the sample does not describe the idle
+        # embedding child while the chat model is the one doing work.
+        _, llama_port = _resolve_local_slots_target(
+            srv, model=model, router_port=llama_port
+        )
+    except Exception:
+        # Discovery is best-effort: fall back to the router port and let the
+        # fetch below report the outcome (a failure still publishes nothing).
+        pass
+
+    url = _build_llama_url(llama_port, "/slots")
+    if model:
+        url = f"{url}?model={model}"
+
+    payload, reason = await _fetch_slots_payload_for_sampler(
+        url, _SLOT_METRICS_TIMEOUT_SECONDS
+    )
+    if payload is None:
+        _record_slots_query_failure(reason or "unknown")
+        return None
+    return summarise_slot_occupancy(payload, sampled_at=time.time())
+
+
+async def _slot_metrics_loop(
+    interval_seconds: float | None = None, srv=None
+) -> None:
+    """Refresh the slot-occupancy gauges on a fixed interval.
+
+    Takes one sample immediately so the first Prometheus scrape after a proxy
+    restart already sees occupancy, then repeats every *interval_seconds*.
+
+    Args:
+        interval_seconds: Cadence override; resolved from
+            ``server.llama_slot_metrics_interval_seconds`` when ``None``. A value
+            ``<= 0`` disables sampling and returns immediately.
+        srv: Server module stand-in (tests); defaults to the live
+            ``proxy.server`` module.
+
+    Never lets a sample failure escape: an exception is swallowed so one bad
+    iteration cannot cancel the sampler (or the proxy's lifespan) — the gauge
+    values simply stay at the previous successful sample.
+    """
+    if srv is None:
+        srv = _srv()
+    if interval_seconds is None:
+        config = getattr(srv, "config", None) or {}
+        server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+        interval_seconds = _slot_metrics_interval_seconds(server_cfg)
+
+    logger = getattr(srv, "logger", None)
+    if interval_seconds <= 0:
+        if logger is not None:
+            logger.info(
+                "Slot occupancy sampler disabled "
+                "(server.llama_slot_metrics_interval_seconds=%s)",
+                interval_seconds,
+            )
+        return
+
+    if logger is not None:
+        logger.info(
+            "Slot occupancy sampler started (interval %.1fs)", interval_seconds
+        )
+
+    while True:
+        try:
+            snapshot = await _sample_slot_occupancy(srv)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A sampler bug must not take the proxy down; the gauges keep their
+            # last successful values and the failure counter stays untouched
+            # (only classified /slots failures are counted there).
+            if logger is not None:
+                logger.debug(
+                    "Slot occupancy sample failed [%s]: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            snapshot = None
+        try:
+            from proxy.metrics import record_slot_occupancy
+
+            record_slot_occupancy(snapshot)
+        except Exception:
+            pass
+        await asyncio.sleep(interval_seconds)
 
 
 async def _query_slots_progress(
