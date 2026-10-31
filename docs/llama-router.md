@@ -205,6 +205,184 @@ error. See `proxy/tests/test_compaction_config.py`.
 > The local-summariser example above is retained for the backwards-compatible
 > path used only when `models.compact` is absent.
 
+### Boundary compaction (local → remote) (LP-0MVRBQBDF0037OZ5)
+
+A session that starts on the local model and later moves to a remote provider
+carries its full grown history upstream, paying for every locally-worked token
+as new remote input. **Boundary compaction** re-arms the compaction machinery
+at that handover: when a session that has been served locally is about to be
+dispatched to a `type: remote` provider, its oldest turns are summarised on the
+session's **own** local slot and the small compacted history is what goes
+upstream.
+
+> **This is not a re-enable of assembly-time compaction.** Prompt-assembly
+> compaction stays disabled (`server.compaction_trigger_ratio: 0`) per the
+> operator's 2026-09-17 decision (`LP-0MU61IRVC003RRN6`). Boundary compaction
+> has its **own** knob, which is neither read nor written by
+> `compaction_trigger_ratio` — enabling one never enables the other. The
+> assembly-time design lives in
+> [session-compaction-design.md](session-compaction-design.md); this section is
+> the only change to it.
+
+#### When it fires
+
+The decision is taken immediately before the remote request is sent, and fires
+only when **all four** gates hold:
+
+1. **Knob on.** `server.remote_boundary_compaction: true`. It ships `false` and
+   is independent of `compaction_trigger_ratio`.
+2. **The provider is remote.** The entry about to be dispatched must be
+   `type: remote`; a local dispatch is never compacted, because its KV cache is
+   still useful.
+3. **The session has local provenance.** The session store records at least one
+   prior locally-served turn (`Session.locally_served_turns`, read through
+   `SessionManager.has_local_provenance`). Provenance is a *recorded counter*,
+   never a live slot assignment, so a released, evicted or save/restored slot
+   does not disqualify a session.
+4. **The history clears the size guard.** The estimate of the outgoing history
+   must be **strictly greater** than
+   `server.remote_boundary_compaction_min_tokens` (default 20 000). Trivial
+   sessions are never summarised.
+
+```yaml
+server:
+  # Independent, default-off knob. Does NOT re-enable assembly-time compaction
+  # (`compaction_trigger_ratio`, which stays 0 — LP-0MU61IRVC003RRN6).
+  remote_boundary_compaction: false
+  # Minimum-size guard, in estimated tokens: sessions at or below this are
+  # never compacted. 20000 is a reasoned starting point, not a measured
+  # optimum. Must be a positive integer or startup fails.
+  remote_boundary_compaction_min_tokens: 20000
+```
+
+**To enable:** set `remote_boundary_compaction: true` and restart the proxy.
+**To tune:** raise or lower `remote_boundary_compaction_min_tokens` (raise it
+first if the added latency is unwelcome — only sessions above it are
+compacted). **To revert:** set the knob back to `false` and restart; request
+handling returns to today's behaviour and `compaction_trigger_ratio` is
+untouched either way. Both values are validated at startup
+(`validate_compaction_config` in `proxy/proxy/provider.py`): a non-boolean knob
+or a non-positive/non-integer guard fails startup with a clear error rather
+than being silently defaulted.
+
+> There is **no dry-run mode** for boundary compaction. `compaction_dry_run`
+> gates only the assembly-time path, so enabling this knob compacts live from
+> the first qualifying remote dispatch. Start with a high guard when trying it.
+
+#### Where it runs
+
+The hook is `evaluate_boundary_compaction` in
+`proxy/proxy/router_helpers.py`, called through
+`_evaluate_boundary_compaction_for_remote` in `proxy/proxy/provider.py` from
+**both** remote dispatch points (`_proxy_with_remote_fallback_cycle` for
+remote-only chains and `_proxy_with_fallback_cycle` for mixed local+remote
+chains) and from the direct remote dispatches in `proxy/proxy/ui.py`. It is
+idempotent per request cycle (`request._boundary_compaction_evaluated`), so a
+provider retry never re-summarises: exactly one summarisation per request.
+
+#### Slot reuse and the KV caveat
+
+`summarise_on_session_slot` looks the session's slot up **read-only**
+(`proxy.session._assigned_slot_for_session`) — it never assigns a slot, so it
+can never borrow another session's warm slot. `build_slot_pinned_summarizer`
+then posts to the local chat-completions endpoint with `id_slot` pinned to that
+slot and the session's **own local model name**; it never uses
+`server.summarizer_model.llama_model`, whose dedicated backend has an unrelated
+slot space.
+
+Prefilling the summarisation prompt **overwrites that slot's KV cache**. That
+is acceptable only because the session is leaving the local model: the lease is
+released immediately afterwards, so the overwritten KV is never consumed by
+this session again. A session with no assigned slot is skipped, never given
+another session's.
+
+#### Immediate release
+
+The session's local dispatch lease is released inside
+`summarise_on_session_slot`'s `finally` block — on success, on failure, on
+timeout, and on the no-assigned-slot path — so the release always precedes the
+remote stream. No local slot stays pinned to a session that is now served
+remotely.
+
+#### Fail-open, never lossy
+
+Every skip leaves the outgoing body **byte-identical** and lets the remote
+dispatch proceed. Blank text, the fail-open `EmptySummary` sentinel, a raising
+summariser and an exception in the hook itself are all handled the same way.
+There is **no remote summariser fallback**: the `models.compact`
+Muse → DeepSeek chain is *not* used by this path (parent Appendix Q3); a
+`models.compact` fallback remains an explicitly out-of-scope follow-up.
+
+A session that *should* have been compacted but was not is logged at
+**WARNING** with one stable reason token — exactly one WARNING per skip:
+
+| Token | Meaning operationally |
+|---|---|
+| `boundary_no_slot` | The session holds no local slot assignment. Nothing was summarised; the full history goes remote. Expected for sessions whose slot was already released or save/restored. |
+| `boundary_slot_unavailable` | The pinned local slot could not be reached at all (connection-level transport error). The local server may be down or the port wrong. |
+| `boundary_summarizer_failed` | The pinned call raised, returned blank text, or returned the `EmptySummary` sentinel (timeout / HTTP error / empty completion). Nothing is injected. |
+| `boundary_below_guard` | The session was remote, provenance-bearing and the knob was on, but the estimate did not exceed `remote_boundary_compaction_min_tokens`. Lower the guard to include it. |
+
+Two further tokens exist for degenerate cases: `boundary_evaluation_failed` (the
+hook itself raised; the request proceeds unchanged) is an outcome token, while
+`boundary_no_local_model` (config declares no local model, so there is no main
+local server to pin against) is the `EmptySummary` failure kind carried on the
+`boundary_summarizer_failed` skip.
+
+Normal, expected skips never warn: `boundary_no_local_provenance` is logged at
+INFO on the `boundary_compaction` line, while the shipped steady state —
+`boundary_disabled` (knob off), `boundary_not_remote`, `boundary_no_session`,
+`already_evaluated` and `boundary_no_history` (non-chat bodies such as
+`v1/embeddings`, which carry no history to compact) — emits **no line at all**,
+so the default configuration adds neither work nor log noise per request. When a
+helper-level skip occurs, the WARNING comes from `boundary_compaction_skipped`
+and the `boundary_compaction` summary line for the same evaluation is INFO, so
+filtering for WARNING still yields exactly one line per skip.
+
+#### Latency cost
+
+Summarisation is charged to the request **before remote TTFT**, which is why the
+minimum-size guard exists. The pinned call is bounded by the existing
+`server.compaction_summarizer_timeout` (default 600 s — no new timeout knob) and
+runs in a worker thread (`asyncio.to_thread`), so the event loop — including any
+in-flight local stream the summariser may be waiting behind — keeps running.
+
+#### Log lines
+
+All three lines go through the server logger:
+
+- `boundary_compaction` — one structured line per evaluation:
+  `session=… provider=… slot=… est_before=… est_after=…
+  turns_summarized=… recent_turns_kept=… duration_ms=… outcome=<token>`.
+  INFO for normal outcomes (and for skips the helper already warned about),
+  WARNING for `boundary_below_guard` and `boundary_evaluation_failed`.
+- `boundary_compaction_summarised` — INFO when the pinned summariser returned
+  usable text (`session`, `slot`, `reason=boundary_compact`).
+- `boundary_compaction_skipped` — WARNING with `session`, `slot` (when known)
+  and the reason token.
+
+The outcome dict is also stored on `request._boundary_compaction_result`.
+**Deviation from the parent plan:** unlike the local path, which emits
+`X-Compaction-Occurred` / `-Marker` / `-Turns-Summarized` /
+`-Recent-Turns-Kept`, the remote response path does not currently mirror
+boundary outcomes into `X-Compaction-*` headers — the structured log line is the
+observability surface for this feature today.
+
+#### Effect on the session
+
+On success the compacted list replaces `body_json["messages"]`, `cache_prompt`
+is set (the compacted prefix no longer matches the client's history, so a full
+prompt is sent), and the compacted history is stored on the session
+(`update_messages` + `mark_compacted`) so the next request's routing estimate
+and the post-compaction delta heal see exactly what the remote provider saw.
+Retention follows the shared invariant: system prompts and the first user
+prompt verbatim, whole recent turns kept within the mode target (38 000 tokens
+for `fast`/`medium`/`high`, 30 000 for `low`/`cheap`), the middle folded into
+the marked summary message.
+
+See `proxy/tests/test_compaction_boundary_remote.py` for the decision, slot-pin,
+release-ordering, fail-open and integration coverage.
+
 ## Routing-estimate tokenizer mismatch (LP-0MSAOQTJS000FFVM F2/F3 finding)
 
 The smart-routing clamp (`_effective_large_context_thresholds` in

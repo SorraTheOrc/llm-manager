@@ -4,6 +4,30 @@ Proxy-side local summarizer for session compaction (LP-0MTPMJG1P0038D32).
 Production ``Summarizer`` callable backed by the local llama-server
 (Qwen2.5-7B, LP-0MTXCQA8I0038J4X). Used by the compaction planner (proxy/compaction.py) to fold
 middle turns; fail-open so compaction never blocks dispatch.
+
+Local→remote boundary summariser (LP-0MVTDU91C003Q9YZ, parent
+LP-0MVRBQBDF0037OZ5): :func:`build_slot_pinned_summarizer` is the second
+callable this module exports. Instead of a dedicated summariser backend it
+posts to the **main local model** with ``id_slot`` pinned to the slot the
+session already owns, so boundary compaction reuses that session's
+disposable slot rather than borrowing another session's warm one.
+
+Slot-reuse KV caveat: prefilling the summarisation prompt overwrites the
+pinned slot's KV cache. That is acceptable *only* because boundary
+compaction runs when the session is leaving the local model — the caller
+releases the session's local dispatch lease immediately afterwards, so the
+destroyed KV is never consumed by that session again. Everything else
+(prompt assembly, retries, the :class:`proxy.compaction.EmptySummary`
+fail-open sentinel) is inherited from :func:`build_local_summarizer`.
+
+Fail-open, no remote fallback: a session with no assigned slot gets an inert
+summariser that never opens a connection and reports ``boundary_no_slot``
+via ``EmptySummary``; a transport failure or blank completion surfaces as
+``boundary_slot_unavailable`` / ``boundary_summarizer_failed`` in
+``proxy.router_helpers.summarise_on_session_slot``. The ``models.compact``
+Muse → DeepSeek chain is deliberately **not** a fallback for this path
+(parent Appendix Q3) — the skip is logged at WARNING and the request
+dispatches with its history untouched.
 """
 
 from __future__ import annotations

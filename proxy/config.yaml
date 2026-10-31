@@ -1527,16 +1527,24 @@ server:
   # history goes upstream — cutting remote input-token spend.
   #
   # Independent of `compaction_trigger_ratio` above: enabling this does NOT
-  # re-enable prompt-assembly compaction, and the knob below is neither read
-  # nor written by it. Shipped DISABLED so request handling is unchanged
-  # until the operator opts in (and so rollback is a one-line flip).
+  # re-enable prompt-assembly compaction (LP-0MU61IRVC003RRN6, operator
+  # request 2026-09-17), and neither key below is read or written by that
+  # trigger. Shipped DISABLED so request handling is unchanged until the
+  # operator opts in (and so rollback is a one-line flip: set it back to
+  # false and restart — `compaction_trigger_ratio` is untouched either way).
+  # There is no dry-run for this trigger: `compaction_dry_run` gates only the
+  # assembly-time path, so enabling this knob compacts live.
+  # Validated at startup (`validate_compaction_config`): a non-boolean value
+  # fails startup rather than being silently defaulted.
   remote_boundary_compaction: false
   # Minimum-size guard (estimated tokens). Sessions at or below this are
   # never compacted: the boundary adds summarisation latency before remote
   # TTFT, so only sessions whose remote prompt cost justifies it qualify.
   # 20000 is a REASONED starting point, not a measured optimum — comfortably
   # above trivial sessions and well below the ~180K assembly-time trigger.
-  # Tunable per deployment.
+  # Tunable per deployment; must be a positive integer (startup fails
+  # otherwise). Raise it if the added pre-remote-TTFT latency is unwelcome.
+  # See docs/llama-router.md → "Boundary compaction (local → remote)".
   remote_boundary_compaction_min_tokens: 20000
 
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---

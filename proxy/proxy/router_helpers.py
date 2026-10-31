@@ -17,6 +17,12 @@ Includes:
 - Session handling helper
 - Concurrency/slot helpers
 - Backend retry wrappers
+- Local→remote boundary compaction (``evaluate_boundary_compaction``,
+  ``summarise_on_session_slot``): the single hook that compacts a
+  locally-served session's oldest turns on its own local slot before a
+  ``type: remote`` dispatch. Its trigger, fail-open WARNING reason tokens
+  and the slot-reuse KV caveat are documented in
+  ``docs/llama-router.md`` → "Boundary compaction (local → remote)".
 """
 
 import asyncio

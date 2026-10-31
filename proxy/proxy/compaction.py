@@ -69,6 +69,25 @@ Local→remote boundary trigger (LP-0MVTDU6Y1004ZCGX):
   dispatch change of its own; the remote-dispatch hook consumes its
   verdict.
 
+  Fail-open contract for that trigger (parent AC4): when boundary
+  compaction cannot run, the outgoing history is left byte-identical and
+  the request still dispatches remote. The skip is logged at **WARNING**
+  with one stable reason token — ``boundary_no_slot`` (session holds no
+  local slot), ``boundary_slot_unavailable`` (pinned slot unreachable),
+  ``boundary_summarizer_failed`` (pinned call raised / returned blank /
+  ``EmptySummary``) or ``boundary_below_guard`` (estimate did not exceed
+  ``server.remote_boundary_compaction_min_tokens``). There is **no remote
+  summariser fallback**: the ``models.compact`` chain is not consulted for
+  this path (parent Appendix Q3) — skipping is the whole failure policy.
+
+  Slot-reuse KV caveat: the summarisation runs on the session's *own*
+  local slot (``id_slot`` pinned by
+  ``compaction_summarizer.build_slot_pinned_summarizer``), which is
+  disposable only because the session is leaving the local model.
+  Prefilling that prompt overwrites the slot's KV cache; the caller must
+  release the session's local dispatch lease immediately afterwards, so
+  the destroyed KV is never reused by that session.
+
 Summary lifecycle (R5, LP-0MTTPXIIX005Y0Z9):
   1. CREATION — a session with no prior summary (``extract_previous_summary``
      returns None) is summarised with the full SUMMARIZATION_PROMPT; the
