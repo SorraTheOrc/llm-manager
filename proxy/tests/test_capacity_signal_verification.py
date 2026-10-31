@@ -22,7 +22,10 @@ observable measurement contract without needing the production log directory:
   (inside the window, at its head, and — only when the window is closed — at
   its tail) that must never let a partial read look like a measurement;
 * the CLI contract: exit 0 for a covered (even empty) window, exit 3 for a
-  coverage gap, and the ``--json`` document shape.
+  coverage gap, and the ``--json`` document shape;
+* ``measured_cache_deficit`` as an abandonment reason, so the release the proxy
+  writes when it aborts a fake-warm local dispatch is attributable (red-first:
+  see the marker notes in the ``_ABANDON_REASONS`` section).
 """
 
 from __future__ import annotations
@@ -1181,6 +1184,158 @@ def test_bulk_eviction_keeps_one_event_per_session(csv, tmp_path):
     )
 
     assert [event["session"] for event in events] == ["s1", "s2", "s3"]
+
+
+# ---------------------------------------------------------------------------
+# measured_cache_deficit is an abandonment (LP-0MVUVHAFR0018V21)
+#
+# The AC4 baseline (night 2026-10-29 20:00 -> 2026-10-30 07:00) left 5 of its
+# 12 residual ``saturated``-without-live-work polls unattributable because the
+# release that explained them carried ``reason=measured_cache_deficit``: a
+# reason ``_ABANDON_REASONS`` did not carry, so the event never reached the
+# attribution join. The set is widened from the constant the proxy itself
+# exports (``proxy.measured_cache_abort.MEASURED_CACHE_DEFICIT_REASON``) rather
+# than from a repeated literal, so the script cannot drift from the reason the
+# proxy actually writes.
+#
+# Red-first encoding (the repository convention — see the module docstring of
+# ``test_abandoned_local_dispatch.py``): the assertions pinning behaviour that
+# does not exist yet are marked ``pytest.mark.xfail(strict=True)`` so this
+# test-only item lands on ``dev`` with a green suite. The paired implementation
+# item (LP-0MVUVHBD40067FE3) extends ``_ABANDON_REASONS`` and removes the
+# markers; ``strict`` fails the suite as soon as a marked assertion starts
+# passing, so a marker cannot be forgotten. The two control cases run unmarked
+# and pass both before and after the change.
+# ---------------------------------------------------------------------------
+
+#: The four reasons the set carried before this item (the pre-change baseline).
+_PRE_EXISTING_ABANDON_REASONS = (
+    "prefill_deadline",
+    "session_evicted",
+    "no_progress_watchdog",
+    "client_disconnect",
+)
+
+
+def _measured_cache_deficit_reason() -> str:
+    """The proxy's own reason string — imported, never re-typed as a literal."""
+    from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
+
+    return MEASURED_CACHE_DEFICIT_REASON
+
+
+def test_abandon_reasons_keep_the_four_existing_reasons(csv):
+    """Control: the change extends the set, it never replaces or narrows it.
+
+    Every existing attribution case for these four reasons must keep passing
+    unchanged, so their membership is pinned independently of the new reason.
+    """
+    assert set(_PRE_EXISTING_ABANDON_REASONS) <= csv._ABANDON_REASONS
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Red-first (LP-0MVUVHAFR0018V21): _ABANDON_REASONS does not carry "
+        "measured_cache_abort.MEASURED_CACHE_DEFICIT_REASON yet; "
+        "LP-0MVUVHBD40067FE3 removes this marker as it extends the set."
+    ),
+)
+def test_abandon_reasons_include_the_measured_cache_deficit_constant(csv):
+    """The set is widened from the proxy's constant, not from a literal copy."""
+    assert _measured_cache_deficit_reason() in csv._ABANDON_REASONS
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Red-first (LP-0MVUVHAFR0018V21): a measured_cache_deficit release is "
+        "dropped by analyse_abandonment_events until _ABANDON_REASONS carries "
+        "the reason; LP-0MVUVHBD40067FE3 removes this marker."
+    ),
+)
+def test_measured_cache_deficit_release_attributes_the_saturated_poll(
+    csv, tmp_path
+):
+    """A ``measured_cache_deficit`` release explains the poll that follows it.
+
+    This is the shape the AC4 baseline could not explain: a deficit release
+    seconds before a fresh ``saturated`` poll with nothing in flight. Once the
+    reason is in the set, the release is an abandonment event and the adjacent
+    poll is attributed instead of counted as unattributable.
+    """
+    reason = _measured_cache_deficit_reason()
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:10:00", reason=reason)
+        + status_line(
+            "2026-10-23 00:11:00",
+            hint="saturated",
+            stale="false",
+            detail_stale="false",
+            in_flight=0,
+            available="0",
+            latency_ms=3100,
+        ),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    assert report["abandonment_events"] == {
+        "count": 1,
+        "by_reason": {reason: 1},
+    }
+    attribution = report["attribution"]
+    assert attribution["attributed_polls"] == 1
+    assert attribution["unattributed_polls"] == 0
+    assert attribution["by_cause"] == {reason: 1}
+    assert attribution["rows"][0]["evidence_timestamp"] == "2026-10-23 00:10:00"
+    assert attribution["rows"][0]["seconds_since_evidence"] == 60
+
+
+def test_measured_cache_deficit_release_outside_lookback_is_not_attributed(
+    csv, tmp_path
+):
+    """Control: widening the reasons must not widen the 600 s lookback.
+
+    A deficit release 20 minutes before the poll is inside the measured window
+    but outside the attribution lookback, so the poll stays unattributed. The
+    time bound is deliberately unchanged by the reason change.
+    """
+    reason = _measured_cache_deficit_reason()
+    log_dir = tmp_path / "logs"
+    write_log(
+        log_dir / "proxy.log",
+        lease_released_line("2026-10-23 00:00:00", reason=reason)
+        + status_line(
+            "2026-10-23 00:20:00",
+            hint="saturated",
+            stale="false",
+            detail_stale="false",
+            in_flight=0,
+            available="0",
+        ),
+    )
+
+    report = csv.measure(
+        log_dir,
+        since=dt.datetime(2026, 10, 23, 0, 0),
+        until=dt.datetime(2026, 10, 23, 7, 0),
+        dispatch_log=None,
+    )
+
+    attribution = report["attribution"]
+    assert attribution["attributed_polls"] == 0
+    assert attribution["unattributed_polls"] == 1
+    assert attribution["by_cause"] == {}
+    assert attribution["rows"][0]["cause"] is None
+    assert attribution["rows"][0]["evidence_timestamp"] is None
 
 
 # ---------------------------------------------------------------------------
