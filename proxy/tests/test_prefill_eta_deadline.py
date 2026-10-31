@@ -268,42 +268,81 @@ def test_record_guard_decision_logs_deadline_refusal(caplog):
 
 
 # ---------------------------------------------------------------------------
-# Direct dispatch path: reason propagates correctly
+# Direct dispatch path: the production guard owns the label mapping
 # ---------------------------------------------------------------------------
 
-def test_direct_path_uses_deadline_reason_in_log(caplog):
-    """The direct dispatch path logs ``prefill_eta_exceeds_deadline`` not
-    ``eta_exceeds_budget_direct`` when the deadline is the cause."""
+#: The label the direct (free-slot) dispatch passes to the guard
+#: (LP-0MVIQ0F8T002FS42).
+_DIRECT_REASON_LABEL = "eta_exceeds_budget_direct"
+
+
+async def _drive_direct_guard(cfg: dict, tokens: int, caplog) -> str:
+    """Drive ``provider._prefill_admission_guard`` exactly as the direct path.
+
+    The free-slot dispatch calls the one guard implementation with
+    ``reason_label="eta_exceeds_budget_direct"`` and ``free_slot=True``, and
+    that call is the only place the log label is decided. Driving it — instead
+    of re-deriving the ``startswith(…)`` rule in the test body — makes a
+    broken mapping in the guard fail these tests (LP-0MVT3TBGD007HWHK
+    AC1/AC2/AC4/AC6).
+
+    Occupancy is pinned to an idle gate so each case isolates the label
+    mapping; the occupancy-aware bounds have their own module
+    (``test_prefill_eta_occupancy``).
+
+    Returns the single emitted ``local_admission_guard`` line.
+    """
+    from unittest.mock import patch
+
+    import proxy.provider as provider
+
     caplog.set_level(logging.INFO, logger="llama-proxy")
+    with (
+        patch("proxy.provider._get_local_concurrency_info", _FreeConcurrency()),
+        patch("proxy.router_helpers._get_live_prefill_in_flight_count", lambda _srv: 0),
+        patch("proxy.provider._local_occupant_prefill_seconds", lambda *a, **k: 0.0),
+        _guard_patches(tokens=tokens),
+    ):
+        decision = await provider._prefill_admission_guard(
+            cfg,
+            {"name": "local-llama", "llama_model": "Qwen3"},
+            tokens,
+            "session-direct",
+            priority="low",
+            max_local=1,
+            reason_label=_DIRECT_REASON_LABEL,
+            free_slot=True,
+        )
+
+    assert decision is not None, "the free-slot guard must reach a decision"
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("local_admission_guard decision=")
+    ]
+    assert len(lines) == 1, f"expected exactly one guard line, got {lines}"
+    return lines[0]
+
+
+@pytest.mark.asyncio
+async def test_direct_path_uses_deadline_reason_in_log(caplog):
+    """AC1: the direct guard logs ``prefill_eta_exceeds_deadline`` — never
+    the generic ``eta_exceeds_budget_direct`` label — when the deadline is the
+    cause."""
     _seed_samples(tokens=100_000, ratio=0.0, ms_per_token=3.9, count=6)
-    cfg = _cfg()
-    decision = prefill_eta.evaluate_admission(cfg, "Qwen3", 100_000, 0.0, "low")
 
-    assert decision.admit is False
-    assert decision.reason == "prefill_eta_exceeds_deadline"
+    line = await _drive_direct_guard(_cfg(), 100_000, caplog)
 
-    # Simulate what _prefill_admission_guard does for the direct path:
-    reason_label = "eta_exceeds_budget_direct"
-    log_label = reason_label
-    if reason_label and str(decision.reason).startswith("prefill_eta_exceeds_deadline"):
-        log_label = decision.reason
-
-    prefill_eta.record_guard_decision(
-        decision, reason_label=log_label, free_slot=True,
-    )
-
-    line = next(
-        r.getMessage() for r in caplog.records
-        if r.getMessage().startswith("local_admission_guard")
-    )
-    assert "prefill_eta_exceeds_deadline" in line
+    assert "decision=reject" in line
+    assert "reason=prefill_eta_exceeds_deadline" in line
     assert "free_slot=true" in line
-    assert "eta_exceeds_budget_direct" not in line
+    assert _DIRECT_REASON_LABEL not in line
 
 
-def test_direct_path_budget_refusal_keeps_original_label(caplog):
-    """When the budget (not deadline) fires, the direct label is preserved."""
-    caplog.set_level(logging.INFO, logger="llama-proxy")
+@pytest.mark.asyncio
+async def test_direct_path_budget_refusal_keeps_original_label(caplog):
+    """AC2: when the budget (not the deadline) fires, the direct guard keeps
+    the ``eta_exceeds_budget_direct`` label."""
     # A 15k cache-cold prompt costs 15k * 4.68 ms ≈ 70.2 s: above the 60 s
     # budget but below the 90 s deadline ⇒ ONLY the budget bound fires and
     # the direct path keeps its ``…_direct`` log label.
@@ -312,25 +351,56 @@ def test_direct_path_budget_refusal_keeps_original_label(caplog):
         contention_queue_max_wait_seconds=60,
         local_prefill_deadline_seconds=90,
     )
-    decision = prefill_eta.evaluate_admission(cfg, "Qwen3", 15_000, 0.0, "low")
 
-    assert decision.admit is False
-    assert decision.reason == "eta_exceeds_budget"
-    assert decision.eta_prefill_seconds < decision.prefill_deadline_seconds
+    line = await _drive_direct_guard(cfg, 15_000, caplog)
 
-    reason_label = "eta_exceeds_budget_direct"
-    log_label = reason_label  # stays
-
-    prefill_eta.record_guard_decision(
-        decision, reason_label=log_label, free_slot=True,
-    )
-
-    line = next(
-        r.getMessage() for r in caplog.records
-        if r.getMessage().startswith("local_admission_guard")
-    )
-    assert "eta_exceeds_budget_direct" in line
+    assert "decision=reject" in line
+    assert f"reason={_DIRECT_REASON_LABEL}" in line
+    assert "free_slot=true" in line
     assert "prefill_eta_exceeds_deadline" not in line
+
+
+@pytest.mark.asyncio
+async def test_direct_path_safety_budget_keeps_own_reason(caplog):
+    """AC3/AC6: the deadline-relative cold-prefill safety budget keeps its own
+    reason on the direct path.
+
+    72 500 cold tokens at the clamped 1.2 ms/token floor cost ≈ 87 s: above
+    the 85.5 s safety budget (0.95 × 90 s) but below the 90 s deadline, so the
+    safety bound is the reason that fires.
+    """
+    _seed_samples(tokens=72_500, ratio=0.0, ms_per_token=1.0, count=6)
+    cfg = _cfg(
+        local_prefill_deadline_seconds=90,
+        local_admission_guard_budget_safety_fraction=0.95,
+    )
+
+    line = await _drive_direct_guard(cfg, 72_500, caplog)
+
+    assert "decision=reject" in line
+    assert "reason=prefill_eta_exceeds_safety_budget" in line
+    assert "free_slot=true" in line
+    assert _DIRECT_REASON_LABEL not in line
+
+
+@pytest.mark.asyncio
+async def test_direct_path_cold_prefill_budget_keeps_own_reason(caplog):
+    """AC3/AC6: the flat cold-prefill token cap keeps its own reason on the
+    direct path. The cap is calibration-independent, so no samples are seeded.
+    """
+    cfg = _cfg(
+        local_cold_prefill_budget_tokens=25_000,
+        # Below the cap so the percentile-pricing warning cannot fire: this
+        # case isolates the flat token-cap label, not the band guard.
+        local_admission_guard_eta_percentile_min_tokens=20_000,
+    )
+
+    line = await _drive_direct_guard(cfg, 40_000, caplog)
+
+    assert "decision=reject" in line
+    assert "reason=prefill_budget_exceeded" in line
+    assert "free_slot=true" in line
+    assert _DIRECT_REASON_LABEL not in line
 
 
 # ---------------------------------------------------------------------------
