@@ -40,6 +40,12 @@ that contract to the *kind* of refusal: the 429 body and the single
 ``admission_reserve.local_capacity_verdict`` — ``deferrable`` when waiting can
 help, ``too_large`` when the request exceeds the local serving envelope — while
 retry timing and every pre-existing field stay untouched.
+
+The free-slot over-budget slice (LP-0MVT3TB6800010XO) pins what a client
+observes on the **direct** path: a prompt above the flat cold-prefill cap is
+refused without a timer (``retryable: false``, compaction guidance, token
+evidence) even when a local slot is free, and a too-large pin-local request on
+a hybrid chain is promoted to the remote tier instead of refused.
 """
 
 from __future__ import annotations
@@ -1542,6 +1548,129 @@ async def test_direct_free_slot_budget_refusal_keeps_its_reason(
     assert "reason=prefill_budget_exceeded" in guard_lines[0]
     assert "free_slot=true" in guard_lines[0]
     assert "reason=eta_exceeds_budget_direct" not in guard_lines[0]
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVT3TB6800010XO (parent AC2): the free-slot over-budget refusal the
+# client observes
+#
+# The unit-level pin in ``test_cold_prefill_budget.py``
+# (``test_direct_free_slot_guard_refuses_an_over_budget_request``) asserts only
+# the guard's decision. These cases pin what a client actually receives on the
+# free-slot (direct) path: the no-timer refusal with compaction evidence, and
+# the promotion of a too-large pin-local request.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_direct_free_slot_over_budget_refusal_is_not_time_retryable():
+    """AC1/AC3/AC4/AC6: the free-slot refusal carries the no-timer contract.
+
+    A free local slot is not permission to start a prefill that can never fit
+    the flat cold-prefill cap: with no fallback provider the client gets the
+    ``prefill_budget_exceeded`` 429, and its retry story — no
+    ``Retry-After``, ``retryable: false``, compaction guidance, token
+    evidence on headers and body — is the one
+    ``_refusal_retry_timing`` decides for that reason.
+    """
+
+    async def _local(_req, _path):
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(),
+            "v1/chat/completions",
+            _local_only_model_config(),
+            _cold_budget_cfg(),
+        )
+
+    body = _assert_prefill_budget_refusal_contract(result)
+    assert body["reason"] == "prefill_budget_exceeded"
+    assert result.headers.get("X-Local-Fallback-Reason") == body["reason"], (
+        "the header and the body must name the same governing reason"
+    )
+
+    # AC3: the recorded attempt carries the governing reason, never the
+    # free-slot dispatch label.
+    attempts = _recorded_admission_rejections(body)
+    assert [attempt["reason"] for attempt in attempts] == [
+        "prefill_budget_exceeded"
+    ]
+    assert "eta_exceeds_budget_direct" not in {
+        attempt["reason"] for attempt in attempts
+    }
+
+    # AC4: the timer story is asserted through the shared decision instead of
+    # re-deriving its arithmetic or copying its reason table here.
+    assert "prefill_budget_exceeded" in provider.NOT_TIME_RETRYABLE_REFUSAL_REASONS
+    timing = provider._refusal_retry_timing(
+        body["reason"],
+        eta_prefill_seconds=body["eta_prefill_seconds"],
+        budget_seconds=body["budget_seconds"],
+        config=_cold_budget_cfg(),
+    )
+    assert timing.retryable is False
+    assert timing.retry_after is None
+    assert timing.retry_at is None
+    assert body["retryable"] is timing.retryable
+    assert body["retry_after"] == timing.retry_after
+    assert body.get("retry_at") == timing.retry_at
+
+
+@pytest.mark.asyncio
+async def test_direct_free_slot_over_budget_pin_local_is_promoted(
+    mixed_model_config,
+):
+    """AC2: a free-slot too-large pin-local request is promoted, not refused.
+
+    The prompt outgrows the local serving envelope, so waiting cannot help and
+    the pin is declined (LP-0MVSLZY470051ZB2 AC4): with a remote provider on
+    the chain the request is served remotely — 200, ``X-Local-Route: remote``,
+    no ``Retry-After``, no local-capacity refusal body.
+    """
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"x-local-preference": "local-only"}),
+            "v1/chat/completions",
+            mixed_model_config,
+            _cold_budget_cfg(),
+        )
+
+    assert calls == ["remote"], (
+        "a free-slot too-large pin-local request must be served remotely; "
+        f"got dispatches={calls}"
+    )
+    assert result.status_code == 200, f"got {result.status_code}"
+    assert result.headers.get("X-Local-Route") == "remote"
+    assert result.headers.get("Retry-After") is None, (
+        "waiting cannot help; the promoted response must not advertise a delay"
+    )
+    body = json.loads(result.body)
+    assert body.get("code") != provider.EXHAUSTION_CODE_LOCAL_ADMISSION, (
+        "promotion must not produce a local-capacity refusal"
+    )
 
 
 @pytest.mark.parametrize(
