@@ -1938,7 +1938,9 @@ non-negative — so the endpoint-wide entry can never collide with a real slot
 Readers must go through :func:`_abandoned_slot_endpoint_wide`, **never**
 :func:`_abandoned_slot_for`: an endpoint-wide entry names no slot, so applying
 it to a live slot is only safe behind the "no live dispatch record / lease
-owner" guard of the status builder (LP-0MVUVHB1V006HA5I).
+owner" guard of the status builder (LP-0MVUVHB1V006HA5I). It is dropped by
+:func:`_clear_abandoned_slot` (``scope="endpoint"``) once a **fresh**
+``/slots`` snapshot reports nothing processing on the endpoint.
 """
 
 _abandoned_slots: dict[tuple[str, int], dict] = {}
@@ -2120,6 +2122,56 @@ def _abandoned_slot_endpoint_wide(
         if sid == ABANDONED_SLOT_ENDPOINT_WIDE:
             return entry
     return None
+
+
+def _clear_abandoned_slot(
+    slot_id: int | None = None,
+    *,
+    scope: str = "slot",
+) -> int:
+    """Drop live abandonment entries for one slot or for the whole endpoint.
+
+    The *only* sanctioned clear path, and the exact mirror of the lookups:
+
+    - ``scope="slot"`` drops every entry naming *slot_id* — the shape a
+      **fresh** ``/slots`` reading reporting that slot not processing proves
+      is no longer draining (LP-0MVUVHB1V006HA5I AC2).
+    - ``scope="endpoint"`` drops the endpoint-wide entries
+      (:data:`ABANDONED_SLOT_ENDPOINT_WIDE`), used only when a fresh snapshot
+      reports **nothing** processing on the endpoint.
+
+    Both clear across endpoint labels, symmetrically with
+    :func:`_abandoned_slot_for` / :func:`_abandoned_slot_endpoint_wide`: when
+    the write and read sides disagree about the label, a stale annotation must
+    still be removable once the backend reports the slot free.
+
+    Callers **must** gate this on fresh evidence. A cached snapshot is a
+    fossil of a past request and is never proof that the slot was released, so
+    the status builder only clears when ``not stale``.
+
+    Read-only with respect to capacity: clearing touches only this in-process
+    registry — no lease is released, no counter is decremented, nothing is
+    re-recorded. Returns how many entries were removed (0 is normal).
+    """
+    if scope == "endpoint":
+        doomed = [
+            key
+            for key in _abandoned_slots
+            if key[1] == ABANDONED_SLOT_ENDPOINT_WIDE
+        ]
+    elif _abandoned_slot_is_real_id(slot_id):
+        doomed = [
+            key
+            for key, entry in _abandoned_slots.items()
+            if entry.get("slot_id") == slot_id
+        ]
+    else:
+        # Nothing to clear: an unresolvable identity names no slot, and the
+        # endpoint-wide entry is only reachable through ``scope="endpoint"``.
+        return 0
+    for key in doomed:
+        _abandoned_slots.pop(key, None)
+    return len(doomed)
 
 
 def _abandoned_slot_count(

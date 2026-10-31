@@ -472,13 +472,19 @@ async def get_llama_local_status(request: Request):
     with its slot identity, so a slot llama-server has not released yet is
     annotated instead of counted as live work. Each slot carries ``abandoned``
     (bool), ``abandonment_reason`` and ``abandoned_session_id`` (both ``None``
-    when the slot is not abandoned) and ``abandoned_at_seconds_ago``; the
+    when the slot is not abandoned), ``abandoned_at_seconds_ago`` and
+    ``abandoned_scope`` (``"slot"`` | ``"endpoint"`` | ``None`` — which
+    registry entry produced the annotation: LP-0MVUVHB1V006HA5I); the
     top-level payload carries ``local_abandoned_slots`` (count of annotated
     slots). ``capacity_hint`` gains the additive value ``abandoned_busy`` —
     occupied only by abandoned work — so ``saturated`` keeps meaning live,
     proxy-owned decode work; a genuinely busy GPU is never reported ``idle``.
-    Consumers must treat any unrecognised hint value (this one included) as
-    busy, never as idle.
+    A draining slot the proxy abandoned without a usable slot identity is
+    annotated from the endpoint-wide entry (``abandoned_scope="endpoint"``)
+    only while no lease or live dispatch record owns it, and the entry is
+    dropped as soon as a fresh ``/slots`` snapshot reports the slot (or the
+    whole endpoint) free. Consumers must treat any unrecognised hint value
+    (this one included) as busy, never as idle.
 
     Per-slot capacity (LP-0MVGDUVGE0024YAI, ``status_schema_version: 3``):
     each slot also carries ``owner_session_id`` and ``lease_state``

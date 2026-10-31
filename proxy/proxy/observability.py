@@ -2078,12 +2078,42 @@ def annotate_slots_for_status(
     (``prefill_eta_kind`` / ``prefill_eta_assumed_cached_ratio``) plus the
     abandonment annotation
     (``abandoned`` / ``abandonment_reason`` / ``abandoned_session_id`` /
-    ``abandoned_at_seconds_ago``, LP-0MVRMI5HK00558TB AC1). Never mutates the
+    ``abandoned_at_seconds_ago`` / ``abandoned_scope``,
+    LP-0MVRMI5HK00558TB AC1). Never mutates the
     input dicts (the per-slot detail cache must stay pristine) and never raises
     — a failure leaves the base fields intact. Per-slot ETAs are ``None`` when
     the underlying ``/slots`` poll is stale (AC7) rather than echoing a stale
     number, and the estimate comes from the shared ``prefill_eta`` calibration
     (AC3), never a second estimator.
+
+    The abandonment annotation is matched in order
+    (LP-0MVUVHB1V006HA5I AC2/AC3):
+
+    1. the **exact** ``(endpoint, slot)`` registry entry — ``abandoned_scope``
+       is ``"slot"``;
+    2. the **endpoint-wide** entry (:func:`_abandoned_slot_endpoint_wide`),
+       which names no slot and is therefore applied **only** to a processing
+       slot with no lease owner and no live dispatch record (that is exactly
+       what ``owner_session_id is None`` means here) — ``abandoned_scope`` is
+       ``"endpoint"``;
+    3. otherwise no annotation (``abandoned_scope`` is ``None``).
+
+    Step 2 closes the shapes the exact match cannot: an abandonment whose
+    resolved slot id no longer matches the slot llama-server is still draining,
+    and one recorded with no slot identity at all (the measured cache-deficit
+    abort). A pool occupied only by such ghosts then reads
+    ``abandoned_busy`` from rule 0 of :func:`compute_capacity_hint`, never
+    ``saturated`` — while any live proxy-owned work keeps its verdict.
+
+    On a **fresh** snapshot (``stale=False``) the annotation also clears the
+    registry entries the backend has disproved: a slot reported not processing
+    drops its exact entry, and a snapshot with nothing processing drops the
+    endpoint-wide entry (:func:`proxy.router_helpers._clear_abandoned_slot`).
+    A *stale* snapshot is a fossil of a past request and never clears
+    anything. Clearing is registry hygiene only — no lease is released and no
+    capacity counter changes. A snapshot that reports **no slots at all** (no
+    model loaded, server down) annotates and clears nothing: omitting a slot id
+    is not evidence about that slot.
 
     The per-slot ETA carries the same labelling as the top-level field
     (LP-0MVSD5RJW008F1IB AC2): ``per_slot_prefill_eta_seconds`` always prices
@@ -2121,9 +2151,36 @@ def annotate_slots_for_status(
     except Exception:
         processing_map = {}
     try:
-        from proxy.router_helpers import _abandoned_slot_for
+        from proxy.router_helpers import _abandoned_slot_endpoint_wide, _abandoned_slot_for
     except Exception:  # pragma: no cover - defensive
         _abandoned_slot_for = None
+        _abandoned_slot_endpoint_wide = None
+    try:
+        from proxy.router_helpers import _clear_abandoned_slot
+    except Exception:  # pragma: no cover - defensive
+        _clear_abandoned_slot = None
+
+    # Fresh evidence of freedom drops what the backend has disproved
+    # (LP-0MVUVHB1V006HA5I). Ordering matters: clear *before* annotating so a
+    # slot llama-server reports free cannot be labelled from an entry this very
+    # call has just removed. A stale snapshot never clears anything — a cached
+    # ``is_processing`` is a fossil, not proof of release.
+    if not stale and _clear_abandoned_slot is not None:
+        try:
+            any_processing = False
+            for slot in slot_details:
+                if not isinstance(slot, dict):
+                    continue
+                if bool(slot.get("is_processing", False)):
+                    any_processing = True
+                    continue
+                _clear_abandoned_slot(slot.get("slot_id"), scope="slot")
+            if not any_processing:
+                # Nothing is processing on this endpoint, so no slot-less
+                # abandonment can still describe a draining ghost.
+                _clear_abandoned_slot(scope="endpoint")
+        except Exception:
+            pass
 
     annotated: list[dict] = []
     for slot in slot_details:
@@ -2169,12 +2226,35 @@ def annotate_slots_for_status(
         # consumer can tell a ghost from live proxy-owned work. Always present
         # and always attributable — ``abandoned`` is paired with the reason and
         # the abandoning session, never emitted as a bare boolean.
+        #
+        # LP-0MVUVHB1V006HA5I AC2/AC3: an exact match wins; failing that, an
+        # endpoint-wide entry annotates a *processing* slot that neither a
+        # lease nor a live dispatch record owns (``owner_session_id is None``),
+        # which is what makes the draining ghost behind a cancelled dispatch
+        # attributable without ever relabelling live work. ``abandoned_scope``
+        # publishes which of the two produced the annotation (additive field,
+        # ``None`` when the slot is not abandoned).
         abandonment = None
+        abandoned_scope = None
         if _abandoned_slot_for is not None and slot_id is not None:
             try:
                 abandonment = _abandoned_slot_for(slot_id)
             except Exception:
                 abandonment = None
+            if abandonment is not None:
+                abandoned_scope = "slot"
+        if (
+            abandonment is None
+            and is_processing
+            and owner_session_id is None
+            and _abandoned_slot_endpoint_wide is not None
+        ):
+            try:
+                abandonment = _abandoned_slot_endpoint_wide()
+            except Exception:
+                abandonment = None
+            if abandonment is not None:
+                abandoned_scope = "endpoint"
         entry["abandoned"] = abandonment is not None
         entry["abandonment_reason"] = (
             abandonment.get("reason") if abandonment else None
@@ -2187,6 +2267,7 @@ def annotate_slots_for_status(
             if abandonment
             else None
         )
+        entry["abandoned_scope"] = abandoned_scope
         annotated.append(entry)
     return annotated
 
