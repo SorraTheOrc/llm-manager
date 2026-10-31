@@ -82,6 +82,10 @@ DOCUMENTED_EXIT_TOKENS = {
     # Structural refusals.
     "local_only_no_local_route",
     "local_route_unavailable",
+    # Bounded deferral (LP-0MVUH9PL0005PW90): the session spent its
+    # retryable-refusal budget, so the pin is declined and a remote tier serves
+    # the request. A promotion with its own token — not a capacity reason.
+    "deferral_refusals_exhausted",
 }
 
 
@@ -258,12 +262,21 @@ def test_promoting_rows_are_exactly_the_implementation_too_large_reasons():
     outcomes = _documented_outcomes(_section(ROUTING_DOC.read_text()))
     promoting = {token for token, outcome in outcomes.items() if outcome == "promoting"}
 
-    assert promoting == set(admission_reserve.CAPACITY_TOO_LARGE_REASONS), (
-        "routing.md must mark exactly the implementation's too-large reasons as "
+    # Two promotion *causes* exist and both must read as promoting: the
+    # capacity verdict (this prompt can never fit local) and the bounded
+    # deferral (this session has been told to retry too many times). The
+    # equivalence stays exact in both directions — a new promoting row that is
+    # neither fails here, and a cause that stops promoting fails too
+    # (LP-0MVUH9PL0005PW90).
+    expected_promoting = set(admission_reserve.CAPACITY_TOO_LARGE_REASONS) | {
+        admission_reserve.LOCAL_FALLBACK_DEFERRAL_EXHAUSTED
+    }
+    assert promoting == expected_promoting, (
+        "routing.md must mark exactly the implementation's promotion reasons as "
         "promoting; documented-but-not-implemented="
-        f"{sorted(promoting - set(admission_reserve.CAPACITY_TOO_LARGE_REASONS))} "
+        f"{sorted(promoting - expected_promoting)} "
         "implemented-but-not-documented="
-        f"{sorted(set(admission_reserve.CAPACITY_TOO_LARGE_REASONS) - promoting)}"
+        f"{sorted(expected_promoting - promoting)}"
     )
     # AC3 names the two promoting exits explicitly.
     assert {"context_too_large", "prefill_budget_exceeded"} <= promoting, (

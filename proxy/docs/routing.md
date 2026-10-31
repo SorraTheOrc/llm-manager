@@ -1585,6 +1585,7 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Outside the entry's `available_times` window (chain resolution) | `outside_available_window` | refusing | `Skipping provider=<local>: outside its available_times window (UTC) reason=outside_available_window ...` |
 | The chain has no local entry at all | `local_only_no_local_route` | refusing | `local_only_refused reason=local_only_no_local_route preference=local-preferred verdict=deferrable` |
 | Any exit that left no reason on the request (e.g. a plain post-dispatch slot-exhaustion 503) | `local_route_unavailable` | refusing | `local_only_refused reason=local_route_unavailable preference=local-preferred verdict=deferrable` |
+| Bounded deferral — the session already spent `local_deferral_max_refusals` consecutive retryable local-capacity refusals, so the pin is declined instead of refused again | `deferral_refusals_exhausted` | promoting | `local_deferral_escalated session=… refusals=… threshold=… preference=local-preferred reason=deferral_refusals_exhausted` |
 
 The table is pinned by `proxy/tests/test_local_only_refusal_matrix.py` (one row
 per exit: a pinned `local-preferred` request ⇒ `429` + token + **no upstream
@@ -1716,6 +1717,35 @@ a busy local slot still queues and still ends in the retryable `429` rather
 than a paid fallback. `local-preferred` promotion needs a remote tier to promote
 to, so a remote-less chain cannot promote at all; its too-large prompts are
 bounded by the local capacity limits instead.
+
+#### Bounded deferral: after three refusals the request goes remote
+
+A pinned request is never *silently* promoted while it still fits local — but
+it is also never deferred for ever. The proxy keeps a per-session count of
+**consecutive retryable local-capacity refusals** (keyed by the resolved
+session id, TTL one hour, store bounded) and escalates at the threshold
+`local_deferral_max_refusals` (default `3`):
+
+| Stage | What the client sees |
+|---|---|
+| Refusals 1–3 | Unchanged retryable `429`: `X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`, `retryable: true`, `Retry-After` + `retry_at`. The body additionally reports `deferral_refusals` (count so far) and `deferral_refusals_remaining` (`0` on the third), so the client can see the escalation coming — compact or switch preference before it happens. |
+| The next request from that session | **Not refused.** The local entry leaves the chain before dispatch and a remote tier serves the request: the upstream status, `X-Local-Route: remote`, `X-Local-Fallback-Reason: deferral_refusals_exhausted`, **no** `Retry-After` (the terminal path advertises no wait it will not honour), and one `local_deferral_escalated session=… refusals=… threshold=…` log line. |
+
+`deferral_refusals_exhausted` is a *different* token from the `too_large`
+promotion, so a client (and an operator reading `proxy.log`) can always tell
+"we stopped waiting for you" from "your prompt cannot fit local".
+
+The counter resets when the session is served locally, when a non-retryable
+refusal (a prompt that must be compacted) or a `too_large` promotion happens,
+when the entry's TTL expires and when the threshold is reconfigured. Three
+cases never escalate:
+
+* **No resolvable session id** — there is no stable key to count against, so
+  today's unbounded refusal behaviour is preserved.
+* **A chain with no remote entry** (e.g. `private`) — nothing to promote to, so
+  the pin keeps refusing; that is the documented zero-remote-spend escape hatch.
+* **`local_deferral_max_refusals: 0`** — the escalation is off and behaviour is
+  exactly as before the bound existed (the rollback).
 
 #### Client migration: what a client author must do
 

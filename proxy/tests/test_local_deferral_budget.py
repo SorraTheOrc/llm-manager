@@ -32,9 +32,11 @@ told to retry must eventually get an answer. Concretely, per session:
     escalates (the cost-capped escape hatch of parent assumption A4), and
     ``local_deferral_max_refusals: 0`` restores today's behaviour exactly.
 
-Red phase: the ``xfail(strict=True)`` specs are red today (no counter, no body
-fields, no escalation token) and LP-0MVUH9PL0005PW90 turns them green. The
-unmarked specs are guards that hold today and must keep holding.
+Red phase (complete): every spec here was written red-first by
+LP-0MVUH9OMY004MQ3U and turned green by **LP-0MVUH9PL0005PW90** (the counter
+store, the additive body fields, the escalation token and the promotion), so no
+marker remains. The former guards still hold, and the store's own specs pin its
+TTL, cap, per-session keying and reset surface.
 
 The counter store itself is exercised through the pre-agreed surface documented
 in :mod:`local_preference_v2_support` (``record_refusal`` / ``refusal_count`` /
@@ -97,13 +99,6 @@ def _clean_state():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9PL0005PW90: the refusal body has no deferral_refusals / "
-        "deferral_refusals_remaining fields yet"
-    ),
-)
 async def test_refusals_one_to_three_advertise_the_remaining_budget():
     """Every retryable refusal counts itself down; nothing else changes.
 
@@ -165,13 +160,6 @@ async def test_refusals_one_to_three_advertise_the_remaining_budget():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9PL0005PW90: the fourth request from a spent session is still "
-        "a fourth retryable 429 instead of a remote dispatch"
-    ),
-)
 async def test_fourth_request_escalates_to_remote_visibly(caplog):
     """After three refusals the next request is served remotely, and says so.
 
@@ -239,10 +227,6 @@ async def test_fourth_request_escalates_to_remote_visibly(caplog):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PL0005PW90: the escalation token is not in the token table",
-)
 def test_escalation_reason_token_is_canonical():
     """One token table: header, body and log field cannot drift apart."""
     assert ESCALATION_TOKEN in admission_reserve.LOCAL_FALLBACK_REASON_TOKENS, (
@@ -261,13 +245,6 @@ def test_escalation_reason_token_is_canonical():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9PL0005PW90: the counter does not exist, so a local success "
-        "cannot reset the budget and the body reports no count"
-    ),
-)
 async def test_local_success_resets_the_counter():
     """Being served locally clears the session's budget.
 
@@ -316,13 +293,6 @@ async def test_local_success_resets_the_counter():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9PL0005PW90: a too_large promotion does not clear the counter "
-        "(and the body reports no count yet)"
-    ),
-)
 async def test_too_large_promotion_resets_the_counter():
     """A ``too_large`` promotion is a different outcome: it clears the budget."""
     refusal, _calls, _request = await support.issue(
@@ -360,10 +330,6 @@ async def test_too_large_promotion_resets_the_counter():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PL0005PW90: the counter store (and its clock hook) does not exist",
-)
 async def test_ttl_expiry_resets_the_counter():
     """A stale entry is not a budget: TTL expiry restarts the count.
 
@@ -489,10 +455,6 @@ async def test_threshold_zero_restores_unbounded_deferral():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PL0005PW90: proxy.local_deferral does not exist yet",
-)
 def test_counter_is_keyed_per_session():
     local_deferral = support.require_local_deferral()
     record = support.require_attribute(local_deferral, "record_refusal")
@@ -507,10 +469,6 @@ def test_counter_is_keyed_per_session():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PL0005PW90: proxy.local_deferral does not exist yet",
-)
 def test_counter_reset_drops_only_the_named_session():
     local_deferral = support.require_local_deferral()
     record = support.require_attribute(local_deferral, "record_refusal")
@@ -528,10 +486,6 @@ def test_counter_reset_drops_only_the_named_session():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PL0005PW90: proxy.local_deferral does not exist yet",
-)
 def test_counter_entries_expire_after_ttl():
     local_deferral = support.require_local_deferral()
     ttl_seconds = support.require_attribute(local_deferral, "TTL_SECONDS")
@@ -547,10 +501,6 @@ def test_counter_entries_expire_after_ttl():
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PL0005PW90: proxy.local_deferral does not exist yet",
-)
 def test_counter_store_is_bounded():
     """The store is capped: no unbounded growth across sessions (parent AC8)."""
     local_deferral = support.require_local_deferral()

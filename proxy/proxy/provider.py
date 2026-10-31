@@ -41,7 +41,13 @@ import httpx
 from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from proxy import admission_reserve, cold_start, quota_pacing, quota_state
+from proxy import (
+    admission_reserve,
+    cold_start,
+    local_deferral,
+    quota_pacing,
+    quota_state,
+)
 
 #: The single source of truth for the ``X-Local-Preference`` vocabulary and its
 #: parser (LP-0MVSHWYVE005MS16 AC4). ``PREF_LOCAL_ONLY`` is imported only as the
@@ -52,6 +58,7 @@ from proxy import admission_reserve, cold_start, quota_pacing, quota_state
 from proxy.admission_reserve import (
     CAPACITY_TOO_LARGE,
     DEFAULT_PREFERENCE,
+    LOCAL_FALLBACK_DEFERRAL_EXHAUSTED,
     PREF_LOCAL_ONLY,
     PREF_LOCAL_PREFERRED,
     PREF_REMOTE_OK,
@@ -6998,6 +7005,173 @@ def _stamp_local_routing_outcome(request, outcome: str) -> None:
         pass
 
 
+#: Server-config key holding the bounded-deferral threshold
+#: (``proxy/config.yaml``; ``0`` disables the escalation — LP-0MVUH9PL0005PW90).
+DEFERRAL_MAX_REFUSALS_KEY = "local_deferral_max_refusals"
+
+#: Documented default, mirrored by :data:`proxy.local_deferral.DEFAULT_MAX_REFUSALS`.
+DEFAULT_DEFERRAL_MAX_REFUSALS = local_deferral.DEFAULT_MAX_REFUSALS
+
+#: Additive refusal-body fields that advertise the remaining budget (AC7).
+DEFERRAL_BODY_REFUSALS = "deferral_refusals"
+DEFERRAL_BODY_REFUSALS_REMAINING = "deferral_refusals_remaining"
+
+
+def _deferral_max_refusals(config: dict | None) -> int:
+    """The single threshold source: ``local_deferral_max_refusals`` (AC5).
+
+    ``0`` (or a negative value) disables the escalation, which restores today's
+    unbounded deferral exactly. An unparsable value falls back to the documented
+    default rather than silently turning the bound off.
+    """
+    server_cfg = config.get("server", config) if isinstance(config, dict) else None
+    if not isinstance(server_cfg, dict):
+        return DEFAULT_DEFERRAL_MAX_REFUSALS
+    raw = server_cfg.get(DEFERRAL_MAX_REFUSALS_KEY)
+    if raw is None:
+        return DEFAULT_DEFERRAL_MAX_REFUSALS
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not an integer; using the default %d",
+            DEFERRAL_MAX_REFUSALS_KEY,
+            raw,
+            DEFAULT_DEFERRAL_MAX_REFUSALS,
+        )
+        return DEFAULT_DEFERRAL_MAX_REFUSALS
+
+
+def _deferral_budget_body_fields(
+    session, timing: "RefusalRetryTiming", config: dict | None
+) -> dict[str, int]:
+    """Count this refusal and return the additive budget fields (AC7).
+
+    The counter hooks the **existing** retryability decision: a retryable
+    refusal spends one unit of the session's budget and reports the count and
+    the remainder; a non-retryable refusal (a prompt that can never fit local)
+    is not a deferral at all, so it **resets** the budget instead of escalating
+    a client that must compact first (AC8).
+
+    No session id, or the escalation switched off, means today's behaviour: no
+    fields, no counting.
+    """
+    threshold = _deferral_max_refusals(config)
+    if threshold <= 0 or not session or session == "unknown":
+        return {}
+    if not getattr(timing, "retryable", False):
+        local_deferral.reset(session)
+        return {}
+    count = local_deferral.record_refusal(session, threshold=threshold)
+    return {
+        DEFERRAL_BODY_REFUSALS: count,
+        DEFERRAL_BODY_REFUSALS_REMAINING: max(0, threshold - count),
+    }
+
+
+def _log_deferral_escalation(
+    session: str, count: int, threshold: int, *, preference: str | None = None
+) -> None:
+    """The one line an escalation owes (AC6): session, count and threshold.
+
+    Visible and attributable by construction: the LP-0MVNU2KTK009D4AG lesson is
+    that spending remote budget without a log line makes the spend
+    unreconstructable from ``proxy.log``.
+    """
+    logger.warning(
+        "local_deferral_escalated session=%s refusals=%d threshold=%d "
+        "preference=%s reason=%s — the session spent its retryable local-capacity "
+        "refusal budget, so the local route was skipped for this request and a "
+        "remote tier served it",
+        session,
+        count,
+        threshold,
+        preference or PREF_LOCAL_PREFERRED,
+        LOCAL_FALLBACK_DEFERRAL_EXHAUSTED,
+    )
+
+
+def _request_session_id(request) -> str | None:
+    """The request's session id, resolved case-insensitively (or ``None``)."""
+    try:
+        from proxy.session import _resolve_session_id_header
+
+        raw_headers = getattr(request, "headers", {}) or {}
+        resolved, _source = _resolve_session_id_header(raw_headers)
+        if resolved:
+            return resolved
+    except Exception:  # pragma: no cover - attribution is best-effort
+        pass
+    return None
+
+
+def _has_non_local_provider(model_config: dict | None) -> bool:
+    """True when the chain has an entry the escalated request could be served by."""
+    for entry in (model_config or {}).get("providers") or []:
+        if isinstance(entry, dict) and entry.get("type", "remote") != "local":
+            return True
+    return False
+
+
+def _deferral_escalation_applies(
+    request,
+    model_config: dict | None,
+    config: dict | None,
+    preference: str | None,
+) -> bool:
+    """Decide — once — that a refusal must become a promotion (AC5/AC6/AC7).
+
+    This is the bounded-deferral decision: a **pin-local** request whose session
+    has already been given ``local_deferral_max_refusals`` retryable
+    local-capacity refusals is not refused again; it is promoted to the next
+    provider instead. Called at exactly the two places a pin-local request would
+    otherwise be *refused* — the loop-head choke point and the admission-refusal
+    branch — so the decision is one implementation and both dispatch cycles
+    agree with the pin predicate (AC7).
+
+    Three conditions keep the escalation honest:
+
+    * a *spent* budget for this session (the
+      :mod:`proxy.local_deferral` store owns the counting, TTL and cap);
+    * a **non-local entry to serve the request** — a ``private`` (remote-less)
+      chain keeps refusing, which is the documented cost-capped escape hatch
+      (parent assumption A4);
+    * the escalation switched on (``local_deferral_max_refusals > 0``).
+
+    Side effects on ``True``: the escalation reason token is stamped on the
+    request (so the response header, the ``reason=`` log field and the outcome
+    line all name it) and exactly one escalation line is emitted for the
+    request, however many cycle re-entries it takes.
+    """
+    if preference != PREF_LOCAL_PREFERRED:
+        return False
+    threshold = _deferral_max_refusals(config)
+    if threshold <= 0:
+        return False
+    session = _request_session_id(request)
+    if not session:
+        return False
+    if not local_deferral.budget_spent(session, threshold=threshold):
+        return False
+    if not _has_non_local_provider(model_config):
+        return False
+    try:
+        escalations = int(getattr(request, "_deferral_escalations", 0) or 0) + 1
+        setattr(request, "_deferral_escalations", escalations)
+        setattr(request, "_local_routing_outcome", LOCAL_ROUTING_OUTCOME_PROMOTED)
+    except Exception:  # pragma: no cover - stamping is best-effort
+        escalations = 1
+    _note_local_fallback_reason(request, LOCAL_FALLBACK_DEFERRAL_EXHAUSTED)
+    if escalations == 1:
+        _log_deferral_escalation(
+            session,
+            local_deferral.refusal_count(session, threshold=threshold),
+            threshold,
+            preference=preference,
+        )
+    return True
+
+
 def _note_local_fallback_reason(
     request, reason: str | None, retry_after_s: int | float | None = None
 ) -> None:
@@ -7320,6 +7494,10 @@ async def _promote_too_large_local_request(
         # attempt/deferral/refusal behaviour applies. Nothing to cache — a
         # cached ``too_large`` would change the pin decision.
         return chain
+    # A ``too_large`` promotion is a different outcome from a deferral, so it
+    # clears the session's deferral budget (LP-0MVUH9PL0005PW90 AC8): the
+    # prompt, not the wait, was the problem.
+    local_deferral.reset(session_id)
     try:
         setattr(request, "_local_capacity_verdict", verdict)
         setattr(request, "_local_routing_outcome", LOCAL_ROUTING_OUTCOME_PROMOTED)
@@ -7565,6 +7743,14 @@ def _build_local_only_refusal_response(
         payload["new_tokens"] = new_tokens
     if budget_tokens is not None:
         payload["budget_tokens"] = budget_tokens
+    # Bounded deferral (LP-0MVUH9PL0005PW90 AC3): the refusal advertises the
+    # budget it just spent, so the client can compact or switch preference
+    # instead of discovering the escalation by surprise. Purely additive —
+    # appended after every pre-existing key, and absent for a non-retryable
+    # refusal, a keyless request and the disabled knob.
+    payload.update(
+        _deferral_budget_body_fields((context or {}).get("session"), timing, config)
+    )
     headers = {
         "Cache-Control": "no-store",
         "X-Local-Admission": "reject",
@@ -7763,6 +7949,25 @@ def _stamp_local_route_headers(
     except Exception:  # pragma: no cover - header stamping is best-effort
         logger.debug("route header stamping failed", exc_info=True)
         stamped = response
+    # A local serve clears the session's deferral budget (LP-0MVUH9PL0005PW90
+    # AC8): the wait it was being asked to retry has been answered. Read from
+    # the *stamped* route rather than from the dispatch path so every local
+    # success (either cycle, direct or compaction-rescued) resets exactly once.
+    try:
+        if getattr(stamped, "headers", {}).get("X-Local-Route") == "local":
+            from proxy.session import _resolve_session_id_header
+
+            raw_headers = getattr(request, "headers", {}) or {}
+            try:
+                lookup = {
+                    str(key).lower(): value for key, value in raw_headers.items()
+                }
+            except Exception:
+                lookup = raw_headers
+            resolved, _source = _resolve_session_id_header(lookup)
+            local_deferral.reset(resolved)
+    except Exception:  # pragma: no cover - bookkeeping must not break the request
+        logger.debug("deferral budget reset on local success failed", exc_info=True)
     _log_local_preference_resolved(stamped, request, model_config)
     return stamped
 
@@ -8203,6 +8408,13 @@ async def _build_local_only_refusal_for_remote(
     if not _local_preference_pins_local(request, preference):
         return None
     if provider_cfg.get("type", "remote") == "local":
+        return None
+    if _deferral_escalation_applies(request, model_config, config, preference):
+        # The session already spent its retryable-refusal budget: refuse
+        # nothing, let this (non-local) candidate serve the request. The
+        # escalation token is stamped on the request, so the response names
+        # ``deferral_refusals_exhausted`` rather than a deferral reason
+        # (LP-0MVUH9PL0005PW90 AC5/AC6).
         return None
     reason = getattr(request, "_local_fallback_reason", None)
     if not reason:
@@ -13094,6 +13306,29 @@ async def _proxy_with_fallback_cycle(
                         # deferrable request. Unlike admission_reject, the request
                         # must NOT fall through to a remote provider — return
                         # the retryable 429 with X-Local-Route: refused now.
+                        #
+                        # Bounded deferral (LP-0MVUH9PL0005PW90 AC5/AC7): unless
+                        # this session has already been told to retry
+                        # ``local_deferral_max_refusals`` times — then the
+                        # refusal becomes a promotion and the remote tiers serve
+                        # it, which is the whole point of the budget.
+                        if _deferral_escalation_applies(
+                            request, model_config, config, _preference
+                        ):
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="local_deferral_escalated",
+                                reason=_cq_reason,
+                            )
+                            fallback_reason = _cq_reason or "fallback_after_queue"
+                            prev_provider = provider_name
+                            all_slot_exhaustion = False
+                            _note_local_fallback_reason(
+                                request, LOCAL_FALLBACK_DEFERRAL_EXHAUSTED
+                            )
+                            continue
                         _admission = getattr(
                             request, "_local_admission_decision", None
                         )
@@ -13716,6 +13951,25 @@ async def _proxy_with_fallback_cycle(
                     # ``prefill_budget_exceeded``) declines the pin and keeps
                     # the direct-guard fall-through to the next provider.
                     if _local_preference_pins_local(request, _preference):
+                        # Bounded deferral (LP-0MVUH9PL0005PW90 AC5): a session
+                        # that has spent its retryable-refusal budget is not
+                        # refused a fourth time — it falls through to the next
+                        # provider, visibly (token stamped by the helper).
+                        if _deferral_escalation_applies(
+                            request, model_config, config, _preference
+                        ):
+                            # The hop line keeps naming the *exit* (why local
+                            # was not used); the escalation token travels on
+                            # the request header, the escalation line and the
+                            # outcome line, so it is reported exactly once
+                            # (LP-0MVUH9PL0005PW90 AC6).
+                            fallback_reason = "local_admission_guard"
+                            prev_provider = provider_name
+                            all_slot_exhaustion = False
+                            _note_local_fallback_reason(
+                                request, LOCAL_FALLBACK_DEFERRAL_EXHAUSTED
+                            )
+                            continue
                         fallback_reason = "local_admission_guard"
                         prev_provider = provider_name
                         all_slot_exhaustion = False
@@ -14230,6 +14484,27 @@ async def _proxy_with_fallback_cycle(
                         # pinned-local + guard refusal on the lease path —
                         # return the 429 instead of falling through to a
                         # remote provider.
+                        #
+                        # Bounded deferral (LP-0MVUH9PL0005PW90 AC5/AC7): a
+                        # session that has spent its refusal budget is promoted
+                        # instead, exactly as on the contention-queue path.
+                        if _deferral_escalation_applies(
+                            request, model_config, config, _preference
+                        ):
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="local_deferral_escalated",
+                                reason=_lease_reason,
+                            )
+                            fallback_reason = _lease_reason
+                            prev_provider = provider_name
+                            all_slot_exhaustion = False
+                            _note_local_fallback_reason(
+                                request, LOCAL_FALLBACK_DEFERRAL_EXHAUSTED
+                            )
+                            continue
                         _admission = getattr(
                             request, "_local_admission_decision", None
                         )

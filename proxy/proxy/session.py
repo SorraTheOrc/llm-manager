@@ -1987,13 +1987,38 @@ def _resolve_session_id_header(
     3. ``X-Client-Request-Id``
     4. ``X-Session-Affinity``
 
+    Header lookup is case-insensitive **by construction**: Starlette's
+    ``Headers`` already is, but a plain dict (in-process callers, test doubles,
+    a hand-built request) is not, so a lowercase miss falls back to a
+    case-insensitive scan. Without that, the same request resolves a session
+    id through the HTTP stack and loses it through an in-process caller — which
+    silently disables every per-session behaviour keyed on it (the bounded
+    deferral budget, LP-0MVUH9PL0005PW90).
+
     Returns ``(session_id, source_header_name)``.
     """
     for header_name in ("x-session-id", "session_id", "x-client-request-id", "x-session-affinity"):
         value = headers.get(header_name)
+        if not value:
+            value = _case_insensitive_header_value(headers, header_name)
         if value:
             return value, header_name
     return None, None
+
+
+def _case_insensitive_header_value(headers: dict, header_name: str):
+    """``headers[header_name]`` ignoring key case (plain-dict tolerant)."""
+    try:
+        items = headers.items()
+    except Exception:  # pragma: no cover - exotic header containers
+        return None
+    try:
+        for key, value in items:
+            if str(key).lower() == header_name and value:
+                return value
+    except Exception:  # pragma: no cover - exotic header containers
+        return None
+    return None
 
 
 def _log_session_header_resolution(

@@ -193,6 +193,12 @@ LOCAL_DISPATCH_REASON_ATTR = "local_dispatch_reason"
 #: fallback reason); the lease token names expected local contention; the last
 #: two are the structural refusals used when there was no local route at all
 #: or an exit left no reason behind.
+#: Reason token of a *bounded-deferral* promotion: the session spent its
+#: retryable-refusal budget, so the pin was declined and a remote tier served
+#: the request (LP-0MVUH9PL0005PW90). Distinct from a ``too_large`` promotion,
+#: which means the prompt could never fit local.
+LOCAL_FALLBACK_DEFERRAL_EXHAUSTED = "deferral_refusals_exhausted"
+
 LOCAL_FALLBACK_REASON_TOKENS: frozenset[str] = frozenset(
     {
         # Chain resolution (``_resolve_provider_with_exclusions``).
@@ -210,6 +216,12 @@ LOCAL_FALLBACK_REASON_TOKENS: frozenset[str] = frozenset(
         # Structural refusals.
         "local_only_no_local_route",
         "local_route_unavailable",
+        # Bounded deferral (LP-0MVUH9PL0005PW90): the session spent its
+        # retryable-refusal budget, so the pin is declined and a remote tier
+        # serves the request. Distinct from ``local_route_unavailable`` and
+        # from the ``too_large`` promotion, so client, header and log can all
+        # tell "we stopped waiting for you" from "your prompt cannot fit".
+        LOCAL_FALLBACK_DEFERRAL_EXHAUSTED,
     }
 )
 

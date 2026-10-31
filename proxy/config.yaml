@@ -1883,6 +1883,25 @@ server:
   contention_queue_policy: queue
   contention_queue_max_wait_seconds: 30   # swept 60 → 30 (LP-0MVT1146V007WXA4: 142 of 180 losses burned the full budget; 30 s retains ~34 % of wins, 57.9 % of baseline wins land at/below 30 s); Server restart required to change.
   contention_queue_max_depth: 2           # swept 8 → 2 (LP-0MVT1146V007WXA4: straggler net, not the observed 7-deep parking lot)
+  # Bounded deferral for pin-local clients (LP-0MVUH9PL0005PW90). A
+  # ``local-preferred`` request that keeps being told "retry later" used to be
+  # told that for ever: refusals 1, 2 and 3 are unchanged (retryable 429 with
+  # ``Retry-After`` / ``retry_at``, and now also the additive body fields
+  # ``deferral_refusals`` / ``deferral_refusals_remaining``), but once a
+  # session has spent this many CONSECUTIVE retryable local-capacity refusals
+  # (counted per resolved session id, TTL 1 h) the next request is no longer
+  # refused — the local entry is dropped for that request and a remote tier
+  # serves it, visibly: ``X-Local-Route: remote``,
+  # ``X-Local-Fallback-Reason: deferral_refusals_exhausted`` (distinct from a
+  # ``too_large`` promotion), no ``Retry-After``, and one
+  # ``local_deferral_escalated`` line naming the session, the count and this
+  # threshold. The counter resets on a local serve, on a non-retryable refusal
+  # or ``too_large`` promotion, on TTL expiry and when this value changes.
+  # 0 disables the escalation (today's unbounded deferral — the rollback).
+  # A chain with no remote entry (e.g. ``private``) never escalates. A request
+  # with no resolvable session id is never counted. Server restart required to
+  # change.
+  local_deferral_max_refusals: 3
   # ETA-aware admission ordering (LP-0MVIQ0G2M0006QF6 AC1). With
   # ``local_max_concurrent_prefills: 1`` one long prefill is head-of-line
   # blocking for every queued local request (1 827 prefill-saturated queue

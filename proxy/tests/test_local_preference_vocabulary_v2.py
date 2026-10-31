@@ -332,10 +332,6 @@ def test_routing_docs_document_the_two_value_vocabulary_and_the_budget():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PL0005PW90 owns the config key; it does not exist yet",
-)
 def test_config_documents_the_deferral_budget_knob():
     """One knob, one documented default, restart-required (parent AC10)."""
     text = support.CONFIG_YAML.read_text(encoding="utf-8")
