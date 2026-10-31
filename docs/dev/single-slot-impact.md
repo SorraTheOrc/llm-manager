@@ -8,7 +8,7 @@ slot)
 | Slice | Work item | What it fills in this report |
 |---|---|---|
 | Pinned derivations | LP-0MVTV6F65005HKQZ (completed) | The executable assertions every derived number below is taken from |
-| Throughput prediction | LP-0MVTV6G0N0053V0G | [§5](#5-throughput-prediction-reserved-for-lp-0mvtv6g0n0053v0g) |
+| Throughput prediction | LP-0MVTV6G0N0053V0G | [§5](#5-throughput-prediction-lp-0mvtv6g0n0053v0g) |
 | Metrics gap list | LP-0MVTV6GA8002P7QU | [§6](#6-metrics-gap-list-reserved-for-lp-0mvtv6ga8002p7qu) |
 | Doc cross-links and 2-slot claims | LP-0MVTV6GK1001ED02 | Corrections to the other slot documents |
 
@@ -321,24 +321,302 @@ single-slot starvation.
 
 ---
 
-## 5. Throughput prediction (reserved for LP-0MVTV6G0N0053V0G)
+## 5. Throughput prediction (LP-0MVTV6G0N0053V0G)
 
-*This section is filled by the throughput-prediction slice.* It reuses the
-classifications from §3 and must cover, at request level and including tokens
-processed locally: turns served locally, input/output tokens processed locally,
-per-session first-byte and decode latency, head-of-line blocking and queue
-waits, slot reuse/thrash and re-prefill volume, and concurrency headroom — each
-with the metric and the A/B arm comparison that would confirm or refute it.
+*A desk prediction, not a measurement.* This section reasons from §3's
+classifications and from a set of recorded baselines; it does **not** flip the
+geometry, restart the proxy or measure an arm. Every figure is registered in
+`docs/dev/single-slot-throughput-baseline-2026-10-31.json` with its window, its
+source document and its provenance class (`measured`, `derived-estimate`,
+`config-derived`), and `proxy/tests/test_single_slot_throughput_doc.py` fails if
+this text and that register disagree or if an estimate is not labelled one.
 
-Inputs it inherits from this slice:
+### 5.1 The short answer
+
+At today's load, one slot costs **latency and prefix reuse, not throughput**:
+
+- **Turns and completion tokens barely move.** Local work is nearly serial
+  already: W1 was busy `10.2` % of the day with average concurrency `1.04` and
+  peak `2`. The only work a second slot actually performs is the `300`
+  slot-seconds/day of overlap (`3.4` % of busy time, D1/D2), i.e. roughly `15`
+  local turns/day (`6.6` %, D3/D4) can be delayed. Predicted turn loss: 0 to
+  `2` % of the `225` local turns/day, because most of those delays fit inside
+  the existing `60` s queue budget.
+- **Prompt tokens processed locally are set by routing, not by slot count.**
+  Without the §1.3 co-change the effective warm ceiling stays `120,000`
+  (D17), so the measured local prompt volume — `5,242,181` tokens/day in W1 and
+  `12,123,352` in W2 — is unchanged: the extra per-slot capacity is
+  unreachable for routing. With the co-change the ceiling becomes `258,048`
+  (D16) and the ceiling-divert pool (`4,443`/day in W1, `4,667`/day in W2)
+  becomes admissible, but capacity limits conversion to about `5.6` % of that
+  pool's cold volume (D22) — a tail effect on diverts, not a volume effect on
+  local tokens.
+- **The costs land on the first-byte tail and on prefix reuse.** A converted
+  258K-class prompt pays a cold prefill of `1,017`–`1,317` s (D11/D12), and
+  minimum-size converted diverts pay about `473` s each (D24). One slot also
+  means concurrent sessions share slot 0, so the recorded `95` % steal rate
+  (W7) replaces today's "each session owns a slot", inflating re-prefill by up
+  to `11.5M` tokens/day (`26.3` % on top of the `43.8M`/day pool, D9/D10).
+- **Headroom is not the constraint.** One slot would be busy `10.5` % of the day
+  (D5), leaving `89.5` % headroom (D6). Fewer slots therefore do not shrink the
+  *tokens the machine can process*; they lengthen the *waits requests pay*.
+
+### 5.2 Baselines of record
+
+| Window | Span | Source | Retention | Used for |
+|---|---|---|---|---|
+| W1 | 2026-10-23 10:52:37 → 2026-10-24 10:52:37 (24.0 h) | `~/proxy-usage-reports/2026-10-25/report.md` | partial | demand, latency, diverts, tokens |
+| W2 | 2026-10-30 05:00:01 → 2026-10-31 05:00:01 (24.0 h) | `~/proxy-usage-reports/report.md` | full | tokens, provenance, denials |
+| W3 | 2026-10-19 → 2026-10-20, 460 paired dispatches | `proxy/docs/routing.md:826`-`847` | recorded-only | prefill overlap rate |
+| W4 | 2026-10-24, 5.4 h | `proxy/config.yaml:1366`-`1380` | recorded-only | prefix reuse |
+| W5 | 2026-08-26 plus companion data to 2026-08-28 | `docs/dev/restore-rate-metric-fix-ranking.md:1`-`20` | recorded-only | re-prefill pool, restore rates |
+| W6 | 2026-10-30 05:00 → 2026-10-31 05:00 (24.0 h) | `docs/dev/contention-queue-sweep-baseline-2026-10-31.json` | committed | queue waits |
+| W7 | not recorded in the source | `docs/dev/slot-management-design.md:28`-`48` | recorded-only | steal rate by pool size |
+
+Plus the engine-side large-prompt measurement — prompt-eval p90 `189` s, max
+`591` s (`docs/dev/ubatch-ab-2026-10-22.md:8`-`11`).
+
+W1's report predates the `tokens=missing` accounting and its pre-2026-10-24 log
+segments have rotated out of retention, so it is the window of record for
+demand, latency and divert shape only; token provenance is measured on W2.
+W3, W4 and W7 are not re-runnable from retained logs; they are quoted as
+recorded measurements and §5.8 names the measurement that refreshes each.
+
+### 5.3 Prediction register
+
+Every row names its mechanism with a `file:line` citation, its baseline with the
+window and the registered figures, the predicted direction and magnitude at one
+slot, the metric that would confirm or refute it, and the Arm A / Arm B
+comparison.
+
+| # | Effect | Mechanism (`file:line`) | Baseline (window · figures) | Prediction at 1 slot | Confirming metric | Arm A vs Arm B |
+|---|---|---|---|---|---|---|
+| E1 | Turns served locally | `max_local` derives from `session_slot_pool_size` (`proxy/proxy/provider.py:6542`); router limit `proxy/proxy/router.py:215`-`233` | W1 · `W1.local_turns`, `W1.local_sessions`, `W1.avg_concurrency_while_busy`; W2 · `W2.dispatch_denied`, `W2.denials_saturated`, `W2.denials_prefill_bound` | direction: flat to slightly down; magnitude: 0 to `2` % of `225` turns/day (at most `15` turns delayed, D3/D4), and no loss while the wait stays inside the `60` s queue budget | `turns_served_locally`, `diverts_by_reason`, `queue_waits`, `fallback_after_queue` | Arm A (2 x 131,072) vs Arm B (1 x 262,144): criterion (a) requires Arm B `turns_served_locally` at least equal to Arm A |
+| E2 | Prompt tokens processed locally | 3-term warm ceiling `proxy/proxy/provider.py:2002`-`2040`; physical clamp `proxy/proxy/provider.py:1890`; dispatch lease pool `proxy/proxy/provider.py:6542` | W1 · `W1.local_prompt_tokens`, `W1.ceiling_diverts`, `W1.divert_context_too_large`; W2 · `W2.local_prompt_tokens`, `W2.ceiling_diverts`; W4 · `W4.aggregate_prefix_reuse_pct` | no co-change: unchanged (`5,242,181` and `12,123,352` per day, D17); with co-change: at most `5.6` % of the `394M` cold ceiling-divert volume convert, i.e. about `21.9M` cold prompt tokens/day (D19-D22) | `diverts_by_reason`, `context_ceiling_diverts`, `prefill_slot_seconds` | Arm A vs Arm B: criterion (b) requires Arm B `context_ceiling_diverts` to fall by at least 50 %; `prefill_slot_seconds` shows the prefill cost of that fall |
+| E3 | Completion tokens processed locally | decode shares one llama.cpp batch across the pool; one slot per session (`proxy/proxy/session.py:1062`-`1095`) | W1 · `W1.local_completion_tokens`, `W1.decode_tok_s_median`; W2 · `W2.local_completion_tokens`, `W2.decode_tok_s_median` | direction: unchanged in volume — `48,700` and `244,657` per day, `216` completion tokens per local turn (D8); only the *timing* of those tokens changes | `decode_slot_seconds` per completed turn, plus the capture's archived `Decode speed` table | Arm A vs Arm B: compare `decode_slot_seconds` divided by `turns_served_locally`; the archived `Decode speed` medians (`30.7` / `37.7` tok/s) normalise the comparison |
+| E4 | Per-session first-byte latency | prefills already serialised (`proxy/config.yaml:1759`, `proxy/proxy/router_helpers.py:2709`); one slot cannot overlap a prefill with another slot's decode | W1 · `W1.prefill_p50_seconds`, `W1.prefill_p90_seconds`; W3 · `W3.solo_first_byte_p50_seconds`, `W3.one_overlap_first_byte_p50_seconds`; engine · D13, D14 | same-class prompts: `4.4` s p50 and `35.3` s p90, flat to slightly worse; co-change admissions: `473` s per minimum-size converted prompt and `1,017`-`1,317` s at the `258,048` ceiling (D11/D12/D24), so the p90 rises with the converted share | `local_dispatch_first_byte` (p50/p90), `ttft_all_streams` | Arm A vs Arm B: criterion (c) allows Arm B `first_byte_p90` to worsen by at most 30 % |
+| E5 | Per-session decode latency | two streams share one decode batch at 2 slots; at 1 slot a stream decodes alone (`proxy/proxy/provider.py:6542`) | W1 · `W1.decode_tok_s_p10`, `W1.decode_tok_s_p90`; W2 · `W2.decode_tok_s_p10`, `W2.decode_tok_s_p90` | direction: per-stream decode flat to slightly better, the low tail (`8.4` / `12.8` tok/s p10) improving once nothing shares the batch; the *second* stream's end-to-end turn worsens by its queue wait | `decode_slot_seconds`, and the capture's archived `Decode speed` p10/p50/p90 (no `decode_tok_s` path exists in `arm.json`) | Arm A vs Arm B: compare the two captures' archived `Decode speed` tables against their `decode_slot_seconds` |
+| E6 | Head-of-line blocking and queue waits | one dispatch lease (`proxy/proxy/provider.py:6542`); queue caps `proxy/config.yaml:1810`-`1811`, `:1820`, `:1841`; router clamps `proxy/proxy/router.py:267`-`330` | W6 · `W6.queue_events`, `W6.queue_wins`, `W6.queue_losses`, `W6.queue_wait_p50_seconds`, `W6.queue_wait_p90_seconds`, `W6.queue_wait_max_seconds` | queue entries rise by the overlap turns only: `351` to about 366/day; losses `137` to about 150/day, concentrated where a prefill-bound wait exceeds the `60` s budget (mean loss wait `60.02` s today) | `queue_waits`, `fallback_after_queue`, `queue_wait_seconds` | Arm A vs Arm B: `queue_waits` and `fallback_after_queue` compared side by side in the two arm captures |
+| E7 | Slot reuse, thrash and re-prefill volume | one slot per session, lowest free slot (`proxy/proxy/session.py:1062`-`1095`); persistence prompt cap `proxy/proxy/session.py:1271`-`1285` | W7 · `W7.steal_pct_pool1_two_sessions`, `W7.steal_pct_pool2_four_sessions`; W4 · `W4.aggregate_prefix_reuse_pct`, `W4.median_reuse_large_prompts_pct`; W5 · `W5.reprefill_pool_tokens_per_day`, `W5.native_checkpoint_restore_pct` | steal rate goes from 0 % between two sessions with a slot each to `95` % on one slot; re-prefill rises by up to `11.5M` tokens/day (D9/D10) when sessions interleave, and by nothing while only one session is active — which was `89.8` % of the W1 day | `prefill_slot_seconds` per served turn, `errors.slot_save_failed`, the engine cross-check | Arm A vs Arm B: a rise in Arm B `prefill_slot_seconds` divided by `turns_served_locally` is thrash cost; a flat ratio is no penalty |
+| E8 | Concurrency headroom | pool size sets concurrent local streams (`proxy/config.yaml:1738`); occupancy measured by the analyzer | W1 · `W1.compute_slot_seconds`, `W1.peak_concurrency`, `W1.busy_pct`; W2 · `W2.compute_slot_seconds`, `W2.peak_concurrency` | one slot's daily capacity is `10.5` % used (D5), leaving `89.5` % headroom (D6); the two-stream peak occupied only `300` s (D1), so neither geometry approaches the throughput ceiling | `local_busy_pct`, `avg_concurrency`, `peak_concurrency`, `local_concurrency_limit` | Arm A vs Arm B: `local_busy_pct` (criterion (d): Arm B must not regress at all) with the `avg_concurrency` / `peak_concurrency` pair |
+
+### 5.4 Effect detail and arithmetic
+
+**E1 — turns served locally.** Two mechanisms bound local turns: the dispatch
+lease pool, whose size *is* `session_slot_pool_size`
+(`proxy/proxy/provider.py:6542`), and the bounded contention queue that decides
+what a refused request does next. Halving the pool halves the number of
+sessions that can hold a lease at once, but the measured overlap says how much
+that matters: W1's total compute was `2h 31m` of slot-seconds inside `2h 26m` of
+busy wall-clock, so a second stream was resident for `300` s of the day (D1),
+`3.4` % of busy time (D2). At W1's mean stream duration `40.5` s that is about
+`15` turns (D3), `6.6` % of `225` (D4). W2's denial attribution sharpens this:
+of `332` denials only `8` were pool-*saturation* denials, against `229`
+prefill-bound ones — the denial mix is already dominated by prefill
+serialisation, not by slot count.
+
+**E2 — prompt tokens processed locally.** Without the §1.3 co-change the
+routing envelope is untouched (physical clamp doubles but is not the binding
+term), so local prompt tokens stay at the measured `5,242,181` (W1) and
+`12,123,352` (W2). With the co-change the ceiling is `258,048`, and the question
+becomes capacity, not routing:
+
+- every ceiling divert carries at least the `120,000` warm ceiling in prompt
+  tokens — W1 recorded `2,064` `context_too_large` diverts plus `2,379`
+  `large_context_bypass` diverts — so its `4,443` ceiling diverts represent at
+  least `533M` prompt tokens/day (D19);
+- at W4's measured aggregate prefix reuse of `26.1` %, at least `73.9` % of that
+  volume is cold (D18), i.e. `394M` cold tokens/day (D20);
+- one dedicated slot at W3's measured solo prefill rate of `253.8` tok/s can
+  prefill `21.9M` cold tokens/day (D21);
+- so at most `5.6` % of the ceiling-divert cold volume fits (D22) — about `183`
+  minimum-size prompts/day if a whole slot-day went to them (D23).
+
+The consequence is that Arm B's divert reduction is a *tail* effect: the
+prompts it wins are the ones whose cold remainder is small, and each one that is
+not small costs `473` s of first byte or more (D24).
+
+**E3 — completion tokens processed locally.** Completion volume is demand, not
+geometry: `48,700` (W1) and `244,657` (W2) tokens/day, `216` per local turn
+(D8). What one slot changes is batching. Decode is where concurrent streams
+share work at two slots — the prefill analogue was measured in W3, where
+overlapping prefills halved per-request throughput while aggregate throughput
+stayed flat at `254` tok/s. The same shape is expected for decode: aggregate
+decode throughput conserved, per-stream latency improved at one slot, and the
+aggregate throughput *ceiling* untouched because it is the GPU, not the slot
+count, that binds.
+
+**E4 — first-byte latency.** Prefills are already serialised by
+`local_max_concurrent_prefills: 1`, so the prefill-vs-prefill queueing term does
+not change: same-class prompts keep `4.4` s p50 / `35.3` s p90 (W1), and W3
+measured `23.4` s of first byte with no overlapping prefill against `85.0` s
+with one. The change
+is that at two slots a second slot can *decode* while slot 0 prefills, whereas
+at one slot a prefill occupies the only slot. For prompts that stay in the same
+routing class the added exposure is bounded by the overlap term (E1); for
+prompts admitted only because of the co-change it is the prefill itself —
+`1,017` s at W3's solo rate and `1,317` s at W2's median prompt-eval rate for a
+`258,048`-token prompt (D11/D12), against an engine-side p90 of `189` s and max
+of `591` s already observed on 20k+ prompts (`docs/dev/ubatch-ab-2026-10-22.md:8`-`11`).
+
+**E5 — decode latency.** Measured per-stream decode is `30.7` tok/s median in
+W1 and `37.7` in W2 (p90 `39.4` and `43.7`), with a long low tail (`8.4` and
+`12.8` tok/s p10). The low
+tail is where two streams sharing one decode batch shows up. At one slot that
+tail should narrow, and the cost moves to end-to-end time for the waiting
+stream. This is the one effect the baselines cannot size: nothing attributes
+decode rate to concurrency, so it is stated as a direction with the confirming
+metric named, not as a number.
+
+**E6 — head-of-line blocking and queue waits.** The queue is bounded
+(`60` s wait, depth 8, lease grace 300 s, ETA ordering on) and already in use:
+`351` entries/day in W6, `214` of which won their slot (p50 wait `22.19` s, p90
+`48.45` s, max `59.49` s) and `137` of which lost at a mean `60.02` s. Adding
+the overlap turns is the increment: about `15` extra entries/day (E1), taking
+the entry count to roughly 366/day and the loss count to roughly 150/day, with
+the risk concentrated on prefill-bound collisions whose remaining duration
+exceeds the budget — decode remaining durations (p90 `22.2` s in W2) fit, large
+prefills (p90 `189` s engine-side, D13) do not.
+
+**E7 — slot reuse, thrash and re-prefill.** Slot assignment takes the lowest
+free slot for the session (`proxy/proxy/session.py:1062`-`1095`), so with a
+pool of one every session maps to slot 0. At two slots two concurrent sessions
+each own a slot and steal nothing from each other; the recorded `95` % steal
+rate at pool size 1 for two sessions (W7) is what one slot substitutes for it.
+W4 shows what thrash already costs at two slots — `27` sessions cycling through
+`2` slots in `5.4` h with only `26.1` % aggregate prefix reuse — and W5 prices
+the pool: `43.8M` re-prefill tokens/day against a `4.88` % native checkpoint
+restore rate. The worst-case increment from one slot is the local prompt volume
+times the steal share, `11.5M` tokens/day (D9), i.e. `26.3` % on top of the
+existing pool (D10). Mitigating term: steals need *interleaving*. While a single
+session is active it holds slot 0 and nothing is stolen, and in W1 local was
+idle `89.8` % of the day.
+
+**E8 — concurrency headroom.** W1's measured compute is `2h 31m` of
+slot-seconds. At two slots that is `5.2` % of daily capacity; at one slot it is
+`10.5` % (D5), i.e. `89.5` % of a single slot would still be idle (D6). W2 tells
+the same story at higher load: `4h 37m` of compute, `18.5` % busy, peak
+concurrency `2`. Neither window is throughput-bound, so reducing the pool cannot
+reduce the tokens the machine is *able* to process; it can only change the order
+in which requests get them.
+
+### 5.5 Token provenance (AC3)
+
+**Authoritative source.** Every token figure here comes from the
+`Stream finished` line's `tokens=<prompt>/<completion>/<total>` fields, which
+carry llama-server's measured usage for local streams (the proxy requests
+`stream_options.include_usage`,
+`.pi/skills/proxy-usage-analysis/REFERENCE.md:865`-`891`), and the attribution
+rule is REFERENCE §3 (`:591`-`598`). Log payload previews are truncated and are
+never used for sizes.
+
+**Attribution rule.** A stream's tokens are attributed to the provider and model
+stamped on its own `Stream finished` line — the one that actually served the
+stream — not to the session's initial provider. A session that starts local and
+falls back therefore splits its tokens across providers, and the `local` row of
+the report's token table *is* the local share. That is the figure quoted as
+"tokens processed locally" above (`5,242,181` prompt / `48,700` completion in
+W1; `12,123,352` / `244,657` in W2).
+
+**Local-versus-remote turn split.** A *covered session* is one with at least one
+local `Stream started`; a local turn is *answered* when a local, non-error
+`Stream finished` pairs with it — exactly by `turn=` where the id is present,
+per-session FIFO otherwise. `% local turns` is `local / (local + remote) × 100`,
+so a session that never used remote reads 100 %. W1: `225` local turns over `26`
+covered sessions out of `175` sessions; W2: `790` local turns over `175`
+covered sessions out of `620`.
+
+**Lines without token evidence.** In W2, `22,568` of `25,446` `Stream finished`
+lines carry `tokens=` (`88.7` % coverage, `W2.usage_coverage_pct`); the
+remaining `2,878` carry `tokens=missing` (MunitoAI 1,230, OpenCode 1,643,
+local `5`) and are excluded from the token totals rather than counted as zero.
+The local exception rate is therefore `5` in `790` finished local streams
+(`99.4` % coverage, `W2.local_usage_coverage_pct`), so the local token figures
+used above are measured for all but `5` turns. **W1 records no such count** —
+the report version predates the `tokens=missing` accounting and the first 13 h of
+its logs have rotated away — so the W1 token split is quoted as that report
+produced it, with the missing-usage count for W1 explicitly *not* recovered
+(§5.8 keeps it as an open re-measurement).
+
+**Derived figures are labelled.** The per-turn means `23,300` prompt tokens and
+`216` completion tokens (D7/D8) are arithmetic over measured totals, not
+measurements, and are labelled estimates. The capacity bounds (D18-D22) are
+estimates with their formulas and assumptions recorded in the register; the
+warm ceilings `120,000` / `258,048` are `config-derived` through the production
+helpers, not hand arithmetic.
+
+### 5.6 The uncontended-evidence caveat (AC4)
+
+Both baseline windows are essentially **uncontended**, and the prediction must
+be read with that in mind:
+
+- W1: local idle `89.8` % of the window, busy `10.2` %, average concurrency
+  while busy `1.04`, peak `2`.
+- W2: local idle `81.5` %, busy `18.5` %, average concurrency `1.04`, peak `2`.
+
+The serialisation cost of one slot is therefore **under-observed today**: a
+second slot is in use for `300` slot-seconds per day (D1), so the data cannot
+show what happens when two sessions genuinely contend for long stretches, and
+every magnitude above is a prediction bounded by today's demand rather than a
+measured result. The measured A/B exists for exactly this reason — the reporter
+returns `inconclusive` unless both arms sustain at least 60 % busy
+(`docs/dev/slot-geometry-ab.md:41`-`48`) — and **no conclusion in this section
+may be presented as a measured single-slot result.** Nothing here was measured
+by flipping the geometry; the geometry was not flipped in this work.
+
+### 5.7 Conditional on the static knobs (AC5)
+
+Any effect stated above as depending on a static knob is conditional on the
+manual change in §1.3:
+
+| Prediction | Conditional on |
+|---|---|
+| the effective warm ceiling rises to `258,048`, so ceiling diverts become admissible (E2, E4) | `local_large_context_economic_ceiling_ratio: 0.4578 -> 0.9844` **and** `local_large_context_warm_cache_threshold: 120000 -> 258048`, applied together |
+| the extra per-slot context routes nothing extra on its own (E2 no-co-change case) | `session_slot_pool_size: 2 -> 1` applied **alone**, leaving the ceiling at `120,000` |
+| two sessions can hold large-prompt reservations in one pool (E6, E7 pressure) | `local_session_tenants: 2 -> 1` |
+| the `(cold, warm]` cached-ratio band stays non-empty | `local_large_context_cold_cache_threshold` **stays** `38000` (unchanged) |
+| the per-slot clamp doubles to `258,048` and the ceiling can reach it | `local_model_ctx_size` **stays** `262144` — the switch changes the split, not the total context |
+
+The stale `3`-slot literal in `proxy/proxy/handlers.py` is not an input to any
+prediction: it is a latent observability defect that would advertise three slots
+at either geometry when the key is absent (§1.2 item 5, and the metrics-gap
+slice). Everything else in the prediction rides on `derived-auto` or
+`not-applicable` rows, which need no manual change (§3).
+
+### 5.8 What must be re-measured (AC6)
+
+| Claim that depends on it | Why the baseline must be refreshed | Confirming measurement |
+|---|---|---|
+| prefill rate `253.8` tok/s, hence `473`-`1,317` s of converted first byte (D11/D12/D24) | W3 (2026-10-19 → 10-20) cannot be re-run from retained logs, and batch/ubatch experiments since then moved prompt-eval rate | re-run the prefill-overlap sweep with the W3 method (`proxy/docs/routing.md:826`-`847`), or read Arm B's `prefill_slot_seconds` against the prompt tokens it served |
+| steal rate `95` % at one slot (E7) | W7 records no measurement window, and its underlying findings document is not in this tree | Arm B `prefill_slot_seconds` per served turn against Arm A, plus the engine cross-check (`## Engine cross-check`, `local_engine_cross_check_threshold_pct: 25.0`) |
+| cold share `73.9` % and the `394M` cold ceiling volume (D18-D20) | W4 measured 5.4 h at two slots; the diverts are larger prompts, whose own reuse was `15.6` %, so the cold share is optimistic | the arm captures' `diverts_by_reason` plus their `prefill_slot_seconds` |
+| queue scaling `351` → about 366 entries/day (E6) | W6 counts queue behaviour at two slots; the increment assumes added entries equal the overlap turns | `queue_waits` and `fallback_after_queue` in both arm captures |
+| W1's missing-usage count (AC3) | not emitted by that report version and the logs have rotated | re-run the analyzer on a retained 24 h window with the W2 pattern and record `streams_without_usage_by_provider` |
+| every magnitude in E1 and E8 | both are functions of measured concurrency, which is `1.04` while busy — a contended window has a different shape | a contended (at least 60 % busy) window in which `avg_concurrency` exceeds 1.04, as §5.6 requires before any arm is measured |
+
+### 5.9 What would refute this prediction
+
+- Arm B `turns_served_locally` materially below Arm A (criterion (a)) — turns do
+  not survive the single slot.
+- Arm B queue entries far above the ~366/day bound, or losses far above
+  ~150/day — head-of-line blocking is worse than the overlap term predicts.
+- Arm B `prefill_slot_seconds` per served turn materially above Arm A — thrash
+  costs more than the `11.5M` tokens/day bound.
+- Arm B `first_byte_p90` worse than 30 % (criterion (c)) — the first-byte tail
+  cost is real rather than tail-only.
+- a contended window where `avg_concurrency` climbs well above 1.04 — the
+  overlap term grows and E1/E6/E8 must be recomputed before the geometry is
+  judged.
+
+### 5.10 Inputs inherited from §3
 
 - `derived-auto` rows 2, 3, 5, 7, 8 and 10 fix the routing envelope: at one
   slot, **only the per-slot clamp doubles**; every routing threshold keeps its
   two-slot value until the §1.3 co-change is applied.
 - `derived-auto` row 12 fixes the concurrency envelope: the dispatch lease pool
   becomes 1, so `max_local` no longer admits a second concurrent session.
-- `not-applicable` row 15 says prefills were already serialised at two slots,
-  so the single-slot cost lands on **decode** overlap, not on prefill overlap.
+- `not-applicable` row 15 says prefills were already serialised at two slots, so
+  the single-slot cost lands on **decode** overlap, not on prefill overlap.
 - `derived-auto` row 21 names the thrash mechanism (all sessions → slot 0) and
   points at the measured steal rate it must reason with.
 
@@ -417,6 +695,11 @@ Documents and analysis catalogue:
 | `docs/dev/slot-geometry-ab.md:9`-`20` | Arm A / Arm B geometry definitions |
 | `docs/dev/slot-geometry-ab.md:116`-`121` | the arm patch table (keys and values) |
 | `docs/dev/slot-management-design.md:38`-`48` | 95-98 % steal rate with `pool_size=1` |
+| `docs/dev/single-slot-throughput-baseline-2026-10-31.json` | every figure quoted in §5, with its measurement window, source document and provenance class |
+| `proxy/docs/routing.md:826`-`847` | prefill-overlap measurement (W3): first-byte p50 23.4 s solo vs 85.0 s with one overlap, aggregate throughput flat at ~254 tok/s |
+| `docs/dev/ubatch-ab-2026-10-22.md:8`-`11` | engine-side large-prompt prompt-eval tail (p50 16 s, p90 189 s, max 591 s) |
+| `docs/dev/restore-rate-metric-fix-ranking.md:16`-`18` | 43.8M re-prefill tokens/day and the 4.88 % native restore rate (W5) |
+| `docs/dev/contention-queue-sweep-baseline-2026-10-31.json` | queue entries, waits and losses for the 24 h contention window (W6) |
 | `.pi/skills/proxy-usage-analysis/REFERENCE.md:359`-`376` | local-turn coverage (turns served locally) |
 | `.pi/skills/proxy-usage-analysis/REFERENCE.md:376`-`412`, `:528` | divert / skip reason distribution |
 | `.pi/skills/proxy-usage-analysis/REFERENCE.md:544`-`548` | prefill breakdown (`queue_wait_ms`, `dispatch_to_first_byte_ms`) |
@@ -424,7 +707,8 @@ Documents and analysis catalogue:
 | `.pi/skills/proxy-usage-analysis/REFERENCE.md:641`-`664` | prefill slot-seconds |
 | `.pi/skills/proxy-usage-analysis/REFERENCE.md:664`-`680` | decode slot-seconds |
 | `.pi/skills/proxy-usage-analysis/REFERENCE.md:788`-`801` | decode tok/s |
-| `.pi/skills/proxy-usage-analysis/REFERENCE.md:817`-`846` | local token reporting and the cold-cache cap |
+| `.pi/skills/proxy-usage-analysis/REFERENCE.md:865`-`891` | local token reporting (`tokens=` / `tokens=missing`) and the cold-cache cap |
+| `.pi/skills/proxy-usage-analysis/REFERENCE.md:591`-`598` | token attribution rule: authoritative `tokens=` on `Stream finished`, provider/model stamped on the line |
 
 Related work items: LP-0MVMHNUXW0061FGN (measured A/B, owns the geometry
 verdict), LP-0MVT1O0VG00905EL (slot occupancy metrics, blocked),
