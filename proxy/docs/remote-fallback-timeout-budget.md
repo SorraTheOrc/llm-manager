@@ -147,10 +147,10 @@ target. Each local ``dispatch_first_byte_ms`` log line now carries:
 | `queue_wait_ms` | Dispatch start → slot acquired (the single-slot contention/queue segment) |
 
 Queue wait is separately capped by the existing contention-queue policy
-(`server.contention_queue_max_wait_seconds`, default 60 — pinned by
-test_contention_queue.py), so the re-scoped target reads: for warm-cache
-local dispatches, `dispatch_to_first_byte_ms` p99 < 60 s, with the queue
-wait bounded by the cap. Warm/cold classification and lookup helpers live in
+(`server.contention_queue_max_wait_seconds`, shipped 30 s since the
+LP-0MVT1146V007WXA4 sweep — pinned by `test_contention_queue_docs.py`), so the
+re-scoped target reads: for warm-cache local dispatches,
+`dispatch_to_first_byte_ms` p99 < 60 s, with the queue wait bounded by the cap. Warm/cold classification and lookup helpers live in
 `proxy/test_dispatch_first_byte_metric.py`-covered helpers
 (`_classify_cache_state`, `_lookup_dispatch_cache_state`).
 

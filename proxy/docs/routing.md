@@ -1039,24 +1039,65 @@ Idle-admitted requests are expected to be **slow** (prefill p90 269.8 s, max
 for remote spend, and it is why the override never fires while anything is
 queued or in flight.
 
-## Slot Contention: Per-Mode Queue vs Fallback (LP-0MSORQVK50012Q4D)
+## Slot Contention: reservations first, the queue as a straggler net
 
-When every local slot is busy (``local_active_queries >= session_slot_pool_size``),
-the proxy's behavior depends on the per-mode contention policy declared in the
-active mode config:
+### The primary cooperative path is a reservation
 
-| Mode (config file) | `contention_queue_policy` | Slot-contention behavior |
-|--------------------|---------------------------|--------------------------|
-| cheap (config-cheap.yaml) | `queue` | Queued cross-session, bounded by `contention_queue_max_wait_seconds` (60) and `contention_queue_max_depth` (8); dispatched local when a slot frees in time, otherwise falls back to the next remote provider |
-| fast (config-fast.yaml) | `queue` | Historical: bounded by `contention_queue_max_wait_seconds` (45) and `contention_queue_max_depth` (3); unified to cheap caps (depth 8, wait 60s) in LP-0MV881O5C007PSL4 / LP-0MVIQ0EXV00673HO |
+A dispatcher that wants local capacity should **claim it before sending**
+rather than wait for it afterwards. `POST /llama/local/reserve` returns the
+same occupancy-aware verdict the queue's admission guard enforces and, on
+`admit`, a single-use ticket the request presents as
+`X-Local-Reservation: <id>` — a ticketed request dispatches **without
+re-checking and without queueing**. `X-Local-Preference`
+(`prefer-local` / `local-preferred` / `remote-ok`) states what the client wants
+when local capacity is unavailable; `local-preferred` defers with a retryable
+`429` instead of buying a remote tier. Reservations are therefore the
+**primary cooperative path**; the protocol is specified in
+[Local Admission Reservations and Fallback Intent](#local-admission-reservations-and-fallback-intent-lp-0mvikpcsg002b0nl).
 
-Fast and cheap now share the same queue caps (depth 8, wait 60s) since
-LP-0MV881O5C007PSL4 unified them; the fast mode note above is historical.
-See LP-0MTQYIK4Z008XF2V / LP-0MVIQ0EXV00673HO for tuning rationale.
+### What the queue is for: stragglers, not parking
+
+When every local slot is busy (``local_active_queries >=
+session_slot_pool_size``), a request that did **not** reserve can still
+**queue** for a slot instead of falling back remote immediately. Since
+LP-0MVT1146V007WXA4 that queue is a bounded **straggler safety net, not a
+parking lot**: it covers non-cooperating clients and the seconds-scale gap
+before a slot frees, priced at a shipped **30 s** wait budget and a **2**-deep
+cap (`proxy/config.yaml`, `server` section). A reservation ticket skips it
+entirely, so the queue only ever holds stragglers.
+
+Queue entry is gated by the request's effective priority (LP-0MVDT94F0003VHUA
+AC3): ``low`` always queues (prefer a local slot over a paid remote call),
+``high`` never queues (immediate remote fallback), ``medium`` follows the
+configured policy. The caps bound the queue for every priority:
+
+| Config key | Meaning | Clamped to |
+|---|---|---|
+| `contention_queue_policy` | ``queue`` or ``fallback`` (applies to ``medium``) | — |
+| `contention_queue_max_depth` | Max queued requests | `[1, 16]` |
+| `contention_queue_max_wait_seconds` | Max seconds to wait for a local slot | `[1, session_guardrail_max_runtime_seconds]` |
+
+**Shipped values (unified config, slot pool fixed at 2):**
+
+| Priority | Policy | Depth | Max wait | Rationale |
+|---|---|---|---|---|
+| **low** | ``queue`` (always) | `2` | `30s` | Straggler net — recover the seconds-scale gaps, never park a request |
+| **medium** | ``queue`` (config-driven) | `2` | `30s` | Shipped default; a wait is only worth taking when it can win inside 30 s |
+| **high** | never queues | — | — | Immediate remote fallback under local contention |
+
+History: the per-mode overlays declared their own queue caps (a deeper depth
+and a longer wait, unified in LP-0MV881O5C007PSL4 and LP-0MVIQ0EXV00673HO);
+the mode axis is retired, so the policy and both caps are now single
+server-level knobs. The depth and wait values were swept to the shipped pair in
+LP-0MVT1146V007WXA4 — see *Evidence, flip criteria and rollback* below
+and the measurement runbook [contention-queue-sweep.md](../../docs/dev/contention-queue-sweep.md).
 
 Key semantics (see `proxy/proxy/provider.py` `_maybe_queue_for_local_slot` and
 `proxy/proxy/contention_queue.py`):
 
+- **Reservations never queue**: a request carrying a claimed
+  `X-Local-Reservation` ticket dispatches without re-checking and without
+  queueing, which is exactly why the queue holds only stragglers.
 - **Cross-session**: the queue is process-global, so a request from session B
   can wait (bounded) behind a long audit stream from session A. This is what
   converts overnight contention fallbacks into queued-local dispatches.
@@ -1102,15 +1143,51 @@ Config reference:
 
 ```yaml
 server:
-  # cheap profile (config-cheap.yaml)
   contention_queue_policy: queue
-  contention_queue_max_wait_seconds: 60    # clamped to [1, max_runtime_seconds]
-  contention_queue_max_depth: 8            # clamped to [1, 16]
+  contention_queue_max_wait_seconds: 30    # clamped to [1, max_runtime_seconds]
+  contention_queue_max_depth: 2            # clamped to [1, 16]
 ```
 
-The queue engages only when ``contention_queue_policy`` is ``queue`` AND the
-proxy is in the corresponding operating mode. Absent keys default to
-``fallback`` for backward compatibility.
+The queue engages only when ``contention_queue_policy`` is ``queue``. Absent
+keys default to ``fallback`` for backward compatibility, so nothing queues.
+
+### Evidence, flip criteria and rollback for the 30 s / depth 2 sweep (LP-0MVIKPRMD000Y97R)
+
+The shipped caps were swept in **LP-0MVT1146V007WXA4** and are pinned by this
+document, `proxy/config.yaml` and
+`proxy/tests/test_contention_queue_docs.py`. Two measured windows justify them:
+
+| Window | Scope | Measured |
+|---|---|---|
+| **2026-10-22 19:00 → 22:18** | 3.3 h intake window | 180 queue events: 38 wins (21 %) / 142 losses (79 %), **every loss at the full wait budget** — 8 705 s of dead wait. Wins retained by budget: 10 s → 16 %, 20 s → 24 %, 30 s → 34 %, 45 s → 60 % |
+| **2026-10-30 05:00 → 2026-10-31 05:00** | 24 h pre-flip baseline (AC1 trigger precondition) | 351 queue events: 214 wins (61 %) / 137 losses (39 %), loss wait 8 222 s (342.6 s/h); 124 wins (57.9 %) landed at or below 30 s; 73 of the 137 losses were `reason=local_lease_active` |
+
+The baseline is produced by `scripts/contention_queue_sweep_report.py` and
+archived in
+[contention-queue-sweep-baseline-2026-10-31.json](../../docs/dev/contention-queue-sweep-baseline-2026-10-31.json);
+the **same** definition must produce the post-flip verdict (runbook:
+[contention-queue-sweep.md](../../docs/dev/contention-queue-sweep.md)), so the
+two numbers are never computed two ways.
+
+**Flip criteria** — the sweep is kept only if ALL three hold over the 7-day /
+≥ 1 000-queue-event observation window, against that 24 h baseline:
+
+1. aggregate dead wait per hour falls by **>= 50 %** (baseline 342.6 s/h);
+2. residual queue wins stay **>= 20 %** of queue events (baseline 61 %);
+3. remote dispatch volume rises by **< 20 %** relative (no paid flood).
+
+Anything else is the rollback — **two lines and a proxy restart** (the queue
+caps are read at startup, so a config edit alone changes nothing):
+
+```yaml
+server:
+  contention_queue_max_wait_seconds: 60
+  contention_queue_max_depth: 8
+```
+
+`contention_queue_policy` and `contention_queue_lease_grace_seconds` (300) are
+unchanged by the sweep, and the lease grace deliberately stays above the wait
+budget so a returning session still re-queues as retained.
 
 ## Prefill-ETA admission guard (LP-0MVGDUV5E005UWBQ, LP-0MVIQ0F8T002FS42)
 
@@ -1205,7 +1282,7 @@ line carries `rate_bucket=contended|solitary|solitary_fallback` and
 `contended_samples=<n>`.
 
 Ordering to keep (the guard does not change these values):
-`contention_queue_max_wait_seconds (60) < local_prefill_deadline_seconds (120)
+`contention_queue_max_wait_seconds (30) < local_prefill_deadline_seconds (120)
 < local_dispatch_first_byte_timeout_seconds (840) <
 local_dispatch_max_prefill_seconds (900)` — an admitted request must never be
 cut off by the deadline, and the deadline must fire before the first-byte
@@ -1555,12 +1632,14 @@ header clients that are served by the next provider).
 
 **Worked example.** The 2026-10-25 refusal of session
 `herdr-1792897705-4039879-16152` — a cache-cold 100k-token prompt priced far
-outside the 60 s wait budget and refused by the direct free-slot guard while a
+outside the wait budget and refused by the direct free-slot guard while a
 local slot was free — reproduces in
 `proxy/tests/test_local_admission_guard.py::test_direct_guard_pin_refusal_is_attributable_and_claims_no_fallback`
 and leaves this output (fields elided with `…` are unchanged by this contract;
 the reproducer asserts the refusal line below is the exact line the code
-emits, and that no fall-through line accompanies it):
+emits, and that no fall-through line accompanies it). `budget_seconds=60.0` is
+the budget that was in force on 2026-10-25, recorded verbatim — the shipped
+budget has since been swept (see the straggler-net section above):
 
 ```text
 local_admission_guard decision=reject reason=eta_exceeds_budget_direct enforced=true eta_prefill_s=468.0 … new_tokens=100000 budget_tokens=0 … free_slot=true priority=low policy=reject model=Qwen3 … provider=local-llama session=herdr-1792897705-4039879-16152
@@ -1893,7 +1972,7 @@ wedged session held the local pool for ~4 h on 2026-10-23
 (LP-0MVKUKFSO008GI6O AC1).
 
 The deadline sits **above** the admission budget
-(`contention_queue_max_wait_seconds`, 60 s) so a request legitimately admitted
+(`contention_queue_max_wait_seconds`, 30 s) so a request legitimately admitted
 inside its budget is never cut off, and **below**
 `local_dispatch_first_byte_timeout_seconds` (840 s), which is itself below
 `local_dispatch_max_prefill_seconds` (900 s) and below the client's own 900 s

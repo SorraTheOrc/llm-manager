@@ -1813,9 +1813,9 @@ server:
   # Contention queue (merged from the retired config-fast/cheap overlays)
   # -----------------------------------------------------------------------
   # The per-mode queue policy was declared by the mode overlays
-  # (config-fast.yaml / config-cheap.yaml, both ``queue`` depth 8 / wait 120s;
-  # unified to a single value, 60 s since LP-0MVIQ0EXV00673HO, then swept to
-  # 30 s / depth 2 in LP-0MVT1146V007WXA4);
+  # (config-fast.yaml / config-cheap.yaml each declared its own depth and wait
+  # budget; unified to a single server-level pair since LP-0MVIQ0EXV00673HO,
+  # then swept to 30 s / depth 2 in LP-0MVT1146V007WXA4);
   # with the mode axis removed the policy is a single server-level knob.
   # Circuit: a request that finds all local slots busy QUEUES (bounded by
   # these caps) instead of immediately falling back to a paid remote
@@ -1831,9 +1831,10 @@ server:
   # prefill-ETA admission guard and ``/llama/local/reserve`` compare against
   # that same number — no second constant, no per-reason budget.
   #
-  # SWEEP EVIDENCE (LP-0MVIKPRMD000Y97R / LP-0MVT1146V007WXA4), 60 s era:
+  # SWEEP EVIDENCE (LP-0MVIKPRMD000Y97R / LP-0MVT1146V007WXA4), pre-sweep
+  # budget:
   #   - 3.3 h intake window 2026-10-22 19:00→22:18: 180 queue events, 38
-  #     wins (21 %) / 142 losses (79 %), EVERY loss at the full 60 s —
+  #     wins (21 %) / 142 losses (79 %), EVERY loss at the full budget —
   #     8 705 s of dead wait. Wins retained by budget: 10 s → 16 %,
   #     20 s → 24 %, 30 s → 34 %, 45 s → 60 %.
   #   - >= 24 h pre-flip baseline (the AC1 trigger precondition, recorded in
@@ -1844,8 +1845,8 @@ server:
   #     124 wins (57.9 %) landed at or below 30 s; 73 of the 137 losses were
   #     ``reason=local_lease_active``.
   # 30 s halves the dead-wait clock while still converting about a third of
-  # the wins a 60 s budget bought; depth 2 keeps a straggler net without the
-  # 7-deep parking lot observed in the 120 s era.
+  # the wins the longer budget bought; depth 2 keeps a straggler net without
+  # the 7-deep parking lot observed in the earlier era.
   #
   # OBSERVATION (7 days / >= 1 000 queue events) — keep the sweep only if ALL
   # three flip criteria hold against the 24 h pre-flip baseline above:
@@ -1872,7 +1873,7 @@ server:
   # wait expires. Kept as-is here (the sweep changes only the two caps);
   # whether to lower the bound or retire it as inert is tracked separately.
   contention_queue_policy: queue
-  contention_queue_max_wait_seconds: 30   # swept 60 → 30 (LP-0MVT1146V007WXA4: 142 of 180 losses burned the full 60 s; 30 s retains ~34 % of wins, 57.9 % of baseline wins land at/below 30 s); Server restart required to change.
+  contention_queue_max_wait_seconds: 30   # swept 60 → 30 (LP-0MVT1146V007WXA4: 142 of 180 losses burned the full budget; 30 s retains ~34 % of wins, 57.9 % of baseline wins land at/below 30 s); Server restart required to change.
   contention_queue_max_depth: 2           # swept 8 → 2 (LP-0MVT1146V007WXA4: straggler net, not the observed 7-deep parking lot)
   # ETA-aware admission ordering (LP-0MVIQ0G2M0006QF6 AC1). With
   # ``local_max_concurrent_prefills: 1`` one long prefill is head-of-line
@@ -1918,7 +1919,7 @@ server:
   # to the full budget and then fall back remote anyway (measured 2026-10-19
   # → 10-20: 4,947 of 5,805 queued waits = 85 % abandoned) — so local
   # admission is refused immediately and the request falls through to the
-  # next provider (LP-0MVIQ0EXV00673HO: halved budget from 120→60 s as 1 481
+  # next provider (LP-0MVIQ0EXV00673HO: halved budget from 120 → 60 as 1 481
   # full-120-s waits were wasted in 24h). A request refused this way that finds no remote provider
   # receives a retryable 429 with ``Retry-After`` and ``X-Local-Admission*``
   # headers.
@@ -1991,7 +1992,7 @@ server:
   # by the measured 2-4x and converged to ~0 exactly when the occupant passed
   # its optimistic ETA — the 2026-10-28 00:28:55 case priced a cold
   # 65-89k-token audit prompt at ``eta_occupancy_s=16.0``, the newcomer queued
-  # the full 60 s, the gate never freed and it fell back remote. Unchanged by
+  # the full budget, the gate never freed and it fell back remote. Unchanged by
   # this revision: measured evidence can only raise the symmetric floor, never
   # lower it; a missing/invalid record or an uncalibrated contended window
   # contributes nothing (never a guessed multiplier). The deadline bound is

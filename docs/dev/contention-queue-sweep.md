@@ -5,7 +5,10 @@ sweep (**LP-0MVIKPRMD000Y97R**, telemetry child **LP-0MVT110PJ003XYLP**).
 
 The sweep shortens `contention_queue_max_wait_seconds` (60 → 30) and
 `contention_queue_max_depth` (8 → 2) so the queue becomes a straggler net rather
-than a parking lot. Because the flip criteria are stated against measured
+than a parking lot. **Shipped caps after the sweep: 30 s / depth 2**
+(`proxy/config.yaml`, documented in [`proxy/docs/routing.md`](../../proxy/docs/routing.md));
+the baseline tables below record the *pre-flip* pair by design, because that is
+the measurement the verdict is compared against. Because the flip criteria are stated against measured
 numbers, the pre-flip baseline and the post-flip verdict must be produced by
 **one definition**. That definition is
 `scripts/contention_queue_sweep_report.py`.

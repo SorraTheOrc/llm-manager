@@ -475,7 +475,7 @@ preserved: missing/malformed evidence or an uncalibrated window contributes
 nothing, and measured evidence can only raise the symmetric
 `eta * busy_slots` floor.
 
-The guardrail ordering is unchanged: `contention_queue_max_wait_seconds (60)
+The guardrail ordering is unchanged: `contention_queue_max_wait_seconds (30)
 < local_prefill_deadline_seconds (120) <
 local_dispatch_first_byte_timeout_seconds (840) <
 local_dispatch_max_prefill_seconds (900)`. Rollback is the existing
