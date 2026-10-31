@@ -879,3 +879,135 @@ async def test_release_helper_is_idempotent(monkeypatch):
     assert len(evictions) == 1, evictions
     assert "reason=measured_cache_deficit" in evictions[0]
     assert SESSION not in server.local_prefill_in_flight
+
+
+# ---------------------------------------------------------------------------
+# AC5 — the deficit 503 carries the marker (header + in-process) so the
+# fallback loop can defer it instead of quarantining the whole local entry
+# ---------------------------------------------------------------------------
+
+#: The marker header the deficit 503 carries. The value is the canonical
+#: deficit token (``measured_cache_abort.MEASURED_CACHE_DEFICIT_REASON``); the
+#: provider sniffs it to take the cold-start-style deferral branch instead of
+#: ``mark_provider_unavailable("local-qwen3", provider_cooldown_seconds)``.
+DEFICIT_MARKER_HEADER = "X-Local-Dispatch-Reason"
+
+#: The implementation child that makes these red rows pass; it must delete the
+#: ``xfail(strict=True)`` markers when the reason-scoped deferral lands.
+_IMPL_ITEM = "LP-0MVWFKESK0005G61"
+_RED_REASON = (
+    "red until %s lands: the deficit 503 carries no marker yet and still "
+    "quarantines the local entry" % _IMPL_ITEM
+)
+
+
+async def _drive_deficit_abort(monkeypatch):
+    """Drive one measured-cache-deficit abort through the real router."""
+    from proxy import cold_start
+
+    cold_start.reset()
+    return await _drive_local(
+        [_fake_warm_progress(), _CONTENT_CHUNK, _FINISH_CHUNK, _DONE],
+        monkeypatch=monkeypatch,
+    )
+
+
+def _provider_config() -> dict:
+    """The config ``_handle_http_error_with_cooldown`` reads its knobs from."""
+    return {"server": dict(SERVER_CONFIG["server"]), "provider_cooldown_seconds": 60}
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+@pytest.mark.asyncio
+async def test_deficit_503_carries_the_marker_header(monkeypatch):
+    """AC5: the deficit 503 names its reason on the response itself.
+
+    The marker header and value are additive to the existing ``Retry-After`` /
+    ``X-Session-*`` headers, which must be unchanged so no other consumer
+    regresses.
+    """
+    from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
+
+    result, received, _sent = await _drive_deficit_abort(monkeypatch)
+
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 503
+    assert received == b""
+
+    headers = result.headers
+    assert headers.get(DEFICIT_MARKER_HEADER) == MEASURED_CACHE_DEFICIT_REASON, (
+        "the deficit 503 must carry the deficit marker so the fallback loop "
+        "can scope the deferral to this reason"
+    )
+    retry_after = headers.get("Retry-After")
+    assert retry_after is not None and float(retry_after) > 0
+    # Existing session headers are unchanged (additive marker only).
+    assert headers.get("X-Session-Id") == SESSION
+    assert headers.get("X-Session-Created") == "false"
+    assert headers.get("X-Session-Delta") == "false"
+    assert headers.get("Cache-Control") == "no-store"
+
+
+@pytest.mark.xfail(strict=True, reason=_RED_REASON)
+@pytest.mark.asyncio
+async def test_deficit_marker_survives_header_loss(monkeypatch):
+    """AC5/AC1b: the in-process marker defers the 503 even without the header.
+
+    The header alone is fragile: an intermediary or a response-rebuilding path
+    can drop it. The router must also stamp the reason in-process on the
+    response, so the provider's marker sniff still defers the dispatch and
+    never quarantines the local entry.
+    """
+    import proxy.provider as provider
+
+    result, _received, _sent = await _drive_deficit_abort(monkeypatch)
+    assert isinstance(result, JSONResponse)
+
+    # Simulate the header being lost in transit.
+    try:
+        del result.headers[DEFICIT_MARKER_HEADER]
+    except KeyError:
+        pass
+    assert DEFICIT_MARKER_HEADER not in result.headers
+
+    provider._provider_unavailable_until.clear()
+    provider._provider_failure_count.clear()
+    attempts: list[dict] = []
+    cooldown = provider._handle_http_error_with_cooldown(
+        result,
+        "local-qwen3",
+        "local",
+        60.0,
+        attempts,
+        "measured cache deficit abort",
+        config=_provider_config(),
+    )
+
+    assert not provider._is_provider_unavailable("local-qwen3"), (
+        "the in-process deficit marker must prevent the entry quarantine even "
+        "when the header is lost"
+    )
+    assert attempts and attempts[0]["status"] == "local_dispatch_deferral", attempts
+    assert cooldown > 0
+
+
+@pytest.mark.asyncio
+async def test_prefill_deadline_503_has_no_deficit_marker(monkeypatch):
+    """AC1b/AC3: only the deficit abort carries the marker.
+
+    A prefill-deadline detour is a different reason and must keep its exact
+    pre-change response (no marker), so the exemption can never widen into
+    "any local 503".
+    """
+    result, _received, _sent = await _drive_local(
+        [_warm_progress()],
+        monkeypatch=monkeypatch,
+        server_config_extra={"local_prefill_deadline_seconds": 0.2},
+        hang_after=1,
+    )
+
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 503
+    assert DEFICIT_MARKER_HEADER not in result.headers, (
+        "a deadline detour must not carry the deficit marker"
+    )
