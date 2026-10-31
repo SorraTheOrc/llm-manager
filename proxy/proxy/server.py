@@ -1468,6 +1468,15 @@ app = FastAPI(
 # Register the CLOSE-WAIT disconnect-reaper middleware (LP-0MSNM9UCC002CHYU).
 app.add_middleware(DisconnectReaperMiddleware)
 
+# Register the downstream write-stall guard (LP-0MVWZ9CH6006NW1H). Added AFTER
+# the reaper so it is the OUTERMOST wrapper: it must see every ``send`` —
+# including the responses the inner middleware stack renders during unwinding.
+# The reaper handles a client that has gone; this handles a client that is
+# still connected but has stopped reading, which is_disconnected() never sees.
+from proxy.client_stall_guard import ClientStallGuardMiddleware  # noqa: E402
+
+app.add_middleware(ClientStallGuardMiddleware)
+
 # Include handlers from the extracted handlers module
 from . import handlers  # noqa: E402
 

@@ -87,6 +87,10 @@ backend_signal_counts: dict = {
     # Per-entry ``max_context_tokens`` ceiling skip (LP-0MVF9N3BV00155RI):
     # mirrors ``context_too_large``; a size mismatch, never a failure signal.
     "provider_context_exceeded": 0,
+    # Downstream write stall: the client stopped draining its socket and the
+    # response was abandoned after the write-progress deadline
+    # (LP-0MVWZ9CH6006NW1H). Not a backend failure — a wedged/absent reader.
+    "client_stall": 0,
 }
 
 

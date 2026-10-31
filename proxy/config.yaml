@@ -2539,6 +2539,21 @@ server:
   # Default: 120 seconds.
   stream_idle_timeout_seconds: 120
 
+  # Downstream write-stall deadline (LP-0MVWZ9CH6006NW1H).
+  # The upstream knobs above bound a SILENT upstream; this one bounds a SILENT
+  # CLIENT. A client that stops draining its socket while TCP stays
+  # ESTABLISHED is invisible to is_disconnected() (no http.disconnect ever
+  # arrives), so the ASGI send() awaited by the streaming response never
+  # completes and the request, its task and its handler are held indefinitely
+  # (observed: two streams with 1.1 MB / 0.6 MB unsent for 30+ min).
+  # When one send makes no progress for this many seconds the response is
+  # abandoned, logged as reason=client_stall, counted in
+  # /health -> backend_signals.client_stall, and the connection is closed.
+  # Default: unset — falls back to stream_idle_timeout_seconds (120s).
+  # Set to 0 to disable the guard. Fail-open: an unparsable value uses the
+  # fallback.
+  # client_stall_timeout_seconds: 120
+
   # Upstream stall idle timeout (LP-0MRE52D3C001KP1H).
   # When the remote upstream stops sending data mid-stream without closing
   # the connection or sending a finish_reason, the proxy waits this long
