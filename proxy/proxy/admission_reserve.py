@@ -25,6 +25,11 @@ Design constraints (from the work item):
 - The verdict comes from ``prefill_eta`` — this module never duplicates ETA
   maths. ``busy_slots`` / ``in_flight_prefills`` are supplied by the caller so
   the reserve verdict and the guard verdict are identical for identical inputs.
+- One budget, one resolver: the number the verdict is priced against is
+  ``prefill_eta.wait_budget_seconds(config, priority)`` (the contention-queue
+  max wait, 30 s in the shipped config since LP-0MVT1146V007WXA4) — the same
+  number the admission guard compares against. This module holds no budget
+  constant and applies no per-call default.
 - Fail-open: an inert (uncalibrated) guard admits. A refusal requires a
   calibrated verdict against a real budget.
 - Tickets are TTL-bound (default 10 s, capped at 60 s), single-use and

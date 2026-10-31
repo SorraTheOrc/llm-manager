@@ -223,6 +223,48 @@ def test_reserve_refuses_with_full_payload_when_wait_exceeds_budget():
     assert payload["retry_after_s"] >= 1
 
 
+def test_reserve_prices_against_the_shipped_swept_budget():
+    """AC2: ``/llama/local/reserve`` compares against the shipped 30 s budget.
+
+    The same 12k-token request that fits a 60 s budget is refused once the
+    shipped 30 s budget applies, so the reservation endpoint and the admission
+    guard share one number (``prefill_eta.wait_budget_seconds`` reading
+    ``proxy/config.yaml``) rather than a per-call default.
+    """
+    from config_test_utils import get_merged_config
+
+    _seed_calibration()
+    shipped_server = get_merged_config("fast")["server"]
+
+    status, payload = admission_reserve.reserve(
+        {"estimated_tokens": _TOKENS, "session_id": "s-1"},
+        {"server": shipped_server},
+        model="Qwen3",
+        busy_slots=0,
+    )
+
+    assert status == 429, payload
+    assert payload["admit"] is False
+    assert payload["budget_s"] == 30.0
+
+    # Control: the identical request admits under the pre-sweep 60 s budget,
+    # so the refusal above is the swept value, not the calibration.
+    status_control, payload_control = admission_reserve.reserve(
+        {"estimated_tokens": _TOKENS, "session_id": "s-2"},
+        {
+            "server": {
+                **shipped_server,
+                "contention_queue_max_wait_seconds": 60,
+            }
+        },
+        model="Qwen3",
+        busy_slots=0,
+    )
+
+    assert status_control == 200, payload_control
+    assert payload_control["admit"] is True
+
+
 @pytest.mark.asyncio
 async def test_refused_reserve_request_never_enters_the_contention_queue(caplog):
     """AC2 end-to-end: a refused refund request has no queue side effects."""

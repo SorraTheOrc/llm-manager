@@ -248,6 +248,12 @@ def _get_contention_queue_config(server_config: dict) -> dict:
     F2 AC3/AC4). Entry is gated per request by the effective priority (AC3,
     LP-0MVDT94F0003VHUA): ``low`` always queues, ``high`` never queues,
     ``medium`` engages when the merged base config's policy is ``queue``.
+
+    This is the ONE place the budget is resolved (LP-0MVIKPRMD000Y97R AC2):
+    ``prefill_eta.wait_budget_seconds`` reads ``max_wait_seconds`` from here,
+    and both the prefill-ETA admission guard and ``POST /llama/local/reserve``
+    compare against that same number — no second constant, no per-call
+    default, no per-reason budget.
     """
     policy = str(
         server_config.get("contention_queue_policy", "fallback") or "fallback"
@@ -270,6 +276,10 @@ def _get_contention_queue_config(server_config: dict) -> dict:
             server_config.get("session_guardrail_max_runtime_seconds"),
         )
         max_runtime = 1800
+    # Below is the INERT no-config fallback: an absent
+    # ``contention_queue_policy`` resolves to ``fallback`` (nothing queues),
+    # so these defaults never govern a running proxy. The shipped values live
+    # in ``proxy/config.yaml`` (30 s / depth 2 since LP-0MVT1146V007WXA4).
     raw_wait = server_config.get("contention_queue_max_wait_seconds", 60)
     try:
         wait = float(raw_wait) if raw_wait is not None else 60.0

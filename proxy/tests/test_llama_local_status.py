@@ -883,6 +883,22 @@ async def test_status_publishes_prefill_and_queue_eta(_eta_calibration):
 
 
 @pytest.mark.asyncio
+async def test_status_publishes_the_shipped_swept_budget(_eta_calibration):
+    """AC2 (LP-0MVT1146V007WXA4): the published budget is the shipped 30 s.
+
+    A dispatcher paces its session against ``prefill_budget_seconds``; it must
+    be the same number the admission guard and ``/reserve`` enforce, resolved
+    from ``proxy/config.yaml`` through the one resolver — not a stale literal.
+    """
+    from config_test_utils import get_merged_config
+
+    server_config = {"server": dict(get_merged_config("fast")["server"])}
+    j = await _EtaStatusHarness().get(server_config)
+
+    assert j["prefill_budget_seconds"] == 30.0
+
+
+@pytest.mark.asyncio
 async def test_status_labels_the_prefill_eta_as_a_cache_cold_reference_bound():
     """AC2 (LP-0MVSD5RJW008F1IB): the published bound is unmistakable.
 

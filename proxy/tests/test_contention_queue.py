@@ -997,21 +997,22 @@ def test_contention_queue_config_logs_invalid_values(caplog):
 
 
 def test_cheap_config_declares_queue_policy():
-    """The merged cheap profile declares queue policy + tuned caps (F2 AC1,
+    """The merged cheap profile declares queue policy + the swept caps (F2 AC1,
     caps tuned 60→120 / 4→8 per LP-0MTF6EVLW007PEHN; halved 120→60 in
-    LP-0MVIQ0EXV00673HO)."""
+    LP-0MVIQ0EXV00673HO; swept 60→30 / 8→2 in LP-0MVT1146V007WXA4)."""
     from config_test_utils import get_merged_config
 
     server = get_merged_config("cheap")["server"]
     assert server["contention_queue_policy"] == "queue"
-    assert server["contention_queue_max_wait_seconds"] == 60
-    assert server["contention_queue_max_depth"] == 8
+    assert server["contention_queue_max_wait_seconds"] == 30
+    assert server["contention_queue_max_depth"] == 2
 
 
 def test_fast_config_declares_queue_policy():
-    """The merged fast profile declares queue policy + the same tuned caps as
-    cheap (depth 8, wait 60s). LP-0MV881O5C007PSL4 raised fast to cheap caps
-    (wait 120s); LP-0MVIQ0EXV00673HO halved the unified cap to 60s.
+    """The merged fast profile declares queue policy + the same swept caps as
+    cheap (depth 2, wait 30s). LP-0MV881O5C007PSL4 raised fast to cheap caps
+    (wait 120s); LP-0MVIQ0EXV00673HO halved the unified cap to 60s;
+    LP-0MVT1146V007WXA4 swept both to 30s / depth 2 (straggler net).
 
     Fast mode originally used a smaller queue (depth 3 vs 8, wait 45s vs 120s,
     LP-0MTQYIK4Z008XF2V) so burst traffic spilled to remotes sooner during
@@ -1023,8 +1024,8 @@ def test_fast_config_declares_queue_policy():
 
     server = get_merged_config("fast")["server"]
     assert server["contention_queue_policy"] == "queue"
-    assert server["contention_queue_max_wait_seconds"] == 60
-    assert server["contention_queue_max_depth"] == 8
+    assert server["contention_queue_max_wait_seconds"] == 30
+    assert server["contention_queue_max_depth"] == 2
 
 
 def test_fast_queue_caps_match_cheap():
@@ -1042,6 +1043,187 @@ def test_fast_queue_caps_match_cheap():
         f"fast wait {fast['contention_queue_max_wait_seconds']} must equal cheap wait "
         f"{cheap['contention_queue_max_wait_seconds']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Sweep 60 s / depth 8 → 30 s / depth 2 (LP-0MVT1146V007WXA4)
+#
+# The swept values must reach the queue through the one resolver, and both
+# must behave as a straggler net: depth 2 spills the third waiter immediately
+# and a parked waiter gives up at 30 s. Never a real 30 s sleep below.
+# ---------------------------------------------------------------------------
+
+
+def _shipped_server_block() -> dict:
+    """The shipped ``proxy/config.yaml`` server block (single source of truth)."""
+    from config_test_utils import get_merged_config
+
+    return get_merged_config("fast")["server"]
+
+
+def _shipped_runtime_config() -> dict:
+    """Runtime config whose queue caps come from the shipped file.
+
+    ``proxy_with_fallback`` resolves the caps through
+    ``_get_contention_queue_config(config)``, so passing the real server block
+    exercises the shipped values end to end (no patched resolver).
+    """
+    return {"provider_cooldown_seconds": 60, "server": dict(_shipped_server_block())}
+
+
+def test_shipped_sweep_reaches_one_resolver_and_both_caps():
+    """AC2: one resolver feeds the queue, the admission guard and ``/reserve``.
+
+    The shipped ``contention_queue_max_wait_seconds`` (30) and
+    ``contention_queue_max_depth`` (2) are read through
+    ``_get_contention_queue_config``; ``wait_budget_seconds`` is that same
+    number on both local paths, and ``high`` priority (which never queues)
+    resolves to 0.
+    """
+    from proxy.router import _get_contention_queue_config
+
+    from proxy import prefill_eta
+
+    server = _shipped_server_block()
+    queue_cfg = _get_contention_queue_config(server)
+    resolved = {"server": server}
+
+    assert queue_cfg["max_wait_seconds"] == 30.0
+    # Depth 2 is inside the [1, 16] clamp: accepted unchanged, not coerced.
+    assert queue_cfg["max_depth"] == 2
+    assert prefill_eta.wait_budget_seconds(resolved, "medium") == 30.0
+    assert prefill_eta.wait_budget_seconds(resolved, "low") == 30.0
+    assert prefill_eta.wait_budget_seconds(resolved, "high") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_shipped_sweep_caps_reach_the_provider_queue_wait(
+    mixed_model_config,
+):
+    """AC2 end to end: the provider hands the shipped 30 s / depth 2 to the
+    queue wait (the resolver is NOT patched in this test)."""
+    calls: list[dict] = []
+    call_log: list[str] = []
+
+    async def _spy_wait(**kwargs):
+        calls.append(kwargs)
+        return None  # caps exceeded → the caller falls back remote
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local")
+        return _ok_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        call_log.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        # ``provider.py`` imports the queue lazily (``from proxy import
+        # contention_queue``), so patching the module attribute is what the
+        # wait site resolves at call time.
+        patch("proxy.contention_queue.wait_for_local_slot", _spy_wait),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(),
+            "v1/chat/completions",
+            mixed_model_config,
+            _shipped_runtime_config(),
+        )
+
+    assert result.status_code == 200
+    assert call_log == ["remote"]
+    assert [(c["max_wait_seconds"], c["max_depth"]) for c in calls] == [(30.0, 2)]
+
+
+@pytest.mark.asyncio
+async def test_swept_depth_two_third_waiter_falls_back_without_enqueueing():
+    """AC4: depth 2 is a straggler net — with two waiters already parked a
+    third request falls back immediately instead of enqueueing."""
+    from proxy.router import _get_contention_queue_config
+
+    queue_cfg = _get_contention_queue_config(_shipped_server_block())
+    assert queue_cfg["max_depth"] == 2
+
+    parked = [
+        asyncio.create_task(
+            contention_queue.wait_for_local_slot(
+                queue_cfg["max_wait_seconds"],
+                queue_cfg["max_depth"],
+                slot_free_check=lambda: False,
+            )
+        )
+        for _ in range(2)
+    ]
+    try:
+        for _ in range(200):
+            if contention_queue.queue_depth() == 2:
+                break
+            await asyncio.sleep(0.005)
+        assert contention_queue.queue_depth() == 2
+
+        third = await contention_queue.wait_for_local_slot(
+            queue_cfg["max_wait_seconds"],
+            queue_cfg["max_depth"],
+            slot_free_check=lambda: False,
+        )
+
+        assert third is None, "the third waiter must not park (depth cap 2)"
+        assert contention_queue.queue_depth() == 2
+    finally:
+        for task in parked:
+            task.cancel()
+        await asyncio.gather(*parked, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_swept_budget_expires_at_thirty_seconds(monkeypatch):
+    """AC4: a parked waiter that is never served falls back at the shipped
+    30 s budget.
+
+    The clock and the wait primitive are faked, so the assertion is on the
+    *budget handed to the wait* (30.0 s, resolved from the shipped config) —
+    never a real 30 s sleep.
+    """
+    from types import SimpleNamespace
+
+    from proxy.router import _get_contention_queue_config
+
+    queue_cfg = _get_contention_queue_config(_shipped_server_block())
+    assert queue_cfg["max_wait_seconds"] == 30.0
+
+    clock = {"now": 1_000.0}
+    timeouts: list[float] = []
+
+    async def _fake_wait_for(awaitable, timeout):
+        timeouts.append(timeout)
+        awaitable.close()
+        clock["now"] += timeout  # the wait consumed the whole budget
+        raise TimeoutError
+
+    monkeypatch.setattr(
+        contention_queue,
+        "asyncio",
+        SimpleNamespace(
+            Condition=asyncio.Condition,
+            Event=asyncio.Event,
+            wait_for=_fake_wait_for,
+        ),
+    )
+    monkeypatch.setattr(contention_queue.time, "monotonic", lambda: clock["now"])
+
+    result = await contention_queue.wait_for_local_slot(
+        queue_cfg["max_wait_seconds"],
+        queue_cfg["max_depth"],
+        slot_free_check=lambda: False,
+    )
+
+    assert result is None
+    assert timeouts == [30.0], "the wait must be bounded by the shipped 30 s"
+    assert contention_queue.queue_depth() == 0
 
 
 # ===================================================================

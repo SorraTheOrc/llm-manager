@@ -4,8 +4,9 @@ Problem
 -------
 
 When every local slot is busy, a request enters the bounded contention queue
-(bounded by ``contention_queue_max_wait_seconds``, 60 s in the shipped
-config — halved from 120 in LP-0MVIQ0EXV00673HO) and waits. For a large
+(bounded by ``contention_queue_max_wait_seconds``, 30 s in the shipped
+config — swept from 60 s in LP-0MVT1146V007WXA4, which halved 120 s in
+LP-0MVIQ0EXV00673HO) and waits. For a large
 cache-cold prompt the local prefill cannot finish inside that budget, so the
 wait is a *guaranteed loss*: the request burns up to the full wait and then
 falls back to a remote provider anyway (measured 2026-10-19/20: 5,805 waits
@@ -515,7 +516,7 @@ The admitted-request lifetime must be strictly increasing so each bound fires
 before the next one and all of them fire before the client gives up
 (LP-0MVN4LBEQ005QRVL AC3)::
 
-        contention_queue_max_wait_seconds (60)
+        contention_queue_max_wait_seconds (30)
           < local_prefill_deadline_seconds (120)
           < local_dispatch_first_byte_timeout_seconds (840)
           < local_dispatch_max_prefill_seconds (900)
@@ -527,6 +528,9 @@ above the client's own deadline loses the race it exists to win. A zero
 (disabled) value is skipped rather than ordered — ``0`` means "no bound".
 """
     server_cfg = _server_config(config)
+    # Inert fallback only: an absent queue key defaults the policy to
+    # ``fallback`` (nothing queues), so this default never applies to a
+    # running proxy — only the shipped config value (30 s) governs.
     queue_budget = _float_setting(
         server_cfg, "contention_queue_max_wait_seconds", 60.0
     )

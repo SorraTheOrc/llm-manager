@@ -531,6 +531,59 @@ def test_generic_exhaustion_is_unchanged_without_a_refusal():
 
 
 # ---------------------------------------------------------------------------
+# The shipped swept budget is the one the guard refuses against
+# (LP-0MVT1146V007WXA4 AC2)
+# ---------------------------------------------------------------------------
+
+def test_shipped_swept_budget_drives_the_guard_refusal_payload():
+    """The 429 a client sees is priced against the shipped 30 s budget.
+
+    The budget is read from the shipped ``proxy/config.yaml`` through the one
+    resolver (``prefill_eta.wait_budget_seconds`` →
+    ``_get_contention_queue_config``), so neither the decision nor the
+    ``X-Local-Admission-Budget`` header can carry a second, test-local
+    constant.
+    """
+    from config_test_utils import get_merged_config
+
+    # Cache-cold 6k prompt at ~3.9 ms/token ≈ 23.4 s own prefill; behind one
+    # occupied gate the projection is ~46.8 s — inside the shipped 120 s
+    # deadline and the 25k cold-prefill budget, but past the 30 s wait budget.
+    _seed_calibration(tokens=6_000, ms_per_token=3.9)
+    config = {
+        "provider_cooldown_seconds": 60,
+        "server": get_merged_config("fast")["server"],
+    }
+
+    decision = prefill_eta.evaluate_admission(
+        config, "Qwen3", 6_000, 0.0, "medium", busy_slots=1
+    )
+
+    assert decision.reason == "eta_exceeds_budget"
+    assert decision.budget_seconds == 30.0
+
+    response = provider._build_exhausted_response(
+        all_local_slot_exhaustion=False,
+        unavailable_providers={},
+        diagnostics=[
+            {
+                "provider": "local-llama",
+                "type": "local",
+                "status": "local_admission_reject",
+                "reason": decision.reason,
+                **provider._local_admission_evidence(decision),
+            }
+        ],
+        config=config,
+    )
+
+    assert response.status_code == 429
+    assert response.headers["X-Local-Admission"] == "reject"
+    assert response.headers["X-Local-Admission-Budget"] == "30.0"
+    assert json.loads(response.body)["budget_seconds"] == 30.0
+
+
+# ---------------------------------------------------------------------------
 # Direct (free-slot) dispatch guard (LP-0MVIQ0F8T002FS42)
 #
 # The queue-entry guard above only runs when every local slot is busy. A
