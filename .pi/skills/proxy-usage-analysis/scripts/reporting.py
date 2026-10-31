@@ -2740,7 +2740,10 @@ def _append_contention_prediction_section(
     ap("| Metric | Value |")
     ap("|---|---:|")
     ap(f"| Matched pairs | {matched['pairs']} "
-       f"(enforced {matched['enforced_pairs']}, observe {matched['observe_pairs']}) |")
+       f"(admitted {matched['admitted_pairs']}, observe-policy "
+       f"{matched['observe_pairs']}) |")
+    ap(f"| Enforced refusals (never paired) | "
+       f"{matched['enforced_refusals']} |")
     ap(f"| Unmatched dispatches | {matched['unmatched_dispatches']} "
        f"of {matched['dispatches']} |")
     ap(f"| Predicted p50 / p90 | "
@@ -2755,7 +2758,11 @@ def _append_contention_prediction_section(
     ap("")
     ap("Unmatched dispatches are never folded into the matched figure: an "
        "inert (uncalibrated) guard, or an inactive `observe`-mode decision, "
-       "logs no priced ETA and therefore cannot be scored. "
+       "logs no priced ETA and cannot be scored, and an enforced refusal "
+       "never owns a first byte. The verdict uses the **median** per-pair "
+       "relative error; its p90 is tail-dominated by very fast cache-warm "
+       "dispatches (a 0.3 s first byte against a several-second ETA is a huge "
+       "percentage). "
        f"**(matched prefill ETA verdict: {matched['verdict']})**")
     ap("")
 
@@ -3777,9 +3784,16 @@ def _matched_prefill_eta(summary: AnalysisResult) -> dict:
     - a dispatch with no matching guard record is **unmatched** and never
       folded into the matched figure (the guard is inert for uncalibrated
       buckets and logs nothing for inactive observe-mode decisions);
-    - ``enforced=false`` (observe rollout) pairs are valid *pricing*
-      measurements and are included, but counted separately so a rollout
-      window stays interpretable;
+    - observe-policy pairs (a would-be refusal priced without enforcement)
+      are valid *pricing* measurements and are included, but counted
+      separately from ordinary admitted dispatches so a rollout window stays
+      interpretable. The log's ``enforced`` token means "the refusal was
+      applied" — it is ``false`` for every admitted request, so the ``policy``
+      token decides the split;
+    - an **enforced refusal never pairs**: it refused that request, so a later
+      first byte in the same session belongs to a different request. Those
+      records are counted in ``enforced_refusals`` and excluded from the
+      candidate set (the dispatch becomes unmatched);
     - guard records whose priced ETA is ``0`` (the calibration-independent
       cold-prefill budget refusal) are not estimates and are skipped.
     """
@@ -3791,13 +3805,19 @@ def _matched_prefill_eta(summary: AnalysisResult) -> dict:
         return out if math.isfinite(out) else None
 
     guards: dict[str, list[tuple[datetime, float, str | None]]] = {}
+    enforced_refusals = 0
     for event in getattr(summary, "local_admission_events", []) or []:
         session = getattr(event, "session", None)
         eta = _num(getattr(event, "eta_prefill_s", None))
         if not session or eta is None or eta <= 0.0:
             continue
+        if getattr(event, "enforced", None) == "true":
+            # A refusal that was actually applied: the request did not
+            # dispatch, so it is never a pairing candidate.
+            enforced_refusals += 1
+            continue
         guards.setdefault(session, []).append(
-            (event.ts, eta, getattr(event, "enforced", None))
+            (event.ts, eta, getattr(event, "policy", None))
         )
     for entries in guards.values():
         entries.sort(key=lambda item: item[0])
@@ -3825,8 +3845,8 @@ def _matched_prefill_eta(summary: AnalysisResult) -> dict:
                 chosen = candidate
         pairs.append((chosen[1], service_ms / 1000.0, chosen[2]))
 
-    predicted = [p for p, _o, _e in pairs]
-    observed = [o for _p, o, _e in pairs]
+    predicted = [p for p, _o, _pol in pairs]
+    observed = [o for _p, o, _pol in pairs]
     relative = [
         (p - o) / o * 100.0 for p, o in zip(predicted, observed) if o > 0
     ]
@@ -3848,8 +3868,13 @@ def _matched_prefill_eta(summary: AnalysisResult) -> dict:
         "pairs": len(pairs),
         "dispatches": dispatches,
         "unmatched_dispatches": unmatched,
-        "enforced_pairs": sum(1 for _p, _o, e in pairs if e != "false"),
-        "observe_pairs": sum(1 for _p, _o, e in pairs if e == "false"),
+        # Mutually exclusive split of the matched pairs: an observe-policy
+        # would-be refusal, or an ordinary admitted dispatch. Enforced
+        # refusals are excluded from pairing entirely (``enforced_refusals``
+        # counts the guard records dropped for that reason).
+        "admitted_pairs": sum(1 for _p, _o, pol in pairs if pol != "observe"),
+        "observe_pairs": sum(1 for _p, _o, pol in pairs if pol == "observe"),
+        "enforced_refusals": enforced_refusals,
         "predicted_p50": _r(_percentile(predicted, 50)),
         "predicted_p90": _r(_percentile(predicted, 90)),
         "observed_p50": _r(_percentile(observed, 50)),

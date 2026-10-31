@@ -193,7 +193,12 @@ Outputs written to:
       admission guard priced for that dispatch (`eta_prefill_s`), observed =
       the same dispatch's `dispatch_to_first_byte_ms`, joined on `session=`.
       Entries: `pairs`, `dispatches`, `unmatched_dispatches`,
-      `enforced_pairs`, `observe_pairs`, `predicted_p50` / `predicted_p90`,
+      `admitted_pairs` / `observe_pairs` (mutually exclusive: an ordinary
+      admitted dispatch, or an observe-policy would-be refusal — note the
+      log's `enforced` token means "the refusal was applied", so `policy=`
+      decides the split), `enforced_refusals` (guard records dropped because
+      the refusal really fired: that request never dispatched, so it cannot be
+      the owner of a first byte), `predicted_p50` / `predicted_p90`,
       `observed_p50` / `observed_p90`, `relative_error_p50_pct` /
       `relative_error_p90_pct` (percentiles of the per-pair relative error),
       `tolerance_pct` (25) and `verdict` (`matches_reality` within tolerance,

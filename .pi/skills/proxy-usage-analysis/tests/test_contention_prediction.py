@@ -608,11 +608,21 @@ class TestStatusRequestCalibrationContext:
 # the own-prefill term (not ``projected_wait_s``, which adds occupancy).
 GUARD_SESSION_A = (
     "2026-08-02 14:20:00,000 - INFO - local_admission_guard decision=admit "
-    "reason=within_budget enforced=true eta_prefill_s=30.0 "
+    "reason=within_budget enforced=false eta_prefill_s=30.0 "
     "eta_occupancy_s=0.0 projected_wait_s=30.0 budget_s=60.0 deadline_s=120.0 "
     "deadline_budget_s=114.0 new_tokens=7692 budget_tokens=25000 busy_slots=0 "
     "in_flight_prefills=0 free_slot=true priority=low policy=reject "
     "model=Qwen3 samples=20 provider=local-qwen3 session=11111111-aaaa"
+)
+# An *enforced* refusal: the request did not dispatch, so it is never a
+# pairing candidate (a later first byte in the same session is another request).
+GUARD_SESSION_REFUSED = (
+    "2026-08-02 14:23:00,000 - INFO - local_admission_guard decision=reject "
+    "reason=eta_exceeds_budget enforced=true eta_prefill_s=20.0 "
+    "eta_occupancy_s=0.0 projected_wait_s=20.0 budget_s=60.0 deadline_s=120.0 "
+    "deadline_budget_s=114.0 new_tokens=7974 budget_tokens=25000 busy_slots=0 "
+    "in_flight_prefills=0 free_slot=true priority=low policy=reject "
+    "model=Qwen3 samples=20 provider=local-qwen3 session=44444444-dddd"
 )
 GUARD_SESSION_B_OBSERVE = (
     "2026-08-02 14:21:00,000 - INFO - local_admission_guard decision=reject "
@@ -667,8 +677,9 @@ class TestMatchedPrefillEtaAccuracy:
         matched = reporting.prefill_eta_error_json(summary, None)["matched"]
 
         assert matched["pairs"] == 1
-        assert matched["enforced_pairs"] == 1
+        assert matched["admitted_pairs"] == 1
         assert matched["observe_pairs"] == 0
+        assert matched["enforced_refusals"] == 0
         assert matched["predicted_p50"] == pytest.approx(30.0)
         assert matched["observed_p50"] == pytest.approx(15.0)
         assert matched["relative_error_p50_pct"] == pytest.approx(100.0)
@@ -710,9 +721,44 @@ class TestMatchedPrefillEtaAccuracy:
         assert matched["pairs"] == 2
         # Pair 1: 30 vs 30 → 0 %. Pair 2: 60 vs 120 → -50 %. p50 = -25 %.
         assert matched["relative_error_p50_pct"] == pytest.approx(-25.0, abs=0.1)
-        # The observe-mode pair is a valid pricing measurement, reported apart.
+        # The observe-policy pair is a valid pricing measurement, reported apart.
         assert matched["observe_pairs"] == 1
-        assert matched["enforced_pairs"] == 1
+        assert matched["admitted_pairs"] == 1
+
+    def test_admitted_dispatch_is_not_mislabelled_as_observe_policy(self):
+        """``enforced=false`` on an admit is not an observe roll-out.
+
+        The log token means "the refusal was applied"; an ordinary admitted
+        dispatch carries ``enforced=false`` under ``policy=reject``. Reading it
+        as an observe-policy pair would mis-describe every normal window.
+        """
+        summary = _matched_summary(
+            GUARD_SESSION_A, _dispatch("11111111-aaaa", 30_000.0)
+        )
+        matched = reporting.prefill_eta_error_json(summary, None)["matched"]
+
+        assert matched["pairs"] == 1
+        assert matched["admitted_pairs"] == 1
+        assert matched["observe_pairs"] == 0
+
+    def test_enforced_refusal_is_never_paired_with_a_dispatch(self):
+        """A refusal that was applied did not dispatch that request."""
+        summary = _matched_summary(
+            GUARD_SESSION_REFUSED, _dispatch("44444444-dddd", 20_000.0)
+        )
+        matched = reporting.prefill_eta_error_json(summary, None)["matched"]
+
+        assert matched["pairs"] == 0
+        assert matched["unmatched_dispatches"] == 1
+        assert matched["enforced_refusals"] == 1
+        assert matched["verdict"] == "inconclusive"
+
+    def test_guard_policy_is_parsed_from_the_decision_line(self):
+        ev = log_parser.parse_log_line(GUARD_SESSION_B_OBSERVE)
+
+        assert ev.kind == "local_admission_guard"
+        assert ev.policy == "observe"
+        assert ev.enforced == "false"
 
     def test_unmatched_dispatch_is_counted_never_folded_in(self):
         """No guard record for the session (inert guard) → unmatched, not scored."""
@@ -776,4 +822,5 @@ class TestContentionReportLabelsTheTwoComparisons:
         assert "bound verdict" in md
         # The matched figure renders its pair split and its own verdict.
         assert "Unmatched dispatches" in md
+        assert "admitted" in md
         assert "matched prefill ETA verdict" in md

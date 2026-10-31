@@ -1230,6 +1230,10 @@ def parse_log_line(line: str) -> LogEvent | None:
             contended_samples=_int(RE_GUARD_CONTENDED_SAMPLES, msg),
             eta_occupancy_s=_first(RE_GUARD_ETA_OCCUPANCY, msg),
             new_tokens=_int(RE_GUARD_NEW_TOKENS, msg),
+            # The pricing policy on the decision line (``reject`` / ``observe``
+            # / ``off``): the matched prefill-ETA accuracy splits a rollout
+            # window by it (LP-0MVSD5RJW008F1IB AC1).
+            policy=_first(RE_CONTENTION_POLICY, msg),
         )
     if msg.startswith(STATUS_REQUEST):
         # "status_request active_query=false available_slots=2
