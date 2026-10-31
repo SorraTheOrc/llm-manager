@@ -13,8 +13,14 @@ Validates that:
   work on a clean host (LP-0MVO8DORX004P05G).
 - The Grafana dashboard's GPU memory panel selects only series the documented
   sampler actually publishes (LP-0MVOHRLPB0086Q5T).
+
+Also enforces the `FORBIDDEN_RULE_SERIES` contract on **every** PromQL source —
+rule files (YAML) and the GPU utilisation CLI (Python, `QUERIES` mapping) — so a
+`gpu_busy_percent` query cannot be introduced in either place
+(LP-0MVT1NVAJ007KUGO).
 """
 
+import ast
 import os
 import re
 import shutil
@@ -153,6 +159,117 @@ def _rule_expressions(path: Path) -> list[str]:
             if expr:
                 exprs.append(expr)
     return exprs
+
+
+# Non-rule PromQL consumers that must obey the same forbidden-series contract
+# (LP-0MVT1NVAJ007KUGO). A rule file is scanned as YAML; a CLI is scanned as
+# Python, because its expressions live in a ``QUERIES`` mapping. Copy-pasting a
+# ``gpu_busy_percent`` query into the CLI would otherwise be a silent
+# utilisation regression that no rule-file check could see.
+CLI_QUERY_SOURCES = [PROJECT_ROOT / "scripts" / "gpu_utilisation.py"]
+
+#: Assignment/argument names whose string values are PromQL, by convention.
+_QUERY_NAME_SUFFIXES = ("QUERY", "QUERIES", "EXPR", "EXPRESSIONS")
+_QUERY_ARGUMENT_NAMES = ("query", "queries", "expr")
+
+
+def _promql_expressions_in_python(source: str, filename: str = "<string>") -> list[str]:
+    """Return the PromQL expressions held in a Python query consumer.
+
+    Only *query* strings are extracted, never prose, so a module may document
+    why ``gpu_busy_percent`` must not be used without tripping its own guard.
+    A string counts as a query expression when it is:
+
+    * a value in an assignment whose target name ends in ``QUERY``, ``QUERIES``,
+      ``EXPR`` or ``EXPRESSIONS`` (the CLI's ``QUERIES`` dict is the canonical
+      case — nested dicts/lists are walked);
+    * a literal passed as the ``query``/``queries``/``expr`` argument of a call.
+
+    Docstrings and ``#`` comments are never scanned. Duplicates are collapsed
+    in first-seen order so an offender is reported once.
+    """
+    tree = ast.parse(source, filename=filename)
+
+    def collect(node: ast.AST) -> None:
+        """Collect string *values* below *node*, never mapping keys.
+
+        A ``QUERIES`` mapping's keys are human labels (``"computing_workload"``);
+        only the values are PromQL. f-string literals are collected part-wise so
+        an expression that interpolates the step still exposes its series names.
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            found.append(node.value)
+        elif isinstance(node, ast.Dict):
+            for value in node.values:
+                collect(value)
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            for element in node.elts:
+                collect(element)
+        elif isinstance(node, ast.JoinedStr):
+            for value in node.values:
+                collect(value)
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            collect(node.left)
+            collect(node.right)
+        elif isinstance(node, ast.FormattedValue):
+            collect(node.value)
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.upper().endswith(
+                    _QUERY_NAME_SUFFIXES
+                ):
+                    collect(node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id.upper().endswith(_QUERY_NAME_SUFFIXES)
+                and node.value is not None
+            ):
+                collect(node.value)
+        elif isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg in _QUERY_ARGUMENT_NAMES:
+                    collect(keyword.value)
+
+    deduped: list[str] = []
+    for expr in found:
+        if expr not in deduped:
+            deduped.append(expr)
+    return deduped
+
+
+def _forbidden_series_offenders(
+    expressions, *, source_label: str, forbidden=None
+) -> list[str]:
+    """Return ``<source>: <expr>`` for every expression selecting a forbidden series."""
+    series_list = FORBIDDEN_RULE_SERIES if forbidden is None else forbidden
+    offenders: list[str] = []
+    for expr in expressions:
+        for series in series_list:
+            if series in expr:
+                offenders.append(f"{source_label}: {' '.join(expr.split())}")
+                break
+    return offenders
+
+
+def _consumer_guard_offenders(path: Path) -> list[str]:
+    """Return forbidden-series offenders for a Python PromQL consumer.
+
+    Fails loudly when no query expression can be found: a rename from
+    ``QUERIES`` to something unrecognised must not turn the guard vacuously
+    green.
+    """
+    expressions = _promql_expressions_in_python(path.read_text(), filename=str(path))
+    assert expressions, (
+        f"{path.name}: no PromQL query expressions found. The "
+        f"FORBIDDEN_RULE_SERIES guard would be vacuous — keep query expressions "
+        f"in a mapping named QUERIES/QUERY/EXPR/EXPRESSIONS, or pass them as a "
+        f"query=/expr= argument."
+    )
+    return _forbidden_series_offenders(expressions, source_label=path.name)
 
 
 def _find_key(node, key: str):
@@ -650,15 +767,130 @@ class TestAlertRuleFiles:
         """No rule may select a series that is unpublished or pinned."""
         offenders = []
         for rule_file in prometheus_alert_rules:
-            for expr in _rule_expressions(rule_file):
-                for forbidden in FORBIDDEN_RULE_SERIES:
-                    if forbidden in expr:
-                        offenders.append(f"{rule_file.name}: {expr.strip()}")
+            offenders.extend(
+                _forbidden_series_offenders(
+                    _rule_expressions(rule_file), source_label=rule_file.name
+                )
+            )
         assert not offenders, (
             "Rules reference series that are unpublished or meaningless on this "
             "host (rocm_vram_* has no exporter, gpu_busy_percent is pinned at "
             "100%):\n" + "\n".join(offenders)
         )
+
+
+class TestForbiddenSeriesGuard:
+    """The forbidden-series guard must fail on violations, not be vacuously green.
+
+    The contract is enforced on two source kinds: Prometheus rule files (YAML,
+    scanned in ``TestAlertRuleFiles``) and the GPU utilisation CLI (Python, whose
+    PromQL lives in a ``QUERIES`` mapping). These tests prove the guard would
+    have caught a ``gpu_busy_percent`` query while still allowing the
+    documentation that explains the caveat (LP-0MVT1NVAJ007KUGO AC3/AC4).
+    """
+
+    def test_gpu_utilisation_cli_uses_no_forbidden_series(self):
+        """The GPU utilisation CLI must not query a forbidden series either.
+
+        Skipped until the CLI lands (LP-0MVT1O52G000LMC6); the guard then
+        activates automatically, and fails if it can no longer find any query
+        expression (non-vacuous).
+        """
+        offenders: list[str] = []
+        checked: list[str] = []
+        for path in CLI_QUERY_SOURCES:
+            if not path.exists():
+                continue
+            checked.append(path.name)
+            offenders.extend(_consumer_guard_offenders(path))
+
+        if not checked:
+            pytest.skip(
+                "scripts/gpu_utilisation.py not implemented yet "
+                "(LP-0MVT1O52G000LMC6); guard activates when it lands"
+            )
+        assert not offenders, (
+            "The GPU utilisation CLI queries a series that is unpublished or "
+            "meaningless on this host (gpu_busy_percent saturates at ~20 W, "
+            "rocm_vram_* has no exporter):\n" + "\n".join(offenders)
+        )
+
+    def test_guard_flags_a_forbidden_series_in_a_queries_mapping(self):
+        source = (
+            "QUERIES = {\n"
+            '            "computing": "avg_over_time(gpu:computing:bool[2h])",\n'
+            '            "busy": "avg_over_time(gpu_busy_percent[2h])",\n'
+            "        }\n"
+        )
+
+        expressions = _promql_expressions_in_python(source)
+        offenders = _forbidden_series_offenders(expressions, source_label="synthetic")
+
+        assert expressions == [
+            "avg_over_time(gpu:computing:bool[2h])",
+            "avg_over_time(gpu_busy_percent[2h])",
+        ]
+        assert offenders == ["synthetic: avg_over_time(gpu_busy_percent[2h])"]
+
+    def test_guard_flags_a_forbidden_series_in_a_nested_query_expression(self):
+        source = (
+            "QUERIES = {\n"
+            '            "gpu": {"vram": "rocm_vram_used_bytes / rocm_vram_total_bytes"},\n'
+            "        }\n"
+        )
+
+        offenders = _forbidden_series_offenders(
+            _promql_expressions_in_python(source), source_label="synthetic"
+        )
+
+        assert len(offenders) == 1
+        assert "rocm_vram_" in offenders[0]
+
+    def test_guard_scans_expressions_passed_as_a_query_argument(self):
+        source = (
+            "def run(getter):\n"
+            '            return getter(query="avg_over_time(gpu_busy_percent[1h])")\n'
+        )
+
+        offenders = _forbidden_series_offenders(
+            _promql_expressions_in_python(source), source_label="synthetic"
+        )
+
+        assert len(offenders) == 1
+        assert "gpu_busy_percent" in offenders[0]
+
+    def test_guard_allows_documentation_and_comment_mentions(self):
+        source = (
+            '"""GPU utilisation. gpu_busy_percent is pinned and must not be used."""\n'
+            "# gpu_busy_percent saturates at ~20 W: never query it here.\n"
+            'NOTE = "gpu_busy_percent reads ~100% above 20 W"\n'
+            "QUERIES = {\n"
+            '            "computing": "avg_over_time(gpu:computing:bool[2h])",\n'
+            "        }\n"
+        )
+
+        expressions = _promql_expressions_in_python(source)
+
+        assert expressions == ["avg_over_time(gpu:computing:bool[2h])"]
+        assert _forbidden_series_offenders(expressions, source_label="synthetic") == []
+
+    def test_guard_fails_when_no_query_expression_is_found(self, tmp_path):
+        """A rename must not silently disable the guard (non-vacuous green)."""
+        path = tmp_path / "cli.py"
+        path.write_text('EXPRESSIONS_RENAMED = {"a": "up"}\n')
+
+        with pytest.raises(AssertionError, match="no PromQL query expressions"):
+            _consumer_guard_offenders(path)
+
+    def test_guard_passes_on_a_clean_consumer(self, tmp_path):
+        path = tmp_path / "cli.py"
+        path.write_text(
+            'QUERIES = {"computing": "avg_over_time(gpu:computing:bool[2h])"}\n'
+        )
+
+        expressions = _promql_expressions_in_python(path.read_text())
+        assert expressions == ["avg_over_time(gpu:computing:bool[2h])"]
+        assert _consumer_guard_offenders(path) == []
 
 
 # ---------------------------------------------------------------------------
