@@ -1024,13 +1024,12 @@ async def test_prefill_deadline_503_has_no_deficit_marker(monkeypatch):
 # Benefit-gate wiring (LP-0MVWDZ1RH006HTFS) — parent AC3, AC4, AC7, AC8
 # ---------------------------------------------------------------------------
 
-#: Every row below is red-first: it pins the *benefit gate* decision reached
-#: through the **wired** peek (``_prefetch_measured_cache_abort`` fed the
-#: router's resolved settings), which lands in LP-0MVWDZ22I005A26B. Until then
-#: the rows fail on purpose and ``xfail(strict=True)`` keeps the changed-scope
-#: gate green — while turning each row into a hard failure the moment it starts
-#: passing, so the wiring child must delete this marker rather than leave the
-#: rows silently unfixed.
+#: Rows still red-first: they pin the *wiring* observability/output surface that
+#: lands in LP-0MVWDZ22I005A26B (the ``measured_cache_abort`` decision log line
+#: carrying ``detail=within_eta_budget`` / ``budget_s=114``). The gate decision
+#: itself landed in LP-0MVWDZ1GG004UGIK, which is why the three decision/serving
+#: rows below no longer carry the marker: they pass outright now, and a
+#: regression must fail the gate loudly rather than hide behind an xfail.
 _BENEFIT_GATE_WIRING_XFAIL = pytest.mark.xfail(
     strict=True,
     reason="benefit-gate wiring lands in LP-0MVWDZ22I005A26B",
@@ -1097,7 +1096,6 @@ def _stamp_admission_evidence(monkeypatch, *, total: int, priced: int) -> None:
     )
 
 
-@_BENEFIT_GATE_WIRING_XFAIL
 def test_incident_replay_never_aborts_and_arms_no_cooldown():
     """AC1 (parent AC8): the five recorded aborts all continue under the gate.
 
@@ -1150,7 +1148,6 @@ def test_incident_replay_never_aborts_and_arms_no_cooldown():
         assert row.measured_eta_s < row.budget_s
 
 
-@_BENEFIT_GATE_WIRING_XFAIL
 @pytest.mark.asyncio
 async def test_incident_pin_local_turn_is_served_locally(monkeypatch):
     """AC1/AC2: the incident turn completes locally — no eviction, no cooldown.
@@ -1265,7 +1262,6 @@ async def test_gate_allowed_abort_arms_exactly_one_thrash_cooldown(monkeypatch):
     assert 0 < remaining <= GATE_COOLDOWN_S, remaining
 
 
-@_BENEFIT_GATE_WIRING_XFAIL
 @pytest.mark.asyncio
 async def test_pinned_incident_turn_is_served_locally_end_to_end(
     monkeypatch, caplog

@@ -34,7 +34,6 @@ import test_measured_cache_abort_wiring as wiring
 from fastapi.responses import JSONResponse, StreamingResponse
 from test_local_resident_prefix_admission import _install_slot_state, _slot
 from test_measured_cache_abort_wiring import (
-    _BENEFIT_GATE_WIRING_XFAIL,
     _CONTENT_CHUNK,
     _DONE,
     _FINISH_CHUNK,
@@ -540,7 +539,6 @@ async def test_replay_events_beyond_the_budget_release_in_seconds(
     BUDGET_NEUTRAL_CLUSTERS,
     ids=lambda cluster: f"{cluster[0]}tok-{cluster[1]}priced",
 )
-@_BENEFIT_GATE_WIRING_XFAIL
 @pytest.mark.asyncio
 async def test_replay_events_within_the_budget_are_served_locally(
     monkeypatch, cluster
@@ -551,8 +549,8 @@ async def test_replay_events_within_the_budget_are_served_locally(
     shipped comparator (72-88 s against 114 s), i.e. the same shape as the
     pin-local incident. They must complete locally: no
     ``local_eviction_after_acceptance``, no thrash cooldown, and the client gets
-    the whole stream. Red-first until the gate is wired
-    (LP-0MVWDZ1GG004UGIK / LP-0MVWDZ22I005A26B).
+    the whole stream. Green since the benefit gate landed
+    (LP-0MVWDZ1GG004UGIK); a regression must fail the gate loudly.
     """
     total, priced = cluster
     eta_s = _measured_eta_s(total)

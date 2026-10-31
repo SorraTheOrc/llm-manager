@@ -61,15 +61,15 @@ an explicitly present safety fraction of ``0`` yields the bare
 ``fraction x deadline``. ``proxy/config.yaml`` declares both keys, so the
 shipped 114 s comparator is unaffected by that distinction.
 
-Why every row is ``xfail(strict=True)`` today
+Why every row used to be ``xfail(strict=True)``
 ---------------------------------------------
-This item is test-first: the rows must *fail* on today's code (they reference
-``budget_s`` / ``measured_eta_s`` / ``DETAIL_WITHIN_ETA_BUDGET`` /
-``prefill_deadline_budget_seconds``, none of which exist yet) while the
-changed-scope test gate has to stay green for this item to reach review.
-``xfail(strict=True)`` states exactly that: xfail now, and a hard failure the
-moment a row starts *passing* — so the implementation item must delete
-``pytestmark`` below rather than leave the rows silently unfixed.
+This module was test-first (LP-0MVWDZ157001KYLO): the rows had to *fail* on
+the pre-gate code (they reference ``budget_s`` / ``measured_eta_s`` /
+``DETAIL_WITHIN_ETA_BUDGET`` / ``prefill_deadline_budget_seconds``, none of
+which existed then) while the changed-scope test gate had to stay green.
+``xfail(strict=True)`` stated exactly that. The implementation landed in
+LP-0MVWDZ1GG004UGIK, which deleted the marker, so a regression now fails the
+gate loudly instead of turning into an xpass surprise.
 """
 
 from __future__ import annotations
@@ -90,12 +90,9 @@ from proxy.prompt_progress import PromptProgress
 
 from proxy import measured_cache_abort, prefill_eta
 
-#: Remove this line in LP-0MVWDZ1GG004UGIK (the gate implementation) — every row
-#: in this module must then pass outright.
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason="benefit gate lands in LP-0MVWDZ1GG004UGIK",
-)
+#: The gate implementation landed in LP-0MVWDZ1GG004UGIK — every row in this
+#: module now passes outright (no ``xfail`` marker: a regression must fail the
+#: gate loudly).
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPO_ROOT / "proxy" / "config.yaml"

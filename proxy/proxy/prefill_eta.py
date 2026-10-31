@@ -1308,6 +1308,58 @@ def _deadline_budget_seconds(guard_cfg: GuardConfig) -> float:
     return guard_cfg.budget_safety_fraction * guard_cfg.prefill_deadline_seconds
 
 
+def _strict_non_negative_float(value: object) -> float | None:
+    """``value`` as a finite non-negative float, else ``None`` (no fallback).
+
+    ``_float_setting`` substitutes a *default* for anything it cannot read,
+    which is right for a hot-path setting but wrong for the benefit gate's
+    comparator: a defaulted deadline would manufacture a budget the operator
+    never configured. This variant reports "unusable" instead.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0.0:
+        return None
+    return number
+
+
+def prefill_deadline_budget_seconds(config: dict | None) -> float | None:
+    """The request's own prefill-deadline budget (seconds) — parent AC1/AC3.
+
+    Public single source of truth for the comparator the measured-cache
+    benefit gate (``proxy.measured_cache_abort``) prices against: the
+    admission guard's ``budget_safety_fraction * local_prefill_deadline_seconds``
+    (0.95 x 120 s = 114 s with the shipped ``proxy/config.yaml``), falling back
+    to the bare ``local_prefill_deadline_seconds`` when the fraction is
+    explicitly ``0`` (the documented "no safety margin" rollback — *not* a
+    disabled budget). Both the advertised threshold and the enforced one come
+    from here, so they can never drift.
+
+    Returns ``None`` when the budget is unusable: either key absent, empty, a
+    bool/string that is not numeric, NaN/inf, or negative — and a deadline of
+    ``0`` (which the deadline backstop itself treats as disabled). Fail-open
+    is the caller's job: an unusable budget must never manufacture an abort.
+    """
+    guard_cfg = resolve_config(config)
+    server_cfg = _server_config(config)
+    deadline = _strict_non_negative_float(server_cfg.get(PREFILL_DEADLINE_KEY))
+    fraction = _strict_non_negative_float(
+        server_cfg.get(BUDGET_SAFETY_FRACTION_KEY)
+    )
+    if deadline is None or deadline <= 0.0 or fraction is None or fraction > 1.0:
+        return None
+    budget = _deadline_budget_seconds(guard_cfg)
+    if budget > 0.0:
+        return budget
+    # A fraction of 0 is the documented rollback ("no safety margin"), not a
+    # disabled comparator: compare against the bare deadline.
+    return guard_cfg.prefill_deadline_seconds
+
+
 # ---------------------------------------------------------------------------
 # Published estimate for /llama/local/status
 # ---------------------------------------------------------------------------

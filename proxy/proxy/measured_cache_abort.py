@@ -35,15 +35,52 @@ of the following hold:
    dispatch *unreachable* for **any** value of the token bound, including
    ``0``, at any prompt size;
 4. the *measured* actual new-token work exceeds the admission-priced
-   ``new_tokens`` by more than ``bound_tokens`` (default 2 000).
+   ``new_tokens`` by more than ``bound_tokens`` (default 2 000);
+5. **the benefit gate**: the measured deficit genuinely cannot complete inside
+   the request's own prefill budget (LP-0MVWDZ1GG004UGIK, parent
+   LP-0MVWBD91Z004U135).
 
 Condition 4 alone is the parent's spec; condition 3 is the ratio floor that
 AC2 (warm never aborts) and AC6 (documented bound + monotonicity) require:
 with ``cache ≥ 0.99 × total`` the deficit ratio is ``≤ 0.01``, so no prompt
 size and no bound value can trip the abort.
 
-Both bounds are monotone in the safe direction: raising ``bound_tokens`` or
-raising ``min_deficit_ratio`` can only make an abort *less* likely.
+Conditions 3 and 4 are monotone in the safe direction: raising ``bound_tokens``
+or raising ``min_deficit_ratio`` can only make an abort *less* likely.
+
+Condition 5 (the benefit gate)
+------------------------------
+
+Conditions 3 and 4 are necessary but not sufficient. A mid-size cold prompt
+(measured 2026-10-31: ``total=14 380``, ``cache=0``, priced ``new_tokens=48``)
+satisfies both and was still cancelled at the 120 s prefill deadline — into a
+600 s thrash cooldown and an endless ``429 Local admission refused`` loop — even
+though its real cold prefill costs 38.8 s at the host median rate (371 tok/s)
+and 84.6 s at p25 (170 tok/s). Waiting could therefore have succeeded.
+
+The gate prices the **measured** deficit ``total - cache`` with the same
+calibrated model the admission guard uses
+(:func:`proxy.prefill_eta.estimate_prefill_seconds`, ``cached_ratio=0.0``
+because a deficit is by definition uncached — never the admission-priced
+``new_tokens``) and aborts only when that ETA **exceeds** the request's own
+prefill-deadline budget::
+
+    budget_s = budget_safety_fraction × local_prefill_deadline_seconds
+               (0.95 × 120 s = 114 s shipped)
+
+falling back to the bare ``local_prefill_deadline_seconds`` when the fraction
+is explicitly ``0`` (the documented "no safety margin" rollback) or omitted.
+The admission **wait** budget (``budget_seconds`` /
+``contention_queue_max_wait_seconds``, 60 s) is never the comparator: it bounds
+queueing, and the recorded incident carried ``deadline_s=120`` /
+``new_tokens=49`` / ``eta_prefill_s=8.2``. Budget resolution lives in
+:func:`proxy.prefill_eta.prefill_deadline_budget_seconds`, so the advertised
+threshold can never drift from the enforced one.
+
+``budget_seconds is None`` means "the benefit gate is not configured" (every
+hand-built :class:`AbortSettings` row) and preserves the pre-gate verdict
+byte-for-byte; ``budget_seconds <= 0`` means "configured, but no usable
+budget" and fails open (continue).
 
 Configuration keys (``server`` section of ``proxy/config.yaml``)
 ----------------------------------------------------------------
@@ -59,11 +96,18 @@ Configuration keys (``server`` section of ``proxy/config.yaml``)
     Minimum measured ``(total - cache) / total`` for an abort. Default
     ``0.25``. Must sit far above the warm-path ceiling (``0.01``).
 
+The benefit gate reads the **existing** admission-guard deadline keys (no new
+config key): ``local_prefill_deadline_seconds`` and
+``local_admission_guard_budget_safety_fraction``, resolved through
+:func:`proxy.prefill_eta.prefill_deadline_budget_seconds`. The admission wait
+budget (``contention_queue_max_wait_seconds``) is deliberately **not** read.
+
 Fail-open contract (AC5)
 ------------------------
 
 Nothing in this module can raise: a missing/partial/non-numeric measurement,
-an unreadable progress object, an invalid priced value, unparseable config,
+an unreadable progress object, an invalid priced value, an unreadable or
+non-positive deadline/budget, an unusable ETA estimator, unparseable config,
 or an internal exception all resolve to *continue* — i.e. today's behaviour.
 The decision is a pure function of its arguments; wiring it into
 ``proxy_to_local``'s reframed stream loop is F4 (LP-0MVR7IN0O000DPXN).
@@ -72,8 +116,8 @@ The decision is a pure function of its arguments; wiring it into
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 #: Eviction reason emitted when the decision fires (parent AC2/AC6).
@@ -102,6 +146,12 @@ DETAIL_BELOW_RATIO_FLOOR = "below_deficit_ratio_floor"
 DETAIL_WITHIN_BOUND = "within_bound"
 DETAIL_ERROR = "decision_error"
 
+#: The benefit gate's single new ``detail`` token (LP-0MVWDZ1GG004UGIK AC1b):
+#: the deficit passed the ratio floor and the token bound, and waiting fits the
+#: request's own prefill-deadline budget. No new reason token, no new header and
+#: no refusal-body change; every fail-open path reuses ``DETAIL_ERROR``.
+DETAIL_WITHIN_ETA_BUDGET = "within_eta_budget"
+
 
 def _as_token_count(value: Any) -> int | None:
     """Coerce a b8782 token-count field to ``int``, or ``None`` if invalid.
@@ -129,6 +179,14 @@ def _as_non_negative_number(value: Any) -> float | None:
     return number
 
 
+def _as_positive_number(value: Any) -> float | None:
+    """Coerce a strictly positive finite number, else ``None``."""
+    number = _as_non_negative_number(value)
+    if number is None or number <= 0.0:
+        return None
+    return number
+
+
 def _field(source: Any, name: str) -> Any:
     """Read ``name`` from a mapping or object, returning ``None`` when absent.
 
@@ -150,19 +208,51 @@ class AbortSettings:
     ``from_config`` is fail-open: any value it cannot understand resolves to
     ``enabled=False`` (pre-change behaviour), never to a *more* aggressive
     abort.
+
+    The benefit gate's inputs (LP-0MVWDZ1GG004UGIK):
+
+    ``model``
+        Calibration key the measured ETA is priced with (the model the
+        dispatch targets).
+    ``config``
+        The config the settings were resolved from — handed back to
+        :func:`proxy.prefill_eta.estimate_prefill_seconds` so the gate prices
+        with the same calibrated/percentile knobs the admission guard uses.
+        Excluded from equality (runtime wiring, not a knob).
+    ``budget_seconds``
+        The comparator, ``prefill_deadline_budget_seconds(config)`` (114 s
+        shipped). ``None`` = the benefit gate is not configured (pre-gate
+        verdict, byte-for-byte); ``<= 0`` = configured but unusable (fail open).
+        Excluded from equality so a fully-resolved settings object still
+        compares equal to the hand-built rows whose verdicts it preserves.
+    ``eta_estimator``
+        One-argument callable pricing the **measured** deficit (tokens) into
+        seconds; ``None`` uses the production estimator. Injected only for
+        deterministic tests.
     """
 
     enabled: bool = DEFAULT_ENABLED
     bound_tokens: float = DEFAULT_BOUND_TOKENS
     min_deficit_ratio: float = DEFAULT_MIN_DEFICIT_RATIO
+    model: str | None = None
+    config: Mapping[str, Any] | None = field(
+        default=None, compare=False, repr=False
+    )
+    budget_seconds: float | None = field(default=None, compare=False)
+    eta_estimator: Callable[[int], float] | None = field(
+        default=None, compare=False, repr=False
+    )
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any] | None) -> AbortSettings:
         """Read the ``server`` keys, tolerating a flat dict and ``None``.
 
-        An absent config (``None``) or absent keys resolve to the documented
-        defaults (feature enabled); a *malformed* config resolves to
-        ``enabled=False`` — fail open rather than guess at a bound.
+        An absent config (``None``) resolves to the documented defaults
+        (feature enabled, benefit gate not configured); a *malformed* config
+        resolves to ``enabled=False`` — fail open rather than guess at a bound.
+        A readable config whose deadline budget is unusable resolves the benefit
+        gate as *configured but unusable* (``budget_seconds=0``), which is a
+        per-verdict fail-open rather than a disabled feature.
         """
         if config is None:
             return cls()
@@ -190,7 +280,32 @@ class AbortSettings:
         if ratio is None or ratio > 1.0:
             return cls(enabled=False)
 
-        return cls(enabled=True, bound_tokens=bound, min_deficit_ratio=ratio)
+        budget = _resolve_budget_seconds(config)
+        return cls(
+            enabled=True,
+            bound_tokens=bound,
+            min_deficit_ratio=ratio,
+            config=config,
+            # ``None`` from the helper means "configured, but unusable": 0 is
+            # the falsy budget the decision fails open on (never an abort).
+            budget_seconds=0.0 if budget is None else budget,
+        )
+
+
+def _resolve_budget_seconds(config: Mapping[str, Any]) -> float | None:
+    """The deadline-derived comparator, or ``None`` when unusable (AC3).
+
+    Delegates to the public
+    :func:`proxy.prefill_eta.prefill_deadline_budget_seconds` so the threshold
+    can never drift from the one the admission guard enforces. Fail-open: an
+    import error or any exception here reads as "no usable budget".
+    """
+    try:
+        from proxy.prefill_eta import prefill_deadline_budget_seconds
+
+        return prefill_deadline_budget_seconds(dict(config))
+    except Exception:  # AC5: resolution trouble is never an abort
+        return None
 
 
 def _coerce_enabled(value: Any) -> bool | None:
@@ -217,6 +332,12 @@ class AbortDecision:
     ``abort`` is the only field wiring code (F4) must act on; the remaining
     fields exist so the eviction snapshot and the post-deploy window can
     report *why* (parent AC6) without re-deriving the numbers.
+
+    ``measured_eta_s`` / ``budget_s`` / ``eta_rate_bucket`` are the benefit
+    gate's provenance (LP-0MVWDZ1GG004UGIK): the ETA the measured deficit was
+    priced at, the comparator it was compared against, and the calibration
+    bucket that priced it — so the dispatch log line can report why a deficit
+    was tolerated (parent AC5). All ``None`` when the gate did not price.
     """
 
     abort: bool
@@ -227,6 +348,9 @@ class AbortDecision:
     priced_new_tokens: float | None = None
     bound_tokens: float = DEFAULT_BOUND_TOKENS
     min_deficit_ratio: float = DEFAULT_MIN_DEFICIT_RATIO
+    measured_eta_s: float | None = None
+    budget_s: float | None = None
+    eta_rate_bucket: str | None = None
 
     @property
     def continue_verdict(self) -> bool:
@@ -240,6 +364,9 @@ def _continue(
     measured_new_tokens: int | None = None,
     deficit_ratio: float | None = None,
     priced_new_tokens: float | None = None,
+    measured_eta_s: float | None = None,
+    budget_s: float | None = None,
+    eta_rate_bucket: str | None = None,
     settings: AbortSettings | None = None,
 ) -> AbortDecision:
     """Build a *continue* verdict carrying whatever context was resolved."""
@@ -253,7 +380,45 @@ def _continue(
         priced_new_tokens=priced_new_tokens,
         bound_tokens=effective.bound_tokens,
         min_deficit_ratio=effective.min_deficit_ratio,
+        measured_eta_s=measured_eta_s,
+        budget_s=budget_s,
+        eta_rate_bucket=eta_rate_bucket,
     )
+
+
+def _price_measured_deficit(
+    deficit_tokens: int, settings: AbortSettings
+) -> tuple[float | None, str | None]:
+    """Price the **measured** deficit into ``(eta_seconds, rate_bucket)``.
+
+    Uses the admission guard's own calibrated model
+    (:func:`proxy.prefill_eta.estimate_prefill_seconds` with
+    ``cached_ratio=0.0``: a deficit is by definition uncached) unless an
+    estimator was injected. Any failure — an import error, a raising estimator,
+    a non-numeric/NaN/negative result — reads as "unpriceable" (``None``), so
+    the gate fails open instead of raising (AC6).
+    """
+    estimator = settings.eta_estimator
+    if estimator is None:
+        try:
+            from proxy.prefill_eta import estimate_prefill_seconds
+
+            seconds, coefficients = estimate_prefill_seconds(
+                settings.model, deficit_tokens, 0.0, settings.config
+            )
+        except Exception:
+            return None, None
+        bucket = getattr(coefficients, "rate_bucket", None)
+        return _as_non_negative_number(seconds), (
+            bucket if isinstance(bucket, str) else None
+        )
+    if not callable(estimator):
+        return None, None
+    try:
+        seconds = estimator(deficit_tokens)
+    except Exception:
+        return None, None
+    return _as_non_negative_number(seconds), None
 
 
 def decide_measured_cache_abort(
@@ -324,15 +489,91 @@ def decide_measured_cache_abort(
                 settings=effective,
             )
 
+        # Enforced order: ratio floor -> token bound -> ETA budget (AC1).
+        return _decide_on_eta_budget(
+            measured_new=measured_new,
+            deficit_ratio=deficit_ratio,
+            priced=priced,
+            settings=effective,
+        )
+    except Exception:  # AC5: a decision error must never abort
+        return _continue(DETAIL_ERROR, settings=effective)
+
+
+def _decide_on_eta_budget(
+    *,
+    measured_new: int,
+    deficit_ratio: float,
+    priced: float,
+    settings: AbortSettings,
+) -> AbortDecision:
+    """The benefit gate: abort only when waiting cannot fit the budget (AC1).
+
+    Called only after the ratio floor and the token bound have both been
+    passed, so an abort here requires all three conditions.
+
+    * ``budget_seconds is None`` — the gate is not configured (hand-built
+      settings): the pre-gate verdict is preserved byte-for-byte.
+    * ``budget_seconds`` unusable (``<= 0``/NaN) — configured but no comparator:
+      fail open (continue), never an abort.
+    * the measured deficit cannot be priced — fail open (continue).
+    * ``measured_eta_s > budget_s`` — abort; equal is *within* budget.
+    """
+    budget_s = settings.budget_seconds
+    context: dict[str, Any] = {
+        "measured_new_tokens": measured_new,
+        "deficit_ratio": deficit_ratio,
+        "priced_new_tokens": priced,
+    }
+
+    if budget_s is None:
         return AbortDecision(
             abort=True,
             reason=MEASURED_CACHE_DEFICIT_REASON,
             detail=DETAIL_ABORT,
-            measured_new_tokens=measured_new,
-            deficit_ratio=deficit_ratio,
-            priced_new_tokens=priced,
-            bound_tokens=effective.bound_tokens,
-            min_deficit_ratio=effective.min_deficit_ratio,
+            bound_tokens=settings.bound_tokens,
+            min_deficit_ratio=settings.min_deficit_ratio,
+            **context,
         )
-    except Exception:  # AC5: a decision error must never abort
-        return _continue(DETAIL_ERROR, settings=effective)
+
+    usable_budget = _as_positive_number(budget_s)
+    if usable_budget is None:
+        # Configured, but no usable comparator: fail open. ``DETAIL_ERROR`` is
+        # reused (AC1b: the gate adds exactly one ``detail`` token); the
+        # ``budget_s=0`` / ``measured_eta_s=None`` pair identifies the case.
+        return _continue(
+            DETAIL_ERROR, budget_s=0.0, settings=settings, **context
+        )
+
+    measured_eta_s, rate_bucket = _price_measured_deficit(measured_new, settings)
+    if measured_eta_s is None:
+        # Unpriceable measured deficit: fail open (never an abort).
+        return _continue(
+            DETAIL_ERROR,
+            budget_s=usable_budget,
+            eta_rate_bucket=rate_bucket,
+            settings=settings,
+            **context,
+        )
+
+    if measured_eta_s > usable_budget:
+        return AbortDecision(
+            abort=True,
+            reason=MEASURED_CACHE_DEFICIT_REASON,
+            detail=DETAIL_ABORT,
+            bound_tokens=settings.bound_tokens,
+            min_deficit_ratio=settings.min_deficit_ratio,
+            measured_eta_s=measured_eta_s,
+            budget_s=usable_budget,
+            eta_rate_bucket=rate_bucket,
+            **context,
+        )
+
+    return _continue(
+        DETAIL_WITHIN_ETA_BUDGET,
+        measured_eta_s=measured_eta_s,
+        budget_s=usable_budget,
+        eta_rate_bucket=rate_bucket,
+        settings=settings,
+        **context,
+    )
