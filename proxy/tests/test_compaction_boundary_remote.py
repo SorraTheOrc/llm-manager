@@ -92,8 +92,11 @@ strict=True)`` — the established test-first convention in this suite
 ``test_local_resident_prefix_admission.py``): the rows stay red without
 breaking the green tree, and ``strict`` means the implementing children cannot
 land without flipping the marker off with the behaviour. LP-0MVTDU6Y1004ZCGX
-removes the decision/config markers; LP-0MVTDU91C003Q9YZ removes the slot-pin
-and release-ordering markers. A red row afterwards is a real failure.
+has removed the decision/config markers (see ``TestBoundaryDecision``,
+``TestBoundaryConfig``, plus this session's ``TestLocalProvenance``,
+``TestBoundaryConfigValidation`` and ``TestLocalCompletionProvenanceWiring``
+below); LP-0MVTDU91C003Q9YZ removes the slot-pin and release-ordering markers.
+A red row afterwards is a real failure.
 
 The one config assertion that already holds (``compaction_trigger_ratio`` stays
 ``0`` — the boundary knob never re-enables assembly-time compaction) is
@@ -257,14 +260,6 @@ def _ok_response(content: str = "SUMMARY TEXT", status: int = 200) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "TDD-red: proxy.compaction.decide_boundary_compaction and the "
-        "remote_boundary_compaction config keys do not exist yet "
-        "(LP-0MVTDU6Y1004ZCGX)"
-    ),
-)
 class TestBoundaryDecision:
     """`decide_boundary_compaction` — remote + provenance + above guard + knob."""
 
@@ -383,13 +378,6 @@ class TestBoundaryDecision:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "TDD-red: compaction_config does not resolve the boundary knob and "
-        "guard yet (LP-0MVTDU6Y1004ZCGX)"
-    ),
-)
 class TestBoundaryConfig:
     """`compaction_config` resolves the boundary knob independently."""
 
@@ -440,6 +428,310 @@ class TestBoundaryKnobIndependence:
         )
 
         assert cfg["trigger_ratio"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# AC2 — local-served provenance lives in the session store
+# ---------------------------------------------------------------------------
+
+
+class TestLocalProvenance:
+    """`SessionManager` records — never infers — local-served provenance."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_fresh_session_has_no_provenance(self):
+        """A session that has never been served locally is unchanged."""
+        from proxy.session_manager import SessionManager
+
+        mgr = SessionManager()
+
+        async def scenario():
+            session, _created = await mgr.get_or_create("sess-fresh")
+            return session.locally_served_turns, await mgr.has_local_provenance(
+                "sess-fresh"
+            )
+
+        turns, has_provenance = self._run(scenario())
+        assert turns == 0
+        assert has_provenance is False
+
+    def test_marking_a_turn_records_provenance_and_counts_up(self):
+        """One local completion is enough; repeated turns accumulate."""
+        from proxy.session_manager import SessionManager
+
+        mgr = SessionManager()
+
+        async def scenario():
+            await mgr.get_or_create("sess-marked")
+            first = await mgr.mark_locally_served("sess-marked")
+            after_one = await mgr.has_local_provenance("sess-marked")
+            await mgr.mark_locally_served("sess-marked")
+            info = mgr.get_session_info("sess-marked")
+            return first, after_one, info
+
+        first, after_one, info = self._run(scenario())
+        assert first is True
+        assert after_one is True
+        assert info is not None
+        assert info["locally_served_turns"] == 2
+
+    def test_unknown_session_never_gains_provenance(self):
+        """Marking an evicted/unknown session is a no-op, not a phantom turn."""
+        from proxy.session_manager import SessionManager
+
+        mgr = SessionManager()
+
+        async def scenario():
+            marked = await mgr.mark_locally_served("sess-unknown")
+            return marked, await mgr.has_local_provenance("sess-unknown")
+
+        marked, has_provenance = self._run(scenario())
+        assert marked is False
+        assert has_provenance is False
+
+    def test_non_positive_turn_counts_are_rejected(self):
+        """A zero/negative increment must not fabricate provenance."""
+        from proxy.session_manager import SessionManager
+
+        mgr = SessionManager()
+
+        async def scenario():
+            await mgr.get_or_create("sess-nonpositive")
+            for bad in (0, -3, "nope"):
+                assert await mgr.mark_locally_served("sess-nonpositive", bad) is False
+            return await mgr.has_local_provenance("sess-nonpositive")
+
+        assert self._run(scenario()) is False
+
+    def test_provenance_survives_slot_release_and_save_restore(self):
+        """Provenance is a session-store fact, never a live slot assignment.
+
+        The boundary decision must still fire for a session whose slot was
+        released, evicted or save/restored: those events touch the slot/KV
+        machinery, not this recorded counter.
+        """
+        from proxy.session_manager import SessionManager
+
+        mgr = SessionManager()
+
+        async def scenario():
+            await mgr.get_or_create("sess-survivor")
+            await mgr.mark_locally_served("sess-survivor")
+            # Slot lifecycle churn: history updates, compaction anchors and a
+            # save/restore confirmation all run after the local turn.
+            await mgr.update_messages(
+                "sess-survivor", [{"role": "user", "content": "u"}]
+            )
+            await mgr.mark_compacted("sess-survivor", from_count=1)
+            await mgr.set_restore_confirmed("sess-survivor", True)
+            await mgr.set_restore_confirmed("sess-survivor", False)
+            return await mgr.has_local_provenance("sess-survivor")
+
+        assert self._run(scenario()) is True
+
+    def test_a_new_session_after_removal_starts_clean(self):
+        """Provenance belongs to the session, not to the session id forever."""
+        from proxy.session_manager import SessionManager
+
+        mgr = SessionManager()
+
+        async def scenario():
+            await mgr.get_or_create("sess-recycled")
+            await mgr.mark_locally_served("sess-recycled")
+            await mgr.remove("sess-recycled")
+            await mgr.get_or_create("sess-recycled")
+            return await mgr.has_local_provenance("sess-recycled")
+
+        assert self._run(scenario()) is False
+
+
+# ---------------------------------------------------------------------------
+# AC2 (config half) — startup validation of the knob and its guard
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryConfigValidation:
+    """`validate_compaction_config` rejects an unusable boundary config."""
+
+    def _problems(self, server: dict) -> list[str]:
+        from proxy.provider import validate_compaction_config
+
+        return validate_compaction_config({"server": server})
+
+    def test_shipped_disabled_default_passes(self):
+        """Absent keys (the default state) are valid."""
+        assert self._problems({}) == []
+
+    @pytest.mark.parametrize(
+        ("enabled", "guard"), [(True, 20000), (False, 5000), (True, 200000)]
+    )
+    def test_valid_knob_and_guard_pass(self, enabled, guard):
+        problems = self._problems(
+            {
+                "remote_boundary_compaction": enabled,
+                "remote_boundary_compaction_min_tokens": guard,
+            }
+        )
+        assert problems == []
+
+    @pytest.mark.parametrize("bad", ["yes", 1, 0, [True]])
+    def test_non_boolean_knob_is_fatal(self, bad):
+        """A truthy string/int is a config typo, not an opt-in."""
+        problems = self._problems({"remote_boundary_compaction": bad})
+        assert any(
+            p.startswith("FATAL:") and "remote_boundary_compaction" in p
+            for p in problems
+        )
+
+    @pytest.mark.parametrize("bad", [0, -1, -20000])
+    def test_non_positive_guard_is_fatal(self, bad):
+        """A non-positive guard would compact every session: refuse it."""
+        problems = self._problems({"remote_boundary_compaction_min_tokens": bad})
+        assert any(
+            p.startswith("FATAL:")
+            and "remote_boundary_compaction_min_tokens" in p
+            for p in problems
+        )
+
+    @pytest.mark.parametrize("bad", ["20000", 1.5, True])
+    def test_non_integer_guard_is_fatal(self, bad):
+        problems = self._problems({"remote_boundary_compaction_min_tokens": bad})
+        assert any(
+            p.startswith("FATAL:")
+            and "remote_boundary_compaction_min_tokens" in p
+            for p in problems
+        )
+
+    def test_validation_does_not_disturb_the_assembly_trigger(self):
+        """Validating the boundary keys never re-enables assembly compaction."""
+        from proxy.provider import compaction_config
+
+        problems = self._problems(
+            {
+                "compaction_trigger_ratio": 0,
+                "remote_boundary_compaction": True,
+            }
+        )
+        assert problems == []
+        assert (
+            compaction_config(
+                {"server": {"compaction_trigger_ratio": 0}}
+            )["trigger_ratio"]
+            == 0.0
+        )
+
+
+# ---------------------------------------------------------------------------
+# AC2 (wiring half) — the successful local-completion path records provenance
+# ---------------------------------------------------------------------------
+
+
+class TestLocalCompletionProvenanceWiring:
+    """`proxy.router` marks provenance only on a successful local completion."""
+
+    def _srv(self, manager):
+        srv = MagicMock()
+        srv.session_manager = manager
+        # No current model → the cached-ratio and slot-save blocks are skipped;
+        # ``slot_enabled=False`` additionally skips the snapshot save.
+        srv.current_model = None
+        srv.logger = MagicMock()
+        return srv
+
+    def _response(self) -> MagicMock:
+        import json
+
+        body = {
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}]
+        }
+        response = MagicMock()
+        response.content = json.dumps(body).encode("utf-8")
+        response.headers = {}
+        return response
+
+    def _has_provenance_after_completion(self, monkeypatch, status: int) -> bool:
+        import proxy.router as router
+        from proxy.session_manager import SessionManager
+
+        monkeypatch.setattr(
+            router, "_detect_restore_signal_from_llama_log", lambda *a, **k: False
+        )
+        manager = SessionManager()
+        session_id = "sess-local-completion"
+        messages = _messages(2)
+
+        async def scenario():
+            await manager.get_or_create(session_id)
+            await router._update_session_and_slot(
+                self._srv(manager),
+                session_id,
+                {"messages": messages},
+                False,
+                [],
+                len(messages),
+                self._response(),
+                llama_port=8080,
+                slot_id=0,
+                slot_filename=None,
+                slot_timeout=1.0,
+                slot_model_payload="Qwen3",
+                slot_enabled=False,
+                upstream_status=status,
+            )
+            return await manager.has_local_provenance(session_id)
+
+        return asyncio.run(scenario())
+
+    def test_successful_local_completion_records_provenance(self, monkeypatch):
+        assert self._has_provenance_after_completion(monkeypatch, 200) is True
+
+    @pytest.mark.parametrize("status", [400, 429, 500, 503])
+    def test_failed_local_completion_records_nothing(self, monkeypatch, status):
+        """A 4xx/5xx local attempt served no turn — no false provenance."""
+        assert self._has_provenance_after_completion(monkeypatch, status) is False
+
+
+# ---------------------------------------------------------------------------
+# AC3 (shipped config) — the knob ships off, with the agreed guard
+# ---------------------------------------------------------------------------
+
+
+class TestShippedBoundaryConfig:
+    """`proxy/config.yaml` ships the boundary trigger disabled by default."""
+
+    def _server(self) -> dict:
+        import pathlib
+
+        import yaml
+
+        config_path = pathlib.Path(__file__).parent.parent / "config.yaml"
+        with open(config_path) as f:
+            return yaml.safe_load(f)["server"]
+
+    def test_knob_ships_disabled(self):
+        """A shipped opt-in would change live request handling unannounced."""
+        assert self._server()["remote_boundary_compaction"] is False
+
+    def test_guard_ships_at_the_agreed_default(self):
+        assert (
+            self._server()["remote_boundary_compaction_min_tokens"]
+            == _DEFAULT_GUARD_TOKENS
+        )
+
+    def test_shipped_values_do_not_fire_the_decision(self):
+        """The shipped profile decides nothing even for a huge session."""
+        from proxy.compaction import decide_boundary_compaction
+
+        out = decide_boundary_compaction(
+            provider_type="remote",
+            has_local_provenance=True,
+            estimated_tokens=500000,
+            config={"server": self._server()},
+        )
+        assert out["should_compact"] is False
+        assert out["reason"] == "boundary_disabled"
 
 
 # ---------------------------------------------------------------------------

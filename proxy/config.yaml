@@ -1472,6 +1472,25 @@ server:
   # enforcement gate passes (experiment bar + client-side compaction
   # review); flip to false to enable live enforcement.
   compaction_dry_run: false
+  # --- Local→remote boundary compaction (LP-0MVTDU6Y1004ZCGX) ---
+  # SECOND, INDEPENDENT compaction trigger (parent LP-0MVRBQBDF0037OZ5):
+  # when a session that was previously served by the local model is about to
+  # be dispatched to a `type: remote` provider, its oldest turns are
+  # summarised on the session's own local slot and the small compacted
+  # history goes upstream — cutting remote input-token spend.
+  #
+  # Independent of `compaction_trigger_ratio` above: enabling this does NOT
+  # re-enable prompt-assembly compaction, and the knob below is neither read
+  # nor written by it. Shipped DISABLED so request handling is unchanged
+  # until the operator opts in (and so rollback is a one-line flip).
+  remote_boundary_compaction: false
+  # Minimum-size guard (estimated tokens). Sessions at or below this are
+  # never compacted: the boundary adds summarisation latency before remote
+  # TTFT, so only sessions whose remote prompt cost justifies it qualify.
+  # 20000 is a REASONED starting point, not a measured optimum — comfortably
+  # above trivial sessions and well below the ~180K assembly-time trigger.
+  # Tunable per deployment.
+  remote_boundary_compaction_min_tokens: 20000
 
   # --- ctx-size / slot-count routing clamp validation (LP-0MSCABA5K0010LW2) ---
   # Startup validation that computes the effective per-slot large-context

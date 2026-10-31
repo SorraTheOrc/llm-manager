@@ -50,6 +50,13 @@ class Session:
     # the client's next request; the heal uses this to strip them from the
     # computed delta. None = never compacted.
     compacted_base_count: int | None = None
+    # Count of turns this session has been served by the local model
+    # (LP-0MVTDU6Y1004ZCGX AC2). Recorded on the successful local-completion
+    # path and read by the local→remote boundary-compaction decision. This is
+    # a *recorded* counter, deliberately never derived from a live slot
+    # assignment: releasing, evicting or save/restoring a slot must not
+    # disqualify an otherwise locally-served session.
+    locally_served_turns: int = 0
 
     @property
     def age_seconds(self) -> float:
@@ -532,6 +539,46 @@ class SessionManager:
             session.touch()
             return True
 
+    async def mark_locally_served(self, session_id: str, turns: int = 1) -> bool:
+        """Record that *turns* more turns were served by the local model.
+
+        Called from the successful local-dispatch completion path
+        (LP-0MVTDU6Y1004ZCGX AC2). The counter is the provenance signal the
+        local→remote boundary-compaction decision reads: it lives in the
+        session store, so it survives slot release, eviction of the slot
+        assignment and KV save/restore.
+
+        Returns True when the session was found and updated, False otherwise
+        (unknown session, or a non-positive *turns* value).
+        """
+        try:
+            increment = int(turns)
+        except (TypeError, ValueError):
+            return False
+        if increment <= 0:
+            return False
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            session.locally_served_turns += increment
+            session.touch()
+            return True
+
+    async def has_local_provenance(self, session_id: str) -> bool:
+        """True when the session store records ≥1 locally-served turn.
+
+        The boundary-compaction provenance signal (LP-0MVTDU6Y1004ZCGX AC2).
+        Reads the recorded counter only — never the live slot registry — so a
+        released or save/restored slot does not disqualify a session. Unknown
+        sessions (never seen, or evicted) have no provenance.
+        """
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            return session.locally_served_turns > 0
+
     async def append_messages(
         self,
         session_id: str,
@@ -658,4 +705,5 @@ class SessionManager:
             "age_seconds": round(session.age_seconds, 1),
             "invalidated": session.invalidated,
             "restore_confirmed": session.restore_confirmed,
+            "locally_served_turns": session.locally_served_turns,
         }

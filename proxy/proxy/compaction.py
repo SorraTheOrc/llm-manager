@@ -51,6 +51,24 @@ with guidance. Structured churn/compaction logging is the sibling logging
 child's scope; this module reports ``compacted_over_budget`` (or
 ``backstop_*`` reasons) so the dispatcher can escalate.
 
+Local→remote boundary trigger (LP-0MVTDU6Y1004ZCGX):
+  A *second*, independently gated trigger — ``decide_boundary_compaction``
+  — answers a different question from ``decide_session_compaction``: not
+  "is this session too big for the slot" but "is this session leaving the
+  local model for a remote provider after having been served locally".
+  It fires **only** when all four hold: the provider about to be dispatched
+  is ``type: remote``, the session store records at least one prior
+  locally-served turn (``Session.locally_served_turns`` — a recorded
+  signal, never a live slot assignment), the estimated token count is
+  strictly above the minimum-size guard
+  (``server.remote_boundary_compaction_min_tokens``), and the independent
+  knob ``server.remote_boundary_compaction`` is enabled. The knob ships
+  **off** and is deliberately independent of ``compaction_trigger_ratio``:
+  it neither reads nor re-enables assembly-time compaction (the
+  operator's 2026-09-17 decision). The helper is pure — it makes no
+  dispatch change of its own; the remote-dispatch hook consumes its
+  verdict.
+
 Summary lifecycle (R5, LP-0MTTPXIIX005Y0Z9):
   1. CREATION — a session with no prior summary (``extract_previous_summary``
      returns None) is summarised with the full SUMMARIZATION_PROMPT; the
@@ -694,6 +712,88 @@ def decide_session_compaction(
     plan["dry_run"] = False
     plan["applied"] = plan["action"] == "compact"
     return plan
+
+
+def decide_boundary_compaction(
+    *,
+    provider_type: str | None,
+    has_local_provenance: bool,
+    estimated_tokens: int,
+    config: dict,
+) -> dict[str, Any]:
+    """Decide whether to compact a session at the local→remote boundary.
+
+    Pure decision helper (LP-0MVTDU6Y1004ZCGX) for the parent feature
+    "compact before moving from local to remote"
+    (LP-0MVRBQBDF0037OZ5). It is evaluated by the remote-dispatch hook
+    *before* the remote request is sent; this module makes no dispatch
+    change of its own.
+
+    The decision fires **only** when every gate holds:
+
+    1. ``provider_type`` is ``remote`` — a local dispatch is never
+       compacted at the boundary (its KV cache is still useful).
+    2. ``has_local_provenance`` is True — the session store records at
+       least one prior locally-served turn
+       (``SessionManager.has_local_provenance``). Provenance is a recorded
+       counter, never a live slot assignment, so a released, evicted or
+       save/restored slot does not disqualify a session.
+    3. ``estimated_tokens`` is strictly greater than the minimum-size
+       guard (``server.remote_boundary_compaction_min_tokens``, default
+       20 000) — trivial sessions are left alone.
+    4. The independent knob ``server.remote_boundary_compaction`` is
+       enabled (default ``False``). It does not read or re-enable the
+       assembly-time ``compaction_trigger_ratio``.
+
+    Args:
+        provider_type: Type of the provider about to be dispatched
+            (``"remote"`` / ``"local"``; compared case-insensitively).
+        has_local_provenance: Whether the session store records a prior
+            locally-served turn.
+        estimated_tokens: Estimated token count of the outgoing history.
+        config: Proxy configuration (flat or nested ``server`` dict).
+
+    Returns:
+        A dict with:
+
+        - should_compact: True only when all four gates hold.
+        - reason: machine-readable token — ``boundary_compact``,
+          ``boundary_disabled``, ``boundary_not_remote``,
+          ``boundary_no_local_provenance`` or ``boundary_below_guard``.
+        - est_before: the estimate the decision was made on.
+        - guard_tokens: the resolved minimum-size guard.
+        - enabled: the resolved knob value.
+    """
+    # Lazy import: provider imports this module for routing integration, so a
+    # module-level import would be circular (same pattern as
+    # ``compaction_trigger_tokens``).
+    from proxy.provider import compaction_config
+
+    cfg = compaction_config(config)
+    enabled = bool(cfg["remote_boundary_compaction"])
+    guard_tokens = int(cfg["remote_boundary_compaction_min_tokens"])
+    est_before = int(estimated_tokens)
+
+    result: dict[str, Any] = {
+        "should_compact": False,
+        "reason": None,
+        "est_before": est_before,
+        "guard_tokens": guard_tokens,
+        "enabled": enabled,
+    }
+
+    if not enabled:
+        result["reason"] = "boundary_disabled"
+    elif str(provider_type or "").strip().lower() != "remote":
+        result["reason"] = "boundary_not_remote"
+    elif not has_local_provenance:
+        result["reason"] = "boundary_no_local_provenance"
+    elif est_before <= guard_tokens:
+        result["reason"] = "boundary_below_guard"
+    else:
+        result["should_compact"] = True
+        result["reason"] = "boundary_compact"
+    return result
 
 
 def plan_session_compaction(

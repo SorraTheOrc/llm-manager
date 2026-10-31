@@ -1459,6 +1459,20 @@ def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
 # fire from it (the legacy 0.8 context_pressure_warn_ratio is retired).
 _DEFAULT_COMPACTION_TRIGGER_RATIO = 0.70
 
+# Local→remote boundary compaction (LP-0MVTDU6Y1004ZCGX, parent
+# LP-0MVRBQBDF0037OZ5): an INDEPENDENT, default-off knob. It is deliberately
+# not derived from ``compaction_trigger_ratio`` so the operator's 2026-09-17
+# decision to keep assembly-time compaction disabled cannot be undone by
+# enabling the boundary trigger.
+_DEFAULT_REMOTE_BOUNDARY_COMPACTION = False
+
+# Minimum-size guard for boundary compaction (estimated tokens). A reasoned
+# starting point, not a measured one: above trivial sessions and well below
+# the ~180K assembly-time trigger, so only sessions whose remote prompt cost
+# justifies the added summarisation latency are compacted. Operator-tunable
+# via ``server.remote_boundary_compaction_min_tokens``.
+_DEFAULT_REMOTE_BOUNDARY_COMPACTION_MIN_TOKENS = 20000
+
 # Default summarizer context size (tokens). 8192 is enough for a short
 # summarisation prompt + middle turns; avoids unnecessary KV cache footprint.
 _DEFAULT_SUMMARIZER_CTX_SIZE = 8192
@@ -1650,6 +1664,12 @@ def compaction_config(config: dict) -> dict:
             - summarizer_retries (int): Retries on transient failures
               (0 disables).
             - summarizer_retry_delay_seconds (float): Inter-attempt delay.
+            - remote_boundary_compaction (bool): Independent, default-off
+              local→remote boundary compaction knob
+              (LP-0MVTDU6Y1004ZCGX). Never reads
+              ``compaction_trigger_ratio``.
+            - remote_boundary_compaction_min_tokens (int): Minimum-size
+              guard for boundary compaction (default 20 000).
     """
     server = config.get("server", {})
 
@@ -1736,6 +1756,26 @@ def compaction_config(config: dict) -> dict:
     except (ValueError, TypeError):
         timeout = _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS
 
+    # Local→remote boundary compaction (LP-0MVTDU6Y1004ZCGX). Independent of
+    # ``compaction_trigger_ratio``: this block must never read or write it.
+    boundary_enabled = server.get("remote_boundary_compaction")
+    if boundary_enabled is None:
+        boundary_enabled = config.get("remote_boundary_compaction")
+    if not isinstance(boundary_enabled, bool):
+        boundary_enabled = _DEFAULT_REMOTE_BOUNDARY_COMPACTION
+
+    boundary_min_tokens = server.get("remote_boundary_compaction_min_tokens")
+    if boundary_min_tokens is None:
+        boundary_min_tokens = config.get("remote_boundary_compaction_min_tokens")
+    try:
+        boundary_min_tokens = int(boundary_min_tokens)
+    except (ValueError, TypeError):
+        boundary_min_tokens = _DEFAULT_REMOTE_BOUNDARY_COMPACTION_MIN_TOKENS
+    if boundary_min_tokens <= 0:
+        # A non-positive guard would compact every session; fall back to the
+        # agreed default (validate_compaction_config flags the raw value).
+        boundary_min_tokens = _DEFAULT_REMOTE_BOUNDARY_COMPACTION_MIN_TOKENS
+
     return {
         "trigger_ratio": trigger_ratio,
         "summarizer_model_type": summarizer_model_type,
@@ -1748,6 +1788,8 @@ def compaction_config(config: dict) -> dict:
         "summarizer_retries": retries,
         "summarizer_retry_delay_seconds": retry_delay,
         "summarizer_timeout_seconds": timeout,
+        "remote_boundary_compaction": boundary_enabled,
+        "remote_boundary_compaction_min_tokens": boundary_min_tokens,
     }
 
 
@@ -1797,6 +1839,38 @@ def validate_compaction_config(config: dict) -> list[str]:
         problems.append(
             f"FATAL: summarizer_max_tokens={max_tokens} must be positive"
         )
+
+    # Local→remote boundary compaction (LP-0MVTDU6Y1004ZCGX) is validated on
+    # the RAW configured values: ``compaction_config`` coerces bad values to
+    # defaults, which would hide an operator typo behind a silent fallback.
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    if not isinstance(server_cfg, dict):
+        server_cfg = {}
+    flat = config if isinstance(config, dict) else {}
+
+    raw_enabled = server_cfg.get("remote_boundary_compaction")
+    if raw_enabled is None:
+        raw_enabled = flat.get("remote_boundary_compaction")
+    if raw_enabled is not None and not isinstance(raw_enabled, bool):
+        problems.append(
+            f"FATAL: remote_boundary_compaction={raw_enabled!r} must be a boolean"
+        )
+
+    raw_guard = server_cfg.get("remote_boundary_compaction_min_tokens")
+    if raw_guard is None:
+        raw_guard = flat.get("remote_boundary_compaction_min_tokens")
+    if raw_guard is not None:
+        # ``bool`` is an ``int`` subclass: True/False is not a token count.
+        if isinstance(raw_guard, bool) or not isinstance(raw_guard, int):
+            problems.append(
+                f"FATAL: remote_boundary_compaction_min_tokens={raw_guard!r} "
+                "must be a positive integer"
+            )
+        elif raw_guard <= 0:
+            problems.append(
+                f"FATAL: remote_boundary_compaction_min_tokens={raw_guard} "
+                "must be positive"
+            )
 
     return problems
 

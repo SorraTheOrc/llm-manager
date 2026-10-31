@@ -594,6 +594,22 @@ async def _update_session_and_slot(
                 exc_info=True,
             )
 
+    # Record local-served provenance in the session store
+    # (LP-0MVTDU6Y1004ZCGX AC2). The local→remote boundary-compaction decision
+    # reads this recorded counter, never a live slot assignment, so a
+    # released/save-restored slot does not disqualify the session. Only a
+    # successful (non-4xx/5xx) local completion counts as a served turn — the
+    # same success bound the slot save uses below. Fail-open: a bookkeeping
+    # failure must never affect the response.
+    if isinstance(upstream_status, int) and 0 <= upstream_status < 400:
+        try:
+            await srv.session_manager.mark_locally_served(session_id)
+        except Exception:
+            srv.logger.debug(
+                "Failed to record local-served provenance",
+                exc_info=True,
+            )
+
     # Update per-session cached-tokens ratio from REAL usage data
     # (LP-0MS9GAN2P009KK6G). The final usage chunk in the local response
     # reports prompt_tokens + prompt_tokens_details.cached_tokens; use the
