@@ -8509,7 +8509,13 @@ async def _prefill_admission_guard(
     *reason_label* / *free_slot* let the direct (free-slot) dispatch guard
     (LP-0MVIQ0F8T002FS42) reuse this one implementation and one budget source
     while logging the decision as ``eta_exceeds_budget_direct`` — the log line
-    is emitted exactly once, by this helper.
+    is emitted exactly once, by this helper. That label is a *dispatch* label
+    for the ETA/budget bound only: a deadline, deadline-relative safety-budget
+    or flat cold-prefill refusal replaces it with the decision's own reason
+    (``prefill_eta_exceeds_deadline`` / ``prefill_eta_exceeds_safety_budget`` /
+    ``prefill_budget_exceeded``), so a non-ETA bound is never relabelled and
+    the reason-driven retry contract stays truthful on both dispatch paths
+    (LP-0MVRO3AHN002UM1Q AC1/AC8).
     """
     try:
         from proxy import prefill_eta
@@ -13936,10 +13942,13 @@ async def _proxy_with_fallback_cycle(
                     except Exception:
                         pass
                     # The guard helper already emitted the single
-                    # ``local_admission_guard ... reason=eta_exceeds_budget_direct``
-                    # line (ETA, budget, free_slot=true). Record the attempt so
-                    # the fallback provider and the diagnostics carry it too
-                    # (AC4).
+                    # ``local_admission_guard ... reason=<governing reason>``
+                    # line: ``eta_exceeds_budget_direct`` only when the
+                    # free-slot ETA/budget bound is the cause, otherwise the
+                    # deadline / safety-budget / cold-budget reason above. The
+                    # log and the attempt recorded here therefore cannot
+                    # disagree. Record the attempt so the fallback provider and
+                    # the diagnostics carry it too (AC4).
                     _record_attempt(
                         attempts,
                         provider=provider_name,

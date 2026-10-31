@@ -1348,13 +1348,18 @@ the guard enforces can never drift apart (LP-0MVICD2YW004DJPV).
   decision is applied one step earlier, before a request that found a *free*
   slot is dispatched. A free slot is not permission to start a prefill the
   caller will abandon — baseline 48 of 606 local dispatches had a first byte
-  after >120 s, most on a free slot. The direct refusal logs
-  `reason=eta_exceeds_budget_direct free_slot=true` (queue-entry refusals keep
-  `reason=eta_exceeds_budget`), records a `local_admission_reject` attempt so
-  the chosen fallback provider appears in the diagnostics, and falls through
-  to the next provider. It reuses the same estimator and the same single
-  budget (`contention_queue_max_wait_seconds`) — there is no second budget
-  knob, and a cold/uncalibrated bucket still admits.
+  after >120 s, most on a free slot. The direct refusal logs the **governing**
+  reason with `free_slot=true`: `reason=eta_exceeds_budget_direct` **only**
+  when the free-slot ETA/budget bound is itself the cause (queue-entry
+  refusals keep `reason=eta_exceeds_budget`), while a deadline,
+  deadline-relative safety-budget or flat cold-prefill refusal keeps its own
+  reason (`prefill_eta_exceeds_deadline` / `prefill_eta_exceeds_safety_budget`
+  / `prefill_budget_exceeded`) on this path exactly as on the queue path — the
+  dispatch path never changes the reason. It records a
+  `local_admission_reject` attempt so the chosen fallback provider appears in
+  the diagnostics, and falls through to the next provider. It reuses the same
+  estimator and the same single budget (`contention_queue_max_wait_seconds`) —
+  there is no second budget knob, and a cold/uncalibrated bucket still admits.
   **Deadline refusal** (LP-0MVKUKEU80022C3U): when the projected **time to
   first byte** — own ETA plus the occupied gate, i.e. the same
   `projected_wait` above — reaches ``local_prefill_deadline_seconds``
@@ -1569,7 +1574,7 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Admission guard, queue path — projected first byte reaches `local_prefill_deadline_seconds` | `prefill_eta_exceeds_deadline` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_deadline ...` |
 | Admission guard, queue path — safety-budget bound of the deadline | `prefill_eta_exceeds_safety_budget` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_safety_budget ...` |
 | Admission guard, queue path — flat cold-prefill token cap (`local_cold_prefill_budget_tokens`): the prompt outgrows the local serving envelope | `prefill_budget_exceeded` | promoting | `local_admission_guard ... reason=prefill_budget_exceeded ...` |
-| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` (the deadline/safety/budget reasons keep their own token) | refusing | `local_admission_guard ... free_slot=true ...` plus, for a pin-local client, `local_only_refused reason=<token> ... route=refused`. The `local_admission_guard_direct_fallback ... → routing to next provider` line is emitted **only** when the request really falls through to the next provider (`prefer-local` / `remote-ok` / absent header) |
+| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` — **only** when the free-slot ETA/budget bound is itself the cause; a deadline, deadline-relative safety-budget or flat cold-prefill refusal keeps its own governing token (`prefill_eta_exceeds_deadline` / `prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded`), so the direct path never relabels a non-ETA bound (`prefill_budget_exceeded` is a `too_large` verdict there: the pin declines and a remote tier serves the request — see [Promoted](#promoted-a-too-large-request-leaves-the-local-chain)) | refusing | `local_admission_guard ... free_slot=true ...` plus, for a pin-local client, `local_only_refused reason=<token> ... route=refused`. The `local_admission_guard_direct_fallback ... → routing to next provider` line is emitted **only** when the request really falls through to the next provider (`prefer-local` / `remote-ok` / absent header) |
 | Local entry in cooldown (chain resolution) | `local_provider_cooldown` | refusing | `Skipping provider=<local>: ... in cooldown (...s remaining) reason=local_provider_cooldown preference=...` |
 | Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap — the prompt can never fit local, however long it waits | `context_too_large` | promoting | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
 | Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
@@ -1899,6 +1904,20 @@ and header a client must honour:
 | `prefill_eta_exceeds_safety_budget` | wait − budget, ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
 | `cooldown` | real cooldown remainder | `true` | RFC 3339 UTC | wait, then retry |
 | `all_slots_exhausted` | measured occupant remainder, else `slot_unavailable_retry_after`; ≥1 s, capped | `true` | RFC 3339 UTC | wait, then retry |
+
+**The dispatch path never changes the reason.** `eta_exceeds_budget_direct` is
+the free-slot *label* of the ETA/budget bound **only**: a deadline,
+deadline-relative safety-budget or flat cold-prefill refusal keeps its
+governing reason (`prefill_eta_exceeds_deadline` /
+`prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded`) on **both**
+the queue and the free-slot path, so the row above applies to it unchanged
+wherever it fires. Relabelling a non-ETA bound as the ETA/budget reason would
+advertise a timer for a prompt that waiting cannot heal — the 2026-10-25
+retry-storm shape. The split is pinned end-to-end on the free-slot path by
+`proxy/tests/test_local_admission_guard.py::test_direct_path_names_the_governing_reason_end_to_end`
+and `::test_direct_free_slot_budget_refusal_keeps_its_reason`, the guard's
+label rule by `proxy/tests/test_prefill_eta_deadline.py`'s direct-path tests,
+and this wording by `proxy/tests/test_direct_path_refusal_docs.py`.
 
 **Which reasons have no timer — and why.** `prefill_budget_exceeded` is a
 property of the *request*: the prompt is permanently over the flat
