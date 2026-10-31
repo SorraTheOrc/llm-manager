@@ -261,6 +261,21 @@ hand and cross-checking two surfaces:
 - **Configurable target.** `--stale-rate-target` (default `0.05`) overrides
   it for both the rendered outcome and the `--json` verdict, so the cron line
   can carry a new target without a code change.
+- **`capacity_hint` distribution and `saturated`-without-live-work.** Every
+  observed hint token (and an unexpected one — a new claim name, or `unknown`
+  for an unreadable value) is listed with its count **and** share of status
+  polls; nothing is dropped or re-bucketed, so a vocabulary change is visible
+  the night it lands. The violations table reports `capacity_hint=saturated`
+  polls with **no** live local work, with both shares (of all polls and of
+  `saturated` polls). Live work is the shared rule: `local_in_flight_requests
+  > 0` (schema 3, authoritative) or the `local_active_query` /
+  `active_query` flags (schema-2 fallback). A one-line verdict names each
+  missed target explicitly.
+- **Coverage caveat.** The section states the span of the polls it measured;
+  when the retained logs do not reach both edges of the window it labels the
+  figures a **partial** measurement (`--json`:
+  `capacity_signals.coverage`) instead of letting a truncated retention
+  window read as a complete night.
 - **Shared derivation.** The status-poll detection, field extraction, the
   denominator, the rate and the target check live once, in
   `scripts/lib/capacity_signals.py`, and are imported by both this skill
@@ -276,7 +291,13 @@ hand and cross-checking two surfaces:
   rather than a misleading `true`.
 
 `--json` exposes the same figures under `capacity_signals.slots_stale`
-(`status_polls`, `count`, `denominator`, `rate`, `target`, `passed`).
+(`status_polls`, `count`, `denominator`, `rate`, `target`, `passed`), plus
+`capacity_signals.capacity_hint` (`status_polls`, `counts`, `shares`),
+`capacity_signals.saturated_without_live_work` (`saturated`, `count`,
+`rate_of_polls`, `rate_of_saturated`), `capacity_signals.targets` (each
+check's `name`, `target`, `observed`, `passed`), `capacity_signals.coverage`
+(`covered`, the two edge gaps, `max_gap_seconds`) and
+`capacity_signals.all_targets_met` (`null` on a window with no polls).
 
 ## Local-turn coverage (LP-0MVM93DE6009JGBU)
 

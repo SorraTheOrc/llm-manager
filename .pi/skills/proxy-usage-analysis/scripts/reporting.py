@@ -2891,19 +2891,26 @@ def capacity_signals_json(
     section (``slots_stale`` sub-key) so automation can read what the Markdown
     shows. The rate and the target verdict come from the shared derivation
     (``scripts/lib/capacity_signals.py``), so this block and the section can
-    never disagree. Only ``slots_stale`` is populated by this work item; the
-    sibling item widens the same block additively.
+    never disagree.
 
-    ``passed`` is ``null`` when the window has no status polls: the Markdown
-    section is omitted in that case (no zero-fill, AC1.4/AC1.8), so there is no
-    outcome to report and a consumer must not read a silent ``true`` as an
-    all-clear. The counts stay present so the key's shape is stable.
+    LP-0MVU8O9OC005YQU1 AC2.5 widens the same block **additively**:
+    ``capacity_hint`` (counts and shares per token, unexpected tokens included),
+    ``saturated_without_live_work`` (count plus its share of all polls and of
+    ``saturated`` polls), ``targets`` (every target's observed value and
+    verdict — what the section's one-line verdict names) and ``coverage`` (the
+    poll span the caveat is about). ``all_targets_met`` is ``null`` on a window
+    with no status polls, exactly like ``slots_stale.passed``: the section is
+    omitted then, so a consumer must not read a silent ``true`` as an
+    all-clear. Existing keys keep their meaning.
     """
     signals = summary.capacity_signals
-    check = capacity_signals.stale_rate_check(
-        signals.slots_stale,
-        signals.slots_stale_denominator,
-        stale_rate_target,
+    hints = signals.hints
+    check, targets = _capacity_targets(summary, stale_rate_target)
+    coverage = capacity_signals.poll_coverage(
+        signals.first_poll_ts,
+        signals.last_poll_ts,
+        summary.window_start,
+        summary.window_end,
     )
     return {
         "slots_stale": {
@@ -2913,8 +2920,60 @@ def capacity_signals_json(
             "rate": check["observed"],
             "target": check["target"],
             "passed": check["passed"] if signals.status_polls else None,
-        }
+        },
+        "capacity_hint": {
+            "status_polls": signals.status_polls,
+            "counts": dict(hints.counts),
+            "shares": dict(hints.shares),
+        },
+        "saturated_without_live_work": {
+            "saturated": hints.saturated,
+            "count": hints.saturated_without_live_work,
+            "rate_of_polls": hints.violation_share_of_polls,
+            "rate_of_saturated": hints.violation_share_of_saturated,
+        },
+        "targets": targets,
+        "all_targets_met": (
+            all(target["passed"] for target in targets)
+            if signals.status_polls
+            else None
+        ),
+        "coverage": coverage,
     }
+
+
+def _capacity_targets(
+    summary: AnalysisResult,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+) -> tuple[dict, list[dict]]:
+    """The capacity target checks, shared by the section and the JSON block.
+
+    One list drives both, so the section's verdict and
+    ``capacity_signals.targets`` cannot name different misses
+    (LP-0MVU8O9OC005YQU1 AC2.4/AC2.5).
+    """
+    signals = summary.capacity_signals
+    check = capacity_signals.stale_rate_check(
+        signals.slots_stale,
+        signals.slots_stale_denominator,
+        stale_rate_target,
+    )
+    violations = signals.hints.saturated_without_live_work
+    targets = [
+        {
+            "name": "slots_stale rate",
+            "target": check["target"],
+            "observed": check["observed"],
+            "passed": check["passed"],
+        },
+        {
+            "name": "saturated only with live local work",
+            "target": 0,
+            "observed": violations,
+            "passed": violations == 0,
+        },
+    ]
+    return check, targets
 
 
 def _append_capacity_signals_section(
@@ -2930,21 +2989,26 @@ def _append_capacity_signals_section(
     from the nightly report alone instead of running
     ``scripts/capacity_signal_verification.py`` by hand.
 
+    LP-0MVU8O9OC005YQU1 AC2.4 adds the ``capacity_hint`` distribution (counts
+    **and** shares, every token — an unexpected one keeps its own row) and the
+    ``saturated``-without-live-work rows (count plus its share of all polls and
+    of ``saturated`` polls), followed by a verdict that names each unmet target.
+    AC2.7 adds the coverage/caveat text: the polls' own span is stated, and a
+    window the retained logs do not span is labelled a **partial** measurement
+    rather than published as a complete night.
+
     Omitted entirely — no heading, no zero-fill — when the window has no status
     polls, so a night with no polls (or no logs at all) renders exactly as it
     did before and the unattended 05:00 run cannot fail on an empty window
     (AC1.8). The figures come from the aggregation's half-open status-poll
     window, which uses the same shared derivation as the standalone tool
-    (AC1.1/AC1.3).
+    (AC1.1/AC1.3, AC2.2/AC2.3).
     """
     signals = summary.capacity_signals
     if not signals.status_polls:
         return
-    check = capacity_signals.stale_rate_check(
-        signals.slots_stale,
-        signals.slots_stale_denominator,
-        stale_rate_target,
-    )
+    hints = signals.hints
+    check, targets = _capacity_targets(summary, stale_rate_target)
     excluded = signals.status_polls - signals.slots_stale_denominator
     ap("")
     ap("## Local capacity signals")
@@ -2971,6 +3035,86 @@ def _append_capacity_signals_section(
         ap(f"{excluded:,} poll(s) carry no `slots_stale` field (schema 1) and "
            "are excluded from the rate rather than counted as fresh.")
         ap("")
+
+    # AC2.4: the full ``capacity_hint`` distribution — counts and shares, every
+    # token in its own row (an unexpected token is a vocabulary change worth
+    # seeing, never something to drop or re-bucket).
+    ap("### capacity_hint — the payload's own claim")
+    ap("")
+    ap("| `capacity_hint` | Status polls | Share |")
+    ap("|---|---:|---:|")
+    for token, count in hints.counts.items():
+        ap(f"| {token} | {count:,} | {hints.shares[token]:.2%} |")
+    ap(f"| **total** | **{signals.status_polls:,}** | **100.00%** |")
+    ap("")
+    ap("Shares are of all status polls in the window. Every token observed is "
+       "listed — a token this report does not know (a new claim name, or "
+       "`unknown` for a poll with no readable value) keeps its own row rather "
+       "than being dropped or re-bucketed, so a vocabulary change is visible "
+       "on the night it lands.")
+    ap("")
+
+    # AC2.4: the saturated-without-live-work rows, with both denominators.
+    violation_passed = hints.saturated_without_live_work == 0
+    ap("### saturated only with live local work")
+    ap("")
+    ap("| Metric | Value |")
+    ap("|---|---:|")
+    ap(f"| `capacity_hint=saturated` polls | {hints.saturated:,} |")
+    ap(f"| ... with **no** live local work | "
+       f"{hints.saturated_without_live_work:,} |")
+    ap(f"| Share of status polls | {hints.violation_share_of_polls:.2%} |")
+    ap(f"| Share of `saturated` polls | "
+       f"{hints.violation_share_of_saturated:.2%} |")
+    ap("| Target | 0 violating polls |")
+    ap(f"| Outcome | **{'met' if violation_passed else 'unmet'}** |")
+    ap("")
+    ap("Live work is any of `local_in_flight_requests > 0` (schema 3, "
+       "authoritative), `local_active_query=true` or `active_query=true` — the "
+       "same rule `scripts/capacity_signal_verification.py` applies, with the "
+       "flags as the schema-2 fallback. A truthful status surface reports "
+       "`saturated` only while real local streams run, so a violating poll is "
+       "the false-`saturated` signal the payload fix targeted. This derivation "
+       "uses the status surface's own liveness fields, not an independent GPU "
+       "probe.")
+    ap("")
+
+    # AC2.4: one line that names each unmet target instead of burying it.
+    unmet = [target["name"] for target in targets if not target["passed"]]
+    if unmet:
+        ap("**Verdict:** unmet — " + "; ".join(unmet) + ".")
+    else:
+        ap("**Verdict:** met — "
+           + "; ".join(target["name"] for target in targets) + ".")
+    ap("")
+
+    # AC2.7: state the poll span, and label a truncated window as partial — a
+    # retention window that does not reach the report's edges must not read as
+    # a complete measurement.
+    coverage = capacity_signals.poll_coverage(
+        signals.first_poll_ts,
+        signals.last_poll_ts,
+        summary.window_start,
+        summary.window_end,
+    )
+    if coverage["covered"]:
+        ap(f"Coverage: the {signals.status_polls:,} polls span "
+           f"{_fmt_ts(signals.first_poll_ts)} → "
+           f"{_fmt_ts(signals.last_poll_ts)}, reaching both edges of this "
+           f"window (tolerance {coverage['max_gap_seconds'] / 3600:.0f} h).")
+    else:
+        ap("**Limitation:** the poll data does not span the whole window "
+           f"({_fmt_ts(signals.first_poll_ts)} → "
+           f"{_fmt_ts(signals.last_poll_ts)} against "
+           f"{_fmt_ts(summary.window_start)} → "
+           f"{_fmt_ts(summary.window_end)}; "
+           f"{coverage['window_start_gap_seconds'] / 3600:.1f} h missing at "
+           f"the start, "
+           f"{coverage['window_end_gap_seconds'] / 3600:.1f} h at the end). "
+           "Log retention does not cover this window, so the distribution "
+           "and the violation counts are a **partial** measurement — do not "
+           "read them as a complete night.")
+    ap("")
     ap("`slots_stale` means the served slot counts *or* the per-slot detail came "
        "from the last-known cache because the fresh `/slots` query failed. It is "
        "a **polling-path** signal, not a capacity verdict: it says whether the "

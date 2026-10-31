@@ -82,7 +82,10 @@ its name-encoded hour, ``scripts/lib/proxy_logs.py``).
 
 ``capacity_hint.histogram``
     Value of ``capacity_hint=<token>`` per status poll (``idle``,
-    ``saturated``, ...), plus each token's share of ``status_polls``.
+    ``saturated``, ...), plus each token's share of ``status_polls``. The
+    histogram and the share arithmetic live in ``lib.capacity_signals``, where
+    the nightly analyzer derives the same distribution
+    (LP-0MVU8O9OC005YQU1 AC2.2/AC2.3).
 
 ``saturated_without_live_work``
     Status polls with ``capacity_hint=saturated`` that report **no** live local
@@ -90,7 +93,10 @@ its name-encoded hour, ``scripts/lib/proxy_logs.py``).
     0 (schema 3), ``local_active_query=true``, or ``active_query=true``.
     Schema 2 polls (pre LP-0MSKV3IEQ) have no ``local_in_flight_requests``
     field, so the ``local_active_query``/``active_query`` flags are the
-    fallback for those lines. This is the "false saturated" signal the fix
+    fallback for those lines. The rule itself is
+    ``lib.capacity_signals.live_local_work`` and the tallies come from
+    ``lib.capacity_signals.summarise_hints``, so the nightly analyzer publishes
+    the identical derivation. This is the "false saturated" signal the fix
     targets: a truthful status surface reports ``saturated`` only while real
     local streams run. Caveat: the derivation uses the status surface's own
     liveness fields, not an independent GPU/stream probe — the log carries no
@@ -310,10 +316,12 @@ from lib.capacity_signals import (  # noqa: E402
     latency_band,
     parse_int,
     parse_latency_ms,
+    share,
     stale_flag,
     stale_rate,
     stale_rate_check,
     status_fields,
+    summarise_hints,
     tally_stale,
 )
 from lib.proxy_logs import (  # noqa: E402
@@ -479,9 +487,12 @@ def analyse_status_stream(
     stale_flags: list[bool | None] = []
     stale_by_source = {"detail_cache": 0, "counts_cache": 0, "unknown": 0}
     stale_by_latency_band: dict[str, int] = {band: 0 for band in LATENCY_BANDS}
-    hints: dict[str, int] = {}
-    saturated = 0
-    saturated_without_live_work = 0
+    # One ``(capacity_hint, has_live_local_work)`` sample per poll. The
+    # histogram, the shares and the saturated-without-live-work tallies are
+    # derived from these by the shared implementation (LP-0MVU8O9OC005YQU1
+    # AC2.3), so this tool and the nightly analyzer cannot publish different
+    # distributions for the same lines.
+    hint_samples: list[tuple[str | None, bool]] = []
     saturated_without_available_slots = 0
     violating_minutes: dict[str, int] = {}
     violating_examples: list[str] = []
@@ -508,8 +519,8 @@ def analyse_status_stream(
                     polls += 1
                     fields = status_fields(line)
                     hint = fields.get("capacity_hint")
-                    if hint is not None:
-                        hints[hint] = hints.get(hint, 0) + 1
+                    live_work = has_live_local_work(fields)
+                    hint_samples.append((hint, live_work))
                     stale = stale_flag(fields)
                     stale_flags.append(stale)
                     if stale:
@@ -526,11 +537,9 @@ def analyse_status_stream(
                         latency = parse_latency_ms(fields.get("latency_ms"))
                         stale_by_latency_band[latency_band(latency)] += 1
                     if hint == "saturated":
-                        saturated += 1
                         if fields.get("available_slots") == "0":
                             saturated_without_available_slots += 1
-                        if not has_live_local_work(fields):
-                            saturated_without_live_work += 1
+                        if not live_work:
                             minute = ts.strftime("%Y-%m-%d %H:%M")
                             violating_minutes[minute] = (
                                 violating_minutes.get(minute, 0) + 1
@@ -569,13 +578,13 @@ def analyse_status_stream(
                     if session.group("session").startswith("herdr-"):
                         herdr_dispatch_sessions.add(session.group("session"))
 
-    def _rate(count: int, denominator: int) -> float:
-        return round(count / denominator, 4) if denominator else 0.0
-
     # Stale count and denominator from the shared rule (LP-0MVU8O4EL005IYP9
     # AC1.1): polls with no ``slots_stale`` field are excluded, never counted
     # as fresh.
     slots_stale, slots_stale_denominator = tally_stale(stale_flags)
+    # The ``capacity_hint`` distribution and the saturated-without-live-work
+    # tallies, from the same shared implementation the nightly analyzer uses.
+    hint_summary = summarise_hints(hint_samples)
 
     worst = sorted(
         violating_minutes.items(), key=lambda item: (-item[1], item[0])
@@ -595,15 +604,13 @@ def analyse_status_stream(
             "unattributed": stale_by_source["unknown"],
         },
         "capacity_hint": {
-            "histogram": dict(sorted(hints.items())),
-            "rates": {
-                key: _rate(value, polls) for key, value in sorted(hints.items())
-            },
+            "histogram": dict(hint_summary.counts),
+            "rates": dict(hint_summary.shares),
         },
         "saturated_without_live_work": {
-            "count": saturated_without_live_work,
-            "rate_of_polls": _rate(saturated_without_live_work, polls),
-            "rate_of_saturated": _rate(saturated_without_live_work, saturated),
+            "count": hint_summary.saturated_without_live_work,
+            "rate_of_polls": hint_summary.violation_share_of_polls,
+            "rate_of_saturated": hint_summary.violation_share_of_saturated,
             "worst_timestamps": [
                 {"minute": minute, "polls": count} for minute, count in worst
             ],
@@ -612,7 +619,7 @@ def analyse_status_stream(
         },
         "saturated_without_available_slots": {
             "count": saturated_without_available_slots,
-            "rate_of_polls": _rate(saturated_without_available_slots, polls),
+            "rate_of_polls": share(saturated_without_available_slots, polls),
         },
         "local_dispatches": {
             "count": local_dispatches,

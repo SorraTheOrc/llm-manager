@@ -667,12 +667,32 @@ class StatusPollSignals:
     freshness field and is excluded from the rate rather than counted as
     fresh (the derivation itself lives in
     ``scripts/lib/capacity_signals.py``).
+
+    LP-0MVU8O9OC005YQU1 AC2.3 adds the ``capacity_hint`` distribution
+    (``hints``: counts and shares per token, unexpected tokens preserved) and
+    the ``saturated``-without-live-work tally with both shares. ``hints`` is
+    computed by the shared derivation from the parser's typed live-work fields,
+    so the nightly figures and ``scripts/capacity_signal_verification.py``
+    cannot drift. ``first_poll_ts`` / ``last_poll_ts`` bound the observed poll
+    span, which is the coverage proxy the report labels a truncated window
+    with (AC2.7).
     """
 
     status_polls: int = 0
     slots_stale: int = 0
     slots_stale_denominator: int = 0
     slots_stale_rate: float = 0.0
+    # ``capacity_hint`` distribution and saturated-without-live-work tally
+    # (LP-0MVU8O9OC005YQU1 AC2.3), computed by the shared derivation so the
+    # nightly figures and the reference tool cannot diverge.
+    hints: capacity_signals.HintSummary = field(
+        default_factory=capacity_signals.HintSummary
+    )
+    # Span of the in-window polls (``None`` when there are none): the honest
+    # coverage proxy the section reports, because this analyzer has no
+    # file-level coverage model (AC2.7).
+    first_poll_ts: datetime | None = None
+    last_poll_ts: datetime | None = None
 
 
 @dataclass
@@ -2516,12 +2536,37 @@ def aggregate(
     stale_count, stale_denominator = capacity_signals.tally_stale(
         ev.slots_stale for ev in windowed_status_events
     )
+    # The ``capacity_hint`` distribution and saturated-without-live-work tally
+    # (LP-0MVU8O9OC005YQU1 AC2.3) come from the same shared derivation the
+    # reference tool uses, fed with the parser's typed live-work fields.
+    hint_summary = capacity_signals.summarise_hints(
+        (
+            ev.capacity_hint,
+            capacity_signals.live_local_work(
+                ev.local_in_flight_requests,
+                ev.local_active_query,
+                ev.active_query,
+            ),
+        )
+        for ev in windowed_status_events
+    )
     capacity_signal_aggregate = StatusPollSignals(
         status_polls=len(windowed_status_events),
         slots_stale=stale_count,
         slots_stale_denominator=stale_denominator,
         slots_stale_rate=capacity_signals.stale_rate(
             stale_count, stale_denominator
+        ),
+        hints=hint_summary,
+        first_poll_ts=(
+            min(ev.ts for ev in windowed_status_events)
+            if windowed_status_events
+            else None
+        ),
+        last_poll_ts=(
+            max(ev.ts for ev in windowed_status_events)
+            if windowed_status_events
+            else None
         ),
     )
 

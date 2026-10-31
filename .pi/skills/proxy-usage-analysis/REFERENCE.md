@@ -240,6 +240,31 @@ Outputs written to:
     (`scripts/lib/capacity_signals.py`), and status polls use the reference
     tool's half-open `[window_start, window_end)` window while every other
     section keeps its historical closed interval.
+  - `capacity_signals.capacity_hint` (LP-0MVU8O9OC005YQU1) — `{status_polls,
+    counts, shares}`: the `capacity_hint` histogram over status polls and each
+    token's share of them. Every token keeps its own row — a new claim name, a
+    case variant or `unknown` for an unreadable value is never dropped or
+    re-bucketed — so a vocabulary change is visible in the JSON the night it
+    lands.
+  - `capacity_signals.saturated_without_live_work` (LP-0MVU8O9OC005YQU1) —
+    `{saturated, count, rate_of_polls, rate_of_saturated}`: the
+    `capacity_hint=saturated` polls that report no live local work
+    (`local_in_flight_requests > 0` authoritative at schema 3, else the
+    `local_active_query` / `active_query` fallback), with its share of all
+    polls and of `saturated` polls. The rule and the tallies are the shared
+    `scripts/lib/capacity_signals.py` implementation, so this key and
+    `scripts/capacity_signal_verification.py` publish identical figures.
+  - `capacity_signals.targets` / `capacity_signals.all_targets_met` — one
+    entry per capacity target (`name`, `target`, `observed`, `passed`), the
+    list the section's one-line verdict names, and the aggregate outcome
+    (`null` when the window has no status polls, matching
+    `slots_stale.passed`).
+  - `capacity_signals.coverage` (LP-0MVU8O9OC005YQU1) — `{covered,
+    window_start_gap_seconds, window_end_gap_seconds, max_gap_seconds}`: the
+    span of the observed polls against the report window. When the retained
+    logs do not reach both edges (1 h tolerance) the section labels the
+    figures a **partial** measurement instead of letting a truncated
+    retention window read as a complete night.
 - **Contended-pricing split keys (LP-0MVS9YKHL007UBBZ, parent
   LP-0MVS8T6F4006DGG3).** Two additive keys split the same
   `local_admission_reject` / `local_admission_admit` verdicts, so a regression

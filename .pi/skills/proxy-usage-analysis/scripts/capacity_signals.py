@@ -61,16 +61,25 @@ def _load_shared():
 _shared = _load_shared()
 
 DEFAULT_STALE_RATE_TARGET = _shared.DEFAULT_STALE_RATE_TARGET
+UNKNOWN_HINT = _shared.UNKNOWN_HINT
+SATURATED_HINT = _shared.SATURATED_HINT
+DEFAULT_COVERAGE_GAP_SECONDS = _shared.DEFAULT_COVERAGE_GAP_SECONDS
 STATUS_POLL_RE = _shared.STATUS_POLL_RE
 STATUS_FIELD_RE = _shared.STATUS_FIELD_RE
 FIELD_SLOTS_STALE = _shared.FIELD_SLOTS_STALE
 LATENCY_BANDS = _shared.LATENCY_BANDS
+HintSummary = _shared.HintSummary
 is_status_poll = _shared.is_status_poll
 status_fields = _shared.status_fields
 parse_latency_ms = _shared.parse_latency_ms
 parse_int = _shared.parse_int
 latency_band = _shared.latency_band
 has_live_local_work = _shared.has_live_local_work
+live_local_work = _shared.live_local_work
+hint_histogram = _shared.hint_histogram
+summarise_hints = _shared.summarise_hints
+poll_coverage = _shared.poll_coverage
+share = _shared.share
 in_window = _shared.in_window
 stale_flag = _shared.stale_flag
 tally_stale = _shared.tally_stale

@@ -221,7 +221,7 @@ RE_STATUS_PREFILL_CALIBRATED = re.compile(
     r"\bprefill_eta_calibrated=(true|false)"
 )
 RE_STATUS_PREFILL_RATE_BUCKET = re.compile(r"\bprefill_eta_rate_bucket=([A-Za-z_]+)")
-RE_STATUS_CAPACITY_HINT = re.compile(r"\bcapacity_hint=([a-z_]+)")
+RE_STATUS_CAPACITY_HINT = re.compile(r"\bcapacity_hint=([^\s]+)")
 RE_STATUS_SCHEMA_VERSION = re.compile(r"\bstatus_schema_version=(\d+)")
 RE_STATUS_AVAILABLE_SLOTS = re.compile(r"\bavailable_slots=(\d+)")
 RE_STATUS_TOTAL_SLOTS = re.compile(r"\btotal_slots=(\d+)")
@@ -237,6 +237,16 @@ RE_STATUS_SLOTS_DETAIL_STALE = re.compile(r"\bslots_detail_stale=(true|false)")
 # the status handler spent serving the request, including a timed-out
 # ``/slots`` query. Absent on pre-change lines, so ``None`` there.
 RE_STATUS_LATENCY_MS = re.compile(r"\blatency_ms=(\d+)")
+# Live local work at poll time (LP-0MVU8O9OC005YQU1 AC2.1): schema 3 carries
+# ``local_in_flight_requests`` — the authoritative count derived from live
+# dispatch records — while every schema (2 and 3) carries the
+# ``local_active_query`` / ``active_query`` flags the pre-fix
+# false-``saturated`` incident was measured on. All three are absent on
+# pre-change lines and stay ``None`` there (never a fabricated ``false``, which
+# would claim the poll had *checked* and found no live work).
+RE_STATUS_LOCAL_IN_FLIGHT = re.compile(r"\blocal_in_flight_requests=(\d+)")
+RE_STATUS_LOCAL_ACTIVE_QUERY = re.compile(r"\blocal_active_query=(true|false)")
+RE_STATUS_ACTIVE_QUERY = re.compile(r"\bactive_query=(true|false)")
 
 # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): the proxy emits
 # ``routing_idle_admit provider=... model=... reason=economic_bypass_idle
@@ -747,6 +757,14 @@ class LogEvent:
     slots_stale: bool | None = None
     slots_detail_stale: bool | None = None
     latency_ms: int | None = None
+    # Live local work at poll time (LP-0MVU8O9OC005YQU1 AC2.1): the
+    # authoritative schema-3 ``local_in_flight_requests`` count and the
+    # ``local_active_query`` / ``active_query`` flags that are the schema-2
+    # fallback. All three are ``None`` on lines predating the fields, so the
+    # shared live-work rule can tell "absent" from "checked, none running".
+    local_in_flight_requests: int | None = None
+    local_active_query: bool | None = None
+    active_query: bool | None = None
     # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J, ``idle_admit`` kind):
     # the idle age at admission and the configured threshold. Populated on
     # ``idle_admit`` events only.
@@ -1308,6 +1326,11 @@ def parse_log_line(line: str) -> LogEvent | None:
             slots_stale=_bool(RE_STATUS_SLOTS_STALE, msg),
             slots_detail_stale=_bool(RE_STATUS_SLOTS_DETAIL_STALE, msg),
             latency_ms=_int(RE_STATUS_LATENCY_MS, msg),
+            # Live local work (LP-0MVU8O9OC005YQU1 AC2.1): additive fields,
+            # ``None`` on lines predating them.
+            local_in_flight_requests=_int(RE_STATUS_LOCAL_IN_FLIGHT, msg),
+            local_active_query=_bool(RE_STATUS_LOCAL_ACTIVE_QUERY, msg),
+            active_query=_bool(RE_STATUS_ACTIVE_QUERY, msg),
         )
     if msg.startswith(ROUTING_RESIDENT_PREFIX):
         # "routing_resident_prefix provider=local model=Qwen3 decision=admit

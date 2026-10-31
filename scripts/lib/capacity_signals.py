@@ -40,6 +40,24 @@ Derivation contract (identical on both surfaces)
     denominator is empty), rounded to four decimals, and the target check is
     the strict comparison ``rate < target`` against the configurable target
     (default :data:`DEFAULT_STALE_RATE_TARGET`, the reference tool's 5 %).
+``hint_histogram`` / ``summarise_hints``
+    The ``capacity_hint`` distribution over status polls — counts and shares of
+    all polls per token, token order stable — plus the
+    ``saturated``-without-live-work tally with its share of all polls and of
+    ``saturated`` polls. A token the report's vocabulary does not know (a new
+    claim name, a case variant, ``unknown`` for an unreadable value) keeps its
+    **own** row; nothing is dropped or re-bucketed.
+``live_local_work``
+    The single live-work rule (LP-0MVU8O9OC005YQU1 AC2.2): ``in_flight > 0``
+    (schema 3, authoritative) **or** one of the ``local_active_query`` /
+    ``active_query`` flags (the schema-2 fallback, the pair the pre-fix
+    false-``saturated`` incident was about). ``has_live_local_work`` is the
+    field-mapping entry point for the reference tool and delegates here, so the
+    two surfaces cannot diverge.
+``poll_coverage``
+    Whether the observed status polls span the report window (within
+    :data:`DEFAULT_COVERAGE_GAP_SECONDS` of each edge), so a truncated log
+    retention window cannot masquerade as a complete measurement.
 
 Standard library only, and deliberately **not** importing ``.pi/**``: this
 module is owned by the repo-level ``scripts/lib/`` package (mirroring
@@ -50,12 +68,28 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 
 #: Default ``slots_stale`` rate target: fewer than 5 % of eligible status polls.
 #: Matches ``scripts/capacity_signal_verification.py --stale-rate-target`` and
 #: the nightly analyzer's ``--stale-rate-target`` default.
 DEFAULT_STALE_RATE_TARGET = 0.05
+
+#: Token recorded for a status poll whose ``capacity_hint`` value is absent or
+#: unreadable. Never dropped from the distribution: a vocabulary change must
+#: stay visible rather than being silently re-bucketed (LP-0MVU8O9OC005YQU1
+#: AC2.3).
+UNKNOWN_HINT = "unknown"
+
+#: The hint token that claims the local pool is out of capacity.
+SATURATED_HINT = "saturated"
+
+#: Tolerance applied when deciding whether the observed status polls span the
+#: reported window. Matches the reference tool's ``--max-gap-seconds`` default
+#: (1 h) so the two coverage models agree on what "spans the window" means.
+DEFAULT_COVERAGE_GAP_SECONDS = 3600.0
 
 #: The structured status surface: one line per ``GET /llama/local/status``.
 STATUS_POLL_RE = re.compile(r"\bstatus_request\b")
@@ -131,18 +165,135 @@ def has_live_local_work(fields: Mapping[str, str]) -> bool:
     exactly the pair the pre-fix false-``saturated`` incident was about.
     Any single positive signal counts as live work: a violating poll must show
     none of them.
+
+    This is the field-mapping entry point used by
+    ``scripts/capacity_signal_verification.py``; the rule itself lives in
+    :func:`live_local_work` so the nightly analyzer — which has typed
+    ``LogEvent`` fields rather than a raw field map — applies exactly the same
+    rule (LP-0MVU8O9OC005YQU1 AC2.2).
     """
-    in_flight = fields.get("local_in_flight_requests")
-    if in_flight is not None:
-        try:
-            if int(in_flight) > 0:
-                return True
-        except ValueError:
-            pass
-    return (
-        fields.get("local_active_query") == "true"
-        or fields.get("active_query") == "true"
+    return live_local_work(
+        parse_int(fields.get("local_in_flight_requests")),
+        fields.get("local_active_query") == "true",
+        fields.get("active_query") == "true",
     )
+
+
+def live_local_work(
+    in_flight_requests: int | None,
+    local_active_query: bool | None,
+    active_query: bool | None,
+) -> bool:
+    """The one live-work rule, over already-parsed poll fields.
+
+    ``in_flight_requests`` (schema 3) is authoritative when it reports live
+    work; otherwise the ``local_active_query`` / ``active_query`` flags decide
+    (the schema-2 fallback). ``None`` means the field was absent from the line,
+    never a fabricated default.
+    """
+    if in_flight_requests is not None and in_flight_requests > 0:
+        return True
+    return bool(local_active_query) or bool(active_query)
+
+
+@dataclass(frozen=True)
+class HintSummary:
+    """The ``capacity_hint`` distribution and the violation tallies.
+
+    ``counts`` is the token-order-stable histogram over status polls and
+    ``shares`` each token's share of those polls. ``saturated_without_live_work``
+    is the number of ``saturated`` polls that report no live local work, with
+    its share of all polls and of ``saturated`` polls — both shares, because a
+    violation rate reads very differently against each denominator
+    (LP-0MVU8O9OC005YQU1 AC2.3).
+    """
+
+    counts: dict[str, int] = field(default_factory=dict)
+    shares: dict[str, float] = field(default_factory=dict)
+    saturated: int = 0
+    saturated_without_live_work: int = 0
+    violation_share_of_polls: float = 0.0
+    violation_share_of_saturated: float = 0.0
+
+
+def hint_histogram(hints: Iterable[str | None]) -> dict[str, int]:
+    """Counts per ``capacity_hint`` token, sorted by token.
+
+    A value that is absent or unreadable is recorded as :data:`UNKNOWN_HINT`
+    rather than dropped, so an unparsed line cannot vanish from the
+    distribution. Sorted output keeps the rendered rows and the JSON keys
+    stable between nights.
+    """
+    counter = Counter(hint if hint else UNKNOWN_HINT for hint in hints)
+    return dict(sorted(counter.items()))
+
+
+def share(count: int, total: int) -> float:
+    """``count / total`` rounded to four decimals (``0.0`` when none)."""
+    return round(count / total, 4) if total else 0.0
+
+
+def summarise_hints(
+    samples: Iterable[tuple[str | None, bool]],
+) -> HintSummary:
+    """Histogram, shares and saturated-without-live-work tallies.
+
+    Each sample is ``(capacity_hint_token, has_live_local_work)`` from one
+    status poll, so both surfaces feed the same shape into the same arithmetic
+    (LP-0MVU8O9OC005YQU1 AC2.2/AC2.3).
+    """
+    materialised = [
+        (hint if hint else UNKNOWN_HINT, bool(live)) for hint, live in samples
+    ]
+    counts = hint_histogram(hint for hint, _ in materialised)
+    total = len(materialised)
+    saturated = counts.get(SATURATED_HINT, 0)
+    violations = sum(
+        1 for hint, live in materialised if hint == SATURATED_HINT and not live
+    )
+    return HintSummary(
+        counts=counts,
+        shares={token: share(count, total) for token, count in counts.items()},
+        saturated=saturated,
+        saturated_without_live_work=violations,
+        violation_share_of_polls=share(violations, total),
+        violation_share_of_saturated=share(violations, saturated),
+    )
+
+
+def poll_coverage(
+    first_poll: dt.datetime | None,
+    last_poll: dt.datetime | None,
+    window_start: dt.datetime,
+    window_end: dt.datetime,
+    max_gap_seconds: float = DEFAULT_COVERAGE_GAP_SECONDS,
+) -> dict:
+    """Whether the observed status polls span the reported window.
+
+    The nightly analyzer has no file-level coverage model (the reference tool
+    does), so the honest proxy is the span of the polls themselves: a window
+    whose retained logs start late or end early shows up as a large gap at one
+    edge. ``covered`` is ``False`` when that gap exceeds *max_gap_seconds* at
+    either edge, which is what lets the report label a truncated window as a
+    partial measurement instead of a complete one (LP-0MVU8O9OC005YQU1 AC2.7).
+    With no polls there is nothing to measure, so ``covered`` is ``False`` and
+    both gaps stay ``None`` rather than being fabricated as zero.
+    """
+    if first_poll is None or last_poll is None:
+        return {
+            "covered": False,
+            "window_start_gap_seconds": None,
+            "window_end_gap_seconds": None,
+            "max_gap_seconds": float(max_gap_seconds),
+        }
+    start_gap = (first_poll - window_start).total_seconds()
+    end_gap = (window_end - last_poll).total_seconds()
+    return {
+        "covered": start_gap <= max_gap_seconds and end_gap <= max_gap_seconds,
+        "window_start_gap_seconds": float(start_gap),
+        "window_end_gap_seconds": float(end_gap),
+        "max_gap_seconds": float(max_gap_seconds),
+    }
 
 
 def in_window(
@@ -192,7 +343,7 @@ def tally_stale(flags: Iterable[bool | None]) -> tuple[int, int]:
 
 def stale_rate(count: int, denominator: int) -> float:
     """Stale polls as a share of eligible polls (``0.0`` when none eligible)."""
-    return round(count / denominator, 4) if denominator else 0.0
+    return share(count, denominator)
 
 
 def stale_rate_check(
