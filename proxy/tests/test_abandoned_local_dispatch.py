@@ -1990,3 +1990,153 @@ class TestAbandonedSlotEntryScope:
         assert _abandoned_slot_endpoint_wide(
             endpoint=ENDPOINT, now=clock.now
         ) is not None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AC4 (LP-0MVWFKF4M009AEJ9) — a deficit-aborted slot stops reading "busy"
+#
+# Parent LP-0MVWEZCB0006WPBQ AC4: after a measured-cache-deficit abort whose
+# upstream cancel is confirmed, `local_abandoned_slots` must stop counting the
+# slot and `capacity_hint` must leave `abandoned_busy` — the marker may not
+# claim 900 s of consumed capacity for a 1-second abort.
+#
+# Chosen option (recorded in the work-item comment and the commit note):
+# **release on the release path**, realised by the fresh-snapshot clear in
+# LP-0MVUVHB1V006HA5I (`_clear_abandoned_slot`, called from
+# `annotate_slots_for_status` only when `stale=False`). The alternative — a
+# reason-scoped shortened TTL for `measured_cache_deficit` — was rejected: any
+# fixed short window re-opens the LP-0MVUTYHG7001S6BM draining-ghost gap for a
+# drain longer than the window, whereas the observed-free release is exact.
+#
+# What this class adds: the *deficit* path is driven end to end (abort →
+# registry → `/llama/local/status`), which the generic clear-on-free tests do
+# not cover, plus the AC4b guard that a still-draining slot keeps its
+# annotation (vocabulary and attribution untouched).
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TestDeficitAbortMarkerRelease:
+    """AC4/AC4b/AC4c: released once free, annotated while still draining."""
+
+    def _abort(
+        self, slot_id: int | None = 0, *, pin_slot: bool = True
+    ) -> None:
+        """Drive the deficit abort with a confirmed upstream cancel.
+
+        ``pin_slot=False`` reproduces the unattributable shape (no slot
+        identity anywhere), which records the endpoint-wide entry instead.
+        """
+        from proxy.router_helpers import _release_measured_cache_abort_dispatch
+
+        record = {
+            "active": True,
+            "expires_at": time.monotonic() + 60.0,
+        }
+        if pin_slot:
+            record["slot_id"] = slot_id
+        srv = _server_stub(records={"sess-abort": record})
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            asyncio.run(
+                _release_measured_cache_abort_dispatch(
+                    srv,
+                    "sess-abort",
+                    abandoned_slot_id=slot_id if pin_slot else None,
+                    upstream_stream_cm=_fake_stream_cm(),
+                )
+            )
+
+    def test_deficit_marker_survives_while_the_slot_is_still_draining(self, clock):
+        """AC4b: the annotation keeps its meaning. The abort records an
+        attributable marker, and a fresh snapshot still reporting the slot
+        processing keeps it — the draining slot must never read `saturated`
+        (LP-0MVUTYHG7001S6BM)."""
+        from proxy.router_helpers import _abandoned_slot_for
+
+        self._abort(0)
+
+        slot = _annotate([_raw_slot(0, is_processing=True, n_decoded=6)])[0]
+
+        assert slot["abandoned"] is True
+        assert slot["abandonment_reason"] == "measured_cache_deficit"
+        assert slot["abandoned_session_id"] == "sess-abort"
+        assert slot["abandoned_at_seconds_ago"] is not None
+        assert slot["abandoned_scope"] == "slot"
+        assert _abandoned_slot_for(0, now=clock.now) is not None
+
+    def test_fresh_free_snapshot_releases_the_deficit_marker(self, clock):
+        """AC4: the moment a fresh snapshot reports the aborted slot free, the
+        marker is released — not 900 s later — so a later poll cannot resurrect
+        the annotation."""
+        from proxy.router_helpers import _abandoned_slot_for
+
+        self._abort(0)
+        assert _annotate([_raw_slot(0, is_processing=True, n_decoded=6)])[0][
+            "abandoned"
+        ] is True
+
+        freed = _annotate([_raw_slot(0, is_processing=False)])[0]
+
+        assert freed["abandoned"] is False
+        assert freed["abandonment_reason"] is None
+        assert freed["abandoned_session_id"] is None
+        assert freed["abandoned_at_seconds_ago"] is None
+        assert _abandoned_slot_for(0, now=clock.now) is None
+
+    def test_stale_snapshot_never_releases_the_deficit_marker(self, clock):
+        """A cached `/slots` snapshot is a fossil, not evidence of release: it
+        must not clear the marker and let a draining slot read `saturated`."""
+        from proxy.router_helpers import _abandoned_slot_for
+
+        self._abort(0)
+
+        stale = _annotate([_raw_slot(0, is_processing=False)], stale=True)
+
+        assert stale[0]["abandoned"] is True
+        assert _abandoned_slot_for(0, now=clock.now) is not None
+
+    def test_status_payload_leaves_abandoned_busy_once_the_slot_is_free(self, clock):
+        """AC4c end-to-end: `/llama/local/status` reports `abandoned_busy` while
+        the aborted slot drains, then real capacity (`idle`, no abandoned slot)
+        on the first fresh poll that sees the slot free — the pair of polls the
+        parent measurement counted as 15 minutes of ghost occupancy."""
+        from proxy.observability import CAPACITY_ABANDONED_BUSY
+        from proxy.router_helpers import _abandoned_slot_for
+
+        self._abort(0)
+
+        ghost = asyncio.run(
+            _StatusHarness().get([_raw_slot(0, is_processing=True, n_decoded=11)])
+        )
+        assert ghost["slots_detail_stale"] is False
+        assert ghost["capacity_hint"] == CAPACITY_ABANDONED_BUSY
+        assert ghost["local_abandoned_slots"] == 1
+        assert ghost["slots"][0]["abandoned"] is True
+        assert (
+            ghost["slots"][0]["abandonment_reason"] == "measured_cache_deficit"
+        )
+
+        freed = asyncio.run(_StatusHarness().get([_raw_slot(0, is_processing=False)]))
+        assert freed["capacity_hint"] == "idle"
+        assert freed["capacity_hint"] != CAPACITY_ABANDONED_BUSY
+        assert freed["local_abandoned_slots"] == 0
+        assert freed["slots"][0]["abandoned"] is False
+        assert _abandoned_slot_for(0, now=clock.now) is None
+
+    def test_unresolved_deficit_identity_is_released_once_nothing_processes(
+        self, clock
+    ):
+        """The unattributable shape: an abort with no slot identity records the
+        endpoint-wide entry, which annotates the draining slot and is released
+        when a fresh snapshot reports nothing processing on the endpoint."""
+        from proxy.router_helpers import _abandoned_slot_endpoint_wide
+
+        self._abort(None, pin_slot=False)
+        assert _abandoned_slot_endpoint_wide(now=clock.now) is not None
+
+        draining = _annotate([_raw_slot(1, is_processing=True, n_decoded=9)])[0]
+        assert draining["abandoned"] is True
+        assert draining["abandoned_scope"] == "endpoint"
+
+        freed = _annotate([_raw_slot(1, is_processing=False)])[0]
+        assert freed["abandoned"] is False
+        assert _abandoned_slot_endpoint_wide(now=clock.now) is None
