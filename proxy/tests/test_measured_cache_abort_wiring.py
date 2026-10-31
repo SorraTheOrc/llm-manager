@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MVWOK763006YGHJ
+# smell: modernization
+# severity: medium
+# description: Use format specifiers instead of percent format
+# -->
 """Early abort on measured prefill cache deficit — router wiring (F4).
 
 LP-0MVR7IN0O000DPXN / parent LP-0MVQIT9QY007QU27 (producer-approved Option D).

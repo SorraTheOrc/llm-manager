@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-LP-0MVWOK6LH006BTN4
+# smell: modernization
+# severity: medium
+# description: Use format specifiers instead of percent format
+# -->
 """Reason-scoped deferral of the measured-cache-deficit local 503.
 
 Parent: LP-0MVWEZCB0006WPBQ (AC1, AC2, AC3, AC5).
@@ -69,14 +75,14 @@ import logging
 import time
 
 import httpx
+import proxy.provider as provider
 import pytest
 from fastapi import Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
 
-import proxy.provider as provider
 from proxy import admission_reserve, cold_start
 from proxy import router_helpers as helpers
-from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
 
 #: The header the router's deficit 503 carries (see module docstring).
 DEFICIT_MARKER_HEADER = "X-Local-Dispatch-Reason"
