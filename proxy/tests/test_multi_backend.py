@@ -7,8 +7,10 @@ Coverage (Acceptance Criteria mapping):
 - AC2  — dispatch lease records are keyed per-endpoint
          ``(endpoint, session_id)``; the same session on different servers
          holds independent leases.
-- AC3  — slot save directories are derived per-endpoint under the global
-         ``session_slot_save_path`` root as ``{host}-{port}/`` subdirectories.
+- AC3  — slot save/restore targets the per-endpoint llama-server instance;
+         snapshots live in the shared ``session_slot_save_path`` root because
+         llama-server accepts only a bare filename under its own
+         ``--slot-save-path`` (LP-0MVVI8TEU006KTOZ).
 - AC4  — the fallback chain iterates multiple ``type: local`` providers and
          falls through when the first server is unavailable.
 - AC5  — per-endpoint health probes: HTTP health check + GPU OOM error-pattern
@@ -183,11 +185,17 @@ async def test_release_and_cleanup_respect_endpoint_keys():
 
 
 # ---------------------------------------------------------------------------
-# AC3: per-endpoint slot save/restore paths
+# AC3: slot save/restore paths
 # ---------------------------------------------------------------------------
 
-def test_slot_context_derives_per_endpoint_subdirectory(tmp_path):
-    """AC3: slot files live under {session_slot_save_path}/{host}-{port}/."""
+def test_slot_context_snapshots_live_in_the_llama_server_save_root(tmp_path):
+    """AC3: an endpoint selects the server, not a subdirectory.
+
+    llama-server accepts only a bare filename (``fs_validate_filename``
+    rejects subdirectories) and writes it under its own ``--slot-save-path``.
+    A proxy-side ``{host}-{port}/`` path therefore separated the snapshot from
+    its sidecar and defeated seeding/restore (LP-0MVVI8TEU006KTOZ).
+    """
     from proxy.session import _build_slot_context, _slot_owners
 
     _slot_owners.clear()
@@ -205,7 +213,7 @@ def test_slot_context_derives_per_endpoint_subdirectory(tmp_path):
     )
     assert slot_id is not None
     path = __import__("pathlib").Path(filename)
-    assert path.parent.name == "192.168.0.199-8080"
+    assert path.parent == tmp_path
     assert path.name == "slot_sess-1.bin"
     assert path.parent.exists()
 

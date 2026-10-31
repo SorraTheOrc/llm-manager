@@ -2909,6 +2909,18 @@ To avoid llama-server invalidating KV checkpoints between turns, the proxy can
 restore and save slot snapshots on each request. This requires llama-server to
 run with `--slot-save-path` pointing at the same path.
 
+**Snapshot directory (LP-0MVVI8TEU006KTOZ).** Snapshots live directly in
+`session_slot_save_path`: llama-server's slot endpoint accepts only a bare
+filename (`fs_validate_filename(..., allow_subdirs=False)`) and writes it under
+its own `--slot-save-path`. The proxy therefore keeps the `slot_<session>.bin`
+snapshot, its `.ratio.json` sidecar and the restore existence check in that
+same directory, even when the request targets a specific `endpoint`. An older
+per-endpoint `{host}-{port}/` layout is still read/retired for compatibility,
+but nothing writes there any more: the divergence it caused (snapshot in the
+root, sidecar in the subdirectory) made every seed report `missing_sidecar` and
+no restore ever run. Point every local llama-server's `--slot-save-path` at
+`session_slot_save_path`.
+
 Config keys:
 - `server.session_slot_save_path` — directory for slot snapshot files
 - `server.session_slot_pool_size` — number of slots; should match llama-server `--parallel`
@@ -3182,8 +3194,8 @@ to prevent disk-space exhaustion:
   (`--keep-recent`, default: `3`)
 - Delete each snapshot's `.ratio.json` routing sidecar with the snapshot, and
   prune orphan sidecars whose snapshot is gone — the scan covers the cache root
-  **and** the per-endpoint `{host}-{port}/` subdirectories
-  (LP-0MVK0E80C009HUQC)
+  **and** any legacy per-endpoint `{host}-{port}/` subdirectories
+  (LP-0MVK0E80C009HUQC, LP-0MVVI8TEU006KTOZ)
 
 **Usage:**
 

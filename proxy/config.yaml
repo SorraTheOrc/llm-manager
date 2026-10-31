@@ -26,8 +26,11 @@
 #   it is busy or unhealthy (sequential fallback). Omitting ``endpoint``
 #   keeps the legacy behaviour of routing to
 #   ``http://localhost:{server.llama_server_port}``. Each server tracks its
-#   own dispatch leases (keyed per-endpoint) and persists slot snapshots in
-#   its own ``{session_slot_save_path}/{host}-{port}/`` subdirectory.
+#   own dispatch leases (keyed per-endpoint). Slot snapshots are written to
+#   the shared ``session_slot_save_path`` root: llama-server accepts only a
+#   bare filename under its own ``--slot-save-path``, so a per-endpoint
+#   subdirectory would separate a snapshot from its sidecar
+#   (LP-0MVVI8TEU006KTOZ; legacy ``{host}-{port}/`` files are still read).
 #   The proxy assumes the servers are already running (no lifecycle
 #   management). Example:
 #
@@ -378,9 +381,9 @@ models:
   # Multi-backend local providers (LP-0MRPILSMW004T4H8): a ``type: local``
   # provider may declare an optional ``endpoint`` (full ``http://host:port``
   # URL of a specific llama-server instance) to run several local servers
-  # behind one model with per-endpoint fallback, slot persistence
-  # (``{host}-{port}/`` subdirs) and dispatch leases. Omitted ``endpoint``
-  # keeps the legacy single-server default
+  # behind one model with per-endpoint fallback, slot persistence (shared
+  # ``session_slot_save_path`` root; see below) and dispatch leases. Omitted
+  # ``endpoint`` keeps the legacy single-server default
   # ``http://localhost:{llama_server_port}``. See proxy/MODEL_ADD.md.
   embed:
     providers:
@@ -1673,11 +1676,13 @@ server:
   # (llama-server prompt_save/prompt_load). Must be writable by the proxy
   # user; retention is handled by scripts/cleanup-slot-cache.sh.
   #
-  # With multiple local backends (LP-0MRPILSMW004T4H8) each server stores
-  # its slot snapshots in its own subdirectory derived from its endpoint:
-  #   {session_slot_save_path}/{host}-{port}/slot_<session_id>.bin
-  # so slot state from one server never collides with another. Single-server
-  # setups (no per-provider ``endpoint``) keep using the directory directly.
+  # With multiple local backends (LP-0MRPILSMW004T4H8) every server still
+  # writes to this root: llama-server accepts only a bare filename under its
+  # own ``--slot-save-path`` (``fs_validate_filename`` rejects subdirectories),
+  # so a proxy-side ``{host}-{port}/`` subdirectory separates the snapshot
+  # from its ``.ratio.json`` sidecar and defeats both seeding and restore
+  # (LP-0MVVI8TEU006KTOZ). Keep llama-server's ``--slot-save-path`` pointed at
+  # this directory; legacy ``{host}-{port}/`` files are still read/retired.
   session_slot_save_path: /home/rgardler/projects/llm/slot-cache
   # Number of parallel sessions (GPU contexts) for local dispatch.
   # Controls how many concurrent Pi agent sessions can hold dispatch leases

@@ -1,0 +1,61 @@
+{
+  "window": {
+    "start": "2026-10-29T12:58:32+00:00",
+    "end": "2026-10-30T12:58:32+00:00"
+  },
+  "seed_outcomes": {
+    "missing_sidecar": 605,
+    "missing_snapshot": 12
+  },
+  "successful_saves": {
+    "eviction": 42,
+    "router": 34
+  },
+  "persistence_skips": {
+    "eviction_save_failed": 64,
+    "slot_busy": 260
+  },
+  "missing_sidecar_seeds": 605,
+  "missing_sidecar_attribution": {
+    "eviction": 414,
+    "no-save-in-window": 10,
+    "router": 181
+  },
+  "distinct_missing_sidecar_sessions": 9,
+  "sessions": {
+    "audit-AH": {
+      "eviction": 86,
+      "router": 118
+    },
+    "audit-LP": {
+      "eviction": 153
+    },
+    "herdr-17": {
+      "eviction": 63,
+      "no-save-in-window": 1,
+      "router": 15
+    },
+    "audit-SA": {
+      "eviction": 54,
+      "router": 20
+    },
+    "audit-RI": {
+      "eviction": 33,
+      "router": 21
+    },
+    "01a187fc": {
+      "eviction": 15,
+      "no-save-in-window": 9
+    },
+    "01a187be": {
+      "eviction": 8
+    },
+    "01a18ac0": {
+      "eviction": 1,
+      "router": 7
+    },
+    "audit-MS": {
+      "eviction": 1
+    }
+  }
+}
