@@ -44,16 +44,20 @@
     },
     {
       "type": "graph",
-      "title": "GPU VRAM Usage (bytes)",
+      "title": "GPU memory: GTT (models) and VRAM carve-out (bytes)",
       "id": 4,
       "targets": [
         {
-          "expr": "rocm_vram_total_bytes",
-          "legendFormat": "total"
+          "expr": "gpu_gtt_used_bytes",
+          "legendFormat": "gpu_gtt_used_bytes — GTT used (models live here)"
         },
         {
-          "expr": "rocm_vram_used_bytes",
-          "legendFormat": "used"
+          "expr": "gpu_vram_used_bytes",
+          "legendFormat": "gpu_vram_used_bytes — VRAM used (1 GiB BIOS carve-out)"
+        },
+        {
+          "expr": "gpu_vram_total_bytes",
+          "legendFormat": "gpu_vram_total_bytes — VRAM total (1 GiB BIOS carve-out)"
         }
       ],
       "datasource": "Prometheus",
@@ -62,5 +66,5 @@
   ],
   "schemaVersion": 16,
   "title": "LLama Server Memory",
-  "version": 1
+  "version": 2
 }

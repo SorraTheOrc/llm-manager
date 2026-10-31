@@ -11,6 +11,8 @@ Validates that:
 - The documented units match the deployed stack: tailnet-only Prometheus binds,
   loopback-only exporters, a working sampler script, and install steps that
   work on a clean host (LP-0MVO8DORX004P05G).
+- The Grafana dashboard's GPU memory panel selects only series the documented
+  sampler actually publishes (LP-0MVOHRLPB0086Q5T).
 """
 
 import os
@@ -54,6 +56,9 @@ REQUIRED_RULE_FILES = {
 # Series that must never appear in a rule expression:
 # - rocm_vram_*: the AMD rocm-exporter publishes no release artifacts, so no
 #   exporter ever served these series and rules using them could never fire.
+#   The dashboard is covered separately by TestGrafanaDashboardVramPanel, which
+#   rejects any series the documented sampler does not publish
+#   (LP-0MVOHRLPB0086Q5T).
 # - gpu_busy_percent: saturates at ~20 W on this Strix Halo APU (it reads
 #   ~100% for any draw above ~20 W, so idle-with-context stretches report as
 #   busy), i.e. it is not a utilisation signal (LP-0MS9GA6QL007XTBP, quantified
@@ -66,12 +71,6 @@ REQUIRED_RULE_FILES = {
 FORBIDDEN_RULE_SERIES = [
     "rocm_vram_",
     "gpu_busy_percent",
-]
-
-EXPECTED_ROCM_EXPORTER_METRICS = [
-    "rocm_vram_total_bytes",
-    "rocm_vram_used_bytes",
-    "rocm_vram_free_bytes",
 ]
 
 
@@ -253,6 +252,102 @@ def _sampler_script() -> str:
     raise AssertionError(
         f"{path} does not document the sampler script in a fenced bash block"
     )
+
+
+def _fake_gpu_sysfs(tmp_path: Path, **attributes: str) -> Path:
+    """Create a fixture sysfs tree holding the amdgpu attributes given."""
+    device = tmp_path / "sys" / "class" / "drm" / "card0" / "device"
+    device.mkdir(parents=True)
+    for name, value in attributes.items():
+        (device / name).write_text(f"{value}\n")
+    return device
+
+
+def _run_documented_sampler(tmp_path: Path, device: Path) -> Path:
+    """Run the documented sampler against *device* and return its textfile dir."""
+    sampler = tmp_path / "gpu-metrics-textfile.sh"
+    sampler.write_text(_sampler_script())
+    out_dir = tmp_path / "textfile"
+    out_dir.mkdir()
+    result = subprocess.run(
+        ["bash", str(sampler), str(out_dir)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GPU_SYSFS": str(device)},
+    )
+    assert result.returncode == 0, f"sampler failed: {result.stderr}"
+    return out_dir
+
+
+def _sampler_emitted_series(out_dir: Path) -> dict[str, str]:
+    """Return the {series: value} pairs the sampler wrote to gpu.prom."""
+    text = (out_dir / "gpu.prom").read_text()
+    return dict(
+        re.findall(r'^(gpu_\w+)\{gpu="card0"\} (\S+)$', text, re.MULTILINE)
+    )
+
+
+#: Fixture readings for a fully readable amdgpu device: every documented series
+#: is published, so the returned set is the sampler's whole output surface.
+FULL_GPU_SYSFS = {
+    "gpu_busy_percent": "100",
+    "mem_info_vram_used": "309604352",
+    "mem_info_vram_total": "1073741824",
+    "mem_info_gtt_used": "36573331456",
+}
+
+
+def _published_gpu_series(tmp_path: Path) -> set[str]:
+    """Run the documented sampler and return every series name it publishes.
+
+    The sampler in `docs/systemd/gpu-metrics.service` is the single source of
+    truth for which `gpu_*` series this host actually serves: executing it
+    against a fully readable fixture yields exactly the set node_exporter's
+    textfile collector exposes. Anything a panel queries outside this set can
+    only ever render "No data".
+    """
+    device = _fake_gpu_sysfs(tmp_path, **FULL_GPU_SYSFS)
+    published = set(_sampler_emitted_series(_run_documented_sampler(tmp_path, device)))
+    assert published, "the documented sampler published no series"
+    return published
+
+
+#: PromQL keywords/aggregation modifiers that are not series selectors.
+PROMQL_NON_SERIES_WORDS = frozenset(
+    {
+        "and",
+        "bool",
+        "by",
+        "group_left",
+        "group_right",
+        "ignoring",
+        "inf",
+        "nan",
+        "offset",
+        "on",
+        "or",
+        "unless",
+        "without",
+    }
+)
+
+
+def _selected_series(expr: str) -> set[str]:
+    """Return the series selectors of a PromQL expression.
+
+    Label values and label matchers are stripped first, so `status="5xx"` or
+    `endpoint="/v1/chat/completions"` cannot be mistaken for a series; names
+    followed by `(` are function calls (`rate(...)`), not selectors.
+    """
+    cleaned = re.sub(r'"[^"]*"', '""', expr)
+    cleaned = re.sub(r"\{[^{}]*\}", "{}", cleaned)
+    return {
+        name
+        for name in re.findall(
+            r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()", cleaned
+        )
+        if name not in PROMQL_NON_SERIES_WORDS
+    }
 
 
 def _exec_start_args(unit_text: str) -> list[str]:
@@ -881,43 +976,132 @@ class TestRocmExporterRouteUnavailable:
         )
 
 
+DASHBOARD_PATH = MONITORING_DIR / "grafana_llama_memory_dashboard.json"
+PROVISIONED_DASHBOARD_PATH = (
+    MONITORING_DIR / "grafana" / "dashboards" / "grafana_llama_memory_dashboard.json"
+)
+
+
 class TestGrafanaDashboardVramPanel:
-    """Validation that the Grafana dashboard has VRAM panels."""
+    """The GPU memory panel must chart memory pools this host really publishes.
+
+    LP-0MVOHRLPB0086Q5T: the panel used to query `rocm_vram_*`, series no process
+    on this host serves (`amd/rocm-exporter` publishes no release artefacts), so
+    it could only ever render "No data". The published set is now derived by
+    running the documented sampler, not from a hand-maintained list, so a panel
+    selecting an unpublished series fails here instead of shipping.
+    """
 
     def _load_dashboard(self) -> dict:
-        path = MONITORING_DIR / "grafana_llama_memory_dashboard.json"
         import json
-        with open(path) as f:
+
+        with open(DASHBOARD_PATH) as f:
             return json.load(f)
 
-    def test_dashboard_has_vram_panel(self):
-        """AC 3: Grafana dashboard includes a VRAM usage panel."""
-        dashboard = self._load_dashboard()
+    def _gpu_memory_panel(self, dashboard: dict) -> dict:
         panels = dashboard.get("panels", [])
-        panel_titles = [p.get("title", "") for p in panels]
-        vram_panels = [t for t in panel_titles if "vram" in t.lower()]
-        assert len(vram_panels) >= 1, (
-            f"Expected at least one VRAM panel in dashboard, found titles: {panel_titles}"
+        for panel in panels:
+            if "vram" in panel.get("title", "").lower():
+                return panel
+        pytest.fail(
+            f"No GPU memory (VRAM) panel found in dashboard, "
+            f"found titles: {[p.get('title', '') for p in panels]}"
         )
 
-    def test_vram_panel_has_rocm_expr(self):
-        """AC 3: VRAM panel uses rocm-exporter metrics in its query."""
+    def test_dashboard_has_vram_panel(self):
+        """AC 2: the GPU memory panel survives, and its title still names VRAM."""
+        panel = self._gpu_memory_panel(self._load_dashboard())
+        assert "vram" in panel["title"].lower()
+
+    def test_panel_identity_is_preserved(self):
+        """Retyping the panel would orphan it in a deployed Grafana instance."""
         dashboard = self._load_dashboard()
-        panels = dashboard.get("panels", [])
-        for p in panels:
-            if "vram" in p.get("title", "").lower():
-                targets = p.get("targets", [])
-                all_exprs = [t.get("expr", "") for t in targets]
-                combined = " ".join(all_exprs)
-                has_rocm_metric = any(
-                    m in combined for m in EXPECTED_ROCM_EXPORTER_METRICS
+        panel = self._gpu_memory_panel(dashboard)
+        assert panel["id"] == 4
+        assert panel["type"] == "graph"
+        assert panel["datasource"] == "Prometheus"
+        assert panel["gridPos"] == {"h": 8, "w": 24, "x": 0, "y": 18}
+        assert dashboard["title"] == "LLama Server Memory"
+        assert dashboard["schemaVersion"] == 16
+
+    def test_title_names_both_pools(self):
+        """AC 2: GTT is where models live; VRAM is the BIOS carve-out."""
+        title = self._gpu_memory_panel(self._load_dashboard())["title"].lower()
+        assert "gtt" in title, "the title must name the GTT pool models map into"
+        assert "vram" in title, "the title must name the VRAM carve-out"
+        assert "carve-out" in title, (
+            "the title must label VRAM as a carve-out, not as the model pool"
+        )
+        assert "model" in title, (
+            "the title must say which pool the models occupy, or a reader will "
+            "assume the 1 GiB carve-out holds them"
+        )
+
+    def test_every_target_legend_names_its_series_and_vram_is_the_carve_out(self):
+        """AC 2: legends identify the series and mark the 1 GiB carve-out."""
+        panel = self._gpu_memory_panel(self._load_dashboard())
+        targets = panel.get("targets", [])
+        assert targets, "the GPU memory panel has no targets"
+        for target in targets:
+            selectors = _selected_series(target.get("expr", ""))
+            assert len(selectors) == 1, (
+                f"each target should select exactly one series, {target.get('expr')!r} "
+                f"selects {sorted(selectors)}"
+            )
+            series = next(iter(selectors))
+            legend = target.get("legendFormat", "")
+            assert series in legend, (
+                f"legendFormat {legend!r} does not name its series {series!r}; a "
+                f"reader cannot tell which exporter series a line comes from"
+            )
+            if "vram" in series:
+                assert "carve-out" in legend.lower(), (
+                    f"VRAM legend {legend!r} must mark the ~1 GiB BIOS carve-out"
                 )
-                assert has_rocm_metric, (
-                    f"VRAM panel '{p['title']}' should reference a rocm-exporter metric. "
-                    f"Exprs: {all_exprs}"
-                )
-                return
-        pytest.fail("No VRAM panel found in dashboard")
+
+    def test_every_target_selects_a_series_the_sampler_publishes(self, tmp_path):
+        """AC 1/AC 3: every expression resolves to a series this host serves.
+
+        The published set comes from executing the documented sampler against a
+        fully readable fixture sysfs, so a `gpu_*` name the sampler does not
+        emit fails just as loudly as a dead `rocm_*` one.
+        """
+        published = _published_gpu_series(tmp_path)
+        panel = self._gpu_memory_panel(self._load_dashboard())
+        for target in panel.get("targets", []):
+            expr = target.get("expr", "")
+            selectors = _selected_series(expr)
+            assert selectors, f"target selects no series: {expr!r}"
+            unpublished = sorted(selectors - published)
+            assert not unpublished, (
+                f"panel target {expr!r} selects series no exporter publishes: "
+                f"{unpublished} (the sampler publishes {sorted(published)})"
+            )
+
+    @pytest.mark.parametrize(
+        "path", [DASHBOARD_PATH, PROVISIONED_DASHBOARD_PATH], ids=["review", "provisioned"]
+    )
+    def test_dashboards_no_longer_query_rocm_series(self, path: Path):
+        """AC 1: the dead rocm-exporter route must not come back, in either copy."""
+        assert "rocm_" not in path.read_text(), (
+            f"{path.name} still queries rocm_* series, which nothing publishes; "
+            f"grep -c 'rocm_' must report 0 for both dashboard copies"
+        )
+
+    def test_dashboard_copies_are_byte_identical(self):
+        """The provisioning copy must not drift from the reviewed copy."""
+        assert PROVISIONED_DASHBOARD_PATH.read_bytes() == DASHBOARD_PATH.read_bytes(), (
+            f"{DASHBOARD_PATH} and {PROVISIONED_DASHBOARD_PATH} have diverged; "
+            f"edit both together"
+        )
+
+    def test_dashboard_version_was_bumped(self):
+        """AC 2: Grafana only picks up a changed dashboard when `version` moves."""
+        version = self._load_dashboard().get("version")
+        assert isinstance(version, int) and version >= 2, (
+            f"the dashboard version must be bumped past its original 1 after the "
+            f"GPU panel rewrite, got {version!r}"
+        )
 
 
 class TestMonitoringDocs:
@@ -1330,29 +1514,13 @@ class TestGpuMetricsSamplerAndUnit:
         return path
 
     def _fake_sysfs(self, tmp_path: Path, **attributes: str) -> Path:
-        device = tmp_path / "sys" / "class" / "drm" / "card0" / "device"
-        device.mkdir(parents=True)
-        for name, value in attributes.items():
-            (device / name).write_text(f"{value}\n")
-        return device
+        return _fake_gpu_sysfs(tmp_path, **attributes)
 
     def _run_sampler(self, tmp_path: Path, device: Path) -> Path:
-        out_dir = tmp_path / "textfile"
-        out_dir.mkdir()
-        result = subprocess.run(
-            ["bash", str(self._sampler_path(tmp_path)), str(out_dir)],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "GPU_SYSFS": str(device)},
-        )
-        assert result.returncode == 0, f"sampler failed: {result.stderr}"
-        return out_dir
+        return _run_documented_sampler(tmp_path, device)
 
     def _emitted_series(self, out_dir: Path) -> dict[str, str]:
-        text = (out_dir / "gpu.prom").read_text()
-        return dict(
-            re.findall(r"^(gpu_\w+)\{gpu=\"card0\"\} (\S+)$", text, re.MULTILINE)
-        )
+        return _sampler_emitted_series(out_dir)
 
     def test_unit_runs_the_documented_sampler_every_ten_seconds(self):
         """AC 2: the 10 s cadence is in the unit, not just in prose."""

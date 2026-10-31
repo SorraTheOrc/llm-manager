@@ -335,11 +335,17 @@ cp monitoring/grafana/dashboards/dashboards.yaml   ~/bin/grafana/conf/provisioni
 cp monitoring/grafana_llama_memory_dashboard.json  ~/bin/grafana/conf/provisioning/dashboards/
 ```
 
-Known gap: the "GPU VRAM Usage" panel in
-`monitoring/grafana_llama_memory_dashboard.json` still queries `rocm_vram_*`,
-which nothing publishes. It needs repointing at `gpu_gtt_used_bytes` /
-`gpu_vram_used_bytes` before Grafana is deployed. Prometheus itself is
-unaffected.
+The dashboard's GPU memory panel — "GPU memory: GTT (models) and VRAM
+carve-out (bytes)" — charts three of the series § 3 lists as published:
+`gpu_gtt_used_bytes` (the pool models map into) alongside
+`gpu_vram_used_bytes` and `gpu_vram_total_bytes` (the ~1 GiB BIOS carve-out,
+shown for context rather than as the model pool). Every expression is guarded
+by `TestGrafanaDashboardVramPanel`, which derives the published set by running
+the documented sampler, so a panel selecting an unpublished series fails the
+suite instead of deploying as "No data". The earlier `rocm_vram_*` query is
+gone: the AMD rocm-exporter route it assumed has no release artefacts (see
+[rocm-exporter.service](../docs/systemd/rocm-exporter.service)) and Prometheus
+has no such series to serve. Prometheus itself is unaffected.
 
 ## 5. Verification (fresh-host checklist)
 

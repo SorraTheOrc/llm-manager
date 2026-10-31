@@ -3015,7 +3015,7 @@ and systemd service setup is documented in [monitoring/README.md](../monitoring/
 - **Llama memory**: Warning at 75% of 90GB; critical at 90GB — `monitoring/llama_memory_alerts.yaml`.
 - **Proxy 5xx errors**: Critical alert when `rate(proxy_http_errors_total{endpoint="/v1/chat/completions",status="5xx"}[5m]) > 5` for 5 minutes — `monitoring/proxy_5xx_alerts.yaml`.
 
-A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json` with panels for llama-server RSS, models loaded, and proxy 5xx error rate.
+A minimal Grafana dashboard JSON is included at `monitoring/grafana_llama_memory_dashboard.json` with panels for llama-server RSS, models loaded, proxy 5xx error rate, and GPU memory (GTT — where models live — plus the ~1 GiB VRAM carve-out, both from `gpu-metrics.service` via node_exporter's textfile collector).
 
 ### Deploying Prometheus and Grafana
 
