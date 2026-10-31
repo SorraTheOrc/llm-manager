@@ -723,7 +723,23 @@ async def _call_with_backend_retries(call_factory, path: str, stream: bool = Fal
 
 
 async def _probe_backend_reachable(llama_port: int) -> bool:
-    """Actively probe backend reachability so /health reflects real connectivity."""
+    """Actively probe backend reachability so /health reflects real connectivity.
+
+    In router mode the probe paths are ``/models`` and ``/health`` only: the
+    router serialises ``GET /slots?model=...`` behind the busy child's
+    generation loop and answers it with HTTP 500 when a giant prefill cancels
+    the proxied poll (LP-0MVP7525P008RXMF). Because ``/health`` calls this
+    probe on every request, a ``/slots`` probe path logged a router-responder
+    ``/slots`` 500 per health check — 1,171 of them in the measured 48 h
+    window — and could hold ``/health`` for up to the probe timeout while the
+    query queued behind the child (LP-0MVVCXUDZ007XID0).
+
+    ``/models`` and ``/health`` answer reachability from the router without
+    touching the child, and the removed ``/slots`` path could not change the
+    verdict anyway: a 5xx fell through to the next path, while any 2xx-4xx
+    returned True. The probe therefore stays cheap — no child-port log
+    discovery, no router-proxied slot query.
+    """
     srv = _srv()
     if llama_port <= 0:
        return False
@@ -731,9 +747,8 @@ async def _probe_backend_reachable(llama_port: int) -> bool:
     router_mode = bool(server_cfg.get("llama_router_mode", False))
     timeout_seconds = float(server_cfg.get("llama_backend_probe_timeout_seconds", 2.0) or 2.0)
     probe_paths: list[str] = []
-    if router_mode and srv.current_model:
-       probe_paths.append(f"/slots?model={srv.current_model}")
     if router_mode:
+       # No ``/slots`` here — see the docstring (LP-0MVVCXUDZ007XID0 AC1).
        probe_paths.extend(["/models", "/health"])
     else:
        probe_paths.append("/health")

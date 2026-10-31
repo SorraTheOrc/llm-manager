@@ -158,7 +158,9 @@ discovery silently failed, plus two call sites never consulted it:
 - `/metrics`: `llama_slots_child_port_fallbacks_total` (by reason).
 - `llama-server.log`: post-restart `/slots` polls should be answered by the
   model child (`[pid]`-prefixed lines) rather than the router; router :500
-  counts toward 0.
+  counts toward 0. Router-responder `/slots` traffic is proxy-originated only
+  from slot polling and (before LP-0MVVCXUDZ007XID0) the `/health`
+  reachability probe; the probe no longer queries `/slots` (see below).
 
 ### Live verification (pre-deploy, 2026-10-26 production log)
 
@@ -254,13 +256,19 @@ Daily router-500 trend (same measurement, one file per UTC day):
 ### Residual router 500s: the `/health` probe, not slot polling
 
 The remaining 1,171 router 500s are explained by the proxy's **`/health`
-reachability probe**, which targets the router by design:
+reachability probe**, which used to target the router by design:
 
 - `proxy/proxy/handlers.py:1170` — `health_check()` calls
   `srv._probe_backend_reachable(llama_port)` on **every** `/health` request.
-- `proxy/proxy/lifecycle.py:725` — `_probe_backend_reachable()` probes
+- `proxy/proxy/lifecycle.py:725` — `_probe_backend_reachable()` probed
   `"/slots?model=<current_model>"` first, then `/models`, `/health`, all on
   `http://localhost:<router_port>`.
+
+**Fixed (LP-0MVVCXUDZ007XID0):** the router-mode probe now issues `/models`
+and `/health` only. Both answer reachability without touching the busy child,
+and the removed `/slots` path could not change the verdict anyway — a 5xx fell
+through to the next path while any 2xx-4xx already returned `True`. The probe
+stays cheap: no child-port log discovery, no router-proxied slot query.
 
 Because that probe never calls `_resolve_local_slots_target()`, it increments
 neither the fallback counter nor the `slots_child_port_unavailable` warning —
@@ -287,8 +295,20 @@ indeterminate. Filed as `LP-0MVVCXUDZ007XID0`
 
 ### Target signal going forward
 
-`router:500 == 0` remains the regression target, but it is only meaningful
-once the `/health` probe stops polling the router (LP-0MVVCXUDZ007XID0). Until
-then, treat router-responder `/slots` 500s as expected noise and use the
-child-vs-router 200 split plus `llama_slots_child_port_fallbacks_total` as the
-authoritative direct-polling signal.
+`router:500 == 0` is the regression target. The residual non-zero floor in
+this window came from the `/health` reachability probe, which polled
+`GET /slots?model=<current>` on the router once per `/health` request; that
+probe path is removed (LP-0MVVCXUDZ007XID0 — router mode now probes
+`/models` + `/health` only, so `/health` no longer touches the router's
+`/slots` and no longer queues behind a busy child).
+
+Consequences when reading these figures:
+
+- Counts measured **before** the LP-0MVVCXUDZ007XID0 fix (i.e. this window)
+  carry the probe's 500s; they are expected noise, not a polling regression.
+- Counts measured **after** the fix ships should reach 0; if they do not, the
+  500s are a genuine polling-path regression and
+  `llama_slots_child_port_fallbacks_total` (plus the child-vs-router 200
+  split) tells you which path regressed.
+- The post-fix 24 h confirmation window is AC3 of LP-0MVVCXUDZ007XID0, using
+the recipe in this document.
