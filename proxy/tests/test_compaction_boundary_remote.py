@@ -95,8 +95,11 @@ land without flipping the marker off with the behaviour. LP-0MVTDU6Y1004ZCGX
 has removed the decision/config markers (see ``TestBoundaryDecision``,
 ``TestBoundaryConfig``, plus this session's ``TestLocalProvenance``,
 ``TestBoundaryConfigValidation`` and ``TestLocalCompletionProvenanceWiring``
-below); LP-0MVTDU91C003Q9YZ removes the slot-pin and release-ordering markers.
-A red row afterwards is a real failure.
+below); LP-0MVTDU91C003Q9YZ removed the slot-pin and release-ordering markers
+(``TestSlotPinnedSummariser``, ``TestSlotReleaseOrdering``) when
+``build_slot_pinned_summarizer`` and ``summarise_on_session_slot`` landed, so
+the only remaining markers belong to the not-yet-wired dispatch hook. A red
+row afterwards is a real failure.
 
 The one config assertion that already holds (``compaction_trigger_ratio`` stays
 ``0`` — the boundary knob never re-enables assembly-time compaction) is
@@ -739,13 +742,6 @@ class TestShippedBoundaryConfig:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "TDD-red: proxy.compaction_summarizer.build_slot_pinned_summarizer "
-        "does not exist yet (LP-0MVTDU91C003Q9YZ)"
-    ),
-)
 class TestSlotPinnedSummariser:
     """`build_slot_pinned_summarizer` pins the call to the session's own slot."""
 
@@ -806,19 +802,56 @@ class TestSlotPinnedSummariser:
             mock_client_cls.assert_not_called()
             assert not result
 
+    def test_no_slot_reports_the_boundary_no_slot_reason_token(self):
+        """The inert summariser carries the machine-readable skip reason."""
+        from proxy.compaction import EmptySummary
+
+        builder = _require(
+            "proxy.compaction_summarizer", "build_slot_pinned_summarizer"
+        )
+
+        with patch("proxy.compaction_summarizer.httpx.Client"):
+            summariser = builder(_boundary_config(), slot_id=None, llama_port=8080)
+            result = summariser([{"role": "user", "content": "u"}], None)
+
+        assert isinstance(result, EmptySummary)
+        assert result.kind == "boundary_no_slot"
+        assert result.attempts == 0
+
+    def test_legacy_top_level_local_model_is_used(self):
+        """A legacy ``type: local`` model entry names the pinned call's model."""
+        builder = _require(
+            "proxy.compaction_summarizer", "build_slot_pinned_summarizer"
+        )
+        cfg = {
+            "server": {
+                "summarizer_model": {
+                    "type": "local",
+                    "llama_model": _DEDICATED_SUMMARISER_MODEL,
+                }
+            },
+            "models": {"legacy-local": {"type": "local", "llama_model": "Qwen3-legacy"}},
+        }
+
+        with patch("proxy.compaction_summarizer.httpx.Client") as mock_client_cls:
+            client = MagicMock()
+            mock_client_cls.return_value.__enter__.return_value = client
+            client.post.return_value = _ok_response("summary")
+
+            builder(cfg, slot_id=1, llama_port=8080)(
+                [{"role": "user", "content": "u"}], None
+            )
+
+            body = client.post.call_args.kwargs["json"]
+            assert body["model"] == "Qwen3-legacy"
+            assert body["id_slot"] == 1
+
 
 # ---------------------------------------------------------------------------
 # AC3 (ordering half) — release precedes the remote stream start
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "TDD-red: proxy.router_helpers.summarise_on_session_slot does not "
-        "exist yet (LP-0MVTDU91C003Q9YZ)"
-    ),
-)
 class TestSlotReleaseOrdering:
     """`summarise_on_session_slot` releases the session's lease before returning."""
 
@@ -891,6 +924,7 @@ class TestSlotReleaseOrdering:
 
         def builder(slot_id):
             def summarise(messages):
+                slot_env.events.append(("summarise", slot_id))
                 raise RuntimeError("summariser blew up")
 
             return summarise

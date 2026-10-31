@@ -350,10 +350,55 @@ def _load_prompt_constants() -> tuple[str, str, str]:
     return _SUMMARIZER_SYSTEM_PROMPT, _SUMMARIZATION_PROMPT, _UPDATE_SUMMARIZATION_PROMPT
 
 
+def _session_local_model_name(config: dict | None) -> str | None:
+    """Return the main local model's llama-server model name, if declared.
+
+    Scans ``models`` for the first ``type: local`` provider (or a legacy
+    top-level ``type: local`` model entry) and returns its ``llama_model``.
+    Falls back to the local provider's model alias when the entry names no
+    ``llama_model``.
+
+    This is the model that owns the session's slot: slot ids are allocated per
+    llama-server instance, so a request pinned to slot *N* of the main local
+    server must also name that server's model. ``server.summarizer_model``
+    (the dedicated Qwen2.5-7B summariser backend) is deliberately never
+    consulted here — it is a different llama-server with its own slot space
+    (LP-0MVTDU91C003Q9YZ AC5).
+    """
+    if not isinstance(config, dict):
+        return None
+    models = config.get("models")
+    if not isinstance(models, dict):
+        return None
+    alias_fallback: str | None = None
+    for alias, model_cfg in models.items():
+        if not isinstance(model_cfg, dict):
+            continue
+        if model_cfg.get("type") == "local":
+            llama_model = model_cfg.get("llama_model")
+            if isinstance(llama_model, str) and llama_model:
+                return llama_model
+        providers = model_cfg.get("providers")
+        if not isinstance(providers, list):
+            continue
+        for provider in providers:
+            if not isinstance(provider, dict) or provider.get("type") != "local":
+                continue
+            llama_model = provider.get("llama_model")
+            if isinstance(llama_model, str) and llama_model:
+                return llama_model
+            if alias_fallback is None and isinstance(alias, str) and alias:
+                alias_fallback = alias
+    return alias_fallback
+
+
 def build_local_summarizer(
     config: dict | None,
     llama_port: int = 8080,
     timeout_seconds: float | None = None,
+    *,
+    id_slot: int | None = None,
+    llama_model: str | None = None,
 ):
     """Build a production Summarizer backed by the local llama-server.
 
@@ -377,6 +422,15 @@ def build_local_summarizer(
             (default 600 s — see ``_DEFAULT_SUMMARIZER_TIMEOUT_SECONDS``)
             so the summarizer can wait for the single local slot to free up
             while a long generating request holds it (LP-0MU1RXEY10075TUU).
+        id_slot: Optional llama-server slot id pinned on every request via the
+            ``id_slot`` body field. ``None`` (default) lets llama-server pick
+            a slot — the pre-existing behaviour. Used by
+            :func:`build_slot_pinned_summarizer` to reuse the slot a session
+            already owns (LP-0MVTDU91C003Q9YZ).
+        llama_model: Optional model name override for the request body. Used
+            by :func:`build_slot_pinned_summarizer` to name the main local
+            model (which owns the pinned slot) instead of
+            ``server.summarizer_model.llama_model``.
 
     Returns:
         A ``Summarizer`` callable.
@@ -384,7 +438,7 @@ def build_local_summarizer(
     from proxy.provider import compaction_config
 
     cfg = compaction_config(config or {})
-    model_name = cfg.get("summarizer_model_name") or "Qwen2.5-7B"
+    model_name = llama_model or cfg.get("summarizer_model_name") or "Qwen2.5-7B"
     max_tokens = int(cfg.get("summarizer_max_tokens") or 512)
     disable_thinking = bool(cfg.get("summarizer_disable_thinking", True))
     _system_default, _format_template, _update_template = _load_prompt_constants()
@@ -429,6 +483,8 @@ def build_local_summarizer(
         }
         if disable_thinking:
             body["chat_template_kwargs"] = {"enable_thinking": False}
+        if id_slot is not None:
+            body["id_slot"] = int(id_slot)
         url = f"http://localhost:{int(llama_port)}/v1/chat/completions"
         timeout = httpx.Timeout(float(timeout_seconds))
         attempts = retries + 1  # initial attempt + configured retries
@@ -540,6 +596,100 @@ def build_local_summarizer(
             return EmptySummary(type(exc).__name__, attempts)
 
     return _summarizer
+
+
+# ---------------------------------------------------------------------------
+# Slot-pinned summariser for local→remote boundary compaction
+# (LP-0MVTDU91C003Q9YZ, parent LP-0MVRBQBDF0037OZ5)
+#
+# At the local→remote boundary the session is leaving the local model, so the
+# slot it still owns is disposable: summarising its oldest turns on that very
+# slot costs no extra capacity and never borrows another session's warm slot.
+# Two consequences shape this builder:
+#
+#   * ``id_slot`` is per llama-server instance, so the request must name the
+#     **main local model** (the instance that owns the slot), never
+#     ``server.summarizer_model.llama_model`` — the dedicated Qwen2.5-7B
+#     summariser backend has its own, unrelated slot space.
+#   * Prefilling the summariser prompt overwrites the pinned slot's KV cache.
+#     That is acceptable *only* because the session is leaving local; the
+#     dispatcher releases the lease immediately afterwards, so the destroyed
+#     KV is never reused by this session.
+#
+# Everything else (prompt assembly, transcript serialisation, retries, the
+# ``EmptySummary`` fail-open sentinel) is inherited from
+# :func:`build_local_summarizer` rather than reimplemented.
+# ---------------------------------------------------------------------------
+
+
+def build_slot_pinned_summarizer(
+    config: dict | None,
+    slot_id: int | None,
+    llama_port: int = 8080,
+    timeout_seconds: float | None = None,
+):
+    """Build a Summarizer pinned to the session's own local llama-server slot.
+
+    The returned callable matches ``proxy.compaction.Summarizer`` and posts to
+    the **local** chat-completions endpoint with ``id_slot == slot_id``, using
+    the session's own local model name (see
+    :func:`_session_local_model_name`). Prompt assembly, retry policy and the
+    fail-open :class:`proxy.compaction.EmptySummary` sentinel are reused from
+    :func:`build_local_summarizer` unchanged.
+
+    KV caveat: prefilling the summarisation prompt overwrites the KV cached in
+    the pinned slot. That is acceptable here because boundary compaction runs
+    only when the session is leaving the local model, and the caller releases
+    the session's local dispatch lease immediately afterwards — so the
+    overwritten KV is never consumed by that session again.
+
+    Args:
+        config: Proxy config dict. Used for the timeout/retry/sizing knobs and
+            to resolve the main local model name.
+        slot_id: The slot assigned to the session (from the read-only
+            ``proxy.session._assigned_slot_for_session`` lookup). ``None``
+            means the session has no assigned slot: the returned summariser is
+            inert — it never opens a connection and reports
+            ``boundary_no_slot`` via an ``EmptySummary`` sentinel, so the
+            caller skips compaction and logs the machine-readable reason.
+        llama_port: Local llama-server port (default 8080).
+        timeout_seconds: HTTP timeout; ``None`` resolves
+            ``server.compaction_summarizer_timeout`` (no new knob).
+
+    Returns:
+        A ``Summarizer`` callable.
+    """
+
+    def _inert(reason: str, attempts: int = 0):
+        def _summarizer(
+            middle_messages: list[dict[str, Any]],
+            previous_summary: str | None = None,
+        ) -> str:
+            return EmptySummary(reason, attempts)
+
+        return _summarizer
+
+    if slot_id is None:
+        return _inert("boundary_no_slot")
+
+    session_model_name = _session_local_model_name(config)
+    if not session_model_name:
+        # No local model declared means no main local server to pin against;
+        # fail open rather than guessing the summariser backend's model.
+        logger.warning(
+            "slot-pinned summarizer: no local model in config; skipping "
+            "boundary summarisation (slot=%s)",
+            slot_id,
+        )
+        return _inert("boundary_no_local_model")
+
+    return build_local_summarizer(
+        config,
+        llama_port=llama_port,
+        timeout_seconds=timeout_seconds,
+        id_slot=int(slot_id),
+        llama_model=session_model_name,
+    )
 
 
 # ---------------------------------------------------------------------------

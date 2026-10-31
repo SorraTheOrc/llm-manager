@@ -3833,6 +3833,198 @@ async def _release_local_dispatch(srv, session_id: str, request: Request | None 
     return removed
 
 
+#: Machine-readable reasons reported by :func:`summarise_on_session_slot` and
+#: logged by the local→remote boundary hook (parent LP-0MVRBQBDF0037OZ5 AC4).
+BOUNDARY_REASON_COMPACT = "boundary_compact"
+BOUNDARY_REASON_NO_SLOT = "boundary_no_slot"
+BOUNDARY_REASON_SLOT_UNAVAILABLE = "boundary_slot_unavailable"
+BOUNDARY_REASON_SUMMARIZER_FAILED = "boundary_summarizer_failed"
+
+
+def _log_boundary_event(srv, level: str, message: str, **fields) -> None:
+    """Emit a boundary-compaction line through ``srv.logger`` when present.
+
+    Logging must never break dispatch, so a missing logger or a failing
+    handler is swallowed (the request still proceeds remote untouched).
+    """
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    try:
+        logger = getattr(srv, "logger", None)
+        if logger is None:
+            return
+        getattr(logger, level)(f"{message} {payload}".strip())
+    except Exception:
+        pass
+
+
+async def summarise_on_session_slot(
+    srv,
+    session_id: str,
+    messages: list[dict],
+    *,
+    config: dict | None = None,
+    summarizer_builder=None,
+    endpoint: str | None = None,
+) -> dict:
+    """Summarise *messages* on the local slot already assigned to *session_id*.
+
+    Local→remote boundary helper (LP-0MVTDU91C003Q9YZ, parent AC2/AC3): the
+    session is leaving the local model, so its own slot is disposable — the
+    summary is produced there instead of on another session's warm slot or on
+    a dedicated summariser backend.
+
+    Ordering contract: the session's local dispatch lease is released the
+    instant the summariser returns (success, failure **or** timeout) and
+    therefore **before** the caller's remote stream starts — no local slot
+    stays pinned to a session now served remotely.
+
+    The slot is looked up with the **read-only**
+    ``proxy.session._assigned_slot_for_session``; this helper never assigns a
+    slot (a session without one is skipped, never given another session's).
+
+    Args:
+        srv: Proxy server object (provides ``local_dispatch_records`` and the
+            optional ``logger``).
+        session_id: Session whose slot is reused.
+        messages: Messages to summarise (the turns being compacted away).
+        config: Proxy config dict; defaults to ``srv.config``. Supplies the
+            llama-server port and the summariser knobs — no new timeout knob
+            is introduced (``compaction_summarizer_timeout`` bounds the call).
+        summarizer_builder: Optional ``Callable[[int], Summarizer]`` called
+            exactly once with the resolved slot id. Production defaults to
+            ``build_slot_pinned_summarizer(config, slot_id, llama_port=…)``;
+            tests inject fakes here.
+        endpoint: Optional per-endpoint local llama-server URL, used for both
+            the slot lookup and the lease release.
+
+    Returns:
+        ``{"slot_id", "summary", "reason", "released"}``. ``summary`` is the
+        summary text on success and ``None`` otherwise; ``reason`` is one of
+        ``boundary_compact``, ``boundary_no_slot``,
+        ``boundary_slot_unavailable`` or ``boundary_summarizer_failed``.
+    """
+    cfg = config if isinstance(config, dict) else None
+    if cfg is None:
+        srv_config = getattr(srv, "config", None)
+        cfg = srv_config if isinstance(srv_config, dict) else {}
+    server_cfg = cfg.get("server") if isinstance(cfg.get("server"), dict) else {}
+    try:
+        llama_port = int(server_cfg.get("llama_server_port", 8080))
+    except (TypeError, ValueError):
+        llama_port = 8080
+    if endpoint:
+        try:
+            _, endpoint_port = _parse_endpoint_url(endpoint)
+            llama_port = endpoint_port
+        except Exception:
+            pass
+
+    # Read-only slot lookup — never ``_slot_id_for_session`` (which assigns).
+    slot_id = None
+    try:
+        from proxy.session import _assigned_slot_for_session
+
+        if endpoint:
+            slot_id = _assigned_slot_for_session(session_id, endpoint=endpoint)
+        else:
+            slot_id = _assigned_slot_for_session(session_id)
+    except Exception:
+        slot_id = None
+
+    reason = BOUNDARY_REASON_NO_SLOT
+    summary: str | None = None
+    released = False
+    try:
+        if slot_id is None:
+            # No slot of its own: never borrow another session's.
+            _log_boundary_event(
+                srv,
+                "warning",
+                "boundary_compaction_skipped",
+                session=session_id,
+                reason=BOUNDARY_REASON_NO_SLOT,
+            )
+        else:
+            if summarizer_builder is not None:
+                summarizer = summarizer_builder(slot_id)
+            else:
+                from proxy.compaction_summarizer import (
+                    build_slot_pinned_summarizer,
+                )
+
+                summarizer = build_slot_pinned_summarizer(
+                    cfg, slot_id, llama_port=llama_port
+                )
+            try:
+                text = summarizer(messages)
+            except httpx.TransportError:
+                # Connection-level failure: the pinned slot could not be
+                # reached at all.
+                reason = BOUNDARY_REASON_SLOT_UNAVAILABLE
+                _log_boundary_event(
+                    srv,
+                    "warning",
+                    "boundary_compaction_skipped",
+                    session=session_id,
+                    slot=slot_id,
+                    reason=reason,
+                )
+            except Exception as exc:
+                reason = BOUNDARY_REASON_SUMMARIZER_FAILED
+                _log_boundary_event(
+                    srv,
+                    "warning",
+                    "boundary_compaction_skipped",
+                    session=session_id,
+                    slot=slot_id,
+                    reason=reason,
+                    error=type(exc).__name__,
+                )
+            else:
+                text = text if isinstance(text, str) else None
+                if text and text.strip():
+                    summary = text
+                    reason = BOUNDARY_REASON_COMPACT
+                    _log_boundary_event(
+                        srv,
+                        "info",
+                        "boundary_compaction_summarised",
+                        session=session_id,
+                        slot=slot_id,
+                        reason=reason,
+                    )
+                else:
+                    # Blank text and the fail-open ``EmptySummary`` sentinel
+                    # both mean "no usable summary" — never injected.
+                    reason = BOUNDARY_REASON_SUMMARIZER_FAILED
+                    _log_boundary_event(
+                        srv,
+                        "warning",
+                        "boundary_compaction_skipped",
+                        session=session_id,
+                        slot=slot_id,
+                        reason=reason,
+                    )
+    finally:
+        # Immediate release: this runs before the helper returns, so the
+        # caller cannot start the remote stream while the slot is still held —
+        # even when the summariser raised or timed out. It also runs on the
+        # no-slot path so no stale lease survives.
+        try:
+            released = await _release_local_dispatch(
+                srv, session_id, endpoint=endpoint
+            )
+        except Exception:
+            released = False
+
+    return {
+        "slot_id": slot_id,
+        "summary": summary,
+        "reason": reason,
+        "released": released,
+    }
+
+
 async def _release_unserved_dispatch(
     srv,
     session_key: str | None,
