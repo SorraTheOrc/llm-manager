@@ -523,6 +523,33 @@ async def _fetch_slots_payload(
     )
 
 
+def _resolve_slots_model_id(model: str | None) -> str:
+    """Return *model*, or a cached ``/models``-derived id when none was given.
+
+    Guarantees every proxy ``/slots`` request carries ``?model=``
+    (LP-0MVP7HV7Q001AJF8 AC2): the three query helpers append it
+    unconditionally, so a model-less request is unreachable. Resolution is
+    cache-only on this (sync) path —
+    :func:`proxy.router_helpers.resolve_local_model_id` never performs HTTP;
+    the async dispatch path warms the ``/models`` snapshot with
+    ``ensure_router_model_ids``, keeping the hot path round-trip free
+    (LP-0MVU7ZZIA0092AXW).
+    """
+    explicit = str(model).strip() if model is not None else ""
+    if explicit:
+        return explicit
+    try:
+        from proxy.router_helpers import (
+            LAST_RESORT_MODEL_ID,
+            resolve_local_model_id,
+        )
+
+        resolved, _source = resolve_local_model_id(_srv())
+        return resolved or LAST_RESORT_MODEL_ID
+    except Exception:
+        return "Qwen3"
+
+
 async def _query_slots(
     client, llama_port: int, timeout: float = 2.0, model: str | None = None,
     base_url: str | None = None,
@@ -560,10 +587,9 @@ async def _query_slots(
     truthful (LP-0MVKSXR4P001V0CM AC3).
     """
     try:
+        resolved_model = _resolve_slots_model_id(model)
         url = _build_llama_url(llama_port, "/slots", base_url=base_url)
-
-        if model:
-            url = f"{url}?model={model}"
+        url = f"{url}?model={resolved_model}"
         # LP-0MUCEFD5B003TURT: coalesce concurrent /slots polls behind a
         # short TTL so N status pollers produce a bounded number of upstream
         # requests (not N per interval).
@@ -698,10 +724,11 @@ async def _query_slots_detail(
     Returns an empty list on any failure (HTTP error, connection error,
     timeout, or unexpected response shape).
     """
+    resolved_model = _resolve_slots_model_id(model)
+    url = ""
     try:
         url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
-        if model:
-            url = f"{url}?model={model}"
+        url = f"{url}?model={resolved_model}"
         if _client is not None:
             slots_resp = await _client.get(url)
             if slots_resp.status_code == 200:
@@ -737,9 +764,8 @@ async def _query_slots_detail(
             return result
     except Exception as exc:
         _srv().logger.debug(
-            "Slot detail query failed [%s] for %s?model=%s: %s",
-            type(exc).__name__, _build_llama_url(llama_port, "/slots"),
-            model or "(none)", exc,
+            "Slot detail query failed [%s] for %s: %s",
+            type(exc).__name__, url, exc,
         )
     return []
 
@@ -874,8 +900,10 @@ async def _sample_slot_occupancy(srv) -> dict | None:
         pass
 
     url = _build_llama_url(llama_port, "/slots")
-    if model:
-        url = f"{url}?model={model}"
+    # Never model-less: the router answers a bare /slots with HTTP 400, so a
+    # missing current_model is filled from the cached /models resolution
+    # (slice 4, LP-0MVU7ZZIA0092AXW).
+    url = f"{url}?model={_resolve_slots_model_id(model)}"
 
     payload, reason = await _fetch_slots_payload_for_sampler(
         url, _SLOT_METRICS_TIMEOUT_SECONDS
@@ -984,10 +1012,11 @@ async def _query_slots_progress(
 
     Pass ``_client`` only in tests to avoid real HTTP.
     """
+    resolved_model = _resolve_slots_model_id(model)
+    url = ""
     try:
         url = _build_llama_url(llama_port, "/slots", base_url=endpoint)
-        if model:
-            url = f"{url}?model={model}"
+        url = f"{url}?model={resolved_model}"
         if _client is not None:
             slots_resp = await _client.get(url)
             if slots_resp.status_code == 200:
@@ -1014,7 +1043,7 @@ async def _query_slots_progress(
     except Exception as exc:
         _srv().logger.debug(
             "Slot progress query failed [%s] for %s: %s",
-            type(exc).__name__, _build_llama_url(llama_port, "/slots", base_url=endpoint), exc,
+            type(exc).__name__, url, exc,
         )
     return {}
 

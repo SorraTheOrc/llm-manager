@@ -151,8 +151,13 @@ class TestDirectModelInstancePolling:
         assert progress[1]["progress"] == 0
         assert progress[1]["processing"] is False
 
-    def test_direct_polling_without_model_param(self):
-        """Direct polling works without a model parameter (port 8080)."""
+    def test_direct_polling_without_model_param_still_sends_resolved_model(self):
+        """A model id is always sent — never a model-less /slots request.
+
+        Slice 4 (LP-0MVU7ZZIA0092AXW): the router answers a model-less
+        ``/slots`` with HTTP 400, so resolution supplies an id even when the
+        caller passes none (previously the query string was omitted).
+        """
         slots_data = [{"id": 0, "is_processing": False}]
         mock_client = _FakeClient([(200, slots_data)])
 
@@ -162,7 +167,8 @@ class TestDirectModelInstancePolling:
 
         (available, total), url = asyncio.run(capture_url())
         assert total == 1
-        assert "model=" not in url  # no model param when not passed
+        assert "?model=" in url
+        assert not url.endswith("?model=")
 
     def test_direct_polling_with_model_param(self):
         """Direct polling includes ?model=... when model is provided."""

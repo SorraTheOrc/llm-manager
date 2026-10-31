@@ -7271,6 +7271,30 @@ _CHILD_PORT_FALLBACK_WARN_INTERVAL = 300.0
 _last_child_port_fallback_warn_ts = 0.0
 """Monotonic timestamp of the last child-port fallback warning (throttle)."""
 
+_router_model_ids_snapshot: dict[str, Any] = {}
+"""Cached router ``/models`` id snapshot (LP-0MVU7ZZIA0092AXW).
+
+Keys: ``ids`` (``list[str]``), ``solo`` (the sole non-embed id, or ``None``),
+``at`` (``time.monotonic()`` fetch time) and ``key`` (router port,
+llama-server pid, ``srv.current_model``). A changed key (restart or model
+switch) invalidates it; :func:`ensure_router_model_ids` refreshes it when the
+TTL (:func:`_child_port_cache_ttl`, mirroring the child-port cache) expires.
+"""
+
+_child_model_signal_cache: dict[Any, tuple[str | None, float]] = {}
+"""Cached live child-port signal *model id* per (pid, current_model, log path).
+
+Resolution reads the 1 MiB log tail only on a miss; caching it with the
+child-port TTL keeps a cold ``srv.current_model`` from re-reading the log on
+every ``/slots`` poll (LP-0MVU7ZZIA0092AXW).
+"""
+
+_last_model_last_resort_warn_ts = 0.0
+"""Monotonic timestamp of the last 'last resort model id' warning (throttle)."""
+
+_last_model_resolution: dict[str, Any] = {}
+"""The most recent ``(model, source)`` resolution, for diagnostics/logging."""
+
 
 def _is_sparse_log(log_path: Path) -> bool:
     """Return True when *log_path* is sparse/NUL-padded/empty (logrotate).
@@ -7333,16 +7357,17 @@ def _read_log_window(log_path: Path, *, tail: bool, window: int) -> str:
         return ""
 
 
-def _last_matching_port(
+def _last_matching_signal(
     text: str, target_model: str | None, pattern: re.Pattern[str]
-) -> int | None:
-    """Return the port on the *last* line of *text* matching *pattern*.
+) -> tuple[str, int] | None:
+    """Return the ``(model, port)`` of the *last* line matching *pattern*.
 
     The last match wins so a restart / child re-spawn (which appends a newer
     line) is picked up. When *target_model* is given only an exact
     case-insensitive model match is accepted; otherwise a non-embed model is
     preferred over an embed one (the first spawn line is ``mxbai-embed`` —
-    LP-0MTP1FQXH004JYEF).
+    LP-0MTP1FQXH004JYEF). The model id travels with the port so callers can
+    resolve the router's own model name (LP-0MVU7ZZIA0092AXW).
     """
     if not text:
         return None
@@ -7361,14 +7386,22 @@ def _last_matching_port(
     if not matches:
         return None
     if want is not None:
-        filtered = [p for n, p in matches if n.lower() == want]
+        filtered = [match for match in matches if match[0].lower() == want]
         if filtered:
             return filtered[-1]
         return None
-    non_embed = [(n, p) for n, p in matches if "embed" not in n.lower()]
+    non_embed = [match for match in matches if "embed" not in match[0].lower()]
     if non_embed:
-        return non_embed[-1][1]
-    return matches[-1][1]
+        return non_embed[-1]
+    return matches[-1]
+
+
+def _last_matching_port(
+    text: str, target_model: str | None, pattern: re.Pattern[str]
+) -> int | None:
+    """Return only the port from :func:`_last_matching_signal` (back-compat)."""
+    signal = _last_matching_signal(text, target_model, pattern)
+    return signal[1] if signal is not None else None
 
 
 def _scan_spawn_ports(log_path: Path, target_model: str | None) -> int | None:
@@ -7388,26 +7421,44 @@ def _scan_spawn_ports(log_path: Path, target_model: str | None) -> int | None:
     return _last_matching_port(text, target_model, _SPAWN_RE)
 
 
-def _scan_proxy_request_ports(
+def _scan_proxy_request_signal(
     log_path: Path, target_model: str | None
-) -> int | None:
-    """Scan the tail of one log file for the *live* child-port signal.
+) -> tuple[str, int] | None:
+    """Scan the tail of one log file for the *live* child-port ``(model, port)``.
 
-    Returns the port from the last ``proxying request to model <model> on port
-    <port>`` line in the tail window — the rotation-proof source introduced by
+    Returns the last ``proxying request to model <model> on port <port>`` line
+    in the tail window — the rotation-proof source introduced by
     LP-0MVP7525P008RXMF AC1. Unlike the startup spawn line this keeps being
     written for the whole life of the process, so it survives logrotate.
     """
     text = _read_log_window(
         log_path, tail=True, window=_CHILD_PORT_TAIL_SCAN_BYTES
     )
-    return _last_matching_port(text, target_model, _PROXY_REQUEST_RE)
+    return _last_matching_signal(text, target_model, _PROXY_REQUEST_RE)
 
 
-def _scan_child_port_signals(
+def _scan_proxy_request_ports(
     log_path: Path, target_model: str | None
 ) -> int | None:
-    """Return the newest child-port signal in a single log file.
+    """Port from :func:`_scan_proxy_request_signal` (back-compat)."""
+    signal = _scan_proxy_request_signal(log_path, target_model)
+    return signal[1] if signal is not None else None
+
+
+def _scan_spawn_signal(
+    log_path: Path, target_model: str | None
+) -> tuple[str, int] | None:
+    """Scan the head of one log file for the startup spawn ``(model, port)``."""
+    text = _read_log_window(
+        log_path, tail=False, window=_CHILD_PORT_HEAD_SCAN_BYTES
+    )
+    return _last_matching_signal(text, target_model, _SPAWN_RE)
+
+
+def _scan_child_port_signal(
+    log_path: Path, target_model: str | None
+) -> tuple[str, int] | None:
+    """Return the newest ``(model, port)`` child-port signal in a log file.
 
     Tail first (live ``proxying request ... on port`` lines — newer than
     anything in the head window and present even when the startup spawn line
@@ -7415,10 +7466,24 @@ def _scan_child_port_signals(
     writes it before any request is proxied, so the very first polls after a
     restart still resolve — documented risk of the live source).
     """
-    port = _scan_proxy_request_ports(log_path, target_model)
-    if port is not None:
-        return port
-    return _scan_spawn_ports(log_path, target_model)
+    signal = _scan_proxy_request_signal(log_path, target_model)
+    if signal is not None:
+        return signal
+    return _scan_spawn_signal(log_path, target_model)
+
+
+def _scan_child_signal_model_name(log_path: Path) -> str | None:
+    """Newest non-embed child-port signal's model id (live source first)."""
+    signal = _scan_child_port_signal(log_path, None)
+    return signal[0] if signal is not None else None
+
+
+def _scan_child_port_signals(
+    log_path: Path, target_model: str | None
+) -> int | None:
+    """Return only the port from :func:`_scan_child_port_signal`."""
+    signal = _scan_child_port_signal(log_path, target_model)
+    return signal[1] if signal is not None else None
 
 
 def _rotated_log_candidates(log_path: Path) -> list[Path]:
@@ -7462,6 +7527,236 @@ def _remember_child_port(cache_key: Any, port: int, now: float) -> int:
     return int(port)
 
 
+LAST_RESORT_MODEL_ID = "Qwen3"
+"""The documented **last-resort** model id (LP-0MVU7ZZIA0092AXW).
+
+Routers report model ids as presets (``Qwen3``, ``Qwen3-32B``, ``Qwen2.5-7B``,
+``Qwen/Qwen3-Coder-Next-GGUF:Q5_K_M``, …), so no single literal is universally
+resolvable. This value is used only when no ``srv.current_model``, no live
+child-port log signal and no cached anything is available; the fallback is
+logged (see :func:`_warn_model_last_resort`) rather than applied silently.
+"""
+
+
+def _router_port_for(srv) -> int:
+    """Return the configured router port (``server.llama_server_port``)."""
+    cfg = getattr(srv, "config", None)
+    server_cfg = cfg.get("server", {}) if isinstance(cfg, dict) else {}
+    try:
+        return int(server_cfg.get("llama_server_port", 8080) or 8080)
+    except (TypeError, ValueError):
+        return 8080
+
+
+def _router_models_snapshot_key(srv) -> tuple[Any, Any, Any]:
+    """Identity of the ``/models`` snapshot: (port, llama-server pid, model)."""
+    proc = getattr(srv, "llama_process", None)
+    pid = getattr(proc, "pid", None) if proc is not None else None
+    return (_router_port_for(srv), pid, getattr(srv, "current_model", None))
+
+
+def _non_embed_model_ids(ids: list[str]) -> list[str]:
+    """Router ids that are not embedding models."""
+    return [mid for mid in ids if "embed" not in str(mid).lower()]
+
+
+def _router_models_snapshot_meta(srv) -> tuple[list[str], str | None]:
+    """Return ``(ids, solo)`` from the cached ``/models`` snapshot.
+
+    The snapshot is keyed by router port + llama-server pid + current model so
+    a restart or a model switch invalidates it. The *refresh* is driven by
+    :func:`ensure_router_model_ids` (async); this sync read never blocks on an
+    HTTP round trip, so the hot ``/slots`` discovery path stays cheap.
+    """
+    snapshot = _router_model_ids_snapshot
+    if not snapshot:
+        return [], None
+    if snapshot.get("key") != _router_models_snapshot_key(srv):
+        snapshot.clear()
+        return [], None
+    ids = list(snapshot.get("ids") or [])
+    solo = snapshot.get("solo")
+    return ids, solo if isinstance(solo, str) else None
+
+
+def _cached_router_model_ids(srv) -> list[str]:
+    """Cached ``/models`` ids for *srv* (empty when absent/stale/restarted)."""
+    ids, _solo = _router_models_snapshot_meta(srv)
+    return ids
+
+
+async def ensure_router_model_ids(srv) -> list[str]:
+    """Refresh the cached router ``/models`` id snapshot when it is stale.
+
+    Reuses the existing lifecycle helpers: ``srv.router_list_models()`` (the
+    server module binds it from :mod:`proxy.lifecycle`) and
+    :func:`proxy.lifecycle._extract_router_model_ids`. The fetch is skipped
+    when the snapshot is fresh (TTL = :func:`_child_port_cache_ttl`, mirroring
+    the child-port cache), and when *srv* exposes no lister (unit-test stubs),
+    so the hot ``/slots`` path costs **zero** ``/models`` requests once warm
+    (LP-0MVU7ZZIA0092AXW).
+    """
+    ids, _solo = _router_models_snapshot_meta(srv)
+    if _router_model_ids_snapshot:
+        at = float(_router_model_ids_snapshot.get("at", 0.0) or 0.0)
+        if time.monotonic() - at < _child_port_cache_ttl():
+            return ids
+    lister = getattr(srv, "router_list_models", None)
+    if not callable(lister):
+        return ids
+    try:
+        payload = await lister()
+    except Exception:
+        return ids
+    try:
+        from proxy.lifecycle import _extract_router_model_ids
+
+        fetched = _extract_router_model_ids(payload)
+    except Exception:
+        fetched = []
+    non_embed = _non_embed_model_ids(fetched)
+    solo = non_embed[0] if len(non_embed) == 1 else None
+    _router_model_ids_snapshot.clear()
+    _router_model_ids_snapshot.update(
+        {
+            "ids": list(fetched),
+            "solo": solo,
+            "at": time.monotonic(),
+            "key": _router_models_snapshot_key(srv),
+        }
+    )
+    return list(fetched)
+
+
+def _match_model_preset(candidate: str | None, ids: list[str]) -> str | None:
+    """Case-insensitive match of *candidate* against router model ids.
+
+    Presets are not one universal name: the router may report the alias
+    ``Qwen3`` while ``/models`` lists ``Qwen3-32B`` (or the reverse), so an
+    exact case-insensitive match wins, then an alias/preset prefix match
+    (``qwen3`` ↔ ``Qwen3-32B``). Returns the router's spelling of the id.
+    """
+    want = str(candidate or "").strip().lower()
+    if not want:
+        return None
+    for mid in ids:
+        if str(mid).strip().lower() == want:
+            return str(mid)
+    for mid in ids:
+        low = str(mid).strip().lower()
+        if low.startswith(want) or want.startswith(low):
+            return str(mid)
+    return None
+
+
+def _warn_model_last_resort(srv) -> None:
+    """Log (throttled) the fallback to :data:`LAST_RESORT_MODEL_ID`."""
+    global _last_model_last_resort_warn_ts
+    now = time.monotonic()
+    if now - _last_model_last_resort_warn_ts < _CHILD_PORT_FALLBACK_WARN_INTERVAL:
+        return
+    _last_model_last_resort_warn_ts = now
+    try:
+        srv.logger.warning(
+            "slots_model_resolution_last_resort: no srv.current_model, no "
+            "router /models id and no child-port log signal; falling back to "
+            f"the documented last_resort id {LAST_RESORT_MODEL_ID!r} "
+            "(LP-0MVU7ZZIA0092AXW)"
+        )
+    except Exception:
+        pass
+
+
+def _remember_model_resolution(model: str, source: str) -> None:
+    """Record the last resolution for diagnostics/logging."""
+    _last_model_resolution.clear()
+    _last_model_resolution.update({"model": model, "source": source})
+
+
+def _cached_child_signal_model(srv, log_path: Path) -> str | None:
+    """Newest child-port signal's model id, cached with the child-port TTL."""
+    proc = getattr(srv, "llama_process", None)
+    pid = getattr(proc, "pid", None) if proc is not None else None
+    key = (pid, getattr(srv, "current_model", None), str(log_path))
+    now = time.monotonic()
+    entry = _child_model_signal_cache.get(key)
+    if isinstance(entry, tuple) and len(entry) == 2:
+        model, at = entry
+        if now - float(at) < _child_port_cache_ttl():
+            return model
+    model = _scan_child_signal_model_name(log_path)
+    _child_model_signal_cache[key] = (model, now)
+    return model
+
+
+def resolve_local_model_id(srv, model: str | None = None) -> tuple[str, str]:
+    """Resolve the model id a proxy ``/slots`` query must send.
+
+    Order (LP-0MVU7ZZIA0092AXW AC2): explicit *model* → ``srv.current_model`` →
+    the sole non-embed ``/models`` preset (unambiguous) → the live child-port
+    log signal canonicalised against the ``/models`` ids (case-insensitive) →
+    the log signal verbatim (it is the id the router itself reports, so it is
+    resolvable by definition) → :data:`LAST_RESORT_MODEL_ID` as a *logged*
+    last resort.
+
+    Returns ``(model_id, source)``; *source* is one of ``explicit``,
+    ``current_model``, ``models_snapshot``, ``log_signal+models_snapshot``,
+    ``log_signal`` or ``last_resort``.
+    """
+    explicit = str(model).strip() if model is not None else ""
+    if explicit:
+        _remember_model_resolution(explicit, "explicit")
+        return explicit, "explicit"
+    current = getattr(srv, "current_model", None)
+    current = str(current).strip() if current is not None else ""
+    if current:
+        _remember_model_resolution(current, "current_model")
+        return current, "current_model"
+    ids, solo = _router_models_snapshot_meta(srv)
+    if solo:
+        _remember_model_resolution(solo, "models_snapshot")
+        return solo, "models_snapshot"
+    signal = _cached_child_signal_model(srv, _llama_log_path(srv))
+    if signal:
+        matched = _match_model_preset(signal, ids)
+        if matched:
+            _remember_model_resolution(matched, "log_signal+models_snapshot")
+            return matched, "log_signal+models_snapshot"
+        _remember_model_resolution(signal, "log_signal")
+        return signal, "log_signal"
+    non_embed = _non_embed_model_ids(ids)
+    if non_embed:
+        preferred = (
+            _match_model_preset(LAST_RESORT_MODEL_ID, non_embed) or non_embed[0]
+        )
+        _remember_model_resolution(preferred, "models_snapshot")
+        return preferred, "models_snapshot"
+    _warn_model_last_resort(srv)
+    _remember_model_resolution(LAST_RESORT_MODEL_ID, "last_resort")
+    return LAST_RESORT_MODEL_ID, "last_resort"
+
+
+def _scan_child_port_with_alias(log_path: Path, target: str) -> int | None:
+    """Scan for *target*'s child port, tolerating a preset/alias mismatch.
+
+    The resolved id may be the ``/models`` preset (``Qwen3-32B``) while the log
+    only names the alias the router reported (``Qwen3``); when the direct scan
+    finds nothing, retry with the newest signal model if it canonicalises to
+    *target*.
+    """
+    port = _scan_child_port_signals(log_path, target)
+    if port is not None:
+        return port
+    alias = _scan_child_signal_model_name(log_path)
+    if (
+        alias
+        and alias.strip().lower() != str(target).strip().lower()
+        and _match_model_preset(alias, [str(target)])
+    ):
+        return _scan_child_port_signals(log_path, alias)
+    return None
+
+
 def _discover_local_child_port(srv, model: str | None = None) -> int | None:
     """Discover the local model child port from the llama-server log.
 
@@ -7477,9 +7772,13 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
     Args:
         srv: Server module / namespace with ``llama_process.pid`` and
             ``log_dir`` / ``current_model``.
-        model: Optional target model name to filter by (e.g. ``"Qwen3"``).
-            When ``None`` the function uses ``srv.current_model`` or
-            ``"Qwen3"`` as the target. Matching is case-insensitive.
+        model: Optional target model name to filter by (e.g. ``"Qwen3-32B"``).
+            When ``None`` the id is resolved by
+            :func:`resolve_local_model_id` (``srv.current_model`` → ``/models``
+            preset → live child-port log signal → a *logged*
+            :data:`LAST_RESORT_MODEL_ID`). Matching is case-insensitive, and a
+            preset/alias mismatch (``Qwen3-32B`` vs the log's ``Qwen3``) still
+            resolves the port via :func:`_scan_child_port_with_alias`.
             Passing the wrong model previously returned the embed child port
             (first spawn line ``mxbai-embed``) — LP-0MTP1FQXH004JYEF.
 
@@ -7502,11 +7801,10 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
         pid = getattr(proc, "pid", None) if proc is not None else None
         if pid is None:
             return None
-        # Resolve the target model: explicit arg wins, then current_model.
-        target = (model or getattr(srv, "current_model", None) or "Qwen3")
-        target = str(target).strip() if target is not None else "Qwen3"
-        if not target:
-            target = "Qwen3"
+        # Resolve the target model id: explicit arg → srv.current_model → the
+        # router /models preset → the live log signal (canonicalised) → a
+        # *logged* last resort (LP-0MVU7ZZIA0092AXW — never a silent "Qwen3").
+        target, _model_source = resolve_local_model_id(srv, model)
         cache_key = (int(pid), target.lower())
         log_path = _llama_log_path(srv)
         now = time.monotonic()
@@ -7528,7 +7826,7 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
             # log tail reflects the newest mapping. If no newer signal exists
             # we keep serving the last known-good port instead of regressing
             # to the router (LP-0MVP7525P008RXMF AC1 — sticky positive).
-            fresh = _scan_child_port_signals(log_path, target)
+            fresh = _scan_child_port_with_alias(log_path, target)
             if fresh is not None:
                 return _remember_child_port(cache_key, fresh, now)
             _child_port_cache_at[cache_key] = now
@@ -7548,7 +7846,7 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
         #    (the 2026-10-26 production log had 38,761 of them and zero spawn
         #    lines — the exact shape that previously pinned None for the whole
         #    pid lifetime). LP-0MVP7525P008RXMF AC1.
-        port = _scan_child_port_signals(log_path, target)
+        port = _scan_child_port_with_alias(log_path, target)
         if port is not None:
             return _remember_child_port(cache_key, port, now)
         # Primary had real content but no matching child-port signal for this
@@ -7566,7 +7864,7 @@ def _discover_local_child_port(srv, model: str | None = None) -> int | None:
         # no matching signal; a missing file already returned above.
         try:
             for cand in _rotated_log_candidates(log_path)[:8]:
-                cand_port = _scan_child_port_signals(cand, target)
+                cand_port = _scan_child_port_with_alias(cand, target)
                 if cand_port is not None:
                     return _remember_child_port(cache_key, cand_port, now)
         except Exception:
@@ -7615,9 +7913,10 @@ def _warn_child_port_fallback(srv, model: str | None, router_port: int) -> None:
     if now - _last_child_port_fallback_warn_ts < _CHILD_PORT_FALLBACK_WARN_INTERVAL:
         return
     _last_child_port_fallback_warn_ts = now
+    resolved_model, model_source = resolve_local_model_id(srv, model)
     message = (
         "slots_child_port_unavailable: no model child port discovered for "
-        f"model={model or getattr(srv, 'current_model', None) or 'unknown'}; "
+        f"model={resolved_model} (source={model_source}); "
         f"falling back to router port {router_port} — every proxy-initiated "
         "/slots poll will traverse the router and can 500 during giant "
         "prefills (LP-0MVP7525P008RXMF AC3)"
@@ -7727,8 +8026,13 @@ async def _check_slot_availability(
         return None
 
     try:
-        slot_model = (
-            slot_model_name or model_name or srv.current_model or "Qwen3"
+        # Warm the cached /models id snapshot on the async dispatch path (the
+        # sync discovery path never blocks on HTTP) and resolve the id so the
+        # `?model=` component is always a router-resolvable preset
+        # (LP-0MVU7ZZIA0092AXW AC2).
+        await ensure_router_model_ids(srv)
+        slot_model, _model_source = resolve_local_model_id(
+            srv, slot_model_name or model_name
         )
         # LP-0MVP7525P008RXMF AC2: single shared resolution path — a
         # *local* endpoint (the router) is rewritten to the discovered child

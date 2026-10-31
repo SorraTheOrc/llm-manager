@@ -33,16 +33,16 @@ slip through.
 The allowlist
 -------------
 
-``ALLOWLIST`` holds exactly the offending sites the AC1 audit identified, so
-the fence is green on landing (slice 2, LP-0MVU7ZYWS002RDYM) and each later
-slice provably closes its own entry:
+``ALLOWLIST`` held exactly the offending sites the AC1 audit identified so
+the fence was green on landing (slice 2, LP-0MVU7ZYWS002RDYM); each later
+slice provably closed its own entry:
 
 * slice 3 (LP-0MVU7ZZ7M002D9GT) threaded a resolved model through the four
-  model-less probes (its entries are removed: the URLs now carry `?model=`
+  model-less probes (its entries were removed: the URLs now carry `?model=`
   inline, or the site skips the query when no model is known);
-* slice 4 (LP-0MVU7ZZIA0092AXW) guarantees a resolved model id everywhere,
-  which removes the three conditional-appender constructors and empties the
-  allowlist.
+* slice 4 (LP-0MVU7ZZIA0092AXW) guarantees a resolved model id everywhere, so
+  the three conditional-appender constructors became unconditional appenders
+  and the allowlist is now empty.
 
 The allowlist cannot rot: an entry whose site no longer offends (or no longer
 exists) is a *stale entry* and fails the suite just like an unlisted violation.
@@ -80,32 +80,10 @@ _NONE_REASON = "no '?model=' component on the URL and no model appender in scope
 
 #: Offending ``/slots`` constructions accepted until their slice removes them.
 #: Keyed by ``(path relative to proxy/proxy, enclosing symbol)``; every value
-#: names the follow-up slice that deletes the entry.
-ALLOWLIST: dict[tuple[str, str], str] = {
-    # ── slice 4 (LP-0MVU7ZZIA0092AXW): the model id is resolved from /models
-    # for every caller, so these three constructors can drop their `if model:`
-    # guard. The two debug-log URL strings inside the detail/progress helpers
-    # (observability.py:734 and :802) are flagged under the same symbols.
-    ("observability.py", "_query_slots"): (
-        "LP-0MVU7ZZIA0092AXW (slice 4): '?model=' is appended only behind "
-        "`if model:`, so a model-less request is reachable when the caller "
-        "passes model=None. Slice 4 guarantees a resolved model id."
-    ),
-    ("observability.py", "_query_slots_detail"): (
-        "LP-0MVU7ZZIA0092AXW (slice 4): same conditional appender as "
-        "_query_slots (AC1 audit site #2)."
-    ),
-    ("observability.py", "_sample_slot_occupancy"): (
-        "LP-0MVU7ZZIA0092AXW (slice 4): the slot-occupancy sampler "
-        "(LP-0MVT1O0VG00905EL) appends '?model=' only behind `if model:`; "
-        "slice 4 guarantees a resolved model id for every /slots caller."
-    ),
-    ("observability.py", "_query_slots_progress"): (
-        "LP-0MVU7ZZIA0092AXW (slice 4): same conditional appender as "
-        "_query_slots (AC1 audit site #3); _query_prefill_progress defaults "
-        "model_name to None."
-    ),
-}
+#: names the follow-up slice that deletes the entry. Empty since slice 4
+#: (LP-0MVU7ZZIA0092AXW) gave every query helper — including the slot-occupancy
+#: sampler added meanwhile by LP-0MVT1O0VG00905EL — a resolved model id.
+ALLOWLIST: dict[tuple[str, str], str] = {}
 
 #: The follow-up slices allowed to own an allowlist entry.
 _REMOVING_SLICES = ("LP-0MVU7ZZ7M002D9GT", "LP-0MVU7ZZIA0092AXW")
@@ -431,6 +409,10 @@ class TestLiveTreeFence:
             "ALLOWLIST entries with no matching model-less site (fixed or "
             f"renamed — delete them): {sorted(stale)}"
         )
+
+    def test_allowlist_is_empty_after_slice_4(self):
+        """Slice 4 (LP-0MVU7ZZIA0092AXW) resolves a model id everywhere."""
+        assert ALLOWLIST == {}
 
     def test_allowlist_entries_name_the_slice_that_removes_them(self):
         for key, note in ALLOWLIST.items():
