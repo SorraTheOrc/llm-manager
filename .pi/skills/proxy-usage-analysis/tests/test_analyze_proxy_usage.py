@@ -8771,7 +8771,7 @@ class TestEngineCrossCheck:
             tmp_path,
             llama_lines=[
                 fixtures.QWEN3_SPAWN_LINE,
-                f"[32999]        eval time =  12000.00 ms /   153 tokens "
+                "[32999]        eval time =  12000.00 ms /   153 tokens "
                 "(   24.68 ms per token,    40.51 tokens per second)",
             ],
         )
