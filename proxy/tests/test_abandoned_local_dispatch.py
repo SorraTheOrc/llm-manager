@@ -1028,12 +1028,19 @@ class TestOtherAbandonmentPaths:
 #
 # Red-first encoding (the repository convention — see the module docstring and
 # ``test_prefill_thrash_cooldown.py``): every assertion pinning behaviour that
-# does not exist yet is marked ``pytest.mark.xfail(strict=True)`` so this
-# test-only item lands on ``dev`` with a green suite. ``strict`` makes the
+# did not exist yet was marked ``pytest.mark.xfail(strict=True)`` so the
+# test-only item landed on ``dev`` with a green suite. ``strict`` makes the
 # assertion fail the suite the moment it starts passing, so the paired
-# implementation items (LP-0MVUVHAQP001IRKK records the entry,
-# LP-0MVUVHB1V006HA5I matches and clears it) cannot forget to remove the
-# marker. Controls that already hold run unmarked.
+# implementation items cannot forget to remove the marker.
+#
+# Marker status:
+#
+# - ``TestEndpointWideRegistry`` is **green**: LP-0MVUVHAQP001IRKK made
+#   ``_record_abandoned_slot`` store the endpoint-wide entry (sentinel key,
+#   ``scope`` field, TTL, refresh, per-endpoint bound) instead of dropping it.
+# - the annotation / clear-on-free classes below stay ``xfail`` until
+#   LP-0MVUVHB1V006HA5I matches the entry in the status builder and clears it
+#   on an observed free.
 #
 # ``ENDPOINT`` is the label the release paths carry for the local backend (the
 # dispatch record's ``endpoint`` field). The status payload describes that same
@@ -1052,8 +1059,8 @@ ENDPOINT_WIDE_REASON = "measured_cache_deficit"
 _SENTINEL_XFAIL = pytest.mark.xfail(
     strict=True,
     reason=(
-        "endpoint-wide abandonment entry is not implemented yet "
-        "(LP-0MVUVHAQP001IRKK / LP-0MVUVHB1V006HA5I)"
+        "endpoint-wide annotation / clear-on-free is not implemented yet "
+        "(LP-0MVUVHB1V006HA5I)"
     ),
 )
 
@@ -1092,7 +1099,6 @@ def _live_dispatch_records(session_id: str = "live-session") -> dict:
 class TestEndpointWideRegistry:
     """AC: a slot-less abandonment is stored, bounded and never collides."""
 
-    @_SENTINEL_XFAIL
     def test_sentinel_cannot_collide_with_a_real_slot_id(self):
         """The "endpoint-wide" key is a documented sentinel that is not a
         non-negative integer, so it can never be mistaken for a real slot."""
@@ -1101,7 +1107,6 @@ class TestEndpointWideRegistry:
         assert isinstance(ABANDONED_SLOT_ENDPOINT_WIDE, int)
         assert ABANDONED_SLOT_ENDPOINT_WIDE < 0
 
-    @_SENTINEL_XFAIL
     def test_recording_without_a_slot_yields_one_endpoint_wide_entry(self):
         """``_record_abandoned_slot(None, ...)`` records instead of silently
         dropping: one entry, attributable, keyed by the sentinel."""
@@ -1127,7 +1132,6 @@ class TestEndpointWideRegistry:
             (ENDPOINT, ABANDONED_SLOT_ENDPOINT_WIDE)
         ]
 
-    @_SENTINEL_XFAIL
     def test_endpoint_wide_entry_never_matches_a_real_slot(self):
         """The fallback must be an explicit endpoint-wide lookup, never a
         match on a real slot id: an exact lookup for any slot stays empty, so
@@ -1141,7 +1145,6 @@ class TestEndpointWideRegistry:
         # ...including the legacy/default endpoint label.
         assert _abandoned_slot_for(0, now=0.0) is None
 
-    @_SENTINEL_XFAIL
     def test_rerecording_refreshes_rather_than_duplicates(self, clock):
         """A second slot-less abandonment refreshes the single entry (no
         growth, latest reason) instead of appending a duplicate."""
@@ -1161,7 +1164,6 @@ class TestEndpointWideRegistry:
         assert refreshed["reason"] == "prefill_deadline"
         assert refreshed["abandoned_at"] == clock.now
 
-    @_SENTINEL_XFAIL
     def test_entry_is_scoped_per_endpoint(self):
         """One entry per endpoint — the bound stays
         ``(endpoint, slot)`` pairs plus one endpoint-wide entry per endpoint."""
@@ -1173,7 +1175,6 @@ class TestEndpointWideRegistry:
         assert _abandoned_slot_count(endpoint=ENDPOINT, now=0.0) == 1
         assert _abandoned_slot_count(endpoint="remote-backend", now=0.0) == 1
 
-    @_SENTINEL_XFAIL
     def test_entry_expires_at_the_default_ttl(self, clock):
         """The endpoint-wide entry is TTL-bounded like every other entry."""
         from proxy.router_helpers import (
@@ -1252,7 +1253,6 @@ class TestEndpointWideAnnotation:
         assert slot["abandoned"] is True
         assert slot["abandoned_scope"] == "slot"
 
-    @_SENTINEL_XFAIL
     def test_live_lease_owner_is_never_annotated(self):
         """Truthful status (LP-0MVKSXR4P001V0CM): an endpoint-wide entry must
         not annotate a processing slot a live dispatch lease owns."""
@@ -1275,7 +1275,6 @@ class TestEndpointWideAnnotation:
         assert annotated[0].get("abandoned_scope") is None
         assert compute_capacity_hint(annotated) == CAPACITY_SATURATED
 
-    @_SENTINEL_XFAIL
     def test_live_dispatch_record_without_a_slot_binding_is_never_annotated(self):
         """The guard covers the dispatch-record binding too: an active record
         matched to the processing slot (no persistence binding) is live work,
@@ -1423,3 +1422,502 @@ class TestEndpointWideAnnotationIsReadOnly:
         assert owners_after == owners_before
         # Clearing dropped the registry entry without re-recording anything.
         assert _abandoned_slot_count() == 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Recording and re-verifying the abandoned slot identity on every release path
+# — LP-0MVUVHAQP001IRKK
+#
+# The registry half of the endpoint-wide contract: every abandonment path must
+# record *something* attributable (the slot the backend is still draining, or
+# the endpoint-wide entry when that slot cannot be resolved), and the resolved
+# identity must be re-verified against what llama-server actually reports so a
+# shape-1 mismatch is diagnosable instead of silent.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _rendered_log_calls(mock, needle: str) -> list[str]:
+    """Render the ``%``-formatted calls a mocked logger received.
+
+    Keeps the assertions on the *rendered* line (the shape an operator greps),
+    never on the raw format string plus argument tuple.
+    """
+    rendered: list[str] = []
+    for logged in getattr(mock, "call_args_list", []):
+        args = logged.args
+        if not args or not isinstance(args[0], str) or needle not in args[0]:
+            continue
+        try:
+            rendered.append(args[0] % tuple(args[1:]))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            rendered.append(args[0])
+    return rendered
+
+
+def _assert_endpoint_wide(reason: str, session_id: str, clock) -> dict:
+    """Assert the endpoint-wide entry exists, is attributable and matches nothing."""
+    from proxy.router_helpers import (
+        _abandoned_slot_endpoint_wide,
+        _abandoned_slot_for,
+    )
+
+    entry = _abandoned_slot_endpoint_wide(now=clock.now)
+    assert entry is not None, (
+        f"{reason} dropped an unresolvable abandonment instead of recording "
+        f"the endpoint-wide entry"
+    )
+    assert entry["scope"] == "endpoint"
+    assert entry["slot_id"] is None
+    assert entry["reason"] == reason
+    assert entry["session_id"] == session_id
+    # The endpoint-wide entry must never be returned to a slot-exact lookup.
+    for slot_id in (0, 1, 2, 7):
+        assert _abandoned_slot_for(slot_id, now=clock.now) is None
+    return entry
+
+
+class TestEveryPathRecordsAnEntryWhenIdentityIsUnresolvable:
+    """AC: no abandonment path silently drops an unresolvable identity.
+
+    One case per recording path named by the work item: prefill deadline,
+    client disconnect, no-progress watchdog, orphan sweep, session eviction and
+    the measured cache-deficit early abort.
+    """
+
+    def test_prefill_deadline(self, clock):
+        from proxy import router_helpers as helpers
+
+        srv = _server_stub(
+            records={
+                "sess-deadline": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                }
+            }
+        )
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            asyncio.run(
+                helpers._release_prefill_deadline_dispatch(srv, "sess-deadline")
+            )
+
+        _assert_endpoint_wide("prefill_deadline", "sess-deadline", clock)
+
+    def test_client_disconnect(self, clock):
+        from proxy import router_helpers as helpers
+
+        srv = _server_stub(
+            records={
+                "sess-gone": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                }
+            }
+        )
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            released = helpers._release_client_disconnect_dispatch(
+                srv, "sess-gone"
+            )
+
+        assert released is True
+        _assert_endpoint_wide("client_disconnect", "sess-gone", clock)
+
+    def test_no_progress_watchdog(self, clock):
+        from proxy import router_helpers as helpers
+
+        now = clock.now
+        srv = _server_stub(
+            records={
+                "sess-wedged": {
+                    "backend": "local",
+                    "active": True,
+                    "started_at": now - 300.0,
+                    "expires_at": now + 600.0,
+                    "last_progress": 0,
+                    "last_progress_ts": now - 300.0,
+                }
+            }
+        )
+        srv.local_prefill_in_flight = {"sess-wedged": True}
+        srv.local_active_queries = 1
+
+        async def _no_slots(*_a, **_k):
+            return None
+
+        with (
+            patch.dict("proxy.session._slot_owners", {}, clear=True),
+            patch.object(
+                helpers, "_query_slots_progress", _no_slots, create=True
+            ),
+        ):
+            asyncio.run(helpers._cleanup_stale_local_dispatch(srv))
+
+        _assert_endpoint_wide("no_progress_watchdog", "sess-wedged", clock)
+
+    def test_orphan_sweep(self, clock):
+        from proxy import router_helpers as helpers
+
+        now = clock.now
+        srv = _server_stub(
+            records={
+                # No ``last_progress_ts`` baseline → the no-progress watchdog
+                # abstains and the record reaches the orphan-cleanup branch.
+                "sess-orphan": {
+                    "backend": "local",
+                    "active": True,
+                    "started_at": now - 400.0,
+                    "expires_at": now - 10.0,
+                }
+            }
+        )
+        srv.local_active_queries = 1
+
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            removed = asyncio.run(helpers._cleanup_stale_local_dispatch(srv))
+
+        assert removed == 1
+        _assert_endpoint_wide("orphan_cleanup", "sess-orphan", clock)
+
+    def test_session_eviction(self, clock):
+        from proxy import server as server_mod
+
+        records = {
+            "sess-evicted": {
+                "active": True,
+                "expires_at": time.monotonic() + 60.0,
+                "endpoint": "local-llama",
+            }
+        }
+        with (
+            patch.object(server_mod, "local_dispatch_records", records),
+            patch.object(
+                server_mod, "local_dispatch_records_lock", asyncio.Lock()
+            ),
+            patch.object(
+                server_mod, "local_prefill_in_flight", {"sess-evicted": True}
+            ),
+            patch.object(
+                server_mod, "local_prefill_in_flight_lock", asyncio.Lock()
+            ),
+            patch.dict("proxy.session._slot_owners", {}, clear=True),
+        ):
+            asyncio.run(
+                server_mod._release_lease_on_session_eviction("sess-evicted")
+            )
+
+        _assert_endpoint_wide("session_evicted", "sess-evicted", clock)
+
+    def test_measured_cache_deficit_abort(self, clock):
+        from proxy import router_helpers as helpers
+
+        srv = _server_stub(
+            records={
+                "sess-abort": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                }
+            }
+        )
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            asyncio.run(
+                helpers._release_measured_cache_abort_dispatch(srv, "sess-abort")
+            )
+
+        _assert_endpoint_wide(
+            "measured_cache_deficit", "sess-abort", clock
+        )
+
+
+class TestMeasuredCacheAbortForwardsThePinnedIdentity:
+    """AC: the earliest-abort path forwards the record's slot and stream."""
+
+    def test_record_pin_is_recorded_and_its_stream_is_cancelled(self, clock):
+        """No caller arguments and no session assignment: the identity the
+        dispatch record pinned at admission and the stream it pinned after the
+        headers both come from the record, so the cancel and the annotation
+        fire on the earliest-abort path."""
+        from proxy.router_helpers import (
+            _abandoned_slot_for,
+            _release_measured_cache_abort_dispatch,
+        )
+
+        stream_cm = _fake_stream_cm()
+        srv = _server_stub(
+            records={
+                "sess-abort": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                    "slot_id": 3,
+                    "stream_cm": stream_cm,
+                }
+            }
+        )
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            asyncio.run(
+                _release_measured_cache_abort_dispatch(srv, "sess-abort")
+            )
+
+        stream_cm.__aexit__.assert_awaited_once()
+        entry = _abandoned_slot_for(3, now=clock.now)
+        assert entry is not None
+        assert entry["scope"] == "slot"
+        assert entry["reason"] == "measured_cache_deficit"
+        assert entry["session_id"] == "sess-abort"
+
+    def test_caller_forwarded_identity_wins_over_the_pin(self, clock):
+        """The explicit ``abandoned_slot_id`` / ``upstream_stream_cm`` the
+        router forwards (the deadline-twin shape) take precedence, so the
+        annotation names the slot the dispatch actually used."""
+        from proxy.router_helpers import (
+            _abandoned_slot_for,
+            _release_measured_cache_abort_dispatch,
+        )
+
+        pinned_stream = _fake_stream_cm()
+        forwarded_stream = _fake_stream_cm()
+        srv = _server_stub(
+            records={
+                "sess-abort": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                    "slot_id": 3,
+                    "stream_cm": pinned_stream,
+                }
+            }
+        )
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            asyncio.run(
+                _release_measured_cache_abort_dispatch(
+                    srv,
+                    "sess-abort",
+                    abandoned_slot_id=5,
+                    upstream_stream_cm=forwarded_stream,
+                )
+            )
+
+        forwarded_stream.__aexit__.assert_awaited_once()
+        assert _abandoned_slot_for(5, now=clock.now) is not None
+        assert _abandoned_slot_for(3, now=clock.now) is None
+
+    def test_the_dispatch_record_pins_the_slot_at_admission(self, clock):
+        """``_try_acquire_local_dispatch`` pins the slot identity on the record,
+        so a later release can name it even after the assignment is freed."""
+        from proxy.router_helpers import _try_acquire_local_dispatch
+        from proxy.session import _slot_registry_key
+
+        srv = _server_stub()
+        with patch.dict(
+            "proxy.session._slot_owners",
+            {_slot_registry_key(None, 2): "sess-pinned"},
+            clear=True,
+        ):
+            asyncio.run(
+                _try_acquire_local_dispatch(
+                    srv, 2, "sess-pinned", backend="local", body_json=None
+                )
+            )
+
+        assert srv.local_dispatch_records["sess-pinned"]["slot_id"] == 2
+
+
+class TestAbandonedSlotIdentityReverification:
+    """AC: the recorded id is re-verified against what the backend reports."""
+
+    def _release_drifted(self, srv, session_id: str, explicit=None):
+        from proxy import router_helpers as helpers
+
+        return asyncio.run(
+            helpers._release_prefill_deadline_dispatch(
+                srv, session_id, abandoned_slot_id=explicit
+            )
+        )
+
+    def test_mismatch_logs_both_slots_and_records_endpoint_wide(self, clock):
+        """Shape 1: the recorded id no longer matches the draining slot. The
+        release must say so (``abandoned_slot_mismatch`` with both ids) and
+        still record the endpoint-wide entry, so the ghost is annotatable."""
+        from proxy import observability as obs
+        from proxy.router_helpers import (
+            _abandoned_slot_endpoint_wide,
+            _abandoned_slot_for,
+        )
+
+        srv = _server_stub(
+            records={
+                "sess-drift": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                    "slot_id": 7,
+                }
+            }
+        )
+        with (
+            patch.dict("proxy.session._slot_owners", {}, clear=True),
+            patch.object(obs, "_processing_slot_assignments", {1: "sess-drift"}),
+        ):
+            self._release_drifted(srv, "sess-drift")
+
+        mismatches = _rendered_log_calls(srv.logger.warning, "abandoned_slot_mismatch")
+        assert len(mismatches) == 1, mismatches
+        assert "recorded_slot=7" in mismatches[0]
+        assert "observed_slot=1" in mismatches[0]
+        assert "reason=prefill_deadline" in mismatches[0]
+        # Both entries: the recorded id (exact evidence) and the endpoint-wide
+        # fallback the guarded status matcher can apply to the draining slot.
+        exact = _abandoned_slot_for(7, now=clock.now)
+        assert exact is not None and exact["scope"] == "slot"
+        wide = _abandoned_slot_endpoint_wide(now=clock.now)
+        assert wide is not None and wide["scope"] == "endpoint"
+        assert wide["reason"] == "prefill_deadline"
+
+    def test_no_mismatch_when_the_backend_agrees(self, clock):
+        """Control: an agreeing observation records only the exact entry."""
+        from proxy import observability as obs
+        from proxy.router_helpers import (
+            _abandoned_slot_endpoint_wide,
+            _abandoned_slot_for,
+        )
+
+        srv = _server_stub(
+            records={
+                "sess-agreed": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                    "slot_id": 1,
+                }
+            }
+        )
+        with (
+            patch.dict("proxy.session._slot_owners", {}, clear=True),
+            patch.object(obs, "_processing_slot_assignments", {1: "sess-agreed"}),
+        ):
+            self._release_drifted(srv, "sess-agreed")
+
+        assert not _rendered_log_calls(
+            srv.logger.warning, "abandoned_slot_mismatch"
+        )
+        assert _abandoned_slot_for(1, now=clock.now) is not None
+        assert _abandoned_slot_endpoint_wide(now=clock.now) is None
+
+    def test_unobserved_backend_is_not_a_mismatch(self, clock):
+        """No ``/slots``-derived observation yet is not evidence of drift."""
+        from proxy import observability as obs
+        from proxy.router_helpers import (
+            _abandoned_slot_endpoint_wide,
+            _abandoned_slot_for,
+        )
+
+        srv = _server_stub(
+            records={
+                "sess-unobserved": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                    "slot_id": 4,
+                }
+            }
+        )
+        with (
+            patch.dict("proxy.session._slot_owners", {}, clear=True),
+            patch.object(obs, "_processing_slot_assignments", {}),
+        ):
+            self._release_drifted(srv, "sess-unobserved")
+
+        assert not _rendered_log_calls(
+            srv.logger.warning, "abandoned_slot_mismatch"
+        )
+        assert _abandoned_slot_for(4, now=clock.now) is not None
+        assert _abandoned_slot_endpoint_wide(now=clock.now) is None
+
+
+class TestAbandonedSlotSourceProvenance:
+    """AC: ``slot_source=explicit|assignment|endpoint_wide`` on the log line."""
+
+    def _release(self, srv, session_id: str, **kwargs):
+        from proxy import router_helpers as helpers
+
+        asyncio.run(
+            helpers._release_prefill_deadline_dispatch(
+                srv, session_id, **kwargs
+            )
+        )
+        return _rendered_log_calls(srv.logger.info, "abandoned_slot_recorded")
+
+    def test_explicit_slot_id(self):
+        srv = _server_stub(
+            records={
+                "sess-explicit": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                }
+            }
+        )
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            lines = self._release(srv, "sess-explicit", abandoned_slot_id=6)
+
+        assert lines and "slot=6" in lines[0]
+        assert "slot_source=explicit" in lines[0]
+
+    def test_assignment_from_the_dispatch_record(self):
+        srv = _server_stub(
+            records={
+                "sess-assigned": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                    "slot_id": 2,
+                }
+            }
+        )
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            lines = self._release(srv, "sess-assigned")
+
+        assert lines and "slot=2" in lines[0]
+        assert "slot_source=assignment" in lines[0]
+
+    def test_endpoint_wide_when_unresolvable(self):
+        srv = _server_stub(
+            records={
+                "sess-unknown": {
+                    "active": True,
+                    "expires_at": time.monotonic() + 60.0,
+                }
+            }
+        )
+        with patch.dict("proxy.session._slot_owners", {}, clear=True):
+            lines = self._release(srv, "sess-unknown")
+
+        assert lines and "slot_source=endpoint_wide" in lines[0]
+        assert "slot=None" in lines[0]
+
+
+class TestAbandonedSlotEntryScope:
+    """AC: every entry carries its ``scope`` and an unusable id is unresolvable."""
+
+    def test_exact_entry_scope_is_slot(self, clock):
+        from proxy.router_helpers import _record_abandoned_slot
+
+        entry = _record_abandoned_slot(
+            1, endpoint=ENDPOINT, reason="prefill_deadline", now=clock.now
+        )
+        assert entry["scope"] == "slot"
+        assert entry["slot_id"] == 1
+
+    def test_non_integer_identity_records_endpoint_wide(self, clock):
+        """A non-int identity (e.g. a stringified id) is unresolvable, not a
+        slot: it must record the endpoint-wide entry instead of dropping."""
+        from proxy.router_helpers import _record_abandoned_slot
+
+        entry = _record_abandoned_slot(
+            "3",  # type: ignore[arg-type]
+            endpoint=ENDPOINT,
+            reason="client_disconnect",
+            now=clock.now,
+        )
+        assert entry["scope"] == "endpoint"
+        assert entry["slot_id"] is None
+
+    def test_endpoint_wide_lookup_falls_back_across_endpoint_labels(self, clock):
+        from proxy.router_helpers import _abandoned_slot_endpoint_wide
+
+        _record_endpoint_wide(endpoint=None, now=clock.now)
+        assert _abandoned_slot_endpoint_wide(
+            endpoint=ENDPOINT, now=clock.now
+        ) is not None

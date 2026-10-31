@@ -1668,8 +1668,10 @@ async def test_query_slots_reports_outcome_for_definitive_absence():
 # These are the payload-contract assertions; the registry and annotation
 # mechanics are pinned in `test_abandoned_local_dispatch.py`. The assertions
 # that do not hold yet are `xfail(strict=True)` (the repository's red-first
-# convention) so this test-only item lands green; the implementation item
-# LP-0MVUVHB1V006HA5I removes the markers as it turns them green.
+# convention) so the test-only item lands green; the implementation item
+# LP-0MVUVHB1V006HA5I removes the markers as it turns them green. The
+# truthful-status control below already holds now that LP-0MVUVHAQP001IRKK
+# records the endpoint-wide entry, so it runs unmarked.
 # ======================================================================
 
 _ENDPOINT = "local-llama"
@@ -1753,13 +1755,6 @@ async def test_local_abandoned_slots_counts_annotated_slots_not_entries(
     assert j["capacity_hint"] == "abandoned_busy"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "endpoint-wide abandonment annotation is not implemented yet "
-        "(LP-0MVUVHB1V006HA5I)"
-    ),
-)
 @pytest.mark.asyncio
 async def test_endpoint_wide_entry_never_annotates_live_owned_work(
     endpoint_wide_abandonment,

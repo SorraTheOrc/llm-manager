@@ -214,16 +214,27 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         # session owns BEFORE the release frees the assignments (the release
         # below pops the records, the markers and the slot registry entries).
         from proxy.router_helpers import (
-            _abandoned_slot_lookup,
             _close_stream_cm,
-            _record_abandoned_slot,
+            _record_abandoned_identity,
+            _resolve_abandoned_slot_identity,
             _spawn_detached_release,
         )
 
-        abandoned_slots: list[tuple[int | None, str | None]] = []
+        abandoned_slots = []
         for record_endpoint, _record in released_records:
             abandoned_slots.append(
-                (_abandoned_slot_lookup(session_id, record_endpoint), record_endpoint)
+                (
+                    # Resolve the identity while the assignment still exists;
+                    # the record's pin is preferred, and an unresolvable one is
+                    # recorded endpoint-wide rather than dropped
+                    # (LP-0MVUVHAQP001IRKK).
+                    _resolve_abandoned_slot_identity(
+                        session_id,
+                        endpoint=record_endpoint,
+                        record=_record,
+                    ),
+                    record_endpoint,
+                )
             )
         # ``_release_local_dispatch`` holds no upstream handle (it pops the
         # record off the registry), so the pinned ``stream_cm`` — the only
@@ -245,9 +256,10 @@ async def _release_lease_on_session_eviction(session_id: str) -> None:
         # annotated "busy, not ours" instead of reading as live work.
         for stream_cm in upstream_streams:
             _spawn_detached_release(_close_stream_cm(stream_cm))
-        for slot_id, record_endpoint in abandoned_slots:
-            _record_abandoned_slot(
-                slot_id,
+        for identity, record_endpoint in abandoned_slots:
+            _record_abandoned_identity(
+                _srv,
+                identity,
                 session_id=session_id,
                 endpoint=record_endpoint,
                 reason="session_evicted",

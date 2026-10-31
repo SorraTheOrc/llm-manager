@@ -2079,6 +2079,12 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # reason the deadline detour is.
                         _mark_local_dispatch_terminal(request)
                         try:
+                            # LP-0MVUVHAQP001IRKK: forward the pinned slot
+                            # identity and the live upstream stream, exactly as
+                            # the deadline twin does, so this earliest-abort
+                            # path cancels the backend task and annotates the
+                            # abandoned slot instead of relying on a
+                            # post-free session lookup.
                             await _release_measured_cache_abort_dispatch(
                                 srv,
                                 session_id,
@@ -2086,6 +2092,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 request=request,
                                 measured=_abort_measured,
                                 priced_new_tokens=_priced_new_tokens,
+                                abandoned_slot_id=slot_id,
+                                upstream_stream_cm=cm,
                             )
                         except Exception:
                             pass
