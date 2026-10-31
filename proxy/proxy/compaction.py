@@ -796,6 +796,186 @@ def decide_boundary_compaction(
     return result
 
 
+def plan_boundary_compaction_span(
+    messages: list[dict[str, Any]],
+    *,
+    mode: str = "fast",
+    estimate_tokens: TokenEstimator | None = None,
+) -> dict[str, Any]:
+    """Select what a local→remote boundary compaction folds and keeps.
+
+    First half of the boundary planning pair (parent LP-0MVRBQBDF0037OZ5,
+    consumed by ``proxy.router_helpers.evaluate_boundary_compaction``).
+
+    The retention/window rules are identical to ``plan_session_compaction``
+    (system prompts + the very first user prompt kept verbatim, whole recent
+    turns kept while the estimate stays within the mode target, the rest
+    folded into one summary) — but the *trigger* is different, so the
+    planner cannot be reused directly: ``plan_session_compaction`` gates on
+    ``compaction_trigger_ratio``, which ships at ``0`` (assembly-time
+    compaction deliberately disabled, LP-0MU61IRVC003RRN6). Boundary
+    compaction has its own independent knob
+    (``server.remote_boundary_compaction``) and decides via
+    ``decide_boundary_compaction`` before calling this helper.
+
+    This half is deliberately pure and synchronous so the caller can hand
+    ``middle_messages`` to the slot-pinned summariser (whose lease release
+    must happen before the remote dispatch) and then assemble the compacted
+    list with :func:`apply_boundary_compaction_summary`.
+
+    Args:
+        messages: The outgoing history (OpenAI-style role/content).
+        mode: Compaction budget — ``fast``/``medium``/``high`` → the 38 000
+            target, ``low``/``cheap`` (and unknown) → the conservative
+            30 000 target.
+        estimate_tokens: Estimator over a full message list; defaults to the
+            module heuristic (production passes the routing estimator).
+
+    Returns:
+        A dict with ``action`` (``"plan"`` | ``"noop"``), ``reason``,
+        ``retained`` (verbatim retention set), ``recent`` (kept whole turns),
+        ``middle_messages`` (turns to summarise), ``turns_to_summarize``,
+        ``estimated_before``, ``target_tokens`` and ``previous_summary``.
+    """
+    est = estimate_tokens or estimate_session_tokens
+    target = compaction_target_tokens(mode)
+    span: dict[str, Any] = {
+        "mode": mode,
+        "action": "noop",
+        "reason": None,
+        "retained": [],
+        "recent": [],
+        "middle_messages": [],
+        "turns_to_summarize": 0,
+        "estimated_before": int(est(messages) or 0),
+        "target_tokens": target,
+        "previous_summary": None,
+    }
+    if not messages:
+        span["reason"] = "no_messages"
+        return span
+
+    # Retention set: all system prompts + the very first user prompt,
+    # verbatim (the invariant shared with plan_session_compaction).
+    system_msgs = [m for m in messages if m.get("role") == _SYSTEM_ROLE]
+    first_user_idx = next(
+        (i for i, m in enumerate(messages) if m.get("role") == _USER_ROLE),
+        None,
+    )
+    if first_user_idx is None:
+        span["reason"] = "no_user_message"
+        return span
+    first_user_msg = messages[first_user_idx]
+
+    turns = pair_turns(messages[first_user_idx + 1 :])
+    if not turns:
+        span["reason"] = "no_turns_to_compact"
+        return span
+
+    retained = list(system_msgs) + [first_user_msg]
+    placeholder = _summary_message("")
+    accepted: list[list[dict[str, Any]]] = []
+    for turn in reversed(turns):
+        candidate = list(retained) + [placeholder]
+        for kept in accepted:
+            candidate.extend(kept)
+        candidate.extend(turn)
+        if est(candidate) <= target:
+            accepted.append(turn)
+        else:
+            break
+    recent = accepted[::-1]
+
+    middle_turns = turns[: len(turns) - len(recent)]
+    middle_messages = [
+        m for turn in middle_turns for m in turn
+        if not _is_compaction_summary_message(m)
+    ]
+    if not middle_messages:
+        # Everything fits in the recent window — folding nothing adds no
+        # value and would only pay the summariser latency.
+        span["reason"] = "no_turns_to_summarize"
+        span["retained"] = retained
+        span["recent"] = recent
+        return span
+
+    span.update(
+        action="plan",
+        reason="boundary_span_selected",
+        retained=retained,
+        recent=recent,
+        middle_messages=middle_messages,
+        turns_to_summarize=len(middle_turns),
+        previous_summary=extract_previous_summary(messages),
+    )
+    return span
+
+
+def apply_boundary_compaction_summary(
+    span: dict[str, Any],
+    summary_text: str,
+    *,
+    estimate_tokens: TokenEstimator | None = None,
+) -> dict[str, Any]:
+    """Assemble the compacted history from a boundary summary.
+
+    Second half of the boundary planning pair: takes the span selected by
+    :func:`plan_boundary_compaction_span` and the summary the slot-pinned
+    summariser produced, and returns the list the remote dispatcher sends.
+
+    A blank / non-string summary — including the fail-open
+    :class:`EmptySummary` sentinel — is never injected (an empty marker would
+    silently drop the folded turns): the result is ``action="noop"`` with
+    ``reason="empty_summary"`` so the caller leaves the outgoing body
+    byte-identical and logs the skip.
+
+    Args:
+        span: Result of :func:`plan_boundary_compaction_span`.
+        summary_text: Summary produced for ``span["middle_messages"]``.
+        estimate_tokens: Estimator over a full message list; defaults to the
+            module heuristic.
+
+    Returns:
+        A dict with ``action`` (``"compact"`` | ``"noop"``), ``reason``,
+        ``messages`` (compacted list, or ``None``), ``summary_text``,
+        ``estimated_before``, ``estimated_after``, ``turns_summarized`` and
+        ``recent_turns_kept``.
+    """
+    est = estimate_tokens or estimate_session_tokens
+    out: dict[str, Any] = {
+        "action": "noop",
+        "reason": None,
+        "messages": None,
+        "summary_text": None,
+        "estimated_before": int(span.get("estimated_before", 0) or 0),
+        "estimated_after": int(span.get("estimated_before", 0) or 0),
+        "turns_summarized": 0,
+        "recent_turns_kept": 0,
+    }
+    if span.get("action") != "plan":
+        out["reason"] = span.get("reason") or "no_span"
+        return out
+    if not isinstance(summary_text, str) or not summary_text.strip():
+        out["reason"] = "empty_summary"
+        return out
+
+    compacted = (
+        list(span["retained"])
+        + [_summary_message(summary_text)]
+        + [m for turn in span["recent"] for m in turn]
+    )
+    out.update(
+        action="compact",
+        reason="boundary_compacted",
+        messages=compacted,
+        summary_text=summary_text,
+        estimated_after=int(est(compacted) or 0),
+        turns_summarized=int(span.get("turns_to_summarize", 0) or 0),
+        recent_turns_kept=len(span["recent"]),
+    )
+    return out
+
+
 def plan_session_compaction(
     messages: list[dict[str, Any]],
     config: dict,

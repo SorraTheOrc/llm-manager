@@ -11963,6 +11963,19 @@ async def _proxy_with_remote_fallback_cycle(
                     **_budget_diagnostics(_budget),
                 )
 
+            # Local→remote boundary compaction (LP-0MVTDUBR00038ZRL): a
+            # session that was already served locally sends its compacted
+            # history upstream. Gated, idempotent per request and fail-open —
+            # on any skip the body is dispatched unchanged.
+            await _evaluate_boundary_compaction_for_remote(
+                request,
+                provider_name,
+                provider_cfg,
+                body_json,
+                _budget_session_id,
+                config,
+            )
+
             response = await ptr(request, path, provider_cfg)
             _maybe_record_provider_affinity(
                 provider_cfg, _budget_session_id, response, config,
@@ -12379,6 +12392,70 @@ async def _evaluate_compaction_for_bypass(
             "(provider=%s session=%s)",
             provider_name,
             str(session_id or "")[:8],
+            exc_info=True,
+        )
+        return outcome
+
+
+async def _evaluate_boundary_compaction_for_remote(
+    request,
+    provider_name: str,
+    provider_cfg: dict,
+    body_json: dict,
+    session_id: str | None,
+    config: dict,
+) -> dict:
+    """Evaluate local→remote boundary compaction before a remote POST.
+
+    LP-0MVTDUBR00038ZRL (parent AC1/AC3/AC4): called by **both** remote
+    dispatch points (``_proxy_with_remote_fallback_cycle`` for remote-only
+    chains and ``_proxy_with_fallback_cycle`` for mixed local+remote chains)
+    immediately before the remote dispatcher runs. Delegates to the single
+    implementation in
+    :func:`proxy.router_helpers.evaluate_boundary_compaction`, which owns the
+    gating, the slot-pinned summarisation, the body rewrite and the
+    structured ``boundary_compaction`` event.
+
+    Fail-open twice over: the helper never raises, and any error surfacing
+    here is logged and swallowed so routing continues with today's history.
+
+    Args:
+        request: The incoming request (idempotence flag + cached body).
+        provider_name: Provider entry name, for the failure log line.
+        provider_cfg: The provider entry about to be dispatched.
+        body_json: Parsed outgoing body (mutated on successful compaction).
+        session_id: Resolved session id (None disables the hook).
+        config: Server configuration dict.
+
+    Returns:
+        The outcome dict from the helper, or a no-op outcome on failure.
+    """
+    outcome: dict[str, Any] = {
+        "evaluated": False,
+        "applied": False,
+        "reason": None,
+        "messages": None,
+    }
+    if not session_id:
+        return outcome
+    try:
+        import proxy.server as _server
+        from proxy.router_helpers import evaluate_boundary_compaction
+
+        return await evaluate_boundary_compaction(
+            _server,
+            config,
+            body_json,
+            session_id,
+            provider_cfg,
+            request=request,
+        )
+    except Exception:
+        logger.warning(
+            "boundary_compaction_failed provider=%s session=%s; dispatching "
+            "the history unchanged",
+            provider_name,
+            str(session_id)[:8],
             exc_info=True,
         )
         return outcome
@@ -13685,6 +13762,18 @@ async def _proxy_with_fallback_cycle(
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                         **_budget_diagnostics(_budget),
                     )
+
+                # Local→remote boundary compaction (LP-0MVTDUBR00038ZRL): same
+                # hook as the remote-only cycle, at the mixed chain's remote
+                # dispatch point.
+                await _evaluate_boundary_compaction_for_remote(
+                    request,
+                    provider_name,
+                    provider_cfg,
+                    body_json,
+                    _session_id,
+                    config,
+                )
 
                 response = await ptr_remote(request, path, provider_cfg)
                 _maybe_record_provider_affinity(

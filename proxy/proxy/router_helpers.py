@@ -4164,6 +4164,37 @@ BOUNDARY_REASON_COMPACT = "boundary_compact"
 BOUNDARY_REASON_NO_SLOT = "boundary_no_slot"
 BOUNDARY_REASON_SLOT_UNAVAILABLE = "boundary_slot_unavailable"
 BOUNDARY_REASON_SUMMARIZER_FAILED = "boundary_summarizer_failed"
+#: Decision outcomes (``decide_boundary_compaction``) — normal skips, logged
+#: at INFO because they are the shipped-steady-state (knob off) behaviour.
+BOUNDARY_REASON_DISABLED = "boundary_disabled"
+BOUNDARY_REASON_NOT_REMOTE = "boundary_not_remote"
+BOUNDARY_REASON_NO_LOCAL_PROVENANCE = "boundary_no_local_provenance"
+#: Skip reasons that are worth a WARNING: a session that *should* have been
+#: compacted was not.
+BOUNDARY_REASON_BELOW_GUARD = "boundary_below_guard"
+#: Idempotence guard — the boundary was already evaluated for this request.
+BOUNDARY_REASON_ALREADY_EVALUATED = "already_evaluated"
+#: The hook itself failed; the request proceeds remote untouched.
+BOUNDARY_REASON_EVALUATION_FAILED = "boundary_evaluation_failed"
+
+#: Reasons ``summarise_on_session_slot`` already emits a WARNING for — the
+#: hook must not warn twice for the same skip (AC3: *one* WARNING with the
+#: token per skip).
+_BOUNDARY_HELPER_WARNING_REASONS = frozenset(
+    {
+        BOUNDARY_REASON_NO_SLOT,
+        BOUNDARY_REASON_SLOT_UNAVAILABLE,
+        BOUNDARY_REASON_SUMMARIZER_FAILED,
+    }
+)
+#: Skip reasons the hook itself logs at WARNING.
+_BOUNDARY_WARNING_REASONS = frozenset(
+    {
+        BOUNDARY_REASON_BELOW_GUARD,
+        BOUNDARY_REASON_EVALUATION_FAILED,
+    }
+    | _BOUNDARY_HELPER_WARNING_REASONS
+)
 
 
 def _log_boundary_event(srv, level: str, message: str, **fields) -> None:
@@ -4281,7 +4312,14 @@ async def summarise_on_session_slot(
                     cfg, slot_id, llama_port=llama_port
                 )
             try:
-                text = summarizer(messages)
+                # Run in a worker thread: the pinned local call blocks until
+                # the slot is free (bounded by ``compaction_summarizer_timeout``)
+                # and this runs *before* the remote dispatch, so an inline
+                # call would freeze the event loop — including the very
+                # stream whose slot we may be waiting on
+                # (LP-0MU1RXEY10075TUU, the same reason
+                # ``evaluate_and_apply_compaction`` uses ``asyncio.to_thread``).
+                text = await asyncio.to_thread(summarizer, messages)
             except httpx.TransportError:
                 # Connection-level failure: the pinned slot could not be
                 # reached at all.
@@ -4348,6 +4386,375 @@ async def summarise_on_session_slot(
         "reason": reason,
         "released": released,
     }
+
+
+def _boundary_request_evaluated(request) -> bool:
+    """True when the boundary was already evaluated for *request*.
+
+    The per-request idempotence gate (matching the assembly path's
+    ``result["compaction_evaluated"]``): a boundary compaction summarises
+    once per request cycle, never once per provider attempt. Stored on the
+    request object, which both remote dispatch cycles share across their
+    provider/chain-hold retries.
+    """
+    return bool(getattr(request, "_boundary_compaction_evaluated", False))
+
+
+def _mark_boundary_request_evaluated(request) -> None:
+    """Record that the boundary decision for *request* has been taken."""
+    try:
+        request._boundary_compaction_evaluated = True
+    except Exception:
+        pass
+
+
+async def evaluate_boundary_compaction(
+    srv,
+    config: dict | None,
+    body_json: dict,
+    session_id: str | None,
+    provider_cfg: Mapping[str, Any] | None,
+    *,
+    request: Request | None = None,
+    estimated_tokens: int | None = None,
+    session_manager: Any | None = None,
+    summarizer_builder: Any | None = None,
+    estimate_tokens: Any | None = None,
+    endpoint: str | None = None,
+    mode: str = "fast",
+) -> dict:
+    """Compact a locally-served session's history before a remote dispatch.
+
+    The single local→remote boundary hook (LP-0MVTDUBR00038ZRL) called by
+    both remote dispatch points in ``proxy.provider`` and by ``proxy.ui``'s
+    direct remote dispatches, immediately before the remote POST. It consumes
+    the pieces the earlier children provide:
+
+    1. :func:`proxy.compaction.decide_boundary_compaction` — the gates
+       (knob, ``type: remote``, recorded local provenance, size guard).
+    2. :func:`proxy.compaction.plan_boundary_compaction_span` — what to fold
+       and what to keep verbatim.
+    3. :func:`summarise_on_session_slot` — the slot-pinned summariser plus
+       the immediate lease release.
+    4. :func:`proxy.compaction.apply_boundary_compaction_summary` — the
+       compacted message list, injected into the outgoing body.
+
+    **Why not ``evaluate_and_apply_compaction``?** That helper is gated by
+    ``compaction_trigger_ratio``, which ships at ``0`` (assembly-time
+    compaction deliberately disabled, LP-0MU61IRVC003RRN6), so it can never
+    fire for a boundary session. Reusing it would require re-enabling the
+    operator's kill-switch. The boundary path therefore calls
+    ``decide_boundary_compaction`` directly and owns its own trigger, while
+    reusing the same planning primitives (retention set, recent window,
+    summary marker), the same per-request idempotence discipline and the same
+    session-history writes.
+
+    Success rewrites ``body_json["messages"]`` in place, sets
+    ``cache_prompt`` (the compacted prefix no longer matches the client's
+    history — a full prompt must be sent) and refreshes the cached
+    ``request._body`` so the remote dispatcher forwards the compacted list.
+    The compacted history is also stored on the session
+    (``update_messages`` + ``mark_compacted``), inheriting the
+    post-compaction delta heal (LP-0MTXEED8E003EDM8). ``outcome`` is
+    mirrored onto ``request._boundary_compaction_result`` so response header
+    bridges can surface it.
+
+    Fail-open, never lossy: every skip and failure — knob off, non-remote
+    provider, no provenance, below the guard, no assigned slot, unreachable
+    slot, blank / ``EmptySummary`` / raising summariser, or an exception in
+    this helper — leaves the outgoing body byte-identical and lets the
+    remote dispatch proceed. There is no remote summariser fallback
+    (parent Appendix Q3).
+
+    Idempotent per request cycle: the request-level
+    ``_boundary_compaction_evaluated`` flag makes a second call a no-op, so
+    a provider retry never re-summarises (exactly one summarisation per
+    request).
+
+    Costs are only paid when the gates pass: the knob and provider-type
+    checks run before the provenance read and the token estimate, so the
+    shipped default (knob off) adds no measurable work per request.
+
+    Args:
+        srv: Server object (``config`` fallback, ``logger``, and — unless
+            ``session_manager`` is passed — ``session_manager``).
+        config: Proxy config (flat or nested ``server``); defaults to
+            ``srv.config``.
+        body_json: Parsed outgoing request body (mutated on success).
+        session_id: Session whose history is compacted.
+        provider_cfg: Provider entry about to be dispatched (``type``).
+        request: The incoming request; carries the idempotence flag and the
+            cached body that the dispatcher reads.
+        estimated_tokens: Pre-computed estimate of the outgoing history;
+            computed here when omitted.
+        session_manager: Session store; defaults to ``srv.session_manager``.
+        summarizer_builder: Optional ``Callable[[int], Summarizer]`` forwarded
+            to :func:`summarise_on_session_slot` (tests inject fakes).
+        estimate_tokens: Optional estimator over a full message list;
+            defaults to the routing estimator (production) — tests inject a
+            deterministic one.
+        endpoint: Optional per-endpoint local llama-server URL.
+        mode: Compaction budget (default ``fast``).
+
+    Returns:
+        The outcome dict: ``evaluated``, ``applied``, ``reason``, ``slot_id``,
+        ``estimated_before``, ``estimated_after``, ``turns_summarized``,
+        ``recent_turns_kept``, ``summary_text``, ``messages`` and
+        ``duration_ms``. Never raises.
+    """
+    started = time.monotonic()
+    outcome: dict[str, Any] = {
+        "evaluated": False,
+        "applied": False,
+        "reason": None,
+        "slot_id": None,
+        "estimated_before": 0,
+        "estimated_after": 0,
+        "turns_summarized": 0,
+        "recent_turns_kept": 0,
+        "summary_text": None,
+        "messages": None,
+        "duration_ms": 0.0,
+    }
+
+    def _emit(level: str, **fields: Any) -> None:
+        """Emit the ONE structured boundary line for this evaluation (AC4)."""
+        outcome["duration_ms"] = round((time.monotonic() - started) * 1000.0, 1)
+        _log_boundary_event(
+            srv,
+            level,
+            "boundary_compaction",
+            session=session_id or "unknown",
+            provider=_provider_name(provider_cfg),
+            slot=outcome["slot_id"],
+            est_before=outcome["estimated_before"],
+            est_after=outcome["estimated_after"],
+            turns_summarized=outcome["turns_summarized"],
+            recent_turns_kept=outcome["recent_turns_kept"],
+            duration_ms=outcome["duration_ms"],
+            outcome=outcome["reason"],
+            **fields,
+        )
+
+    def _finish(reason: str, *, record: bool = True) -> dict:
+        outcome["reason"] = reason
+        if record:
+            outcome["evaluated"] = True
+            level = (
+                "warning"
+                if reason in _BOUNDARY_WARNING_REASONS
+                and reason not in _BOUNDARY_HELPER_WARNING_REASONS
+                else "info"
+            )
+            _emit(level)
+            if request is not None:
+                try:
+                    request._boundary_compaction_result = {
+                        k: v for k, v in outcome.items() if k != "messages"
+                    }
+                except Exception:
+                    pass
+        return outcome
+
+    try:
+        cfg = config if isinstance(config, dict) else None
+        if cfg is None:
+            srv_config = getattr(srv, "config", None)
+            cfg = srv_config if isinstance(srv_config, dict) else {}
+        server_cfg = cfg.get("server") if isinstance(cfg.get("server"), dict) else {}
+
+        # --- Cheap gates first: no provenance read, no estimate, no
+        # summariser unless boundary compaction could possibly apply.
+        from proxy.provider import compaction_config
+
+        if not bool(compaction_config(cfg)["remote_boundary_compaction"]):
+            return _finish(BOUNDARY_REASON_DISABLED, record=False)
+        provider_type = str(
+            (provider_cfg or {}).get("type") if isinstance(provider_cfg, Mapping) else ""
+        ).strip().lower()
+        if provider_type != "remote":
+            return _finish(BOUNDARY_REASON_NOT_REMOTE, record=False)
+        if not session_id:
+            return _finish("boundary_no_session", record=False)
+        if _boundary_request_evaluated(request):
+            return _finish(BOUNDARY_REASON_ALREADY_EVALUATED, record=False)
+
+        # From here on the decision is taken: never re-evaluate this cycle.
+        _mark_boundary_request_evaluated(request)
+
+        messages = (
+            body_json.get("messages") if isinstance(body_json, dict) else None
+        )
+        if not isinstance(messages, list) or not messages:
+            # Non-chat routes (``v1/embeddings``, completions without a message
+            # list) carry no history to compact: skip silently rather than log
+            # a below-guard WARNING for traffic the feature never applies to.
+            return _finish("boundary_no_history", record=False)
+
+        manager = (
+            session_manager
+            if session_manager is not None
+            else getattr(srv, "session_manager", None)
+        )
+        has_provenance = False
+        if manager is not None:
+            try:
+                has_provenance = bool(
+                    await manager.has_local_provenance(session_id)
+                )
+            except Exception:
+                has_provenance = False
+
+        from proxy.compaction import decide_boundary_compaction
+
+        estimate = (
+            estimate_tokens
+            if callable(estimate_tokens)
+            else _boundary_estimator(body_json, server_cfg)
+        )
+        if estimated_tokens is None:
+            try:
+                estimated_tokens = int(estimate(list(messages or [])) or 0)
+            except Exception:
+                estimated_tokens = 0
+        outcome["estimated_before"] = int(estimated_tokens or 0)
+
+        decision = decide_boundary_compaction(
+            provider_type=provider_type,
+            has_local_provenance=has_provenance,
+            estimated_tokens=outcome["estimated_before"],
+            config=cfg,
+        )
+        if not decision["should_compact"]:
+            return _finish(decision["reason"] or "boundary_not_compacted")
+
+        from proxy.compaction import plan_boundary_compaction_span
+
+        span = plan_boundary_compaction_span(
+            list(messages or []), mode=mode, estimate_tokens=estimate
+        )
+        outcome["estimated_before"] = int(span.get("estimated_before", 0) or 0)
+        if span.get("action") != "plan":
+            return _finish(span.get("reason") or "boundary_not_compacted")
+
+        summarised = await summarise_on_session_slot(
+            srv,
+            session_id,
+            span["middle_messages"],
+            config=cfg,
+            summarizer_builder=summarizer_builder,
+            endpoint=endpoint,
+        )
+        outcome["slot_id"] = summarised.get("slot_id")
+        if not summarised.get("summary"):
+            # The helper already warned with the machine-readable token
+            # (boundary_no_slot / boundary_slot_unavailable /
+            # boundary_summarizer_failed); this line is the AC4 record.
+            return _finish(
+                summarised.get("reason") or BOUNDARY_REASON_SUMMARIZER_FAILED,
+                record=True,
+            )
+
+        from proxy.compaction import apply_boundary_compaction_summary
+
+        plan = apply_boundary_compaction_summary(
+            span, summarised["summary"], estimate_tokens=estimate
+        )
+        if plan["action"] != "compact":
+            return _finish(plan.get("reason") or BOUNDARY_REASON_SUMMARIZER_FAILED)
+
+        # --- Apply: the compacted list is what the remote dispatcher sends.
+        body_json["messages"] = list(plan["messages"])
+        body_json["cache_prompt"] = True
+        body_json["session_id"] = session_id
+        if request is not None:
+            try:
+                request._body = json.dumps(body_json).encode("utf-8")
+            except Exception:
+                # The body refresh is best-effort: a synthetic request
+                # without a writable body still gets the parsed rewrite, and
+                # the dispatch itself reads through ``request.body()``.
+                pass
+
+        outcome.update(
+            applied=True,
+            estimated_after=int(plan.get("estimated_after", 0) or 0),
+            turns_summarized=int(plan.get("turns_summarized", 0) or 0),
+            recent_turns_kept=int(plan.get("recent_turns_kept", 0) or 0),
+            summary_text=plan.get("summary_text"),
+            messages=list(plan["messages"]),
+        )
+
+        # Persist the compacted history so the next request's routing estimate
+        # and the delta heal see the same history the remote provider saw.
+        if manager is not None:
+            try:
+                await manager.update_messages(session_id, list(plan["messages"]))
+                await manager.mark_compacted(
+                    session_id,
+                    len(messages or []),
+                    len(plan["messages"]),
+                )
+            except Exception:
+                pass  # non-fatal: dispatch still sends the compacted body
+
+        return _finish(BOUNDARY_REASON_COMPACT)
+    except Exception as exc:  # never raise into the dispatch loop
+        outcome["applied"] = False
+        outcome["reason"] = BOUNDARY_REASON_EVALUATION_FAILED
+        try:
+            _emit("warning", error=type(exc).__name__)
+        except Exception:
+            pass
+        return outcome
+
+
+def _provider_name(provider_cfg: Mapping[str, Any] | None) -> str:
+    """Best-effort provider label for boundary log lines."""
+    if not isinstance(provider_cfg, Mapping):
+        return "unknown"
+    return str(
+        provider_cfg.get("name")
+        or provider_cfg.get("provider")
+        or provider_cfg.get("model")
+        or "unknown"
+    )
+
+
+def _boundary_estimator(body_json: dict, server_cfg: dict):
+    """Return a token estimator over a full message list (routing parity).
+
+    Resolved once per evaluation so the decision, the span selection and the
+    post-compaction estimate all price the history with the same tokenizer
+    (the same parity contract ``evaluate_and_apply_compaction`` keeps with
+    routing, LP-0MU5A84YU003YOTY). Falls back to tiktoken via
+    ``_estimate_prompt_tokens_for_routing``.
+    """
+    from proxy.provider import (
+        _estimate_prompt_tokens_for_routing,
+        _get_tokenizer_for_model,
+    )
+
+    model_cfg: dict = {}
+    try:
+        model_name = body_json.get("model") if isinstance(body_json, dict) else None
+        if model_name:
+            from proxy.lifecycle import get_model_config
+
+            model_cfg = get_model_config(model_name) or {}
+    except Exception:
+        model_cfg = {}
+    tokenizer, _multiplier = _get_tokenizer_for_model(model_cfg, server_cfg)
+
+    def estimate(msgs) -> int:
+        return int(
+            _estimate_prompt_tokens_for_routing(
+                {"messages": msgs}, tokenizer=tokenizer
+            )
+            or 0
+        )
+
+    return estimate
 
 
 async def _release_unserved_dispatch(
