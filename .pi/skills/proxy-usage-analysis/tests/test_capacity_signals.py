@@ -1236,3 +1236,187 @@ class TestHintDivergence:
         assert nightly.saturated_without_live_work == 2
         assert nightly.violation_share_of_polls == round(2 / 6, 4)
         assert nightly.violation_share_of_saturated == 0.5
+
+
+# ---------------------------------------------------------------------------
+# AC3 — reproduction of the recorded 2026-10-24 post-fix night
+# (LP-0MVU8OA1A002GTN0)
+# ---------------------------------------------------------------------------
+
+#: Live log directory the cron reads, and the exact directory the reference
+#: tool measured the recorded night from.
+RECORDED_LOG_DIR = Path("/var/log/llama-proxy")
+
+#: The recorded artifact this item reproduces (work item LP-0MVOG6YRA000T9PK).
+RECORDED_ARTIFACT = (
+    Path.home()
+    / "proxy-usage-reports"
+    / "2026-10-24_post-fix-night-measurement"
+    / "measurement.json"
+)
+
+POST_FIX_START = datetime(2026, 10, 24, 20, 0, 0)
+POST_FIX_END = datetime(2026, 10, 25, 7, 0, 0)
+
+#: Transcription of the recorded figures — deliberately **not** re-derived by
+#: the code under test. Provenance:
+#: ``~/proxy-usage-reports/2026-10-24_post-fix-night-measurement/measurement.json``
+#: (``meta.tool = scripts/capacity_signal_verification.py``,
+#: ``meta.work_item = LP-0MVOG6YRA000T9PK``, ``meta.generated_at =
+#: 2026-10-28T00:24:41``, ``coverage.covered = true``), measured on log schema 3
+#: and re-verified during the LP-0MVLNBCTN0084MT0 audit. A future re-baseline is
+#: therefore deliberate: change this constant *and* the provenance above.
+RECORDED_NIGHT_FIGURES = {
+    "status_polls": 11654,
+    "slots_stale": 9278,
+    "slots_stale_denominator": 11654,
+    "slots_stale_rate": 0.7961,
+    "hints": {"idle": 4577, "prefill_bound": 6024, "saturated": 1053},
+    "saturated_without_live_work": 247,
+}
+
+
+def _skip_reason_for_recorded_window(reference_tool) -> str | None:
+    """``None`` when the recorded window is still measureable, else why not.
+
+    Retention is a host fact, not a property of the code: the window has to
+    still be present in ``/var/log/llama-proxy`` and free of adjacent-file
+    gaps. The check uses the reference tool's own coverage model, so "skipped"
+    always means "the evidence is gone", never "the assertion was inconvenient"
+    (AC3.2).
+    """
+    if not RECORDED_LOG_DIR.is_dir():
+        return f"{RECORDED_LOG_DIR} is absent on this host"
+    # ``window_closed=True`` because the recorded window has fully elapsed: a
+    # long tail hole is a real coverage gap for it, exactly as the reference
+    # tool measured it with ``--window-closed``.
+    coverage = reference_tool.measure_coverage(
+        RECORDED_LOG_DIR,
+        since=POST_FIX_START,
+        until=POST_FIX_END,
+        window_closed=True,
+    )
+    if not coverage["covered"]:
+        return (
+            "the 2026-10-24 20:00 → 2026-10-25 07:00 window has rotated out of "
+            f"the retained logs ({len(coverage['spans'])} file span(s), "
+            f"{len(coverage['gaps'])} gap(s))"
+        )
+    return None
+
+
+class TestRecordedNightFixture:
+    """The transcribed figures must still match the recorded artifact."""
+
+    def test_fixture_matches_the_recorded_artifact(self):
+        if not RECORDED_ARTIFACT.is_file():
+            pytest.skip(f"recorded artifact {RECORDED_ARTIFACT} is not on this host")
+
+        metrics = json.loads(RECORDED_ARTIFACT.read_text(encoding="utf-8"))["metrics"]
+
+        assert metrics["status_polls"] == RECORDED_NIGHT_FIGURES["status_polls"]
+        assert (
+            metrics["slots_stale"]["count"]
+            == RECORDED_NIGHT_FIGURES["slots_stale"]
+        )
+        assert (
+            metrics["slots_stale"]["denominator"]
+            == RECORDED_NIGHT_FIGURES["slots_stale_denominator"]
+        )
+        assert (
+            metrics["slots_stale"]["rate"]
+            == RECORDED_NIGHT_FIGURES["slots_stale_rate"]
+        )
+        assert (
+            metrics["capacity_hint"]["histogram"]
+            == RECORDED_NIGHT_FIGURES["hints"]
+        )
+        assert (
+            metrics["saturated_without_live_work"]["count"]
+            == RECORDED_NIGHT_FIGURES["saturated_without_live_work"]
+        )
+
+
+class TestRecordedNightReproduction:
+    """The nightly pipeline reproduces the recorded night, or says why not."""
+
+    def test_nightly_pipeline_reproduces_the_recorded_night(
+        self, reference_tool, tmp_path
+    ):
+        reason = _skip_reason_for_recorded_window(reference_tool)
+        if reason is not None:
+            pytest.skip(reason)
+
+        run = reporting.run_analysis(
+            log_dir=RECORDED_LOG_DIR,
+            window_start=POST_FIX_START,
+            window_end=POST_FIX_END,
+            output_dir=tmp_path,
+        )
+        signals = run.summary.capacity_signals
+
+        assert signals.status_polls == RECORDED_NIGHT_FIGURES["status_polls"]
+        assert signals.slots_stale == RECORDED_NIGHT_FIGURES["slots_stale"]
+        assert (
+            signals.slots_stale_denominator
+            == RECORDED_NIGHT_FIGURES["slots_stale_denominator"]
+        )
+        assert signals.slots_stale_rate == RECORDED_NIGHT_FIGURES["slots_stale_rate"]
+        assert signals.hints.counts == RECORDED_NIGHT_FIGURES["hints"]
+        assert (
+            signals.hints.saturated_without_live_work
+            == RECORDED_NIGHT_FIGURES["saturated_without_live_work"]
+        )
+
+
+class TestReproductionWindowBoundary:
+    """AC3.4 — the half-open window the reproduction depends on.
+
+    A poll timestamped exactly at ``window_end`` is excluded and one exactly at
+    ``window_start`` is included, so a re-run of the recorded command can never
+    double-count the boundary poll into the adjacent window. The millisecond
+    poll either side of the boundary pins that the rule bites at the instant,
+    not a whole second early.
+    """
+
+    LINES = [
+        _schema3("2026-10-24 19:59:59,999", stale=False),  # before start
+        _schema3("2026-10-24 20:00:00,000", stale=True),  # exactly the start
+        _schema3("2026-10-25 06:59:59,999", stale=False),  # last instant inside
+        _schema3("2026-10-25 07:00:00,000", stale=True),  # exactly the end
+    ]
+
+    def test_boundary_polls_are_half_open(self, tmp_path):
+        signals = _aggregate(
+            _write_log(tmp_path, self.LINES),
+            window_start=POST_FIX_START,
+            window_end=POST_FIX_END,
+        ).capacity_signals
+
+        assert signals.status_polls == 2
+        assert signals.slots_stale == 1
+        assert signals.slots_stale_denominator == 2
+        assert signals.slots_stale_rate == 0.5
+        assert signals.first_poll_ts == POST_FIX_START
+        assert signals.last_poll_ts == datetime(2026, 10, 25, 6, 59, 59, 999000)
+
+    def test_the_shared_rule_agrees_with_the_aggregation(self, tmp_path):
+        """Both surfaces apply the same ``[start, end)`` rule to the boundary."""
+        signals = _aggregate(
+            _write_log(tmp_path, self.LINES),
+            window_start=POST_FIX_START,
+            window_end=POST_FIX_END,
+        ).capacity_signals
+
+        inside = [
+            capacity_signals.in_window(ts, POST_FIX_START, POST_FIX_END)
+            for ts in (
+                datetime(2026, 10, 24, 19, 59, 59, 999000),
+                POST_FIX_START,
+                datetime(2026, 10, 25, 6, 59, 59, 999000),
+                POST_FIX_END,
+            )
+        ]
+
+        assert inside == [False, True, True, False]
+        assert sum(inside) == signals.status_polls
