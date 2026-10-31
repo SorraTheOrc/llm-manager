@@ -284,11 +284,43 @@ hand and cross-checking two surfaces:
   disagree. Status polls are aggregated with the reference tool's half-open
   `[window_start, window_end)` window, so a poll exactly at the window end
   belongs to the next night.
+- **Standalone equivalent.** For an ad-hoc window — or to cross-check a night
+  — run the same derivation without the rest of the report:
+  `python3 scripts/capacity_signal_verification.py --since '<start>' --until
+  '<end>' --window-closed --json`. Its docstring ("Derivation of every emitted
+  figure") and the module docstring of `scripts/lib/capacity_signals.py` are
+  the **source of truth** for the wording used above; the two must never
+  describe the same rule differently.
 - **Unattended safety.** The section is **omitted** (no heading, no zero-fill)
   when the window has no status polls, so an empty window — or a log directory
   with no logs at all — renders a clean report and the 05:00 cron exits 0. In
   that case `--json` reports `capacity_signals.slots_stale.passed: null`
-  rather than a misleading `true`.
+  rather than a misleading `true`. The capacity-signal work added **no
+  network call, no LLM call and no interactive prompt** to the pipeline: the
+  figures are derived from the same log lines the report already parses, and
+  the optional Prometheus GPU row keeps its pre-existing best-effort
+  behaviour (fail-soft, never a cron failure).
+
+### Overriding the stale-rate target on the cron line
+
+`--stale-rate-target` is the only knob: it changes the rendered met/unmet
+outcome **and** `--json`'s `capacity_signals.slots_stale.passed` /
+`capacity_signals.targets`, so a new target needs no code change. Put it on the
+cron line (the daily job otherwise uses the `0.05` default):
+
+```cron
+0 5 * * * cd /home/rgardler/projects/llm && python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py --stale-rate-target 0.10 >> ~/proxy-usage-reports/cron.log 2>&1
+```
+
+Equivalently, for a one-off re-run over an arbitrary window, pass the same flag
+together with `--start` / `--end`:
+
+```bash
+cd /home/rgardler/projects/llm
+python3 .pi/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
+  --start '2026-10-24 20:00:00' --end '2026-10-25 07:00:00' \
+  --output-dir ~/proxy-usage-reports/recheck --stale-rate-target 0.10 --json
+```
 
 `--json` exposes the same figures under `capacity_signals.slots_stale`
 (`status_polls`, `count`, `denominator`, `rate`, `target`, `passed`), plus

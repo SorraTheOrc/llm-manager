@@ -227,7 +227,10 @@ Outputs written to:
     denials happened?" without parsing Markdown.
 - **Local capacity signals key (LP-0MVU8O4EL005IYP9).** One additive key
   mirrors the **Local capacity signals** section, so automation reads exactly
-  what the Markdown shows:
+  what the Markdown shows. The pre-existing count-only keys are **unchanged**
+  by it: `status_capacity_hint` (the payload's own claim over the denial
+  window) and `denial_attribution.capacity_hint` keep their current meaning,
+  and the new block below is an addition beside them, not a replacement.
   - `capacity_signals.slots_stale` — `{status_polls, count, denominator, rate,
     target, passed}`: the status-poll count, the polls with
     `slots_stale=true`, the denominator (polls that carry the `slots_stale`
@@ -373,9 +376,16 @@ Outputs written to:
   polls, polls with `slots_stale=true`, the schema-aware denominator, the rate,
   the configurable target (`--stale-rate-target`, default < 5 %) and an
   explicit met/unmet outcome, with the excluded schema-1 poll count stated —
+  plus (LP-0MVU8O9OC005YQU1) the `capacity_hint` distribution with counts and
+  shares (an unexpected token keeps its own row), the
+  `saturated`-without-live-work count with its share of polls and of
+  `saturated` polls, a one-line verdict naming each missed target, and the
+  retained-log coverage caveat that labels a truncated window **partial** —
   derived by the same implementation as
   `scripts/capacity_signal_verification.py` and exposed as
-  `--json`'s `capacity_signals.slots_stale`, then
+  `--json`'s `capacity_signals` block (`slots_stale`, `capacity_hint`,
+  `saturated_without_live_work`, `targets`, `coverage`,
+  `all_targets_met`), then
   **Admission verdicts by rate bucket and prompt band** (LP-0MVS9YKHL007UBBZ,
   when the window has any `local_admission_guard` decision): the admit/reject
   verdicts split by the pricing `rate_bucket` (`contended` / `solitary` /
