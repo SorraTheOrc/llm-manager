@@ -705,3 +705,72 @@ class TestSessionSlotMaxPromptDerivation:
         # Estimate path may use cl100k on the 640K-char string — allow either
         # outcome documented by logging; we assert the per-slot fallback math.
         assert provider_mod is not None
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVTV6F65005HKQZ AC4 — pin the cap derivation across geometries
+# ---------------------------------------------------------------------------
+# The ratio keys are retired (0) in the shipped config, so the cap resolves to
+# 0 (disabled) today. If a ratio is re-enabled the cap must resolve to the
+# PINNED value below at both geometries, never to an unpinned number.
+
+#: ``mode -> pinned cap`` for ratio 0.5 against the shipped routing geometry.
+_PINNED_HALF_RATIO_CAP: dict[str, int] = {"fast": 60000, "cheap": 60000}
+
+
+class TestHardRoutingCapGeometryDerivation:
+    """LP-0MVTV6F65005HKQZ AC4: the hard-routing cap is
+    ``round(ratio x min(warm config, per-slot clamp))`` and the warm config
+    (120000) is the smaller term at BOTH 1 and 2 slots, so the cap is
+    geometry-invariant for a given ratio — pinned at 60000 for ratio 0.5."""
+
+    @pytest.mark.parametrize("slots", [1, 2])
+    def test_ratio_half_cap_pinned_per_geometry(self, provider_mod, slots):
+        """AC4: ratio 0.5 resolves to the pinned 60000 at 1 and at 2 slots, and
+        the effective warm ceiling clamps down to that same cap."""
+        from config_test_utils import geometry_config
+
+        config = geometry_config(slots)
+        for mode in ("fast", "cheap"):
+            config["server"][f"local_hard_routing_cap_ratio_{mode}"] = 0.5
+
+        for mode in ("fast", "cheap"):
+            cap = provider_mod.compute_hard_routing_cap(mode, config)
+            expected = _PINNED_HALF_RATIO_CAP[mode]
+            assert cap == expected, (
+                f"hard-routing cap ({mode}) @{slots} slot(s) "
+                f"(ctx=262144, ratio=0.5): expected {expected}, got {cap} — "
+                "pinned at 1 slot=60000 and 2 slots=60000 "
+                "(round(0.5 x min(warm 120000, per-slot clamp)))"
+            )
+
+        cold, warm = provider_mod._effective_large_context_thresholds(config)
+        assert warm == _PINNED_HALF_RATIO_CAP["fast"], (
+            "effective warm ceiling with the hard cap enabled @"
+            f"{slots} slot(s) (ctx=262144, ratio=0.5): expected 60000 "
+            f"(min(120000, cap 60000)), got {warm} — the cap is the single "
+            "source for context_too_large"
+        )
+        assert cold == 38000, (
+            f"cold threshold with the hard cap enabled @{slots} slot(s) "
+            f"(ctx=262144, ratio=0.5): expected 38000, got {cold} — the cap "
+            "must never move the economic cold threshold"
+        )
+
+    @pytest.mark.parametrize("slots", [1, 2])
+    def test_shipped_config_cap_disabled_per_geometry(self, provider_mod, slots):
+        """AC4 (shipped config): with the ratio keys retired the cap is 0
+        (disabled) at both geometries, so no hidden cap fires."""
+        from config_test_utils import load_profile
+
+        server_cfg = dict(load_profile("config.yaml")["server"])
+        server_cfg["session_slot_pool_size"] = slots
+        config = {"server": server_cfg}
+
+        for mode in ("fast", "cheap"):
+            cap = provider_mod.compute_hard_routing_cap(mode, config)
+            assert cap == 0, (
+                f"hard-routing cap ({mode}) from the shipped config @{slots} "
+                f"slot(s) (ctx=262144): expected 0 (disabled — ratio keys "
+                f"retired), got {cap}"
+            )

@@ -564,3 +564,163 @@ class TestEffectiveLargeContextThresholds1Slot:
             "Qwen3", "large_sess", body, cold, warm_cache_threshold=warm
         )
         assert skip is True
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVTV6F65005HKQZ — pin the derivations a single-slot switch produces
+# ---------------------------------------------------------------------------
+# ``docs/dev/single-slot-impact.md`` cites the numbers below, so the suite must
+# pin them at BOTH geometries rather than leaving them derived by hand.
+# Geometry: ctx 262144, cold 38000, economic ceiling ratio 0.4578, absolute
+# warm cap 120000 (mirrors ``proxy/config.yaml`` via
+# ``config_test_utils.geometry_config``).
+
+#: Derivation -> {slot count: pinned value}.
+_PINNED_DERIVATIONS: dict[str, dict[int, int]] = {
+    "physical per-slot clamp": {1: 258048, 2: 126976},
+    "effective warm ceiling": {1: 120000, 2: 120000},
+    "cold threshold": {1: 38000, 2: 38000},
+    "hard-routing cap": {1: 0, 2: 0},
+}
+
+
+def _derivation_message(
+    derivation: str, slots: int, expected: int, actual: int
+) -> str:
+    """Actionable failure message naming the derivation and BOTH geometries."""
+    pinned = ", ".join(
+        f"{count} slot(s)={value}"
+        for count, value in _PINNED_DERIVATIONS[derivation].items()
+    )
+    return (
+        f"{derivation} @{slots} slot(s) (ctx=262144): expected {expected}, "
+        f"got {actual} — pinned derivations are {pinned}; "
+        "docs/dev/single-slot-impact.md cites these values"
+    )
+
+
+class TestSingleSlotThresholdDerivations:
+    """LP-0MVTV6F65005HKQZ AC1-AC3: pin what a switch to a single slot does to
+    the four routing-threshold derivations.
+
+    A single slot doubles the per-slot context (258048 vs 126976) but must NOT
+    raise the effective warm ceiling: the economic term
+    (``round(0.4578 x 262144) = 120010``) capped by the absolute
+    ``local_large_context_warm_cache_threshold`` (120000) binds below the
+    physical clamp at 1 slot, and the physical clamp binds below the ceiling at
+    2 slots. Cold is an economic new-token threshold and is untouched by the
+    slot count, so the ``(cold, warm]`` band stays non-empty at both
+    geometries.
+    """
+
+    @pytest.mark.parametrize("slots", [1, 2])
+    def test_four_derivations_pinned_per_geometry(self, slots):
+        """AC1: physical clamp, effective warm ceiling, cold and hard-routing
+        cap all resolve to the pinned value at 1 and at 2 slots."""
+        from config_test_utils import geometry_config
+        from proxy.provider import (
+            _effective_large_context_thresholds,
+            compute_hard_routing_cap,
+            effective_per_slot_threshold,
+        )
+
+        config = geometry_config(slots)
+
+        clamp = effective_per_slot_threshold(262144, slots)
+        expected_clamp = _PINNED_DERIVATIONS["physical per-slot clamp"][slots]
+        assert clamp == expected_clamp, _derivation_message(
+            "physical per-slot clamp", slots, expected_clamp, clamp
+        )
+
+        cold, warm = _effective_large_context_thresholds(config)
+
+        expected_warm = _PINNED_DERIVATIONS["effective warm ceiling"][slots]
+        assert warm == expected_warm, _derivation_message(
+            "effective warm ceiling", slots, expected_warm, warm
+        )
+
+        expected_cold = _PINNED_DERIVATIONS["cold threshold"][slots]
+        assert cold == expected_cold, _derivation_message(
+            "cold threshold", slots, expected_cold, cold
+        )
+
+        cap = compute_hard_routing_cap("fast", config)
+        expected_cap = _PINNED_DERIVATIONS["hard-routing cap"][slots]
+        assert cap == expected_cap, _derivation_message(
+            "hard-routing cap", slots, expected_cap, cap
+        )
+
+    def test_absolute_warm_cap_dominates_physical_clamp_at_1_slot(self):
+        """AC2: at 1 slot the physical clamp (258048) is NOT the binding term;
+        the economic ceiling (120010) is capped to 120000 by the absolute warm
+        config, so doubling per-slot context raises no routing threshold."""
+        from config_test_utils import geometry_config
+        from proxy.provider import (
+            _effective_large_context_thresholds,
+            effective_large_context_economic_ceiling,
+            effective_per_slot_threshold,
+        )
+
+        ratio_ceiling = round(0.4578 * 262144)
+        assert ratio_ceiling == 120010, (
+            "economic ceiling ratio term @both geometries (ctx=262144): "
+            f"round(0.4578 x 262144) must be 120010, got {ratio_ceiling}"
+        )
+
+        ceiling_1 = effective_large_context_economic_ceiling(geometry_config(1))
+        assert ceiling_1 == 120000, (
+            "economic ceiling after the absolute warm cap @1 slot "
+            f"(ctx=262144, slots=1): expected 120000 "
+            f"(min(120010, absolute 120000)), got {ceiling_1}; "
+            "the absolute local_large_context_warm_cache_threshold must dominate"
+        )
+
+        clamp_1 = effective_per_slot_threshold(262144, 1)
+        assert clamp_1 == _PINNED_DERIVATIONS["physical per-slot clamp"][1], (
+            "physical per-slot clamp @1 slot (ctx=262144, slots=1): expected "
+            f"{_PINNED_DERIVATIONS['physical per-slot clamp'][1]}, got {clamp_1}"
+        )
+
+        _, warm_1 = _effective_large_context_thresholds(geometry_config(1))
+        _, warm_2 = _effective_large_context_thresholds(geometry_config(2))
+
+        assert warm_1 == 120000, (
+            "effective warm ceiling @1 slot (ctx=262144, slots=1): expected "
+            f"120000, got {warm_1} — the absolute cap must dominate"
+        )
+        assert warm_1 < clamp_1, (
+            "absolute-cap dominance @1 slot (ctx=262144, slots=1): warm "
+            f"({warm_1}) must stay below the physical clamp ({clamp_1}); "
+            "otherwise the physical term is the binding one"
+        )
+        assert warm_2 == warm_1, (
+            "warm ceiling across geometries (1 slot vs 2 slots, ctx=262144): "
+            f"expected equal ({warm_1} == {warm_2}) — doubling per-slot "
+            "context must not raise a routing threshold on its own"
+        )
+
+    def test_cold_warm_band_non_empty_and_cold_slot_invariant(self):
+        """AC3: the ``(cold, warm]`` band stays non-empty at 1 slot and cold is
+        unchanged by the slot count (cold is an economic new-token threshold,
+        never clamped or scaled)."""
+        from config_test_utils import geometry_config
+        from proxy.provider import _effective_large_context_thresholds
+
+        cold_1, warm_1 = _effective_large_context_thresholds(geometry_config(1))
+        cold_2, warm_2 = _effective_large_context_thresholds(geometry_config(2))
+
+        assert cold_1 == cold_2 == 38000, (
+            "cold threshold across geometries (1 slot vs 2 slots, ctx=262144): "
+            f"expected cold == 38000 at both, got {cold_1} (1 slot) and "
+            f"{cold_2} (2 slots) — the slot count must not move cold"
+        )
+        assert cold_1 < warm_1, (
+            "(cold, warm] band @1 slot (ctx=262144, slots=1): expected "
+            f"cold 38000 < warm 120000, got cold {cold_1} / warm {warm_1} — "
+            "a collapsed band makes the cached_ratio check unreachable "
+            "(LP-0MSI2M5BT004BCDP)"
+        )
+        assert cold_2 < warm_2, (
+            "(cold, warm] band @2 slots (ctx=262144, slots=2): expected "
+            f"cold 38000 < warm 120000, got cold {cold_2} / warm {warm_2}"
+        )
