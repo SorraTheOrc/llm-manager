@@ -116,11 +116,11 @@ PREFER_LOCAL = "prefer-local"
 REMOTE_OK = "remote-ok"
 #: What the canonical parser yields when the header is absent or unknown.
 DEFAULT_PREFERENCE = PREFER_LOCAL
-#: The value each wire value is logged as: the parser normalises the legacy
-#: ``local-only`` alias to the canonical ``local-preferred``
-#: (LP-0MVSHWYVE005MS16 AC1), so the exit lines name that canonical value.
+#: The value each wire value is logged as. Every live value is logged as
+#: itself; ``local-only`` has no entry because it is **retired** — a request
+#: carrying it is a ``400`` before routing and therefore never reaches an exit
+#: line (LP-0MVUH9PAZ002UAPA).
 _PARSED_PREFERENCE = {
-    LOCAL_ONLY: LOCAL_PREFERRED,
     LOCAL_PREFERRED: LOCAL_PREFERRED,
     PREFER_LOCAL: PREFER_LOCAL,
     REMOTE_OK: REMOTE_OK,
@@ -215,7 +215,7 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
         # ``local_preference_resolved`` instead — asserted by
         # ``test_remote_ok_never_waits.py``, which pins that exit's route,
         # zero queue wait and reason per local-exit cause.
-        preferences=(LOCAL_ONLY, LOCAL_PREFERRED, PREFER_LOCAL, None),
+        preferences=(LOCAL_PREFERRED, PREFER_LOCAL, None),
     ),
     _NotLocalLineRow(
         trigger="admission_guard_free_slot",
@@ -242,9 +242,11 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
             "prefill-gate refusal of a pin-local client on the free-slot "
             "(direct dispatch) path"
         ),
-        # The pin-local wire values: the refusal line replaces the fallback
-        # line for exactly these clients (LP-0MVNTJQVB007QWEZ AC1/AC2).
-        preferences=(LOCAL_ONLY, LOCAL_PREFERRED),
+        # The live pin-local wire value: the refusal line replaces the
+        # fallback line for exactly this client (LP-0MVNTJQVB007QWEZ AC1/AC2).
+        # The retired ``local-only`` spelling is a 400 before routing, so it
+        # never reaches this exit (LP-0MVUH9PAZ002UAPA).
+        preferences=(LOCAL_PREFERRED,),
     ),
     _NotLocalLineRow(
         trigger="chain_cooldown",
@@ -344,12 +346,13 @@ def _preference_params() -> list:
 
     ``remote-ok`` is included: it keeps the local route and is attempted exactly
     as an absent header is (LP-0MVUH9OYZ007GMWF AC1), so it takes the same
-    local-route exits and must name them on the same lines. The legacy
-    ``local-only`` case is kept deliberately: it is the deployed wire value and
-    must take exactly the same exits as the canonical ``local-preferred``.
+    local-route exits and must name them on the same lines. The retired
+    ``local-only`` spelling is **not** a case here any more: it is answered with
+    a ``400`` before routing (LP-0MVUH9PAZ002UAPA), so it never reaches a
+    local-route exit — ``test_retired_local_only_is_rejected_and_reported_as_
+    retired`` pins that instead.
     """
     cases = (
-        (LOCAL_ONLY, "local-only-legacy-alias"),
         (LOCAL_PREFERRED, "local-preferred"),
         (PREFER_LOCAL, "prefer-local"),
         (REMOTE_OK, "remote-ok"),
@@ -1201,12 +1204,12 @@ async def test_local_only_refusal_logs_one_line_with_reason_and_preference(caplo
 
     The skip reason the chain recorded (here: the local entry's cooldown) must
     appear on the refusal line together with the *parsed* preference
-    (``preference=local-preferred`` for the legacy ``local-only`` header), so an
-    operator grepping ``proxy.log`` sees the violation and its cause instead of
-    joining the request's headers to a routing line.
+    (``preference=local-preferred``), so an operator grepping ``proxy.log`` sees
+    the violation and its cause instead of joining the request's headers to a
+    routing line.
     """
-    result = await _issue(_row("chain_cooldown"), LOCAL_ONLY)
-    assert result.status_code == 429, "the local-only client is refused, not served"
+    result = await _issue(_row("chain_cooldown"), LOCAL_PREFERRED)
+    assert result.status_code == 429, "the pin-local client is refused, not served"
 
     lines = [m for m in _messages(caplog) if m.startswith("local_only_refused ")]
     assert len(lines) == 1, (
@@ -1217,8 +1220,7 @@ async def test_local_only_refusal_logs_one_line_with_reason_and_preference(caplo
         f"the refusal line must name the recorded skip reason; got {kv!r}"
     )
     assert kv.get("preference") == LOCAL_PREFERRED, (
-        "the refusal line names the parsed intent — the legacy ``local-only`` "
-        f"alias canonicalises to ``local-preferred``; got {kv!r}"
+        f"the refusal line names the parsed intent; got {kv!r}"
     )
 
 
@@ -1232,7 +1234,7 @@ async def test_local_only_refusal_without_a_local_route_names_that_reason(caplog
         ],
     }
     result = await _issue(
-        _row("chain_cooldown"), LOCAL_ONLY, model_config=remote_only
+        _row("chain_cooldown"), LOCAL_PREFERRED, model_config=remote_only
     )
     assert result.status_code == 429
 
@@ -1337,7 +1339,7 @@ async def test_local_success_logs_the_local_outcome_once(caplog):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preference", [LOCAL_PREFERRED, LOCAL_ONLY])
+@pytest.mark.parametrize("preference", [LOCAL_PREFERRED])
 async def test_pin_refusal_logs_the_pinned_outcome_once(preference, caplog):
     """AC1/AC2: a refused pin-local request reports ``outcome=pinned``.
 
@@ -1429,7 +1431,7 @@ def _promoted_config() -> dict:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preference", [LOCAL_PREFERRED, LOCAL_ONLY])
+@pytest.mark.parametrize("preference", [LOCAL_PREFERRED])
 async def test_too_large_promotion_logs_the_promoted_outcome_once(
     preference, caplog
 ):
@@ -1489,24 +1491,38 @@ async def test_prefer_local_remote_fall_through_logs_the_remote_outcome(caplog):
 
 
 @pytest.mark.asyncio
-async def test_legacy_local_only_is_reported_under_its_normalised_value(caplog):
-    """AC3: ``local-only`` never appears as the resolved preference.
+async def test_retired_local_only_is_rejected_and_reported_as_retired(caplog):
+    """AC3: a retired value is refused, and the log names it as retired.
 
-    The alias is normalised by the canonical parser (and cached on the request),
-    so the line reports ``preference=local-preferred``. The deprecation warning
-    from LP-0MVSHWYVE005MS16 is separate and unchanged.
+    Before the retirement the alias was normalised and the resolved line
+    reported ``preference=local-preferred``. Now the request never reaches a
+    routing decision: it is a ``400`` before any state is written, and the one
+    ``WARNING`` the rejection owes names the **retired** value (so a deployed
+    client is identifiable) together with its live successor. No
+    ``local_preference_resolved`` line may be emitted — there is no resolved
+    routing intent to report.
     """
-    await _issue(_row("chain_cooldown"), LOCAL_ONLY)
+    caplog.set_level(logging.WARNING, logger="llama-proxy")
 
-    lines = _resolved_lines(caplog)
-    assert len(lines) == 1, f"one line per request; got {lines!r}"
-    assert "local-only" not in lines[0].replace("local-preferred", ""), (
-        f"the legacy alias must never be presented as the resolved value: "
-        f"{lines[0]!r}"
+    result = await _issue(_row("chain_cooldown"), LOCAL_ONLY)
+
+    assert result.status_code == 400, (
+        f"a retired value is a 400, got {result.status_code}"
     )
-    fields = _parse_kv(lines[0])
-    assert fields.get("preference") == LOCAL_PREFERRED, (
-        f"expected the normalised value, got {fields.get('preference')!r}"
+    assert _resolved_lines(caplog) == [], (
+        "a pre-routing rejection resolves no preference; got "
+        f"{_resolved_lines(caplog)!r}"
+    )
+    retired = [
+        message
+        for message in _messages(caplog)
+        if "is retired" in message
+    ]
+    assert len(retired) == 1, f"one line per rejection; got {retired!r}"
+    fields = _parse_kv(retired[0])
+    assert fields.get("X-Local-Preference") == LOCAL_ONLY or LOCAL_ONLY in retired[0]
+    assert LOCAL_PREFERRED in retired[0], (
+        f"the line must name the live successor: {retired[0]!r}"
     )
 
 

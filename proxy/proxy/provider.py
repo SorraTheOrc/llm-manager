@@ -55,7 +55,9 @@ from proxy.admission_reserve import (
     PREF_LOCAL_ONLY,
     PREF_LOCAL_PREFERRED,
     PREF_REMOTE_OK,
+    LocalPreferenceRetiredError,
     parse_preference,
+    retired_preference_body,
 )
 from proxy.observability import _record_backend_signal
 from proxy.priority import (
@@ -7045,16 +7047,22 @@ def _request_local_preference(request) -> str:
     """Return the request's ``X-Local-Preference`` (default ``prefer-local``).
 
     Unknown values fall back to today's behaviour (AC8). The parsed value is
-    cached on the request so both routing cycles and the refusal path agree —
-    which is also what makes the legacy-alias deprecation in
-    :func:`admission_reserve.parse_preference` once per *request* rather than
-    once per decision (LP-0MVSHWYVE005MS16 AC2).
+    cached on the request so both routing cycles and the refusal path agree.
+
+    A **retired** value raises :class:`LocalPreferenceRetiredError` instead of
+    falling back (LP-0MVUH9PAZ002UAPA AC1/AC2): the retirement must fail closed
+    on every path, so it is never swallowed into a live value here. The request
+    entry points reject such a request before this is ever reached; a raise
+    from here therefore means a caller bypassed them, and staying loud is
+    better than routing a policy the client did not ask for.
     """
     cached = getattr(request, "_local_preference", None)
     if cached:
         return cached
     try:
         preference = parse_preference(getattr(request, "headers", {}) or {})
+    except LocalPreferenceRetiredError:
+        raise
     except Exception:
         preference = DEFAULT_PREFERENCE
     try:
@@ -7062,6 +7070,71 @@ def _request_local_preference(request) -> str:
     except Exception:
         pass
     return preference
+
+
+def _log_retired_local_preference(
+    request, exc: LocalPreferenceRetiredError
+) -> None:
+    """Emit the one attributable ``WARNING`` a rejection owes (parent AC2).
+
+    The line names the retired value, its live successors and the session id
+    when one is resolvable, so a deployed client still on the withdrawn
+    spelling can be identified from ``proxy.log`` alone. It never raises: a
+    rejection must not turn into an error because the log could not be built.
+    """
+    session_id = "unknown"
+    try:
+        from proxy.session import _resolve_session_id_header
+
+        # ``_resolve_session_id_header`` looks up lowercase keys, which
+        # Starlette's Headers satisfy but a plain dict (in-process callers,
+        # test doubles) does not: normalise before resolving so the line stays
+        # attributable however the request was built.
+        raw_headers = getattr(request, "headers", {}) or {}
+        try:
+            lookup = {str(key).lower(): value for key, value in raw_headers.items()}
+        except Exception:
+            lookup = raw_headers
+        resolved, _source = _resolve_session_id_header(lookup)
+        session_id = resolved or "unknown"
+    except Exception:
+        pass
+    logger.warning(
+        "X-Local-Preference=%r is retired; rejected with 400 "
+        "(code=local_preference_retired) — send %s (session=%s)",
+        exc.value,
+        " or ".join(repr(successor) for successor in exc.successors),
+        session_id,
+    )
+
+
+def _retired_local_preference_response(request, model_config: dict) -> Response | None:
+    """Reject a retired ``X-Local-Preference`` **before** any routing state.
+
+    One implementation for both dispatch entry points (parent AC1: the
+    rejection is emitted before routing, queueing, leasing, dispatch or
+    cooldown state exists). Returns ``None`` — the request proceeds — for every
+    live value, every unknown value (still additive, AC8) and an absent header.
+
+    The parsed value is cached on the request exactly as
+    :func:`_request_local_preference` does, so a valid request is still parsed
+    once per request and not once per decision.
+    """
+    headers = getattr(request, "headers", {}) or {}
+    try:
+        preference = parse_preference(headers)
+    except LocalPreferenceRetiredError as exc:
+        _log_retired_local_preference(request, exc)
+        return JSONResponse(
+            status_code=400, content=retired_preference_body(exc)
+        )
+    except Exception:
+        return None
+    try:
+        setattr(request, "_local_preference", preference)
+    except Exception:
+        pass
+    return None
 
 
 def _local_capacity_verdict_for_request(request):
@@ -12336,6 +12409,9 @@ async def proxy_with_remote_fallback(
         A ``Response`` from a successful provider, or the 503/429 exhaustion
         response once the hold-retry bound is reached.
     """
+    retired = _retired_local_preference_response(request, model_config)
+    if retired is not None:
+        return retired
     response = await _run_chain_cycles(
         request, path, model_config, config, _proxy_with_remote_fallback_cycle,
     )
@@ -14746,6 +14822,9 @@ async def proxy_with_fallback(
         A ``Response`` from a successful provider, or the 503/429 exhaustion
         response once the hold-retry bound is reached.
     """
+    retired = _retired_local_preference_response(request, model_config)
+    if retired is not None:
+        return retired
     response = await _run_chain_cycles(
         request, path, model_config, config, _proxy_with_fallback_cycle,
     )

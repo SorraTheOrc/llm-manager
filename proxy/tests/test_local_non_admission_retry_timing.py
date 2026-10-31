@@ -46,7 +46,10 @@ from proxy import contention_queue, prefill_eta
 
 LOCAL_PROVIDER_NAME = "local-llama"
 REMOTE_PROVIDER_NAME = "remote-fallback"
-LOCAL_ONLY = "local-only"
+#: The live pin-local wire value. ``local-only`` is retired (a 400 before
+#: routing, LP-0MVUH9PAZ002UAPA); the refusal timing contract this module
+#: pins is unchanged and still reached through the live spelling.
+PIN_LOCAL = "local-preferred"
 
 #: What the ETA formula returns while these cases run. Real-expiry timers are
 #: asserted to be a different value, so a regression to the ETA formula is an
@@ -216,7 +219,7 @@ def _clean_state():
 
 async def _issue(
     *,
-    preference: str | None = LOCAL_ONLY,
+    preference: str | None = PIN_LOCAL,
     config: dict | None = None,
     concurrency: tuple[int, int] = (0, 1),
     local_responder=None,

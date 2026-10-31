@@ -405,10 +405,20 @@ def local_preference_for_request(request) -> str:
     # One canonical parser and one fallback value: the vocabulary (and the
     # legacy-alias normalisation) lives in ``admission_reserve`` only
     # (LP-0MVSHWYVE005MS16 AC4).
-    from proxy.admission_reserve import DEFAULT_PREFERENCE, parse_preference
+    from proxy.admission_reserve import (
+        DEFAULT_PREFERENCE,
+        LocalPreferenceRetiredError,
+        parse_preference,
+    )
 
     try:
         preference = parse_preference(getattr(request, "headers", {}) or {})
+    except LocalPreferenceRetiredError:
+        # A retired value must never be resolved here: the request entry points
+        # reject it with a 400 before routing (LP-0MVUH9PAZ002UAPA AC1), so a
+        # raise reaching this point means the vocabulary was bypassed and the
+        # caller must see it rather than inherit a silent demotion.
+        raise
     except Exception:
         preference = DEFAULT_PREFERENCE
     try:

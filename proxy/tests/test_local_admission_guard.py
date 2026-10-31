@@ -867,7 +867,7 @@ async def _issue_local_only_prefill_budget_refusal(mixed_model_config) -> tuple:
         _guard_patches(tokens=INCIDENT_NEW_TOKENS),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(headers={"x-local-preference": "local-only"}),
+            _DummyRequest(headers={"x-local-preference": "local-preferred"}),
             "v1/chat/completions",
             mixed_model_config,
             _cold_budget_cfg(),
@@ -1388,7 +1388,7 @@ async def _issue_occupancy_refusal(case: _OccupancyRefusalCase, mixed_model_conf
         mixed_model_config if case.chain == "hybrid" else _local_only_model_config()
     )
     headers = (
-        {"x-local-preference": "local-only"} if case.chain == "hybrid" else {}
+        {"x-local-preference": "local-preferred"} if case.chain == "hybrid" else {}
     )
     concurrency = _MutableConcurrency(1 if case.path == "queue" else 0, 1)
 
@@ -1705,7 +1705,7 @@ async def test_direct_free_slot_over_budget_pin_local_is_promoted(
         _guard_patches(tokens=INCIDENT_NEW_TOKENS),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(headers={"x-local-preference": "local-only"}),
+            _DummyRequest(headers={"x-local-preference": "local-preferred"}),
             "v1/chat/completions",
             mixed_model_config,
             _cold_budget_cfg(),
@@ -2094,7 +2094,7 @@ async def _issue_cooldown_refusal(mixed_model_config) -> tuple:
         _local_entry_in_cooldown(),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(headers={"x-local-preference": "local-only"}),
+            _DummyRequest(headers={"x-local-preference": "local-preferred"}),
             "v1/chat/completions",
             mixed_model_config,
             _cold_budget_cfg(),
@@ -2132,7 +2132,7 @@ async def _issue_refusal(row: _RefusalContractRow, mixed_model_config) -> tuple:
             _guard_patches(tokens=PROMPT_NEW_TOKENS, skip_reason=row.reason),
         ):
             result = await provider.proxy_with_fallback(
-                _DummyRequest(headers={"x-local-preference": "local-only"}),
+                _DummyRequest(headers={"x-local-preference": "local-preferred"}),
                 "v1/chat/completions",
                 mixed_model_config,
                 _cold_budget_cfg(),
@@ -2742,7 +2742,7 @@ async def test_choke_point_refusal_logs_one_verdict_line(caplog):
         # *only* blocking signal, so the verdict must be ``deferrable``
         # (waiting helps) rather than ``too_large`` (the prompt never fits).
         result, calls = await _issue_guard_refusal(
-            "local-only", tokens=INCIDENT_BUDGET_TOKENS // 2
+            "local-preferred", tokens=INCIDENT_BUDGET_TOKENS // 2
         )
     finally:
         provider._provider_unavailable_until.pop("local-llama", None)
@@ -2770,7 +2770,7 @@ async def test_too_large_pin_local_promotes_instead_of_refusing(caplog):
     """
     caplog.set_level(logging.INFO, logger="llama-proxy")
 
-    result, calls = await _issue_guard_refusal("local-only")
+    result, calls = await _issue_guard_refusal("local-preferred")
 
     assert result.status_code == 200, (
         f"a too-large request must fall through to remote, got "
@@ -2783,7 +2783,7 @@ async def test_too_large_pin_local_promotes_instead_of_refusing(caplog):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preference", ["local-preferred", "local-only"])
+@pytest.mark.parametrize("preference", ["local-preferred"])
 async def test_pin_local_with_a_free_slot_is_served_locally(
     mixed_model_config, preference
 ):
@@ -2791,8 +2791,9 @@ async def test_pin_local_with_a_free_slot_is_served_locally(
 
     The pin only ever removes the *remote* option; a request local can serve
     right now must be served locally with no refusal, no queueing and a single
-    ``X-Local-Route: local`` stamp (parent AC2 / AC6). Both wire spellings are
-    asserted because the ``local-only`` alias must keep working.
+    ``X-Local-Route: local`` stamp (parent AC2 / AC6). Only the live spelling is
+    parametrised: the retired ``local-only`` is a ``400`` before routing
+    (LP-0MVUH9PAZ002UAPA), pinned by ``test_local_preference_vocabulary_v2.py``.
     """
     calls: list[str] = []
 

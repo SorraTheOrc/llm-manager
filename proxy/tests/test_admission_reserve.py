@@ -478,74 +478,123 @@ def test_local_preferred_parses():
     )
 
 
-def test_legacy_local_only_alias_normalises():
-    """AC1/AC3: the deployed wire value normalises, in any header case."""
-    assert (
-        admission_reserve.parse_preference({"x-local-preference": "local-only"})
-        == "local-preferred"
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({"x-local-preference": "local-only"}, id="lower"),
+        pytest.param({"X-Local-Preference": "Local-Only"}, id="mixed-case"),
+        pytest.param(
+            Headers({"X-LOCAL-PREFERENCE": "LOCAL-ONLY"}), id="starlette-headers"
+        ),
+    ],
+)
+def test_retired_local_only_raises_instead_of_normalising(headers):
+    """LP-0MVUH9PAZ002UAPA AC1/AC4: the withdrawn value fails closed.
+
+    Before the retirement the value normalised to ``local-preferred`` in any
+    header/value case; now it raises :class:`LocalPreferenceRetiredError` in every
+    case. The two failures this pins are the ones the work item names: a silent
+    demotion to ``local-preferred`` (a policy the client may not have asked for)
+    and a silent resolution to the default (which lets a cost-capped client be
+    billed — LP-0MVNU2KTK009D4AG).
+    """
+    with pytest.raises(admission_reserve.LocalPreferenceRetiredError) as excinfo:
+        admission_reserve.parse_preference(headers)
+    assert excinfo.value.value == "local-only", (
+        "the error must name the retired value it received, got "
+        f"{excinfo.value.value!r}"
     )
-    assert (
-        admission_reserve.parse_preference({"X-Local-Preference": "Local-Only"})
-        == "local-preferred"
-    )
-    # Real requests carry Starlette's case-insensitive Headers: both the header
-    # name and the value case must keep working (AC3).
-    assert (
-        admission_reserve.parse_preference(
-            Headers({"X-LOCAL-PREFERENCE": "LOCAL-ONLY"})
-        )
-        == "local-preferred"
+    assert excinfo.value.successors == ("local-preferred",), (
+        "the error must name the live successor, got "
+        f"{excinfo.value.successors!r}"
     )
 
 
-def test_alias_table_and_canonical_set_cannot_drift():
-    """The alias is a table entry, not a stray literal (AC4)."""
-    assert admission_reserve.LEGACY_PREFERENCE_ALIASES == {
-        "local-only": "local-preferred"
-    }
+def test_retired_local_only_body_is_stable_and_actionable():
+    """The rejection body is a client contract: ``error``/``code``/``detail``.
+
+    ``code`` is the machine-readable branch point, ``detail`` names the live
+    successor *and* tells a zero-remote-spend client that the guarantee is a
+    chain property rather than a preference value (parent AC1).
+    """
+    exc = admission_reserve.LocalPreferenceRetiredError("local-only", ("local-preferred",))
+    body = admission_reserve.retired_preference_body(exc)
+    assert set(body) == {"error", "code", "detail"}, sorted(body)
+    assert body["code"] == admission_reserve.RETIRED_PREFERENCE_CODE
+    assert "local-preferred" in body["detail"]
+    assert "local-only" in body["detail"]
+    assert "chain" in body["detail"]
+
+
+def test_retired_table_and_canonical_set_cannot_drift():
+    """The retirement is a table entry, not a stray literal (AC4)."""
+    assert admission_reserve.LEGACY_PREFERENCE_ALIASES == {}, (
+        "no live value is normalised any more: the last alias (local-only) is "
+        f"retired; got {admission_reserve.LEGACY_PREFERENCE_ALIASES!r}"
+    )
+    assert admission_reserve.RETIRED_PREFERENCES == {
+        "local-only": ("local-preferred",)
+    }, "the retired table is the single source of the successors"
     assert "local-preferred" in admission_reserve.VALID_PREFERENCES
     assert "local-only" not in admission_reserve.VALID_PREFERENCES, (
-        "local-only is a legacy alias, not a canonical value"
+        "a retired value is not a canonical value"
     )
-    assert set(admission_reserve.LEGACY_PREFERENCE_ALIASES.values()) <= set(
-        admission_reserve.VALID_PREFERENCES
-    )
+    for successors in admission_reserve.RETIRED_PREFERENCES.values():
+        assert successors, "a retired value must name at least one successor"
+        assert set(successors) <= set(admission_reserve.VALID_PREFERENCES), (
+            f"every successor must be live, got {successors!r}"
+        )
 
 
-def test_legacy_alias_logs_one_deprecation_per_request(caplog):
-    """AC2: one WARNING per request, naming both sides of the alias.
+@pytest.mark.asyncio
+async def test_retired_value_logs_one_warning_per_rejection(caplog):
+    """AC3: one attributable WARNING per rejection, never one per decision.
 
-    The deprecation is emitted by ``parse_preference()`` and latched by the
-    per-request ``_local_preference`` cache, so a request that is parsed for
-    the dispatch loop, the remote cycle and the refusal path still logs once.
+    The line names the retired value, its live successor and the session id, so
+    a deployed client still on the withdrawn spelling is identifiable from
+    ``proxy.log`` alone (parent AC2). The rejection is returned before the
+    routing cycles run, so a request cannot produce a second line.
     """
-    request = _DummyRequest(headers={"x-local-preference": "local-only"})
+    caplog.set_level(logging.WARNING, logger="llama-proxy")
 
-    with caplog.at_level(logging.WARNING, logger="llama-proxy"):
-        first = provider._request_local_preference(request)
-        second = provider._request_local_preference(request)
-        third = priority.local_preference_for_request(request)
+    result = await provider.proxy_with_fallback(
+        _DummyRequest(
+            headers={
+                "x-local-preference": "local-only",
+                "X-Session-ID": "sess-retired-1",
+            }
+        ),
+        "v1/chat/completions",
+        {"providers": [], "aliases": ["hybrid*"]},
+        _cfg(),
+    )
 
-    assert first == second == third == "local-preferred"
-    deprecated = [
+    assert result.status_code == 400
+    retired_lines = [
         record.getMessage()
         for record in caplog.records
         if record.levelno == logging.WARNING
     ]
-    assert len(deprecated) == 1, (
-        "the legacy alias must log exactly one deprecation per request; got "
-        f"{deprecated!r}"
+    assert len(retired_lines) == 1, (
+        "exactly one WARNING per rejection; got " f"{retired_lines!r}"
     )
-    assert "local-only" in deprecated[0], (
-        f"the deprecation must name the legacy value; got {deprecated[0]!r}"
+    line = retired_lines[0]
+    assert "local-only" in line, f"the line must name the retired value: {line!r}"
+    assert "local-preferred" in line, f"the line must name the successor: {line!r}"
+    assert "sess-retired-1" in line, f"the line must name the session: {line!r}"
+
+    # The liveness half: the retired value never becomes a live preference.
+    first = provider._request_local_preference(
+        _DummyRequest(headers={"x-local-preference": "local-preferred"})
     )
-    assert "local-preferred" in deprecated[0], (
-        f"the deprecation must name the canonical value; got {deprecated[0]!r}"
+    second = priority.local_preference_for_request(
+        _DummyRequest(headers={"x-local-preference": "local-preferred"})
     )
+    assert first == second == "local-preferred"
 
 
-def test_canonical_preference_logs_no_deprecation(caplog):
-    """AC2: only the legacy alias is deprecated — canonical values stay quiet."""
+def test_canonical_preference_logs_no_warning(caplog):
+    """AC3: only a retired value is rejected — live values stay quiet."""
     for value in ("local-preferred", "prefer-local", "remote-ok"):
         request = _DummyRequest(headers={"x-local-preference": value})
         with caplog.at_level(logging.WARNING, logger="llama-proxy"):
@@ -637,19 +686,16 @@ def test_dry_run_returns_verdict_without_claiming():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "preference",
-    ["local-only", "local-preferred"],
-    ids=["legacy-alias", "canonical"],
-)
+@pytest.mark.parametrize("preference", ["local-preferred"], ids=["canonical"])
 async def test_pin_local_refuses_429_when_guard_would_fall_back_remote(
     preference, caplog
 ):
-    """AC4/AC5: with remotes available, either pin-local spelling yields 429.
+    """AC4/AC5: with remotes available, a pin-local request yields 429.
 
-    ``local-only`` is the deployed legacy alias and must reach the *same*
-    choke point as the canonical ``local-preferred`` once normalised — no
-    demotion to ``prefer-local``, no silent remote fall-through.
+    ``local-preferred`` is now the **only** pin-local spelling: the retired
+    ``local-only`` is a ``400`` before routing (LP-0MVUH9PAZ002UAPA), so it can
+    no longer be parametrised here — no demotion to ``prefer-local``, no silent
+    remote fall-through.
     """
     caplog.set_level(logging.INFO, logger="llama-proxy")
     _seed_calibration()
@@ -756,59 +802,46 @@ async def _issue_pin_local_refusal(preference: str) -> tuple:
 
 
 @pytest.mark.asyncio
-async def test_legacy_alias_refusal_is_field_for_field_the_canonical_one(caplog):
-    """Row 7: the alias is the same refusal, plus exactly one deprecation line.
+async def test_retired_value_rejects_before_the_capacity_refusal(caplog):
+    """The retirement outranks the local-capacity refusal (AC1/AC2).
 
-    ``local-only`` is a *wire* alias, not a second behaviour: the two spellings
-    must produce an identical refusal — status, route/reason headers and every
-    stable body field (including the retry story) — and the alias must announce
-    itself exactly once per request, never once per routing decision
-    (LP-0MVSHWYVE005MS16 AC1/AC2). ``retry_at`` is excluded from the comparison
-    because it is stamped from the wall clock at build time.
+    On the *same* fixture that produces a pin-local ``429`` for the live value,
+    the retired spelling answers ``400`` with no route header, no refusal
+    reason, no retry story and no dispatch: the client's intent is settled
+    before capacity is even consulted, so no capacity state is written for a
+    request that cannot be honoured.
     """
     caplog.set_level(logging.WARNING, logger="llama-proxy")
 
     canonical, canonical_calls = await _issue_pin_local_refusal("local-preferred")
-    canonical_deprecations = [
-        record.getMessage()
-        for record in caplog.records
-        if "deprecated X-Local-Preference" in record.getMessage()
-    ]
+    assert canonical.status_code == 429
+    assert canonical_calls == []
+
     caplog.clear()
-    legacy, legacy_calls = await _issue_pin_local_refusal("local-only")
-    legacy_deprecations = [
+    retired, retired_calls = await _issue_pin_local_refusal("local-only")
+
+    assert retired.status_code == 400, (
+        f"the retired value must be a 400, got {retired.status_code}"
+    )
+    assert retired_calls == [], (
+        f"a rejected value must not reach any provider (dispatched={retired_calls!r})"
+    )
+    for header in ("X-Local-Route", "X-Local-Fallback-Reason", "Retry-After"):
+        assert retired.headers.get(header) is None, (
+            f"a pre-routing rejection must not carry {header}="
+            f"{retired.headers.get(header)!r}"
+        )
+    body = json.loads(retired.body)
+    assert body["code"] == admission_reserve.RETIRED_PREFERENCE_CODE
+    assert "retryable" not in body and "verdict" not in body, sorted(body)
+
+    warnings = [
         record.getMessage()
         for record in caplog.records
-        if "deprecated X-Local-Preference" in record.getMessage()
+        if record.levelno == logging.WARNING
     ]
-
-    assert canonical_calls == legacy_calls == [], (
-        "neither spelling may reach a remote provider (dispatched="
-        f"{canonical_calls!r}/{legacy_calls!r})"
-    )
-    assert canonical.status_code == legacy.status_code == 429
-    for header in ("X-Local-Route", "X-Local-Fallback-Reason", "Retry-After"):
-        assert legacy.headers.get(header) == canonical.headers.get(header), (
-            f"the alias must not change {header}: canonical="
-            f"{canonical.headers.get(header)!r}, legacy="
-            f"{legacy.headers.get(header)!r}"
-        )
-    canonical_body = json.loads(canonical.body)
-    legacy_body = json.loads(legacy.body)
-    for key in ("code", "reason", "verdict", "retryable", "retry_after"):
-        assert legacy_body.get(key) == canonical_body.get(key), (
-            f"the alias must not change body[{key!r}]: canonical="
-            f"{canonical_body.get(key)!r}, legacy={legacy_body.get(key)!r}"
-        )
-
-    assert canonical_deprecations == [], (
-        "the canonical value is not deprecated; got "
-        f"{canonical_deprecations!r}"
-    )
-    assert len(legacy_deprecations) == 1, (
-        "the legacy alias must log exactly one deprecation per request; got "
-        f"{legacy_deprecations!r}"
-    )
+    assert len(warnings) == 1, f"one line per rejection; got {warnings!r}"
+    assert "local-only" in warnings[0] and "local-preferred" in warnings[0]
 
 
 @pytest.mark.asyncio
@@ -1392,7 +1425,7 @@ async def test_remote_first_cycle_routes_through_the_helper_once():
 
     with patcher, patch("proxy.server.proxy_to_remote", _remote):
         result = await provider.proxy_with_remote_fallback(
-            _DummyRequest(headers={"X-Local-Preference": "local-only"}),
+            _DummyRequest(headers={"X-Local-Preference": "local-preferred"}),
             "v1/chat/completions",
             _remote_only_chain(),
             _cfg(),
@@ -1414,7 +1447,9 @@ async def test_local_first_choke_point_refusal_routes_through_the_helper_once():
     spy, patcher = _spy_capacity_verdict()
 
     with patcher:
-        result, calls = await _issue_local_first_cycle("local-only", cooldown=True)
+        result, calls = await _issue_local_first_cycle(
+            "local-preferred", cooldown=True
+        )
 
     assert result.status_code == 429
     assert calls == [], "a pin-local client is never moved to remote"
@@ -1429,7 +1464,11 @@ async def test_local_first_choke_point_refusal_routes_through_the_helper_once():
 
 @pytest.mark.asyncio
 async def test_refused_local_only_branch_routes_through_the_helper_once():
-    """AC1: the ``refused_local_only`` branch's refusal computes it once."""
+    """AC1: the ``refused_local_only`` branch's refusal computes it once.
+
+    The branch keeps its historic name (the ``local_only`` token family is
+    unchanged, parent AC3) but is now driven by the only live pin-local value.
+    """
     spy, patcher = _spy_capacity_verdict()
     _seed_calibration(100_000)
 
@@ -1438,7 +1477,7 @@ async def test_refused_local_only_branch_routes_through_the_helper_once():
         # denial (``refused_local_only``), not the free-slot direct path that
         # deliberately keeps the exhausted response (out of scope here).
         result, calls = await _issue_local_first_cycle(
-            "local-only", tokens=100_000, concurrency=(1, 1)
+            "local-preferred", tokens=100_000, concurrency=(1, 1)
         )
 
     assert result.status_code == 429

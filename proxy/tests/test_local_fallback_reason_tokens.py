@@ -50,7 +50,11 @@ from proxy import admission_reserve, contention_queue, prefill_eta
 LOCAL_PROVIDER_NAME = "local-llama"
 REMOTE_PROVIDER_NAME = "remote-fallback"
 
-LOCAL_ONLY = "local-only"
+#: The live pin-local wire value. ``local-only`` is retired (a 400 before
+#: routing, LP-0MVUH9PAZ002UAPA); the *refusal path* keeps its historic
+#: ``local_only_*`` token names (parent AC3), which is what this module
+#: asserts.
+PIN_LOCAL = "local-preferred"
 PREFER_LOCAL = "prefer-local"
 
 #: Wait budget every route runs with (seconds).
@@ -343,7 +347,7 @@ async def test_chain_skip_records_token_on_local_only_refusal(
 ):
     """local-only + a chain skip ⇒ 429 naming the token, matched by the log."""
     with caplog.at_level("INFO", logger="llama-proxy.provider"):
-        result, calls = await _issue(trigger, LOCAL_ONLY)
+        result, calls = await _issue(trigger, PIN_LOCAL)
 
     assert calls == [], (
         f"{trigger}: a local-only request must be refused, not dispatched "
@@ -458,7 +462,7 @@ async def test_lease_active_records_local_lease_active_on_local_only_refusal(cap
     instead of the contention cause.
     """
     with caplog.at_level("INFO", logger="llama-proxy.provider"):
-        result, calls = await _issue_lease(LOCAL_ONLY)
+        result, calls = await _issue_lease(PIN_LOCAL)
 
     assert calls == ["local", "local"], (
         "the lease route is probed and re-probed after the queue; the refusal "

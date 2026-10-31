@@ -77,19 +77,82 @@ PREF_LOCAL_PREFERRED = "local-preferred"
 PREF_PREFER_LOCAL = "prefer-local"
 PREF_REMOTE_OK = "remote-ok"
 
-#: Deployed wire value accepted as a **deprecated alias** of
-#: :data:`PREF_LOCAL_PREFERRED` (LP-0MVSHWYVE005MS16). It stays a first-class
-#: constant — never re-spelled at a call site — so the canonical set and the
-#: alias table cannot drift, and so an un-migrated client is normalised rather
-#: than demoted to ``prefer-local`` (which would let its request go remote).
+#: Deployed wire value **retired** by LP-0MVUH9PAZ002UAPA. It was a deprecated
+#: alias of :data:`PREF_LOCAL_PREFERRED` (LP-0MVSHWYVE005MS16); it is now
+#: withdrawn: an explicit request carrying it is refused with a stable ``400``
+#: (:data:`RETIRED_PREFERENCE_CODE`) instead of being normalised — silently
+#: re-interpreting it would deliver a policy the client did not ask for — and
+#: instead of being resolved to the default, which would let a cost-capped
+#: client be billed without consent (LP-0MVNU2KTK009D4AG). The constant stays
+#: a first-class name so the retired-value table can never drift from it.
 PREF_LOCAL_ONLY = "local-only"
 
-#: ``alias -> canonical value``. :func:`parse_preference` normalises through
-#: this table and logs one deprecation warning per request.
-LEGACY_PREFERENCE_ALIASES = {PREF_LOCAL_ONLY: PREF_LOCAL_PREFERRED}
+#: Stable machine-readable code carried by a retired-value rejection body
+#: (parent AC1). Clients branch on this, not on the prose.
+RETIRED_PREFERENCE_CODE = "local_preference_retired"
+
+#: ``retired value -> live successors``. The **single** table a rejection body
+#: and its log line are both built from, so the two observability surfaces
+#: cannot drift apart. A retired value is never normalised and never resolved
+#: to :data:`DEFAULT_PREFERENCE` (fail closed).
+RETIRED_PREFERENCES: dict[str, tuple[str, ...]] = {
+    PREF_LOCAL_ONLY: (PREF_LOCAL_PREFERRED,),
+}
+
+#: ``alias -> canonical value``. Empty since the last alias was retired
+#: (LP-0MVUH9PAZ002UAPA); kept as the single normalisation seam that
+#: :func:`parse_preference` consults, so a future alias has exactly one place
+#: to live and the removal is directly assertable.
+LEGACY_PREFERENCE_ALIASES: dict[str, str] = {}
 
 VALID_PREFERENCES = (PREF_LOCAL_PREFERRED, PREF_PREFER_LOCAL, PREF_REMOTE_OK)
 DEFAULT_PREFERENCE = PREF_PREFER_LOCAL
+
+
+class LocalPreferenceRetiredError(ValueError):
+    """A **withdrawn** ``X-Local-Preference`` value was requested.
+
+    Raised by :func:`parse_preference` so the retirement fails *closed*: no
+    caller can silently fall back to a live value for a value the client asked
+    for and the proxy no longer honours. The request entry points convert this
+    into the stable ``400`` built by :func:`retired_preference_body` **before**
+    any routing, queueing, lease or dispatch state is written.
+
+    Attributes:
+        value: The retired value the client sent (normalised: stripped and
+            lower-cased, exactly as the parse site compares it).
+        successors: The live values that replace it, in preference order.
+    """
+
+    def __init__(self, value: str, successors: tuple[str, ...]) -> None:
+        self.value = value
+        self.successors = successors
+        super().__init__(
+            f"X-Local-Preference={value!r} is retired; send "
+            + " or ".join(repr(successor) for successor in successors)
+        )
+
+
+def retired_preference_body(exc: LocalPreferenceRetiredError) -> dict[str, Any]:
+    """Stable JSON body for a retired-value rejection (parent AC1).
+
+    The three keys are the contract a client may branch on: ``error`` (human
+    summary), ``code`` (machine-readable, :data:`RETIRED_PREFERENCE_CODE`) and
+    ``detail``, which names every live successor **and** tells a
+    zero-remote-spend client that the guarantee is a chain property, not a
+    preference value (parent assumption A4).
+    """
+    successors = ", ".join(repr(successor) for successor in exc.successors)
+    return {
+        "error": "X-Local-Preference value is retired",
+        "code": RETIRED_PREFERENCE_CODE,
+        "detail": (
+            f"X-Local-Preference {exc.value!r} is retired and is no longer "
+            f"accepted; send {successors} instead. A client that must never "
+            "spend remote budget should pin a chain with no remote entries "
+            "(e.g. the private model) rather than a preference value."
+        ),
+    }
 
 HEADER_PREFERENCE = "x-local-preference"
 HEADER_RESERVATION = "x-local-reservation"
@@ -662,16 +725,20 @@ def reservation_id_from_headers(headers: Any) -> str | None:
 def parse_preference(headers: Any) -> str:
     """Parse ``X-Local-Preference`` (case-insensitive header names).
 
-    Missing or unknown values fall back to ``prefer-local`` — today's
-    behaviour — so the header is purely additive (AC8).
+    Missing or unknown values fall back to :data:`DEFAULT_PREFERENCE` — the
+    header stays purely additive for anything genuinely unrecognised (AC8).
 
-    The legacy wire value ``local-only`` is normalised to the canonical
-    ``local-preferred`` through :data:`LEGACY_PREFERENCE_ALIASES`, so a
-    deployed client keeps pin-local semantics instead of being demoted to
-    ``prefer-local`` (LP-0MVSHWYVE005MS16 AC1/AC5). Each normalisation logs one
-    ``WARNING`` naming both values; because both call sites cache the parsed
-    value on the request (``request._local_preference``), that is once per
-    request, not once per routing decision (AC2).
+    A **retired** value (:data:`RETIRED_PREFERENCES`) is not additive: it
+    raises :class:`LocalPreferenceRetiredError`, which the request entry points turn
+    into the stable ``400`` of LP-0MVUH9PAZ002UAPA AC1. A retired value is
+    therefore never normalised to a live value and never resolved to the
+    default — both would be silent re-interpretations of an explicit request.
+
+    Remaining aliases (none at present, :data:`LEGACY_PREFERENCE_ALIASES`) are
+    normalised here and log one ``WARNING`` naming both values; because both
+    call sites cache the parsed value on the request
+    (``request._local_preference``), that is once per request, not once per
+    routing decision (AC2).
     """
     if not headers:
         return DEFAULT_PREFERENCE
@@ -685,6 +752,10 @@ def parse_preference(headers: Any) -> str:
     if not raw:
         return DEFAULT_PREFERENCE
     requested = str(raw).strip().lower()
+    retired = RETIRED_PREFERENCES.get(requested)
+    if retired is not None:
+        # Fail closed: never a live value, never the default.
+        raise LocalPreferenceRetiredError(requested, retired)
     value = LEGACY_PREFERENCE_ALIASES.get(requested, requested)
     if value in VALID_PREFERENCES:
         if value != requested:

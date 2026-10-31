@@ -54,7 +54,6 @@ from local_preference_v2_support import (
     PREFER_LOCAL,
     REMOTE_OK,
     RETIRED_CODE,
-    RETIRED_VALUE_IDS,
     RETIRED_VALUES,
 )
 
@@ -64,6 +63,34 @@ from proxy import admission_reserve
 #: proves the retired value was refused on its own account, not because no
 #: local capacity happened to exist.
 _HEALTHY_ROW = support.matrix._HEALTHY_ROW
+
+
+def _retired_param(row: support.RetiredValue):
+    """Parametrise one retired value, marked red until *its own* child lands.
+
+    A single module-level ``xfail`` cannot express the staggered retirement:
+    ``local-only`` is retired by LP-0MVUH9PAZ002UAPA and ``prefer-local`` by
+    LP-0MVUH9PUU005HVS4, so each row carries its own marker. ``strict`` keeps
+    its two jobs — the owning child cannot land without removing it, and a
+    later re-introduction of the value cannot pass silently.
+    """
+    if row.owner == "LP-0MVUH9PAZ002UAPA":
+        return pytest.param(row, id=row.value)
+    return pytest.param(
+        row,
+        id=row.value,
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason=(
+                f"{row.owner}: {row.value} is still a live value — its "
+                "retirement is that child's job"
+            ),
+        ),
+    )
+
+
+RETIRED_PARAMS = [_retired_param(row) for row in RETIRED_VALUES]
+
 #: A chain with no local entry at all, driven through the remote-only cycle.
 _REMOTE_ONLY_ROW = support.matrix._row("no_local_route")
 
@@ -81,16 +108,8 @@ def _clean_state():
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9PAZ002UAPA (local-only) / LP-0MVUH9PUU005HVS4 (prefer-local): "
-        "both values are still accepted today — local-only is silently "
-        "normalised and prefer-local is still the default"
-    ),
-)
 @pytest.mark.parametrize("entry_point", support.ENTRY_POINTS)
-@pytest.mark.parametrize("retired", RETIRED_VALUES, ids=RETIRED_VALUE_IDS)
+@pytest.mark.parametrize("retired", RETIRED_PARAMS)
 async def test_retired_value_is_rejected_with_a_stable_400(
     retired: support.RetiredValue, entry_point: str
 ):
@@ -135,11 +154,7 @@ async def test_retired_value_is_rejected_with_a_stable_400(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PAZ002UAPA/LP-0MVUH9PUU005HVS4: parse still maps both values",
-)
-@pytest.mark.parametrize("retired", RETIRED_VALUES, ids=RETIRED_VALUE_IDS)
+@pytest.mark.parametrize("retired", RETIRED_PARAMS)
 def test_retired_value_is_never_normalised_or_resolved_to_the_default(
     retired: support.RetiredValue,
 ):
@@ -195,21 +210,35 @@ def test_live_vocabulary_is_exactly_the_two_documented_values():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PAZ002UAPA: LEGACY_PREFERENCE_ALIASES still maps local-only",
-)
-def test_retired_values_have_left_the_alias_table_and_the_live_set():
-    """A retired value cannot silently re-enter through the alias table."""
+def test_local_only_has_left_the_alias_table_and_the_live_set():
+    """A retired value cannot silently re-enter through the alias table.
+
+    Split from the ``prefer-local`` half (LP-0MVUH9PAZ002UAPA): one marker over
+    both retirements would stop guarding the *withdrawn* value the moment the
+    still-live one kept the row red.
+    """
     aliases = admission_reserve.LEGACY_PREFERENCE_ALIASES
     assert LOCAL_ONLY not in aliases, (
         "local-only must not be normalised any more; it is a loud 400 "
         f"(alias table: {aliases!r})"
     )
+    assert LOCAL_ONLY not in admission_reserve.VALID_PREFERENCES
+    assert set(aliases.values()) <= set(admission_reserve.VALID_PREFERENCES), (
+        "every alias must still resolve to a live value "
+        f"(alias table: {aliases!r})"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="LP-0MVUH9PUU005HVS4: prefer-local is still a live value",
+)
+def test_prefer_local_has_left_the_alias_table_and_the_live_set():
+    """The second retirement's half of the same guarantee."""
+    aliases = admission_reserve.LEGACY_PREFERENCE_ALIASES
     assert PREFER_LOCAL not in aliases, (
         f"prefer-local must not be normalised (alias table: {aliases!r})"
     )
-    assert LOCAL_ONLY not in admission_reserve.VALID_PREFERENCES
     assert PREFER_LOCAL not in admission_reserve.VALID_PREFERENCES
     assert getattr(admission_reserve, "PREF_LOCAL_ONLY", LOCAL_ONLY) not in (
         admission_reserve.VALID_PREFERENCES

@@ -2051,13 +2051,15 @@ server:
   #     defers and never receives a local-capacity 429. The name is historic
   #     (it once removed the local provider from the chain); no preference
   #     value strips a local entry any more.
-  # The legacy spelling ``local-only`` is a DEPRECATED alias: it is still
-  # accepted and normalised to ``local-preferred`` at parse time (one
-  # deprecation line per request), so an un-migrated client keeps pin-local
-  # semantics — sending it is optional, and either spelling means the same
-  # request intent. Unknown values and an absent header behave exactly as
-  # ``prefer-local`` (today). ``high`` priority keeps its never-queue semantics
-  # under every preference.
+  # The legacy spelling ``local-only`` is RETIRED (LP-0MVUH9PAZ002UAPA): it is
+  # no longer accepted and a request that sends it is refused with 400 and
+  # ``code: local_preference_retired`` (the body names ``local-preferred`` as
+  # the successor) BEFORE any routing, queueing, lease or dispatch state is
+  # written, with exactly one WARNING naming the value and the session. Migrate
+  # a client by sending ``local-preferred``; a client that must never spend
+  # remote budget pins a chain with no remote entries instead. Unknown values
+  # and an absent header behave exactly as ``prefer-local`` (today). ``high``
+  # priority keeps its never-queue semantics under every preference.
   #
   # Interaction with the queue: ``contention_queue_max_wait_seconds`` is the
   # wait budget both this guard and ``/reserve`` compare against, and

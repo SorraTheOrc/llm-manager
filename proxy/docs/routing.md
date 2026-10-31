@@ -1364,13 +1364,33 @@ reserved dispatch does not consume queue depth.
 | `local-preferred` | **Local while the request fits local capacity, remote beyond it.** Pin local **while the request can still fit**. A *deferrable* request — the block is temporal, so waiting can help — waits for local capacity and, when the wait budget runs out, receives the retryable `429` deferral (`X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`, `Retry-After` / `retry_at`) instead of being moved to a paid provider. A *too-large* request — one that outgrows the local serving envelope, so waiting cannot help — is **never deferred and never refused for local capacity**: the local entry leaves the chain and a remote tier serves it (`200`, `X-Local-Route: remote`, no `Retry-After`). See [`local-preferred`: pinned while deferrable, promoted when too large](#local-preferred-pinned-while-deferrable-promoted-when-too-large) and the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
 | `remote-ok` | **Local allowed, remote acceptable.** The local route stays in the chain and is attempted exactly as an absent header attempts it, so a free local slot is used. When local cannot serve the request **right now** — the slot is saturated, the prefill ETA is over the wait budget, the local entry is in cooldown, the residency ladder skipped it, the lease is held, or the per-entry context cap excludes it — the request **steps straight to the next provider**: it does **not** enter the contention queue, does not defer, and never receives a local-capacity `429`, so its queue wait is always `0`. The value's name is **historic**: it once meant "remove the local route from the chain", which is the opposite of the behaviour above and must not be restored |
 
-Wire compatibility (LP-0MVSHWYVE005MS16): `local-only` is the **legacy,
-deprecated** alias of `local-preferred`. It is still accepted and normalised to
-`local-preferred` at parse time — a client that keeps sending it retains
-pin-local semantics and is never demoted to `prefer-local` — and it logs one
-`WARNING` deprecation line per request. No removal date is scheduled, so
-migrating a client is optional: the alias is the same request intent, and an
-un-migrated client needs no code change to get the deferral semantics.
+Wire compatibility: **`local-only` is retired** (LP-0MVUH9PAZ002UAPA). It was
+the deprecated alias of `local-preferred` (LP-0MVSHWYVE005MS16); it is no
+longer accepted. A request that sends it is refused **before** any routing,
+queueing, lease, dispatch or cooldown state is written, with `400` and this
+body:
+
+```json
+{
+  "error": "X-Local-Preference value is retired",
+  "code": "local_preference_retired",
+  "detail": "X-Local-Preference 'local-only' is retired and is no longer accepted; send 'local-preferred' instead. A client that must never spend remote budget should pin a chain with no remote entries (e.g. the private model) rather than a preference value."
+}
+```
+
+Exactly one `WARNING` names the retired value, its live successor and the
+session id (`WARNING … X-Local-Preference='local-only' is retired; rejected
+with 400 (code=local_preference_retired) — send 'local-preferred'
+(session=…)`), so a deployed client still on the old spelling is identifiable
+from `proxy.log` alone.
+
+`code` is the machine-readable branch point: treat it as a permanent client
+configuration error, not a retryable one. **Migration:** send
+`local-preferred` to keep pin-local (deferral) semantics — a pure spelling
+change, no behaviour change. A client that must never spend remote budget does
+not need a preference value at all: pin a model whose chain has **no remote
+entries** (the `private` model), which no preference — and no promotion — can
+ever move to a paid provider.
 
 Unknown values (and an absent header) behave as `prefer-local`, so the header
 is purely additive. `high` priority keeps its "never queue" semantics under
@@ -1619,11 +1639,13 @@ bounded by the local capacity limits instead.
 
 #### Client migration: what a client author must do
 
-**No change is required to keep pin-local semantics.** A client that already
-sends `local-only` may keep sending it: the alias is accepted and normalised to
-`local-preferred`, so the request keeps the deferral behaviour described here
-(one deprecation `WARNING` is logged per request). Renaming the value is a
-clean-up, not a migration gate.
+**One change is required: replace `local-only` with `local-preferred`.** The
+old spelling is retired and now answers `400` with
+`code: local_preference_retired` (see [the retirement
+note](#x-local-preference-request-header)) instead of being normalised, so a
+client that still sends it gets no answer at all. The rename is the whole
+migration — the request intent and the deferral behaviour described here are
+unchanged.
 
 What *is* needed for end-to-end deferral is client-side and tracked outside
 this repository, in the ContextHub store:
