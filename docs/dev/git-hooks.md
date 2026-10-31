@@ -23,9 +23,13 @@ push:
 3. **Full-suite test gate on `dev`/`main` pushes** — a push whose target ref
    is `refs/heads/dev` or `refs/heads/main` runs the **full test suite**
    (`run_tests.py --scope full --strict-git-env`) and is **refused** while
-   the suite is red. Feature-branch pushes never run the suite (fast loop;
-   the full suite first runs at this integration gate, per
-   SA-0MVECQUGF0064U81).
+   the suite is red. The gate first verifies that it is measuring the
+   **pushed commit** — the pushed `local_sha` must be the checkout's `HEAD`
+   and the tree must be clean, otherwise the push is refused before the suite
+   runs (see [The gate verifies the pushed
+   commit](#the-gate-verifies-the-pushed-commit)). Feature-branch pushes never
+   run the suite (fast loop; the full suite first runs at this integration
+   gate, per SA-0MVECQUGF0064U81).
 4. **Worklog sync** — the worklog data branch is synced before the code
    push (skipped when pushing from a linked worktree).
 
@@ -70,7 +74,6 @@ what this repo uses, since it ships no repo-local `skill/` tree). With no
 runner at all the push **fails closed** on a `dev`/`main` target: a machine
 that cannot run the suite cannot sneak a red tree into `dev`. Escape hatch:
 `TEST_SCOPE_SKIP=1` (loud, not recommended).
-
 The runner writes its per-git-state results to `<repo>/.worklog/cache` (or,
 in a worktree — no `.worklog` — the worktree's `<main>/.git/worktrees/<name>/test-cache`).
 To keep the evidence readable by the main checkout's post-push verification
@@ -85,15 +88,116 @@ it. This repo therefore provisions headroom in `.pi/test-config.json`
 and by `implement.py finish`'s push step). After the suite is cached (2 h
 TTL, git-state fingerprint) repeat pushes at the same commit are cheap.
 
+### The gate verifies the pushed commit
+
+A green gate is only worth something if it is evidence about **the commit
+being pushed**. The gate therefore measures the tree the push runs in (the
+checkout's toplevel, which `implement.py finish` makes the main checkout)
+only when that tree **is** the pushed commit:
+
+- the checkout's `HEAD` must equal the pushed `local_sha` of every gated ref
+  (`refs/heads/dev`, `refs/heads/main`) in this push; and
+- the tree must be **clean** — no modified, staged or untracked paths.
+
+Anything else is refused **before the suite runs**, because the runner keys
+its cache on the git state (`HEAD` plus the content of every dirty path): a
+stale or dirty checkout has a *different but valid* fingerprint, so a green
+run there would be a legitimate cache hit for a tree the pushed commit never
+was. The failure mode this closes: `implement.py finish` cannot fast-forward
+the main checkout (it is dirty from concurrent work), warns, and pushes from
+the stale checkout — the gate then went green in seconds and
+`run_tests.py --summary` reported `missing` for the pushed commit
+(LP-0MVSJUM3O003C0H9, observed on 2026-10-28).
+
+Two refusals, both loud and actionable:
+
+```text
+ERROR: pre-push gate refuses this push: the tree it would measure is not the pushed commit.
+  pushed commit  (refs/heads/dev): 903497fb36a2bc153d26533af8c2b56913703b09
+  checked-out HEAD:            4e1691b4e168c758470e93aa578c904afbd8a92b
+  gate tree:                   /home/…/llm
+  …Recovery: bring the main checkout to the pushed commit and re-run
+            'implement.py finish' …, or verify the commit in a worktree that is
+            checked out at <pushed sha> and push from there.
+```
+
+```text
+ERROR: pre-push gate refuses this push: the gate tree is dirty at the pushed commit.
+  pushed commit: 50167e0098f7ae503b5056ca1a49a9219a621b7c
+  gate tree:     /home/…/llm
+  2 path(s) uncommitted, first 10:
+     M proxy/tests/test_llama_local_status.py
+     ?? scratch-untracked.txt
+  …A full-suite run here fingerprints the dirty state, so a green result
+  would not be evidence about the pushed commit; the push is refused
+  before the suite runs.
+```
+
+**Recovery.** Bring the gate tree to the pushed commit and re-push:
+
+1. clean the main checkout — commit or stash the changes (never discard
+   someone else's work), and let `implement.py finish` fast-forward `dev` to
+   the pushed commit; then
+2. re-run `python3 ~/.pi/agent/skills/implement/scripts/implement.py finish
+   <work-item-id>` (idempotent: it re-verifies commit → ancestry → status);
+3. or, when the main checkout cannot be cleaned, verify in a worktree that
+   **is** checked out at the pushed commit and push from there — the gate
+   measures the worktree, which is clean and at the pushed commit, so the
+   run is genuine evidence and its cache entry is mirrored into the main
+   checkout's `.worklog/cache`:
+
+   ```bash
+   cd .worklog/worktrees/wl-<id>-<slug>
+   git fetch origin dev && git rebase origin/dev
+   WORKLOG_SKIP_PRE_PUSH=1 git push origin HEAD:refs/heads/dev
+   ```
+
+   (`WORKLOG_SKIP_PRE_PUSH=1` only skips the worklog sync, which cannot run
+   from a linked worktree — the full-suite gate still runs.)
+
+The guard is scoped to the gated refs: feature-branch pushes still skip the
+suite, and an all-zero (deletion) `local_sha` carries no commit and is not a
+mismatch. `.worklog/` is gitignored here, so worklog churn never makes the
+tree look dirty. **No expected-dirty paths are declared** for this repo; if a
+permanently dirty, gate-irrelevant path is ever needed, that is a deliberate
+change to the hook, not a configuration knob.
+
+**Escape hatches** stay explicit and loud: `TEST_SCOPE_SKIP=1` bypasses the
+whole `dev`/`main` gate (the guard included) and `git push --no-verify`
+skips every hook. Neither is silent — a bypassed push leaves no full-suite
+cache entry, so post-push verification reports `missing` and the audit has no
+evidence to consume.
+
+> **Bootstrap note.** The push that *introduces* a new hook version runs the
+> previous hook (the hook is read from the pushing checkout before the push
+> lands), so the first post-landing push is the first one the guard protects.
+> Also note `implement.py finish` pushes from the main checkout, so a skipped
+> fast-forward now surfaces as this refusal rather than a silent green gate.
+
 ## Simulate a `dev` push without a remote
 
-The hook reads the pushed refs on stdin
-(`<local-ref> <local-sha> <remote-ref> <remote-sha>`). From a checkout with
-a green tree (expect exit 0, full suite runs):
+The hook reads the pushed refs on stdin, one line per ref, in git's order
+(`<local-ref> <local-sha> <remote-ref> <remote-sha>`). From a **clean**
+checkout whose `HEAD` is the sha you pass as `<local-sha>` (expect exit 0
+and a full-suite run):
 
 ```bash
-printf 'refs/heads/wl-x refs/heads/x 0000000000000000000000000000000000000000 refs/heads/dev 0000000000000000000000000000000000000000\n' \
+sha="$(git rev-parse HEAD)"
+printf 'refs/heads/wl-x %s refs/heads/dev %s\n' "$sha" \
+  0000000000000000000000000000000000000000 \
   | sh .githooks/pre-push origin git@example.invalid:repo.git
+echo "exit=$?"   # expect: 0
+```
+
+The same invocation with a `<local-sha>` that is **not** the checkout's
+`HEAD` demonstrates the pushed-commit guard (expect exit 1 and no suite):
+
+```bash
+stale="$(git rev-parse HEAD^)"
+printf 'refs/heads/wl-x %s refs/heads/dev %s\n' "$stale" \
+  0000000000000000000000000000000000000000 \
+  | sh .githooks/pre-push origin git@example.invalid:repo.git
+echo "exit=$?"   # expect: 1, with both shas and the gate tree in the message
 ```
 
 With a deliberately red tree (or `TEST_SCOPE_SKIP` unset and a failing
@@ -105,7 +209,7 @@ the push — that is the regression guard verified by
 
 | Hook | Purpose |
 |---|---|
-| `pre-push` | branch policy, context budget, full-suite gate on `dev`/`main`, worklog sync |
+| `pre-push` | branch policy, context budget, pushed-commit guard + full-suite gate on `dev`/`main`, worklog sync |
 | `post-checkout` | worklog sync after branch checkout (main checkout only) |
 | `post-merge` | worklog sync after a pull/merge; delegates to the repo-local `.githooks/worklog-post-pull` (main checkout only) |
 | `post-rewrite` | worklog sync after an amend/rebase; delegates to the repo-local `.githooks/worklog-post-pull` (main checkout only, stdin forwarded) |

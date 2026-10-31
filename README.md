@@ -107,7 +107,10 @@ Git hooks
   scripts/install_git_hooks.sh --check  # verify
   ```
   `.githooks/pre-push` runs the **full test suite** on every push to
-  `dev`/`main` and refuses a red push; feature-branch pushes skip the suite.
+  `dev`/`main` and refuses a red push; it also refuses to gate at all unless
+  the checkout it measures *is* the pushed commit (clean tree at the pushed
+  sha), so a green gate is always evidence about the pushed commit.
+  Feature-branch pushes skip the suite.
   See [docs/dev/git-hooks.md](docs/dev/git-hooks.md) for bypass knobs,
   timeouts, and a stdin based push simulation.
 
