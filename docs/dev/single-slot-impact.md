@@ -256,8 +256,8 @@ does not report slot counts**; the counts and the per-slot detail live on
 
 | # | Mechanism / metric | Value @ 2 slots | Value @ 1 slot | Classification | Evidence |
 |---|---|---|---|---|---|
-| 30 | Prometheus `llama_slots_query_failures_total{reason}` | counter, no slot dimension | counter, no slot dimension | `not-applicable` | `proxy/proxy/metrics.py:158`-`162` |
-| 31 | Prometheus `llama_slots_child_port_fallbacks_total{reason}` | counter, no slot dimension | counter, no slot dimension | `not-applicable` | `proxy/proxy/metrics.py:163`-`168` |
+| 30 | Prometheus `llama_slots_query_failures_total{reason}` | counter, no slot dimension | counter, no slot dimension | `not-applicable` | `proxy/proxy/metrics.py:179`-`183` |
+| 31 | Prometheus `llama_slots_child_port_fallbacks_total{reason}` | counter, no slot dimension | counter, no slot dimension | `not-applicable` | `proxy/proxy/metrics.py:184`-`188` |
 | 32 | herdr's consumption of `/llama/local/status` (same free slots tracked across polls; cross-repo WL-0MUFP30T2003OX1F) | 2 slots tracked | 1 slot tracked | `derived-auto` | `proxy/proxy/handlers.py:459`-`470`; `proxy/proxy/observability.py:166`-`177` |
 | 33 | Report metric: local busy % (dispatch → finish wall-clock union) | geometry-independent | geometry-independent | `not-applicable` | `.pi/skills/proxy-usage-analysis/REFERENCE.md:575`-`631` |
 | 34 | Report metric: turns served locally (local-turn coverage) | geometry-independent | geometry-independent | `not-applicable` | `.pi/skills/proxy-usage-analysis/REFERENCE.md:359`-`376` |
@@ -274,6 +274,18 @@ the analysis computes wall-clock unions, per-stream slot-second sums and
 per-stream rates, all of which stay comparable across geometries. That is also
 why they can evidence the A/B — see §6 for the ones that *cannot* see
 single-slot starvation.
+
+**Slot-occupancy gauges (added after this table was first written).**
+LP-0MVT1O0VG00905EL landed the metric-level counterpart of rows 24-29:
+`llama_slots_total`, `llama_slots_busy`, `llama_slot_busy{slot}`,
+`llama_slots_in_flight_tasks` and `llama_slots_sample_timestamp_seconds`
+(`proxy/proxy/metrics.py:189`-`217`), published by the slot-metrics sampler
+(`proxy/proxy/observability.py:889`-`960`, started at
+`proxy/proxy/server.py:1119`-`1151`). They are `derived-auto` — they follow the
+live pool at either geometry (2 total at two slots, 1 at one) — and they close
+the "no per-slot occupancy metric" gap §6 previously recorded. They are
+reported here rather than as an inventory row so the row numbering and the
+headline tally above stay valid.
 
 ---
 
@@ -620,26 +632,93 @@ slice). Everything else in the prediction rides on `derived-auto` or
 - `derived-auto` row 21 names the thrash mechanism (all sessions → slot 0) and
   points at the measured steal rate it must reason with.
 
-## 6. Metrics gap list (reserved for LP-0MVTV6GA8002P7QU)
+## 6. Metrics gap list (LP-0MVTV6GA8002P7QU)
 
-*This section is filled by the metrics-gap slice.* Every conclusion of §5 must
-be mapped to an existing metric that can detect it, and every blind spot filed
-as a follow-up work item.
+*Which existing metric would reveal a single-slot problem, and which would stay
+silent.* One row per §5 conclusion (E1-E8). Nothing in this section adds a
+metric, an endpoint field or a configuration value: every blind spot is filed as
+a follow-up work item (§6.4) and implemented there.
 
-Inputs it inherits from this slice:
+### 6.1 The question, and the short answer
 
-- Rows 33-41 are the existing measurement surface, and all of them are
-  geometry-independent — none of them is divided by, or scoped to, a specific
-  slot.
-- Rows 24-29 publish **pool-level** counts and **per-slot** detail, but the
-  proxy publishes **no per-slot occupancy metric** (the only Prometheus
-  `llama_slots_*` series are the two failure counters, rows 30 and 31). Per-slot
-  occupancy metrics are the known gap and are already tracked as the blocked
-  item **LP-0MVT1O0VG00905EL** ("Publish slot occupancy metrics from the
-  proxy") — they are not implemented here.
-- Row 32 is the other consumer whose blind spots matter: herdr reads pool counts
-  and per-slot detail, so a starved single slot is visible to herdr only through
-  `slots[]` poll data, not through a metric.
+Can today's metric set detect a single-slot regime? **Partly.** Demand, tokens,
+latency and queue effects are all detectable — but only *after the fact*, from
+the nightly log-derived usage-analysis report (rows 33-41 of §3.5). Live
+pool-level starvation is now observable as well: the per-slot occupancy gauges
+that this report previously listed as a gap (`llama_slots_total`,
+`llama_slots_busy`, `llama_slot_busy{slot}`, `llama_slots_in_flight_tasks`,
+`llama_slots_sample_timestamp_seconds`) have landed with
+**LP-0MVT1O0VG00905EL** (`proxy/proxy/metrics.py`; published by the
+slot-metrics sampler, `proxy/proxy/server.py` and `proxy/proxy/observability.py`),
+and `slots_stale` now reaches the nightly report (LP-0MVU8O4EL005IYP9).
+
+What stays silent is the *mechanism* side of the prediction: there is **no**
+contention-queue series, **no** prefix-reuse or KV-steal series, and **no** way
+to join decode rate to the concurrency it was measured under (§6.3). Those are
+the three gaps a single-slot regression would hide behind.
+
+### 6.2 Detection per conclusion
+
+| # | Conclusion (§5) | Existing metric that would detect it | Surface | Detection window | Sufficient? | Follow-up |
+|---|---|---|---|---|---|---|
+| E1 | turns served locally fall (0-2 %) | `turns_served_locally` (local-turn coverage), `diverts_by_reason`, `queue_waits` | usage-analysis report (rows 34, 36, 37) | one 24 h window, or one A/B arm capture | yes — a 2 % shift is inside the report's own per-session attribution noise, so the A/B arm capture (not the nightly report) is the real detector | none needed |
+| E2 | local prompt tokens unchanged without the co-change; ceiling diverts fall with it | `local_prompt_tokens` (`Stream finished` `tokens=<p>/<c>`), `context_ceiling_diverts` / `diverts_by_reason` | report rows 35-36 | one 24 h window | yes | none needed |
+| E3 | completion volume unchanged; batching/timing changes | `local_completion_tokens`, `decode_slot_seconds` | report rows 35, 40 | one 24 h window | volume: yes. **timing: no** — decode rate cannot be attributed to concurrency (`llama_token_rate_gauge` is labelled by `session_id` only) | **LP-0MVWPK95J003HAAB** |
+| E4 | first-byte tail worsens for co-change admissions | `dispatch_to_first_byte` (p50/p90), `ttft_all_streams` | report row 38 | one 24 h window, or one A/B arm capture | yes — the p90 is exactly the predicted tail | none needed |
+| E5 | per-stream decode flat to better; low tail narrows | `decode_slot_seconds`, `Decode speed` p10/p50/p90 | report rows 40-41 | one A/B arm capture | **partly** — per-stream decode is measured, but nothing records the concurrency it ran under, so "the tail narrowed *because* the batch was not shared" is not testable | **LP-0MVWPK95J003HAAB** |
+| E6 | queue entries and losses rise by the overlap turns | `queue_waits`, `fallback_after_queue` (`queue_wait_ms` in the prefill breakdown) | report row 37 | one 24 h window | after the fact: yes. **live: no** — `proxy/proxy/metrics.py` publishes no contention-queue series, so a queue filling up at one slot cannot alert | **LP-0MVWPJW2700966ZU** |
+| E7 | prefix reuse collapses (95 % steal) and re-prefill rises up to 11.5 M tokens/day | `prefill_slot_seconds` per served turn; `llama_local_evictions_after_acceptance_total{reason}`; `llama_slot_busy{slot}` | report rows 39, 31; `proxy/proxy/metrics.py` | one A/B arm capture (ratio), one 24 h window (pool) | **partly** — the *cost* is visible as a rising prefill-seconds-per-turn ratio, but the *cause* (prefix reuse vs steal) has no metric, so a decode-side or prompt-size change could mimic it | **LP-0MVWPK2VH008YWBD** |
+| E8 | headroom stays ≈ 89.5 %, so throughput is not the constraint | `local_busy_pct`, `avg_concurrency`, `peak_concurrency`; live: `llama_slots_busy` / `llama_slot_busy{slot}` | report rows 33; `proxy/proxy/metrics.py` | one 24 h window (report), 15 s sample (gauges) | yes, now that the per-slot gauges exist (LP-0MVT1O0VG00905EL) | the capacity *advertisement* can still be wrong: **LP-0MVWPKF3A007KIXK** |
+
+### 6.3 The metrics that stay silent
+
+At minimum, these blind spots would let a single-slot regression pass unnoticed:
+
+1. **Contention queue.** No Prometheus series exists for depth, wait or loss
+   (`proxy/proxy/metrics.py` has none), so the queue is only visible in the
+   nightly `queue_wait_ms` breakdown. A one-slot pool makes the queue the
+   primary cost centre (E6), which is exactly the surface that has no live
+   signal. → LP-0MVWPJW2700966ZU.
+2. **Prefix reuse and KV-cache steal.** No counter records whether a stream
+   reused a prefix or stole a slot's cache (E7). The 95 % steal rate that
+   single-slot serving would introduce is only inferable from the
+   prefill-seconds ratio. → LP-0MVWPK2VH008YWBD.
+3. **Decode rate versus concurrency.** `llama_token_rate_gauge` carries
+   `session_id`, and the report's `Decode speed` table is per stream; nothing
+   records the concurrent-stream count at sample time, so E3/E5 are direction
+   statements that no query can settle. → LP-0MVWPK95J003HAAB.
+4. **Capacity advertisement when the key is absent.** The three
+   `server_cfg.get("session_slot_pool_size", 3) or 3` fallbacks in
+   `proxy/proxy/handlers.py` (§3.4 row 26) would advertise three slots at
+   *either* geometry if the key were missing, so the pool-level gauges could
+   look healthy against a wrong denominator. → LP-0MVWPKF3A007KIXK.
+
+Two surfaces are **no longer** silent and are listed here only to keep the
+record straight: per-slot occupancy (LP-0MVT1O0VG00905EL, published by the
+slot-metrics sampler and consumed for counts and processing state) and pool
+staleness (`slots_stale`, LP-0MVU8O4EL005IYP9). Rows 24-29 of §3.4 remain the
+payload-level view; the gauges are the metric-level one.
+
+### 6.4 Follow-ups filed (or reused)
+
+| Work item | Metric it adds | How it surfaces single-slot starvation | Status at filing |
+|---|---|---|---|
+| **LP-0MVWPJW2700966ZU** | contention-queue depth gauge, wait histogram, loss counter with fall-through reason | a queue that fills and drops because only one slot exists becomes alertable instead of a nightly footnote | open (new) |
+| **LP-0MVWPK2VH008YWBD** | prefix-reuse outcome counter, slot steal/eviction counter | separates "more re-prefill because of thrash" from "more re-prefill because prompts got bigger" | open (new) |
+| **LP-0MVWPK95J003HAAB** | decode-rate histogram keyed by concurrent-stream count | turns E3/E5 from a direction into a measurable comparison between arms | open (new) |
+| **LP-0MVWPKF3A007KIXK** | none (corrects the slot-count denominator) | stops a missing config key from advertising 3 slots and making occupancy look normal | open (new) |
+| **LP-0MVT1O0VG00905EL** | `llama_slots_total`, `llama_slots_busy`, `llama_slot_busy{slot}`, `llama_slots_in_flight_tasks`, `llama_slots_sample_timestamp_seconds` | live per-slot occupancy — the primary single-slot starvation signal | open at filing; the gauges and sampler are already on `dev` |
+| **LP-0MVT1O7AU002CM7P** | documentation of GPU telemetry, calibration and retention | keeps the busy-time figure E8 relies on interpretable | blocked (cited, not created) |
+
+Every row of §6.2 is therefore backed by an existing item or a filed one; no
+gap is left unfiled.
+
+### 6.5 What this slice did not do
+
+No metric, endpoint field or configuration value was added or changed by
+LP-0MVTV6GA8002P7QU: the diff is this documentation section plus the worklog
+items above (AC5). The measurement itself stays with the A/B in
+LP-0MVMHNUXW0061FGN, and the per-slot gauges belong to LP-0MVT1O0VG00905EL.
 
 ---
 
@@ -686,7 +765,10 @@ Code and config (`proxy/` relative to the repository root):
 | `proxy/proxy/handlers.py:683`, `:729`, `:859` | fail-open pool literal `3` |
 | `proxy/proxy/handlers.py:912`-`953` | `slots_stale` / `slots_detail_stale` / abandoned slots |
 | `proxy/proxy/handlers.py:1192`-`1264` | `/health` (no slot counts) |
-| `proxy/proxy/metrics.py:158`-`168` | the only two `llama_slots_*` series |
+| `proxy/proxy/metrics.py:179`-`188` | the two `llama_slots_*` failure counters |
+| `proxy/proxy/metrics.py:189`-`217` | the slot-occupancy gauges (LP-0MVT1O0VG00905EL) |
+| `proxy/proxy/server.py:1119`-`1151` | slot-metrics sampler start/stop |
+| `proxy/proxy/observability.py:889`-`960` | `_slot_metrics_loop`, the sampler that publishes the gauges |
 
 Documents and analysis catalogue:
 
