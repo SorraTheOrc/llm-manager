@@ -419,6 +419,52 @@ def test_ac2_dispatch_outside_correlation_window_is_not_paired(tmp_path):
     assert data["windows"]["after"]["ac2"]["non_idle_service_ms"]["n"] == 1
 
 
+def test_ac2_check_is_measurable_when_enough_admits_pair(tmp_path):
+    data, _ = _result(_write_log(tmp_path, _baseline_lines() + _after_lines()))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC2:")
+    )
+    assert check["measurable"] is True
+    assert check["pass"] is True
+    assert check["idle_admits"] == 6
+    assert check["unpaired_admits"] == 0
+
+
+def test_ac2_states_the_comparison_is_unmeasurable_when_nothing_paired(tmp_path):
+    """An admit that never dispatched leaves AC2 with no treatment sample.
+
+    The recorded 2026-10-22→23 window is this shape (0 of 31 admits paired).
+    The report must say the comparison is *unmeasurable* with its sample
+    counts, not merely fail a check: that is what the parent's AC2 allows
+    ("the comparison must state sample counts").
+    """
+    lines = _baseline_with_interactive() + [
+        _idle_admit("2026-10-20 01:00:00,000", "refused-1", tokens=95000),
+        _fallback("2026-10-20 01:00:01,000"),
+        # A non-idle control dispatch, so the note's control sample count is real.
+        _dispatch("2026-10-20 03:00:00,000", "other", 40000.0, 39900.0,
+                  cache_state="warm", priority="medium", tokens=20000),
+    ]
+    data, _ = _result(_write_log(tmp_path, lines))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC2:")
+    )
+    assert check["measurable"] is False
+    assert check["pass"] is False
+    assert check["observed"] == 0
+    assert check["idle_admits"] == 1
+    assert check["unpaired_admits"] == 1
+    assert check["non_idle_samples"] >= 1
+    note = " ".join(data["verdict"]["notes"])
+    assert "AC2 unmeasurable" in note
+    assert "0 of 1" in note
+    assert "non-idle control n=" in note
+
+
 def test_ac2_legacy_dispatch_falls_back_to_routing_check_bucket(tmp_path):
     """Logs predating the dispatch-line instrumentation still bucket correctly."""
     lines = [
@@ -642,7 +688,98 @@ def test_ac4_unmeasurable_when_dispatch_lines_lack_priority(tmp_path):
         if check["target"].startswith("AC4:")
     )
     assert check["pass"] is False
+    assert check["measurable"] is False
     assert any("priority=" in note for note in data["verdict"]["notes"])
+
+
+def test_ac4_zero_baseline_is_unmeasurable_not_a_999_percent_regression(tmp_path):
+    """A window with no interactive-tier sample cannot express a % change.
+
+    The recorded 2026-10-22→23 window has before n=0: reporting
+    ``_NEW_ACTIVITY_PCT`` (999 %) there invents a regression the data cannot
+    support, and the parent's AC4 asks for "unchanged within noise" *or* the
+    regression stated with causal evidence — neither of which a zero-baseline
+    percentage is.
+    """
+    data, _ = _result(_write_log(tmp_path, _baseline_lines() + _after_lines()))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC4:")
+    )
+    assert check["before"]["n"] == 0
+    assert check["after"]["n"] == 5
+    assert check["measurable"] is False
+    assert check["observed_p50_pct_change"] is None
+    assert check["observed_p90_pct_change"] is None
+    assert check["pass"] is False
+    note = " ".join(data["verdict"]["notes"])
+    assert "AC4 unmeasurable" in note
+    assert "999" not in note
+    assert "Interactive latency regressed" not in note
+
+
+def test_ac4_names_a_cross_tier_prefill_overlap_as_the_cause(tmp_path):
+    """AC4's causal evidence is a prefill *overlap*, not a tier match.
+
+    A ``low``-priority idle-admitted prefill holds the slot while a
+    ``high``-priority request is dispatched; the note must name both, which is
+    the cross-tier attribution the AC4 wording asks for.
+    """
+    after = [
+        _idle_admit("2026-10-20 01:00:00,000", "idle-low", tokens=95000),
+        _dispatch("2026-10-20 01:00:02,000", "idle-low", 60200.0, 60000.0,
+                  priority="low", tokens=95000),
+        _dispatch("2026-10-20 01:00:20,000", "interactive-slow", 45000.0, 44000.0,
+                  cache_state="warm", priority="high", tokens=20000),
+        _dispatch("2026-10-20 12:00:00,000", "interactive-clear", 41000.0, 40900.0,
+                  cache_state="warm", priority="high", tokens=20000),
+    ]
+    data, _ = _result(_write_log(tmp_path, _baseline_with_interactive() + after))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC4:")
+    )
+    assert check["measurable"] is True
+    assert check["pass"] is False
+    overlap = data["windows"]["after"]["ac4"]["overlap"]
+    assert overlap["interactive_samples"] == 2
+    assert overlap["interactive_samples_overlapped"] == 1
+    assert overlap["idle_prefills_with_interval"] == 1
+    assert overlap["cross_tier_prefills"] == 1
+    assert overlap["same_tier_prefills"] == 0
+    assert [entry["admit_session"] for entry in overlap["cross_tier"]] == ["idle-low"]
+    assert overlap["cross_tier"][0]["interactive_sessions"] == ["interactive-slow"]
+    assert overlap["same_tier"] == []
+    note = " ".join(data["verdict"]["notes"])
+    assert "idle-low" in note and "interactive-slow" in note
+    assert "cross-tier" in note
+
+
+def test_ac4_states_when_no_idle_prefill_overlapped_the_interactive_tier(tmp_path):
+    """A regression with no overlap is stated as unattributed by this evidence."""
+    after = _after_lines(interactive_service_ms=40000.0)
+    data, _ = _result(_write_log(tmp_path, _baseline_with_interactive() + after))
+    overlap = data["windows"]["after"]["ac4"]["overlap"]
+    assert overlap["idle_prefills_with_interval"] == 6
+    assert overlap["interactive_samples"] == 5
+    assert overlap["interactive_samples_overlapped"] == 0
+    assert overlap["same_tier"] == []
+    assert overlap["cross_tier"] == []
+    note = " ".join(data["verdict"]["notes"])
+    assert "No in-flight overlap" in note
+
+
+def test_ac4_recommendation_reports_an_unmeasurable_tier(tmp_path):
+    """The AC5 reasons must not print a percentage for an unmeasurable tier."""
+    data, _ = _result(
+        _write_log(tmp_path, _baseline_lines() + _after_lines(fallbacks=2))
+    )
+    recommendation = data["verdict"]["recommendation"]
+    reasons = " ".join(recommendation["reasons"])
+    assert "unmeasurable" in reasons
+    assert "None%" not in reasons
 
 
 # ---------------------------------------------------------------------------

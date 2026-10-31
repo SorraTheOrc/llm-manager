@@ -63,8 +63,14 @@ stated in the output.
 
 **AC4 — interactive traffic.** p50/p90 ``dispatch_first_byte_ms`` for the
 interactive priority tier (``--interactive-priority``, default ``high``) before
-vs after, with a noise band; a regression is reported together with the
-idle-admitted prompts that overlap it.
+vs after, with a noise band. The comparison needs an interactive-tier sample in
+**both** windows: with zero samples on one side no percentage change exists, so
+the check reports *unmeasurable* (never a percentage against a zero baseline,
+which would invent a regression) and states the sample counts. A regression is
+reported together with its causal evidence — the idle-admitted prefills that
+were **in flight** when an interactive-tier dispatch started, split same-tier
+vs cross-tier (``ac4.overlap``) — because the harm is GPU occupancy from a
+prefill, not a matching priority label.
 
 **AC5 — enable-by-default decision or concrete tuning follow-up.** A
 deterministic recommendation (``enable_by_default`` / ``tune`` / ``measure``)
@@ -138,6 +144,9 @@ _FALLBACK_REDUCTION_MIN_PCT = 2.0
 
 #: Interactive p50/p90 movements within this percentage are "within noise".
 _INTERACTIVE_NOISE_PCT = 10.0
+
+#: Priority tier treated as interactive (``--interactive-priority``).
+_DEFAULT_INTERACTIVE_PRIORITY = "high"
 
 #: Denial-rate increases within this percentage are tolerated (AC3 asks only
 #: that denials do not increase).
@@ -760,6 +769,7 @@ def summarise_window(
     bucket_edges: tuple[int, ...],
     correlation_window_s: float,
     min_lease_samples: int = _MIN_LEASE_SAMPLES,
+    interactive_priority: str = _DEFAULT_INTERACTIVE_PRIORITY,
 ) -> dict:
     """Aggregate one window's events into the AC1/AC2/AC3/AC4 metric set."""
     local_dispatches = [e for e in events if e["kind"] == "local_dispatch"]
@@ -1014,6 +1024,11 @@ def summarise_window(
     non_idle_dispatches = [
         event for index, event in enumerate(local_dispatches) if index not in claimed
     ]
+    interactive_events = [
+        event
+        for event in non_idle_dispatches
+        if event.get("priority") == interactive_priority
+    ]
     ac4 = {
         "interactive_priority": None,  # filled by the caller's comparison
         "by_priority": {},
@@ -1037,6 +1052,14 @@ def summarise_window(
         ac4["idle_admitted_by_priority"][priority] = (
             ac4["idle_admitted_by_priority"].get(priority, 0) + 1
         )
+    # Causal evidence for a reported regression: which idle-admitted prefills
+    # were actually IN FLIGHT (slot held, from dispatch to first byte) when an
+    # interactive-tier dispatch started. A priority-label match alone is not
+    # causation — a lower-tier prefill occupying the slot is the mechanism
+    # AC4's wording names ("idle-admitted prompt overlapping").
+    ac4["overlap"] = _idle_interactive_overlap(
+        idle_records, interactive_events, interactive_priority=interactive_priority
+    )
 
     return {
         "ac1": ac1,
@@ -1071,6 +1094,140 @@ def summarise_window(
         "_idle_records": idle_records,  # internal (rendered only in JSON detail)
         "_events": events,
     }
+
+
+def _idle_interactive_overlap(
+    idle_records: list[dict],
+    interactive_events: list[dict],
+    *,
+    interactive_priority: str = _DEFAULT_INTERACTIVE_PRIORITY,
+    limit: int = 10,
+    session_limit: int = 5,
+) -> dict:
+    """Idle-admitted prefills that were in flight when the interactive tier waited.
+
+    AC4 accepts either "unchanged within noise" or the regression stated with
+    causal evidence ("idle-admitted prompt overlapping"). The causal claim is
+    GPU occupancy: an idle-admitted prefill holds the slot from its dispatch
+    for ``dispatch_to_first_byte_ms`` (the slot-held service time), so an
+    interactive-tier dispatch that starts inside that interval is the evidence.
+    Entries are split by the *admitting* request's tier — same-tier and
+    cross-tier — because a lower-tier prefill is exactly the indirect harm the
+    check exists to catch. Bounded (``limit`` entries, ``session_limit``
+    session ids each) to keep the JSON artifact small.
+    """
+
+    def _iso(moment: dt.datetime | None) -> str | None:
+        return moment.isoformat(sep=" ") if moment else None
+
+    prefills: list[dict] = []
+    without_interval = 0
+    for record in idle_records:
+        dispatch = record.get("dispatch")
+        service_ms = dispatch.get("service_ms") if dispatch else None
+        if not dispatch or service_ms is None:
+            without_interval += 1
+            continue
+        start = dispatch["ts"]
+        prefills.append(
+            {
+                "record": record,
+                "start": start,
+                "end": start + dt.timedelta(milliseconds=float(service_ms)),
+                "priority": dispatch.get("priority"),
+            }
+        )
+
+    same_tier: list[dict] = []
+    cross_tier: list[dict] = []
+    entry_by_prefill: dict[int, dict] = {}
+    overlapping_samples: set[int] = set()
+    for event_index, event in enumerate(interactive_events):
+        covering = [
+            prefill
+            for prefill in prefills
+            if prefill["start"] <= event["ts"] <= prefill["end"]
+        ]
+        if not covering:
+            continue
+        overlapping_samples.add(event_index)
+        for prefill in covering:
+            entry = entry_by_prefill.get(id(prefill))
+            if entry is None:
+                admit = prefill["record"]["admit"]
+                entry = {
+                    "admit_session": admit.get("session"),
+                    "admit_at": _iso(admit["ts"]),
+                    "prefill_start": _iso(prefill["start"]),
+                    "prefill_end": _iso(prefill["end"]),
+                    "priority": prefill["priority"],
+                    "interactive_sessions": [],
+                }
+                entry_by_prefill[id(prefill)] = entry
+                bucket = same_tier if prefill["priority"] == interactive_priority else cross_tier
+                if len(bucket) < limit:
+                    bucket.append(entry)
+            session = event.get("session")
+            if (
+                session
+                and session not in entry["interactive_sessions"]
+                and len(entry["interactive_sessions"]) < session_limit
+            ):
+                entry["interactive_sessions"].append(session)
+
+    same_tier_prefills = sum(1 for p in prefills if p["priority"] == interactive_priority)
+    return {
+        "interactive_priority": interactive_priority,
+        "interactive_samples": len(interactive_events),
+        "interactive_samples_overlapped": len(overlapping_samples),
+        "idle_prefills_with_interval": len(prefills),
+        "idle_admits_without_interval": without_interval,
+        "same_tier_prefills": same_tier_prefills,
+        "cross_tier_prefills": len(prefills) - same_tier_prefills,
+        "same_tier": same_tier,
+        "cross_tier": cross_tier,
+        "semantics": (
+            "An idle-admitted prefill is in flight from its dispatch for "
+            "dispatch_to_first_byte_ms (slot-held service time); an interactive-tier "
+            "dispatch starting inside that interval is the causal evidence AC4 asks "
+            "for. same_tier/cross_tier describe the ADMITTING request's priority, not "
+            "the harmed one."
+        ),
+    }
+
+
+def _overlap_evidence_text(overlap: dict, *, limit: int = 3) -> str:
+    """One-sentence AC4 causal-overlap reading (see ``_idle_interactive_overlap``)."""
+    samples = overlap.get("interactive_samples")
+    if not samples:
+        return ""
+    overlapped = overlap.get("interactive_samples_overlapped") or 0
+    prefills = overlap.get("idle_prefills_with_interval") or 0
+    if not overlapped:
+        return (
+            f"No in-flight overlap: 0 of {samples} interactive-tier dispatch(es) started "
+            f"inside an idle-admitted prefill ({prefills} prefill interval(s) "
+            "reconstructed), so this evidence does not attribute the regression to an "
+            "idle-admitted prompt."
+        )
+    parts: list[str] = []
+    for label, entries in (
+        ("cross-tier", overlap.get("cross_tier") or []),
+        ("same-tier", overlap.get("same_tier") or []),
+    ):
+        if not entries:
+            continue
+        described = "; ".join(
+            f"{entry['admit_session']} ({entry['prefill_start']} → {entry['prefill_end']}, "
+            f"overlapping {', '.join(entry['interactive_sessions']) or 'unnamed session'})"
+            for entry in entries[:limit]
+        )
+        parts.append(f"{label}: {described}")
+    return (
+        f"In-flight overlap: {overlapped} of {samples} interactive-tier dispatch(es) "
+        f"started inside an idle-admitted prefill ({prefills} prefill interval(s) "
+        "reconstructed) — " + " | ".join(parts) + "."
+    )
 
 
 def _bucket_sort_key(label: str) -> tuple[int, str]:
@@ -1251,18 +1408,37 @@ def evaluate(
         )
 
     # AC2: the comparison must carry samples, and idle-admitted prompts are
-    # expected to be slow (no threshold — the trade, not a target).
+    # expected to be slow (no threshold — the trade, not a target). With too
+    # few paired admits there is no idle-admitted distribution to compare, so
+    # the check says so explicitly with its sample counts instead of leaving a
+    # bare failed check that reads like a failed comparison.
     paired = after["ac2"]["idle_admitted_sample_counts"]["paired_local_dispatches"]
+    unpaired = after["ac2"]["idle_admitted_sample_counts"]["unpaired_admits"]
+    idle_admit_events = after_ac1["local_idle_admit"]
+    non_idle_samples = after["ac2"]["non_idle_first_byte_ms"]["n"]
     checks.append(
         {
             "target": "AC2: idle-admitted dispatches paired with their dispatch event",
             "observed": paired,
+            "measurable": paired >= min_idle_samples,
+            "idle_admits": idle_admit_events,
+            "unpaired_admits": unpaired,
+            "non_idle_samples": non_idle_samples,
             "pass": paired >= min_idle_samples,
         }
     )
-    if after["ac2"]["idle_admitted_sample_counts"]["unpaired_admits"]:
+    if paired < min_idle_samples:
         notes.append(
-            f"{after['ac2']['idle_admitted_sample_counts']['unpaired_admits']} idle_admit "
+            f"AC2 unmeasurable: {paired} of {idle_admit_events} idle_admit event(s) had "
+            "a local dispatch inside the "
+            f"{_DEFAULT_CORRELATION_WINDOW_S:.0f} s correlation window (non-idle control "
+            f"n={non_idle_samples}), so this window carries no idle-admitted "
+            "percentile/slot-second distribution to compare. The AC2 trade is "
+            "unmeasured, not failed."
+        )
+    if unpaired:
+        notes.append(
+            f"{unpaired} idle_admit "
             "event(s) had no local dispatch event inside the correlation window "
             "(possible: fallback after admission, or a restart mid-request)."
         )
@@ -1352,14 +1528,26 @@ def evaluate(
             "(see ac3.attribution_limit)."
         )
 
-    # AC4: interactive latency within noise.
+    # AC4: interactive latency within noise. A percentage change is only
+    # defined when BOTH windows carry an interactive-tier sample; with a zero
+    # baseline ``_pct_change`` returns ``_NEW_ACTIVITY_PCT`` (999 %), which
+    # reports a regression that the data cannot support. Such a window is
+    # reported as unmeasurable with its sample counts instead.
     interactive_before = before["ac4"]["interactive"]
     interactive_after = after["ac4"]["interactive"]
-    p50_change = _pct_change(interactive_before["p50_ms"], interactive_after["p50_ms"])
-    p90_change = _pct_change(interactive_before["p90_ms"], interactive_after["p90_ms"])
-    interactive_ok = (
-        interactive_after["n"] > 0
-        and max(p50_change, p90_change) <= _INTERACTIVE_NOISE_PCT
+    interactive_measurable = interactive_before["n"] > 0 and interactive_after["n"] > 0
+    if interactive_measurable:
+        p50_change: float | None = _pct_change(
+            interactive_before["p50_ms"], interactive_after["p50_ms"]
+        )
+        p90_change: float | None = _pct_change(
+            interactive_before["p90_ms"], interactive_after["p90_ms"]
+        )
+    else:
+        p50_change = p90_change = None
+    interactive_ok = bool(
+        interactive_measurable
+        and max(p50_change or 0.0, p90_change or 0.0) <= _INTERACTIVE_NOISE_PCT
     )
     if interactive_after["n"] == 0:
         notes.append(
@@ -1368,17 +1556,28 @@ def evaluate(
             "estimated_tokens=) with LP-0MVGHXD59008UOUD, so AC4 needs a window "
             "logged after that instrumentation is deployed."
         )
+    elif interactive_before["n"] == 0:
+        notes.append(
+            "AC4 unmeasurable: the before window has no non-idle "
+            f"priority={interactive_priority} dispatch (n=0) to compare the after "
+            f"window's n={interactive_after['n']} against, so no percentage change "
+            "is reported (a zero baseline would report a spurious regression). The "
+            f"after window's absolute p50 {interactive_after['p50_ms']} ms / p90 "
+            f"{interactive_after['p90_ms']} ms is the measurement; AC4 needs a "
+            "before window logged with the same instrumentation."
+        )
     checks.append(
         {
             "target": f"AC4: {interactive_priority}-priority first byte within {_INTERACTIVE_NOISE_PCT:.0f}% p50/p90",
             "observed_p50_pct_change": p50_change,
             "observed_p90_pct_change": p90_change,
+            "measurable": interactive_measurable,
             "before": interactive_before,
             "after": interactive_after,
             "pass": interactive_ok,
         }
     )
-    if not interactive_ok and interactive_after["n"] > 0:
+    if interactive_measurable and not interactive_ok:
         overlapping = [
             f"{record['admit']['session']}@{record['admit']['ts'].isoformat(sep=' ')}"
             for record in after["_idle_records"]
@@ -1393,7 +1592,9 @@ def evaluate(
             overlapping_text = ", ".join(overlapping)
         notes.append(
             "Interactive latency regressed beyond the noise band; idle-admitted prompts at "
-            f"the SAME priority tier: {overlapping_text}."
+            f"the SAME priority tier: {overlapping_text}. " + _overlap_evidence_text(
+                after["ac4"].get("overlap") or {}
+            )
         )
 
     # ---- Parent AC1 (LP-0MVK16GME007EYUW) — lease-gate shape attribution ----
@@ -1516,15 +1717,27 @@ def evaluate(
                 f"{len(attributed)} timeout(s) attributable to idle-admitted requests"
             )
         if not interactive_ok:
-            recommendation["reasons"].append(
-                f"{interactive_priority}-priority first byte moved p50 {p50_change}% / "
-                f"p90 {p90_change}%"
-            )
+            if interactive_measurable:
+                recommendation["reasons"].append(
+                    f"{interactive_priority}-priority first byte moved p50 {p50_change}% / "
+                    f"p90 {p90_change}%"
+                )
+            else:
+                recommendation["reasons"].append(
+                    f"{interactive_priority}-priority first byte is unmeasurable "
+                    f"(n={interactive_before['n']} before / n={interactive_after['n']} after)"
+                )
         tuning: list[str] = []
-        if not interactive_ok:
+        if not interactive_ok and interactive_measurable:
             tuning.append(
                 "gate the override on priority (never admit for the interactive tier) "
                 "and/or cap the admitted prompt size"
+            )
+        if not interactive_measurable:
+            tuning.append(
+                "re-measure AC4 in a window whose before-period carries the same "
+                "priority=/estimated_tokens= instrumentation, so the interactive "
+                "comparison is measurable"
             )
         if denied_ok is False:
             tuning.append(
@@ -1732,6 +1945,15 @@ def render(meta: dict, windows: dict, verdict: dict) -> str:
             f"[{label}] n={dist['n']:<5} p50={dist['p50_ms']:>10.1f} ms "
             f"p90={dist['p90_ms']:>10.1f} ms"
         )
+    overlap = windows["after"]["ac4"].get("overlap") or {}
+    if overlap:
+        out.append(
+            f"sampling: interactive samples {overlap['interactive_samples']}, "
+            f"idle-admitted prefills reconstructed {overlap['idle_prefills_with_interval']} "
+            f"(same-tier {overlap['same_tier_prefills']}, "
+            f"cross-tier {overlap['cross_tier_prefills']}), "
+            f"samples started inside a prefill {overlap['interactive_samples_overlapped']}"
+        )
     out.append("")
 
     cf = windows["after"].get("counterfactual", {})
@@ -1750,6 +1972,8 @@ def render(meta: dict, windows: dict, verdict: dict) -> str:
     out.append(f"VERDICT: {verdict['verdict']}")
     for check in verdict["checks"]:
         observed = check.get("observed", check.get("observed_pct_change", check.get("observed_hours", "n/a")))
+        if observed is None:
+            observed = "unmeasurable"
         out.append(f"  [{'ok  ' if check['pass'] else 'FAIL'}] {check['target']} (observed {observed})")
     for note in verdict["notes"]:
         out.append(f"  note: {note}")
@@ -1908,11 +2132,27 @@ def render_markdown(meta: dict, windows: dict, verdict: dict) -> str:
             "counts as a confident attribution."
         )
     out.append("")
+    before_interactive = windows["before"]["ac4"].get("interactive", _dist_stats([]))
+    after_interactive = windows["after"]["ac4"].get("interactive", _dist_stats([]))
     out.append(
         f"Interactive ({windows['after']['ac4']['interactive_priority'] or 'high'}) first byte: "
-        f"baseline p50 {windows['before']['ac4'].get('interactive', _dist_stats([]))['p50_ms']} ms / "
-        f"post p50 {windows['after']['ac4'].get('interactive', _dist_stats([]))['p50_ms']} ms."
+        f"baseline n={before_interactive['n']} p50 {before_interactive['p50_ms']} ms / "
+        f"post n={after_interactive['n']} p50 {after_interactive['p50_ms']} ms."
     )
+    if before_interactive["n"] == 0 or after_interactive["n"] == 0:
+        out.append(
+            "- AC4 **unmeasurable**: the comparison needs an interactive-tier sample in "
+            "both windows, and one side has n=0 — no percentage change is reported."
+        )
+    overlap = windows["after"]["ac4"].get("overlap") or {}
+    if overlap:
+        out.append(
+            f"- Idle-admitted prefills reconstructed {overlap['idle_prefills_with_interval']} "
+            f"(same-tier {overlap['same_tier_prefills']}, "
+            f"cross-tier {overlap['cross_tier_prefills']}); "
+            f"{overlap['interactive_samples_overlapped']} of "
+            f"{overlap['interactive_samples']} interactive-tier dispatch(es) started inside one."
+        )
     out.append("")
     out.append(f"**Verdict:** `{verdict['verdict']}` — AC5 recommendation "
                f"`{verdict['recommendation']['decision']}`.")
@@ -2083,6 +2323,7 @@ def main(argv: list[str] | None = None) -> int:
             bucket_edges=args.bucket_edges_list,
             correlation_window_s=args.correlation_window,
             min_lease_samples=args.min_lease_samples,
+            interactive_priority=args.interactive_priority,
         )
         summary["counterfactual"] = counterfactual(summary, idle_threshold_s=args.idle_threshold)
         summary["start"] = start.isoformat(sep=" ")

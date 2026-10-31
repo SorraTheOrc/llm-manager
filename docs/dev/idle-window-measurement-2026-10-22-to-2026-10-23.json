@@ -3,7 +3,7 @@
     "tool": "scripts/idle_admit_impact.py",
     "work_item": "LP-0MVGHXD59008UOUD",
     "feature_work_item": "LP-0MVGD9Z8Z0055Y5J",
-    "generated_at": "2026-10-30T22:15:51",
+    "generated_at": "2026-10-31T04:21:58",
     "log_dir": "/var/log/llama-proxy",
     "files": [
       "proxy.log",
@@ -64,7 +64,7 @@
     },
     "deployed_at": "2026-10-22 21:48:00",
     "label": null,
-    "notes": "; AC3 denial check re-derived on 2026-10-30 with the load-normalised verdict of LP-0MVSAZLNL007B072 (denials per bypass+fallback event): the raw per-hour delta is load-confounded; the original proxy logs for the before window fell out of retention, so the check is recomputed from this artifact's recorded window aggregates via scripts/idle_admit_impact.py's own functions",
+    "notes": "; AC3 denial check re-derived on 2026-10-30 with the load-normalised verdict of LP-0MVSAZLNL007B072 (denials per bypass+fallback event): the raw per-hour delta is load-confounded; the original proxy logs for the before window fell out of retention, so the check is recomputed from this artifact's recorded window aggregates via scripts/idle_admit_impact.py's own functions; AC2/AC4 reporting re-derived on 2026-10-31 with the unmeasurable semantics and prefill-overlap evidence of LP-0MVGHXD59008UOUD: the AC2 comparison (0 of 31 admits paired) and the AC4 comparison (before window n=0) are reported as unmeasurable with their sample counts instead of a percentage against a zero baseline; both are recomputed from this artifact's recorded window aggregates via scripts/idle_admit_impact.py's own functions, because the raw logs of the before window have aged out of retention (ac4.overlap is therefore null: the per-request prefill intervals cannot be reconstructed from aggregates)",
     "interactive_priority": "high",
     "correlation_window_seconds": 60.0,
     "idle_threshold_seconds": 60.0,
@@ -323,7 +323,8 @@
           "p90_ms": 0.0,
           "max_ms": 0.0,
           "sum_slot_seconds": 0.0
-        }
+        },
+        "overlap": null
       },
       "lease_gate": {
         "refusals": 1451,
@@ -746,7 +747,8 @@
           "p90_ms": 28600.7,
           "max_ms": 69560.6,
           "sum_slot_seconds": 758.3
-        }
+        },
+        "overlap": null
       },
       "lease_gate": {
         "refusals": 1731,
@@ -893,6 +895,10 @@
       {
         "target": "AC2: idle-admitted dispatches paired with their dispatch event",
         "observed": 0,
+        "measurable": false,
+        "idle_admits": 31,
+        "unpaired_admits": 31,
+        "non_idle_samples": 278,
         "pass": false
       },
       {
@@ -914,8 +920,9 @@
       },
       {
         "target": "AC4: high-priority first byte within 10% p50/p90",
-        "observed_p50_pct_change": 999.0,
-        "observed_p90_pct_change": 999.0,
+        "observed_p50_pct_change": null,
+        "observed_p90_pct_change": null,
+        "measurable": false,
         "before": {
           "n": 0,
           "p50_ms": 0.0,
@@ -941,9 +948,10 @@
       }
     ],
     "notes": [
+      "AC2 unmeasurable: 0 of 31 idle_admit event(s) had a local dispatch inside the 60 s correlation window (non-idle control n=278), so this window carries no idle-admitted percentile/slot-second distribution to compare. The AC2 trade is unmeasured, not failed.",
       "31 idle_admit event(s) had no local dispatch event inside the correlation window (possible: fallback after admission, or a restart mid-request).",
       "3 timeout event(s) carry no session id and fall inside the correlation window of an idle-admitted request: coincident, not attributable (see ac3.attribution_limit).",
-      "Interactive latency regressed beyond the noise band; idle-admitted prompts at the SAME priority tier: none (no same-tier admits \u2014 the regression is indirect, e.g. GPU occupancy from a lower tier).",
+      "AC4 unmeasurable: the before window has no non-idle priority=high dispatch (n=0) to compare the after window's n=85 against, so no percentage change is reported (a zero baseline would report a spurious regression). The after window's absolute p50 2467.7 ms / p90 28600.7 ms is the measurement; AC4 needs a before window logged with the same instrumentation.",
       "Lease-gate refusals: 1731 attributable `local_lease_active` refusal(s): shape A 0 (0.0 %), shape B 1731 (100.0 %). Shape B evidence: no work behind it 1674, silent prefill 0, owner working 0, unconfirmed 57. Contention queue: converted 100 to local, fell through 522. (shape A = inactive cooldown lease, shape B = `active` record with no work behind it; of the 1731 shape-B refusals, 1674 had no work behind it, 0 were silent prefills, 0 were genuinely working owners and 57 lacked corroborating evidence)."
     ],
     "recommendation": {

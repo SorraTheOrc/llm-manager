@@ -155,8 +155,22 @@ silently passing. Mid-stream timeouts (`ReadTimeout`, `empty_response`,
 **non-idle** dispatches is compared before vs after with a ±10 % noise band.
 Idle-admitted dispatches are the *treatment*, so they are excluded from the
 control distribution and counted separately
-(`ac4.idle_admitted_by_priority`); when the interactive tier regresses, the
-tool names the idle-admitted prompts at that tier as the causal evidence.
+(`ac4.idle_admitted_by_priority`).
+
+The comparison needs an interactive-tier sample in **both** windows. With zero
+samples on one side no percentage change exists, so the check reports
+**unmeasurable** with the sample counts — it never prints a percentage against a
+zero baseline, which would manufacture a regression out of a missing
+instrumentation era (the recorded window below has `before n=0`).
+
+When a regression *is* measurable, the causal evidence AC4 asks for is a
+**prefill overlap**, not a matching priority label: `ac4.overlap` reconstructs
+each idle-admitted prefill's in-flight interval (dispatch → first byte, i.e.
+`dispatch_to_first_byte_ms`) and reports which interactive-tier dispatches
+started inside one, split `same_tier` / `cross_tier` by the **admitting**
+request's priority. A lower-tier prefill occupying the slot is exactly the
+indirect harm the check exists to catch; when no prefill overlapped, the note
+says so instead of blaming the admits.
 
 **Counterfactual (approximation).** For a window in which the override was
 never enabled the tool estimates how often it *would* have fired: an economic
@@ -175,7 +189,7 @@ estimate, never as a measurement.
 | AC2 samples | at least 5 idle-admitted dispatches paired with their dispatch event |
 | AC3 denials | `local_dispatch_denied` per **bypass+fallback event** does not rise by more than 5 % (the raw per-hour rate is reported alongside it but is load-confounded) |
 | AC3 timeouts | zero timeouts attributable to idle-admitted requests |
-| AC4 interactive | non-idle `high`-priority p50/p90 first byte within 10 % |
+| AC4 interactive | an interactive-tier sample in **both** windows, and non-idle `high`-priority p50/p90 first byte within 10 % (a zero-sample side is *unmeasurable*, never a percentage) |
 | AC1 (LP-0MVK16GME007EYUW) lease gate | at least 5 attributable `local_lease_active` refusals in the post-deploy window (below it the split percentages are withheld and the run is a WARN) |
 
 The AC5 recommendation is deterministic:
@@ -264,7 +278,8 @@ in-flight prefills are not reconstructable from logs.
 
 The AC4 rows are unmeasurable in any window logged before the
 `priority=`/`estimated_tokens=` instrumentation is deployed; the tool says so
-explicitly instead of reporting a vacuous pass.
+explicitly instead of reporting a vacuous pass, and reports the after window's
+absolute p50/p90 as the measurement with the sample counts on both sides.
 
 **Lease-gate reading, 2026-10-25 → 2026-10-27 (illustration, not the decision).**
 A live run over the two most recent 24 h windows read: 338 and 291
@@ -318,6 +333,24 @@ the ETA guard's 60 s queue budget (9). The counterfactual's 75.9 % therefore
 over-estimates for a different reason than the lease gate: the admitted prompts
 (39 K–119 K tokens, all `cache_state=cold`) cannot reach a first byte inside the
 deadline at all.
+
+### AC2 / AC4 — what this window can and cannot measure
+
+Both rows are **unmeasurable in this window, and the artifact now records them
+that way** (re-derived 2026-10-31 from the artifact's own window aggregates,
+since the before window's raw logs have aged out of retention — the same path
+used for the AC3 normalisation):
+
+| Row | Sample counts | Reading |
+| --- | --- | --- |
+| AC2 idle-admitted distribution | **0 of 31** admits paired with a local dispatch inside the 60 s correlation window; non-idle control **n=278** | No idle-admitted percentile/slot-second distribution exists, so there is no bucket comparison to report. The check is `measurable: false`, not a failed comparison: the admits never reached a first byte (see the outcome table above), which is the AC5 finding, not an AC2 measurement. |
+| AC4 interactive tier | before **n=0**, after **n=85** (p50 2,467.7 ms / p90 28,600.7 ms) | The before window predates the `priority=` instrumentation, so no change is computable. The after window's absolute figures are the measurement. `ac4.overlap` is `null` for this window: per-request prefill intervals cannot be reconstructed from aggregates. |
+
+Previously AC4 reported `observed_p50_pct_change: 999.0` here — the tool's
+"new activity" sentinel applied to a zero baseline. That is an artefact of the
+missing before-window instrumentation, not a measured regression, and the note
+that accompanied it named no same-tier admits and examined no cross-tier
+overlap.
 
 ### AC1 — which blocking shape accounts for the refusals
 
@@ -476,6 +509,12 @@ asserts the metric contract above (aggregates, hold-cycle exclusion, session
 pairing and the correlation window, bucket comparison, three-way timeout
 attribution, the AC4 control distribution, the recommendation rules, the
 counterfactual, and the CLI's exit codes / JSON shape / markdown rendering).
+The AC2/AC4 measurement-state suite asserts that a zero-sample side is reported
+as *unmeasurable* with its sample counts (no `999` percentage, no "regressed"
+note), that a measurable regression names the **cross-tier** idle-admitted
+prefill that was in flight when the interactive dispatch started (and states
+"no in-flight overlap" when none was), and that the AC5 reasons say
+`unmeasurable` rather than printing a percentage for a missing tier.
 The AC3 denial suite asserts the load-normalised verdict against the exact
 recorded window numbers (0.181 → 0.104, −42 %), that a raw per-hour increase
 driven purely by a heavier window passes while a synthetic per-event increase
