@@ -2106,8 +2106,9 @@ server:
   local_prefill_deadline_seconds: 120
   # Post-deadline prefill-thrash cooldown (LP-0MVKUKFHH005UDWL): when a
   # local dispatch is cancelled by the prefill deadline
-  # (``prefill_deadline_exceeded``), that session is kept OFF local for
-  # ``local_prefill_thrash_cooldown_seconds`` (default **600 s**; 0 disables)
+  # (``prefill_deadline_exceeded``) or by the measured-cache early abort
+  # (``measured_cache_deficit``), that session is kept OFF local for
+  # ``local_prefill_thrash_cooldown_seconds`` (default **120 s**; 0 disables)
   # so the identical prompt is not re-prefilled every turn — the 2026-10-23
   # incident re-dispatched the same 28k-124k-token prompt 41 times (35 inside
   # 02:00-03:00), each burning a full prefill before the 90 s deadline
@@ -2120,7 +2121,20 @@ server:
   # ``local_prefill_thrash_recovery_fraction`` below); this knob is the
   # documented rollback — 0 restores the pre-fix behaviour (no cooldown, no
   # skip).
-  local_prefill_thrash_cooldown_seconds: 600
+  #
+  # VALUE HISTORY (2026-10-31, LP-0MVWC8JCG007GAPW, operator option B): 600 ->
+  # 120. The measured-cache early abort fires ~0.1 s into a dispatch yet armed
+  # this 600 s quarantine, a 6000x asymmetry that became a ten-minute
+  # client-visible outage for every pin-local (``local-preferred``) session:
+  # those cannot fall through to a paid provider, so each of the ~10 retries
+  # inside the window received ``429 Local admission refused``. Measured that
+  # day: 330 aborts across 28 sessions (249 at ``deficit_ratio=1.0``) and 113
+  # refusals for one session alone, while post-cooldown retries measured
+  # ``cache=0`` again — the 600 s bought no cache warmth, only delay. Two
+  # minutes still spans two client retry intervals. INTERIM VALUE: once the
+  # benefit gate in LP-0MVWBD91Z004U135 stops the abort firing for prompts that
+  # fit the budget, re-tune this upward rather than leaving 120 as the default.
+  local_prefill_thrash_cooldown_seconds: 120
   # Size gate on the cooldown's EARLY CLEAR (LP-0MVQITN6P008DPLB). A successful
   # local first byte releases the window only when that dispatch prefilled at
   # least this fraction (default 0.9 = 90 %) of the prompt size that armed it.

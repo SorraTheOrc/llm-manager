@@ -457,8 +457,9 @@ anything.
    session — a concurrent request from the same session keeps its own admission
    decision.
 2. **Session cooldown enforced at every acquisition choke point.** The
-   post-deadline thrash window (`local_prefill_thrash_cooldown_seconds`, default
-   600) is consulted at `proxy_to_local` **before any local resource is
+   post-deadline thrash window (`local_prefill_thrash_cooldown_seconds`,
+   default 600 s at the time of this verification; **120 s** since 2026-10-31,
+   `LP-0MVWC8JCG007GAPW`) is consulted at `proxy_to_local` **before any local resource is
    acquired** and again in `_try_acquire_local_dispatch` **before the lease
    record is created**, so the paths that never consult the provider chain
    (in-request retries, `ui.py`'s direct dispatch, the contention-queue

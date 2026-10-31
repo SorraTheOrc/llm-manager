@@ -2344,7 +2344,8 @@ fix, verified by LP-0MVSAMS5O006OAIS):
    release (the 2026-10-26 re-dispatch that re-armed a lease ~150 ms later). A
    concurrent request from the same session is unaffected.
 2. **Session cooldown.** The session is kept off local for the same prompt for
-   `local_prefill_thrash_cooldown_seconds` (default 600). The gate is enforced
+   `local_prefill_thrash_cooldown_seconds` (default 120 since 2026-10-31,
+   `LP-0MVWC8JCG007GAPW`; was 600). The gate is enforced
    at every local-dispatch **acquisition choke point** — `proxy_to_local`
    before any local resource is acquired and `_try_acquire_local_dispatch`
    before the lease record is created — so paths that bypass the provider
@@ -2358,7 +2359,7 @@ for a slot the gate refuses to grant).
 
 | Knob | Default | Rollback meaning |
 |---|---|---|
-| `local_prefill_thrash_cooldown_seconds` | `600` | **`0` disables** the thrash cooldown entirely — restores pre-fix behaviour (no arming, no `routing_skip_local reason=prefill_thrash_cooldown`, no early clear). |
+| `local_prefill_thrash_cooldown_seconds` | `120` | **`0` disables** the thrash cooldown entirely — restores pre-fix behaviour (no arming, no `routing_skip_local reason=prefill_thrash_cooldown`, no early clear). Reduced from 600 s on 2026-10-31 (`LP-0MVWC8JCG007GAPW`) so a pin-local session's cold-prefix abort costs 2 minutes, not 10; interim until the benefit gate (`LP-0MVWBD91Z004U135`) lands. |
 | `local_prefill_thrash_recovery_fraction` | `0.9` | Size gate on the cooldown's early clear — `0` restores clear-on-any-success (the measured bug). |
 
 Deprecated knobs are not re-tuned without fresh evidence

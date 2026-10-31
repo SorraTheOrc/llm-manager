@@ -436,8 +436,8 @@ also:
   the record was retained with a future `expires_at` and the wedged session
   re-dispatching the identical prompt held the local pool ~4 h on 2026-10-23;
 - arms a per-session cooldown (`local_prefill_thrash_cooldown_seconds`, default
-  600 s), during which that session's local routing skips with
-  `reason=prefill_thrash_cooldown` and other sessions are unaffected;
+  120 s since 2026-10-31, was 600 s), during which that session's local routing
+  skips with `reason=prefill_thrash_cooldown` and other sessions are unaffected;
 - once the admission guard is calibrated for a (model, context bucket), refuses
   local up front when the projected first-byte ETA is `>= local_prefill_
   deadline_seconds` (`reason=prefill_eta_exceeds_deadline`), pricing prompts

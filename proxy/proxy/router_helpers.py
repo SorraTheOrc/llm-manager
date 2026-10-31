@@ -1209,8 +1209,26 @@ def _get_prefill_deadline_seconds(srv) -> float:
 # and on a successful local first byte, and ``0`` disables it (documented
 # rollback).
 
-DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS = 600.0
-"""Default post-deadline cooldown for a thrashing session (10 minutes)."""
+DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS = 120.0
+"""Default post-deadline cooldown for a thrashing session (2 minutes).
+
+Was 600 s. Reduced to 120 s on 2026-10-31 (LP-0MVWC8JCG007GAPW, operator
+option B) because the measured-cache early abort (LP-0MVR7IN0O000DPXN) fires
+~0.1 s into a dispatch and then armed this *client-visible* quarantine: a
+6000x asymmetry that became a ten-minute outage for every pin-local
+(``local-preferred``) session, which by contract receives
+``429 Local admission refused`` instead of a remote fallback. Two minutes
+still spans two client retry intervals, so the retry storm this window exists
+to suppress stays suppressed while a pinned session recovers without operator
+help. This is an interim value: the benefit gate in LP-0MVWBD91Z004U135 stops
+the abort firing for prompts that fit the budget, after which this should be
+re-tuned upward rather than left at 120 by default.
+
+A missing or malformed config value falls back to this constant, so it must
+agree with ``server.local_prefill_thrash_cooldown_seconds`` in
+``proxy/config.yaml`` (pinned by
+``proxy/tests/test_prefill_thrash_cooldown_default.py``).
+"""
 
 DEFAULT_PREFILL_THRASH_RECOVERY_FRACTION = 0.9
 """Share of the cancelled prompt a success must reach to clear the window.
@@ -1393,12 +1411,14 @@ def _prefill_thrash_config_section(config) -> Mapping:
 
 
 def _get_prefill_thrash_cooldown_seconds(config) -> float:
-    """Return the post-deadline cooldown in seconds (default 600; 0 disables).
+    """Return the post-deadline cooldown in seconds (default 120; 0 disables).
 
     ``server.local_prefill_thrash_cooldown_seconds`` is the rollback knob: 0
     disables the cooldown entirely (both the arming on a deadline event and
-    the routing skip). A missing or malformed value falls back to the default
-    so a config typo cannot silently switch the protection off.
+    the routing skip). A missing or malformed value falls back to
+    :data:`DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS` so a config typo cannot
+    silently switch the protection off (and cannot silently restore the
+    600 s value this default replaced either — see that constant).
     """
     section = _prefill_thrash_config_section(config)
     raw = section.get(

@@ -1939,6 +1939,25 @@ root cause of the thrash: the client re-dispatches the identical prompt and the
 whole prefill burns again (the incident's 41 local POSTs, 35 inside
 02:00-03:00, re-prefilling near-duplicates of the same 28k-124k-token prompts).
 
+**Duration: 120 s** (`server.local_prefill_thrash_cooldown_seconds`; was 600 s
+until 2026-10-31, `LP-0MVWC8JCG007GAPW`). The window is armed by both arming
+sites below, including the measured-cache early abort, which fires ~0.1 s into
+a dispatch — so at 600 s a 0.1 s GPU saving bought a ten-minute *client*
+outage, a 6000x asymmetry. It is worst for a **pin-local** client
+(`X-Local-Preference: local-preferred`), which by contract receives a retryable
+`429 Local admission refused` instead of falling through to a paid provider, so
+every retry inside the window is a hard refusal. Measured 2026-10-31: 330
+`measured_cache_abort` events across 28 sessions (249 at `deficit_ratio=1.0`),
+and 113 refusals for the single session `herdr-1793416360-4155786-6690`; the
+post-cooldown retries measured `cache=0` again, so the longer window was not
+buying cache warmth — only delay. Two minutes still spans two client retry
+intervals, so the retry-storm defence is intact.
+
+120 s is deliberately **interim**: the benefit gate in `LP-0MVWBD91Z004U135`
+stops the abort firing for prompts whose measured cold prefill fits the
+request's budget, after which this value should be re-tuned upward rather than
+left at 120 by default.
+
 **What it refuses.** The window is keyed by **(session, prompt fingerprint)**,
 not by session alone. The fingerprint is a 32-hex-char SHA-256 prefix over the
 **current turn** of the request's `messages` — everything after the last
@@ -2074,9 +2093,10 @@ achievable and observable here. The sequence is always
 
 Because the backend can lag the close, the abandonment is also **recorded**
 (`_record_abandoned_slot`, `proxy/proxy/router_helpers.py`) with a bounded TTL
-(`DEFAULT_ABANDONED_SLOT_TTL_SECONDS`, 900 s — longer than the 600 s cooldown
-so the annotation outlives the window in which the ghost can still be seen
-processing), keyed by slot identity so the registry cannot grow past the pool,
+(`DEFAULT_ABANDONED_SLOT_TTL_SECONDS`, 900 s — longer than the prefill-thrash
+cooldown so the annotation outlives the window in which the ghost can still be seen
+processing; the cooldown was 600 s when this bound was chosen and is 120 s
+since 2026-10-31, `LP-0MVWC8JCG007GAPW`, so the margin only grew), keyed by slot identity so the registry cannot grow past the pool,
 and pruned lazily on read. It is published on `/llama/local/status`:
 `status_schema_version` 4, each slot carrying `abandoned`,
 `abandonment_reason`, `abandoned_session_id` and `abandoned_at_seconds_ago`,
