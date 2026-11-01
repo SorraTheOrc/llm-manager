@@ -239,15 +239,45 @@ def test_reserve_prices_against_the_shipped_swept_budget():
     shipped 30 s budget applies, so the reservation endpoint and the admission
     guard share one number (``prefill_eta.wait_budget_seconds`` reading
     ``proxy/config.yaml``) rather than a per-call default.
+
+    The shipped config now runs with the free-gate eligibility rung enabled
+    (``local_admission_guard_free_gate_deadline_budget: true``, operator
+    decision LP-0MVXZWF7A002TUO1): at a FREE prefill gate the
+    deadline-relative safety budget (0.95 x 120 s = 114 s, shipped) governs
+    instead of the queue budget, so the same request the swept budget refuses
+    is admitted — the accepted ``admitted_and_doomed`` trade. The queue-budget
+    sharing invariant is therefore exercised under the rung's documented
+    rollback (knob off); the shipped rung-on free-gate behaviour is asserted
+    as the admit leg.
     """
     from config_test_utils import get_merged_config
 
     _seed_calibration()
     shipped_server = get_merged_config("fast")["server"]
 
+    # Shipped (rung ON), free gate: the deadline-relative safety budget
+    # (114 s) admits the ~56 s request — the accepted trade of
+    # LP-0MVXZWF7A002TUO1.
+    status_on, payload_on = admission_reserve.reserve(
+        {"estimated_tokens": _TOKENS, "session_id": "s-rung-on"},
+        {"server": shipped_server},
+        model="Qwen3",
+        busy_slots=0,
+    )
+
+    assert status_on == 200, payload_on
+    assert payload_on["admit"] is True
+
+    # Rollback (rung OFF): the shipped swept 30 s budget refuses the same
+    # request, so the reservation endpoint and the admission guard share one
+    # config number (not a per-call default).
+    rollback_server = {
+        **shipped_server,
+        "local_admission_guard_free_gate_deadline_budget": False,
+    }
     status, payload = admission_reserve.reserve(
         {"estimated_tokens": _TOKENS, "session_id": "s-1"},
-        {"server": shipped_server},
+        {"server": rollback_server},
         model="Qwen3",
         busy_slots=0,
     )
@@ -262,7 +292,7 @@ def test_reserve_prices_against_the_shipped_swept_budget():
         {"estimated_tokens": _TOKENS, "session_id": "s-2"},
         {
             "server": {
-                **shipped_server,
+                **rollback_server,
                 "contention_queue_max_wait_seconds": 60,
             }
         },
