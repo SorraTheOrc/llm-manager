@@ -130,6 +130,37 @@ awaiting steps run as detached tasks. Only an explicit `is_disconnected()`
 a live but slow prefill is untouched, and the 90 s deadline / 180 s watchdog /
 900 s ceiling all still apply.
 
+#### Completion releases a lease that outlived its request (LP-0MVWFKI8O001X694)
+
+A local dispatch that ended **without a first byte** while the request was
+re-routed to a remote provider used to leave its dispatch record `active`:
+the end-of-request cleanup only transitioned the record of the endpoint the
+request finally completed on, so the lease was never marked terminal. The
+`no_progress_watchdog` then reclaimed it 180 s later and emitted
+`local_eviction reason=tenancy_lease_expired` /
+`local_eviction_after_acceptance reason=no_progress_watchdog` for a request
+that had **succeeded** — an eviction that feeds the local entry-cooldown
+machinery (parent LP-0MVWEZCB0006WPBQ AC8).
+
+`_cleanup_after_request` is the request's single end-of-request owner, so it
+now calls `_release_completed_dispatch`, which releases every record still
+`active` for the session (i.e. one whose own endpoint never received its
+end-of-request transition), pops the session's `local_prefill_in_flight`
+marker, frees the slot assignment and wakes the contention queue, logging
+`lease_released session=… reason=request_completed endpoint=…` once per
+released record. It is **not** an eviction path: no `local_eviction` event, no
+`eviction_after_acceptance` counter, no KV-snapshot plan, no entry cooldown
+and no abandoned-slot annotation, and it does not cancel the upstream stream
+(a lease-lifecycle fix, not a prefill-cancel fix). Genuine stalls are
+unaffected: the watchdog, the prefill deadline and the disconnect path
+release their own records exactly as before.
+
+Belt-and-braces: a record that somehow survives to the sweep carrying the
+`terminal` / `completed_at` stamp is reaped there **without** an eviction and
+logged once as `local_dispatch_completed_record_reaped
+reason=completed_record_in_sweep`, so a missed completion release is
+diagnosable from the log alone.
+
 ### 5. Remote Model Handling
 
 For remote models (`proxy_to_remote()`):

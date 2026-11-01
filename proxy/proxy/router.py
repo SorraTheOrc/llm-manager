@@ -207,6 +207,7 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _prefill_thrash_fingerprint,
     _record_prefill_thrash_cooldown,
     _release_client_disconnect_dispatch,
+    _release_completed_dispatch,
     _release_measured_cache_abort_dispatch,
     _release_prefill_deadline_dispatch,
     _request_dedup_hash,
@@ -878,6 +879,28 @@ async def _cleanup_after_request(
                                 pass
             except Exception:
                 pass
+
+    # LP-0MVWFKI8O001X694 (parent LP-0MVWEZCB0006WPBQ AC8/AC8b): this is the
+    # request's single end-of-request cleanup, so it is also where a dispatch
+    # lease that outlived its request must be released. The endpoint-scoped
+    # decrement above transitions only the record of the endpoint the request
+    # completed on; a lease taken on *another* (local) endpoint — the shape
+    # produced when the local attempt ended without a first byte and the chain
+    # re-routed the request to a remote provider — used to stay ``active`` and
+    # be evicted 180 s later as ``local_eviction_after_acceptance
+    # reason=no_progress_watchdog``, arming a local entry cooldown for a
+    # request that succeeded. Released here, at completion, it is never seen by
+    # the tenancy-expiry / no-progress sweep at all.
+    if decrement_local and session_id:
+        try:
+            await _release_completed_dispatch(
+                srv,
+                session_id,
+                served_endpoint=backend,
+                request=request,
+            )
+        except Exception:
+            pass
 
     # On client disconnect, immediately remove the dispatch lease record.
     # The ``disconnect`` reason is the stream-end path (a client that vanished

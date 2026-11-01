@@ -5569,6 +5569,141 @@ def _release_client_disconnect_dispatch(
     return removed or marker_popped
 
 
+async def _release_completed_dispatch(
+    srv,
+    session_key: str | None,
+    *,
+    served_endpoint: str | None = None,
+    request: Request | None = None,
+) -> bool:
+    """Release a local dispatch lease that outlived its completed request.
+
+    Parent LP-0MVWEZCB0006WPBQ **AC8** — *no post-completion evictions*
+    (LP-0MVWFKI8O001X694).
+
+    The defect (measured 2026-10-31): a request acquired a local dispatch
+    lease, the local attempt ended without a first byte, the provider chain
+    re-routed the request to a remote provider and the request then completed
+    normally — but the local record stayed ``active=True``. Nothing marked it
+    terminal, so the ``no_progress_watchdog`` sweep reclaimed it
+    ``local_dispatch_no_progress_timeout_seconds`` (180 s) later, emitting
+    ``local_eviction reason=tenancy_lease_expired`` / ``local_eviction_after_
+    acceptance reason=no_progress_watchdog`` for a request that **succeeded**.
+    That eviction feeds the local entry-cooldown machinery (the sibling
+    measured-deficit path, parent AC1), so a completed request could poison
+    the whole ``local-qwen3`` route.
+
+    Called from the router's single end-of-request owner
+    (``router._cleanup_after_request``, the same place that decrements the
+    per-request counters), this releases every dispatch record still
+    ``active`` for *session_key* — i.e. any lease whose own endpoint did not
+    receive its end-of-request transition, the shape produced when the
+    request finished on a different endpoint than the one that leased the
+    dispatch.
+
+    Deliberately **not** an eviction path (AC8b): no ``local_eviction``
+    event, no ``local_eviction_after_acceptance`` counter, no
+    ``_record_local_eviction`` KV-snapshot plan, no local entry cooldown and
+    no abandonment annotation. A completed dispatch is normal churn; the
+    abandoned-slot annotation for a *genuinely* abandoned (draining) slot is
+    owned by LP-0MVUTYHG7001S6BM / LP-0MVWFKF4M009AEJ9 and is released from
+    observed-free snapshots there, so this path must not register one.
+    The upstream stream is likewise left alone: this is a lease-lifecycle
+    fix, not a prefill-cancel fix (LP-0MVVEQW5Y00962T2 tracks that).
+
+    Releases, in order: the record (marked ``terminal`` with a
+    ``completed_at`` stamp before deletion, so a record that somehow survives
+    is recognisable by the sweep's guard), the session's
+    ``local_prefill_in_flight`` marker, and the session's slot assignment;
+    then wakes the cross-session contention queue. Emits one distinct
+    ``lease_released session=... reason=request_completed endpoint=...`` line
+    per released record — never ``no_progress_watchdog`` and never
+    ``tenancy_lease_expired``.
+
+    Idempotent: with no active record left the call is a no-op returning
+    ``False`` and logging nothing, so it can never race the endpoint-matched
+    ``_decrement_local_active_queries`` (which has already marked that
+    record inactive on the same completion path).
+
+    Concurrency model: a dispatch record is keyed ``(endpoint, session)``, so
+    the proxy holds at most **one** lease per session (a same-session
+    re-dispatch reuses the record, and sessions are serialised by
+    ``server.session_single_flight_mode`` — ``queue`` by default). At the end
+    of a session's request, an active record for that session therefore has no
+    live request behind it, which is exactly the invariant this release
+    restores; the sibling endpoint-scoped decrement already transitions that
+    same shared record on the same assumption.
+    """
+    if not session_key:
+        return False
+    records = getattr(srv, "local_dispatch_records", None)
+    if not isinstance(records, dict):
+        return False
+    served_key = _dispatch_lease_key(served_endpoint, session_key)
+    released: list[dict] = []
+    try:
+        lock = getattr(srv, "local_dispatch_records_lock", None)
+        if lock is None:
+            return False
+        async with lock:
+            for key in list(records.keys()):
+                if key == served_key:
+                    # The endpoint the request completed on already owns this
+                    # record's end-of-request transition; only leftovers are
+                    # ghosts.
+                    continue
+                if _dispatch_key_session_id(key) != session_key:
+                    continue
+                record = records.get(key)
+                if not isinstance(record, dict) or not record.get("active"):
+                    continue
+                record["terminal"] = True
+                record["completed_at"] = time.monotonic()
+                records.pop(key, None)
+                released.append(record)
+    except Exception:
+        return False
+
+    if not released:
+        return False
+
+    # A completed request has no prefill in flight: a leftover marker counts
+    # against the pool's prefill cap until the sweep pops it.
+    try:
+        markers = getattr(srv, "local_prefill_in_flight", None)
+        if markers is not None:
+            markers.pop(session_key, None)
+    except Exception:
+        pass
+
+    for record in released:
+        endpoint = _endpoint_from_record(record)
+        try:
+            srv.logger.info(
+                "lease_released session=%s reason=request_completed "
+                "endpoint=%s",
+                session_key,
+                endpoint or "default",
+                extra=_client_identity_extra(request),
+            )
+        except Exception:
+            pass
+        try:
+            from proxy.session import _free_slot_assignment
+
+            _free_slot_assignment(session_key, endpoint=endpoint)
+        except Exception:
+            pass
+
+    try:
+        from proxy.contention_queue import wake
+
+        await wake(len(released))
+    except Exception:
+        pass
+    return True
+
+
 async def _query_slot_processing(srv, session_id: str, model_name: str | None, endpoint: str | None = None) -> bool:
     """Check whether the session's llama-server slot is still processing.
 
@@ -5689,6 +5824,14 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
 
     Three categories of stale records are cleaned:
 
+    0a. **Completed records** (LP-0MVWFKI8O001X694, parent LP-0MVWEZCB0006WPBQ
+       AC8c) — a record carrying the ``terminal`` / ``completed_at`` marker a
+       completed request stamps on release. The completion path
+       (``_release_completed_dispatch``) normally deletes the record, so this
+       branch is a guard: the record is reaped without an eviction, an
+       eviction counter or a cooldown, logging
+       ``local_dispatch_completed_record_reaped`` once per record.
+
     0. **Active records with no observed progress** (LP-0MUCEFB8E003YVFF) —
        the no-progress watchdog releases any active record whose
        ``last_progress_ts`` is older than
@@ -5740,6 +5883,58 @@ async def _cleanup_stale_local_dispatch(srv) -> int:
         async with srv.local_dispatch_records_lock:
             for sid, record in list(srv.local_dispatch_records.items()):
                 active = record.get("active", False)
+                # LP-0MVWFKI8O001X694 (parent LP-0MVWEZCB0006WPBQ AC8c):
+                # belt-and-braces guard. A completed dispatch is released at
+                # completion time (``_release_completed_dispatch``), so a
+                # record carrying the terminal marker here means the release
+                # was missed. Reap it WITHOUT an eviction, an eviction counter
+                # or a cooldown, and log once per record with a distinct token
+                # so such a miss is diagnosable without any new polling.
+                # ``local_active_queries`` is deliberately not decremented: the
+                # completion path is the single owner of the per-request
+                # decrements (see ``_release_client_disconnect_dispatch``), and
+                # a second decrement would release another session's capacity.
+                if record.get("terminal") or record.get("completed_at") is not None:
+                    session_key = _dispatch_key_session_id(sid)
+                    endpoint_from_record = _endpoint_from_record(record)
+                    try:
+                        age_s = max(
+                            0.0,
+                            float(now) - float(record.get("completed_at", now) or now),
+                        )
+                    except Exception:
+                        age_s = 0.0
+                    del srv.local_dispatch_records[sid]
+                    removed += 1
+                    try:
+                        srv.logger.warning(
+                            "local_dispatch_completed_record_reaped "
+                            "session=%s reason=completed_record_in_sweep "
+                            "endpoint=%s age_s=%.1f → completed dispatch "
+                            "record outlived its request; released without "
+                            "eviction",
+                            session_key if session_key else "unknown",
+                            endpoint_from_record or "default",
+                            age_s,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        from proxy.session import _free_slot_assignment
+
+                        _free_slot_assignment(
+                            session_key, endpoint=endpoint_from_record
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        _p = getattr(srv, "local_prefill_in_flight", None)
+                        if _p is not None and session_key in _p:
+                            _p.pop(session_key, None)
+                    except Exception:
+                        pass
+                    continue
+
                 # LP-0MUCEFB8E003YVFF: no-progress watchdog. Runs on every
                 # active record regardless of ``expires_at`` — a wedged
                 # record's lease may be far in the future (adaptive lease),

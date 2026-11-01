@@ -40,15 +40,22 @@ What this file pins
 -------------------
 
 * ``test_completed_dispatch_is_not_evicted_after_completion`` — the post-fix
-  expectation (AC8/AC8b): a completed dispatch's lease is released (or marked
+  contract (AC8/AC8b): a completed dispatch's lease is released (or marked
   terminal) at completion time, so advancing the injected clock past the
   lease and watchdog horizons produces **no** ``local_eviction
   reason=tenancy_lease_expired``, **no**
   ``local_eviction_after_acceptance reason=no_progress_watchdog`` and **no**
-  local entry cooldown. Red against today's behaviour, pinned with
-  ``xfail(strict=True)`` so this test-only item can land on ``dev`` with a
-  green suite; ``strict`` makes an unexpectedly passing test fail, so the
-  marker cannot be forgotten by LP-0MVWFKI8O001X694.
+  local entry cooldown. This was the red-first assertion of
+  LP-0MVWFKFFY002RU78, pinned there with ``xfail(strict=True)``;
+  LP-0MVWFKI8O001X694 removes the marker together with the fix, and the same
+  test now also pins that the release happens *at completion* (record and
+  marker gone, one distinct ``lease_released reason=request_completed`` line)
+  rather than the eviction merely being suppressed.
+* ``test_sweep_never_evicts_a_terminal_dispatch_record`` — AC8c guard: a
+  record that somehow survives to the sweep carrying the completion marker is
+  reaped **without** an eviction, counters or cooldown, and logs the distinct
+  ``local_dispatch_completed_record_reaped`` line (the item's cheap
+  diagnostic).
 * ``test_locally_served_dispatch_completes_without_eviction`` — control: the
   same harness driving a dispatch that is served *and* completed on the local
   endpoint produces no eviction today, so the assertion above is not vacuous.
@@ -266,16 +273,6 @@ async def _sweep_past_every_horizon(srv: SimpleNamespace, clock: _InjectedClock)
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "AC8 red: a completed dispatch's local lease outlives the request, so "
-        "the no_progress_watchdog sweep reclassifies it as "
-        "local_eviction_after_acceptance reason=no_progress_watchdog and "
-        "reclaims the tenancy (tenancy_lease_expired) ~180 s later. "
-        "LP-0MVWFKI8O001X694 removes this marker."
-    ),
-)
 async def test_completed_dispatch_is_not_evicted_after_completion(clock, caplog):
     """A request that completed must not leave a lease for the sweep to evict.
 
@@ -294,16 +291,35 @@ async def test_completed_dispatch_is_not_evicted_after_completion(clock, caplog)
       eviction is what feeds the local entry-cooldown machinery;
     * no cooldown is armed for the ``local-qwen3`` entry by this path.
 
-    Red today: the local record stays ``active=True`` with a stale
-    ``last_progress_ts`` because the end-of-request cleanup targets the
-    endpoint the request actually completed on, and the watchdog reclaims it.
+    Red before LP-0MVWFKI8O001X694: the local record stayed ``active=True``
+    with a stale ``last_progress_ts`` because the end-of-request cleanup only
+    transitioned the record of the endpoint the request actually completed on,
+    and the watchdog reclaimed it ~180 s later.
     """
     srv = _make_srv()
     await _acquire(srv)
 
     # The request completes on the re-routed (remote) provider — this is the
     # router's real end-of-request path, not a hand-built record mutation.
-    await _finish_request(srv, endpoint=REMOTE_ENDPOINT)
+    with caplog.at_level(logging.INFO, logger="llama-proxy"):
+        await _finish_request(srv, endpoint=REMOTE_ENDPOINT)
+
+    # Released at completion time, not merely spared by the sweep: the lease
+    # and the prefill marker are gone before any clock advance.
+    assert (LOCAL_ENDPOINT, SESSION) not in srv.local_dispatch_records, (
+        "the completed dispatch's lease outlived its request"
+    )
+    assert SESSION not in srv.local_prefill_in_flight, (
+        "the completed dispatch's prefill marker outlived its request"
+    )
+    # One distinct, once-per-event line names the real cause of the release.
+    completion_release = [
+        line
+        for line in _eviction_lines(caplog, "lease_released")
+        if "reason=request_completed" in line
+    ]
+    assert len(completion_release) == 1, completion_release
+    assert f"session={SESSION}" in completion_release[0]
 
     with caplog.at_level(logging.DEBUG, logger="llama-proxy"):
         await _sweep_past_every_horizon(srv, clock)
@@ -312,6 +328,9 @@ async def test_completed_dispatch_is_not_evicted_after_completion(clock, caplog)
     assert after_acceptance == [], (
         "a completed dispatch was evicted after acceptance: "
         f"{after_acceptance} — the lease outlived the request"
+    )
+    assert _eviction_lines(caplog, "local_dispatch_completed_record_reaped") == [], (
+        "the sweep saw a completed record: the completion path did not release it"
     )
 
     tenancy_expiry = [
@@ -331,6 +350,46 @@ async def test_completed_dispatch_is_not_evicted_after_completion(clock, caplog)
     assert provider._provider_cooldown_remaining(LOCAL_ENTRY) == 0, (
         "the post-completion eviction armed a local entry cooldown"
     )
+
+
+# ---------------------------------------------------------------------------
+# AC8c guard — a terminal record that reaches the sweep is never evicted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_never_evicts_a_terminal_dispatch_record(clock, caplog):
+    """A completed-record marker reaching the sweep is reaped, never evicted.
+
+    Belt-and-braces for the completion release: were a release to be missed,
+    the record carries the terminal marker and the sweep must reap it without
+    an eviction, an ``eviction_after_acceptance`` counter or a cooldown — and
+    say so once with a distinct token. The record is built through the real
+    lease bookkeeping and then stamped the way the completion path stamps it,
+    so this pins the guard rather than a hand-shaped dict.
+    """
+    srv = _make_srv()
+    await _acquire(srv)
+    caller_record = srv.local_dispatch_records[(LOCAL_ENDPOINT, SESSION)]
+    caller_record["terminal"] = True
+    caller_record["completed_at"] = clock.now
+
+    with caplog.at_level(logging.DEBUG, logger="llama-proxy"):
+        await _sweep_past_every_horizon(srv, clock)
+
+    assert _eviction_lines(caplog, "local_eviction_after_acceptance") == []
+    assert [
+        line
+        for line in _eviction_lines(caplog, "local_eviction ")
+        if "reason=tenancy_lease_expired" in line
+    ] == []
+    assert _after_acceptance_by_reason() == {}
+    assert provider._provider_cooldown_remaining(LOCAL_ENTRY) == 0
+    reaped = _eviction_lines(caplog, "local_dispatch_completed_record_reaped")
+    assert len(reaped) == 1, reaped
+    assert f"session={SESSION}" in reaped[0]
+    assert "reason=completed_record_in_sweep" in reaped[0]
+    assert (LOCAL_ENDPOINT, SESSION) not in srv.local_dispatch_records
 
 
 # ---------------------------------------------------------------------------
