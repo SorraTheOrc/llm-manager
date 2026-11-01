@@ -434,9 +434,9 @@ def _ok():
 
 
 class _DummyRequest:
-    def __init__(self, body: bytes = b'{"model":"test"}'):
+    def __init__(self, body: bytes = b'{"model":"test"}', headers=None):
         self._body = body
-        self.headers = {}
+        self.headers = headers or {}
         self.method = "POST"
         self.url = type("U", (), {"path": "/v1/chat/completions"})()
 
@@ -488,11 +488,17 @@ def _guard_patches(tokens: int):
 
 
 @pytest.mark.asyncio
-async def test_queue_path_refuses_on_deadline_and_reaches_next_provider(
+async def test_queue_path_refuses_on_deadline_before_the_queue(
     mixed_model_config, caplog
 ):
-    """AC1 (queue path): slots busy ⇒ guard refuses with the deadline reason
-    and the request dispatches to the remote provider."""
+    """AC1 (queue path): slots busy ⇒ the guard refuses with the deadline
+    reason before a queue slot is taken.
+
+    The queue entry is reachable only for a pin-local client, and a pinned
+    client is never moved to a paid provider (LP-0MVUH9PUU005HVS4): the bound
+    surfaces as the retryable ``429`` deferral instead of a remote dispatch.
+    The non-pinned default never queues, so it cannot reach this exit at all.
+    """
     from unittest.mock import patch
 
     import proxy.provider as provider
@@ -517,12 +523,14 @@ async def test_queue_path_refuses_on_deadline_and_reaches_next_provider(
         _guard_patches(tokens=100_000),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(), "v1/chat/completions", mixed_model_config,
+            _DummyRequest(headers={"X-Local-Preference": "local-preferred"}),
+            "v1/chat/completions",
+            mixed_model_config,
             _integration_cfg(deadline=90),
         )
 
-    assert result.status_code == 200
-    assert calls == ["remote"], "a deadline-refused request must reach the next provider"
+    assert result.status_code == 429, "the pinned client gets the retryable deferral"
+    assert calls == [], "a deadline-refused request must not dispatch or wait"
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "local_admission_guard decision=reject" in messages
     assert "reason=prefill_eta_exceeds_deadline" in messages

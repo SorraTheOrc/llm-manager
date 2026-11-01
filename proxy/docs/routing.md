@@ -1089,9 +1089,10 @@ same occupancy-aware verdict the queue's admission guard enforces and, on
 `admit`, a single-use ticket the request presents as
 `X-Local-Reservation: <id>` — a ticketed request dispatches **without
 re-checking and without queueing**. `X-Local-Preference`
-(`prefer-local` / `local-preferred` / `remote-ok`) states what the client wants
+(`local-preferred` / `remote-ok`, the default) states what the client wants
 when local capacity is unavailable; `local-preferred` defers with a retryable
-`429` instead of buying a remote tier. Reservations are therefore the
+`429` instead of buying a remote tier, while the default `remote-ok` steps
+straight to the next provider. Reservations are therefore the
 **primary cooperative path**; the protocol is specified in
 [Local Admission Reservations and Fallback Intent](#local-admission-reservations-and-fallback-intent-lp-0mvikpcsg002b0nl).
 
@@ -1592,11 +1593,43 @@ reserved dispatch does not consume queue depth.
 
 ### `X-Local-Preference` request header
 
+Exactly two values are live (`VALID_PREFERENCES == (local-preferred, remote-ok)`);
+`prefer-local` and `local-only` are **retired** and answered with a `400` before
+any routing (see the migration notes below).
+
 | Value | Behaviour |
 |-------|-----------|
-| `prefer-local` (default) | Today's behaviour: use local when it can serve within the budget, else fall through to the next provider |
+| `remote-ok` (default) | **Local allowed, remote acceptable.** The local route stays in the chain and is attempted; when local cannot serve **right now** the request steps straight to the next provider — no queue, no deferral, no local-capacity `429`. This is what an absent header (and any unknown value) resolves to |
 | `local-preferred` | **Local while the request fits local capacity, remote beyond it.** Pin local **while the request can still fit**. A *deferrable* request — the block is temporal, so waiting can help — waits for local capacity and, when the wait budget runs out, receives the retryable `429` deferral (`X-Local-Route: refused`, `X-Local-Fallback-Reason: <exit token>`, `Retry-After` / `retry_at`) instead of being moved to a paid provider. A *too-large* request — one that outgrows the local serving envelope, so waiting cannot help — is **never deferred and never refused for local capacity**: the local entry leaves the chain and a remote tier serves it (`200`, `X-Local-Route: remote`, no `Retry-After`). See [`local-preferred`: pinned while deferrable, promoted when too large](#local-preferred-pinned-while-deferrable-promoted-when-too-large) and the [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x) |
-| `remote-ok` | **Local allowed, remote acceptable.** The local route stays in the chain and is attempted exactly as an absent header attempts it, so a free local slot is used. When local cannot serve the request **right now** — the slot is saturated, the prefill ETA is over the wait budget, the local entry is in cooldown, the residency ladder skipped it, the lease is held, or the per-entry context cap excludes it — the request **steps straight to the next provider**: it does **not** enter the contention queue, does not defer, and never receives a local-capacity `429`, so its queue wait is always `0`. The value's name is **historic**: it once meant "remove the local route from the chain", which is the opposite of the behaviour above and must not be restored |
+The `remote-ok` row above is the *historic* name for "local allowed, remote
+acceptable": it once meant "remove the local route from the chain", which is the
+opposite of the behaviour it selects today and must not be restored. When local
+cannot serve a `remote-ok` request **right now** — the slot is saturated, the
+prefill ETA is over the wait budget, the local entry is in cooldown, the
+residency ladder skipped it, the lease is held, or the per-entry context cap
+excludes it — the request **steps straight to the next provider**: it does
+**not** enter the contention queue, does not defer, and never receives a
+local-capacity `429`, so its queue wait is always `0`.
+
+Wire compatibility: **`prefer-local` is retired** (LP-0MVUH9PUU005HVS4). It
+was the default until the two-value vocabulary; it meant "wait for local while
+the request fits the wait budget", which is now expressed by the explicit
+`local-preferred`. An explicit `prefer-local` is **not** silently reinterpreted
+as the new default — that would deliver a materially different policy with no
+signal — it is refused before any routing, queueing, lease, dispatch or
+cooldown state is written, with `400` and this body:
+
+```json
+{
+  "error": "X-Local-Preference value is retired",
+  "code": "local_preference_retired",
+  "detail": "X-Local-Preference 'prefer-local' is retired and is no longer accepted; send 'local-preferred' or 'remote-ok' instead."
+}
+```
+
+**Migration:** a client that needs the wait-for-local behaviour sends
+`local-preferred`; a client that is happy to step remote sends `remote-ok` (or
+omits the header, which is the same thing).
 
 Wire compatibility: **`local-only` is retired** (LP-0MVUH9PAZ002UAPA). It was
 the deprecated alias of `local-preferred` (LP-0MVSHWYVE005MS16); it is no
@@ -1626,9 +1659,35 @@ not need a preference value at all: pin a model whose chain has **no remote
 entries** (the `private` model), which no preference — and no promotion — can
 ever move to a paid provider.
 
-Unknown values (and an absent header) behave as `prefer-local`, so the header
-is purely additive. `high` priority keeps its "never queue" semantics under
-every preference.
+Unknown values resolve to the default `remote-ok` and log a `WARNING` naming
+the value received and the default it resolved to
+(`WARNING … unknown X-Local-Preference='local-pref' ; using 'remote-ok'`), so a
+client typo is identifiable from `proxy.log` alone; an absent header is the
+same resolution without the `WARNING`. The header stays purely additive — never
+a `400`, never a silent demotion of a *retired* value (those are rejected).
+`high` priority keeps its "never queue" semantics under every preference.
+
+#### Behaviour shift under the `remote-ok` default
+
+The default is `remote-ok`, so headerless traffic now behaves as "take local
+only when it is free *right now*". Two observable shifts follow, and **neither
+is a local-serving defect** — they are the intended contract:
+
+- **No queue wait by default.** `contention_queue_dispatch` and
+  `contention_queue_fallback_after_queue` lines disappear for headerless
+  traffic, so the measured `queued_duration` median drops to ~0 and the remote
+  share rises whenever the GPU is busy at request time. The contention queue,
+  the deferral/retry surface and `POST /llama/local/reserve` are reachable only
+  for `local-preferred` clients.
+- **Local serving is opportunistic.** A headerless request is served locally
+  only when a slot is free at that instant, so local utilisation falls under
+  contention and `X-Local-Route: remote` with a fall-through reason becomes the
+  common outcome. The prefill-ETA admission guard still decides whether local
+  can serve now, but its *refusal* outcome is unreachable for this preference:
+  the request steps to the next provider instead of receiving a `429`.
+
+Expect the daily proxy-usage report's local/remote split to move accordingly;
+read the shift as the new default, not as a regression.
 
 ### `local-preferred`: pinned while deferrable, promoted when too large
 

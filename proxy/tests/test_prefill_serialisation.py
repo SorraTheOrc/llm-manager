@@ -250,7 +250,9 @@ class TestQueueStampsPrefillSaturation:
             contention_queue, "wait_for_local_slot", _no_dispatch, raising=False
         )
 
-        request = SimpleNamespace()
+        # The queue is a pin-local surface: a headerless (``remote-ok``)
+        # request never queues (LP-0MVUH9PUU005HVS4).
+        request = SimpleNamespace(headers={"X-Local-Preference": "local-preferred"})
         action, reason, _elapsed = await provider._maybe_queue_for_local_slot(
             _config(contention_queue_policy="queue"),
             0,

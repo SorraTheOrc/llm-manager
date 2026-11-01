@@ -590,17 +590,19 @@ async def test_context_too_large_refusal_keeps_its_no_timer_contract():
 
 
 @pytest.mark.asyncio
-async def test_prefer_local_keeps_todays_remote_fall_through_on_real_expiry():
+async def test_non_pinned_keeps_todays_remote_fall_through_on_real_expiry():
     """Byte-compatibility: a default client still falls through to remote.
 
     The real-expiry timer is added to the `local-only` refusal only; a
-    ``prefer-local`` client must keep today's remote dispatch unchanged.
+    non-pin-local client must keep today's remote dispatch unchanged. Since
+    LP-0MVUH9PUU005HVS4 that value is ``remote-ok`` — the default — because
+    ``prefer-local`` is retired with a ``400``.
     """
     with _local_entry_in_cooldown(COOLDOWN_REMAINDER_SECONDS):
-        result, dispatched = await _issue(preference="prefer-local")
+        result, dispatched = await _issue(preference="remote-ok")
 
     assert dispatched == ["remote"], (
-        "prefer-local must keep today's remote fall-through, got "
+        "remote-ok must keep today's remote fall-through, got "
         f"{dispatched}"
     )
     assert result.status_code == 200

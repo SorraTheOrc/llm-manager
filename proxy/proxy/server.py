@@ -1414,6 +1414,15 @@ async def lifespan(app: FastAPI):
     # Startup phase
     # ------------------------------------------------------------------ #
     _startup_config_logging()
+    # AC17 (LP-0MVUH9PUU005HVS4): name the active X-Local-Preference vocabulary,
+    # its default and the retired values so a deploy can be proven from
+    # proxy.log alone. One line per process (the helper is idempotent).
+    try:
+        from proxy import admission_reserve as _pref_vocab
+
+        _pref_vocab.log_vocabulary_banner()
+    except Exception:  # pragma: no cover - a banner must never block startup
+        pass
     _startup_initialize_backend_state()
     _startup_create_http_client(config)
     _startup_create_remote_http_client(config)

@@ -324,8 +324,9 @@ async def test_remote_ok_steps_to_the_next_provider_without_waiting(
 async def test_private_model_with_absent_header_is_served_locally():
     """Guard: the ``private`` model's behaviour must not change.
 
-    Today's default (``prefer-local``) already serves this chain locally; the
-    default inversion must not alter it, so this row stays green throughout.
+    A headerless request resolves to the default ``remote-ok``, which keeps the
+    local route; the default inversion must not alter this chain, so this row
+    stays green throughout (LP-0MVUH9PUU005HVS4 AC7 / parent AC16).
     """
     result, calls, _request = await support.issue(
         _HEALTHY_ROW, preference=None, model_config=support.private_model_config()

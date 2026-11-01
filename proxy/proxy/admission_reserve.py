@@ -97,6 +97,14 @@ RETIRED_PREFERENCE_CODE = "local_preference_retired"
 #: to :data:`DEFAULT_PREFERENCE` (fail closed).
 RETIRED_PREFERENCES: dict[str, tuple[str, ...]] = {
     PREF_LOCAL_ONLY: (PREF_LOCAL_PREFERRED,),
+    # ``prefer-local`` was the default until LP-0MVUH9PUU005HVS4. It meant
+    # "wait for local while the request fits", which is now expressed by the
+    # explicit ``local-preferred``; the new default (``remote-ok``) means
+    # "take local only when it is free *right now*". Silently re-interpreting
+    # one as the other would deliver a materially different policy with no
+    # signal — a client relying on the queue wait would start paying for
+    # remote dispatch — so an explicit ``prefer-local`` is a loud 400.
+    PREF_PREFER_LOCAL: (PREF_LOCAL_PREFERRED, PREF_REMOTE_OK),
 }
 
 #: ``alias -> canonical value``. Empty since the last alias was retired
@@ -105,8 +113,17 @@ RETIRED_PREFERENCES: dict[str, tuple[str, ...]] = {
 #: to live and the removal is directly assertable.
 LEGACY_PREFERENCE_ALIASES: dict[str, str] = {}
 
-VALID_PREFERENCES = (PREF_LOCAL_PREFERRED, PREF_PREFER_LOCAL, PREF_REMOTE_OK)
-DEFAULT_PREFERENCE = PREF_PREFER_LOCAL
+#: Exactly two live values (parent AC21): the pin-local intent and the
+#: default. ``prefer-local`` is withdrawn (see
+#: :data:`RETIRED_PREFERENCES`).
+VALID_PREFERENCES = (PREF_LOCAL_PREFERRED, PREF_REMOTE_OK)
+
+#: The default an absent header (and any genuinely unknown value) resolves to.
+#: ``remote-ok`` is the *historic* name for "local allowed, remote acceptable":
+#: the local route is attempted when a slot is free, and when it cannot serve
+#: the request right now the request steps straight to the next provider with
+#: no queueing, no deferral and no local-capacity refusal (parent AC20/AC21).
+DEFAULT_PREFERENCE = PREF_REMOTE_OK
 
 
 class LocalPreferenceRetiredError(ValueError):
@@ -799,6 +816,32 @@ def reservation_id_from_headers(headers: Any) -> str | None:
     return None
 
 
+#: Set once when the vocabulary banner has been emitted (AC17: one line only).
+_VOCABULARY_BANNER_LOGGED = False
+
+
+def log_vocabulary_banner() -> None:
+    """Name the live vocabulary, the default and the retirements — once (AC17).
+
+    An operator must be able to prove from ``proxy.log`` which
+    ``X-Local-Preference`` policy the **running** proxy applies: a deploy that
+    ships the code without the intended behaviour is otherwise invisible, and
+    the retired values are exactly what a stale client will trip over. Emitted
+    at most once per process; callers may invoke it at startup and again
+    lazily on the first dispatch (whichever happens first wins).
+    """
+    global _VOCABULARY_BANNER_LOGGED
+    if _VOCABULARY_BANNER_LOGGED:
+        return
+    _VOCABULARY_BANNER_LOGGED = True
+    logger.info(
+        "local_preference_vocabulary default=%s live=%s retired=%s",
+        DEFAULT_PREFERENCE,
+        ",".join(VALID_PREFERENCES),
+        ",".join(sorted(RETIRED_PREFERENCES)),
+    )
+
+
 def parse_preference(headers: Any) -> str:
     """Parse ``X-Local-Preference`` (case-insensitive header names).
 
@@ -817,6 +860,7 @@ def parse_preference(headers: Any) -> str:
     (``request._local_preference``), that is once per request, not once per
     routing decision (AC2).
     """
+    log_vocabulary_banner()
     if not headers:
         return DEFAULT_PREFERENCE
     raw = None
@@ -844,7 +888,12 @@ def parse_preference(headers: Any) -> str:
                 PREF_LOCAL_PREFERRED,
             )
         return value
-    logger.debug(
+    # AC22: a typo must be visible. The header stays additive (an unknown value
+    # still resolves to the default), but at ``WARNING`` — one line per request
+    # (the parse is cached on the request), naming the value received and the
+    # default it resolved to, so ``local-preffered`` is distinguishable from a
+    # client that sent no header at all.
+    logger.warning(
         "unknown X-Local-Preference=%r; using %r", raw, DEFAULT_PREFERENCE
     )
     return DEFAULT_PREFERENCE

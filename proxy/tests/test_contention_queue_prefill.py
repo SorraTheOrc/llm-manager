@@ -27,12 +27,18 @@ from proxy import contention_queue
 # Helpers
 # ---------------------------------------------------------------------------
 
+#: The contention queue is a **pin-local** surface: since
+#: LP-0MVUH9PUU005HVS4 the default (``remote-ok``) never queues, so a stub that
+#: exercises a queue/admission-refusal path must send the pin-local value.
+PIN_LOCAL_HEADERS = {"X-Local-Preference": "local-preferred"}
+
+
 class _DummyRequest:
     """Minimal request stub for use in fallback tests."""
 
-    def __init__(self, body: bytes = b'{"model":"test"}'):
+    def __init__(self, body: bytes = b'{"model":"test"}', headers=None):
         self._body = body
-        self.headers = {}
+        self.headers = headers or {}
         self.method = "POST"
         self.url = type("U", (), {"path": "/v1/chat/completions"})()
 
@@ -183,7 +189,7 @@ async def test_queue_waits_for_prefill_then_dispatches(prefill_state):
     ):
         asyncio.create_task(_clear_prefill())
         action, reason, elapsed = await provider._maybe_queue_for_local_slot(
-            cfg, 0, 1, _DummyRequest(), {}, {}, {}, "s2",
+            cfg, 0, 1, _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), {}, {}, {}, "s2",
         )
 
     assert action == "dispatch", "prefill-saturated request must wait, not fall back"
@@ -205,7 +211,7 @@ async def test_queue_cap_exceeded_when_prefill_never_clears(prefill_state):
         ),
     ):
         action, reason, elapsed = await provider._maybe_queue_for_local_slot(
-            cfg, 0, 1, _DummyRequest(), {}, {}, {}, "s2",
+            cfg, 0, 1, _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), {}, {}, {}, "s2",
         )
 
     assert action == "fallback"
@@ -227,7 +233,7 @@ async def test_queue_logs_prefill_saturation(prefill_state, caplog):
         ),
     ):
         await provider._maybe_queue_for_local_slot(
-            cfg, 0, 1, _DummyRequest(), {}, {}, {}, "s2",
+            cfg, 0, 1, _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), {}, {}, {}, "s2",
         )
 
     messages = " ".join(r.getMessage() for r in caplog.records)
@@ -249,7 +255,7 @@ async def test_queue_logs_generating_saturation(caplog):
         ),
     ):
         await provider._maybe_queue_for_local_slot(
-            cfg, 1, 1, _DummyRequest(), {}, {}, {}, "s2",
+            cfg, 1, 1, _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), {}, {}, {}, "s2",
         )
 
     messages = " ".join(r.getMessage() for r in caplog.records)
@@ -280,7 +286,7 @@ async def test_queue_wait_log_carries_the_admission_decisions_own_pricing(caplog
         admit=True, reason="within_budget", new_tokens=35077,
         rate_bucket="contended", eta_prefill_seconds=12.0,
     )
-    request = _DummyRequest()
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
 
     with (
         patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
@@ -320,7 +326,7 @@ async def test_queue_wait_log_prices_an_inert_guard_from_the_routing_estimate(
     path does it (``estimated_tokens * (1 - cached ratio)``)."""
     caplog.set_level(logging.INFO, logger="llama-proxy.provider")
     cfg = _cfg(max_wait=0.05)
-    request = _DummyRequest()
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
 
     with (
         patch("proxy.provider._get_local_concurrency_info", _Concurrency(1, 1)),
@@ -409,7 +415,7 @@ async def test_prefill_denied_request_queues_and_redispatches_local(
         asyncio.create_task(_clear_prefill())
         result = await asyncio.wait_for(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", config, _cfg(max_wait=5.0),
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), "v1/chat/completions", config, _cfg(max_wait=5.0),
             ),
             timeout=5,
         )
@@ -425,8 +431,12 @@ async def test_prefill_denied_request_queues_and_redispatches_local(
 async def test_prefill_denied_request_cap_exceeded_falls_back_to_remote(
     prefill_state, caplog
 ):
-    """AC6: when the prefill outlasts the wait cap, the request falls back to
-    an available remote provider and records ``fallback_after_queue``."""
+    """AC6: when the prefill outlasts the wait cap, the queue records
+    ``fallback_after_queue`` and the pin-local client is refused.
+
+    A pin-local client is never silently moved to a paid provider, so the
+    fallback surfaces as the retryable ``429`` deferral
+    (LP-0MVUH9PUU005HVS4)."""
     caplog.set_level(logging.INFO, logger="llama-proxy.provider")
     config = {
         "providers": [
@@ -461,12 +471,15 @@ async def test_prefill_denied_request_cap_exceeded_falls_back_to_remote(
     ):
         result = await asyncio.wait_for(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", config, _cfg(max_wait=0.1),
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), "v1/chat/completions", config, _cfg(max_wait=0.1),
             ),
             timeout=5,
         )
 
-    assert result.status_code == 200
-    assert remote_calls == [1], "cap-exceeded prefill wait must fall back remote"
+    assert result.status_code == 429
+    assert remote_calls == [], "cap-exceeded prefill wait must not dispatch remote"
+    assert result.headers.get("X-Local-Fallback-Reason") == "local_lease_active", (
+        "the refusal names the exit that left the local route"
+    )
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "contention_queue_fallback_after_queue" in messages

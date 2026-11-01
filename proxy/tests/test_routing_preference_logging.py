@@ -29,7 +29,7 @@ Two guards keep the change additive:
   asserts every *pre-existing* key is still emitted. Log-grep consumers
   (``.pi/skills/proxy-log-debug``, ``.pi/skills/proxy-usage-analysis``) key off
   those names, so losing one would silently break them.
-- A request with no header logs ``preference=prefer-local`` — never an empty or
+- A request with no header logs ``preference=remote-ok`` — never an empty or
   absent value.
 
 One more property lives here because it is the same observability contract:
@@ -45,15 +45,11 @@ test-skill runner, ``20 failed, 22 passed``). The ``xfail(strict=True)`` markers
 that pinned the missing behaviour were removed with the behaviour they pinned;
 the red evidence is recorded on the work item.
 
-Structural note — why ``remote-ok`` has no "not local" line row: ``remote-ok``
-is enforced by :func:`proxy.priority.apply_local_preference`, which strips every
-local entry from the chain *before* dispatch. A ``remote-ok`` request therefore
-never reaches a local-route exit and never emits a "not local" line; its
-preference is still visible on ``priority_routing``. A dedicated test asserts
-exactly that (and that no local-route line is emitted), which is the honest
-three-value coverage the parent AC asks for: all three parsed values are
-provably loggable, but only the two that keep the local route in the chain can
-appear on its exit lines.
+Structural note — ``remote-ok`` keeps the local route (LP-0MVUH9OYZ007GMWF
+AC1): it is *not* stripped from the chain, so it reaches the same local-route
+exits as any other value and its ``preference=`` is asserted on them here. It
+differs only in that it never *waits*: on a saturated slot it takes the
+generic ``local_concurrency_limit`` fall-through instead of a queue exit.
 """
 
 from __future__ import annotations
@@ -112,17 +108,17 @@ CHAIN_SKIP_QUOTA_REASON = (
 
 LOCAL_ONLY = "local-only"
 LOCAL_PREFERRED = "local-preferred"
-PREFER_LOCAL = "prefer-local"
 REMOTE_OK = "remote-ok"
 #: What the canonical parser yields when the header is absent or unknown.
-DEFAULT_PREFERENCE = PREFER_LOCAL
+#: Since LP-0MVUH9PUU005HVS4 that is ``remote-ok``; ``prefer-local`` is
+#: retired (a ``400`` before routing).
+DEFAULT_PREFERENCE = REMOTE_OK
 #: The value each wire value is logged as. Every live value is logged as
 #: itself; ``local-only`` has no entry because it is **retired** — a request
 #: carrying it is a ``400`` before routing and therefore never reaches an exit
 #: line (LP-0MVUH9PAZ002UAPA).
 _PARSED_PREFERENCE = {
     LOCAL_PREFERRED: LOCAL_PREFERRED,
-    PREFER_LOCAL: PREFER_LOCAL,
     REMOTE_OK: REMOTE_OK,
     None: DEFAULT_PREFERENCE,
 }
@@ -215,7 +211,7 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
         # ``local_preference_resolved`` instead — asserted by
         # ``test_remote_ok_never_waits.py``, which pins that exit's route,
         # zero queue wait and reason per local-exit cause.
-        preferences=(LOCAL_PREFERRED, PREFER_LOCAL, None),
+        preferences=(LOCAL_PREFERRED,),
     ),
     _NotLocalLineRow(
         trigger="admission_guard_free_slot",
@@ -225,7 +221,7 @@ _NOT_LOCAL_LINE_ROWS: tuple[_NotLocalLineRow, ...] = (
         # Only the clients that really move on to the next provider: a
         # pin-local refusal is an exit, not a fall-through
         # (LP-0MVNTJQVB007QWEZ AC1).
-        preferences=(PREFER_LOCAL, None),
+        preferences=(REMOTE_OK, None),
     ),
     _NotLocalLineRow(
         trigger="admission_guard_free_slot_refused",
@@ -354,7 +350,6 @@ def _preference_params() -> list:
     """
     cases = (
         (LOCAL_PREFERRED, "local-preferred"),
-        (PREFER_LOCAL, "prefer-local"),
         (REMOTE_OK, "remote-ok"),
         (None, "absent-header"),
     )
@@ -818,10 +813,9 @@ async def test_not_local_line_names_the_parsed_preference(row, preference, caplo
     """Each exit line carries ``preference=<parsed value>``; absent ⇒ default.
 
     ``preference=`` must be the value the canonical parser produced (never a
-    re-parse, never blank): ``local-preferred`` for either pin-local spelling
-    (the legacy ``local-only`` alias is normalised to it), and ``prefer-local``
-    for the two cases that keep today's behaviour (explicit ``prefer-local``
-    and no header at all).
+    re-parse, never blank): ``local-preferred`` for the pin-local value, and
+    ``remote-ok`` for the two non-pinned cases (explicit ``remote-ok`` and no
+    header at all — the latter is the default since LP-0MVUH9PUU005HVS4).
     """
     await _issue(row, preference)
     line = _assert_line_present(_messages(caplog), row)
@@ -850,11 +844,10 @@ async def test_not_local_line_names_the_parsed_preference(row, preference, caplo
 # them with it.
 # ---------------------------------------------------------------------------
 
-#: The three parsed values the parent AC names. ``remote-ok`` is included here
-#: (the end-to-end rows cannot reach these lines with it — see above).
+#: The live parsed values the parent AC names. Both reach these lines: the
+#: chain-resolution skip is preference-independent.
 _CHAIN_SKIP_PREFERENCES = (
     pytest.param(LOCAL_PREFERRED, id="local-preferred"),
-    pytest.param(PREFER_LOCAL, id="prefer-local"),
     pytest.param(REMOTE_OK, id="remote-ok"),
 )
 
@@ -1006,7 +999,7 @@ def test_preference_never_changes_the_resolved_provider(row):
     """
     resolved = {
         (_resolve_chain_skip(row, preference) or {}).get("name")
-        for preference in (None, LOCAL_PREFERRED, PREFER_LOCAL, REMOTE_OK)
+        for preference in (None, LOCAL_PREFERRED, REMOTE_OK)
     }
 
     assert resolved == {REMOTE_PROVIDER_NAME}, (
@@ -1101,13 +1094,13 @@ async def test_priority_routing_keeps_its_existing_fields(cycle, caplog):
     selected; it must keep exactly those fields on both cycles while gaining
     the session attribution.
     """
-    line = await _issue_priority_routing(cycle, PREFER_LOCAL, caplog)
+    line = await _issue_priority_routing(cycle, REMOTE_OK, caplog)
     kv = _parse_kv(line)
 
     assert kv.get("model") == MODEL_NAME, f"model field lost/changed: {line!r}"
     assert kv.get("priority") == "low", f"priority field lost/changed: {line!r}"
     assert kv.get("providers"), f"providers field lost: {line!r}"
-    assert kv.get("preference") == PREFER_LOCAL, (
+    assert kv.get("preference") == REMOTE_OK, (
         f"preference field lost/changed: {line!r}"
     )
     assert kv["preference"] != "", "preference must never be an empty value"
@@ -1122,7 +1115,7 @@ async def test_priority_routing_carries_session_attribution(cycle, caplog):
     skip line but cannot tie it to the client request that made the choice —
     exactly the correlation heuristic the parent item exists to remove.
     """
-    line = await _issue_priority_routing(cycle, PREFER_LOCAL, caplog)
+    line = await _issue_priority_routing(cycle, REMOTE_OK, caplog)
     kv = _parse_kv(line)
 
     attribution = kv.get("session") or kv.get("request_id")
@@ -1147,7 +1140,7 @@ async def test_priority_routing_carries_session_attribution(cycle, caplog):
 
 @pytest.mark.asyncio
 async def test_absent_header_logs_the_default_preference(caplog):
-    """AC4: no header ⇒ ``preference=prefer-local``, never empty or absent."""
+    """AC4: no header ⇒ ``preference=remote-ok``, never empty or absent."""
     line = await _issue_priority_routing("local_remote", None, caplog)
     kv = _parse_kv(line)
 
@@ -1250,7 +1243,7 @@ async def test_local_only_refusal_without_a_local_route_names_that_reason(caplog
 @pytest.mark.asyncio
 async def test_prefer_local_fall_through_logs_no_refusal_line(caplog):
     """The additive half: the default client's fall-through claims no refusal."""
-    result = await _issue(_row("chain_cooldown"), PREFER_LOCAL)
+    result = await _issue(_row("chain_cooldown"), REMOTE_OK)
     assert result.status_code == 200, "the default client keeps the remote answer"
     assert [
         m for m in _messages(caplog) if m.startswith("local_only_refused ")
@@ -1479,13 +1472,13 @@ async def test_prefer_local_remote_fall_through_logs_the_remote_outcome(caplog):
     ``prefer-local`` is not a pin, so the request is served remotely as today —
     the line must say exactly that instead of pretending local was used.
     """
-    result = await _issue(_row("chain_cooldown"), PREFER_LOCAL)
+    result = await _issue(_row("chain_cooldown"), REMOTE_OK)
 
     assert result.status_code == 200
     _assert_outcome(
         caplog,
         outcome=provider.LOCAL_ROUTING_OUTCOME_REMOTE,
-        preference=PREFER_LOCAL,
+        preference=REMOTE_OK,
         reason="local_provider_cooldown",
     )
 
@@ -1755,7 +1748,7 @@ def _emission_suppressed():
     [
         pytest.param("clean", None, id="local-served"),
         pytest.param("chain_cooldown", LOCAL_PREFERRED, id="pinned-refusal"),
-        pytest.param("chain_cooldown", PREFER_LOCAL, id="remote-served"),
+        pytest.param("chain_cooldown", REMOTE_OK, id="remote-served"),
     ],
 )
 async def test_response_is_identical_with_the_line_suppressed(
@@ -1805,7 +1798,7 @@ async def test_a_raising_logger_still_returns_the_response_unchanged(caplog):
 async def test_exhaustion_of_a_non_pinned_client_is_not_reported_as_pinned(caplog):
     """AC2: a refusal-shaped exhaustion is not a pin the client never asked for.
 
-    A ``prefer-local`` (or header-less) client whose admission refusal leaves no
+    A non-pinned (``remote-ok``, or header-less) client whose admission refusal leaves no
     provider to serve it receives the admission-refusal payload — which carries
     ``X-Local-Route: refused`` — but it was never pinned: the chain exhausted.
     The line must say ``outcome=exhausted``, so an operator never reads a pin
@@ -1903,7 +1896,6 @@ async def _issue_remote_only(preference: str | None) -> Response:
     ("preference", "expected"),
     [
         pytest.param(None, DEFAULT_PREFERENCE, id="absent-header"),
-        pytest.param(PREFER_LOCAL, PREFER_LOCAL, id="prefer-local"),
         pytest.param(REMOTE_OK, REMOTE_OK, id="remote-ok"),
     ],
 )

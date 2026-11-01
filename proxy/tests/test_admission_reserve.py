@@ -173,7 +173,16 @@ async def test_follow_up_with_ticket_dispatches_local_without_queueing(caplog):
     )
     assert status == 200
 
-    request = _DummyRequest(headers={"X-Local-Reservation": payload["reservation_id"]})
+    # The reservation API is the pin-local path: a ticket asks for local, so
+    # the follow-up carries the pin-local value explicitly. A headerless
+    # request now resolves to ``remote-ok`` and declines before consuming the
+    # ticket (LP-0MVUH9PUU005HVS4 AC1/AC21).
+    request = _DummyRequest(
+        headers={
+            "X-Local-Reservation": payload["reservation_id"],
+            "X-Local-Preference": "local-preferred",
+        }
+    )
     with (
         patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
         patch("proxy.provider.request_priority", return_value="low"),
@@ -439,16 +448,22 @@ def test_uncalibrated_reserve_admits_even_with_full_occupancy():
     assert decision.reason == "insufficient_samples"
 
 
-def test_unknown_preference_value_falls_back_to_prefer_local():
+def test_unknown_preference_value_falls_back_to_remote_ok():
+    """An unknown value resolves to the default, which is ``remote-ok``.
+
+    LP-0MVUH9PUU005HVS4 AC1/AC21: the default is no longer ``prefer-local``.
+    An unknown value stays additive (no ``400``) and inherits the default's
+    keep-local/no-queue behaviour.
+    """
     assert (
         admission_reserve.parse_preference({"X-Local-Preference": "purple"})
-        == "prefer-local"
+        == "remote-ok"
     )
     assert (
         admission_reserve.parse_preference({"X-Local-Preference": "PURPLE"})
-        == "prefer-local"
+        == "remote-ok"
     )
-    assert admission_reserve.parse_preference({}) == "prefer-local"
+    assert admission_reserve.parse_preference({}) == "remote-ok"
     assert (
         admission_reserve.parse_preference({"X-Local-Preference": "remote-ok"})
         == "remote-ok"
@@ -533,11 +548,15 @@ def test_retired_table_and_canonical_set_cannot_drift():
         f"retired; got {admission_reserve.LEGACY_PREFERENCE_ALIASES!r}"
     )
     assert admission_reserve.RETIRED_PREFERENCES == {
-        "local-only": ("local-preferred",)
+        "local-only": ("local-preferred",),
+        "prefer-local": ("local-preferred", "remote-ok"),
     }, "the retired table is the single source of the successors"
-    assert "local-preferred" in admission_reserve.VALID_PREFERENCES
+    assert admission_reserve.VALID_PREFERENCES == ("local-preferred", "remote-ok")
     assert "local-only" not in admission_reserve.VALID_PREFERENCES, (
         "a retired value is not a canonical value"
+    )
+    assert "prefer-local" not in admission_reserve.VALID_PREFERENCES, (
+        "the second retired value is not a canonical value either"
     )
     for successors in admission_reserve.RETIRED_PREFERENCES.values():
         assert successors, "a retired value must name at least one successor"
@@ -595,7 +614,7 @@ async def test_retired_value_logs_one_warning_per_rejection(caplog):
 
 def test_canonical_preference_logs_no_warning(caplog):
     """AC3: only a retired value is rejected — live values stay quiet."""
-    for value in ("local-preferred", "prefer-local", "remote-ok"):
+    for value in ("local-preferred", "remote-ok"):
         request = _DummyRequest(headers={"x-local-preference": value})
         with caplog.at_level(logging.WARNING, logger="llama-proxy"):
             provider._request_local_preference(request)
@@ -845,8 +864,13 @@ async def test_retired_value_rejects_before_the_capacity_refusal(caplog):
 
 
 @pytest.mark.asyncio
-async def test_prefer_local_still_falls_back_remote_when_refused(caplog):
-    """Backcompat (AC8): prefer-local (and absent header) keep the fallback."""
+async def test_absent_header_still_falls_back_remote_when_refused(caplog):
+    """The default (``remote-ok``) keeps the remote fall-through.
+
+    LP-0MVUH9PUU005HVS4 AC1: a headerless request is no longer the historic
+    ``prefer-local``; it inherits ``remote-ok``, which keeps the local route
+    but steps straight to the next provider on a busy slot.
+    """
     _seed_calibration()
     calls: list[str] = []
 
@@ -877,7 +901,7 @@ async def test_prefer_local_still_falls_back_remote_when_refused(caplog):
             _DummyRequest(), "v1/chat/completions", config, _cfg()
         )
 
-    assert calls == ["remote"], "prefer-local keeps today's remote fallback"
+    assert calls == ["remote"], "remote-ok keeps the immediate remote fallback"
     assert result.status_code == 200
 
 
@@ -1509,9 +1533,15 @@ def test_refusal_builder_routes_through_the_helper_once():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preference", ["prefer-local", "remote-ok", None])
+@pytest.mark.parametrize("preference", ["remote-ok", None])
 async def test_non_refusal_paths_never_call_the_helper(preference):
-    """AC4: no verdict is produced for a request that is not refused."""
+    """AC4: no verdict is produced for a request that is not refused.
+
+    ``remote-ok`` is now the only non-pin-local value, so it carries the row
+    the historic ``prefer-local`` used to: a served request never builds a
+    refusal verdict. (``local-preferred`` deliberately does consult the shared
+    helper pre-dispatch — LP-0MVSLZY470051ZB2 — so it is not a row here.)
+    """
     spy, patcher = _spy_capacity_verdict()
 
     with patcher:
@@ -1524,13 +1554,13 @@ async def test_non_refusal_paths_never_call_the_helper(preference):
 
 @pytest.mark.asyncio
 async def test_fall_through_on_a_size_refusal_never_calls_the_helper():
-    """AC4: a fall-through (prefer-local over budget) is not a refusal verdict."""
+    """AC4: a fall-through (remote-ok over budget) is not a refusal."""
     spy, patcher = _spy_capacity_verdict()
     _seed_calibration(100_000)
 
     with patcher:
         result, calls = await _issue_local_first_cycle(
-            "prefer-local", tokens=100_000
+            "remote-ok", tokens=100_000
         )
 
     assert result.status_code == 200

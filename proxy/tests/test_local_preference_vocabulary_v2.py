@@ -66,27 +66,13 @@ _HEALTHY_ROW = support.matrix._HEALTHY_ROW
 
 
 def _retired_param(row: support.RetiredValue):
-    """Parametrise one retired value, marked red until *its own* child lands.
+    """Parametrise one retired value.
 
-    A single module-level ``xfail`` cannot express the staggered retirement:
-    ``local-only`` is retired by LP-0MVUH9PAZ002UAPA and ``prefer-local`` by
-    LP-0MVUH9PUU005HVS4, so each row carries its own marker. ``strict`` keeps
-    its two jobs — the owning child cannot land without removing it, and a
-    later re-introduction of the value cannot pass silently.
+    Both retirements have landed — ``local-only`` by LP-0MVUH9PAZ002UAPA and
+    ``prefer-local`` by LP-0MVUH9PUU005HVS4 — so every row is a live assertion
+    and no marker remains.
     """
-    if row.owner == "LP-0MVUH9PAZ002UAPA":
-        return pytest.param(row, id=row.value)
-    return pytest.param(
-        row,
-        id=row.value,
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason=(
-                f"{row.owner}: {row.value} is still a live value — its "
-                "retirement is that child's job"
-            ),
-        ),
-    )
+    return pytest.param(row, id=row.value)
 
 
 RETIRED_PARAMS = [_retired_param(row) for row in RETIRED_VALUES]
@@ -190,13 +176,6 @@ def test_retired_value_is_never_normalised_or_resolved_to_the_default(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9PUU005HVS4: VALID_PREFERENCES still carries prefer-local and "
-        "DEFAULT_PREFERENCE is still prefer-local"
-    ),
-)
 def test_live_vocabulary_is_exactly_the_two_documented_values():
     """The live set and the default, asserted exactly (no subset check)."""
     assert admission_reserve.VALID_PREFERENCES == LIVE_PREFERENCES, (
@@ -229,10 +208,6 @@ def test_local_only_has_left_the_alias_table_and_the_live_set():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PUU005HVS4: prefer-local is still a live value",
-)
 def test_prefer_local_has_left_the_alias_table_and_the_live_set():
     """The second retirement's half of the same guarantee."""
     aliases = admission_reserve.LEGACY_PREFERENCE_ALIASES
@@ -245,10 +220,6 @@ def test_prefer_local_has_left_the_alias_table_and_the_live_set():
     ), "the retired local-only constant must not be part of the live set"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LP-0MVUH9PUU005HVS4: an absent header still resolves to prefer-local",
-)
 def test_absent_header_resolves_to_the_documented_default():
     assert admission_reserve.parse_preference({}) == DEFAULT_PREFERENCE, (
         "an absent header must resolve to the documented default "
@@ -279,14 +250,6 @@ def test_unknown_value_still_falls_back_to_the_default():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9Q4O008RHDX owns the docs: routing.md still documents "
-        "prefer-local as the default, the local-only alias and the remote-ok "
-        "strip, and config.yaml has no deferral-budget key"
-    ),
-)
 def test_routing_docs_document_the_two_value_vocabulary_and_the_budget():
     """Docs-contract: a client author can learn the whole vocabulary here.
 
@@ -345,13 +308,6 @@ def test_config_documents_the_deferral_budget_knob():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "LP-0MVUH9Q4O008RHDX owns the docs: routing.md still lists "
-        "`prefer-local` as a selectable preference-table row"
-    ),
-)
 def test_routing_docs_still_name_the_live_values_only_as_live():
     """The retired spellings remain migration *notes*, not live policy.
 

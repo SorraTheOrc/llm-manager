@@ -28,7 +28,8 @@ recorded for its branch and equals the log ``reason=`` value verbatim"):
   ``X-Local-Fallback-Reason`` header and the body ``reason``;
 - the router's own ``Skipping provider= ... reason=<token>`` log line matches
   verbatim;
-- ``prefer-local`` records the SAME token (observability is
+- ``remote-ok`` (the non-pin-local value, and the default since
+  LP-0MVUH9PUU005HVS4) records the SAME token (observability is
   preference-independent) but never refuses — the remote fall-through still
   completes (parent AC: preferred status only).
 """
@@ -55,7 +56,10 @@ REMOTE_PROVIDER_NAME = "remote-fallback"
 #: ``local_only_*`` token names (parent AC3), which is what this module
 #: asserts.
 PIN_LOCAL = "local-preferred"
-PREFER_LOCAL = "prefer-local"
+#: The non-pin-local wire value. ``prefer-local`` is retired (a 400 before
+#: routing, LP-0MVUH9PUU005HVS4); ``remote-ok`` carries the row it used to:
+#: the same token recorded, but no refusal.
+NON_PINNED = "remote-ok"
 
 #: Wait budget every route runs with (seconds).
 WAIT_BUDGET_SECONDS = 60
@@ -383,30 +387,30 @@ async def test_chain_skip_records_token_on_local_only_refusal(
     _CHAIN_SKIP_ROWS,
     ids=[r[0] for r in _CHAIN_SKIP_ROWS],
 )
-async def test_chain_skip_records_token_for_prefer_local_without_refusal(
+async def test_chain_skip_records_token_for_non_pinned_without_refusal(
     trigger: str, token: str, local_entry: dict | None
 ):
-    """prefer-local records the SAME token but never refuses (AC6).
+    """remote-ok records the SAME token but never refuses (AC6).
 
     The remote fall-through completes exactly as before — only the
     ``X-Local-Fallback-Reason`` header now names *why* local was skipped,
     so observability is preference-independent without changing routing.
     """
-    result, calls = await _issue(trigger, PREFER_LOCAL)
+    result, calls = await _issue(trigger, NON_PINNED)
 
     assert calls == ["remote"], (
-        f"{trigger}: prefer-local must keep today's remote fall-through "
+        f"{trigger}: remote-ok must keep today's remote fall-through "
         f"(dispatched={calls})"
     )
     assert result.status_code == 200, f"{trigger}: got {result.status_code}"
     assert result.headers.get("X-Local-Route") == "remote"
     assert result.headers.get("X-Local-Fallback-Reason") == token, (
-        f"{trigger}: prefer-local carries the same token as the refusal, got "
+        f"{trigger}: remote-ok carries the same token as the refusal, got "
         f"{result.headers.get('X-Local-Fallback-Reason')!r}"
     )
     body = json.loads(result.body)
     assert "code" not in body or body.get("code") != provider.EXHAUSTION_CODE_LOCAL_ADMISSION, (
-        f"{trigger}: no refusal is allowed behind prefer-local"
+        f"{trigger}: no refusal is allowed behind remote-ok"
     )
 
 
@@ -482,13 +486,14 @@ async def test_lease_active_records_local_lease_active_on_local_only_refusal(cap
 
 
 @pytest.mark.asyncio
-async def test_lease_active_records_token_for_prefer_local_without_refusal():
-    """prefer-local records local_lease_active but still completes remotely."""
-    result, calls = await _issue_lease(PREFER_LOCAL)
+async def test_lease_active_records_token_for_non_pinned_without_refusal():
+    """remote-ok records local_lease_active but still completes remotely."""
+    result, calls = await _issue_lease(NON_PINNED)
 
-    assert calls == ["local", "local", "remote"], (
-        "prefer-local keeps the lease fall-through to remote "
-        f"(dispatched={calls})"
+    assert calls == ["local", "remote"], (
+        "remote-ok keeps the lease fall-through to remote — and steps straight "
+        "there rather than re-queueing for a second probe, because the value "
+        f"never waits (dispatched={calls})"
     )
     assert result.status_code == 200, f"got {result.status_code}"
     assert result.headers.get("X-Local-Route") == "remote"

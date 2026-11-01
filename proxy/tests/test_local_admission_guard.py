@@ -81,6 +81,13 @@ class _DummyRequest:
         return self._body
 
 
+#: The pin-local wire value. The admission guard (queueing, ETA refusal,
+#: deferral) is reachable only for this value: since LP-0MVUH9PUU005HVS4 the
+#: default is ``remote-ok``, which never waits and whose refusal outcome is
+#: therefore unreachable.
+PIN_LOCAL_HEADERS = {"X-Local-Preference": "local-preferred"}
+
+
 class _MutableConcurrency:
     """Mutable ``_get_local_concurrency_info`` stand-in."""
 
@@ -175,9 +182,16 @@ def _guard_patches(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_eta_above_budget_falls_back_immediately_without_queueing(
+async def test_eta_above_budget_refuses_immediately_without_queueing(
     mixed_model_config, caplog
 ):
+    """A pin-local request over the budget is refused, never queued.
+
+    Since LP-0MVUH9PUU005HVS4 the *fall-through* variant of this shape belongs
+    to the ``remote-ok`` default (which never waits); the guard's refusal is
+    reachable only for a pin-local client, and it is an immediate ``429`` with
+    no dispatch and no queue state.
+    """
     caplog.set_level(logging.INFO, logger="llama-proxy")
     _seed_calibration(tokens=100_000, ms_per_token=3.9)
     calls: list[str] = []
@@ -199,12 +213,15 @@ async def test_eta_above_budget_falls_back_immediately_without_queueing(
     ):
         started = time.monotonic()
         result = await provider.proxy_with_fallback(
-            _DummyRequest(), "v1/chat/completions", mixed_model_config, _queue_cfg()
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+            "v1/chat/completions",
+            mixed_model_config,
+            _queue_cfg(),
         )
         elapsed = time.monotonic() - started
 
-    assert result.status_code == 200
-    assert calls == ["remote"], "a refused request must never dispatch or wait local"
+    assert result.status_code == 429, "a pin-local refusal is a retryable 429"
+    assert calls == [], "a refused request must never dispatch or wait local"
     assert elapsed < 2.0, "the refusal must be immediate (no queue wait)"
     assert contention_queue.queue_depth() == 0
 
@@ -218,7 +235,11 @@ async def test_eta_above_budget_falls_back_immediately_without_queueing(
 
 @pytest.mark.asyncio
 async def test_refused_request_records_eta_diagnostics(mixed_model_config):
-    """The refusal is visible in the exhaustion diagnostics (ETA + budget)."""
+    """The refusal is visible in the exhaustion diagnostics (ETA + budget).
+
+    The guard refusal is a pin-local outcome (``refused_local_only``): the
+    value holds the request local rather than moving it remote.
+    """
     _seed_calibration(tokens=100_000, ms_per_token=3.9)
 
     with (
@@ -230,7 +251,7 @@ async def test_refused_request_records_eta_diagnostics(mixed_model_config):
             _queue_cfg(),
             1,
             1,
-            _DummyRequest(),
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
             {},
             {},
             {"name": "local-llama", "llama_model": "Qwen3"},
@@ -238,7 +259,7 @@ async def test_refused_request_records_eta_diagnostics(mixed_model_config):
             priority="low",
         )
 
-    assert action == "admission_reject"
+    assert action == "refused_local_only"
     assert reason == "eta_exceeds_budget"
     assert elapsed is None
 
@@ -275,7 +296,9 @@ async def test_eta_within_budget_still_queues_and_dispatches_local(
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", mixed_model_config,
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+                "v1/chat/completions",
+                mixed_model_config,
                 _queue_cfg(),
             )
         )
@@ -327,7 +350,9 @@ async def test_warm_cache_prompt_is_admitted_and_queued(mixed_model_config, capl
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", mixed_model_config,
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+                "v1/chat/completions",
+                mixed_model_config,
                 _queue_cfg(),
             )
         )
@@ -377,7 +402,9 @@ async def test_missing_calibration_keeps_queueing_unchanged(
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", mixed_model_config,
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+                "v1/chat/completions",
+                mixed_model_config,
                 _queue_cfg(),
             )
         )
@@ -424,7 +451,9 @@ async def test_observe_policy_never_refuses(mixed_model_config, caplog):
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", mixed_model_config,
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+                "v1/chat/completions",
+                mixed_model_config,
                 _queue_cfg(local_admission_guard_policy="observe"),
             )
         )
@@ -965,7 +994,9 @@ async def test_prefill_budget_exceeded_exhaustion_refusal_is_not_time_retryable(
         _guard_patches(tokens=INCIDENT_NEW_TOKENS),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(), "v1/chat/completions", local_only_chain,
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+            "v1/chat/completions",
+            local_only_chain,
             _cold_budget_cfg(),
         )
 
@@ -1128,6 +1159,10 @@ class _OccupancyRefusalCase:
     #: ``"hybrid"`` = a remote provider is available (local-only refusal) or
     #: ``"local_only"`` = the chain has no fallback (exhaustion refusal).
     chain: str = "hybrid"
+    #: Whether the request is a pin-local client (``local-preferred``). A
+    #: headerless request now resolves to the ``remote-ok`` default, whose
+    #: guard refusal is unreachable: it falls through instead of pinning.
+    pinned: bool = True
     #: Extra ``server`` config for this case.
     server: dict = field(default_factory=dict)
 
@@ -1387,9 +1422,11 @@ async def _issue_occupancy_refusal(case: _OccupancyRefusalCase, mixed_model_conf
     model_config = (
         mixed_model_config if case.chain == "hybrid" else _local_only_model_config()
     )
-    headers = (
-        {"x-local-preference": "local-preferred"} if case.chain == "hybrid" else {}
-    )
+    # Both refusal builders answer a *pin-local* client: the hybrid chain
+    # produces the local-only refusal, the remote-less chain its own variant.
+    # A headerless request now resolves to ``remote-ok``, whose guard refusal
+    # is unreachable — it falls through instead (LP-0MVUH9PUU005HVS4 AC21).
+    headers = {"x-local-preference": "local-preferred"} if case.pinned else {}
     concurrency = _MutableConcurrency(1 if case.path == "queue" else 0, 1)
 
     with (
@@ -1448,13 +1485,13 @@ async def test_occupancy_refusal_advertises_a_truthful_retry_time(
 _DIRECT_GOVERNING_REASON_CASES = [
     pytest.param(
         _OccupancyRefusalCase(
-            **_PREFILL_DEADLINE_DIRECT_CASE, chain="local_only"
+            **_PREFILL_DEADLINE_DIRECT_CASE, chain="local_only", pinned=False
         ),
         id="prefill_eta_exceeds_deadline-direct",
     ),
     pytest.param(
         _OccupancyRefusalCase(
-            **_PREFILL_SAFETY_BUDGET_DIRECT_CASE, chain="local_only"
+            **_PREFILL_SAFETY_BUDGET_DIRECT_CASE, chain="local_only", pinned=False
         ),
         id="prefill_eta_exceeds_safety_budget-direct",
     ),
@@ -1879,14 +1916,25 @@ async def test_both_local_only_refusal_paths_answer_with_one_shape(
 async def test_exhausted_chain_keeps_the_exhaustion_prose(mixed_model_config):
     """AC3/AC6 regression: a genuinely exhausted chain is unchanged.
 
-    The local-only path carries the truthful refusal prose; a request the guard
+    The pin-local path carries the truthful refusal prose; a request the guard
     refused that then finds **no** remaining provider still answers with the
     retained ``All providers exhausted`` prose and the shipped
     ``local_admission_reject`` code (LP-0MVGDUV5E005UWBQ AC3), so older clients
     keep parsing exactly what they parse today.
+
+    Since LP-0MVUH9PUU005HVS4 that shape is the *default* (``remote-ok``)
+    client's: a pin-local request is refused on the spot (``refused_local_only``
+    — its prose is asserted above), while a non-pinned request the guard
+    declined really does walk the rest of the chain, so it is the one that can
+    still report genuine exhaustion. The free-slot path is used because the
+    queue path returns before the guard for a never-waiting preference.
     """
     result, dispatched = await _issue_occupancy_refusal(
-        _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_CASE, chain="local_only"),
+        _OccupancyRefusalCase(
+            **_ETA_EXCEEDS_BUDGET_DIRECT_CASE,
+            chain="local_only",
+            pinned=False,
+        ),
         mixed_model_config,
     )
 
@@ -2675,8 +2723,9 @@ async def _issue_guard_refusal(
 ) -> tuple:
     """Drive the end-to-end over-budget refusal for *preference*.
 
-    Returns ``(response, provider_calls)``; a ``prefer-local`` request falls
-    through to remote (no refusal), a pin-local one is refused locally.
+    Returns ``(response, provider_calls)``; a non-pin-local request
+    (``remote-ok``, or the absent-header default) falls through to remote with
+    no refusal, a pin-local one is refused locally.
     *tokens* is the priced prompt size — the default is the incident shape
     (over the cold-prefill cap), a smaller one keeps the sole blocking signal
     temporal so a temporal exit can be asserted as ``deferrable``.
@@ -2720,7 +2769,7 @@ async def _issue_guard_refusal(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preference", ["prefer-local", "remote-ok", None])
+@pytest.mark.parametrize("preference", ["remote-ok", None])
 async def test_non_refusal_paths_log_no_verdict_line(preference, caplog):
     """AC3: only a refusal produces a verdict; fall-through logs none."""
     caplog.set_level(logging.INFO, logger="llama-proxy")
@@ -3085,7 +3134,7 @@ async def _issue_direct_guard_refusal(
 
     A 100k-token cache-cold prompt is priced at ~468 s against the 60 s wait
     budget while a local slot is free, so the direct guard refuses. A
-    pin-local client gets the 429; ``prefer-local`` falls through to remote.
+    pin-local client gets the 429; ``remote-ok`` falls through to remote.
     Returns ``(response, dispatches)``.
     """
     calls: list[str] = []
@@ -3190,22 +3239,22 @@ async def test_direct_guard_pin_refusal_is_attributable_and_claims_no_fallback(
 
 
 @pytest.mark.asyncio
-async def test_prefer_local_direct_fall_through_keeps_the_fallback_line(
+async def test_non_pinned_direct_fall_through_keeps_the_fallback_line(
     mixed_model_config, caplog
 ):
     """AC1/AC4: the truthful half — a real fall-through still says so.
 
     Regression guard: moving the line behind the pin check must not silence it
-    for the ``prefer-local`` client that genuinely moves to the next provider.
+    for the ``remote-ok`` client that genuinely moves to the next provider.
     """
     caplog.set_level(logging.INFO, logger="llama-proxy")
 
     result, calls = await _issue_direct_guard_refusal(
-        mixed_model_config, "prefer-local"
+        mixed_model_config, "remote-ok"
     )
 
-    assert result.status_code == 200, "prefer-local keeps the remote answer"
-    assert calls == ["remote"], f"prefer-local falls through; got {calls}"
+    assert result.status_code == 200, "remote-ok keeps the remote answer"
+    assert calls == ["remote"], f"remote-ok falls through; got {calls}"
 
     messages = _log_messages(caplog)
     fallback = [
