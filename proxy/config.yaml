@@ -2026,7 +2026,15 @@ server:
   # cold-prefill budget was added to protect. Hence OPT-IN: leave it off unless
   # the operator accepts that trade after measuring. Rollback: false (read per
   # request).
-  local_admission_guard_free_gate_deadline_budget: false
+  #
+  # DECISION (LP-0MVXZWF7A002TUO1, 2026-11-01): the operator enabled this rung
+  # for a live re-measurement of local stream share. The measured 2026-11-01
+  # post-fix window (13:17:50-15:34:42 UTC) showed local share at 1.56 % with
+  # admission-guard refusals (``eta_exceeds_budget`` on a FREE prefill gate)
+  # as a residual non-quarantine cause, so the trade (admitted-and-doomed risk)
+  # is accepted for the re-measurement window; the trade and its result are
+  # recorded on that item. Flip back to false to restore the queue-budget bound.
+  local_admission_guard_free_gate_deadline_budget: true
   #
   # The comparison is OCCUPANCY-AWARE (LP-0MVICD2YW004DJPV): the quantity
   # tested against the budget is

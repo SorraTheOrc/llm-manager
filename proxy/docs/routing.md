@@ -1329,10 +1329,15 @@ Counter-evidence: replaying the 2026-10-23 thrash window with the rung enabled
 admits them, but 6 of the 20 are then cancelled at the deadline
 (`admitted_and_doomed` 0 → 6) — the very invariant the flat cold-prefill
 budget exists to protect. The rung therefore ships **off**
-(`local_admission_guard_free_gate_deadline_budget: false`); enable it only
-with an accepted trade. Contended admissions keep the queue bound in either
-case, and the deadline + safety bounds still refuse anything that could not
-finish. The log line carries `budget_s` (the resolved queue budget) and
+(`local_admission_guard_free_gate_deadline_budget: false`) unless the operator
+accepts the trade. **Status 2026-11-01:** enabled by operator decision
+(LP-0MVXZWF7A002TUO1 — the post-fix 13:17:50-15:34:42 UTC window measured
+1.56 % local share with free-gate refusals as a residual non-quarantine
+cause; the trade was accepted for a live re-measurement with the rung on,
+recorded in a comment on that item). Flip the config value back to `false` to
+restore the queue-bound behaviour. Contended admissions keep the queue bound in
+either case, and the deadline + safety bounds still refuse anything that could
+not finish. The log line carries `budget_s` (the resolved queue budget) and
 `bound_s` (the bound actually enforced), so the two can never be confused.
 
 The occupancy term matters because prefills are serialised
