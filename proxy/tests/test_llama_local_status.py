@@ -795,7 +795,8 @@ class TestPerSlotDetails:
             assert slot["prefill_eta_seconds"] is None or isinstance(
                 slot["prefill_eta_seconds"], (int, float)
             )
-        assert j["status_schema_version"] == 4  # AC1: additive + versioned
+        # v5 (LP-0MVWFKIKJ005XHAY): the three ``local_route_*`` fields.
+        assert j["status_schema_version"] == 5  # AC1: additive + versioned
 
 
 # ======================================================================
@@ -1050,6 +1051,7 @@ class _CapacityStatusHarness:
         slot_owners=None,
         dispatch_records=None,
         counts_outcome=None,
+        llama_running=True,
     ):
         """Issue /llama/local/status and return the parsed JSON body.
 
@@ -1058,6 +1060,8 @@ class _CapacityStatusHarness:
         ``slots_stale=true``. ``counts_outcome`` simulates the fresh counts
         query's ``status_out`` (e.g. ``{"status": 400, "reason": "http_400"}``
         for an unloaded model) while still returning ``(0, 0)``.
+        ``llama_running`` selects the engine-health state the fake status query
+        reports (``False`` exercises the payload's absent-safe paths).
         """
         from unittest.mock import AsyncMock
 
@@ -1066,7 +1070,7 @@ class _CapacityStatusHarness:
         from proxy import server
 
         async def fake_query():
-            return {"llama_server_running": True}
+            return {"llama_server_running": llama_running}
 
         detail_mock = AsyncMock(return_value=slots_detail or [])
         if counts_outcome is None:
@@ -1162,7 +1166,9 @@ async def test_new_capacity_fields_are_additive_and_versioned():
 
     # v4 (LP-0MVRMI5HK00558TB): per-slot abandonment annotation, the additive
     # ``abandoned_busy`` hint value and ``local_abandoned_slots``.
-    assert j["status_schema_version"] == 4
+    # v5 (LP-0MVWFKIKJ005XHAY): ``local_route_available`` /
+    # ``local_route_reason`` / ``local_route_cooldown_remaining_s``.
+    assert j["status_schema_version"] == 5
     assert j["capacity_hint"] in (
         "idle",
         "prefill_bound",
@@ -1716,7 +1722,7 @@ async def test_endpoint_wide_entry_annotates_the_draining_slot(
         slots_detail=[_slot(1, is_processing=True, n_decoded=7)],
     )
 
-    assert j["status_schema_version"] == 4
+    assert j["status_schema_version"] == 5
     assert j["capacity_hint"] == "abandoned_busy"
     assert j["capacity_hint"] != "saturated"
     assert j["capacity_hint"] != "idle"
@@ -1777,3 +1783,412 @@ async def test_endpoint_wide_entry_never_annotates_live_owned_work(
     slot = j["slots"][0]
     assert slot.get("abandoned") is not True
     assert slot.get("abandoned_scope") is None
+
+
+# ======================================================================
+# Local-route availability on /llama/local/status
+# (LP-0MVWFKIKJ005XHAY, parent LP-0MVWEZCB0006WPBQ AC10)
+#
+# Every capacity field above describes the ENGINE. A dispatcher also needs the
+# ROUTE: on 2026-10-31 the local entry was quarantined (100 % of local attempts
+# refused, 217 arms / 5.5 h) while this endpoint kept serving
+# ``available_slots: 2, capacity_hint: idle``, so herdr's downtime dispatcher
+# launched work into the poisoned route. The three additive fields are
+# READ-ONLY observability: the routing decision never reads them.
+# ======================================================================
+
+_LOCAL_ENTRY_NAME = "local-qwen3"
+
+
+def _route_config(*, local_entry=None, with_models=True) -> dict:
+    """Server config carrying a local + remote provider chain.
+
+    The same local entry is referenced by two models (as ``local-qwen3`` is in
+    ``proxy/config.yaml``), which also exercises the entry de-duplication.
+    """
+    config = {"server": {"llama_server_port": 8080}}
+    if not with_models:
+        return config
+    entry = local_entry or {
+        "name": _LOCAL_ENTRY_NAME,
+        "type": "local",
+        "llama_model": "Qwen3",
+    }
+    config["models"] = {
+        "plan": {
+            "providers": [
+                entry,
+                {
+                    "name": "remote-fallback",
+                    "type": "remote",
+                    "endpoint": "https://example.invalid/v1",
+                },
+            ]
+        },
+        "private": {"providers": [dict(entry)]},
+    }
+    return config
+
+
+def _window_excluding_now() -> str:
+    """A non-current ``HH:MM-HH:MM`` window (deterministic, no clock patching)."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    ahead = now + timedelta(hours=3)
+    if ahead.date() == now.date():
+        start, end = ahead, ahead + timedelta(minutes=1)
+    else:
+        start = now - timedelta(hours=3)
+        end = start + timedelta(minutes=1)
+    return f"{start:%H:%M}-{end:%H:%M}"
+
+
+def _deficit_marked_503():
+    """The retryable 503 the router returns for a measured cache-deficit abort."""
+    from fastapi import Response
+    from proxy.admission_reserve import HEADER_LOCAL_DISPATCH_REASON
+    from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
+
+    return Response(
+        content=b'{"error": {"message": "Backend unavailable, please retry later"}}',
+        status_code=503,
+        media_type="application/json",
+        headers={
+            "Retry-After": "11",
+            HEADER_LOCAL_DISPATCH_REASON: MEASURED_CACHE_DEFICIT_REASON,
+        },
+    )
+
+
+def _unmarked_503():
+    """A plain local 503: a genuine fault, which still quarantines the entry."""
+    from fastapi import Response
+
+    return Response(
+        content=b'{"error": {"message": "boom"}}',
+        status_code=503,
+        media_type="application/json",
+        headers={"Retry-After": "11"},
+    )
+
+
+class TestLocalRouteAvailability:
+    """AC10/AC10b/AC10c/AC10d: the route's armed state beside the engine's."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_armed_state(self):
+        """Isolate the shared in-process cooldown/failure state per test."""
+        import proxy.provider as provider
+
+        from proxy import cold_start
+
+        def _clear():
+            provider._provider_unavailable_until.clear()
+            provider._provider_failure_count.clear()
+            cold_start.reset()
+
+        _clear()
+        yield
+        _clear()
+
+    @pytest.mark.asyncio
+    async def test_idle_route_publishes_absent_safe_defaults(self):
+        """AC10b/AC10d: nothing armed reads true / null / null (never a 0)."""
+        j = await _CapacityStatusHarness().get(
+            config=_route_config(), current_model="Qwen3"
+        )
+
+        assert j["status_schema_version"] == 5
+        assert j["local_route_available"] is True
+        assert j["local_route_reason"] is None
+        # ``None`` — a fabricated ``0`` would read as "armed and expiring now".
+        assert j["local_route_cooldown_remaining_s"] is None
+
+    @pytest.mark.asyncio
+    async def test_armed_cooldown_is_published_with_a_canonical_token(self):
+        """AC10/AC10d: a real armed cooldown is reflected in the payload.
+
+        The engine view is deliberately unchanged (``capacity_hint`` stays
+        ``idle``): that disagreement is exactly the 2026-10-31 misread.
+        """
+        import proxy.provider as provider
+        from proxy.admission_reserve import LOCAL_FALLBACK_REASON_TOKENS
+
+        provider.mark_provider_unavailable(_LOCAL_ENTRY_NAME, 60)
+
+        j = await _CapacityStatusHarness().get(config=_route_config())
+
+        assert j["local_route_available"] is False
+        assert j["local_route_reason"] == "local_provider_cooldown"
+        assert j["local_route_reason"] in LOCAL_FALLBACK_REASON_TOKENS
+        assert isinstance(j["local_route_cooldown_remaining_s"], int)
+        assert 0 < j["local_route_cooldown_remaining_s"] <= 60
+        # The engine still reports itself healthy: the two axes are independent.
+        assert j["capacity_hint"] == "idle"
+        assert j["local_abandoned_slots"] == 0
+
+    @pytest.mark.asyncio
+    async def test_brand_or_entry_arm_is_attributed_to_the_route(self):
+        """AC10: the arm may live on the entry name OR its brand — either way
+        the route is unavailable and the reason is the canonical cooldown token.
+
+        ``_entry_cooldown_key`` is the same predicate chain resolution uses, so
+        the published field cannot disagree with the skip line.
+        """
+        import proxy.provider as provider
+
+        provider.mark_provider_unavailable("Qwen3-Brand", 45)
+        entry = {
+            "name": _LOCAL_ENTRY_NAME,
+            "type": "local",
+            "llama_model": "Qwen3",
+            "provider": "Qwen3-Brand",
+        }
+
+        j = await _CapacityStatusHarness().get(
+            config=_route_config(local_entry=entry), current_model="Qwen3"
+        )
+
+        assert j["local_route_available"] is False
+        assert j["local_route_reason"] == "local_provider_cooldown"
+        assert 0 < j["local_route_cooldown_remaining_s"] <= 45
+
+    @pytest.mark.asyncio
+    async def test_outside_available_window_reports_its_own_token(self):
+        """AC10: an entry outside ``available_times`` is unavailable with the
+        window token and **no** fabricated cooldown value."""
+        from proxy.admission_reserve import LOCAL_FALLBACK_REASON_TOKENS
+
+        entry = {
+            "name": _LOCAL_ENTRY_NAME,
+            "type": "local",
+            "llama_model": "Qwen3",
+            "available_times": [_window_excluding_now()],
+        }
+
+        j = await _CapacityStatusHarness().get(
+            config=_route_config(local_entry=entry), current_model="Qwen3"
+        )
+
+        assert j["local_route_available"] is False
+        assert j["local_route_reason"] == "outside_available_window"
+        assert j["local_route_reason"] in LOCAL_FALLBACK_REASON_TOKENS
+        assert j["local_route_cooldown_remaining_s"] is None
+
+    @pytest.mark.asyncio
+    async def test_deficit_abort_leaves_the_route_available_while_a_fault_arms_it(
+        self,
+    ):
+        """AC10d: the post-fix deficit abort is NOT an entry fault.
+
+        The router's deficit 503 is deferred by
+        ``_handle_http_error_with_cooldown`` (LP-0MVWFKESK0005G61), so the
+        published route stays available; an unmarked 503 from the same path is
+        a genuine fault and still arms it. This is the cross-child contract: the
+        status field must agree with the skip-reason decision.
+        """
+        import proxy.provider as provider
+
+        attempts: list[dict] = []
+        provider._handle_http_error_with_cooldown(
+            _deficit_marked_503(),
+            _LOCAL_ENTRY_NAME,
+            "local",
+            60,
+            attempts,
+            "measured cache deficit abort",
+            config={"server": {"provider_cooldown_seconds": 60}},
+        )
+        assert attempts and attempts[0]["status"] == "local_dispatch_deferral"
+
+        after_deficit = await _CapacityStatusHarness().get(
+            config=_route_config(), current_model="Qwen3"
+        )
+        assert after_deficit["local_route_available"] is True
+        assert after_deficit["local_route_reason"] is None
+        assert after_deficit["local_route_cooldown_remaining_s"] is None
+
+        provider._handle_http_error_with_cooldown(
+            _unmarked_503(),
+            _LOCAL_ENTRY_NAME,
+            "local",
+            60,
+            attempts,
+            "genuine local fault",
+            config={"server": {"provider_cooldown_seconds": 60}},
+        )
+
+        after_fault = await _CapacityStatusHarness().get(
+            config=_route_config(), current_model="Qwen3"
+        )
+        assert after_fault["local_route_available"] is False
+        assert after_fault["local_route_reason"] == "local_provider_cooldown"
+        assert 0 < after_fault["local_route_cooldown_remaining_s"] <= 60
+
+    @pytest.mark.asyncio
+    async def test_payload_is_absent_safe_without_a_local_entry(self):
+        """AC10b: a config with no resolvable local entry stays well-formed."""
+        j = await _CapacityStatusHarness().get(config=_route_config(with_models=False))
+
+        assert j["status_schema_version"] == 5
+        assert j["local_route_available"] is True
+        assert j["local_route_reason"] is None
+        assert j["local_route_cooldown_remaining_s"] is None
+
+    @pytest.mark.asyncio
+    async def test_route_state_is_published_while_the_engine_is_unavailable(self):
+        """AC10b: route armed + engine state unavailable is still well-formed.
+
+        The two axes are independent, so an unavailable ``llama_server_running``
+        must not swallow the route evidence.
+        """
+        import proxy.provider as provider
+
+        provider.mark_provider_unavailable(_LOCAL_ENTRY_NAME, 60)
+
+        j = await _CapacityStatusHarness().get(
+            config=_route_config(), llama_running=False
+        )
+
+        assert j["llama_server_running"] is False
+        assert j["local_route_available"] is False
+        assert j["local_route_reason"] == "local_provider_cooldown"
+        assert 0 < j["local_route_cooldown_remaining_s"] <= 60
+
+    @pytest.mark.asyncio
+    async def test_reading_the_route_state_never_mutates_it(self):
+        """AC10c: read-only — polling twice leaves the armed state intact.
+
+        A handler that consumed or extended the cooldown would make this
+        endpoint a routing participant; it must only observe.
+        """
+        import proxy.provider as provider
+
+        provider.mark_provider_unavailable(_LOCAL_ENTRY_NAME, 60)
+        before_until = dict(provider._provider_unavailable_until)
+        before_failures = dict(provider._provider_failure_count)
+
+        first = await _CapacityStatusHarness().get(
+            config=_route_config(), current_model="Qwen3"
+        )
+        second = await _CapacityStatusHarness().get(
+            config=_route_config(), current_model="Qwen3"
+        )
+
+        assert provider._provider_unavailable_until == before_until
+        assert provider._provider_failure_count == before_failures
+        assert first["local_route_available"] is second["local_route_available"]
+        assert first["local_route_reason"] == second["local_route_reason"]
+        # The armed window is still running (not consumed by the first poll).
+        assert second["local_route_cooldown_remaining_s"] > 0
+
+    @pytest.mark.asyncio
+    async def test_status_request_log_line_carries_the_route_state(self, caplog):
+        """AC10: the poll line answers "armed?" as well as "busy?".
+
+        A skip reason that existed only in routing log lines forced log
+        archaeology; the ``status_request`` line now carries the same verdict
+        (plus the failure count that explains why it armed).
+        """
+        import proxy.provider as provider
+
+        provider.mark_provider_unavailable(_LOCAL_ENTRY_NAME, 60)
+        provider._provider_failure_count[_LOCAL_ENTRY_NAME] = 3
+
+        with caplog.at_level(logging.INFO, logger="llama-proxy"):
+            await _CapacityStatusHarness().get(
+                config=_route_config(), current_model="Qwen3"
+            )
+
+        record = next(r for r in caplog.records if r.getMessage() == "status_request")
+        assert record.local_route_available is False
+        assert record.local_route_reason == "local_provider_cooldown"
+        assert record.local_route_cooldown_remaining_s > 0
+        assert record.local_route_failure_count == 3
+        # Pre-existing fields are unchanged on the enriched line.
+        assert isinstance(record.available_slots, int)
+        assert record.capacity_hint == "idle"
+
+    @pytest.mark.asyncio
+    async def test_one_eligible_backend_keeps_the_route_available(self):
+        """AC10: a multi-backend local model is available while any sibling is.
+
+        Reporting the whole route unavailable because ONE backend is armed
+        would hold back work that a healthy local backend could serve.
+        """
+        import proxy.provider as provider
+
+        config = {
+            "server": {"llama_server_port": 8080},
+            "models": {
+                "plan": {
+                    "providers": [
+                        {"name": "local-qwen3-a", "type": "local", "llama_model": "Qwen3"},
+                        {"name": "local-qwen3-b", "type": "local", "llama_model": "Qwen3"},
+                    ]
+                }
+            },
+        }
+
+        provider.mark_provider_unavailable("local-qwen3-a", 60)
+        one_armed = await _CapacityStatusHarness().get(
+            config=config, current_model="Qwen3"
+        )
+        assert one_armed["local_route_available"] is True
+        assert one_armed["local_route_reason"] is None
+        assert one_armed["local_route_cooldown_remaining_s"] is None
+
+        # Both armed: the route is unavailable and the published delay is the
+        # SHORTEST arm — how long until a local backend is usable again.
+        provider.mark_provider_unavailable("local-qwen3-b", 20)
+        both_armed = await _CapacityStatusHarness().get(
+            config=config, current_model="Qwen3"
+        )
+        assert both_armed["local_route_available"] is False
+        assert both_armed["local_route_reason"] == "local_provider_cooldown"
+        assert 0 < both_armed["local_route_cooldown_remaining_s"] <= 20
+
+    @pytest.mark.asyncio
+    async def test_embed_and_chat_routes_are_judged_separately(self):
+        """AC10: an armed embed entry must not declare the chat route armed.
+
+        Both are ``type: local`` entries, so without model scoping the embed
+        route would mask (or fake) the chat route's availability — the false
+        positive this field exists to prevent.
+        """
+        import proxy.provider as provider
+
+        config = {
+            "server": {"llama_server_port": 8080},
+            "models": {
+                "embed": {
+                    "providers": [
+                        {
+                            "name": "local-embed",
+                            "type": "local",
+                            "llama_model": "mxbai-embed",
+                        }
+                    ]
+                },
+                "plan": {
+                    "providers": [
+                        {"name": _LOCAL_ENTRY_NAME, "type": "local", "llama_model": "Qwen3"}
+                    ]
+                },
+            },
+        }
+
+        provider.mark_provider_unavailable("local-embed", 60)
+
+        chat = await _CapacityStatusHarness().get(
+            config=config, current_model="Qwen3"
+        )
+        assert chat["local_route_available"] is True
+        assert chat["local_route_reason"] is None
+
+        embed = await _CapacityStatusHarness().get(
+            config=config, current_model="mxbai-embed"
+        )
+        assert embed["local_route_available"] is False
+        assert embed["local_route_reason"] == "local_provider_cooldown"

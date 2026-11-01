@@ -405,6 +405,9 @@ async def get_llama_local_status(request: Request):
          "queue_eta_seconds": float | None,
          "prefill_budget_seconds": float | None,
          "capacity_hint": str,
+         "local_route_available": bool,
+         "local_route_reason": str | None,
+         "local_route_cooldown_remaining_s": int | None,
          "status_schema_version": int}
 
     ``local_idle_seconds`` reports how long the local backend has been idle
@@ -485,6 +488,28 @@ async def get_llama_local_status(request: Request):
     dropped as soon as a fresh ``/slots`` snapshot reports the slot (or the
     whole endpoint) free. Consumers must treat any unrecognised hint value
     (this one included) as busy, never as idle.
+
+    Local-route availability (LP-0MVWFKIKJ005XHAY, ``status_schema_version: 5``):
+    every capacity field above describes the *engine*; ``local_route_available``
+    describes the *route*. It is ``false`` when the local provider entry would
+    currently be refused by chain resolution — ``local_route_reason`` names why
+    with a canonical ``LOCAL_FALLBACK_REASON_TOKENS`` member
+    (``local_provider_cooldown`` | ``outside_available_window``) and
+    ``local_route_cooldown_remaining_s`` gives the seconds until the route is
+    usable again (the shortest active arm). The local entries considered are
+    the ones serving the reported local model (``current_model``), so the
+    embed route and the chat route never decide each other's availability; one
+    eligible entry is enough (a multi-backend model with an armed sibling is
+    still available). With nothing armed the three fields read ``true`` /
+    ``null`` / ``null`` (never a fabricated ``0``), and the payload stays
+    well-formed when no local entry is configured or llama-server state is
+    unavailable. The split matters because the two disagree exactly when it
+    hurts: on 2026-10-31 the entry was quarantined (100 % of local attempts
+    refused) while this endpoint still reported ``available_slots: 2`` and
+    ``capacity_hint: idle``, and a dispatcher reading only slot counts launched
+    work into the poisoned route. The fields are **read-only**: they are built
+    from the in-process armed state at request time and the routing decision
+    never reads them, so there is no behaviour change and no new poll.
 
     Per-slot capacity (LP-0MVGDUVGE0024YAI, ``status_schema_version: 3``):
     each slot also carries ``owner_session_id`` and ``lease_state``
@@ -879,6 +904,24 @@ async def get_llama_local_status(request: Request):
         if isinstance(_slot, dict) and _slot.get("abandoned") is True:
             abandoned_slots += 1
 
+    # -- local-route availability (LP-0MVWFKIKJ005XHAY, parent AC10) -------
+    # READ-ONLY observability: the routing decision never reads these values
+    # (AC10c). ``available_slots``/``capacity_hint`` say whether the ENGINE is
+    # busy; these say whether the local ROUTE would be accepted by the
+    # chain — the distinction whose absence dispatched a downtime audit into
+    # a quarantined route on 2026-10-31 (``available_slots: 2`` while 100 % of
+    # local attempts were refused). Sourced from the existing armed-state
+    # helpers at request time: no new timer, no new poll.
+    try:
+        from proxy.observability import local_route_availability
+
+        local_route = local_route_availability(
+            srv.config if isinstance(srv.config, dict) else {},
+            model=cm,
+        )
+    except Exception:
+        local_route = {}
+
     # -- prefill gate state (LP-0MVGDUUV3001XFRJ AC4) ----------------------
     # Prefills are serialised by default (``local_max_concurrent_prefills``),
     # so a dispatcher needs to see how many prefills are in flight, what the
@@ -961,7 +1004,20 @@ async def get_llama_local_status(request: Request):
         "local_in_flight_requests": live_local_requests,
         "local_abandoned_slots": abandoned_slots,
         "slots_detail_stale": detail_stale,
-        "status_schema_version": 4,
+        # LP-0MVWFKIKJ005XHAY AC10: the same route-availability evidence the
+        # payload carries, so the poll line answers "armed?" and "busy?" on
+        # its own (the failure count is log-only evidence of WHY it armed).
+        "local_route_available": bool(
+            local_route.get("local_route_available", True)
+        ),
+        "local_route_reason": local_route.get("local_route_reason"),
+        "local_route_cooldown_remaining_s": local_route.get(
+            "local_route_cooldown_remaining_s"
+        ),
+        "local_route_failure_count": local_route.get(
+            "local_route_failure_count", 0
+        ),
+        "status_schema_version": 5,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -1030,6 +1086,21 @@ async def get_llama_local_status(request: Request):
         # proxy has given up on and llama-server has not released yet. Additive
         # — a consumer that ignores it behaves exactly as before.
         "local_abandoned_slots": abandoned_slots,
+        # Local-route availability (LP-0MVWFKIKJ005XHAY, parent
+        # LP-0MVWEZCB0006WPBQ AC10): whether the local ENTRY would currently be
+        # accepted by the routing chain, and why not. Additive and read-only —
+        # the routing decision never reads it, so a consumer that ignores the
+        # fields behaves exactly as before. ``local_route_reason`` is a
+        # canonical ``LOCAL_FALLBACK_REASON_TOKENS`` member (never a new
+        # spelling) and ``local_route_cooldown_remaining_s`` is ``None`` —
+        # never a fabricated ``0`` — whenever the cooldown is not armed.
+        "local_route_available": bool(
+            local_route.get("local_route_available", True)
+        ),
+        "local_route_reason": local_route.get("local_route_reason"),
+        "local_route_cooldown_remaining_s": local_route.get(
+            "local_route_cooldown_remaining_s"
+        ),
         # Additive payload version (AC1): bumped when per-slot/top-level
         # capacity fields change meaning. Consumers that ignore it behave
         # exactly as before. v3 (LP-0MVKSXR4P001V0CM): ``capacity_hint`` is
@@ -1037,7 +1108,10 @@ async def get_llama_local_status(request: Request):
         # ``slots_detail_stale`` / ``local_in_flight_requests`` are added.
         # v4 (LP-0MVRMI5HK00558TB): per-slot abandonment annotation, the
         # additive ``abandoned_busy`` hint and ``local_abandoned_slots``.
-        "status_schema_version": 4,
+        # v5 (LP-0MVWFKIKJ005XHAY): ``local_route_available`` /
+        # ``local_route_reason`` / ``local_route_cooldown_remaining_s`` publish
+        # the local entry's routing availability beside its capacity.
+        "status_schema_version": 5,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local

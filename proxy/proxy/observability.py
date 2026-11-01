@@ -2022,6 +2022,183 @@ def downgrade_stale_capacity_hint(
     return CAPACITY_PREFILL_BOUND
 
 
+# ---------------------------------------------------------------------------
+# Local-route availability (LP-0MVWFKIKJ005XHAY — parent LP-0MVWEZCB0006WPBQ AC10)
+#
+# ``capacity_hint`` above answers "is the ENGINE busy?". A consumer also needs
+# "is the ROUTE armed?" — the two are independent: on 2026-10-31 the local
+# entry was quarantined for 60 s at a time (217 arms / 5.5 h, 100 % of local
+# attempts refused) while ``/llama/local/status`` kept serving
+# ``available_slots: 2, capacity_hint: idle``. The herdr downtime dispatcher
+# reads only slot counts, so it dispatched an audit into a poisoned route.
+#
+# The tokens below are canonical members of
+# ``admission_reserve.LOCAL_FALLBACK_REASON_TOKENS`` — the single vocabulary
+# shared with the ``X-Local-Fallback-Reason`` header and the routing log lines
+# — so a consumer sees the same spelling on the status payload as on the
+# response header (LP-0MVRMC1W6003MV3Y AC1).
+# ---------------------------------------------------------------------------
+
+#: The local provider entry is inside a cooldown window (chain-resolution skip).
+LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN = "local_provider_cooldown"
+
+#: The local provider entry is outside its configured ``available_times``.
+LOCAL_ROUTE_REASON_OUTSIDE_WINDOW = "outside_available_window"
+
+
+def local_provider_entries(config: dict | None) -> list[dict]:
+    """Every ``type: local`` provider entry declared by *config*, deduplicated.
+
+    ``/llama/local/status`` is model-agnostic while local entries live inside
+    each model's ``providers`` list (``local-qwen3`` is referenced by several
+    models), so the distinct entry names are collected across every model in
+    declaration order. A missing/unreadable config yields ``[]`` — the caller's
+    payload then stays well-formed and absent-safe (AC10b).
+    """
+    entries: list[dict] = []
+    seen: set[str] = set()
+    models = config.get("models") if isinstance(config, dict) else None
+    if not isinstance(models, dict):
+        return entries
+    for model_cfg in models.values():
+        providers = model_cfg.get("providers") if isinstance(model_cfg, dict) else None
+        if not isinstance(providers, (list, tuple)):
+            continue
+        for entry in providers:
+            if not isinstance(entry, dict) or entry.get("type") != "local":
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name or name in seen:
+                continue
+            seen.add(name)
+            entries.append(entry)
+    return entries
+
+
+def _local_entry_serves_model(entry: dict, model: str) -> bool:
+    """True when *entry* serves the local model id *model*.
+
+    ``llama_model`` is matched case-insensitively, tolerating the preset/alias
+    mismatch the child-port resolver already tolerates (``Qwen3-32B`` vs the
+    log's ``Qwen3``): equal, or one a prefix of the other on a ``-`` boundary.
+    Without this filter the embed entry (``mxbai-embed``) would decide the chat
+    route's availability — and vice versa.
+    """
+    llama_model = entry.get("llama_model")
+    if not isinstance(llama_model, str) or not llama_model:
+        return False
+    candidate = llama_model.strip().lower()
+    target = model.strip().lower()
+    if not candidate or not target:
+        return False
+    return (
+        candidate == target
+        or candidate.startswith(target + "-")
+        or target.startswith(candidate + "-")
+    )
+
+
+def local_route_availability(config: dict | None, model: str | None = None) -> dict:
+    """Read-only snapshot of the local route's *routing* availability (AC10).
+
+    Answers the question a slot count cannot: would the routing chain accept
+    the local route right now, and if not, why? The values are read from the
+    existing armed-state helpers — ``_entry_cooldown_key`` /
+    ``_provider_cooldown_remaining`` (the exact predicate the chain-resolution
+    skip uses) and ``_provider_failure_count`` — at request time. Nothing here
+    is a gate: the proxy's own routing decision never reads this function
+    (AC10c), and no new timer or poll is introduced.
+
+    *model* is the local model id the status payload is reporting on
+    (``current_model``). When it matches at least one declared local entry,
+    only those entries are judged, so the embed route and the chat route never
+    decide each other's availability. With no resolvable model the whole local
+    entry set is judged (fail-open, still truthful about arms that are known).
+
+    Returns::
+
+        {"local_route_available": bool,
+         "local_route_reason": str | None,   # canonical fallback token
+         "local_route_cooldown_remaining_s": int | None,
+         "local_route_failure_count": int}   # log-only evidence
+
+    Semantics (judged over the selected entries):
+
+    * **Any** eligible entry → ``True`` / ``None`` / ``None``. A multi-backend
+      model with one armed entry still has a usable local route, so this never
+      reports a false "unavailable".
+    * No eligible entry, at least one armed → ``False`` /
+      ``local_provider_cooldown`` / the **shortest** remaining arm, i.e. how
+      long until the route becomes usable again. A cooldown takes precedence
+      over a window because it is the actionable (waitable) reason.
+    * No eligible entry, none armed, at least one outside its
+      ``available_times`` → ``False`` / ``outside_available_window`` /
+      ``None`` (a window is not a cooldown, so no fabricated ``0``).
+    * No local entry at all (or unresolvable config) → ``True`` / ``None`` /
+      ``None``: absent-safe, never a fabricated cooldown.
+
+    Engine health (``llama_server_running``, ``capacity_hint``) is deliberately
+    *not* folded in: the whole point is to distinguish "engine busy" from
+    "route armed".
+    """
+    snapshot = {
+        "local_route_available": True,
+        "local_route_reason": None,
+        "local_route_cooldown_remaining_s": None,
+        "local_route_failure_count": 0,
+    }
+    try:
+        from proxy import provider as _provider
+
+        entries = local_provider_entries(config)
+    except Exception:  # pragma: no cover - defensive: payload stays well-formed
+        return snapshot
+    if not entries:
+        return snapshot
+
+    if isinstance(model, str) and model.strip():
+        serving = [e for e in entries if _local_entry_serves_model(e, model)]
+        if serving:
+            entries = serving
+
+    eligible = 0
+    armed_remaining: list[int] = []
+    outside_window = False
+    failure_count = 0
+    for entry in entries:
+        try:
+            name = entry.get("name")
+            failures = _provider._provider_failure_count.get(name, 0)
+            if isinstance(failures, int) and not isinstance(failures, bool):
+                failure_count = max(failure_count, failures)
+            cooldown_key = _provider._entry_cooldown_key(entry)
+            if cooldown_key is not None:
+                remaining = _provider._provider_cooldown_remaining(cooldown_key)
+                if remaining > 0:
+                    armed_remaining.append(remaining)
+                    continue
+            if not _provider._provider_in_allowed_window(entry, config):
+                outside_window = True
+                continue
+            eligible += 1
+        except Exception:
+            # One unreadable entry must never break the whole payload: the
+            # remaining entries still contribute their evidence.
+            continue
+
+    snapshot["local_route_failure_count"] = failure_count
+    if eligible:
+        return snapshot
+    if armed_remaining:
+        snapshot["local_route_available"] = False
+        snapshot["local_route_reason"] = LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN
+        snapshot["local_route_cooldown_remaining_s"] = min(armed_remaining)
+    elif outside_window:
+        snapshot["local_route_available"] = False
+        snapshot["local_route_reason"] = LOCAL_ROUTE_REASON_OUTSIDE_WINDOW
+    return snapshot
+
+
 def _build_status_slot_owners(srv) -> dict[int, dict]:
     """Map llama-server slot_id -> the dispatch lease reserving it.
 
