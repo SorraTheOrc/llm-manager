@@ -220,7 +220,7 @@ class TestCitationsStillResolve:
         ("proxy/proxy/session.py", 1305, "effective_per_slot_threshold"),
         # 5 — dispatch-lease cap
         ("proxy/proxy/router.py", 213, "def _get_local_max_concurrent_queries"),
-        ("proxy/proxy/router.py", 1457, "_try_acquire_local_dispatch"),
+        ("proxy/proxy/router.py", 1519, "_try_acquire_local_dispatch"),
         ("proxy/proxy/router_helpers.py", 3853, "async def _try_acquire_local_dispatch"),
         ("proxy/proxy/provider.py", 6464, "session_slot_pool_size"),
         # 6 — slot-ID space
