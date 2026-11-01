@@ -6954,6 +6954,13 @@ def _local_occupant_prefill_seconds(
 LOCAL_FALLBACK_RETRY_AFTER_ATTR = "_local_fallback_retry_after_s"
 LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR = "_local_fallback_token_evidence"
 
+#: Request attribute holding the capacity gate's admission verdict
+#: (:func:`proxy.capacity_admission.evaluate_capacity_admission`). The dispatch
+#: guard reads it so a request this gate admitted against MEASURED idle
+#: slot-time is not then refused by the flat cold-prefill token cap it has
+#: already out-priced (LP-0MVXWQQ20002HAX4).
+LOCAL_CAPACITY_ADMISSION_ATTR = "_local_capacity_admission"
+
 #: Outcome stamped on ``request._local_routing_outcome``: what the proxy
 #: actually did with the request's local-route intent. The closed vocabulary of
 #: the single per-request outcome line (LP-0MVSM06Z8003UQTM) — every decision
@@ -8525,6 +8532,7 @@ async def _prefill_admission_guard(
     endpoint: str | None = None,
     reason_label: str | None = None,
     free_slot: bool = False,
+    capacity_admitted: bool = False,
 ):
     """Evaluate (and log) the prefill-ETA admission guard.
 
@@ -8551,6 +8559,12 @@ async def _prefill_admission_guard(
     ``prefill_budget_exceeded``), so a non-ETA bound is never relabelled and
     the reason-driven retry contract stays truthful on both dispatch paths
     (LP-0MVRO3AHN002UM1Q AC1/AC8).
+
+    *capacity_admitted* (LP-0MVXWQQ20002HAX4) says the capacity gate has
+    already admitted this request against MEASURED idle slot-time and the
+    prefill deadline, so the flat cold-prefill token cap must not override it
+    (the measured bounds still do). Without it the two gates contradict each
+    other: routing admitted the prompt and the guard then always refused it.
     """
     try:
         from proxy import prefill_eta
@@ -8601,6 +8615,7 @@ async def _prefill_admission_guard(
             busy_slots=occupancy,
             in_flight_prefills=in_flight_prefills,
             occupant_prefill_seconds=occupant_prefill_seconds,
+            capacity_admitted=capacity_admitted,
         )
         if not decision.active:
             return None
@@ -9003,6 +9018,9 @@ async def _maybe_queue_for_local_slot(
         messages=body_json.get("messages") if isinstance(body_json, dict) else None,
         max_local=max_local,
         endpoint=endpoint,
+        capacity_admitted=bool(
+            getattr(request, LOCAL_CAPACITY_ADMISSION_ATTR, None)
+        ),
     )
     if _admission is not None and not _admission.admit:
         try:
@@ -13722,22 +13740,41 @@ async def _proxy_with_fallback_cycle(
                     except Exception:
                         _capacity_admit = None
                     if _capacity_admit is not None:
+                        # Stamp the admission on the request so the dispatch
+                        # guard's flat cold-prefill cap cannot override a
+                        # verdict this gate already priced against measured
+                        # idle slot-time and the prefill deadline
+                        # (LP-0MVXWQQ20002HAX4: without this the two gates
+                        # contradicted each other and the capacity gate could
+                        # never admit anything).
+                        try:
+                            setattr(
+                                request,
+                                LOCAL_CAPACITY_ADMISSION_ATTR,
+                                dict(_capacity_admit),
+                            )
+                        except Exception:
+                            pass
                         logger.info(
                             "routing_capacity_admit provider=%s model=%s "
-                            "reason=%s projected_s=%.1f admitted_s=%.1f "
-                            "budget_s=%.1f idle_s=%.1f budget_ratio=%.2f "
-                            "horizon_s=%.0f estimated_tokens=%d "
-                            "cached_ratio=%.2f cache_state=%s warm_threshold=%d "
-                            "session=%s",
+                            "reason=%s projected_s=%.1f prefill_s=%.1f "
+                            "admitted_s=%.1f budget_s=%.1f idle_s=%.1f "
+                            "budget_ratio=%.2f horizon_s=%.0f "
+                            "deadline_s=%.1f deadline_budget_s=%.1f "
+                            "estimated_tokens=%d cached_ratio=%.2f "
+                            "cache_state=%s warm_threshold=%d session=%s",
                             provider_name,
                             _llama_model or "unknown",
                             _capacity_admit["reason"],
                             _capacity_admit["projected_seconds"],
+                            _capacity_admit.get("prefill_seconds", 0.0),
                             _capacity_admit["admitted_seconds"],
                             _capacity_admit["budget_seconds"],
                             _capacity_admit["idle_seconds"],
                             _capacity_admit["budget_ratio"],
                             _capacity_admit["horizon_seconds"],
+                            _capacity_admit.get("deadline_seconds", 0.0),
+                            _capacity_admit.get("deadline_budget_seconds", 0.0),
                             _estimated_tokens,
                             _routing_cached_ratio,
                             _routing_cache_state,
@@ -14002,6 +14039,9 @@ async def _proxy_with_fallback_cycle(
                     endpoint=local_endpoint,
                     reason_label="eta_exceeds_budget_direct",
                     free_slot=True,
+                    capacity_admitted=bool(
+                        getattr(request, LOCAL_CAPACITY_ADMISSION_ATTR, None)
+                    ),
                 )
                 if _direct_admission is not None and not _direct_admission.admit:
                     # Deadline refusal (LP-0MVKUKEU80022C3U) keeps its own

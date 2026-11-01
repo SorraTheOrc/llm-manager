@@ -1785,6 +1785,17 @@ server:
   # queue above (when the policy allows) and falls back to remote exactly as
   # before when the caps are hit; the prefill-ETA admission guard refuses
   # waits that cannot succeed. Server restart required to change.
+  #
+  # Occupancy term (LP-0MVXWQQ20002HAX4): because ONLY prefill-vs-prefill is
+  # serialised, the admission guard now costs its wait/deadline bounds against
+  # the in-flight PREFILL count (``gate_occupancy``), not against
+  # ``max(generating, prefills)``. A decoding neighbour does not occupy this
+  # gate — and its throughput effect is already priced by the contended rate
+  # bucket — so charging it a second time as an occupancy multiplier
+  # double-counted the slowdown and refused work the GPU could start at once
+  # (measured 2026-11-01, one hour: 40 refusals with
+  # ``in_flight_prefills=0 busy_slots=1``). The symmetric floor and the
+  # measured-occupant term still apply whenever a prefill IS in flight.
   local_max_concurrent_prefills: 1
 
   # -----------------------------------------------------------------------
@@ -1813,6 +1824,25 @@ server:
   # Rollback: local_capacity_admission_enabled: false (read per request; no
   # llama-server restart needed).
   #
+  # SWITCH STAYS OFF — the wiring was fixed and the effect was measured
+  # (LP-0MVXWQQ20002HAX4). Two defects in this gate were corrected:
+  #   1. the gate now enforces the admission guard's OWN prefill deadline
+  #      bound (prefill_s < local_prefill_deadline_seconds and within
+  #      local_admission_guard_budget_safety_fraction x deadline), so it can
+  #      never admit a prompt the deadline would cancel;
+  #   2. an admitted request is stamped on the request, so the dispatch
+  #      guard's FLAT token cap (local_cold_prefill_budget_tokens, 25000) no
+  #      longer overrides it. Before this the two gates contradicted each
+  #      other — routing admitted the band and the guard then always refused
+  #      it — so enabling this key was a NO-OP.
+  # With both fixed the gate is safe but still not productive: the band it
+  # governs starts at `local_large_context_cold_cache_threshold` (38 000 new
+  # tokens), and at the guard's conservative ~3.9 ms/token that is >= 148 s —
+  # beyond the 114 s safety budget. So it admits NOTHING until the per-bucket
+  # calibration (a measured, faster rate) makes a band prompt fit, which is
+  # exactly the documented precondition. Leave it off; flip it on when
+  # `routing_capacity_admit` would fire on a real band prompt.
+  #
   # Achieved warm threshold: unchanged - the hard routing cap (~126,976 at
   # N=2, ctx 262144, minus output headroom). Reason: the measured cold share of
   # local dispatches in the 24h window ending 2026-10-20 11:00 is 39.4%
@@ -1821,7 +1851,13 @@ server:
   local_capacity_admission_enabled: false
   local_capacity_admission_budget_ratio: 0.8
   local_capacity_admission_horizon_seconds: 3600
-  local_capacity_admission_decode_seconds: 30
+  # Decode allowance per admitted request (seconds). 5 (was 30): measured
+  # 2026-11-01 13:12-14:00, local completions are tiny — 5 027 completion
+  # tokens over 46 local streams = 109 tokens/stream ≈ 4.4 s at ~25 tok/s.
+  # The 30 s allowance charged ~6x the measured decode and consumed ledger
+  # budget that should be admitting prompt work. Still an allowance, never 0:
+  # decode is real slot time even when it cannot be priced per request.
+  local_capacity_admission_decode_seconds: 5
 
   # -----------------------------------------------------------------------
   # Contention queue (merged from the retired config-fast/cheap overlays)
@@ -1966,6 +2002,24 @@ server:
   #     ``reason=eta_exceeds_budget_direct free_slot=true`` (the queue
   #     decision keeps ``reason=eta_exceeds_budget``); both use this one
   #     estimator and this one budget knob — there is no second budget.
+  #
+  # FREE-GATE BOUND (LP-0MVXWQQ20002HAX4) — OPT-IN, ships OFF.
+  # ``contention_queue_max_wait_seconds`` is calibrated for QUEUE losses: it
+  # prices waiting behind somebody else's prefill. A request that finds the
+  # prefill gate FREE never queues — its only wait is its own prefill — so it
+  # could be bounded by the prefill deadline and its deadline-relative safety
+  # budget instead of by the queue budget. Measured 2026-11-01 13:12-14:00
+  # (1 788 requests, local share 2.6 %): 20 of the 76 refusals that had a free
+  # prefill gate had a measured own ETA of 36-102 s — inside the 114 s safety
+  # budget — and were refused only against the 30 s queue budget, i.e. a paid
+  # remote call for work the GPU could have started immediately. Counter-
+  # evidence: replaying the 2026-10-23 thrash window with the rung enabled
+  # admits those prompts but 6 of the 20 are then cancelled at the deadline
+  # (``admitted_and_doomed`` 0 -> 6), which is exactly the invariant the flat
+  # cold-prefill budget was added to protect. Hence OPT-IN: leave it off unless
+  # the operator accepts that trade after measuring. Rollback: false (read per
+  # request).
+  local_admission_guard_free_gate_deadline_budget: false
   #
   # The comparison is OCCUPANCY-AWARE (LP-0MVICD2YW004DJPV): the quantity
   # tested against the budget is

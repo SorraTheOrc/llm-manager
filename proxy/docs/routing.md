@@ -833,10 +833,10 @@ admit iff admitted_s + projected_s <= budget_s
 
 ```yaml
 server:
-  local_capacity_admission_enabled: false   # rollback switch, default off
+  local_capacity_admission_enabled: false   # ships off; wiring is now correct
   local_capacity_admission_budget_ratio: 0.8
   local_capacity_admission_horizon_seconds: 3600
-  local_capacity_admission_decode_seconds: 30
+  local_capacity_admission_decode_seconds: 5
 ```
 
 - **Not a threshold widening.** Both existing thresholds keep their values;
@@ -851,15 +851,48 @@ server:
   budget; once the budget is exhausted the bypass stands (today's behaviour).
 - **Never overrides the physical cap.** `context_too_large` still routes
   remote; a prompt that cannot fit a KV slot is never admitted by capacity.
+- **Never overrides the prefill deadline** (LP-0MVXWQQ20002HAX4). The gate
+  applies the admission guard's *own* deadline bounds to the projected
+  **prefill** term (decode allowance excluded): `prefill_s <
+  local_prefill_deadline_seconds` and, when configured, `prefill_s <=
+  local_admission_guard_budget_safety_fraction × local_prefill_deadline_seconds`.
+  Before this bound existed the gate could admit a prompt the deadline would
+  then cancel, so enabling it only ever bought a wasted dispatch.
+- **The flat cold-prefill cap yields to a capacity admission**
+  (LP-0MVXWQQ20002HAX4). A request admitted here is stamped on the request
+  (`provider.LOCAL_CAPACITY_ADMISSION_ATTR`) and the dispatch guard no longer
+  refuses it on the flat `local_cold_prefill_budget_tokens` count; the
+  guard's measured ETA/deadline/safety bounds still apply. Without that
+  deference the two gates contradicted each other — routing admitted the band
+  and the guard then always refused it, so enabling this key was a no-op.
+  Every other path (the idle economic bypass included) keeps the flat cap, and
+  disabling the gate is a complete rollback.
+- **What bounds the live effect.** The deadline bound prices the band with the
+  same conservative estimator the guard uses, so the admission rate is
+  whatever the *measured* prefill rate supports. The band starts at
+  `local_large_context_cold_cache_threshold` (38 000 new tokens); at the
+  guard's conservative ~3.9 ms/token that is ≥ 148 s, beyond the 114 s safety
+  budget, so with today's pricing the gate admits **nothing** and the key
+  ships **off**. It becomes productive once the per-bucket calibration (a
+  measured, faster rate) makes a band prompt fit — that is the documented
+  enablement precondition, and `routing_capacity_admit` firing on a real band
+  prompt is the signal to flip it.
 - **Observability.** Each admit logs `routing_capacity_admit provider=… model=…
-  reason=capacity_admission projected_s=… admitted_s=… budget_s=… idle_s=…
-  budget_ratio=… horizon_s=… estimated_tokens=… cached_ratio=… cache_state=…
-  warm_threshold=… session=…` and records a `status=capacity_admit` attempt.
-- **Rollout / rollback.** Ships **off**. Enable only once cache warmth
+  reason=capacity_admission projected_s=… prefill_s=… admitted_s=… budget_s=…
+  idle_s=… budget_ratio=… horizon_s=… deadline_s=… deadline_budget_s=…
+  estimated_tokens=… cached_ratio=… cache_state=… warm_threshold=… session=…`
+  and records a `status=capacity_admit` attempt.
+- **Rollout / rollback.** Enabled 2026-11-01 once cache warmth
   (LP-0MVGD9YXH008O304), the prefill-ETA guard (LP-0MVGDUV5E005UWBQ) and
-  prefill serialisation (LP-0MVGDUUV3001XFRJ) are live in the running proxy and
-  the 24 h measurement (LP-0MVGHXD59008UOUD) is green; revert by setting
+  prefill serialisation (LP-0MVGDUUV3001XFRJ) were live; revert by setting
   `local_capacity_admission_enabled: false` (read per request, no restart).
+  The decode allowance was re-measured for the same change (109
+  completion tokens per local stream ≈ 4.4 s, not the 30 s placeholder).
+  The three prerequisites are live, but the 2026-11-01 measurement shows the
+  gate admits nothing at the current conservative pricing, so it **ships
+  off** (LP-0MVXWQQ20002HAX4); the deadline bound and the flat-cap deference
+  above are what make enabling it safe and effective once calibration
+  supports it.
 
 ## Prefill serialisation (LP-0MVGDUUV3001XFRJ)
 
@@ -884,7 +917,17 @@ server:
 ```
 
 - **Decode is not affected** — only prefill-vs-prefill is serialised; a slot
-  that is already generating does not block another slot's prefill.
+  that is already generating does not block another slot's prefill. The
+  admission guard honours this literally (LP-0MVXWQQ20002HAX4): its occupancy
+  term (`gate_occupancy` on the `local_admission_guard` line) is the in-flight
+  **prefill** count, capped by the prefill cap — never the generating
+  concurrency. A decoder-only neighbour contributed no gate wait, and its
+  throughput effect is already priced by the *contended* rate bucket, so
+  charging it again as an occupancy multiplier double-counted the slowdown
+  and refused work the GPU could start immediately (measured 2026-11-01, one
+  hour: 40 refusals with `in_flight_prefills=0 busy_slots=1`). The symmetric
+  floor and the measured-occupant term still apply whenever a prefill IS in
+  flight, so the deadline bound is unchanged in that case.
 - **Waiting is bounded by the existing machinery** — a second prefill waits
   in the contention queue (policy/depth/wait caps) and falls back to remote
   exactly as before when those caps are hit; the prefill-ETA admission guard
@@ -1251,15 +1294,46 @@ eta_prefill = coded_tokens * coded_ms_per_token + new_tokens * prefill_ms_per_to
   new_tokens   = est_tokens * (1 - cached_ratio)    # must actually be prefilled
 
 projected_wait = own_prefill_seconds + occupied_seconds
-  occupied_seconds = max(eta_prefill * busy_slots, sum(remaining occupant service))
+  occupied_seconds = max(eta_prefill * gate_occupancy, sum(remaining occupant service))
     # remaining occupant service is re-priced from the occupant's remaining
     # uncached new tokens at the contended co-residency rate (see below)
   busy_slots       = min(slot_pool, max(generating_concurrency, prefills_in_flight))
+  gate_occupancy   = min(busy_slots, prefills_in_flight)   # in-flight PREFILLS only
 
-admit  if projected_wait <= wait_budget
+bound  = wait_budget
+       if free_gate_deadline_budget and gate_occupancy == 0 and safety_budget > 0:
+           max(wait_budget, safety_budget)   # free gate ⇒ no queue, bound = deadline
+admit  if projected_wait <= bound
        and projected_wait <  local_prefill_deadline_seconds
 else   refuse local admission immediately -> next provider in the chain
 ```
+
+**The occupancy term is the PREFILL gate, not the generating concurrency**
+(LP-0MVXWQQ20002HAX4). Only prefill-vs-prefill is serialised
+(`local_max_concurrent_prefills`); decoding runs in parallel, so a
+*decoder-only* neighbour leaves the gate free for this request's prefill. Its
+throughput effect is already priced by the contended rate bucket, and charging
+it again as an occupancy multiplier double-counted the slowdown. The
+`local_admission_guard` line reports both numbers (`busy_slots` = observed
+concurrency, `gate_occupancy` = what the wait was costed against).
+
+**A free gate may be bounded by the deadline instead of the queue budget —
+opt-in** (LP-0MVXWQQ20002HAX4). `contention_queue_max_wait_seconds` is
+calibrated for *queue* losses; a request that starts its prefill immediately
+never queues, so its only wait is its own prefill. Measured 2026-11-01
+13:12-14:00 (1 788 requests, 58 sessions, local share 2.6 %): 20 of the 76
+refusals with a free prefill gate had a measured own ETA of 36-102 s, inside
+the 114 s safety budget, and were refused **only** against the 30 s queue
+budget — a paid remote call for a prefill the GPU could have started at once.
+Counter-evidence: replaying the 2026-10-23 thrash window with the rung enabled
+admits them, but 6 of the 20 are then cancelled at the deadline
+(`admitted_and_doomed` 0 → 6) — the very invariant the flat cold-prefill
+budget exists to protect. The rung therefore ships **off**
+(`local_admission_guard_free_gate_deadline_budget: false`); enable it only
+with an accepted trade. Contended admissions keep the queue bound in either
+case, and the deadline + safety bounds still refuse anything that could not
+finish. The log line carries `budget_s` (the resolved queue budget) and
+`bound_s` (the bound actually enforced), so the two can never be confused.
 
 The occupancy term matters because prefills are serialised
 (`local_max_concurrent_prefills: 1`): the in-flight prefill holds the gate

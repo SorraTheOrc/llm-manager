@@ -264,6 +264,13 @@ DEFAULT_ETA_PERCENTILE_MIN_TOKENS = CONSERVATIVE_MIN_TOKENS
 BUDGET_SAFETY_FRACTION_KEY = "local_admission_guard_budget_safety_fraction"
 DEFAULT_BUDGET_SAFETY_FRACTION = 0.0
 
+#: Opt-in free-gate bound (LP-0MVXWQQ20002HAX4): when the PREFILL gate is free,
+#: bound admission by the deadline-relative safety budget instead of the
+#: queue-wait budget. ``false`` (default) keeps the queue budget governing
+#: every admission — the documented rollback and the shipped state.
+FREE_GATE_DEADLINE_BUDGET_KEY = "local_admission_guard_free_gate_deadline_budget"
+DEFAULT_FREE_GATE_DEADLINE_BUDGET = False
+
 #: Client-visible queue deadline (seconds) the prefill deadline must stay
 #: strictly below, so the proxy answers before the client gives up.
 CLIENT_QUEUE_DEADLINE_SECONDS = 900.0
@@ -394,6 +401,13 @@ class GuardConfig:
     reference_window_samples: int = DEFAULT_REFERENCE_WINDOW_SAMPLES
     #: Ceiling on the published reference prompt size (tokens); 0 = none.
     reference_max_tokens: int = DEFAULT_REFERENCE_MAX_TOKENS
+    #: Free-gate bound (LP-0MVXWQQ20002HAX4). When True, a request that finds
+    #: the PREFILL gate free is bounded by the deadline-relative safety budget
+    #: instead of the queue-wait budget: it never queues, so its only wait is
+    #: its own prefill. DEFAULT FALSE — the queue budget keeps governing every
+    #: admission, so an enabled deployment is a deliberate, measured choice
+    #: (see ``docs/routing.md`` for the trade-off evidence).
+    free_gate_deadline_budget: bool = DEFAULT_FREE_GATE_DEADLINE_BUDGET
 
 
 def resolve_config(config: dict | None) -> GuardConfig:
@@ -476,6 +490,17 @@ def resolve_config(config: dict | None) -> GuardConfig:
     safety_fraction = _float_setting(
         server_cfg, BUDGET_SAFETY_FRACTION_KEY, DEFAULT_BUDGET_SAFETY_FRACTION,
     )
+    # Free-gate bound (LP-0MVXWQQ20002HAX4): opt-in, default off (the queue
+    # budget keeps governing every admission). Any value other than a
+    # true boolean-ish token reads as False, so a config typo can never widen
+    # admission — this rung must fail closed.
+    raw_free_gate = server_cfg.get(
+        FREE_GATE_DEADLINE_BUDGET_KEY, DEFAULT_FREE_GATE_DEADLINE_BUDGET
+    )
+    if isinstance(raw_free_gate, str):
+        free_gate = raw_free_gate.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        free_gate = raw_free_gate is True
     if safety_fraction > 1.0:
         logger.warning(
             "Invalid %s=%r — using %r (valid: 0.0-1.0; 0 disables)",
@@ -506,6 +531,7 @@ def resolve_config(config: dict | None) -> GuardConfig:
         budget_safety_fraction=safety_fraction,
         reference_window_samples=reference_window,
         reference_max_tokens=reference_max,
+        free_gate_deadline_budget=free_gate,
     )
 
 
@@ -1045,6 +1071,19 @@ class AdmissionDecision:
     eta_occupancy_seconds: float | None = None
     busy_slots: int = 0
     in_flight_prefills: int = 0
+    #: Occupied PREFILL gate ahead of this request — reported for diagnosis
+    #: on every decision (LP-0MVXWQQ20002HAX4): the in-flight prefill count
+    #: capped by the prefill cap, never the generating concurrency. The *wait*
+    #: term is costed against it only under the opt-in free-gate rung, so this
+    #: field always shows "how much of ``busy_slots`` is a prefill".
+    gate_occupancy: int = 0
+    #: The bound the projected wait was actually compared against, in seconds
+    #: (LP-0MVXWQQ20002HAX4). With the opt-in free-gate rung enabled and the
+    #: prefill gate free this is the deadline's safety budget, not the
+    #: queue-wait budget: a request that never queues is bounded by its own
+    #: prefill. ``budget_seconds`` keeps its historical meaning (the resolved
+    #: queue-wait budget) on every decision.
+    bound_seconds: float | None = None
     #: Projected first-byte deadline (seconds) used by this decision.
     prefill_deadline_seconds: float = 0.0
     #: New (uncached, to-be-prefilled) tokens priced by this decision
@@ -1108,9 +1147,10 @@ def evaluate_admission(
     priority: str | None = None,
     *,
     busy_slots: int = 0,
-    in_flight_prefills: int = 0,
+    in_flight_prefills: int | None = None,
     occupant_prefill_seconds: float | None = None,
     contended: bool | None = None,
+    capacity_admitted: bool = False,
 ) -> AdmissionDecision:
     """Decide whether a local dispatch can finish inside the wait budget.
 
@@ -1131,8 +1171,13 @@ def evaluate_admission(
 
     *busy_slots* is the number of occupied gate slots ahead of this request
     (``max(generating concurrency, prefills in flight)``); *in_flight_prefills*
-    is carried for the decision log so an unobservable-progress gate is
-    diagnosable (AC4/AC6). *occupant_prefill_seconds* is the measured
+    is the in-flight PREFILL count, which is what the occupancy term is costed
+    against when the caller supplies it — a decoder-only neighbour does not
+    occupy the serialised prefill gate (LP-0MVXWQQ20002HAX4). ``None`` (the
+    default) means the caller did not observe the prefill gate, so
+    ``busy_slots`` keeps its historical meaning. It is also carried for the
+    decision log so an unobservable-progress gate is diagnosable (AC4/AC6).
+    *occupant_prefill_seconds* is the measured
     remaining prefill service read from the occupants' own dispatch records
     (raises, never lowers, the symmetric occupancy floor).
 
@@ -1142,6 +1187,26 @@ def evaluate_admission(
     is calibrated and falls back to the solitary window when it is not
     (``rate_bucket=contended|solitary|solitary_fallback`` on the decision);
     an explicit value overrides the derivation.
+
+    *capacity_admitted* (LP-0MVXWQQ20002HAX4) marks a request the capacity
+    gate (:func:`proxy.capacity_admission.evaluate_capacity_admission`) has
+    already admitted against MEASURED idle slot-time. That gate has priced the
+    request's projected slot-seconds and enforced the same deadline bound, so
+    the flat cold-prefill token cap — a static proxy for the same cost — must
+    not override it; the measured bounds below still apply unchanged. Every
+    other path keeps the flat cap, so the documented protection for the idle
+    bypass is preserved and disabling the capacity gate is a complete
+    rollback.
+
+    ``gate_occupancy`` (reported on the decision and the log line) is the
+    in-flight PREFILL count capped by the prefill cap — the gate that is
+    actually serialised (``local_max_concurrent_prefills``). The *wait* term
+    is costed against it only under the opt-in free-gate rung
+    (``local_admission_guard_free_gate_deadline_budget``); with the rung off
+    (shipped) the occupancy term keeps its historical ``busy_slots`` meaning,
+    so a decoder-only neighbour is charged exactly as before. The field is
+    always reported so the difference between "the pool is generating" and
+    "the prefill gate is busy" is legible from the log.
 
     Fail-open by construction: the guard is inert (``admit=True``) when the
     policy is ``off``, the priority never queues, the bucket is not yet
@@ -1165,6 +1230,13 @@ def evaluate_admission(
         in_flight = max(0, int(in_flight_prefills or 0))
     except (TypeError, ValueError):
         in_flight = 0
+    # The PREFILL gate ahead of this request. ``in_flight_prefills is None``
+    # means the caller did not observe the prefill gate (a legacy call site),
+    # so ``busy_slots`` keeps its historical meaning. Reported on every
+    # decision; it drives the wait term only under the opt-in free-gate rung.
+    gate_occupancy = (
+        occupancy if in_flight_prefills is None else min(occupancy, in_flight)
+    )
 
     def _inert(reason: str, eta: float | None = None, budget: float | None = None,
                coeffs: Coefficients | None = None,
@@ -1179,6 +1251,7 @@ def evaluate_admission(
             reason=reason,
             eta_prefill_seconds=eta,
             budget_seconds=budget,
+            bound_seconds=budget,
             policy=guard_cfg.policy,
             calibrated=bool(coeffs.calibrated) if coeffs else False,
             samples=coeffs.samples if coeffs else 0,
@@ -1188,8 +1261,9 @@ def evaluate_admission(
             eta_occupancy_seconds=(
                 projected.occupancy_seconds if projected else None
             ),
-            busy_slots=projected.busy_slots if projected else occupancy,
+            busy_slots=occupancy,
             in_flight_prefills=in_flight,
+            gate_occupancy=gate_occupancy,
             prefill_deadline_seconds=guard_cfg.prefill_deadline_seconds,
             new_tokens=new_tokens,
             budget_tokens=guard_cfg.cold_prefill_budget_tokens,
@@ -1210,6 +1284,7 @@ def evaluate_admission(
     if (
         guard_cfg.cold_prefill_budget_tokens > 0
         and new_tokens > guard_cfg.cold_prefill_budget_tokens
+        and not capacity_admitted
     ):
         return AdmissionDecision(
             admit=guard_cfg.policy == POLICY_OBSERVE,
@@ -1223,6 +1298,7 @@ def evaluate_admission(
             eta_occupancy_seconds=None,
             busy_slots=occupancy,
             in_flight_prefills=in_flight,
+            gate_occupancy=gate_occupancy,
             prefill_deadline_seconds=guard_cfg.prefill_deadline_seconds,
             new_tokens=new_tokens,
             budget_tokens=guard_cfg.cold_prefill_budget_tokens,
@@ -1235,11 +1311,23 @@ def evaluate_admission(
     # (occupied gate ahead) must be priced from the contended calibration
     # window when calibrated; an explicit override wins over the derivation.
     _contended = occupancy >= 1 if contended is None else bool(contended)
+    # The gate the newcomer must wait for is the PREFILL gate: prefills are
+    # serialised, decoding is not (LP-0MVXWQQ20002HAX4). A decoder-only
+    # neighbour therefore contributes no occupancy term — its throughput cost
+    # is already inside the contended rate bucket the own-ETA is priced from.
+    # That correction is part of the OPT-IN free-gate rung
+    # (``local_admission_guard_free_gate_deadline_budget``): with it off the
+    # occupancy term keeps its historical ``busy_slots`` meaning byte-for-byte.
+    wait_occupancy = (
+        gate_occupancy
+        if guard_cfg.free_gate_deadline_budget
+        else occupancy
+    )
     projected = projected_wait_seconds(
         model,
         prompt_tokens,
         cached_ratio,
-        occupancy,
+        wait_occupancy,
         config,
         occupant_prefill_seconds=occupant_prefill_seconds,
         contended=_contended,
@@ -1248,7 +1336,24 @@ def evaluate_admission(
     eta = projected.own_prefill_seconds
     if not coeffs.calibrated:
         return _inert("insufficient_samples", eta, budget, coeffs, projected)
-    within = projected.projected_seconds <= budget
+    deadline = guard_cfg.prefill_deadline_seconds
+    deadline_budget = _deadline_budget_seconds(guard_cfg)
+    # A FREE prefill gate means the request never queues: its only wait is its
+    # own prefill, so the deadline-relative safety budget is the honest bound
+    # rather than the queue-wait budget (LP-0MVXWQQ20002HAX4). OPT-IN: the
+    # queue budget keeps governing every admission unless the operator enables
+    # ``local_admission_guard_free_gate_deadline_budget``, because the deadline
+    # bound still admits the occasional prompt the measured deadline then
+    # cancels (see ``docs/routing.md`` for the 20-admitted / 6-doomed replay
+    # evidence).
+    bound = budget
+    if (
+        guard_cfg.free_gate_deadline_budget
+        and gate_occupancy == 0
+        and deadline_budget > 0.0
+    ):
+        bound = max(bound, deadline_budget)
+    within = projected.projected_seconds <= bound
     reason = "within_budget" if within else "eta_exceeds_budget"
     admit = within or guard_cfg.policy == POLICY_OBSERVE
     # Second independent bound: deadline check (LP-0MVKUKEU80022C3U).
@@ -1260,7 +1365,6 @@ def evaluate_admission(
     # (LP-0MVOFVCA2008DQVE residual, measured 2026-10-25).
     # The deadline is the dominant reason when it fires (AC1) and, like
     # the budget bound, honours ``observe`` (log but never refuse).
-    deadline = guard_cfg.prefill_deadline_seconds
     if deadline > 0 and projected.projected_seconds >= deadline:
         reason = "prefill_eta_exceeds_deadline"
         admit = guard_cfg.policy == POLICY_OBSERVE
@@ -1269,7 +1373,6 @@ def evaluate_admission(
     # ``budget_safety_fraction * deadline`` (0.95 x 120 s = 114 s), not merely
     # inside the deadline. This is what stops a prompt whose BAND is slow from
     # slipping past the flat token cap priced at the fast band's rate.
-    deadline_budget = _deadline_budget_seconds(guard_cfg)
     if deadline_budget > 0.0 and eta > deadline_budget:
         reason = "prefill_eta_exceeds_safety_budget"
         admit = guard_cfg.policy == POLICY_OBSERVE
@@ -1278,13 +1381,15 @@ def evaluate_admission(
         reason=reason,
         eta_prefill_seconds=eta,
         budget_seconds=budget,
+        bound_seconds=bound,
         policy=guard_cfg.policy,
         calibrated=True,
         samples=coeffs.samples,
         projected_wait_seconds=projected.projected_seconds,
         eta_occupancy_seconds=projected.occupancy_seconds,
-        busy_slots=projected.busy_slots,
+        busy_slots=occupancy,
         in_flight_prefills=in_flight,
+        gate_occupancy=gate_occupancy,
         prefill_deadline_seconds=deadline,
         new_tokens=new_tokens,
         budget_tokens=guard_cfg.cold_prefill_budget_tokens,
@@ -1620,10 +1725,10 @@ def record_guard_decision(
     logger.info(
         "local_admission_guard decision=%s reason=%s enforced=%s "
         "eta_prefill_s=%.1f eta_occupancy_s=%.1f projected_wait_s=%.1f "
-        "budget_s=%.1f deadline_s=%.1f deadline_budget_s=%.1f "
+        "budget_s=%.1f bound_s=%.1f deadline_s=%.1f deadline_budget_s=%.1f "
         "new_tokens=%d budget_tokens=%d "
         "rate_bucket=%s contended_samples=%d "
-        "busy_slots=%d in_flight_prefills=%d "
+        "busy_slots=%d in_flight_prefills=%d gate_occupancy=%d "
         "free_slot=%s priority=%s policy=%s model=%s samples=%d provider=%s "
         "session=%s",
         verdict,
@@ -1633,6 +1738,11 @@ def record_guard_decision(
         float(decision.eta_occupancy_seconds or 0.0),
         float(projected),
         float(decision.budget_seconds or 0.0),
+        float(
+            decision.bound_seconds
+            if decision.bound_seconds is not None
+            else (decision.budget_seconds or 0.0)
+        ),
         float(decision.prefill_deadline_seconds or 0.0),
         float(decision.deadline_budget_seconds or 0.0),
         int(decision.new_tokens or 0),
@@ -1641,6 +1751,7 @@ def record_guard_decision(
         int(decision.contended_samples or 0),
         int(decision.busy_slots or 0),
         int(decision.in_flight_prefills or 0),
+        int(decision.gate_occupancy or 0),
         "true" if free_slot else "false",
         priority or "unknown",
         decision.policy,
