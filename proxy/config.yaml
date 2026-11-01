@@ -1999,9 +1999,16 @@ server:
   #     is not permission to start a 40-80k-token prefill the caller will
   #     abandon — baseline 48 of 606 local dispatches had a first byte after
   #     >120 s, most of them on a free slot. The direct decision logs
-  #     ``reason=eta_exceeds_budget_direct free_slot=true`` (the queue
-  #     decision keeps ``reason=eta_exceeds_budget``); both use this one
-  #     estimator and this one budget knob — there is no second budget.
+  #     ``reason=eta_exceeds_budget_direct free_slot=true`` **only** when the
+  #     free-slot ETA/budget bound is itself the cause (the queue decision
+  #     keeps ``reason=eta_exceeds_budget``); a deadline, deadline-relative
+  #     safety-budget or flat cold-prefill refusal keeps its own governing
+  #     token on that path too
+  #     (``prefill_eta_exceeds_deadline`` /
+  #     ``prefill_eta_exceeds_safety_budget`` / ``prefill_budget_exceeded``),
+  #     so a non-ETA bound is never relabelled and the reason-driven retry
+  #     contract stays truthful (LP-0MVRO3AHN002UM1Q). Both paths use this
+  #     one estimator and this one budget knob — there is no second budget.
   #
   # FREE-GATE BOUND (LP-0MVXWQQ20002HAX4) — OPT-IN, ships OFF.
   # ``contention_queue_max_wait_seconds`` is calibrated for QUEUE losses: it

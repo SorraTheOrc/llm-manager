@@ -26,6 +26,11 @@ from pathlib import Path
 
 ROUTING_DOC = Path(__file__).resolve().parents[1] / "docs" / "routing.md"
 
+#: The operator-facing default configuration whose guard comment documents
+#: the same label mapping (LP-0MVXZA6L30000QYD — the parent audit's AC6 gap:
+#: the config stated the direct decision *always* logs the ETA/budget token).
+CONFIG_YAML = Path(__file__).resolve().parents[1] / "config.yaml"
+
 #: The exit-table row that documents the free-slot dispatch path.
 DIRECT_PATH_EXIT = "Admission guard, direct free-slot dispatch path"
 
@@ -132,4 +137,56 @@ def test_retry_contract_states_the_path_never_changes_the_reason():
     assert "both" in prose.lower() and "path" in prose.lower(), (
         "the retry contract must state that the reason is the same on both "
         f"dispatch paths; got {prose!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The shipped default configuration (LP-0MVXZA6L30000QYD / parent AC6): the
+# config comment that documents the direct decision must state the same
+# scoping as routing.md, or an operator reading config.yaml is misled into
+# the 2026-10-25 retry-storm shape (a timer advertised for a refusal that
+# waiting cannot heal). Textual check — the paragraph lives inside a YAML
+# comment block, so the assertion pins the *rule* the prose must state,
+# matching the routing.md helpers above.
+# ---------------------------------------------------------------------------
+
+
+def _config_direct_decision_paragraph() -> str:
+    """The config comment paragraph naming the direct decision, or fail."""
+    lines = CONFIG_YAML.read_text().splitlines()
+    start = [i for i, ln in enumerate(lines) if "The direct decision logs" in ln]
+    assert len(start) == 1, (
+        "config.yaml must describe the direct decision exactly once; got "
+        "occurrences at {start!r}"
+    )
+    para = [lines[start[0]]]
+    for ln in lines[start[0] + 1:]:
+        stripped = ln.strip()
+        if not stripped or stripped == "#":
+            break
+        para.append(ln)
+    return " ".join(para)
+
+
+def test_config_yaml_scopes_the_direct_token_to_the_eta_budget_bound():
+    """AC1: config.yaml must not contradict routing.md's scoping rule.
+
+    The parent audit (LP-0MVRO3AHN002UM1Q AC6) found the shipped config said
+    the direct decision logs ``eta_exceeds_budget_direct`` unconditionally.
+    The comment must now state that only the free-slot ETA/budget bound keeps
+    that token and name every reason that keeps its own instead.
+    """
+    para = _config_direct_decision_paragraph()
+    assert "the direct decision logs" in para.lower()
+    assert "only" in para.lower(), (
+        "config.yaml must scope eta_exceeds_budget_direct to the free-slot "
+        f"ETA/budget bound; got {para!r}"
+    )
+    missing = GOVERNING_REASONS - _ticked_spans(para)
+    assert not missing, (
+        "config.yaml must name every reason that keeps its own governing "
+        f"token on the direct path; missing={sorted(missing)}"
+    )
+    assert "free_slot=true" in para, (
+        "config.yaml's direct-decision comment must keep the free_slot marker"
     )
