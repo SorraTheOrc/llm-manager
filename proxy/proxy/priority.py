@@ -307,17 +307,23 @@ def priority_routing_profile(
         * ``medium``: the merged base config flag
           (``local_large_context_economic_bypass_serves_local``).
 
-    Paid-tier invariant for ``low`` (LP-0MVF17VP70053JXX): ``low`` never
-    *prefers* a paid remote tier — local is preferred, then the free tier —
-    but it is no longer forbidden from spending at all. Once the free tier is
-    exhausted the chain continues into the ``opencode-go`` entries, which are
-    only eligible inside their own ``available_times`` (UTC) windows, so paid
-    spend stays confined to off-peak hours. The cheap priority window is
+    Paid-tier invariant for ``low`` (LP-0MVF17VP70053JXX, relaxed by
+    LP-0MVY8REC80097HI0): ``low`` never *prefers* a paid remote tier — local
+    is preferred, then the free tier — but it is no longer forbidden from
+    spending at all. Once the free tier is exhausted the chain continues into
+    the ``opencode-go`` entries, which are only eligible inside their own
+    off-peak ``available_times`` (UTC) windows, and then into the
+    around-the-clock paid tail ``munitoai`` → ``deepseek-flash`` (reachable at
+    ``low`` since LP-0MVY8REC80097HI0, so low-priority requests keep a paid
+    fallback when the free tier is quarantined and the opencode accounts are
+    quota-exhausted). The cheap priority window is
     local ``Europe/Dublin`` 01:00-10:00 (= UTC 00:00-09:00) while the opencode
-    windows are UTC 00:00-01:00, 04:00-06:00 and 10:00-00:00, so the exception
-    adds capacity in ~3 of the 9 cheap hours; the UTC 01:00-04:00 and
-    06:00-10:00 gaps are deliberate paid-spend avoidance (the windows are
-    never widened to close them).
+    windows are UTC 00:00-01:00, 04:00-06:00 and 10:00-00:00, so the opencode
+    exception adds capacity in ~3 of the 9 cheap hours; outside those windows
+    the paid tail absorbs overflow. Within the UTC 01:00-04:00 and
+    06:00-10:00 gaps the opencode entries are skipped (the windows are never
+    widened to close them) but the paid tier remains eligible as the final
+    fallback.
 
     ``low`` failover capacity vs resiliency:
 

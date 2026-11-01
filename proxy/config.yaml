@@ -568,7 +568,7 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
-        priorities: [medium, high]
+        priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
@@ -590,7 +590,7 @@ models:
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
       - name: deepseek-flash
-        priorities: [medium, high]
+        priorities: [low, medium, high]
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
@@ -730,7 +730,7 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
-        priorities: [medium, high]
+        priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
@@ -752,7 +752,7 @@ models:
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
       - name: deepseek-flash
-        priorities: [medium, high]
+        priorities: [low, medium, high]
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com
@@ -899,7 +899,7 @@ models:
       # so it is eligible around the clock. The API key is resolved from
       # ~/.pi/agent/auth.json (key ``munitoai``).
       - name: munitoai
-        priorities: [medium, high]
+        priorities: [low, medium, high]
         # Honour MunitoAI's x-ratelimit-reset-* headers on 429
         # (LP-0MVBHDNLB007ALLJ): no Retry-After is sent, so without
         # this the proxy re-probes the endpoint during exhaustion.
@@ -921,7 +921,7 @@ models:
         # (probed 2026-10-19; see the sourced-limits block above).
         max_context_tokens: 400000
       - name: deepseek-flash
-        priorities: [medium, high]
+        priorities: [low, medium, high]
         type: remote
         provider: deepseek
         endpoint: https://api.deepseek.com

@@ -13,7 +13,10 @@ editing, and chain order is exactly ``providers`` order.
 Covers:
 
 - AC2 — every provider of ``plan``/``author``/``code``/``compact`` is labelled;
-  ``munitoai`` / ``deepseek-flash`` declare exactly ``[medium, high]``.
+  ``munitoai`` / ``deepseek-flash`` declare ``[low, medium, high]`` so the paid
+  tiers are reachable from a ``low`` route too (LP-0MVY8REC80097HI0 — operator
+  decision; previously they were ``[medium, high]``-only, leaving low-priority
+  requests with no paid fallback once the free tier is quarantined).
 - AC3 — the derived chains are byte-identical to the pre-change chains,
   frozen here as literals.
 - AC5 — load-time validation rejects every malformed label shape and a stale
@@ -38,8 +41,10 @@ from proxy.provider import validate_priority_config
 from proxy.utils import _validate_config, load_config
 
 # ---------------------------------------------------------------------------
-# Frozen pre-change chains (AC3). These are the chains the shipped config
-# resolved to *before* this refactor; the labels must reproduce them exactly.
+# Frozen chains (AC3). These are the chains the shipped config resolves to;
+# the labels must reproduce them exactly. The ``low`` chain gains the paid
+# tail since LP-0MVY8REC80097HI0 (previously it stopped at the opencode
+# entries).
 # ---------------------------------------------------------------------------
 
 CHAIN_MODELS = ("plan", "author", "code")
@@ -53,7 +58,9 @@ PLAN_PROVIDER_ORDER = [
     "munitoai",
     "deepseek-flash",
 ]
-PLAN_LOW_CHAIN = PLAN_PROVIDER_ORDER[:5]
+#: The ``low`` chain since LP-0MVY8REC80097HI0: the paid tiers declare
+#: ``low`` too, so the low chain is the full provider order.
+PLAN_LOW_CHAIN = PLAN_PROVIDER_ORDER
 
 COMPACT_PROVIDER_ORDER = ["opencode-go-compact", "deepseek-flash-compact"]
 
@@ -70,7 +77,7 @@ ALL_PRIORITIES = (PRIORITY_LOW, PRIORITY_MEDIUM, PRIORITY_HIGH)
 
 
 def _expected_chain(model_name: str, priority: str) -> list[str]:
-    """Frozen expectation: the chain the pre-change config resolved to."""
+    """Frozen expectation: the chain the shipped config resolves to (AC3)."""
     if model_name in CHAIN_MODELS:
         providers = PLAN_PROVIDER_ORDER
         return PLAN_LOW_CHAIN if priority == PRIORITY_LOW else providers
@@ -141,18 +148,19 @@ class TestLiveConfigLabels:
             assert "priorities" in entry, f"{model_name}/{entry.get('name')}"
 
     @pytest.mark.parametrize("model_name", CHAIN_MODELS)
-    def test_paid_tiers_are_medium_high_only(self, model_name):
+    def test_paid_tiers_serve_all_priorities(self, model_name):
+        # LP-0MVY8REC80097HI0: munitoai (paid) and deepseek-flash now declare
+        # ``low`` too, so low-priority requests can reach them once the free
+        # tier is quarantined and the opencode accounts are exhausted.
         model = load_profile("config.yaml")["models"][model_name]
         labels = {e["name"]: e["priorities"] for e in model["providers"]}
-        assert labels["munitoai"] == ["medium", "high"]
-        assert labels["deepseek-flash"] == ["medium", "high"]
+        assert labels["munitoai"] == ["low", "medium", "high"]
+        assert labels["deepseek-flash"] == ["low", "medium", "high"]
 
     @pytest.mark.parametrize("model_name", ALL_LABELLED_MODELS)
-    def test_remaining_entries_serve_all_priorities(self, model_name):
+    def test_all_entries_serve_all_priorities(self, model_name):
         model = load_profile("config.yaml")["models"][model_name]
         for entry in model["providers"]:
-            if entry["name"] in ("munitoai", "deepseek-flash"):
-                continue
             assert entry["priorities"] == ["low", "medium", "high"], entry["name"]
 
     def test_unlabelled_models_stay_unlabelled(self):
