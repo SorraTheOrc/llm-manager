@@ -12,7 +12,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import aggregation
+import bucketing
 import gpu_busy
+import log_parser
+import reporting
+
+from tests import fixtures
 
 # A mock Prometheus response for avg_over_time(gpu:computing:bool[1h]).
 _MOCK_BOOL_RESPONSE = {
@@ -233,3 +239,87 @@ class TestComputeGpuBusyMatrixFormat:
         with patch("gpu_busy.query_prometheus", return_value=bad):
             result = gpu_busy.compute_gpu_busy(ws, we)
         assert result is None
+
+
+class TestLocalBusyIsDecisionFigure:
+    """AC3/AC4 (LP-0MVUIM7A50053EFN): the decision-facing busy figure is the
+    log-derived ``local_busy`` (``dispatch → finish``); the power-based
+    ``gpu_busy`` stays a separate, clearly-labelled hardware key. Fixtures
+    come from real log lines (``tests/fixtures.py``); the Prometheus source
+    is stubbed — never live.
+    """
+
+    WINDOW_START = datetime(2026, 8, 2, 14, 0, 0)
+    WINDOW_END = datetime(2026, 8, 2, 15, 0, 0)
+
+    @staticmethod
+    def _summary() -> aggregation.AnalysisResult:
+        """Summary aggregated from the real-log ``fixtures.E2E_LINES``."""
+        schedule = bucketing.schedule_from_entries([("23:59", 8), ("10:00", 6)])
+        events = [
+            e
+            for e in (
+                log_parser.parse_log_line(ln) for ln in fixtures.E2E_LINES
+            )
+            if e is not None
+        ]
+        return aggregation.aggregate(
+            events, TestLocalBusyIsDecisionFigure.WINDOW_START,
+            TestLocalBusyIsDecisionFigure.WINDOW_END, schedule,
+        )
+
+    @staticmethod
+    def _stub_gpu_busy() -> gpu_busy.GpuBusyResult:
+        """A deterministic hardware figure that diverges from the log data."""
+        return gpu_busy.GpuBusyResult(
+            computing_fraction=0.50,
+            total_seconds=3600.0,
+            busy_seconds=1800.0,
+            idle_seconds=1800.0,
+            smoothed_power_values=[],
+        )
+
+    def test_json_decision_figure_is_log_derived(self):
+        """``summary_to_json``'s decision-facing busy is the log-derived
+        ``local_busy`` carrying the ``dispatch_to_finish`` definition marker;
+        ``gpu_busy`` is a separate key and ``None`` without Prometheus."""
+        data = reporting.summary_to_json(self._summary(), None)
+        local_busy = data["local_busy"]
+        assert local_busy is not None
+        assert local_busy["definition"] == "dispatch_to_finish"
+        # The dispatch → finish union measured from the real-log fixtures
+        # (14:01:00 → 14:01:05 local stream plus the sibling pair).
+        assert local_busy["busy_seconds"] == pytest.approx(7.0)
+        assert local_busy["busy_pct"] == pytest.approx(0.2, abs=0.05)
+        assert data["gpu_busy"] is None
+
+    def test_gpu_busy_stays_separate_and_never_presented_as_local_utilisation(self):
+        """With a stubbed GPU result the two JSON keys stay separate and the
+        hardware figure never replaces the log-derived decision figure."""
+        summary = self._summary()
+        summary.gpu_busy = self._stub_gpu_busy()
+        data = reporting.summary_to_json(summary, None)
+        local_busy = data["local_busy"]
+        gpu = data["gpu_busy"]
+        assert local_busy["definition"] == "dispatch_to_finish"
+        assert gpu is not None
+        assert gpu["busy_pct"] == 50.0
+        assert gpu["busy_seconds"] == 1800.0
+        # The log-derived decision figure is untouched by the hardware block
+        # and the hardware and log figures diverge by design; a consumer
+        # reading either as the local utilisation number would be misled.
+        assert local_busy["busy_seconds"] == pytest.approx(7.0)
+        assert local_busy["busy_pct"] != gpu["busy_pct"]
+
+    def test_report_note_states_not_local_model_utilisation(self):
+        """AC4: the report note carries the explicit \"not local model
+        utilisation\" statement naming ``local_busy`` as the decision figure,
+        and the hardware row label stays ``GPU busy — power-based
+        (hardware)``."""
+        summary = self._summary()
+        summary.gpu_busy = self._stub_gpu_busy()
+        report = reporting.build_report(summary, None)
+        section = report.split("## Local model utilization", 1)[1].split("## ", 1)[0]
+        assert "GPU busy — power-based (hardware)" in section
+        assert "not local model utilisation" in section
+        assert "local_busy" in section

@@ -30,6 +30,19 @@ deliberate follow-on: it must only be enabled once cache warmth
 (LP-0MVGD9YXH008O304), the prefill-ETA guard (LP-0MVGDUV5E005UWBQ) and prefill
 serialisation (LP-0MVGDUUV3001XFRJ) are live in the running proxy.
 
+Two bounds, both measured/configured rather than magic constants
+(LP-0MVXWQQ20002HAX4):
+
+1. the projected PREFILL must fit inside the admission guard's own deadline
+   and its deadline-relative safety budget, so the gate can never admit a
+   prompt the deadline would cancel; and
+2. the projected slot-seconds of admissions in the horizon must fit inside
+   ``budget_ratio x measured idle slot-seconds``.
+
+A request admitted here is marked on the request object so the flat
+cold-prefill token cap cannot override a verdict that has already priced it
+against measured capacity; the guard's measured bounds still apply.
+
 Fail-open: any error, a disabled policy or an uncalibrated ETA keeps today's
 behaviour (the bypass stands).
 """
@@ -212,6 +225,25 @@ def project_slot_seconds(
     prefix; the decode allowance is a configured constant because decode time
     is dominated by the client's output budget, not by prompt size.
     """
+    return project_slot_seconds_detail(
+        config, model, estimated_tokens, cached_ratio
+    )[1]
+
+
+def project_slot_seconds_detail(
+    config: dict | None,
+    model: str | None,
+    estimated_tokens: int,
+    cached_ratio: float,
+) -> tuple[float, float]:
+    """``(prefill_seconds, projected_seconds)`` for one request.
+
+    The two terms are returned separately so the *prefill* term — the only one
+    that competes for the serialised prefill gate and the only one the
+    prefill deadline can cancel — can be bounded on its own before the decode
+    allowance is added (LP-0MVXWQQ20002HAX4). ``(0.0, 0.0)`` when the prompt
+    cannot be priced (fail-open: today's bypass stands).
+    """
     policy = resolve_policy(config)
     eta = None
     try:
@@ -223,8 +255,31 @@ def project_slot_seconds(
     except Exception:
         eta = None
     if eta is None or eta < 0:
-        return 0.0
-    return float(eta) + float(policy.decode_seconds)
+        return (0.0, 0.0)
+    return (float(eta), float(eta) + float(policy.decode_seconds))
+
+
+def _prefill_deadline_bounds(config: dict | None) -> tuple[float, float]:
+    """``(deadline_seconds, safety_budget_seconds)`` from the admission guard.
+
+    Both bounds are read from the ONE configuration the prefill-ETA admission
+    guard enforces (``local_prefill_deadline_seconds`` and
+    ``local_admission_guard_budget_safety_fraction``), so the capacity gate
+    can never admit a prompt the guard would then refuse (or the deadline
+    would cancel). A missing/unreadable guard config reads as ``(0.0, 0.0)`` —
+    both bounds disabled — which leaves the ledger bound as the only limit
+    (today's behaviour).
+    """
+    try:
+        from proxy.prefill_eta import resolve_config
+
+        guard_cfg = resolve_config(_server_config(config))
+        deadline = float(guard_cfg.prefill_deadline_seconds or 0.0)
+        fraction = float(guard_cfg.budget_safety_fraction or 0.0)
+    except Exception:
+        return (0.0, 0.0)
+    safety = fraction * deadline if (deadline > 0.0 and fraction > 0.0) else 0.0
+    return (max(0.0, deadline), max(0.0, safety))
 
 
 def evaluate_capacity_admission(
@@ -239,6 +294,22 @@ def evaluate_capacity_admission(
     Returns a decision dict (recorded in the log line) when the request should
     be admitted locally, else ``None`` — meaning today's bypass stands.
 
+    Two independent bounds, both measured/configured (never a magic constant):
+
+    1. **Prefill deadline** (LP-0MVXWQQ20002HAX4): the projected PREFILL time
+       (decode allowance excluded — a decode is not what the deadline
+       cancels) must fit inside the admission guard's own deadline and its
+       deadline-relative safety budget
+       (``local_admission_guard_budget_safety_fraction x
+       local_prefill_deadline_seconds``). Before this bound the gate could
+       admit a prompt the guard/deadline would then cancel, which is why
+       enabling it against the flat token cap could only ever waste a
+       dispatch.
+
+    2. **Idle-slot ledger** (LP-0MVGDUVS6003T2IX): the projected slot-seconds
+       of admissions inside the horizon must fit inside
+       ``budget_ratio x measured idle slot-seconds``.
+
     The decision is recorded in the rolling admission ledger, so a burst of
     band requests cannot collectively over-commit the horizon.
     """
@@ -246,10 +317,18 @@ def evaluate_capacity_admission(
     if not policy.enabled:
         return None
     reference = time.monotonic() if now is None else float(now)
-    projected = project_slot_seconds(
+    prefill_seconds, projected = project_slot_seconds_detail(
         config, model, estimated_tokens, cached_ratio
     )
     if projected <= 0.0:
+        return None
+    deadline_seconds, safety_seconds = _prefill_deadline_bounds(config)
+    # Bound 1: never admit a prefill the deadline (or its safety margin) would
+    # cancel. The check is on the PREFILL term only: the decode allowance is
+    # not part of the time to first byte the deadline governs.
+    if deadline_seconds > 0.0 and prefill_seconds >= deadline_seconds:
+        return None
+    if safety_seconds > 0.0 and prefill_seconds > safety_seconds:
         return None
     idle = idle_slot_seconds(config, policy.horizon_seconds, now=reference)
     budget = policy.budget_ratio * idle
@@ -260,6 +339,9 @@ def evaluate_capacity_admission(
     return {
         "reason": "capacity_admission",
         "projected_seconds": projected,
+        "prefill_seconds": prefill_seconds,
+        "deadline_seconds": deadline_seconds,
+        "deadline_budget_seconds": safety_seconds,
         "admitted_seconds": admitted + projected,
         "budget_seconds": budget,
         "idle_seconds": idle,

@@ -41,7 +41,13 @@ import httpx
 from fastapi import HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from proxy import cold_start, quota_pacing, quota_state
+from proxy import (
+    admission_reserve,
+    cold_start,
+    local_deferral,
+    quota_pacing,
+    quota_state,
+)
 
 #: The single source of truth for the ``X-Local-Preference`` vocabulary and its
 #: parser (LP-0MVSHWYVE005MS16 AC4). ``PREF_LOCAL_ONLY`` is imported only as the
@@ -52,11 +58,19 @@ from proxy import cold_start, quota_pacing, quota_state
 from proxy.admission_reserve import (
     CAPACITY_TOO_LARGE,
     DEFAULT_PREFERENCE,
+    LOCAL_FALLBACK_DEFERRAL_EXHAUSTED,
     PREF_LOCAL_ONLY,
     PREF_LOCAL_PREFERRED,
     PREF_REMOTE_OK,
+    LocalPreferenceRetiredError,
     parse_preference,
+    retired_preference_body,
 )
+from proxy.local_route_starvation import (
+    LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN,
+    record_local_route_arm,
+)
+from proxy.measured_cache_abort import MEASURED_CACHE_DEFICIT_REASON
 from proxy.observability import _record_backend_signal
 from proxy.priority import (
     PRIORITY_HIGH,
@@ -718,7 +732,7 @@ def _fallback_budget_evidence(budget: Any) -> dict[str, Any] | None:
 
     ``provider_budget.BudgetDecision`` already carries the numbers the budget
     gate used (``limit_rpm``/``remaining``/``waited_seconds``); the fallback
-    line re-emits them so a ``rate_limited`` fallback is auditable without
+    line re-emits them so a ``provider_budget_exhausted`` fallback is auditable without
     replaying the gate (LP-0MVMBMSWR0036RES AC3).
     """
     if budget is None:
@@ -741,7 +755,7 @@ def _fallback_evidence(
     """Build the trailing ``key=value`` evidence for a ``Fallback triggered`` line.
 
     Always carries ``session=`` (``unknown`` when the request had no session
-    UUID) and ``attempt=``. When *reason* is budget-driven (``rate_limited*``)
+    UUID) and ``attempt=``. When *reason* is budget-driven (``provider_budget_exhausted*``)
     and *budget* holds the snapshot, it also carries the budget evidence
     (``limit=``/``remaining=``/``waited=``). Appended **after** ``reason=``,
     which is why every end-anchored consumer regex was updated in the same
@@ -751,7 +765,7 @@ def _fallback_evidence(
         f"session={session_id or 'unknown'}",
         f"attempt={_next_fallback_attempt(session_id)}",
     ]
-    if budget and (reason or "").startswith("rate_limited"):
+    if budget and (reason or "").startswith("provider_budget_exhausted"):
         parts.append(f"limit={budget.get('limit', 0)}")
         parts.append(f"remaining={budget.get('remaining', 0)}")
         parts.append(f"waited={float(budget.get('waited', 0.0)):.3f}")
@@ -1354,11 +1368,16 @@ def _get_local_model_ctx_size(config: dict) -> int:
 def _get_active_local_slots(config: dict) -> int:
     """Return the number of currently active local slots.
 
-    The slot count is a single per-mode definition: the active mode-profile
-    config's ``session_slot_pool_size`` (default/fast: 3, cheap: 2). The
-    time-based slot scheduler was removed (operator-directed simplification
-    LP-0MTZRM5HV0007S0V) — there is no schedule-aware live slot count.
-    Returns 1 as a safe default when nothing is configured.
+    The slot count is a single definition: the ``server`` block's
+    ``session_slot_pool_size`` (shipped value 2). The per-mode profiles are
+    retired (LP-0MVDT94F0003VHUA), so there is no fast/cheap distinction left;
+    the historical "default/fast: 3, cheap: 2" pairs described profiles that no
+    longer exist. The time-based slot scheduler was removed (operator-directed
+    simplification LP-0MTZRM5HV0007S0V) — there is no schedule-aware live slot
+    count. Returns 1 as a safe default when nothing is configured.
+
+    A single-slot switch changes exactly this value; see
+    ``docs/dev/single-slot-impact.md`` for what follows it and what does not.
     """
     server_cfg = config.get("server", config)
     try:
@@ -1458,6 +1477,20 @@ def should_warn_context_pressure(estimated_tokens: int, config: dict) -> bool:
 # context_pressure advisory, the live compaction path and the 429 gate all
 # fire from it (the legacy 0.8 context_pressure_warn_ratio is retired).
 _DEFAULT_COMPACTION_TRIGGER_RATIO = 0.70
+
+# Local→remote boundary compaction (LP-0MVTDU6Y1004ZCGX, parent
+# LP-0MVRBQBDF0037OZ5): an INDEPENDENT, default-off knob. It is deliberately
+# not derived from ``compaction_trigger_ratio`` so the operator's 2026-09-17
+# decision to keep assembly-time compaction disabled cannot be undone by
+# enabling the boundary trigger.
+_DEFAULT_REMOTE_BOUNDARY_COMPACTION = False
+
+# Minimum-size guard for boundary compaction (estimated tokens). A reasoned
+# starting point, not a measured one: above trivial sessions and well below
+# the ~180K assembly-time trigger, so only sessions whose remote prompt cost
+# justifies the added summarisation latency are compacted. Operator-tunable
+# via ``server.remote_boundary_compaction_min_tokens``.
+_DEFAULT_REMOTE_BOUNDARY_COMPACTION_MIN_TOKENS = 20000
 
 # Default summarizer context size (tokens). 8192 is enough for a short
 # summarisation prompt + middle turns; avoids unnecessary KV cache footprint.
@@ -1650,6 +1683,12 @@ def compaction_config(config: dict) -> dict:
             - summarizer_retries (int): Retries on transient failures
               (0 disables).
             - summarizer_retry_delay_seconds (float): Inter-attempt delay.
+            - remote_boundary_compaction (bool): Independent, default-off
+              local→remote boundary compaction knob
+              (LP-0MVTDU6Y1004ZCGX). Never reads
+              ``compaction_trigger_ratio``.
+            - remote_boundary_compaction_min_tokens (int): Minimum-size
+              guard for boundary compaction (default 20 000).
     """
     server = config.get("server", {})
 
@@ -1736,6 +1775,26 @@ def compaction_config(config: dict) -> dict:
     except (ValueError, TypeError):
         timeout = _DEFAULT_SUMMARIZER_TIMEOUT_SECONDS
 
+    # Local→remote boundary compaction (LP-0MVTDU6Y1004ZCGX). Independent of
+    # ``compaction_trigger_ratio``: this block must never read or write it.
+    boundary_enabled = server.get("remote_boundary_compaction")
+    if boundary_enabled is None:
+        boundary_enabled = config.get("remote_boundary_compaction")
+    if not isinstance(boundary_enabled, bool):
+        boundary_enabled = _DEFAULT_REMOTE_BOUNDARY_COMPACTION
+
+    boundary_min_tokens = server.get("remote_boundary_compaction_min_tokens")
+    if boundary_min_tokens is None:
+        boundary_min_tokens = config.get("remote_boundary_compaction_min_tokens")
+    try:
+        boundary_min_tokens = int(boundary_min_tokens)
+    except (ValueError, TypeError):
+        boundary_min_tokens = _DEFAULT_REMOTE_BOUNDARY_COMPACTION_MIN_TOKENS
+    if boundary_min_tokens <= 0:
+        # A non-positive guard would compact every session; fall back to the
+        # agreed default (validate_compaction_config flags the raw value).
+        boundary_min_tokens = _DEFAULT_REMOTE_BOUNDARY_COMPACTION_MIN_TOKENS
+
     return {
         "trigger_ratio": trigger_ratio,
         "summarizer_model_type": summarizer_model_type,
@@ -1748,6 +1807,8 @@ def compaction_config(config: dict) -> dict:
         "summarizer_retries": retries,
         "summarizer_retry_delay_seconds": retry_delay,
         "summarizer_timeout_seconds": timeout,
+        "remote_boundary_compaction": boundary_enabled,
+        "remote_boundary_compaction_min_tokens": boundary_min_tokens,
     }
 
 
@@ -1797,6 +1858,38 @@ def validate_compaction_config(config: dict) -> list[str]:
         problems.append(
             f"FATAL: summarizer_max_tokens={max_tokens} must be positive"
         )
+
+    # Local→remote boundary compaction (LP-0MVTDU6Y1004ZCGX) is validated on
+    # the RAW configured values: ``compaction_config`` coerces bad values to
+    # defaults, which would hide an operator typo behind a silent fallback.
+    server_cfg = config.get("server", {}) if isinstance(config, dict) else {}
+    if not isinstance(server_cfg, dict):
+        server_cfg = {}
+    flat = config if isinstance(config, dict) else {}
+
+    raw_enabled = server_cfg.get("remote_boundary_compaction")
+    if raw_enabled is None:
+        raw_enabled = flat.get("remote_boundary_compaction")
+    if raw_enabled is not None and not isinstance(raw_enabled, bool):
+        problems.append(
+            f"FATAL: remote_boundary_compaction={raw_enabled!r} must be a boolean"
+        )
+
+    raw_guard = server_cfg.get("remote_boundary_compaction_min_tokens")
+    if raw_guard is None:
+        raw_guard = flat.get("remote_boundary_compaction_min_tokens")
+    if raw_guard is not None:
+        # ``bool`` is an ``int`` subclass: True/False is not a token count.
+        if isinstance(raw_guard, bool) or not isinstance(raw_guard, int):
+            problems.append(
+                f"FATAL: remote_boundary_compaction_min_tokens={raw_guard!r} "
+                "must be a positive integer"
+            )
+        elif raw_guard <= 0:
+            problems.append(
+                f"FATAL: remote_boundary_compaction_min_tokens={raw_guard} "
+                "must be positive"
+            )
 
     return problems
 
@@ -1985,8 +2078,10 @@ def _effective_large_context_thresholds(config: dict) -> tuple[int, int]:
         # single source as ``session_slot_max_prompt_tokens`` persistence.
         # No circularity: ``compute_hard_routing_cap`` derives its denominator
         # from the RAW warm config + per-slot threshold, not this clamped warm.
-        # The per-mode ratios are retired (0 → disabled) and the slot pool is
-        # fixed at 2, so the unified profile is used unconditionally.
+        # The per-mode ratios are retired (0 → disabled) and the mode axis is
+        # gone (LP-0MVDT94F0003VHUA), so one unified ratio profile applies at
+        # ANY slot count — the pool size (``session_slot_pool_size``, currently
+        # 2) does not select a ratio set.
         try:
             _hard_cap = compute_hard_routing_cap("fast", config)
         except Exception:
@@ -2478,9 +2573,43 @@ IDLE_OVERRIDABLE_SKIP_REASONS: tuple[str, ...] = (
 
 #: Provenance of a residency measurement, reported in the admission log line.
 RESIDENCY_SOURCE_MEASURED = "measured"       # live context_tokens from /slots
+RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH = "measured_last_dispatch"
+#: ``measured_last_dispatch``: the last local dispatch's measured ``total``
+#: (``proxy.measured_prefill``) for the ``(model, session)`` pair. The next
+#: *measurement* rung when the deployed llama.cpp build reports no per-slot
+#: ``context_tokens`` (LP-0MVT2PY3J00077W6).
 RESIDENCY_SOURCE_SESSION_SLOT = "session_slot"  # owns the slot, size unknown
 RESIDENCY_SOURCE_NON_RESIDENT = "non_resident"  # owns no slot (view is fresh)
 RESIDENCY_SOURCE_UNKNOWN = "unknown"            # no fresh view and no ownership
+
+#: ``measurement=`` provenance value for a decision that *is* measured.
+MEASUREMENT_MEASURED = "measured"
+#: Closed vocabulary for a decision that *cannot* be measured
+#: (LP-0MVT2Q1SD009JLKD). Each value names a different cause, so an
+#: unmeasured decision is attributable instead of a bare ``none``:
+#:
+#: - ``no_slot`` — the session owns no slot in a *fresh* view, so there is
+#:   nothing to measure (a measured zero, never a fabricated ratio);
+#: - ``no_prior_measurement`` — the session owns its slot but no local
+#:   dispatch has been measured for the ``(model, session)`` pair yet;
+#: - ``capture_disabled`` — the ``local_measured_cache_abort_enabled``
+#:   rollback is off, so capture cannot happen at all;
+#: - ``stale_view`` — the residency view is absent or stale (no fresh
+#:   ``/slots`` snapshot), so the pool state is genuinely unknown.
+MEASUREMENT_UNAVAILABLE_NO_SLOT = "unavailable:no_slot"
+MEASUREMENT_UNAVAILABLE_NO_PRIOR = "unavailable:no_prior_measurement"
+MEASUREMENT_UNAVAILABLE_STALE_VIEW = "unavailable:stale_view"
+MEASUREMENT_UNAVAILABLE_CAPTURE_DISABLED = "unavailable:capture_disabled"
+
+#: The whole closed vocabulary, in precedence order (first match wins).
+#: ``measurement=`` on a decision line is always exactly one of these.
+MEASUREMENT_VOCABULARY: tuple[str, ...] = (
+    MEASUREMENT_MEASURED,
+    MEASUREMENT_UNAVAILABLE_CAPTURE_DISABLED,
+    MEASUREMENT_UNAVAILABLE_NO_PRIOR,
+    MEASUREMENT_UNAVAILABLE_NO_SLOT,
+    MEASUREMENT_UNAVAILABLE_STALE_VIEW,
+)
 
 
 @dataclass(frozen=True)
@@ -2492,14 +2621,76 @@ class ResidentPrefixFacts:
     slot_owner_session: str | None
     source: str
     view_known: bool = False
+    #: ``measurement=`` provenance: ``MEASUREMENT_MEASURED`` when the ratio
+    #: came from a real measurement, otherwise one of the closed
+    #: ``unavailable:<reason>`` values (see :func:`measurement_reason`).
+    measurement: str | None = None
 
     @property
     def resident(self) -> bool:
         """True when the session owns a slot (measured or restore path)."""
         return self.source in (
             RESIDENCY_SOURCE_MEASURED,
+            RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
             RESIDENCY_SOURCE_SESSION_SLOT,
         )
+
+
+def measurement_reason(
+    source: str | None = None,
+    *,
+    view_known: bool = False,
+    capture_enabled: bool = True,
+) -> str:
+    """The single closed-vocabulary ``measurement=`` value for a decision.
+
+    Deterministic precedence (LP-0MVT2Q1SD009JLKD), first match wins:
+
+    1. a **measured** source (live ``context_tokens`` or the last measured
+       dispatch) ⇒ ``measured`` — a real measurement needs no reason, and the
+       capture rollback never re-labels one;
+    2. a **slot-owning** session (``session_slot``) ⇒
+       ``unavailable:capture_disabled`` when the capture rollback is off (this
+       wins over ``no_prior_measurement``: the operator must be able to tell
+       "the feature is off" from "nothing was measured"), else
+       ``unavailable:no_prior_measurement``;
+    3. a **fresh view** with no slot of this session's ⇒ ``unavailable:no_slot``
+       — the zero is a measured fact, not an absence of data;
+    4. anything else — an ``unknown`` source, or no residency facts at all
+       (``source=None``: the gate is disabled, or the caller logged without
+       resolving one) ⇒ ``unavailable:stale_view``, because no fresh residency
+       view informed the decision.
+
+    Never raises: a metric derivation must not become an admission failure
+    mode.
+    """
+    if source in (RESIDENCY_SOURCE_MEASURED, RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH):
+        return MEASUREMENT_MEASURED
+    if source == RESIDENCY_SOURCE_SESSION_SLOT:
+        return (
+            MEASUREMENT_UNAVAILABLE_NO_PRIOR
+            if capture_enabled
+            else MEASUREMENT_UNAVAILABLE_CAPTURE_DISABLED
+        )
+    if view_known:
+        return MEASUREMENT_UNAVAILABLE_NO_SLOT
+    return MEASUREMENT_UNAVAILABLE_STALE_VIEW
+
+
+def _closed_measurement_value(measurement: str | None) -> str:
+    """Normalise *measurement* into the closed vocabulary — never absent.
+
+    Every ``routing_resident_prefix`` line carries exactly one ``measurement=``
+    value (AC2). ``facts`` is ``None`` when the residency gate is disabled
+    (``local_resident_prefix_min_ratio: 0``) or when a caller logs a decision
+    without resolving one, and a future producer could set a value outside the
+    vocabulary: both report ``unavailable:stale_view`` (no fresh residency view
+    informed the decision), so a line can carry neither zero nor two reasons and
+    the vocabulary cannot widen silently.
+    """
+    if isinstance(measurement, str) and measurement in MEASUREMENT_VOCABULARY:
+        return measurement
+    return MEASUREMENT_UNAVAILABLE_STALE_VIEW
 
 
 def _effective_resident_prefix_min_ratio(config: dict | None) -> float:
@@ -2549,12 +2740,66 @@ def _session_owns_slot(session_id: str | None, endpoint: str | None = None) -> i
     return None
 
 
+def _measured_capture_enabled(server_config=None) -> bool:
+    """Whether measured-prefill capture is enabled (fail-open to today's rung).
+
+    Reads the ``local_measured_cache_abort_enabled`` rollback switch through
+    :func:`proxy.measured_prefill.capture_enabled`, lazily and fail-open: an
+    unreadable config, an unreadable server module or any other error treats
+    the measurement as unavailable (pre-change behaviour) rather than
+    fabricating one. The config is read per call (never cached) so a
+    ``/config/reload`` takes effect immediately.
+    """
+    try:
+        from proxy.measured_prefill import capture_enabled
+
+        if server_config is None:
+            from proxy.server import config as proxy_config
+
+            server_config = proxy_config if isinstance(proxy_config, dict) else None
+        return bool(capture_enabled(server_config))
+    except Exception:
+        return False
+
+
+def _measured_last_dispatch_total(
+    model_name: str | None, session_id: str | None
+) -> int | None:
+    """The last local dispatch's measured ``total`` for ``(model, session)``.
+
+    llama-server's own ``prompt_progress`` ``total`` is the only measurement of
+    the session's prefix available on a build that reports no per-slot
+    ``context_tokens``. Purely in-process (no ``/slots`` query, so the >15 s
+    ``/slots`` hold cannot stall admission — ``LP-0MUXTW4MD003TVIC``).
+
+    Fail-open by contract: a missing model/session, a missing store entry, a
+    ``None``/``0``/negative/non-finite ``total``, or any exception reads as
+    *no measurement* (``None``) — never as a zero-size or fabricated prefix.
+    """
+    if not model_name or not session_id:
+        return None
+    try:
+        from proxy.measured_prefill import get_measured_prefill
+
+        measured = get_measured_prefill(model_name, session_id)
+    except Exception:
+        return None
+    total = getattr(measured, "total", None)
+    if isinstance(total, bool) or not isinstance(total, (int, float)):
+        return None
+    if not math.isfinite(float(total)) or total <= 0:
+        return None
+    return int(total)
+
+
 def resolve_resident_prefix(
     session_id: str | None,
     estimated_tokens: int,
     *,
     view=None,
     endpoint: str | None = None,
+    model_name: str | None = None,
+    server_config: dict | None = None,
 ) -> ResidentPrefixFacts:
     """Measure the session's reusable prefix and classify its residency.
 
@@ -2562,16 +2807,36 @@ def resolve_resident_prefix(
 
     1. ``context_tokens`` known ⇒ measured ratio
        ``min(context_tokens, estimated_tokens) / estimated_tokens``;
-    2. ``context_tokens`` unknown but the session owns the slot ⇒ treat as
-       resident (the restore path: the slot holds this session's prefix but
-       the build does not report its size — llama.cpp b8782 dropped `n_past`);
-    3. neither ⇒ non-resident (the caller then falls back to today's
+    2. ``context_tokens`` unknown but the session owns a live slot *and* a
+       prior local dispatch was measured ⇒ measured ratio from that dispatch's
+       ``total`` (``measured_last_dispatch``: the deployed llama.cpp b8782
+       build reports no per-slot ``context_tokens``, so rung 1 is unreachable
+       there — LP-0MVT2PY3J00077W6);
+    3. ``context_tokens`` and the store unknown but the session owns the slot ⇒
+       treat as resident (the restore path: the slot holds this session's
+       prefix but nothing measures its size);
+    4. neither ⇒ non-resident (the caller then falls back to today's
        predicted-ratio decision).
 
-    Only the two documented sources are consulted — the cached `/slots`
-    snapshot and the in-process ownership registry. There is deliberately no
-    synchronous `/slots` call here: llama-server holds `/slots` for >15 s while
-    processing a prompt batch (LP-0MUXTW4MD003TVIC).
+    Only already-captured sources are consulted — the cached `/slots`
+    snapshot, the in-process ``proxy.measured_prefill`` store and the
+    ownership registry. There is deliberately no synchronous `/slots` call
+    here: llama-server holds `/slots` for >15 s while processing a prompt
+    batch (LP-0MUXTW4MD003TVIC).
+
+    A stored measurement is only valid while its session still owns the slot
+    it was captured against: rung 2 is gated on live ownership, and the
+    invalidation paths clear the entry when that ownership ends — eviction
+    (``router_helpers._record_local_eviction``), slot release/reassignment
+    (``session._free_slot_assignment``) and a model switch
+    (``lifecycle.ensure_model_loaded``, LP-0MVT2QFAP0082BKR). The ownership
+    gate is the backstop for any clear that was missed.
+
+    Each rung also sets exactly one ``measurement=`` reason via
+    :func:`measurement_reason`: ``measured`` for rungs 1–2,
+    ``unavailable:capture_disabled`` / ``unavailable:no_prior_measurement`` for
+    rung 3, and ``unavailable:no_slot`` / ``unavailable:stale_view`` for rung 4
+    (LP-0MVT2Q1SD009JLKD).
 
     Args:
         session_id: Session whose prefix is being priced.
@@ -2579,6 +2844,11 @@ def resolve_resident_prefix(
         view: Pre-built :class:`proxy.residency.ResidencyView`; built on demand
             when omitted (fail-open: an unknown view is not an error).
         endpoint: Local llama-server endpoint scope when several are in play.
+        model_name: Model the prompt is priced for; scopes the measurement
+            store key (``(model, session)``). ``None`` disables rung 2, so a
+            call site without a model name keeps its pre-change behaviour.
+        server_config: ``server`` config used to read the capture rollback
+            switch; read lazily from the running proxy when omitted.
     """
     if view is None:
         try:
@@ -2609,10 +2879,42 @@ def resolve_resident_prefix(
             slot_owner_session=owner or session_id,
             source=RESIDENCY_SOURCE_MEASURED,
             view_known=known,
+            measurement=MEASUREMENT_MEASURED,
         )
 
-    # Unknown size: ownership is the authoritative signal (restore path).
     owned_slot = _session_owns_slot(session_id, endpoint)
+    # Read the capture rollback switch once, and only when a measurement could
+    # possibly be used: it decides both whether rung 2 fires and which
+    # unmeasured reason a slot-owning session reports
+    # (``capture_disabled`` vs ``no_prior_measurement``).
+    capture_enabled = (
+        _measured_capture_enabled(server_config) if owned_slot is not None else True
+    )
+
+    # Rung 2 — the last measured dispatch for this (model, session). Consulted
+    # only while the session still owns a live slot (a measurement whose slot
+    # has been reclaimed is exactly the stale ratio this ladder must not
+    # fabricate) and only while capture is enabled, so the feature rollback
+    # restores the pre-change ``session_slot`` behaviour end to end. Every
+    # failure mode degrades to rung 3 (ownership-only), never to an error.
+    if (
+        owned_slot is not None
+        and estimated_tokens > 0
+        and capture_enabled
+    ):
+        measured_total = _measured_last_dispatch_total(model_name, session_id)
+        if measured_total is not None:
+            reusable = min(measured_total, int(estimated_tokens))
+            return ResidentPrefixFacts(
+                n_past_actual=measured_total,
+                reuse_ratio=min(1.0, max(0.0, reusable / float(estimated_tokens))),
+                slot_owner_session=owner or session_id,
+                source=RESIDENCY_SOURCE_MEASURED_LAST_DISPATCH,
+                view_known=known,
+                measurement=MEASUREMENT_MEASURED,
+            )
+
+    # Unknown size: ownership is the authoritative signal (restore path).
     if owned_slot is not None:
         return ResidentPrefixFacts(
             n_past_actual=None,
@@ -2620,6 +2922,11 @@ def resolve_resident_prefix(
             slot_owner_session=owner or session_id,
             source=RESIDENCY_SOURCE_SESSION_SLOT,
             view_known=known,
+            measurement=measurement_reason(
+                RESIDENCY_SOURCE_SESSION_SLOT,
+                view_known=known,
+                capture_enabled=capture_enabled,
+            ),
         )
 
     # No ownership. With a *fresh* view that is a measured fact (the pool holds
@@ -2637,12 +2944,19 @@ def resolve_resident_prefix(
         except Exception:
             occupants = ()
         owner = occupants[0] if occupants else None
+    source = (
+        RESIDENCY_SOURCE_NON_RESIDENT if known else RESIDENCY_SOURCE_UNKNOWN
+    )
     return ResidentPrefixFacts(
         n_past_actual=None,
         reuse_ratio=0.0,
         slot_owner_session=owner,
-        source=RESIDENCY_SOURCE_NON_RESIDENT if known else RESIDENCY_SOURCE_UNKNOWN,
+        source=source,
         view_known=known,
+        # A fresh view with no slot of this session's is a *measured* zero
+        # (``no_slot``); an absent/stale view is genuinely unknown
+        # (``stale_view``).
+        measurement=measurement_reason(source, view_known=known),
     )
 
 
@@ -2713,6 +3027,7 @@ def _log_residency_decision(
         reuse = getattr(facts, "reuse_ratio", None)
         owner = getattr(facts, "slot_owner_session", None)
         source = getattr(facts, "source", "none")
+        measurement = _closed_measurement_value(getattr(facts, "measurement", None))
         occupants = len(getattr(tenancy, "occupants", ()) or ())
         tenant_limit = getattr(tenancy, "tenant_limit", None)
         # ``reuse_ratio`` is a *measurement*, so it must be reported as
@@ -2724,18 +3039,29 @@ def _log_residency_decision(
         # resident/evicted ratio rows (LP-0MVNPZY22008B536). A genuine
         # measured 0 (a slot reporting ``context_tokens=0``) still logs 0.0000.
         measured_ratio = n_past is not None and isinstance(reuse, (int, float))
+        # Additive provenance field, immediately after ``residency_source=``
+        # (LP-0MVT2PY3J00077W6): a measured decision says so; a decision that
+        # cannot be measured says *why* in the closed vocabulary
+        # (LP-0MVT2Q1SD009JLKD — ``unavailable:no_slot`` /
+        # ``unavailable:no_prior_measurement`` /
+        # ``unavailable:stale_view`` / ``unavailable:capture_disabled``).
+        # Exactly one value per line: a line logged without residency facts
+        # (the gate is disabled) still reports ``unavailable:stale_view``.
+        # Existing keys keep their relative order so deployed parsers are
+        # unaffected; ``measurement=`` is the only addition.
         logger.info(
             "routing_resident_prefix provider=local model=%s decision=%s "
             "n_past_actual=%s estimated_tokens=%d reuse_ratio=%s "
-            "slot_owner_session=%s residency_source=%s min_ratio=%s "
+            "slot_owner_session=%s residency_source=%s measurement=%s min_ratio=%s "
             "tenants=%s occupants=%d session=%s",
             model_name or "unknown",
             decision,
             n_past if n_past is not None else "none",
             int(estimated_tokens),
-            f"{reuse:.4f}" if measured_ratio else "none",
+            f"{reuse:.6f}" if measured_ratio else "none",
             owner or "none",
             source or "none",
+            measurement,
             f"{min_ratio:.2f}" if isinstance(min_ratio, (int, float)) else "none",
             tenant_limit if tenant_limit is not None else "none",
             occupants,
@@ -2805,11 +3131,14 @@ def _should_skip_local(
 
     1. the hard ``context_too_large`` cap above (unchanged, still first);
     2. **resident-prefix gate** — admit only when the session's *measured*
-       reusable prefix is at least ``resident_prefix_min_ratio`` of the
-       prompt, else skip with ``resident_prefix_insufficient``;
-    3. **live-prefix pricing** — price ``new_tokens`` from that same live
-       measurement (never the predicted sidecar ratio), so the cold cap is
-       evaluated against real prefill work;
+       reusable prefix (live `/slots` `context_tokens`, else the session's last
+       measured dispatch — see `resolve_resident_prefix`) is at least
+       `resident_prefix_min_ratio` of the prompt, else skip with
+       `resident_prefix_insufficient`;
+    3. **live-prefix pricing** — price `new_tokens` from that same live
+       measurement (`min(n_past_actual, estimated_tokens)` reusable, never the
+       predicted sidecar ratio and never the ownership rung's implicit "all
+       tokens reused"), so the cold cap is evaluated against real prefill work;
     4. the idle-exempt override is applied by the *caller* after this
        function returns (``IDLE_OVERRIDABLE_SKIP_REASONS``), so an idle GPU
        still serves cold work.
@@ -2873,6 +3202,7 @@ def _should_skip_local(
             estimated_tokens,
             view=residency_view,
             endpoint=endpoint,
+            model_name=model_name,
         )
         if facts.source == RESIDENCY_SOURCE_UNKNOWN:
             # Fail-open: no fresh measurement and no ownership — degrade to
@@ -4351,7 +4681,7 @@ def _compute_retry_after(
 #: ``_compute_retry_after`` finds no candidate (returns 0) even though the
 #: provider comes back as soon as its rolling window drains
 #: (LP-0MVF0N9SA0071LWM).
-_BUDGET_SKIP_STATUSES = frozenset({"rate_limited"})
+_BUDGET_SKIP_STATUSES = frozenset({"provider_budget_exhausted"})
 
 
 def _budget_window_retry_after(
@@ -4482,7 +4812,7 @@ NOT_TIME_RETRYABLE_REFUSAL_REASONS = frozenset(
 _COMPACTION_GUIDANCE = (
     "Do not retry: waiting cannot make this request fit. Compact the session "
     "history (the refusal carries new_tokens/budget_tokens so the target size "
-    "is explicit) and resend, or send X-Local-Preference: prefer-local to "
+    "is explicit) and resend, or send X-Local-Preference: remote-ok to "
     "allow a remote fallback."
 )
 
@@ -5782,6 +6112,38 @@ def _build_local_admission_reject_response(
     )
 
 
+def _slot_exhaustion_retry_after_seconds(config: dict | None) -> int:
+    """Truthful retry delay for the all-slots-exhausted refusal.
+
+    A busy slot frees when its in-flight request finishes, so the measured
+    remaining service owed by live prefill occupants
+    (:func:`_local_occupant_prefill_seconds`) is the honest wait whenever one
+    is observable. The probe is pool-wide because the builder is not
+    endpoint-scoped: an occupant on another local backend can only make the
+    hint longer, never shorter, and a measured wait may be pessimistic but
+    must never be optimistic. With no measurement (a decoding occupant, an
+    idle-leased slot, or an observability gap — the probe is fail-open and
+    returns ``0``) the configured ``server.slot_unavailable_retry_after``
+    (default ``5``, the knob the router-level slot ``503`` already advertises)
+    is the best available hint, so the two slot surfaces cannot disagree about
+    the order of magnitude. The value is rounded **up**, never down. The 1 s
+    floor and the ``server.max_retry_after_seconds`` cap are applied by
+    :func:`_refusal_retry_timing`, never re-derived here
+    (LP-0MVUXY1CL005KWCC AC2).
+    """
+    measured = 0.0
+    try:
+        measured = float(_local_occupant_prefill_seconds() or 0.0)
+    except Exception:  # pragma: no cover - the probe is already fail-open
+        measured = 0.0
+    if measured > 0.0:
+        return max(1, int(math.ceil(measured)))
+    fallback = _get_slot_unavailable_retry_after(
+        config if isinstance(config, dict) else {}
+    )
+    return max(1, int(math.ceil(fallback)))
+
+
 def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slots: int = 0, unavailable_providers: dict | None = None, diagnostics: list[dict[str, Any]] | None = None, model_config: dict | None = None, config: dict | None = None) -> Response:
     """Build the response when all providers are exhausted.
 
@@ -5808,6 +6170,13 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     retryable 429 carrying ``Retry-After`` plus the ETA guidance headers
     instead of the generic exhaustion body, so the refusal is actionable.
 
+    The slot-exhaustion branch carries retry timing as well
+    (LP-0MVUXY1CL005KWCC): ``Retry-After`` == body ``retry_after``, plus
+    ``retry_at`` and ``retryable: true``, derived from the measured remaining
+    occupant service or ``server.slot_unavailable_retry_after``.
+    ``proxy/tests/test_admission_refusal_retry_contract.py`` pins the builder
+    contract for every client-facing admission refusal.
+
     Verified end-to-end by ``proxy/tests/test_overnight_exhaustion_e2e.py``
     (LP-0MV728XBH00546FB): ``Retry-After`` / ``retry_after`` are identical,
     the stable ``code`` discriminator is present, the advertisement cap is
@@ -5816,15 +6185,37 @@ def _build_exhausted_response(all_local_slot_exhaustion: bool = False, total_slo
     if all_local_slot_exhaustion:
         # total_slots may be 0 if unknown; still format per acceptance criteria.
         # JSON keeps the machine-readable ``code`` alongside the retained prose.
+        #
+        # Retry timing (LP-0MVUXY1CL005KWCC): the last timer-free admission
+        # refusal now answers *when* to retry, using the same vocabulary as the
+        # other refusals — ``Retry-After`` equal to the body ``retry_after``,
+        # plus ``retry_at`` (RFC 3339 UTC) and ``retryable``. The delay is the
+        # measured remaining occupant service, else
+        # ``server.slot_unavailable_retry_after``; the shared
+        # :func:`_refusal_retry_timing` helper owns the 1 s floor and the
+        # ``server.max_retry_after_seconds`` cap so there is no second timer
+        # formula.
+        timing = _refusal_retry_timing(
+            EXHAUSTION_CODE_SLOTS,
+            advertised_retry_after=_slot_exhaustion_retry_after_seconds(config),
+            config=config,
+        )
         slot_payload: dict[str, Any] = {
             "error": "All providers exhausted",
             "code": EXHAUSTION_CODE_SLOTS,
             "message": f"Model server busy: 0/{int(total_slots)} slots available. Retry later.",
+            "retryable": timing.retryable,
+            "retry_after": timing.retry_after,
         }
+        if timing.retry_at is not None:
+            slot_payload["retry_at"] = timing.retry_at
+        slot_headers: dict[str, str] = {"Cache-Control": "no-store"}
+        slot_headers.update(_refusal_timing_headers(timing, None, None))
         return Response(
             content=json.dumps(slot_payload).encode("utf-8"),
             status_code=429,
             media_type="application/json",
+            headers=slot_headers,
         )
 
     admission_reject = _local_admission_reject_payload(diagnostics)
@@ -6563,6 +6954,13 @@ def _local_occupant_prefill_seconds(
 LOCAL_FALLBACK_RETRY_AFTER_ATTR = "_local_fallback_retry_after_s"
 LOCAL_FALLBACK_TOKEN_EVIDENCE_ATTR = "_local_fallback_token_evidence"
 
+#: Request attribute holding the capacity gate's admission verdict
+#: (:func:`proxy.capacity_admission.evaluate_capacity_admission`). The dispatch
+#: guard reads it so a request this gate admitted against MEASURED idle
+#: slot-time is not then refused by the flat cold-prefill token cap it has
+#: already out-priced (LP-0MVXWQQ20002HAX4).
+LOCAL_CAPACITY_ADMISSION_ATTR = "_local_capacity_admission"
+
 #: Outcome stamped on ``request._local_routing_outcome``: what the proxy
 #: actually did with the request's local-route intent. The closed vocabulary of
 #: the single per-request outcome line (LP-0MVSM06Z8003UQTM) — every decision
@@ -6625,6 +7023,173 @@ def _stamp_local_routing_outcome(request, outcome: str) -> None:
         pass
 
 
+#: Server-config key holding the bounded-deferral threshold
+#: (``proxy/config.yaml``; ``0`` disables the escalation — LP-0MVUH9PL0005PW90).
+DEFERRAL_MAX_REFUSALS_KEY = "local_deferral_max_refusals"
+
+#: Documented default, mirrored by :data:`proxy.local_deferral.DEFAULT_MAX_REFUSALS`.
+DEFAULT_DEFERRAL_MAX_REFUSALS = local_deferral.DEFAULT_MAX_REFUSALS
+
+#: Additive refusal-body fields that advertise the remaining budget (AC7).
+DEFERRAL_BODY_REFUSALS = "deferral_refusals"
+DEFERRAL_BODY_REFUSALS_REMAINING = "deferral_refusals_remaining"
+
+
+def _deferral_max_refusals(config: dict | None) -> int:
+    """The single threshold source: ``local_deferral_max_refusals`` (AC5).
+
+    ``0`` (or a negative value) disables the escalation, which restores today's
+    unbounded deferral exactly. An unparsable value falls back to the documented
+    default rather than silently turning the bound off.
+    """
+    server_cfg = config.get("server", config) if isinstance(config, dict) else None
+    if not isinstance(server_cfg, dict):
+        return DEFAULT_DEFERRAL_MAX_REFUSALS
+    raw = server_cfg.get(DEFERRAL_MAX_REFUSALS_KEY)
+    if raw is None:
+        return DEFAULT_DEFERRAL_MAX_REFUSALS
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not an integer; using the default %d",
+            DEFERRAL_MAX_REFUSALS_KEY,
+            raw,
+            DEFAULT_DEFERRAL_MAX_REFUSALS,
+        )
+        return DEFAULT_DEFERRAL_MAX_REFUSALS
+
+
+def _deferral_budget_body_fields(
+    session, timing: "RefusalRetryTiming", config: dict | None
+) -> dict[str, int]:
+    """Count this refusal and return the additive budget fields (AC7).
+
+    The counter hooks the **existing** retryability decision: a retryable
+    refusal spends one unit of the session's budget and reports the count and
+    the remainder; a non-retryable refusal (a prompt that can never fit local)
+    is not a deferral at all, so it **resets** the budget instead of escalating
+    a client that must compact first (AC8).
+
+    No session id, or the escalation switched off, means today's behaviour: no
+    fields, no counting.
+    """
+    threshold = _deferral_max_refusals(config)
+    if threshold <= 0 or not session or session == "unknown":
+        return {}
+    if not getattr(timing, "retryable", False):
+        local_deferral.reset(session)
+        return {}
+    count = local_deferral.record_refusal(session, threshold=threshold)
+    return {
+        DEFERRAL_BODY_REFUSALS: count,
+        DEFERRAL_BODY_REFUSALS_REMAINING: max(0, threshold - count),
+    }
+
+
+def _log_deferral_escalation(
+    session: str, count: int, threshold: int, *, preference: str | None = None
+) -> None:
+    """The one line an escalation owes (AC6): session, count and threshold.
+
+    Visible and attributable by construction: the LP-0MVNU2KTK009D4AG lesson is
+    that spending remote budget without a log line makes the spend
+    unreconstructable from ``proxy.log``.
+    """
+    logger.warning(
+        "local_deferral_escalated session=%s refusals=%d threshold=%d "
+        "preference=%s reason=%s — the session spent its retryable local-capacity "
+        "refusal budget, so the local route was skipped for this request and a "
+        "remote tier served it",
+        session,
+        count,
+        threshold,
+        preference or PREF_LOCAL_PREFERRED,
+        LOCAL_FALLBACK_DEFERRAL_EXHAUSTED,
+    )
+
+
+def _request_session_id(request) -> str | None:
+    """The request's session id, resolved case-insensitively (or ``None``)."""
+    try:
+        from proxy.session import _resolve_session_id_header
+
+        raw_headers = getattr(request, "headers", {}) or {}
+        resolved, _source = _resolve_session_id_header(raw_headers)
+        if resolved:
+            return resolved
+    except Exception:  # pragma: no cover - attribution is best-effort
+        pass
+    return None
+
+
+def _has_non_local_provider(model_config: dict | None) -> bool:
+    """True when the chain has an entry the escalated request could be served by."""
+    for entry in (model_config or {}).get("providers") or []:
+        if isinstance(entry, dict) and entry.get("type", "remote") != "local":
+            return True
+    return False
+
+
+def _deferral_escalation_applies(
+    request,
+    model_config: dict | None,
+    config: dict | None,
+    preference: str | None,
+) -> bool:
+    """Decide — once — that a refusal must become a promotion (AC5/AC6/AC7).
+
+    This is the bounded-deferral decision: a **pin-local** request whose session
+    has already been given ``local_deferral_max_refusals`` retryable
+    local-capacity refusals is not refused again; it is promoted to the next
+    provider instead. Called at exactly the two places a pin-local request would
+    otherwise be *refused* — the loop-head choke point and the admission-refusal
+    branch — so the decision is one implementation and both dispatch cycles
+    agree with the pin predicate (AC7).
+
+    Three conditions keep the escalation honest:
+
+    * a *spent* budget for this session (the
+      :mod:`proxy.local_deferral` store owns the counting, TTL and cap);
+    * a **non-local entry to serve the request** — a ``private`` (remote-less)
+      chain keeps refusing, which is the documented cost-capped escape hatch
+      (parent assumption A4);
+    * the escalation switched on (``local_deferral_max_refusals > 0``).
+
+    Side effects on ``True``: the escalation reason token is stamped on the
+    request (so the response header, the ``reason=`` log field and the outcome
+    line all name it) and exactly one escalation line is emitted for the
+    request, however many cycle re-entries it takes.
+    """
+    if preference != PREF_LOCAL_PREFERRED:
+        return False
+    threshold = _deferral_max_refusals(config)
+    if threshold <= 0:
+        return False
+    session = _request_session_id(request)
+    if not session:
+        return False
+    if not local_deferral.budget_spent(session, threshold=threshold):
+        return False
+    if not _has_non_local_provider(model_config):
+        return False
+    try:
+        escalations = int(getattr(request, "_deferral_escalations", 0) or 0) + 1
+        setattr(request, "_deferral_escalations", escalations)
+        setattr(request, "_local_routing_outcome", LOCAL_ROUTING_OUTCOME_PROMOTED)
+    except Exception:  # pragma: no cover - stamping is best-effort
+        escalations = 1
+    _note_local_fallback_reason(request, LOCAL_FALLBACK_DEFERRAL_EXHAUSTED)
+    if escalations == 1:
+        _log_deferral_escalation(
+            session,
+            local_deferral.refusal_count(session, threshold=threshold),
+            threshold,
+            preference=preference,
+        )
+    return True
+
+
 def _note_local_fallback_reason(
     request, reason: str | None, retry_after_s: int | float | None = None
 ) -> None:
@@ -6672,19 +7237,28 @@ def _note_local_token_evidence(
 
 
 def _request_local_preference(request) -> str:
-    """Return the request's ``X-Local-Preference`` (default ``prefer-local``).
+    """Return the request's ``X-Local-Preference`` (default ``remote-ok``).
 
-    Unknown values fall back to today's behaviour (AC8). The parsed value is
-    cached on the request so both routing cycles and the refusal path agree —
-    which is also what makes the legacy-alias deprecation in
-    :func:`admission_reserve.parse_preference` once per *request* rather than
-    once per decision (LP-0MVSHWYVE005MS16 AC2).
+    An **unknown** value resolves to the default and logs one ``WARNING``
+    naming the value received and the default it resolved to
+    (LP-0MVUH9PUU005HVS4 AC22): the header stays additive, but a client typo
+    must be visible in ``proxy.log``. The parsed value is cached on the request
+    so both routing cycles and the refusal path agree.
+
+    A **retired** value raises :class:`LocalPreferenceRetiredError` instead of
+    falling back (LP-0MVUH9PAZ002UAPA AC1/AC2): the retirement must fail closed
+    on every path, so it is never swallowed into a live value here. The request
+    entry points reject such a request before this is ever reached; a raise
+    from here therefore means a caller bypassed them, and staying loud is
+    better than routing a policy the client did not ask for.
     """
     cached = getattr(request, "_local_preference", None)
     if cached:
         return cached
     try:
         preference = parse_preference(getattr(request, "headers", {}) or {})
+    except LocalPreferenceRetiredError:
+        raise
     except Exception:
         preference = DEFAULT_PREFERENCE
     try:
@@ -6692,6 +7266,71 @@ def _request_local_preference(request) -> str:
     except Exception:
         pass
     return preference
+
+
+def _log_retired_local_preference(
+    request, exc: LocalPreferenceRetiredError
+) -> None:
+    """Emit the one attributable ``WARNING`` a rejection owes (parent AC2).
+
+    The line names the retired value, its live successors and the session id
+    when one is resolvable, so a deployed client still on the withdrawn
+    spelling can be identified from ``proxy.log`` alone. It never raises: a
+    rejection must not turn into an error because the log could not be built.
+    """
+    session_id = "unknown"
+    try:
+        from proxy.session import _resolve_session_id_header
+
+        # ``_resolve_session_id_header`` looks up lowercase keys, which
+        # Starlette's Headers satisfy but a plain dict (in-process callers,
+        # test doubles) does not: normalise before resolving so the line stays
+        # attributable however the request was built.
+        raw_headers = getattr(request, "headers", {}) or {}
+        try:
+            lookup = {str(key).lower(): value for key, value in raw_headers.items()}
+        except Exception:
+            lookup = raw_headers
+        resolved, _source = _resolve_session_id_header(lookup)
+        session_id = resolved or "unknown"
+    except Exception:
+        pass
+    logger.warning(
+        "X-Local-Preference=%r is retired; rejected with 400 "
+        "(code=local_preference_retired) — send %s (session=%s)",
+        exc.value,
+        " or ".join(repr(successor) for successor in exc.successors),
+        session_id,
+    )
+
+
+def _retired_local_preference_response(request, model_config: dict) -> Response | None:
+    """Reject a retired ``X-Local-Preference`` **before** any routing state.
+
+    One implementation for both dispatch entry points (parent AC1: the
+    rejection is emitted before routing, queueing, leasing, dispatch or
+    cooldown state exists). Returns ``None`` — the request proceeds — for every
+    live value, every unknown value (still additive, AC8) and an absent header.
+
+    The parsed value is cached on the request exactly as
+    :func:`_request_local_preference` does, so a valid request is still parsed
+    once per request and not once per decision.
+    """
+    headers = getattr(request, "headers", {}) or {}
+    try:
+        preference = parse_preference(headers)
+    except LocalPreferenceRetiredError as exc:
+        _log_retired_local_preference(request, exc)
+        return JSONResponse(
+            status_code=400, content=retired_preference_body(exc)
+        )
+    except Exception:
+        return None
+    try:
+        setattr(request, "_local_preference", preference)
+    except Exception:
+        pass
+    return None
 
 
 def _local_capacity_verdict_for_request(request):
@@ -6751,8 +7390,9 @@ def _local_preference_pins_local(request, preference: str | None = None) -> bool
       the remote tiers and must **not** be refused for local capacity
       (parent AC4). Chain-level stripping and the promoted outcome line belong
       to LP-0MVSM06LB001PRU4; this predicate only declines the pin.
-    * ``prefer-local`` / ``remote-ok`` / absent header — never pinned, exactly
-      as today (parent AC5).
+    * ``remote-ok`` / absent header — never pinned: the default is the
+      immediate-step policy, so a pin never applies to it (parent AC5).
+      (``prefer-local`` is retired and answers ``400`` before routing.)
 
     Fail-safe direction (parent constraints): an unclassifiable exit stays
     pinned, because
@@ -6782,8 +7422,8 @@ async def _promote_too_large_local_request(
     Called once per cycle, after the authoritative routing estimate exists and
     **before** the dispatch loop. A ``too_large`` verdict means the prompt
     outgrows the local serving envelope, so waiting cannot help: the local
-    entry is removed from the chain at resolution time (the same filter
-    ``remote-ok`` uses, :func:`proxy.priority.apply_local_preference`) and the
+    entry is removed from the chain at resolution time (the capacity filter
+    :func:`proxy.priority.apply_local_preference`) and the
     remote tiers serve the request with no local attempt, no queue entry, no
     lease and no local-capacity 429 (parent AC4). A ``deferrable`` verdict
     leaves the chain untouched — a fits-local request stays pinned.
@@ -6804,8 +7444,9 @@ async def _promote_too_large_local_request(
     :func:`admission_reserve.local_capacity_verdict` — the single verdict
     source (parent AC1/AC3); no reason or size table is re-derived here.
 
-    Only a pin-local (``local-preferred``) request is eligible: ``prefer-local``
-    and ``remote-ok`` keep today's behaviour (parent AC5). A chain with no
+    Only a pin-local (``local-preferred``) request is eligible: ``remote-ok``
+    (the default) and a headerless request keep the immediate-step behaviour
+    (parent AC5). A chain with no
     non-local entry is left intact (the filter's remote-less carve-out):
     stripping it would manufacture an empty-chain exhaustion, so the local
     route keeps its existing deferral/refusal exits (parent A5/AC5).
@@ -6876,6 +7517,10 @@ async def _promote_too_large_local_request(
         # attempt/deferral/refusal behaviour applies. Nothing to cache — a
         # cached ``too_large`` would change the pin decision.
         return chain
+    # A ``too_large`` promotion is a different outcome from a deferral, so it
+    # clears the session's deferral budget (LP-0MVUH9PL0005PW90 AC8): the
+    # prompt, not the wait, was the problem.
+    local_deferral.reset(session_id)
     try:
         setattr(request, "_local_capacity_verdict", verdict)
         setattr(request, "_local_routing_outcome", LOCAL_ROUTING_OUTCOME_PROMOTED)
@@ -6927,6 +7572,14 @@ def _log_local_only_refusal(
     reason: str | None,
     preference: str | None = None,
     verdict: str | None = None,
+    *,
+    session: str | None = None,
+    provider: str | None = None,
+    priority: str | None = None,
+    new_tokens: int | None = None,
+    budget_tokens: int | None = None,
+    eta_prefill_seconds: float | None = None,
+    budget_seconds: float | None = None,
 ) -> None:
     """One attributable line per pin-local refusal (parent AC4/AC5).
 
@@ -6940,36 +7593,82 @@ def _log_local_only_refusal(
     LP-0MVSMINPR006SWT6: the refusal builder also passes the capacity
     ``verdict`` (``deferrable`` / ``too_large``) computed once by
     :func:`admission_reserve.local_capacity_verdict`, so the line reports the
-    same classification as the 429 body rather than a second guess. The key is
-    appended only when supplied: the free-slot/exhausted caller keeps its
-    two-key line byte-identical.
+    same classification as the 429 body rather than a second guess.
+
+    LP-0MVNTJQVB007QWEZ: the line is the *countable* token for this failure
+    class (``decision=reject`` is shared with the ``remote-ok`` fall-through
+    that is served remotely), so it also carries the dispatch context
+    (``session`` / ``provider`` / ``priority``) and the admission decision's own
+    evidence (``new_tokens`` / ``budget_tokens`` / ``eta_prefill_seconds`` /
+    ``budget_seconds``) plus the constant ``route=refused``. Every optional key
+    is appended only when supplied — a missing value is omitted, never guessed.
 
     ``preference`` is the *parsed* intent threaded in by the call sites; it
     defaults to ``PREF_LOCAL_ONLY`` so a direct builder caller (and the
     pre-existing log contract) keeps its current spelling.
     """
     try:
-        if verdict is None:
-            logger.info(
-                "local_only_refused reason=%s preference=%s",
-                reason or LOCAL_ROUTE_UNAVAILABLE,
-                preference or PREF_LOCAL_ONLY,
-            )
-        else:
-            logger.info(
-                "local_only_refused reason=%s preference=%s verdict=%s",
-                reason or LOCAL_ROUTE_UNAVAILABLE,
-                preference or PREF_LOCAL_ONLY,
-                verdict,
-            )
+        fields = [
+            f"reason={reason or LOCAL_ROUTE_UNAVAILABLE}",
+            f"preference={preference or PREF_LOCAL_ONLY}",
+        ]
+        if verdict is not None:
+            fields.append(f"verdict={verdict}")
+        if session:
+            fields.append(f"session={session}")
+        if provider:
+            fields.append(f"provider={provider}")
+        if priority:
+            fields.append(f"priority={priority}")
+        if new_tokens is not None:
+            fields.append(f"new_tokens={int(new_tokens)}")
+        if budget_tokens is not None:
+            fields.append(f"budget_tokens={int(budget_tokens)}")
+        if eta_prefill_seconds is not None:
+            fields.append(f"eta_prefill_seconds={round(float(eta_prefill_seconds), 1)}")
+        if budget_seconds is not None:
+            fields.append(f"budget_seconds={round(float(budget_seconds), 1)}")
+        fields.append("route=refused")
+        logger.info("local_only_refused %s", " ".join(fields))
     except Exception:  # pragma: no cover - observability is best-effort
         pass
+
+
+def _refusal_dispatch_context(
+    request: Any,
+    provider: str | None = None,
+    priority: str | None = None,
+) -> dict[str, str]:
+    """Dispatch context fields for the ``local_only_refused`` line (AC2).
+
+    LP-0MVNTJQVB007QWEZ: a refusal is only attributable if the line names the
+    request it refused and the provider that could not serve it. The session is
+    resolved from the same ``X-Session-Id`` chain every other line uses; a
+    request without one reports ``unknown`` (never an empty value). Best-effort:
+    observability must never break a refusal.
+    """
+    context: dict[str, str] = {}
+    try:
+        from proxy.session import _resolve_session_id_header
+
+        session_id, _ = _resolve_session_id_header(
+            getattr(request, "headers", {}) or {}
+        )
+        context["session"] = session_id or "unknown"
+    except Exception:  # pragma: no cover - attribution is best-effort
+        context["session"] = "unknown"
+    if provider:
+        context["provider"] = provider
+    if priority:
+        context["priority"] = priority
+    return context
 
 
 def _build_local_only_refusal_response(
     attempt: dict[str, Any] | None,
     config: dict | None = None,
     preference: str | None = None,
+    context: dict[str, str] | None = None,
 ) -> Response:
     """429 for a pin-local request that could not be served locally (AC4).
 
@@ -6984,6 +7683,15 @@ def _build_local_only_refusal_response(
     reasons carry ``Retry-After`` + ``retry_at``, reasons waiting cannot heal
     carry neither (LP-0MVNTT4X8009IO2X AC1/AC2). Adds
     ``X-Local-Route: refused``.
+
+    This is the **only** builder a pin-local request can be refused with
+    (LP-0MVNTJJGX00375VQ AC1/AC2): both the contention-queue/lease
+    ``refused_local_only`` branches and the direct free-slot admission guard
+    return it, so a pinned client sees one body/header shape and one truthful
+    prose whichever path refused it. ``All providers exhausted`` stays reserved
+    for :func:`_build_exhausted_response`, i.e. a chain that really did exhaust
+    — a pinned request never consults the rest of the chain, so claiming
+    exhaustion for its refusal was the 2026-10-25 defect.
 
     LP-0MVSMINPR006SWT6: this builder is the **only** place in ``provider.py``
     that classifies a refusal, and it delegates that classification to
@@ -7036,8 +7744,9 @@ def _build_local_only_refusal_response(
         "error": "Local admission refused",
         "code": EXHAUSTION_CODE_LOCAL_ADMISSION,
         "detail": (
-            "local admission refused: the projected wait exceeds the wait "
-            "budget and X-Local-Preference: local-only forbids remote fallback"
+            "local admission refused: the request is pinned to the local route "
+            "(X-Local-Preference: local-only / local-preferred) and the local "
+            "capacity guard refused it; no remote provider was used"
         ),
         "reason": reason,
         # Additive only (parent AC2/AC3): every pre-existing field and header
@@ -7057,6 +7766,14 @@ def _build_local_only_refusal_response(
         payload["new_tokens"] = new_tokens
     if budget_tokens is not None:
         payload["budget_tokens"] = budget_tokens
+    # Bounded deferral (LP-0MVUH9PL0005PW90 AC3): the refusal advertises the
+    # budget it just spent, so the client can compact or switch preference
+    # instead of discovering the escalation by surprise. Purely additive —
+    # appended after every pre-existing key, and absent for a non-retryable
+    # refusal, a keyless request and the disabled knob.
+    payload.update(
+        _deferral_budget_body_fields((context or {}).get("session"), timing, config)
+    )
     headers = {
         "Cache-Control": "no-store",
         "X-Local-Admission": "reject",
@@ -7069,7 +7786,16 @@ def _build_local_only_refusal_response(
     # One line per refusal, naming the reason the client is told about, the
     # intent that produced it and the verdict computed above (parent AC4).
     _log_local_only_refusal(
-        reason, preference=preference, verdict=capacity.verdict
+        reason,
+        preference=preference,
+        verdict=capacity.verdict,
+        session=(context or {}).get("session"),
+        provider=(context or {}).get("provider"),
+        priority=(context or {}).get("priority"),
+        new_tokens=new_tokens,
+        budget_tokens=budget_tokens,
+        eta_prefill_seconds=eta,
+        budget_seconds=budget,
     )
     return Response(
         content=json.dumps(payload).encode("utf-8"),
@@ -7246,6 +7972,25 @@ def _stamp_local_route_headers(
     except Exception:  # pragma: no cover - header stamping is best-effort
         logger.debug("route header stamping failed", exc_info=True)
         stamped = response
+    # A local serve clears the session's deferral budget (LP-0MVUH9PL0005PW90
+    # AC8): the wait it was being asked to retry has been answered. Read from
+    # the *stamped* route rather than from the dispatch path so every local
+    # success (either cycle, direct or compaction-rescued) resets exactly once.
+    try:
+        if getattr(stamped, "headers", {}).get("X-Local-Route") == "local":
+            from proxy.session import _resolve_session_id_header
+
+            raw_headers = getattr(request, "headers", {}) or {}
+            try:
+                lookup = {
+                    str(key).lower(): value for key, value in raw_headers.items()
+                }
+            except Exception:
+                lookup = raw_headers
+            resolved, _source = _resolve_session_id_header(lookup)
+            local_deferral.reset(resolved)
+    except Exception:  # pragma: no cover - bookkeeping must not break the request
+        logger.debug("deferral budget reset on local success failed", exc_info=True)
     _log_local_preference_resolved(stamped, request, model_config)
     return stamped
 
@@ -7303,6 +8048,41 @@ SKIP_REASON_LOCAL_LEASE_ACTIVE = _canonical_local_fallback_reason(
     "local_lease_active"
 )
 
+#: Reason-scoped local 5xx release (LP-0MVWFKESK0005G61): the measured
+#: cache-deficit abort released the dispatch because this *prompt* cannot be
+#: served in time, not because local is unhealthy. The token names that detour
+#: on the request so a log reader can tell it apart from a genuine local fault
+#: and from the entry-wide ``local_provider_cooldown`` it replaces.
+SKIP_REASON_MEASURED_CACHE_DEFICIT = _canonical_local_fallback_reason(
+    MEASURED_CACHE_DEFICIT_REASON
+)
+
+#: Thrash-gate refusal tokens (LP-0MVXSSYTN001TBW5): the router's post-deadline
+#: local gate refused this request's dispatch because the request itself is
+#: already terminal for local (``post_deadline_terminal``) or because the
+#: session/prompt is inside its post-deadline window
+#: (``prefill_thrash_cooldown``). Both are verdicts on the request, not on
+#: local's health — a neighbour's aborted prompt must never become a 60 s
+#: entry-wide outage. Spelled as literals here (and in router_helpers, which
+#: owns the gate) because ``router_helpers`` imports ``provider`` lazily: the
+#: drift guard is a test asserting these keys equal the gate's own constants.
+SKIP_REASON_POST_DEADLINE_TERMINAL = _canonical_local_fallback_reason(
+    "post_deadline_terminal"
+)
+SKIP_REASON_PREFILL_THRASH_COOLDOWN = _canonical_local_fallback_reason(
+    "prefill_thrash_cooldown"
+)
+
+#: Local-dispatch markers (``X-Local-Dispatch-Reason``) that name a *deferral*
+#: rather than a local fault, mapped to the skip/canonical reason token the
+#: fallback loop records and logs. The deferral is reason-scoped: a marker that
+#: is absent or not listed here keeps the pre-existing entry quarantine.
+DEFERRABLE_LOCAL_DISPATCH_REASONS: dict[str, str] = {
+    MEASURED_CACHE_DEFICIT_REASON: SKIP_REASON_MEASURED_CACHE_DEFICIT,
+    "post_deadline_terminal": SKIP_REASON_POST_DEADLINE_TERMINAL,
+    "prefill_thrash_cooldown": SKIP_REASON_PREFILL_THRASH_COOLDOWN,
+}
+
 #: Local-route exits whose retry hint is a *real* availability expiry rather
 #: than the ETA formula (LP-0MVQ23B80009OZ9V AC1–AC4). An exit records the
 #: expiry it measured via ``_note_local_fallback_reason(..., retry_after_s=)``;
@@ -7314,7 +8094,7 @@ REAL_EXPIRY_FALLBACK_REASONS = frozenset({
     SKIP_REASON_USAGE_LIMIT_RESET_PENDING,
     SKIP_REASON_OUTSIDE_AVAILABLE_WINDOW,
     SKIP_REASON_LOCAL_LEASE_ACTIVE,
-    "prefill_thrash_cooldown",
+    SKIP_REASON_PREFILL_THRASH_COOLDOWN,
     "fallback_after_queue",
 })
 
@@ -7558,6 +8338,8 @@ def _build_deferral_refusal_response(
     *,
     retry_after_s: int | float | None = None,
     elapsed_wait_seconds: float | None = None,
+    provider: str | None = None,
+    priority: str | None = None,
 ) -> Response | None:
     """End a spent local deferral in the retryable 429 (parent AC3/AC6).
 
@@ -7581,7 +8363,7 @@ def _build_deferral_refusal_response(
       re-derived estimate.
 
     Returns ``None`` — leaving the caller's pre-existing ``continue`` exactly
-    as it was — when the request is not pinned to local (``prefer-local`` /
+    as it was — when the request is not pinned to local (``remote-ok`` /
     ``remote-ok`` / absent header keep today's fall-through) or when its
     verdict is ``too_large`` (waiting cannot help; that request is promoted to
     the remote tiers by the sibling chain-stripping slice, never refused for
@@ -7595,7 +8377,14 @@ def _build_deferral_refusal_response(
     if elapsed_wait_seconds is not None:
         attempt["elapsed_wait_seconds"] = round(float(elapsed_wait_seconds), 3)
     response = _build_local_only_refusal_response(
-        attempt, config, preference=preference
+        attempt,
+        config,
+        preference=preference,
+        # A spent deferral has no provider in scope by name, but the session
+        # still attributes the refusal (LP-0MVNTJQVB007QWEZ AC2).
+        context=_refusal_dispatch_context(
+            request, provider=provider, priority=priority
+        ),
     )
     # The deferral outcome is stamped where the deferral ends, so the single
     # per-request line can tell a spent deferral (``deferred``) from chain
@@ -7621,7 +8410,7 @@ async def _build_local_only_refusal_for_remote(
     header normalised to it by :func:`admission_reserve.parse_preference`
     (LP-0MVSHWYVE005MS16 AC5) — the dispatch loop must NEVER hand the request
     to a non-local provider, regardless of which skip branch the local route
-    took — the structural analogue of ``remote-ok`` being enforced by
+    took — the structural analogue of the capacity promotion being enforced by
     ``apply_local_preference()`` (intent enforced by structure, not by
     remembering to patch each ``continue``). Called at the head of both
     dispatch cycles immediately after the next candidate provider is resolved;
@@ -7639,9 +8428,11 @@ async def _build_local_only_refusal_for_remote(
 
     Inert for a local candidate (the request still completes locally) and,
     through the single pin predicate
-    :func:`_local_preference_pins_local`, for ``prefer-local`` / absent header /
-    ``remote-ok`` clients, so AC3 byte-compatibility and the ``remote-ok``
-    strip are preserved. The predicate also declines the pin when the request's
+    :func:`_local_preference_pins_local`, for ``remote-ok`` / absent header /
+    ``remote-ok`` clients, so AC3 byte-compatibility is preserved and a
+    ``remote-ok`` request keeps the local route (it falls through at the
+    admission decision instead — LP-0MVUH9OYZ007GMWF AC1/AC4). The predicate
+    also declines the pin when the request's
     capacity verdict is ``too_large`` (LP-0MVSLZY470051ZB2 AC4): a prompt that
     outgrows the local serving envelope is never refused for local capacity —
     it falls through to the remote tiers. The refusal is terminal for the
@@ -7666,6 +8457,13 @@ async def _build_local_only_refusal_for_remote(
     if not _local_preference_pins_local(request, preference):
         return None
     if provider_cfg.get("type", "remote") == "local":
+        return None
+    if _deferral_escalation_applies(request, model_config, config, preference):
+        # The session already spent its retryable-refusal budget: refuse
+        # nothing, let this (non-local) candidate serve the request. The
+        # escalation token is stamped on the request, so the response names
+        # ``deferral_refusals_exhausted`` rather than a deferral reason
+        # (LP-0MVUH9PL0005PW90 AC5/AC6).
         return None
     reason = getattr(request, "_local_fallback_reason", None)
     if not reason:
@@ -7706,8 +8504,16 @@ async def _build_local_only_refusal_for_remote(
     # The parsed intent is threaded through so the single refusal line names the
     # preference that actually caused the refusal (LP-0MVSMINPR006SWT6 AC4);
     # the builder computes the verdict exactly once and never re-derives it.
+    # The dispatch context (session + the provider the chain resolved) is
+    # threaded too, so the refusal is attributable from the log line alone
+    # (LP-0MVNTJQVB007QWEZ AC2).
     response = _build_local_only_refusal_response(
-        attempt, config, preference=preference
+        attempt,
+        config,
+        preference=preference,
+        context=_refusal_dispatch_context(
+            request, provider=(provider_cfg or {}).get("name")
+        ),
     )
     # Pin refusal: the client's intent was honoured and the request was not
     # promoted (LP-0MVSM06Z8003UQTM).
@@ -7726,6 +8532,7 @@ async def _prefill_admission_guard(
     endpoint: str | None = None,
     reason_label: str | None = None,
     free_slot: bool = False,
+    capacity_admitted: bool = False,
 ):
     """Evaluate (and log) the prefill-ETA admission guard.
 
@@ -7745,7 +8552,19 @@ async def _prefill_admission_guard(
     *reason_label* / *free_slot* let the direct (free-slot) dispatch guard
     (LP-0MVIQ0F8T002FS42) reuse this one implementation and one budget source
     while logging the decision as ``eta_exceeds_budget_direct`` — the log line
-    is emitted exactly once, by this helper.
+    is emitted exactly once, by this helper. That label is a *dispatch* label
+    for the ETA/budget bound only: a deadline, deadline-relative safety-budget
+    or flat cold-prefill refusal replaces it with the decision's own reason
+    (``prefill_eta_exceeds_deadline`` / ``prefill_eta_exceeds_safety_budget`` /
+    ``prefill_budget_exceeded``), so a non-ETA bound is never relabelled and
+    the reason-driven retry contract stays truthful on both dispatch paths
+    (LP-0MVRO3AHN002UM1Q AC1/AC8).
+
+    *capacity_admitted* (LP-0MVXWQQ20002HAX4) says the capacity gate has
+    already admitted this request against MEASURED idle slot-time and the
+    prefill deadline, so the flat cold-prefill token cap must not override it
+    (the measured bounds still do). Without it the two gates contradict each
+    other: routing admitted the prompt and the guard then always refused it.
     """
     try:
         from proxy import prefill_eta
@@ -7796,6 +8615,7 @@ async def _prefill_admission_guard(
             busy_slots=occupancy,
             in_flight_prefills=in_flight_prefills,
             occupant_prefill_seconds=occupant_prefill_seconds,
+            capacity_admitted=capacity_admitted,
         )
         if not decision.active:
             return None
@@ -7889,6 +8709,79 @@ def _set_queue_wait_on_request(request, elapsed: float) -> None:
         setattr(request, "_contention_queue_wait_seconds", float(elapsed or 0.0))
     except Exception:
         pass
+
+
+#: Request attribute holding the queued request's OWN priced new-token count,
+#: stamped when it enters the contention queue (LP-0MVV29WR0009DY1A AC2). The
+#: ``contention_queue_dispatch`` / ``contention_queue_fallback_after_queue``
+#: lines that end the same wait read it back, so all three lines of one queue
+#: wait carry identical, own-request evidence and the conversion harness never
+#: has to join a wait to another request's admission.
+CONTENTION_QUEUE_NEW_TOKENS_ATTR = "_contention_queue_new_tokens"
+
+
+def _queue_own_new_tokens(
+    config: dict,
+    provider_cfg: dict,
+    session_id: str | None,
+    estimated_tokens: int | None,
+    messages: list | None,
+    decision=None,
+) -> int | None:
+    """Return *this request's* priced new (uncached) token count.
+
+    The admission guard's own decision is preferred — it priced this exact
+    prompt against this exact prefix ratio. When the guard is inert the prompt is
+    priced from the routing ratio exactly as the dispatch path does
+    (``int(estimated_tokens * (1 - expected_cached_ratio(...)))``), so the
+    enqueue, dispatch and fallback lines of one wait band identically.
+
+    ``None`` (logged by callers as ``new_tokens=unknown``) when the prompt cannot
+    be priced — an absent field is honest, a guessed band is not.
+    """
+    if decision is not None:
+        value = getattr(decision, "new_tokens", None)
+        if value is not None:
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                pass
+    try:
+        tokens = max(0, int(estimated_tokens or 0))
+        if tokens <= 0:
+            return None
+        model_name = (
+            provider_cfg.get("llama_model", "")
+            if isinstance(provider_cfg, dict)
+            else ""
+        )
+        server_cfg = config.get("server", config) if isinstance(config, dict) else {}
+        ratio = expected_cached_ratio(
+            model_name, session_id, tokens, messages, server_config=server_cfg
+        )
+        return max(0, int(round(tokens * (1.0 - ratio))))
+    except Exception:
+        logger.debug("queue-wait new_tokens pricing failed", exc_info=True)
+        return None
+
+
+def _stamp_queue_new_tokens(request, value: int | None) -> None:
+    """Best-effort stamp of :data:`CONTENTION_QUEUE_NEW_TOKENS_ATTR`."""
+    if value is None:
+        return
+    try:
+        setattr(request, CONTENTION_QUEUE_NEW_TOKENS_ATTR, int(value))
+    except Exception:
+        pass
+
+
+def _queue_new_tokens_from_request(request) -> int | None:
+    """Read back the enqueue-time pricing stamped on *request*, if any."""
+    try:
+        value = getattr(request, CONTENTION_QUEUE_NEW_TOKENS_ATTR, None)
+    except Exception:
+        return None
+    return value if isinstance(value, int) else None
 
 
 #: Attribute name on the request holding the admission-time pricing snapshot.
@@ -8000,9 +8893,10 @@ async def _maybe_queue_for_local_slot(
       - ``"context_bypass"`` — the request cannot fit a KV slot; it was
         never queued; the caller records ``cached_tokens_skip`` with the
         returned *reason*.
-      - ``"fallback_policy"`` — policy is fallback / high priority never
-        queues; the caller keeps today's ``local_concurrency_limit``
-        behavior.
+      - ``"fallback_policy"`` — no queue applies to this request: the policy
+        is fallback, the priority is ``high`` (never queues), or the
+        preference is ``remote-ok`` (see below). The caller keeps today's
+        ``local_concurrency_limit`` fall-through behaviour.
       - ``"admission_reject"`` — the prefill-ETA admission guard refused
         local admission because the projected prefill cannot finish inside
         the wait budget; the caller falls through to the next provider
@@ -8014,10 +8908,31 @@ async def _maybe_queue_for_local_slot(
         admission response instead of falling back to a remote provider
         (LP-0MVIKPCSG002B0NL AC4).
 
+    ``remote-ok`` never waits (LP-0MVUH9OYZ007GMWF AC4 / parent AC20). The
+    value means *"local allowed, remote acceptable"* — its name is historic,
+    it used to *strip* the local route from the chain — so when the local slot
+    is saturated the request steps straight to the next provider instead of
+    queueing: this function declines before the reservation ticket is consumed
+    and before any queue state is written, so no ticket is spent and no
+    ``contention_queue_*`` wait (and no local-capacity ``429``) is produced for
+    a request that will not wait. ``high`` priority keeps its existing
+    never-queue semantics.
+
     A valid ``X-Local-Reservation`` ticket is consumed first: a reservation is
     a pre-granted admission, so the follow-up request dispatches without
     re-checking or queueing (LP-0MVIKPCSG002B0NL AC1).
     """
+    # ``remote-ok`` declines to queue *before* the reservation ticket is
+    # consumed and before any queue bookkeeping: the value promises an
+    # immediate step to the next provider, so spending a single-use ticket (or
+    # a queue slot) on a request that will not wait would waste a resource the
+    # next request needs (LP-0MVUH9OYZ007GMWF AC4). The returned action is the
+    # pre-existing ``fallback_policy`` outcome, so both dispatch cycles fall
+    # through exactly as they do for a never-queue policy — no new branch and
+    # no new reason token.
+    if _request_local_preference(request) == PREF_REMOTE_OK:
+        return ("fallback_policy", None, None)
+
     # Atomic local-admission reservation (LP-0MVIKPCSG002B0NL): a ticket
     # claimed via POST /llama/local/reserve is a pre-granted admission. It is
     # single-use and TTL-bound, so consuming it here is what makes the
@@ -8051,6 +8966,19 @@ async def _maybe_queue_for_local_slot(
         _ticket = None
     if _ticket is not None:
         _note_local_fallback_reason(request, None)
+        # Own-request evidence for the dispatch line that follows: a
+        # reservation is a pre-granted admission, so its estimated size is the
+        # only pricing available.
+        _stamp_queue_new_tokens(
+            request,
+            _queue_own_new_tokens(
+                config,
+                provider_cfg,
+                session_id,
+                _ticket.estimated_tokens,
+                body_json.get("messages") if isinstance(body_json, dict) else None,
+            ),
+        )
         logger.info(
             "local_admission_reserve_claimed ticket=%s session=%s tokens=%d",
             _ticket.ticket_id,
@@ -8090,6 +9018,9 @@ async def _maybe_queue_for_local_slot(
         messages=body_json.get("messages") if isinstance(body_json, dict) else None,
         max_local=max_local,
         endpoint=endpoint,
+        capacity_admitted=bool(
+            getattr(request, LOCAL_CAPACITY_ADMISSION_ATTR, None)
+        ),
     )
     if _admission is not None and not _admission.admit:
         try:
@@ -8128,9 +9059,31 @@ async def _maybe_queue_for_local_slot(
         setattr(request, "_local_queue_saturation", _saturation)
     except Exception:
         pass
+    # Own-request enqueue evidence (LP-0MVV29WR0009DY1A AC2): the wait is logged
+    # with the request's own session and pricing, so banding the wait never
+    # depends on joining it to an admission (which could be another request's).
+    # The same numbers are stamped on the request for the dispatch/fallback line
+    # that ends this wait.
+    _enqueue_new_tokens = _queue_own_new_tokens(
+        config,
+        provider_cfg,
+        session_id,
+        _estimated_tokens,
+        body_json.get("messages") if isinstance(body_json, dict) else None,
+        decision=_admission,
+    )
+    _stamp_queue_new_tokens(request, _enqueue_new_tokens)
+    _enqueue_rate_bucket = getattr(_admission, "rate_bucket", None) or "unknown"
     logger.info(
-        "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s",
-        cq["max_wait_seconds"], cq["max_depth"], _saturation or "none",
+        "contention_queue_wait max_wait=%.1fs max_depth=%d saturation=%s "
+        "session=%s new_tokens=%s rate_bucket=%s trigger=%s",
+        cq["max_wait_seconds"],
+        cq["max_depth"],
+        _saturation or "none",
+        session_id or "unknown",
+        _enqueue_new_tokens if _enqueue_new_tokens is not None else "unknown",
+        _enqueue_rate_bucket,
+        _saturation or "concurrency_limit",
     )
 
     _wait_started = _time.monotonic()
@@ -10040,7 +10993,7 @@ def _handle_streaming_success(
     return the augmented response.
 
     The ``Fallback triggered`` line carries ``session=``/``attempt=`` (and the
-    budget evidence for ``rate_limited*`` reasons) so per-session attribution
+    budget evidence for ``provider_budget_exhausted*`` reasons) so per-session attribution
     never has to guess (LP-0MVMBMSWR0036RES AC1-AC3).
 
     Returns ``None`` if *response* is **not** a streaming success (caller
@@ -10114,7 +11067,7 @@ def _build_fallback_success_response(
     This is the normal (non-streaming) success path used by both fallback
     entrypoints when a provider returns a successful response. The
     ``Fallback triggered`` line carries ``session=``/``attempt=`` plus the
-    budget evidence for ``rate_limited*`` reasons (LP-0MVMBMSWR0036RES).
+    budget evidence for ``provider_budget_exhausted*`` reasons (LP-0MVMBMSWR0036RES).
     """
     _record_attempt(
         attempts,
@@ -10139,6 +11092,65 @@ def _build_fallback_success_response(
             _fallback_evidence(session_id, fallback_reason or "unknown", budget_evidence),
         )
     return result
+
+
+def _local_dispatch_deferral_reason(
+    response: Response, provider_type: str
+) -> str | None:
+    """Return the reason marker when *response* is a deferrable local 503.
+
+    Only a local **503** carrying one of
+    :data:`DEFERRABLE_LOCAL_DISPATCH_REASONS` is deferrable. Each marker names a
+    verdict on the *request/prompt* — the measured ``prompt_progress`` proved
+    the dispatch was re-prefilling far more than admission priced
+    (``measured_cache_deficit``), the request already had a local dispatch
+    cancelled post-deadline (``post_deadline_terminal``), or the session/prompt
+    is inside its post-deadline thrash window (``prefill_thrash_cooldown``) —
+    none of which says anything about local's health for any *other* session.
+
+    The exemption is **reason-scoped**, never "any 503 from local": an
+    unmarked local 503, another status code, or a 503 carrying a different
+    marker all keep the pre-change quarantine. The marker is read from the
+    response's in-process attribute as well as its header, so a header lost in
+    transit cannot silently re-enable the entry cooldown.
+    """
+    if provider_type != "local":
+        return None
+    try:
+        if int(getattr(response, "status_code", 0) or 0) != 503:
+            return None
+    except Exception:  # pragma: no cover - response stand-ins
+        return None
+    marker = admission_reserve.local_dispatch_reason(response)
+    if marker is None:
+        return None
+    return DEFERRABLE_LOCAL_DISPATCH_REASONS.get(marker)
+
+
+def _note_local_route_arm(
+    provider_type: str,
+    cooldown_seconds: float,
+    config: dict | None = None,
+    reason: str = LOCAL_ROUTE_REASON_PROVIDER_COOLDOWN,
+) -> None:
+    """Feed the local-route starvation detector (LP-0MVWFKIVO007EGDU AC11).
+
+    Called *after* an intended cooldown was applied, so the detector observes
+    the same arming the chain will honour. Observability only: this never
+    changes the cooldown, never touches the failure counter and never raises —
+    a remote arm is ignored entirely (a remote cooldown is not local-route
+    starvation) and so is a zero-length one.
+
+    The measured 2026-10-31 fingerprint (217 arms / 5.5 h, local share 2.8 %)
+    was produced by exactly this path, so the detector is fed from it rather
+    than from a new poll.
+    """
+    if provider_type != "local":
+        return
+    try:
+        record_local_route_arm(reason, cooldown_seconds, config=config)
+    except Exception:  # pragma: no cover - observability must never fail an arm
+        pass
 
 
 def _handle_connection_error_in_fallback(
@@ -10186,6 +11198,7 @@ def _handle_connection_error_in_fallback(
             cooldown = min(backoff, cooldown_seconds)
             _provider_failure_count[provider_name] = count + 1
         mark_provider_unavailable(provider_name, cooldown)
+        _note_local_route_arm(provider_type, cooldown, config=config)
         _record_attempt(
             attempts,
             provider=provider_name,
@@ -10229,6 +11242,25 @@ def _handle_http_error_with_cooldown(
     surface Retry-After.  Any other status code during the window still
     quarantines normally so genuine faults are not masked.
 
+    Reason-scoped deferral (LP-0MVWFKESK0005G61, extended by
+    LP-0MVXSSYTN001TBW5): a local 503 carrying a marker listed in
+    ``DEFERRABLE_LOCAL_DISPATCH_REASONS`` means the router released or refused
+    *this dispatch* for a reason about the request/prompt — the measured prefix
+    deficit proved the prompt could not be served in time
+    (``measured_cache_deficit``), this request already had a local dispatch
+    cancelled post-deadline (``post_deadline_terminal``), or the session/prompt
+    is inside its post-deadline window (``prefill_thrash_cooldown``) — not that
+    local is unhealthy. Quarantining the entry starved every other session's
+    ``prefer-local`` work while the GPU idled (measured 2026-10-31: 217 arms /
+    5.5 h, local share 2.8 %; then 87.1 % of the 2026-11-01 cooldown skips came
+    from the unmarked thrash-gate 503). Such a 503 is DEFERRED the same way:
+    recorded as ``local_dispatch_deferral``, no entry cooldown, no
+    failure-counter bump, and the response's own ``Retry-After`` returned as
+    the hint. The aborting/refused prompt is still refused for the configured
+    ``local_prefill_thrash_cooldown_seconds`` by the per-session/per-prompt
+    window. The cold-start branch keeps precedence (AC3), and an unmarked 503
+    is untouched.
+
     The caller is responsible for setting ``fallback_reason``, ``prev_provider``,
     and ``all_slot_exhaustion`` after calling this function, and for issuing
     ``continue``.
@@ -10246,6 +11278,25 @@ def _handle_http_error_with_cooldown(
             status="cold_start_deferral",
             status_code=int(response.status_code),
             retry_after_seconds=retry_hint,
+        )
+        return float(retry_hint)
+
+    local_deferral_reason = _local_dispatch_deferral_reason(
+        response, provider_type
+    )
+    if local_deferral_reason is not None:
+        # The response's own Retry-After is the only hint: the deferral applies
+        # no cooldown (nothing is quarantined), so an absent header means "no
+        # wait enforced" rather than the configured provider cooldown.
+        retry_hint = _parse_retry_after(response) or 0.0
+        _record_attempt(
+            attempts,
+            provider=provider_name,
+            type=provider_type,
+            status="local_dispatch_deferral",
+            status_code=int(response.status_code),
+            retry_after_seconds=retry_hint,
+            reason=local_deferral_reason,
         )
         return float(retry_hint)
 
@@ -10298,6 +11349,7 @@ def _handle_http_error_with_cooldown(
         )
 
     mark_provider_unavailable(provider_name, cooldown)
+    _note_local_route_arm(provider_type, cooldown, config=config)
     attempt_fields: dict[str, Any] = {
         "provider": provider_name,
         "type": provider_type,
@@ -10534,7 +11586,7 @@ def _resolve_reasoning_content_promotion(
     augmented response.
 
     The ``Fallback triggered`` line carries ``session=``/``attempt=`` plus the
-    budget evidence for ``rate_limited*`` reasons (LP-0MVMBMSWR0036RES).
+    budget evidence for ``provider_budget_exhausted*`` reasons (LP-0MVMBMSWR0036RES).
 
     Returns ``None`` if the body does **not** contain ``reasoning_content``
     (caller should continue with empty-response cooldown logic).
@@ -11161,7 +12213,7 @@ async def _proxy_with_remote_fallback_cycle(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
-    # Budget snapshot behind a ``rate_limited`` fallback, re-emitted on the
+    # Budget snapshot behind a ``provider_budget_exhausted`` fallback, re-emitted on the
     # ``Fallback triggered`` line (LP-0MVMBMSWR0036RES AC3).
     _budget_evidence: dict[str, Any] | None = None
     # SSE comment emitted on the next successful streaming response after a
@@ -11215,11 +12267,6 @@ async def _proxy_with_remote_fallback_cycle(
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
-    elif _preference == PREF_REMOTE_OK:
-        # ``remote-ok`` with no remote-capable provider in the chain: the
-        # client asked for no local route, so the chain is genuinely empty
-        # (AC5).
-        model_config = {**model_config, "providers": []}
     logger.info(
         "priority_routing model=%s priority=%s providers=%d preference=%s "
         "session=%s",
@@ -11346,7 +12393,7 @@ async def _proxy_with_remote_fallback_cycle(
                     attempts,
                     provider=provider_name,
                     type="remote",
-                    status="rate_limited",
+                    status="provider_budget_exhausted",
                     status_code=429,
                     reason=_budget.reason,
                     limit_rpm=_budget.limit_rpm,
@@ -11356,7 +12403,7 @@ async def _proxy_with_remote_fallback_cycle(
                     elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                     **_budget_diagnostics(_budget),
                 )
-                fallback_reason = "rate_limited"
+                fallback_reason = "provider_budget_exhausted"
                 _budget_evidence = _fallback_budget_evidence(_budget)
                 prev_provider = provider_name
                 all_slot_exhaustion = False
@@ -11366,7 +12413,7 @@ async def _proxy_with_remote_fallback_cycle(
                     attempts,
                     provider=provider_name,
                     type="remote",
-                    status="rate_limited_waited",
+                    status="provider_budget_exhausted_waited",
                     reason=_budget.reason,
                     limit_rpm=_budget.limit_rpm,
                     effective_limit=_budget.effective_limit,
@@ -11375,6 +12422,19 @@ async def _proxy_with_remote_fallback_cycle(
                     elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                     **_budget_diagnostics(_budget),
                 )
+
+            # Local→remote boundary compaction (LP-0MVTDUBR00038ZRL): a
+            # session that was already served locally sends its compacted
+            # history upstream. Gated, idempotent per request and fail-open —
+            # on any skip the body is dispatched unchanged.
+            await _evaluate_boundary_compaction_for_remote(
+                request,
+                provider_name,
+                provider_cfg,
+                body_json,
+                _budget_session_id,
+                config,
+            )
 
             response = await ptr(request, path, provider_cfg)
             _maybe_record_provider_affinity(
@@ -11563,9 +12623,28 @@ async def _proxy_with_remote_fallback_cycle(
                     attempted_domains.add(_usage_limit_account_key(provider_cfg))
                 else:
                     attempted_domains.add(_failure_domain_key(provider_cfg))
-                fallback_reason = f"HTTP {response.status_code}"
+                # LP-0MVXSSYTN001TBW5 AC5: a deferrable local 503 (measured
+                # cache deficit, post-deadline terminal, thrash window) names
+                # itself on the request and on the fallback line, so the detour
+                # is attributable as its own reason instead of the generic
+                # ``HTTP 503`` a genuine local fault carries.
+                _deferral_reason = _local_dispatch_deferral_reason(
+                    response, provider_type
+                )
+                if _deferral_reason is not None:
+                    _note_local_fallback_reason(request, _deferral_reason)
+                fallback_reason = (
+                    _deferral_reason or f"HTTP {response.status_code}"
+                )
                 prev_provider = provider_name
-                if response.status_code != 429:
+                # A bare 429 from a LOCAL backend means "slots busy", so the
+                # exhaustion is reported as slot exhaustion. A 429 from a
+                # remote provider is a rate limit, never local slot pressure —
+                # treating it as slot exhaustion advertised an untrue
+                # "Model server busy: 0/N slots available" refusal (and, now
+                # that the slot refusal carries a retry timer, the wrong
+                # wait). LP-0MVUXY1CL005KWCC.
+                if response.status_code != 429 or provider_type != "local":
                     all_slot_exhaustion = False
                 _observe_http_error_400(
                     response, provider_name, provider_type, path, body_text, fallback_reason,
@@ -11729,6 +12808,9 @@ async def proxy_with_remote_fallback(
         A ``Response`` from a successful provider, or the 503/429 exhaustion
         response once the hold-retry bound is reached.
     """
+    retired = _retired_local_preference_response(request, model_config)
+    if retired is not None:
+        return retired
     response = await _run_chain_cycles(
         request, path, model_config, config, _proxy_with_remote_fallback_cycle,
     )
@@ -11785,6 +12867,70 @@ async def _evaluate_compaction_for_bypass(
             "(provider=%s session=%s)",
             provider_name,
             str(session_id or "")[:8],
+            exc_info=True,
+        )
+        return outcome
+
+
+async def _evaluate_boundary_compaction_for_remote(
+    request,
+    provider_name: str,
+    provider_cfg: dict,
+    body_json: dict,
+    session_id: str | None,
+    config: dict,
+) -> dict:
+    """Evaluate local→remote boundary compaction before a remote POST.
+
+    LP-0MVTDUBR00038ZRL (parent AC1/AC3/AC4): called by **both** remote
+    dispatch points (``_proxy_with_remote_fallback_cycle`` for remote-only
+    chains and ``_proxy_with_fallback_cycle`` for mixed local+remote chains)
+    immediately before the remote dispatcher runs. Delegates to the single
+    implementation in
+    :func:`proxy.router_helpers.evaluate_boundary_compaction`, which owns the
+    gating, the slot-pinned summarisation, the body rewrite and the
+    structured ``boundary_compaction`` event.
+
+    Fail-open twice over: the helper never raises, and any error surfacing
+    here is logged and swallowed so routing continues with today's history.
+
+    Args:
+        request: The incoming request (idempotence flag + cached body).
+        provider_name: Provider entry name, for the failure log line.
+        provider_cfg: The provider entry about to be dispatched.
+        body_json: Parsed outgoing body (mutated on successful compaction).
+        session_id: Resolved session id (None disables the hook).
+        config: Server configuration dict.
+
+    Returns:
+        The outcome dict from the helper, or a no-op outcome on failure.
+    """
+    outcome: dict[str, Any] = {
+        "evaluated": False,
+        "applied": False,
+        "reason": None,
+        "messages": None,
+    }
+    if not session_id:
+        return outcome
+    try:
+        import proxy.server as _server
+        from proxy.router_helpers import evaluate_boundary_compaction
+
+        return await evaluate_boundary_compaction(
+            _server,
+            config,
+            body_json,
+            session_id,
+            provider_cfg,
+            request=request,
+        )
+    except Exception:
+        logger.warning(
+            "boundary_compaction_failed provider=%s session=%s; dispatching "
+            "the history unchanged",
+            provider_name,
+            str(session_id)[:8],
             exc_info=True,
         )
         return outcome
@@ -11860,7 +13006,7 @@ async def _proxy_with_fallback_cycle(
     any_provider_tried = False
     prev_provider: str | None = None
     fallback_reason: str | None = None
-    # Budget snapshot behind a ``rate_limited`` fallback, re-emitted on the
+    # Budget snapshot behind a ``provider_budget_exhausted`` fallback, re-emitted on the
     # ``Fallback triggered`` line (LP-0MVMBMSWR0036RES AC3).
     _budget_evidence: dict[str, Any] | None = None
     # SSE comment emitted on the next successful streaming response after a
@@ -11912,11 +13058,6 @@ async def _proxy_with_fallback_cycle(
     _chain = effective_chain_for_request(request, model_config, server_cfg)
     if _chain:
         model_config = {**model_config, "providers": _chain}
-    elif _preference == PREF_REMOTE_OK:
-        # ``remote-ok`` with no remote-capable provider in the chain: the
-        # client asked for no local route, so the chain is genuinely empty
-        # (AC5).
-        model_config = {**model_config, "providers": []}
     logger.info(
         "priority_routing model=%s priority=%s providers=%d preference=%s "
         "session=%s",
@@ -11981,7 +13122,7 @@ async def _proxy_with_fallback_cycle(
             # never run this remote-only walk — a fits-local request is not
             # promoted. Its refusal names ``local_lease_active`` and carries
             # the lease remainder; the walk below stays byte-identical for
-            # ``prefer-local`` / ``remote-ok`` / absent-header clients.
+            # ``remote-ok`` / absent-header clients.
             _lease_refusal = _build_deferral_refusal_response(
                 request,
                 config,
@@ -11990,6 +13131,7 @@ async def _proxy_with_fallback_cycle(
                 retry_after_s=_local_refusal_retry_after_s(
                     request, SKIP_REASON_LOCAL_LEASE_ACTIVE, model_config, config
                 ),
+                priority=_priority,
             )
             if _lease_refusal is not None:
                 return _lease_refusal
@@ -12167,12 +13309,17 @@ async def _proxy_with_fallback_cycle(
                             _cq_depth = contention_queue.queue_depth()
                         except Exception:
                             _cq_depth = 0
+                        _cq_new_tokens = _queue_new_tokens_from_request(request)
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
-                            "queued_duration=%.2fs policy=queue depth=%d",
+                            "queued_duration=%.2fs policy=queue depth=%d "
+                            "new_tokens=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                             _cq_depth,
+                            _cq_new_tokens
+                            if _cq_new_tokens is not None
+                            else "unknown",
                         )
                     elif _cq_action == "fallback":
                         # Caps exceeded — the request never got a local slot:
@@ -12202,12 +13349,17 @@ async def _proxy_with_fallback_cycle(
                             fallback_reason,
                             _cq_remaining_s,
                         )
+                        _cq_new_tokens = _queue_new_tokens_from_request(request)
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
-                            "session=%s queued_duration=%.2fs preference=%s",
+                            "session=%s queued_duration=%.2fs preference=%s "
+                            "new_tokens=%s",
                             provider_name, _session_id or "unknown",
                             _cq_elapsed or 0.0,
                             _preference,
+                            _cq_new_tokens
+                            if _cq_new_tokens is not None
+                            else "unknown",
                         )
                         # Deferral (LP-0MVSM06BK008FZUE): a pin-local
                         # ``deferrable`` request must never be promoted — the
@@ -12220,6 +13372,8 @@ async def _proxy_with_fallback_cycle(
                             request, config, _preference, fallback_reason,
                             retry_after_s=_cq_remaining_s,
                             elapsed_wait_seconds=_cq_elapsed,
+                            provider=provider_name,
+                            priority=_priority,
                         )
                         if _deferral_refusal is not None:
                             return _deferral_refusal
@@ -12267,6 +13421,29 @@ async def _proxy_with_fallback_cycle(
                         # deferrable request. Unlike admission_reject, the request
                         # must NOT fall through to a remote provider — return
                         # the retryable 429 with X-Local-Route: refused now.
+                        #
+                        # Bounded deferral (LP-0MVUH9PL0005PW90 AC5/AC7): unless
+                        # this session has already been told to retry
+                        # ``local_deferral_max_refusals`` times — then the
+                        # refusal becomes a promotion and the remote tiers serve
+                        # it, which is the whole point of the budget.
+                        if _deferral_escalation_applies(
+                            request, model_config, config, _preference
+                        ):
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="local_deferral_escalated",
+                                reason=_cq_reason,
+                            )
+                            fallback_reason = _cq_reason or "fallback_after_queue"
+                            prev_provider = provider_name
+                            all_slot_exhaustion = False
+                            _note_local_fallback_reason(
+                                request, LOCAL_FALLBACK_DEFERRAL_EXHAUSTED
+                            )
+                            continue
                         _admission = getattr(
                             request, "_local_admission_decision", None
                         )
@@ -12279,9 +13456,18 @@ async def _proxy_with_fallback_cycle(
                         # The verdict and the preference named on the single
                         # refusal line come from the shared builder / the parsed
                         # intent (LP-0MVSMINPR006SWT6 AC1/AC4) — never re-derived
-                        # on this branch.
+                        # on this branch. The dispatch context is threaded so
+                        # the line names the session, provider and priority
+                        # the refusal happened on (LP-0MVNTJQVB007QWEZ AC2).
                         return _build_local_only_refusal_response(
-                            _refusal_attempt, config, preference=_preference
+                            _refusal_attempt,
+                            config,
+                            preference=_preference,
+                            context={
+                                "session": _session_id or "unknown",
+                                "provider": provider_name,
+                                "priority": _priority,
+                            },
                         )
                     else:  # fallback_policy — fast mode unchanged
                         _record_attempt(
@@ -12554,22 +13740,41 @@ async def _proxy_with_fallback_cycle(
                     except Exception:
                         _capacity_admit = None
                     if _capacity_admit is not None:
+                        # Stamp the admission on the request so the dispatch
+                        # guard's flat cold-prefill cap cannot override a
+                        # verdict this gate already priced against measured
+                        # idle slot-time and the prefill deadline
+                        # (LP-0MVXWQQ20002HAX4: without this the two gates
+                        # contradicted each other and the capacity gate could
+                        # never admit anything).
+                        try:
+                            setattr(
+                                request,
+                                LOCAL_CAPACITY_ADMISSION_ATTR,
+                                dict(_capacity_admit),
+                            )
+                        except Exception:
+                            pass
                         logger.info(
                             "routing_capacity_admit provider=%s model=%s "
-                            "reason=%s projected_s=%.1f admitted_s=%.1f "
-                            "budget_s=%.1f idle_s=%.1f budget_ratio=%.2f "
-                            "horizon_s=%.0f estimated_tokens=%d "
-                            "cached_ratio=%.2f cache_state=%s warm_threshold=%d "
-                            "session=%s",
+                            "reason=%s projected_s=%.1f prefill_s=%.1f "
+                            "admitted_s=%.1f budget_s=%.1f idle_s=%.1f "
+                            "budget_ratio=%.2f horizon_s=%.0f "
+                            "deadline_s=%.1f deadline_budget_s=%.1f "
+                            "estimated_tokens=%d cached_ratio=%.2f "
+                            "cache_state=%s warm_threshold=%d session=%s",
                             provider_name,
                             _llama_model or "unknown",
                             _capacity_admit["reason"],
                             _capacity_admit["projected_seconds"],
+                            _capacity_admit.get("prefill_seconds", 0.0),
                             _capacity_admit["admitted_seconds"],
                             _capacity_admit["budget_seconds"],
                             _capacity_admit["idle_seconds"],
                             _capacity_admit["budget_ratio"],
                             _capacity_admit["horizon_seconds"],
+                            _capacity_admit.get("deadline_seconds", 0.0),
+                            _capacity_admit.get("deadline_budget_seconds", 0.0),
                             _estimated_tokens,
                             _routing_cached_ratio,
                             _routing_cache_state,
@@ -12834,6 +14039,9 @@ async def _proxy_with_fallback_cycle(
                     endpoint=local_endpoint,
                     reason_label="eta_exceeds_budget_direct",
                     free_slot=True,
+                    capacity_admitted=bool(
+                        getattr(request, LOCAL_CAPACITY_ADMISSION_ATTR, None)
+                    ),
                 )
                 if _direct_admission is not None and not _direct_admission.admit:
                     # Deadline refusal (LP-0MVKUKEU80022C3U) keeps its own
@@ -12858,10 +14066,13 @@ async def _proxy_with_fallback_cycle(
                     except Exception:
                         pass
                     # The guard helper already emitted the single
-                    # ``local_admission_guard ... reason=eta_exceeds_budget_direct``
-                    # line (ETA, budget, free_slot=true). Record the attempt so
-                    # the fallback provider and the diagnostics carry it too
-                    # (AC4).
+                    # ``local_admission_guard ... reason=<governing reason>``
+                    # line: ``eta_exceeds_budget_direct`` only when the
+                    # free-slot ETA/budget bound is the cause, otherwise the
+                    # deadline / safety-budget / cold-budget reason above. The
+                    # log and the attempt recorded here therefore cannot
+                    # disagree. Record the attempt so the fallback provider and
+                    # the diagnostics carry it too (AC4).
                     _record_attempt(
                         attempts,
                         provider=provider_name,
@@ -12870,6 +14081,76 @@ async def _proxy_with_fallback_cycle(
                         reason=_direct_reason,
                         **_local_admission_evidence(_direct_admission),
                     )
+                    # Explicit client intent (LP-0MVIKPCSG002B0NL AC4 / pin
+                    # slice LP-0MVSLZY470051ZB2 AC1/AC2): the single pin
+                    # predicate. A pin-local client (``local-preferred`` or
+                    # its normalized ``local-only`` alias) with a
+                    # ``deferrable`` capacity verdict must never be moved
+                    # remote — the caller turns the decision into the
+                    # retryable 429. A ``too_large`` verdict (e.g.
+                    # ``prefill_budget_exceeded``) declines the pin and keeps
+                    # the direct-guard fall-through to the next provider.
+                    if _local_preference_pins_local(request, _preference):
+                        # Bounded deferral (LP-0MVUH9PL0005PW90 AC5): a session
+                        # that has spent its retryable-refusal budget is not
+                        # refused a fourth time — it falls through to the next
+                        # provider, visibly (token stamped by the helper).
+                        if _deferral_escalation_applies(
+                            request, model_config, config, _preference
+                        ):
+                            # The hop line keeps naming the *exit* (why local
+                            # was not used); the escalation token travels on
+                            # the request header, the escalation line and the
+                            # outcome line, so it is reported exactly once
+                            # (LP-0MVUH9PL0005PW90 AC6).
+                            fallback_reason = "local_admission_guard"
+                            prev_provider = provider_name
+                            all_slot_exhaustion = False
+                            _note_local_fallback_reason(
+                                request, LOCAL_FALLBACK_DEFERRAL_EXHAUSTED
+                            )
+                            continue
+                        fallback_reason = "local_admission_guard"
+                        prev_provider = provider_name
+                        all_slot_exhaustion = False
+                        _note_local_fallback_reason(request, fallback_reason)
+                        # A local-only refusal is a *capacity/intent* outcome,
+                        # not chain exhaustion (LP-0MVNTJJGX00375VQ AC1/AC2):
+                        # the request never consulted the rest of the chain, so
+                        # ``All providers exhausted`` is false whenever a
+                        # remote provider is available — and it made clients
+                        # treat a recoverable refusal as terminal.
+                        #
+                        # Both pin-local refusal paths therefore share the one
+                        # refusal builder (the queue/lease ``refused_only``
+                        # branches above). It also emits the single
+                        # ``local_only_refused`` line, naming ``_direct_reason``
+                        # with the parsed intent, the capacity verdict and — via
+                        # ``context`` — the dispatch context, so this branch
+                        # emits no line of its own and never claims it routed
+                        # onwards (LP-0MVNTJQVB007QWEZ AC1/AC2). The exhaustion
+                        # builder keeps its admission-refusal variant for the
+                        # genuinely exhausted chain a ``remote-ok`` request
+                        # reaches after the guard refused it.
+                        return _build_local_only_refusal_response(
+                            {
+                                "status": "local_admission_reject",
+                                "reason": _direct_reason,
+                                **_local_admission_evidence(_direct_admission),
+                            },
+                            config,
+                            preference=_preference,
+                            context={
+                                "session": _session_id or "unknown",
+                                "provider": provider_name,
+                                "priority": _priority,
+                            },
+                        )
+                    # Only reached on a REAL fall-through: the next provider
+                    # will be tried, so the line may say so
+                    # (LP-0MVNTJQVB007QWEZ AC1 — it used to be emitted before
+                    # the pin-local branch above, claiming routing that never
+                    # happened).
                     try:
                         logger.info(
                             "local_admission_guard_direct_fallback "
@@ -12883,30 +14164,6 @@ async def _proxy_with_fallback_cycle(
                         )
                     except Exception:
                         pass
-                    # Explicit client intent (LP-0MVIKPCSG002B0NL AC4 / pin
-                    # slice LP-0MVSLZY470051ZB2 AC1/AC2): the single pin
-                    # predicate. A pin-local client (``local-preferred`` or
-                    # its normalized ``local-only`` alias) with a
-                    # ``deferrable`` capacity verdict must never be moved
-                    # remote — the caller turns the decision into the
-                    # retryable 429. A ``too_large`` verdict (e.g.
-                    # ``prefill_budget_exceeded``) declines the pin and keeps
-                    # the direct-guard fall-through to the next provider.
-                    if _local_preference_pins_local(request, _preference):
-                        fallback_reason = "local_admission_guard"
-                        prev_provider = provider_name
-                        all_slot_exhaustion = False
-                        _note_local_fallback_reason(request, fallback_reason)
-                        # The refusal the client receives names
-                        # ``_direct_reason``; log that same reason with the
-                        # intent that caused it (LP-0MVRMC275000R2W6 AC4).
-                        _log_local_only_refusal(_direct_reason)
-                        return _build_exhausted_response(
-                            all_local_slot_exhaustion=False,
-                            unavailable_providers={},
-                            diagnostics=attempts,
-                            config=config,
-                        )
                     fallback_reason = "local_admission_guard"
                     prev_provider = provider_name
                     all_slot_exhaustion = False
@@ -13018,7 +14275,7 @@ async def _proxy_with_fallback_cycle(
                         attempts,
                         provider=provider_name,
                         type="remote",
-                        status="rate_limited",
+                        status="provider_budget_exhausted",
                         status_code=429,
                         reason=_budget.reason,
                         limit_rpm=_budget.limit_rpm,
@@ -13028,7 +14285,7 @@ async def _proxy_with_fallback_cycle(
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                         **_budget_diagnostics(_budget),
                     )
-                    fallback_reason = "rate_limited"
+                    fallback_reason = "provider_budget_exhausted"
                     _budget_evidence = _fallback_budget_evidence(_budget)
                     prev_provider = provider_name
                     all_slot_exhaustion = False
@@ -13038,7 +14295,7 @@ async def _proxy_with_fallback_cycle(
                         attempts,
                         provider=provider_name,
                         type="remote",
-                        status="rate_limited_waited",
+                        status="provider_budget_exhausted_waited",
                         reason=_budget.reason,
                         limit_rpm=_budget.limit_rpm,
                         effective_limit=_budget.effective_limit,
@@ -13047,6 +14304,18 @@ async def _proxy_with_fallback_cycle(
                         elapsed_wait_seconds=round(_budget.waited_seconds, 3),
                         **_budget_diagnostics(_budget),
                     )
+
+                # Local→remote boundary compaction (LP-0MVTDUBR00038ZRL): same
+                # hook as the remote-only cycle, at the mixed chain's remote
+                # dispatch point.
+                await _evaluate_boundary_compaction_for_remote(
+                    request,
+                    provider_name,
+                    provider_cfg,
+                    body_json,
+                    _session_id,
+                    config,
+                )
 
                 response = await ptr_remote(request, path, provider_cfg)
                 _maybe_record_provider_affinity(
@@ -13174,6 +14443,20 @@ async def _proxy_with_fallback_cycle(
                     prev_provider = provider_name
                     total_slots_sum += int(slot_info.get("total_slots", 0) or 0)
                     available_slots_sum += int(slot_info.get("available_slots", 0) or 0)
+                    # Name the exit before deciding whether to queue: the
+                    # lease denial is the reason local was not used, and it is
+                    # the only exit a ``remote-ok`` request can take here
+                    # (that preference never queues, so the
+                    # ``fallback_policy`` outcome below leaves no later note
+                    # behind — LP-0MVUH9OYZ007GMWF AC4). A queued request that
+                    # later falls through overwrites this with its own
+                    # measured reason, and a local re-dispatch is served with
+                    # ``X-Local-Route: local``, which carries no reason at all.
+                    _note_local_fallback_reason(
+                        request,
+                        SKIP_REASON_LOCAL_LEASE_ACTIVE,
+                        _local_lease_retry_after_seconds(config, local_endpoint),
+                    )
                     _record_attempt(
                         attempts,
                         provider=provider_name,
@@ -13207,14 +14490,18 @@ async def _proxy_with_fallback_cycle(
                             _lease_depth = _cq_mod.queue_depth()
                         except Exception:
                             _lease_depth = 0
+                        _cq_new_tokens = _queue_new_tokens_from_request(request)
                         logger.info(
                             "contention_queue_dispatch provider=%s session=%s "
                             "queued_duration=%.2fs policy=queue depth=%d "
-                            "reason=local_lease_active",
+                            "reason=local_lease_active new_tokens=%s",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
                             _lease_depth,
+                            _cq_new_tokens
+                            if _cq_new_tokens is not None
+                            else "unknown",
                         )
                         _record_attempt(
                             attempts,
@@ -13255,14 +14542,18 @@ async def _proxy_with_fallback_cycle(
                             status="fallback_after_queue",
                             elapsed_wait_seconds=round(_lease_elapsed or 0.0, 3),
                         )
+                        _cq_new_tokens = _queue_new_tokens_from_request(request)
                         logger.info(
                             "contention_queue_fallback_after_queue provider=%s "
                             "session=%s queued_duration=%.2fs preference=%s "
-                            "reason=local_lease_active",
+                            "reason=local_lease_active new_tokens=%s",
                             provider_name,
                             _session_id or "unknown",
                             _lease_elapsed or 0.0,
                             _preference,
+                            _cq_new_tokens
+                            if _cq_new_tokens is not None
+                            else "unknown",
                         )
                         all_slot_exhaustion = False
                         # The token matches the log's reason= field verbatim.
@@ -13289,6 +14580,8 @@ async def _proxy_with_fallback_cycle(
                             SKIP_REASON_LOCAL_LEASE_ACTIVE,
                             retry_after_s=_lease_remaining_s,
                             elapsed_wait_seconds=_lease_elapsed,
+                            provider=provider_name,
+                            priority=_priority,
                         )
                         if _deferral_refusal is not None:
                             return _deferral_refusal
@@ -13331,6 +14624,27 @@ async def _proxy_with_fallback_cycle(
                         # pinned-local + guard refusal on the lease path —
                         # return the 429 instead of falling through to a
                         # remote provider.
+                        #
+                        # Bounded deferral (LP-0MVUH9PL0005PW90 AC5/AC7): a
+                        # session that has spent its refusal budget is promoted
+                        # instead, exactly as on the contention-queue path.
+                        if _deferral_escalation_applies(
+                            request, model_config, config, _preference
+                        ):
+                            _record_attempt(
+                                attempts,
+                                provider=provider_name,
+                                type=provider_type,
+                                status="local_deferral_escalated",
+                                reason=_lease_reason,
+                            )
+                            fallback_reason = _lease_reason
+                            prev_provider = provider_name
+                            all_slot_exhaustion = False
+                            _note_local_fallback_reason(
+                                request, LOCAL_FALLBACK_DEFERRAL_EXHAUSTED
+                            )
+                            continue
                         _admission = getattr(
                             request, "_local_admission_decision", None
                         )
@@ -13342,10 +14656,18 @@ async def _proxy_with_fallback_cycle(
                         }
                         # Same single-implementation contract as the queue
                         # branch above: the builder classifies, the parsed
-                        # preference is only threaded for the log line
-                        # (LP-0MVSMINPR006SWT6 AC1/AC4).
+                        # preference and the dispatch context are only threaded
+                        # for the log line (LP-0MVSMINPR006SWT6 AC1/AC4,
+                        # LP-0MVNTJQVB007QWEZ AC2).
                         return _build_local_only_refusal_response(
-                            _refusal_attempt, config, preference=_preference
+                            _refusal_attempt,
+                            config,
+                            preference=_preference,
+                            context={
+                                "session": _session_id or "unknown",
+                                "provider": provider_name,
+                                "priority": _priority,
+                            },
                         )
                     else:
                         # Queue disabled / fallback policy: preserve the
@@ -13640,9 +14962,24 @@ async def _proxy_with_fallback_cycle(
                         attempted_domains.add(_usage_limit_account_key(provider_cfg))
                     else:
                         attempted_domains.add(_failure_domain_key(provider_cfg))
-                    fallback_reason = f"HTTP {response.status_code}"
+                    # LP-0MVWFKESK0005G61 AC5: a reason-scoped deferral names
+                    # itself on the request (``X-Local-Fallback-Reason`` and the
+                    # routing-outcome line) and on the fallback line, so the
+                    # detour is attributable as ``measured_cache_deficit``
+                    # instead of the generic ``HTTP 503`` a genuine local fault
+                    # carries.
+                    _deferral_reason = _local_dispatch_deferral_reason(
+                        response, provider_type
+                    )
+                    if _deferral_reason is not None:
+                        _note_local_fallback_reason(request, _deferral_reason)
+                    fallback_reason = (
+                        _deferral_reason or f"HTTP {response.status_code}"
+                    )
                     prev_provider = provider_name
-                    if response.status_code != 429:
+                    # See _proxy_with_remote_fallback_cycle: only a LOCAL 429
+                    # is local slot pressure (LP-0MVUXY1CL005KWCC).
+                    if response.status_code != 429 or provider_type != "local":
                         all_slot_exhaustion = False
                     _observe_http_error_400(
                         response, provider_name, provider_type, path, body_text, fallback_reason,
@@ -13985,6 +15322,9 @@ async def proxy_with_fallback(
         A ``Response`` from a successful provider, or the 503/429 exhaustion
         response once the hold-retry bound is reached.
     """
+    retired = _retired_local_preference_response(request, model_config)
+    if retired is not None:
+        return retired
     response = await _run_chain_cycles(
         request, path, model_config, config, _proxy_with_fallback_cycle,
     )

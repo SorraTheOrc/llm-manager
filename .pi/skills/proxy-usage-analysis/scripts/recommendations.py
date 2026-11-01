@@ -22,6 +22,9 @@ operator's domain knowledge:
 - Fast vs cheap fallback-rate imbalance → adjust ``slot_schedule`` entries.
 - Remote-side errors (HTTP 4xx/5xx, empty responses, timeouts) are
   informational: check the remote provider configuration.
+- The proxy's own request-budget skip (``provider_budget_exhausted``) is
+  pacing on a healthy provider, not an upstream 429, and gets its own
+  informational recommendation so the two can never be conflated.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 import bucketing
+import engine_cross_check
 from aggregation import (
     FALLBACK_ATTRIBUTION_LEASE_DENIED,
     FALLBACK_ATTRIBUTION_UNATTRIBUTED,
@@ -39,7 +43,7 @@ from aggregation import (
     ROOT_CAUSE_STALL,
     AnalysisResult,
 )
-from log_parser import CONTEXT_TOO_LARGE
+from log_parser import CONTEXT_TOO_LARGE, is_provider_budget_reason
 
 # Reasons that point at local slot pool contention.
 SLOT_CONTENTION_REASONS = {
@@ -237,6 +241,7 @@ def generate_recommendations(
     attribution_note = _attribution_coverage(result)
 
     recs.extend(_error_recommendations(result))
+    recs.extend(_engine_cross_check_recommendations(result, config))
 
     # --- 1. Slot pool contention ------------------------------------------
     contention = sum(reason_counts[r] for r in SLOT_CONTENTION_REASONS)
@@ -459,9 +464,56 @@ def generate_recommendations(
                 )
             )
 
-    # --- 7. Remote provider errors (informational) ---------------------------
+    # --- 7. Proxy request-budget pacing (informational) ---------------------
+    # The proxy's own per-provider RPM budget skip is a pre-flight pacing
+    # decision on a healthy provider, NOT an upstream rate-limit rejection.
+    # Its reason name contains ``exhausted``, which ``REMOTE_ERROR_REASONS``
+    # also matches, so section 8 excludes it explicitly and it is reported
+    # here instead (LP-0MVMBM8YS003Y2JG AC4/AC7).
+    budget_reasons = {
+        r: count
+        for r, count in reason_counts.items()
+        if is_provider_budget_reason(r)
+    }
+    budget_skips = sum(budget_reasons.values())
+    if budget_skips >= MIN_EVENTS and _pct(budget_skips, total_fallbacks) >= REASON_SHARE * 100:
+        budget_fast = sum(bucket_reasons["fast"][r] for r in budget_reasons)
+        budget_cheap = sum(bucket_reasons["cheap"][r] for r in budget_reasons)
+        breakdown = ", ".join(
+            f"{r}: {budget_reasons[r]}"
+            for r in sorted(budget_reasons, key=lambda r: -budget_reasons[r])
+        )
+        recs.append(
+            Recommendation(
+                severity="info",
+                title="Proxy request-budget pacing (not an upstream 429)",
+                detail=(
+                    "Requests were passed to the next provider because the proxy's own "
+                    "per-provider request budget (`rate_limit_rpm` and its reserve/wait "
+                    "settings) was exhausted before dispatch. This is pre-flight pacing "
+                    "on a healthy provider, not an upstream HTTP 429 rate-limit response "
+                    "— upstream 429s surface separately as `upstream_http_error status=429` "
+                    "events. If the volume is unwanted, raise that entry's "
+                    "`rate_limit_rpm`, or reorder the chain so a larger-budget entry is "
+                    "tried first. Worked examples of the wait/reserve knobs are in "
+                    "`proxy/README.md` (`provider_rate_limit_wait_*`)."
+                ),
+                evidence=(
+                    f"{budget_skips} of {total_fallbacks} fallback events "
+                    f"({_pct(budget_skips, total_fallbacks):.1f}%) were proxy budget skips "
+                    f"({breakdown}). "
+                    f"{_dn(budget_skips, budget_fast, budget_cheap)}."
+                ),
+            )
+        )
+
+    # --- 8. Remote provider errors (informational) ---------------------------
     remote_errors = [
-        r for r in reason_counts if r and any(tok in r.lower() for tok in REMOTE_ERROR_REASONS)
+        r
+        for r in reason_counts
+        if r
+        and not is_provider_budget_reason(r)
+        and any(tok in r.lower() for tok in REMOTE_ERROR_REASONS)
     ]
     if remote_errors:
         counts = ", ".join(f"{r}: {reason_counts[r]}" for r in sorted(remote_errors, key=lambda r: -reason_counts[r]))
@@ -484,7 +536,7 @@ def generate_recommendations(
             )
         )
 
-    # --- 8. No change needed --------------------------------------------------
+    # --- 9. No change needed --------------------------------------------------
     if not recs and fallback_rate < FALLBACK_RATE_LOW:
         fast_fb_total = sum(bucket_reasons["fast"].values())
         cheap_fb_total = sum(bucket_reasons["cheap"].values())
@@ -787,6 +839,65 @@ def _error_recommendations(result: AnalysisResult) -> list[Recommendation]:
         )
 
     return recs
+
+
+def _engine_cross_check_recommendations(
+    result: AnalysisResult, config: dict | None
+) -> list[Recommendation]:
+    """Warn when proxy slot-time and engine eval timings diverge (AC 6).
+
+    The cross-check compares the report's proxy-inferred phase slot-seconds
+    with llama-server's own summed per-task eval durations
+    (``engine_cross_check``, LP-0MVNWULLI006ZYXX). A structural skew is
+    expected, so the warning only fires when a phase's **absolute** percentage
+    delta exceeds ``local_engine_cross_check_threshold_pct`` (default 25 %,
+    ``0`` disables). A phase diverging by at least twice the threshold is
+    escalated to ``high``: at that size the gap is no longer the expected
+    per-stream vs per-task difference and points at an accounting problem.
+    """
+    check = engine_cross_check.compute(result, config)
+    divergent = check.get("divergent_phases") or []
+    if not divergent:
+        return []
+
+    threshold = check["threshold_pct"]
+    rows = []
+    escalated = False
+    for phase in divergent:
+        entry = check[phase]
+        delta_pct = entry["delta_pct"]
+        escalated = escalated or abs(delta_pct) >= threshold * engine_cross_check.HIGH_SEVERITY_MULTIPLIER
+        rows.append(
+            f"{phase}: proxy {entry['proxy_slot_seconds']:.1f}s vs engine "
+            f"{entry['engine_seconds']:.1f}s ({delta_pct:+.1f}%)"
+        )
+
+    return [
+        Recommendation(
+            severity="high" if escalated else "medium",
+            title=(
+                "Engine cross-check divergence: proxy slot-time and "
+                "llama-server eval timings disagree"
+            ),
+            detail=(
+                "The report's proxy-inferred phase slot-seconds and llama-server's "
+                "own summed per-task eval durations diverge beyond the configured "
+                "threshold. Both figures are slot-seconds (sums of durations), not "
+                "wall-clock, and neither is comparable with `busy_seconds`. "
+                f"{engine_cross_check.INTERPRETATION} "
+                "If the divergence persists across windows, check for queueing/"
+                "retries/cancelled work on the proxy side or unattributed local "
+                "traffic on the engine side; tune "
+                "`local_engine_cross_check_threshold_pct` in proxy/config.yaml "
+                "only once the expected structural skew is understood."
+            ),
+            evidence=(
+                f"{', '.join(rows)} — absolute percentage delta above the "
+                f"{threshold:.1f}% threshold "
+                "(`local_engine_cross_check_threshold_pct`)."
+            ),
+        )
+    ]
 
 
 def _slot_counts_str(fast_slots: int | None, cheap_slots: int | None) -> str:

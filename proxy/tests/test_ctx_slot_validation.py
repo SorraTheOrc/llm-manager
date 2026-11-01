@@ -409,3 +409,56 @@ class TestWarmCapCeilingConsistency:
         from config_test_utils import load_profile
 
         assert validate_local_routing_config(load_profile("config.yaml")) == []
+
+
+class TestShippedGeometryMatchesPinnedFixture:
+    """LP-0MVTV6F65005HKQZ AC5: the derivation fixture in
+    ``config_test_utils.SHIPPED_ROUTING_GEOMETRY`` mirrors the live
+    ``proxy/config.yaml`` server block.
+
+    A config drift must fail HERE, naming the key and both values, instead of
+    silently unpinning the numbers ``docs/dev/single-slot-impact.md`` cites.
+    """
+
+    @staticmethod
+    def _shipped_server() -> dict:
+        from config_test_utils import load_profile
+
+        return load_profile("config.yaml")["server"]
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "local_large_context_cold_cache_threshold",
+            "local_large_context_warm_cache_threshold",
+            "local_large_context_economic_ceiling_ratio",
+            "local_model_ctx_size",
+            "session_slot_pool_size",
+        ],
+    )
+    def test_shipped_value_matches_pinned_fixture(self, key):
+        from config_test_utils import SHIPPED_ROUTING_GEOMETRY
+
+        shipped = self._shipped_server().get(key)
+        expected = SHIPPED_ROUTING_GEOMETRY[key]
+        assert shipped == expected, (
+            f"server.{key} drifted: proxy/config.yaml has {shipped!r}, the "
+            f"pinned routing-geometry fixture has {expected!r}. The single-slot "
+            "threshold derivations (physical clamp 258048/126976, effective "
+            "warm 120000, cold 38000) and docs/dev/single-slot-impact.md must "
+            "be re-derived together (LP-0MVTV6F65005HKQZ)."
+        )
+
+    @pytest.mark.parametrize("mode", ["fast", "cheap"])
+    def test_hard_routing_cap_ratios_retired(self, mode):
+        """AC4 (shipped config): the per-mode hard-routing-cap ratios are
+        retired, so the shipped config keeps the cap disabled (0)."""
+        key = f"local_hard_routing_cap_ratio_{mode}"
+        shipped = self._shipped_server().get(key)
+        assert shipped in (None, 0), (
+            f"server.{key} is set to {shipped!r} in proxy/config.yaml — the "
+            "retired hard-routing-cap ratio was re-enabled, so the pinned "
+            "cap-derivation values in test_hard_routing_cap.py "
+            "(ratio 0.5 -> 60000 at 1 and 2 slots) no longer describe the "
+            "shipped behaviour (LP-0MVTV6F65005HKQZ)."
+        )

@@ -460,34 +460,37 @@ def _candidate_slot_filenames(
 ) -> list[str]:
     """Return the snapshot filenames a session could own, most specific first.
 
-    Mirrors ``session._build_slot_context``: per-endpoint subdirectories
-    (``{host}-{port}``) keep different llama-server instances' snapshots apart
-    (LP-0MRPILSMW004T4H8).  The legacy root directory is tried as a fallback so
-    snapshots written before per-endpoint layout (or by callers that resolve no
-    endpoint) are still found.  Imported lazily to avoid a module-level import
-    cycle (``session`` → ``provider``).
+    The first candidate is llama-server's real save location: the cache root
+    plus ``slot_<session>.bin`` (the server accepts only a bare filename and
+    writes it under ``--slot-save-path``). A legacy ``{host}-{port}``
+    subdirectory is appended when an endpoint is known so snapshots written by
+    the pre-fix layout are still found (LP-0MVVI8TEU006KTOZ, superseding the
+    subdirectory assumption of LP-0MRPILSMW004T4H8 / LP-0MVK0E80C009HUQC).
     """
     try:
         from proxy.session import _endpoint_host_port, _slot_filename_for_session
     except Exception:
         return []
     candidates: list[str] = []
+    # The snapshot lives in llama-server's own ``--slot-save-path`` (the cache
+    # root): it accepts only a bare filename, so the endpoint dimension never
+    # reached the on-disk path (LP-0MVVI8TEU006KTOZ). The endpoint
+    # subdirectory is kept only as a legacy fallback for snapshots written by
+    # the older layout so they are still discovered and retired.
+    try:
+        candidates.append(_slot_filename_for_session(session_id, Path(slot_path)))
+    except Exception:
+        return candidates
     if endpoint:
         try:
             host, port = _endpoint_host_port(endpoint)
-            candidates.append(
-                _slot_filename_for_session(
-                    session_id, Path(slot_path) / f"{host}-{port}"
-                )
+            legacy = _slot_filename_for_session(
+                session_id, Path(slot_path) / f"{host}-{port}"
             )
+            if legacy not in candidates:
+                candidates.append(legacy)
         except Exception:
             pass
-    try:
-        root = _slot_filename_for_session(session_id, Path(slot_path))
-    except Exception:
-        return candidates
-    if root not in candidates:
-        candidates.append(root)
     return candidates
 
 

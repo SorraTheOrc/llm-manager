@@ -117,10 +117,10 @@ class BudgetDecision:
     - ``unlimited`` — the entry has no ``rate_limit_rpm`` (not gated);
     - ``allowed`` — a slot was available immediately;
     - ``allowed_after_wait`` — an in-progress session waited and got a slot;
-    - ``rate_limited`` — over budget, new session: passed through immediately;
-    - ``rate_limited_after_wait`` — an in-progress session's wait ran out;
-    - ``rate_limited_waiters`` — waiter depth cap reached: passed through;
-    - ``rate_limited_disconnect`` — the client disconnected during the wait.
+    - ``provider_budget_exhausted`` — over budget, new session: passed through immediately;
+    - ``provider_budget_exhausted_after_wait`` — an in-progress session's wait ran out;
+    - ``provider_budget_exhausted_waiters`` — waiter depth cap reached: passed through;
+    - ``provider_budget_exhausted_disconnect`` — the client disconnected during the wait.
     """
 
     allowed: bool
@@ -550,7 +550,7 @@ async def _wait_for_capacity(
         # in-progress sessions pass through exactly like new sessions.
         logger.info(
             "Provider budget exhausted: skipping provider=%s limit=%d "
-            "remaining=%d reason=rate_limited session_affinity=true wait_disabled=true%s",
+            "remaining=%d reason=provider_budget_exhausted session_affinity=true wait_disabled=true%s",
             entry_name,
             rpm,
             limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
@@ -558,7 +558,7 @@ async def _wait_for_capacity(
         )
         return BudgetDecision(
             allowed=False,
-            reason="rate_limited",
+            reason="provider_budget_exhausted",
             limit_rpm=rpm,
             remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
             sources=sources,
@@ -566,7 +566,7 @@ async def _wait_for_capacity(
     if _waiters >= max_waiters:
         logger.info(
             "Provider budget wait declined: provider=%s limit=%d "
-            "reason=rate_limited_waiters waiters=%d max_waiters=%d%s",
+            "reason=provider_budget_exhausted_waiters waiters=%d max_waiters=%d%s",
             entry_name,
             rpm,
             _waiters,
@@ -575,7 +575,7 @@ async def _wait_for_capacity(
         )
         return BudgetDecision(
             allowed=False,
-            reason="rate_limited_waiters",
+            reason="provider_budget_exhausted_waiters",
             limit_rpm=rpm,
             remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
             sources=sources,
@@ -614,7 +614,7 @@ async def _wait_for_capacity(
                 )
                 return BudgetDecision(
                     allowed=False,
-                    reason="rate_limited_disconnect",
+                    reason="provider_budget_exhausted_disconnect",
                     limit_rpm=rpm,
                     remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
                     waited_seconds=waited,
@@ -644,7 +644,7 @@ async def _wait_for_capacity(
 
     logger.warning(
         "Provider budget wait exhausted: provider=%s limit=%d waited=%.2fs "
-        "reason=rate_limited_after_wait%s",
+        "reason=provider_budget_exhausted_after_wait%s",
         entry_name,
         rpm,
         waited,
@@ -652,7 +652,7 @@ async def _wait_for_capacity(
     )
     return BudgetDecision(
         allowed=False,
-        reason="rate_limited_after_wait",
+        reason="provider_budget_exhausted_after_wait",
         limit_rpm=rpm,
         remaining=limiter.remaining(entry_name, rpm, RATE_LIMIT_WINDOW_SECONDS),
         waited_seconds=waited,
@@ -752,7 +752,7 @@ async def acquire_provider_budget(
     label = settings.source_label
     logger.warning(
         "Provider budget exhausted: skipping provider=%s limit=%d reserve=%d "
-        "remaining=%d reason=rate_limited session_affinity=false session=%s%s",
+        "remaining=%d reason=provider_budget_exhausted session_affinity=false session=%s%s",
         entry_name,
         effective_limit,
         reserve,
@@ -762,7 +762,7 @@ async def acquire_provider_budget(
     )
     return BudgetDecision(
         allowed=False,
-        reason="rate_limited",
+        reason="provider_budget_exhausted",
         limit_rpm=rpm,
         remaining=remaining,
         reserve_slots=reserve,

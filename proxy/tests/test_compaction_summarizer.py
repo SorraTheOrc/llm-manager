@@ -490,13 +490,48 @@ class TestTimeoutDiagnosticContext:
         diag = _timeout_diagnostic("Qwen3-8B", 1500, 0, 1, 2, 3)
         assert "attempt=2/3" in diag
 
-    def test_slot_capacity_sync_returns_zero_on_failure(self):
-        from proxy.compaction_summarizer import _probe_slot_capacity_sync
+    def test_slot_capacity_sync_returns_zero_on_failure(self, monkeypatch):
+        from types import SimpleNamespace
 
-        # Port 19999 is unlikely to have a llama-server
-        avail, total = _probe_slot_capacity_sync(19999)
+        import httpx
+
+        from proxy import compaction_summarizer as summarizer
+        from proxy import router_helpers as rh
+
+        monkeypatch.setattr(rh, "_discover_local_child_port", lambda *a, **k: None)
+        monkeypatch.setattr(rh, "_child_port_cache", {})
+        monkeypatch.setattr(rh, "_child_port_cache_at", {})
+        monkeypatch.setattr(rh, "_child_port_miss_cache", {})
+        monkeypatch.setattr(rh, "_last_child_port_fallback_warn_ts", 0.0)
+
+        seen: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            return httpx.Response(500)
+
+        real_client = httpx.Client
+
+        def _factory(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(_handler)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr(summarizer.httpx, "Client", _factory)
+        srv = SimpleNamespace(
+            config={"server": {"llama_server_port": 19999}},
+            current_model="Qwen3",
+            llama_process=SimpleNamespace(pid=41395),
+            log_dir=__import__("pathlib").Path("/nonexistent"),
+            logger=SimpleNamespace(warning=lambda *a, **k: None),
+        )
+
+        avail, total = summarizer._probe_slot_capacity_sync(
+            19999, model_name="Qwen3", srv=srv
+        )
         assert avail == 0
         assert total == 0
+        # The failed probe still carried ?model= — it is never model-less.
+        assert seen and all("model=Qwen3" in url for url in seen)
 
     def test_estimate_payload_tokens_produces_positive_int(self):
         from proxy.compaction_summarizer import _estimate_payload_tokens

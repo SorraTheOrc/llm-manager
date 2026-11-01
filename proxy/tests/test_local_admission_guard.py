@@ -40,6 +40,12 @@ that contract to the *kind* of refusal: the 429 body and the single
 ``admission_reserve.local_capacity_verdict`` — ``deferrable`` when waiting can
 help, ``too_large`` when the request exceeds the local serving envelope — while
 retry timing and every pre-existing field stay untouched.
+
+The free-slot over-budget slice (LP-0MVT3TB6800010XO) pins what a client
+observes on the **direct** path: a prompt above the flat cold-prefill cap is
+refused without a timer (``retryable: false``, compaction guidance, token
+evidence) even when a local slot is free, and a too-large pin-local request on
+a hybrid chain is promoted to the remote tier instead of refused.
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import proxy.provider as provider
@@ -72,6 +79,13 @@ class _DummyRequest:
 
     async def body(self):
         return self._body
+
+
+#: The pin-local wire value. The admission guard (queueing, ETA refusal,
+#: deferral) is reachable only for this value: since LP-0MVUH9PUU005HVS4 the
+#: default is ``remote-ok``, which never waits and whose refusal outcome is
+#: therefore unreachable.
+PIN_LOCAL_HEADERS = {"X-Local-Preference": "local-preferred"}
 
 
 class _MutableConcurrency:
@@ -168,9 +182,16 @@ def _guard_patches(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_eta_above_budget_falls_back_immediately_without_queueing(
+async def test_eta_above_budget_refuses_immediately_without_queueing(
     mixed_model_config, caplog
 ):
+    """A pin-local request over the budget is refused, never queued.
+
+    Since LP-0MVUH9PUU005HVS4 the *fall-through* variant of this shape belongs
+    to the ``remote-ok`` default (which never waits); the guard's refusal is
+    reachable only for a pin-local client, and it is an immediate ``429`` with
+    no dispatch and no queue state.
+    """
     caplog.set_level(logging.INFO, logger="llama-proxy")
     _seed_calibration(tokens=100_000, ms_per_token=3.9)
     calls: list[str] = []
@@ -192,12 +213,15 @@ async def test_eta_above_budget_falls_back_immediately_without_queueing(
     ):
         started = time.monotonic()
         result = await provider.proxy_with_fallback(
-            _DummyRequest(), "v1/chat/completions", mixed_model_config, _queue_cfg()
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+            "v1/chat/completions",
+            mixed_model_config,
+            _queue_cfg(),
         )
         elapsed = time.monotonic() - started
 
-    assert result.status_code == 200
-    assert calls == ["remote"], "a refused request must never dispatch or wait local"
+    assert result.status_code == 429, "a pin-local refusal is a retryable 429"
+    assert calls == [], "a refused request must never dispatch or wait local"
     assert elapsed < 2.0, "the refusal must be immediate (no queue wait)"
     assert contention_queue.queue_depth() == 0
 
@@ -211,7 +235,11 @@ async def test_eta_above_budget_falls_back_immediately_without_queueing(
 
 @pytest.mark.asyncio
 async def test_refused_request_records_eta_diagnostics(mixed_model_config):
-    """The refusal is visible in the exhaustion diagnostics (ETA + budget)."""
+    """The refusal is visible in the exhaustion diagnostics (ETA + budget).
+
+    The guard refusal is a pin-local outcome (``refused_local_only``): the
+    value holds the request local rather than moving it remote.
+    """
     _seed_calibration(tokens=100_000, ms_per_token=3.9)
 
     with (
@@ -223,7 +251,7 @@ async def test_refused_request_records_eta_diagnostics(mixed_model_config):
             _queue_cfg(),
             1,
             1,
-            _DummyRequest(),
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
             {},
             {},
             {"name": "local-llama", "llama_model": "Qwen3"},
@@ -231,7 +259,7 @@ async def test_refused_request_records_eta_diagnostics(mixed_model_config):
             priority="low",
         )
 
-    assert action == "admission_reject"
+    assert action == "refused_local_only"
     assert reason == "eta_exceeds_budget"
     assert elapsed is None
 
@@ -268,7 +296,9 @@ async def test_eta_within_budget_still_queues_and_dispatches_local(
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", mixed_model_config,
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+                "v1/chat/completions",
+                mixed_model_config,
                 _queue_cfg(),
             )
         )
@@ -320,7 +350,9 @@ async def test_warm_cache_prompt_is_admitted_and_queued(mixed_model_config, capl
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", mixed_model_config,
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+                "v1/chat/completions",
+                mixed_model_config,
                 _queue_cfg(),
             )
         )
@@ -370,7 +402,9 @@ async def test_missing_calibration_keeps_queueing_unchanged(
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", mixed_model_config,
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+                "v1/chat/completions",
+                mixed_model_config,
                 _queue_cfg(),
             )
         )
@@ -417,7 +451,9 @@ async def test_observe_policy_never_refuses(mixed_model_config, caplog):
     ):
         task = asyncio.create_task(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", mixed_model_config,
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+                "v1/chat/completions",
+                mixed_model_config,
                 _queue_cfg(local_admission_guard_policy="observe"),
             )
         )
@@ -521,6 +557,59 @@ def test_generic_exhaustion_is_unchanged_without_a_refusal():
     assert response.status_code == 503
     assert "X-Local-Admission" not in response.headers
     assert json.loads(response.body)["code"] == provider.EXHAUSTION_CODE_ALL
+
+
+# ---------------------------------------------------------------------------
+# The shipped swept budget is the one the guard refuses against
+# (LP-0MVT1146V007WXA4 AC2)
+# ---------------------------------------------------------------------------
+
+def test_shipped_swept_budget_drives_the_guard_refusal_payload():
+    """The 429 a client sees is priced against the shipped 30 s budget.
+
+    The budget is read from the shipped ``proxy/config.yaml`` through the one
+    resolver (``prefill_eta.wait_budget_seconds`` →
+    ``_get_contention_queue_config``), so neither the decision nor the
+    ``X-Local-Admission-Budget`` header can carry a second, test-local
+    constant.
+    """
+    from config_test_utils import get_merged_config
+
+    # Cache-cold 6k prompt at ~3.9 ms/token ≈ 23.4 s own prefill; behind one
+    # occupied gate the projection is ~46.8 s — inside the shipped 120 s
+    # deadline and the 25k cold-prefill budget, but past the 30 s wait budget.
+    _seed_calibration(tokens=6_000, ms_per_token=3.9)
+    config = {
+        "provider_cooldown_seconds": 60,
+        "server": get_merged_config("fast")["server"],
+    }
+
+    decision = prefill_eta.evaluate_admission(
+        config, "Qwen3", 6_000, 0.0, "medium", busy_slots=1
+    )
+
+    assert decision.reason == "eta_exceeds_budget"
+    assert decision.budget_seconds == 30.0
+
+    response = provider._build_exhausted_response(
+        all_local_slot_exhaustion=False,
+        unavailable_providers={},
+        diagnostics=[
+            {
+                "provider": "local-llama",
+                "type": "local",
+                "status": "local_admission_reject",
+                "reason": decision.reason,
+                **provider._local_admission_evidence(decision),
+            }
+        ],
+        config=config,
+    )
+
+    assert response.status_code == 429
+    assert response.headers["X-Local-Admission"] == "reject"
+    assert response.headers["X-Local-Admission-Budget"] == "30.0"
+    assert json.loads(response.body)["budget_seconds"] == 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -807,7 +896,7 @@ async def _issue_local_only_prefill_budget_refusal(mixed_model_config) -> tuple:
         _guard_patches(tokens=INCIDENT_NEW_TOKENS),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(headers={"x-local-preference": "local-only"}),
+            _DummyRequest(headers={"x-local-preference": "local-preferred"}),
             "v1/chat/completions",
             mixed_model_config,
             _cold_budget_cfg(),
@@ -905,13 +994,23 @@ async def test_prefill_budget_exceeded_exhaustion_refusal_is_not_time_retryable(
         _guard_patches(tokens=INCIDENT_NEW_TOKENS),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(), "v1/chat/completions", local_only_chain,
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+            "v1/chat/completions",
+            local_only_chain,
             _cold_budget_cfg(),
         )
 
     body = _assert_prefill_budget_refusal_contract(result)
     assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
     assert body["error"] == "All providers exhausted"
+    # AC8 on the queue path: the permanent cold-budget bound keeps its own
+    # token here too (the free-slot path is pinned by
+    # ``test_direct_free_slot_budget_refusal_keeps_its_reason``).
+    assert body["reason"] == "prefill_budget_exceeded"
+    assert (
+        result.headers.get("X-Local-Fallback-Reason")
+        == "prefill_budget_exceeded"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1159,10 @@ class _OccupancyRefusalCase:
     #: ``"hybrid"`` = a remote provider is available (local-only refusal) or
     #: ``"local_only"`` = the chain has no fallback (exhaustion refusal).
     chain: str = "hybrid"
+    #: Whether the request is a pin-local client (``local-preferred``). A
+    #: headerless request now resolves to the ``remote-ok`` default, whose
+    #: guard refusal is unreachable: it falls through instead of pinning.
+    pinned: bool = True
     #: Extra ``server`` config for this case.
     server: dict = field(default_factory=dict)
 
@@ -1112,6 +1215,17 @@ _PREFILL_SAFETY_BUDGET_CASE = dict(
     },
 )
 
+#: The deadline refusal on the **free-slot** (direct) dispatch path: the same
+#: governing decision applied one step earlier, so the advertised reason and
+#: timer must not change with the path (AC1/AC6).
+_PREFILL_DEADLINE_DIRECT_CASE = dict(_PREFILL_DEADLINE_CASE, path="direct")
+
+#: The deadline-relative safety-budget refusal on the free-slot path; the
+#: binding bound is still the safety budget, never the ETA/budget label.
+_PREFILL_SAFETY_BUDGET_DIRECT_CASE = dict(
+    _PREFILL_SAFETY_BUDGET_CASE, path="direct"
+)
+
 #: The advertised duration is capped by ``server.max_retry_after_seconds``.
 _CAPPED_CASE = dict(
     reason="eta_exceeds_budget",
@@ -1146,12 +1260,20 @@ _OCCUPANCY_REFUSAL_CASES = [
         id="prefill_eta_exceeds_deadline-exhausted",
     ),
     pytest.param(
+        _OccupancyRefusalCase(**_PREFILL_DEADLINE_DIRECT_CASE),
+        id="prefill_eta_exceeds_deadline-direct",
+    ),
+    pytest.param(
         _OccupancyRefusalCase(**_PREFILL_SAFETY_BUDGET_CASE),
         id="prefill_eta_exceeds_safety_budget-local-only",
     ),
     pytest.param(
         _OccupancyRefusalCase(**_PREFILL_SAFETY_BUDGET_CASE, chain="local_only"),
         id="prefill_eta_exceeds_safety_budget-exhausted",
+    ),
+    pytest.param(
+        _OccupancyRefusalCase(**_PREFILL_SAFETY_BUDGET_DIRECT_CASE),
+        id="prefill_eta_exceeds_safety_budget-direct",
     ),
     pytest.param(
         _OccupancyRefusalCase(**_CAPPED_CASE),
@@ -1236,6 +1358,12 @@ def _assert_occupancy_refusal_contract(result, case: _OccupancyRefusalCase) -> d
     )
 
     body = json.loads(result.body)
+    # AC2: the body names the same governing reason as the header. Asserting
+    # only ``X-Local-Fallback-Reason`` would let the two surfaces drift apart.
+    assert body.get("reason") == case.reason, (
+        "the refusal body must name the same reason as "
+        "X-Local-Fallback-Reason, not only restate it in a header"
+    )
     assert body.get("retryable") is True, "a wait the client can outlast is retryable"
     assert body.get("retry_after") == case.expected_retry_after, (
         "the body must carry the same seconds as the Retry-After header"
@@ -1294,9 +1422,11 @@ async def _issue_occupancy_refusal(case: _OccupancyRefusalCase, mixed_model_conf
     model_config = (
         mixed_model_config if case.chain == "hybrid" else _local_only_model_config()
     )
-    headers = (
-        {"x-local-preference": "local-only"} if case.chain == "hybrid" else {}
-    )
+    # Both refusal builders answer a *pin-local* client: the hybrid chain
+    # produces the local-only refusal, the remote-less chain its own variant.
+    # A headerless request now resolves to ``remote-ok``, whose guard refusal
+    # is unreachable — it falls through instead (LP-0MVUH9PUU005HVS4 AC21).
+    headers = {"x-local-preference": "local-preferred"} if case.pinned else {}
     concurrency = _MutableConcurrency(1 if case.path == "queue" else 0, 1)
 
     with (
@@ -1330,6 +1460,495 @@ async def test_occupancy_refusal_advertises_a_truthful_retry_time(
     )
     body = _assert_occupancy_refusal_contract(result, case)
     assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+
+
+# ---------------------------------------------------------------------------
+# Direct-path reason pass-through (LP-0MVRO3AHN002UM1Q AC1/AC3/AC4)
+#
+# The free-slot branch already records the governing decision reason verbatim
+# for the deadline, deadline-relative safety-budget and flat cold-budget
+# refusals (commit ``0466f5db``), but nothing pinned it on the direct path. The
+# rows below drive each reason through a FREE local slot end-to-end, so a
+# regression that relabels a non-ETA bound as ``eta_exceeds_budget_direct``
+# whenever a slot happens to be free fails here.
+#
+# The cases run without a fallback provider and without an
+# ``X-Local-Preference`` header: the request therefore really falls through
+# (emitting the ``local_admission_guard_direct_fallback`` line) and the chain
+# exhaustion surfaces the recorded ``local_admission_reject`` attempt in the
+# response body, so both AC7 surfaces are asserted from production output
+# rather than re-derived in the test.
+# ---------------------------------------------------------------------------
+
+#: Governing reasons pinned on the free-slot path by the AC7 tests. The cold
+#: prefill budget needs a prompt above the flat cap, so it has its own test.
+_DIRECT_GOVERNING_REASON_CASES = [
+    pytest.param(
+        _OccupancyRefusalCase(
+            **_PREFILL_DEADLINE_DIRECT_CASE, chain="local_only", pinned=False
+        ),
+        id="prefill_eta_exceeds_deadline-direct",
+    ),
+    pytest.param(
+        _OccupancyRefusalCase(
+            **_PREFILL_SAFETY_BUDGET_DIRECT_CASE, chain="local_only", pinned=False
+        ),
+        id="prefill_eta_exceeds_safety_budget-direct",
+    ),
+]
+
+#: Reasons whose refusal must never be relabelled as the free-slot ETA/budget
+#: token (AC8); each has a queue row and a direct row in the case table.
+_NON_ETA_GUARD_REASONS = frozenset(
+    {
+        "prefill_eta_exceeds_deadline",
+        "prefill_eta_exceeds_safety_budget",
+    }
+)
+
+_NON_ETA_GUARD_CASES = [
+    param
+    for param in _OCCUPANCY_REFUSAL_CASES
+    if param.values[0].reason in _NON_ETA_GUARD_REASONS
+]
+
+
+def _direct_fallback_lines(caplog) -> list[str]:
+    """Every ``local_admission_guard_direct_fallback`` line in *caplog*."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "local_admission_guard_direct_fallback" in record.getMessage()
+    ]
+
+
+def _guard_decision_lines(caplog) -> list[str]:
+    """Every ``local_admission_guard decision=`` line in *caplog*."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "local_admission_guard decision=" in record.getMessage()
+    ]
+
+
+def _recorded_admission_rejections(body: dict) -> list[dict]:
+    """The ``local_admission_reject`` attempts the refusal body reports."""
+    return [
+        attempt
+        for attempt in (body.get("diagnostics") or [])
+        if isinstance(attempt, dict)
+        and attempt.get("status") == "local_admission_reject"
+    ]
+
+
+@pytest.mark.parametrize("case", _DIRECT_GOVERNING_REASON_CASES)
+@pytest.mark.asyncio
+async def test_direct_path_names_the_governing_reason_end_to_end(
+    case: _OccupancyRefusalCase, mixed_model_config, caplog
+):
+    """AC7/AC8: header, body, attempt diagnostics and dispatch log agree."""
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    result, dispatched = await _issue_occupancy_refusal(case, mixed_model_config)
+
+    assert dispatched == [], "a refused free-slot request must never dispatch"
+    assert result.status_code == 429
+    assert result.headers.get("X-Local-Fallback-Reason") == case.reason
+    body = json.loads(result.body)
+    assert body.get("reason") == case.reason
+
+    attempts = _recorded_admission_rejections(body)
+    assert [attempt["reason"] for attempt in attempts] == [case.reason], (
+        "the recorded local_admission_reject attempt must name the governing "
+        "decision reason, not the free-slot dispatch label"
+    )
+
+    lines = _direct_fallback_lines(caplog)
+    assert len(lines) == 1, f"expected one direct fallback line, got {lines}"
+    assert f"reason={case.reason}" in lines[0]
+    assert "free_slot=true" in lines[0]
+    assert "reason=eta_exceeds_budget_direct" not in lines[0], (
+        "a non-ETA bound must never be relabelled as the ETA/budget reason"
+    )
+
+    guard_lines = _guard_decision_lines(caplog)
+    assert len(guard_lines) == 1, (
+        f"expected exactly one guard line, got {guard_lines}"
+    )
+    assert f"reason={case.reason}" in guard_lines[0]
+    assert "free_slot=true" in guard_lines[0]
+    assert "reason=eta_exceeds_budget_direct" not in guard_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_direct_free_slot_budget_refusal_keeps_its_reason(
+    mixed_model_config, caplog
+):
+    """AC6/AC7: a free-slot ``prefill_budget_exceeded`` refusal keeps its token.
+
+    The prompt is above the flat cold-prefill cap, so the guard refuses even
+    with a free local slot. The full no-timer / compaction contract for this
+    reason is pinned by LP-0MVT3TB6800010XO; here the pin is the label: the
+    attempt diagnostics and the dispatch log must both say
+    ``prefill_budget_exceeded``.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    async def _local(_req, _path):
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(),
+            "v1/chat/completions",
+            _local_only_model_config(),
+            _cold_budget_cfg(),
+        )
+
+    assert result.status_code == 429
+    assert (
+        result.headers.get("X-Local-Fallback-Reason")
+        == "prefill_budget_exceeded"
+    )
+    body = json.loads(result.body)
+    assert body.get("reason") == "prefill_budget_exceeded"
+    assert result.headers.get("Retry-After") is None, (
+        "waiting cannot heal a permanently over-budget prompt"
+    )
+
+    attempts = _recorded_admission_rejections(body)
+    assert [attempt["reason"] for attempt in attempts] == [
+        "prefill_budget_exceeded"
+    ]
+
+    lines = _direct_fallback_lines(caplog)
+    assert len(lines) == 1, f"expected one direct fallback line, got {lines}"
+    assert "reason=prefill_budget_exceeded" in lines[0]
+    assert "free_slot=true" in lines[0]
+    assert "reason=eta_exceeds_budget_direct" not in lines[0]
+
+    guard_lines = _guard_decision_lines(caplog)
+    assert len(guard_lines) == 1, (
+        f"expected exactly one guard line, got {guard_lines}"
+    )
+    assert "reason=prefill_budget_exceeded" in guard_lines[0]
+    assert "free_slot=true" in guard_lines[0]
+    assert "reason=eta_exceeds_budget_direct" not in guard_lines[0]
+
+
+# ---------------------------------------------------------------------------
+# LP-0MVT3TB6800010XO (parent AC2): the free-slot over-budget refusal the
+# client observes
+#
+# The unit-level pin in ``test_cold_prefill_budget.py``
+# (``test_direct_free_slot_guard_refuses_an_over_budget_request``) asserts only
+# the guard's decision. These cases pin what a client actually receives on the
+# free-slot (direct) path: the no-timer refusal with compaction evidence, and
+# the promotion of a too-large pin-local request.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_direct_free_slot_over_budget_refusal_is_not_time_retryable():
+    """AC1/AC3/AC4/AC6: the free-slot refusal carries the no-timer contract.
+
+    A free local slot is not permission to start a prefill that can never fit
+    the flat cold-prefill cap: with no fallback provider the client gets the
+    ``prefill_budget_exceeded`` 429, and its retry story — no
+    ``Retry-After``, ``retryable: false``, compaction guidance, token
+    evidence on headers and body — is the one
+    ``_refusal_retry_timing`` decides for that reason.
+    """
+
+    async def _local(_req, _path):
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(),
+            "v1/chat/completions",
+            _local_only_model_config(),
+            _cold_budget_cfg(),
+        )
+
+    body = _assert_prefill_budget_refusal_contract(result)
+    assert body["reason"] == "prefill_budget_exceeded"
+    assert result.headers.get("X-Local-Fallback-Reason") == body["reason"], (
+        "the header and the body must name the same governing reason"
+    )
+
+    # AC3: the recorded attempt carries the governing reason, never the
+    # free-slot dispatch label.
+    attempts = _recorded_admission_rejections(body)
+    assert [attempt["reason"] for attempt in attempts] == [
+        "prefill_budget_exceeded"
+    ]
+    assert "eta_exceeds_budget_direct" not in {
+        attempt["reason"] for attempt in attempts
+    }
+
+    # AC4: the timer story is asserted through the shared decision instead of
+    # re-deriving its arithmetic or copying its reason table here.
+    assert "prefill_budget_exceeded" in provider.NOT_TIME_RETRYABLE_REFUSAL_REASONS
+    timing = provider._refusal_retry_timing(
+        body["reason"],
+        eta_prefill_seconds=body["eta_prefill_seconds"],
+        budget_seconds=body["budget_seconds"],
+        config=_cold_budget_cfg(),
+    )
+    assert timing.retryable is False
+    assert timing.retry_after is None
+    assert timing.retry_at is None
+    assert body["retryable"] is timing.retryable
+    assert body["retry_after"] == timing.retry_after
+    assert body.get("retry_at") == timing.retry_at
+
+
+@pytest.mark.asyncio
+async def test_direct_free_slot_over_budget_pin_local_is_promoted(
+    mixed_model_config,
+):
+    """AC2: a free-slot too-large pin-local request is promoted, not refused.
+
+    The prompt outgrows the local serving envelope, so waiting cannot help and
+    the pin is declined (LP-0MVSLZY470051ZB2 AC4): with a remote provider on
+    the chain the request is served remotely — 200, ``X-Local-Route: remote``,
+    no ``Retry-After``, no local-capacity refusal body.
+    """
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=INCIDENT_NEW_TOKENS),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers={"x-local-preference": "local-preferred"}),
+            "v1/chat/completions",
+            mixed_model_config,
+            _cold_budget_cfg(),
+        )
+
+    assert calls == ["remote"], (
+        "a free-slot too-large pin-local request must be served remotely; "
+        f"got dispatches={calls}"
+    )
+    assert result.status_code == 200, f"got {result.status_code}"
+    assert result.headers.get("X-Local-Route") == "remote"
+    assert result.headers.get("Retry-After") is None, (
+        "waiting cannot help; the promoted response must not advertise a delay"
+    )
+    body = json.loads(result.body)
+    assert body.get("code") != provider.EXHAUSTION_CODE_LOCAL_ADMISSION, (
+        "promotion must not produce a local-capacity refusal"
+    )
+
+
+@pytest.mark.parametrize(
+    "case", _NON_ETA_GUARD_CASES, ids=[param.id for param in _NON_ETA_GUARD_CASES]
+)
+@pytest.mark.asyncio
+async def test_a_non_eta_bound_is_never_relabelled_on_either_path(
+    case: _OccupancyRefusalCase, mixed_model_config
+):
+    """AC8: the free-slot ETA/budget token covers only the ETA/budget bound.
+
+    Both dispatch paths are covered because the case table holds a queue row
+    and a direct row for each of these reasons; a regression that relabels
+    either one fails here.
+    """
+    result, _ = await _issue_occupancy_refusal(case, mixed_model_config)
+    advertised = {
+        result.headers.get("X-Local-Fallback-Reason"),
+        json.loads(result.body).get("reason"),
+    }
+    assert advertised == {case.reason}, (
+        "a non-ETA refusal must be named by its governing reason on both the "
+        f"header and the body; got {advertised!r}"
+    )
+    assert "eta_exceeds_budget_direct" not in advertised
+
+
+# ---------------------------------------------------------------------------
+# A local-only refusal is a capacity/intent outcome, never chain exhaustion
+# (LP-0MVNTJJGX00375VQ AC1/AC2/AC6)
+#
+# The 2026-10-25 incident: a client pinned ``X-Local-Preference: local-only``
+# was refused by the admission guard while ``opencode-go`` still reported 62 %
+# effective headroom, yet the response said ``error: "All providers exhausted"``
+# — factually wrong (no remote provider was ever consulted), and unrecoverable-
+# looking to a client retry loop. Both local-only refusal paths — the
+# queue/lease one and the direct free-slot one — must answer with the *one*
+# refusal shape, and the exhaustion prose stays reserved for a chain that
+# really did exhaust (``_build_exhausted_response``).
+# ---------------------------------------------------------------------------
+
+#: The truthful prose of a pin-local refusal, and the exhaustion prose it must
+#: never borrow: a pinned request never consulted the rest of the chain.
+LOCAL_ONLY_REFUSAL_ERROR = "Local admission refused"
+CHAIN_EXHAUSTION_ERROR = "All providers exhausted"
+
+#: Headers both local-only refusal paths must carry (AC1). ``Retry-After`` and
+#: the token headers depend on the *reason*, so they are pinned per row above;
+#: this tuple is the routing/admission shape that must be identical whichever
+#: path refused.
+_SHARED_REFUSAL_HEADERS = (
+    "X-Local-Route",
+    "X-Local-Fallback-Reason",
+    "X-Local-Admission",
+    "X-Local-Admission-Eta",
+    "X-Local-Admission-Budget",
+    "Cache-Control",
+)
+
+
+def _assert_not_chain_exhaustion(result) -> dict:
+    """AC1/AC2/AC6: the refusal must not claim the chain is exhausted."""
+    assert result.status_code == 429, f"got {result.status_code}"
+    assert result.headers.get("X-Local-Route") == "refused"
+    body = json.loads(result.body)
+    assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+    assert body["error"] == LOCAL_ONLY_REFUSAL_ERROR, (
+        "a pin-local refusal is a capacity/intent outcome: remote providers "
+        f"are available, so the body must not read as exhaustion; got {body!r}"
+    )
+    assert CHAIN_EXHAUSTION_ERROR not in result.body.decode(), (
+        "the exhaustion prose is reserved for a genuinely exhausted chain; a "
+        "pinned request never consults one"
+    )
+    # AC2: the detail states the pin intent and the guard's refusal, so a human
+    # reading ``detail`` alone learns why no remote provider was used.
+    assert "local-only" in body["detail"], (
+        f"detail must name the pin intent; got {body['detail']!r}"
+    )
+    assert "refused" in body["detail"], (
+        f"detail must say the local guard refused the request; got {body['detail']!r}"
+    )
+    return body
+
+
+@pytest.mark.asyncio
+async def test_direct_local_only_refusal_is_not_chain_exhaustion(
+    mixed_model_config,
+):
+    """AC1/AC2/AC6: the free-slot (direct) refusal never reports exhaustion.
+
+    A remote provider is in the chain and available throughout; the guard
+    refused local admission on a free slot, so the honest answer is the
+    pin-local refusal — never the chain-exhaustion prose the incident showed.
+    """
+    result, dispatched = await _issue_occupancy_refusal(
+        _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_DIRECT_CASE),
+        mixed_model_config,
+    )
+
+    assert dispatched == [], (
+        "a pinned-local request must never be dispatched locally or moved "
+        f"remote (dispatched={dispatched})"
+    )
+    body = _assert_not_chain_exhaustion(result)
+    for header in _SHARED_REFUSAL_HEADERS:
+        assert result.headers.get(header) is not None, (
+            f"the direct refusal must carry {header}; got {dict(result.headers)!r}"
+        )
+    assert body["verdict"] == admission_reserve.CAPACITY_DEFERRABLE
+
+
+@pytest.mark.asyncio
+async def test_both_local_only_refusal_paths_answer_with_one_shape(
+    mixed_model_config,
+):
+    """AC1: the queue/lease and direct free-slot refusals are one contract.
+
+    Same status, same body keys, same ``error``/``code`` prose and the same
+    header set — only the reason token and its numbers differ, because they
+    describe *which* exit refused the request.
+    """
+    queue_result, queue_calls = await _issue_occupancy_refusal(
+        _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_CASE), mixed_model_config
+    )
+    direct_result, direct_calls = await _issue_occupancy_refusal(
+        _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_DIRECT_CASE),
+        mixed_model_config,
+    )
+
+    assert queue_calls == direct_calls == []
+    queue_body = _assert_not_chain_exhaustion(queue_result)
+    direct_body = _assert_not_chain_exhaustion(direct_result)
+
+    assert set(queue_body) == set(direct_body), (
+        "both local-only refusal paths must return the same body shape; "
+        f"queue-only={sorted(set(queue_body) - set(direct_body))} "
+        f"direct-only={sorted(set(direct_body) - set(queue_body))}"
+    )
+    assert {k: queue_body[k] for k in ("error", "code", "detail")} == {
+        k: direct_body[k] for k in ("error", "code", "detail")
+    }, "the truthful prose and the stable code must not depend on the path"
+    assert set(queue_result.headers) == set(direct_result.headers), (
+        "both paths must carry the same refusal headers; "
+        f"queue-only={sorted(set(queue_result.headers) - set(direct_result.headers))} "
+        f"direct-only={sorted(set(direct_result.headers) - set(queue_result.headers))}"
+    )
+    for header in ("X-Local-Route", "X-Local-Admission"):
+        assert direct_result.headers[header] == queue_result.headers[header]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_chain_keeps_the_exhaustion_prose(mixed_model_config):
+    """AC3/AC6 regression: a genuinely exhausted chain is unchanged.
+
+    The pin-local path carries the truthful refusal prose; a request the guard
+    refused that then finds **no** remaining provider still answers with the
+    retained ``All providers exhausted`` prose and the shipped
+    ``local_admission_reject`` code (LP-0MVGDUV5E005UWBQ AC3), so older clients
+    keep parsing exactly what they parse today.
+
+    Since LP-0MVUH9PUU005HVS4 that shape is the *default* (``remote-ok``)
+    client's: a pin-local request is refused on the spot (``refused_local_only``
+    — its prose is asserted above), while a non-pinned request the guard
+    declined really does walk the rest of the chain, so it is the one that can
+    still report genuine exhaustion. The free-slot path is used because the
+    queue path returns before the guard for a never-waiting preference.
+    """
+    result, dispatched = await _issue_occupancy_refusal(
+        _OccupancyRefusalCase(
+            **_ETA_EXCEEDS_BUDGET_DIRECT_CASE,
+            chain="local_only",
+            pinned=False,
+        ),
+        mixed_model_config,
+    )
+
+    assert dispatched == []
+    assert result.status_code == 429
+    body = json.loads(result.body)
+    assert body["error"] == CHAIN_EXHAUSTION_ERROR, (
+        "a genuinely exhausted chain keeps its byte-compatible prose; got "
+        f"{body['error']!r}"
+    )
+    assert body["code"] == provider.EXHAUSTION_CODE_LOCAL_ADMISSION
+    assert LOCAL_ONLY_REFUSAL_ERROR not in result.body.decode(), (
+        "the pin-local prose must not leak onto the exhaustion surface"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1415,24 +2034,37 @@ class _RefusalContractRow:
     promoted: bool = False
     #: The AC2 occupancy case that reaches this reason, when applicable.
     occupancy_case: _OccupancyRefusalCase | None = None
+    #: Dispatch path the row drives (``"queue"`` / ``"direct"``). Together
+    #: with *reason* it identifies the row (AC3): the occupancy table pins the
+    #: same governing reason on both paths, while this contract table keeps
+    #: exactly one row per reason.
+    path: str | None = None
     #: ``new_tokens`` the refusal must advertise. Defaults to the shared
     #: ``PROMPT_NEW_TOKENS``; the ``prefill_budget_exceeded`` row reproduces the
     #: 2026-10-25 incident verbatim, so it advertises that prompt's size.
     expected_new_tokens: int = PROMPT_NEW_TOKENS
 
 
-def _occupancy_row(reason: str) -> _RefusalContractRow:
-    """Row for an ETA/occupancy reason, reusing the AC2 case table verbatim."""
+def _occupancy_row(reason: str, path: str) -> _RefusalContractRow:
+    """Row for an ETA/occupancy reason, reusing the AC2 case table verbatim.
+
+    The row is identified by ``(reason, path)`` (AC3): the same governing
+    reason is pinned on both the queue and the free-slot path, so the case
+    must be selected by the path it drives rather than by reason alone.
+    """
     case = next(
         param.values[0]
         for param in _OCCUPANCY_REFUSAL_CASES
-        if param.values[0].reason == reason and param.values[0].chain == "hybrid"
+        if param.values[0].reason == reason
+        and param.values[0].path == path
+        and param.values[0].chain == "hybrid"
     )
     return _RefusalContractRow(
         reason=reason,
         trigger="occupancy",
         time_retryable=True,
         occupancy_case=case,
+        path=path,
     )
 
 
@@ -1440,10 +2072,13 @@ def _occupancy_row(reason: str) -> _RefusalContractRow:
 #: per-reason contract of LP-0MVNTT4X8009IO2X (AC1/AC2/AC3) and the docs item
 #: LP-0MVQ23BH7006HLKB (wait / compact / refuse).
 _REFUSAL_CONTRACT_ROWS = [
-    _occupancy_row("eta_exceeds_budget"),
-    _occupancy_row("eta_exceeds_budget_direct"),
-    _occupancy_row("prefill_eta_exceeds_deadline"),
-    _occupancy_row("prefill_eta_exceeds_safety_budget"),
+    _occupancy_row("eta_exceeds_budget", path="queue"),
+    # Only the free-slot ETA/budget bound keeps this token; the rows below it
+    # are driven through the free-slot path too, so a relabel regression is
+    # observable on the contract table itself (LP-0MVRO3AHN002UM1Q AC1/AC8).
+    _occupancy_row("eta_exceeds_budget_direct", path="direct"),
+    _occupancy_row("prefill_eta_exceeds_deadline", path="direct"),
+    _occupancy_row("prefill_eta_exceeds_safety_budget", path="direct"),
     # Permanently over the flat cold-prefill cap: time cannot heal it. The
     # pin is declined for a too-large verdict (LP-0MVSLZY470051ZB2 AC4), so
     # the row asserts promotion to the remote tiers — the no-timer contract
@@ -1507,7 +2142,7 @@ async def _issue_cooldown_refusal(mixed_model_config) -> tuple:
         _local_entry_in_cooldown(),
     ):
         result = await provider.proxy_with_fallback(
-            _DummyRequest(headers={"x-local-preference": "local-only"}),
+            _DummyRequest(headers={"x-local-preference": "local-preferred"}),
             "v1/chat/completions",
             mixed_model_config,
             _cold_budget_cfg(),
@@ -1545,7 +2180,7 @@ async def _issue_refusal(row: _RefusalContractRow, mixed_model_config) -> tuple:
             _guard_patches(tokens=PROMPT_NEW_TOKENS, skip_reason=row.reason),
         ):
             result = await provider.proxy_with_fallback(
-                _DummyRequest(headers={"x-local-preference": "local-only"}),
+                _DummyRequest(headers={"x-local-preference": "local-preferred"}),
                 "v1/chat/completions",
                 mixed_model_config,
                 _cold_budget_cfg(),
@@ -1565,6 +2200,13 @@ def test_refusal_contract_table_has_exactly_one_row_per_reason():
     """
     reasons = [row.reason for row in _REFUSAL_CONTRACT_ROWS]
     assert len(reasons) == len(set(reasons)), f"duplicate reason rows: {reasons}"
+    # A row is identified by ``(reason, path)`` (AC3): the occupancy table
+    # holds both paths for the same reason, so a duplicate identity would let
+    # one of them silently go unpinned.
+    identities = [(row.reason, row.path) for row in _REFUSAL_CONTRACT_ROWS]
+    assert len(identities) == len(set(identities)), (
+        f"duplicate (reason, path) rows: {identities}"
+    )
     assert set(reasons) == {
         "eta_exceeds_budget",
         "eta_exceeds_budget_direct",
@@ -1588,6 +2230,9 @@ def test_refusal_contract_table_has_exactly_one_row_per_reason():
             assert row.occupancy_case.reason == row.reason, (
                 "an occupancy row must reuse the AC2 case table, not restate "
                 "its numbers"
+            )
+            assert row.occupancy_case.path == row.path, (
+                "an occupancy row must drive the (reason, path) it names"
             )
 
 
@@ -2078,8 +2723,9 @@ async def _issue_guard_refusal(
 ) -> tuple:
     """Drive the end-to-end over-budget refusal for *preference*.
 
-    Returns ``(response, provider_calls)``; a ``prefer-local`` request falls
-    through to remote (no refusal), a pin-local one is refused locally.
+    Returns ``(response, provider_calls)``; a non-pin-local request
+    (``remote-ok``, or the absent-header default) falls through to remote with
+    no refusal, a pin-local one is refused locally.
     *tokens* is the priced prompt size — the default is the incident shape
     (over the cold-prefill cap), a smaller one keeps the sole blocking signal
     temporal so a temporal exit can be asserted as ``deferrable``.
@@ -2123,7 +2769,7 @@ async def _issue_guard_refusal(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preference", ["prefer-local", "remote-ok", None])
+@pytest.mark.parametrize("preference", ["remote-ok", None])
 async def test_non_refusal_paths_log_no_verdict_line(preference, caplog):
     """AC3: only a refusal produces a verdict; fall-through logs none."""
     caplog.set_level(logging.INFO, logger="llama-proxy")
@@ -2145,7 +2791,7 @@ async def test_choke_point_refusal_logs_one_verdict_line(caplog):
         # *only* blocking signal, so the verdict must be ``deferrable``
         # (waiting helps) rather than ``too_large`` (the prompt never fits).
         result, calls = await _issue_guard_refusal(
-            "local-only", tokens=INCIDENT_BUDGET_TOKENS // 2
+            "local-preferred", tokens=INCIDENT_BUDGET_TOKENS // 2
         )
     finally:
         provider._provider_unavailable_until.pop("local-llama", None)
@@ -2173,7 +2819,7 @@ async def test_too_large_pin_local_promotes_instead_of_refusing(caplog):
     """
     caplog.set_level(logging.INFO, logger="llama-proxy")
 
-    result, calls = await _issue_guard_refusal("local-only")
+    result, calls = await _issue_guard_refusal("local-preferred")
 
     assert result.status_code == 200, (
         f"a too-large request must fall through to remote, got "
@@ -2186,7 +2832,7 @@ async def test_too_large_pin_local_promotes_instead_of_refusing(caplog):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preference", ["local-preferred", "local-only"])
+@pytest.mark.parametrize("preference", ["local-preferred"])
 async def test_pin_local_with_a_free_slot_is_served_locally(
     mixed_model_config, preference
 ):
@@ -2194,8 +2840,9 @@ async def test_pin_local_with_a_free_slot_is_served_locally(
 
     The pin only ever removes the *remote* option; a request local can serve
     right now must be served locally with no refusal, no queueing and a single
-    ``X-Local-Route: local`` stamp (parent AC2 / AC6). Both wire spellings are
-    asserted because the ``local-only`` alias must keep working.
+    ``X-Local-Route: local`` stamp (parent AC2 / AC6). Only the live spelling is
+    parametrised: the retired ``local-only`` is a ``400`` before routing
+    (LP-0MVUH9PAZ002UAPA), pinned by ``test_local_preference_vocabulary_v2.py``.
     """
     calls: list[str] = []
 
@@ -2430,3 +3077,295 @@ async def test_deferral_exit_refuses_before_resolving_a_remote_candidate(
         f"{trigger}: the refusal must come from the queue exit itself, before "
         f"the next candidate is resolved (resolved={resolutions})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Truthful fallback accounting + attributable refusal context
+# (LP-0MVNTJQVB007QWEZ)
+#
+# The 2026-10-25 diagnosis of session ``herdr-1792897705-4039879-16152``
+# needed to tell "local refused the request by design" from "the chain really
+# ran out". Two things broke that:
+#
+# - the ``local_admission_guard_direct_fallback … → routing to next provider``
+#   line was emitted *before* the pin-local branch returned the 429, so the
+#   log claimed routing that never happened (AC1);
+# - the refusal line named the reason and the intent but not the dispatch
+#   context or the decision evidence, so counting refusals per session /
+#   provider / priority needed other lines (AC2).
+#
+# Every test below greps the same public log contract an operator does: one
+# ``local_only_refused`` line per refused request, no false fallback line.
+# ---------------------------------------------------------------------------
+
+#: The 2026-10-25 refusal's session id — the AC5 reproduction case.
+INCIDENT_REFUSAL_SESSION = "herdr-1792897705-4039879-16152"
+
+#: The operator-facing doc that shows the incident's worked-example log output
+#: (AC5). The reproduction below asserts the example *is* the line it emits, so
+#: the runbook can never show output no build produces.
+_ROUTING_DOC = Path(__file__).resolve().parents[1] / "docs" / "routing.md"
+
+
+def _documented_incident_refusal_line() -> str:
+    """The ``local_only_refused`` line the docs show for the incident session."""
+    documented = [
+        line.strip()
+        for line in _ROUTING_DOC.read_text().splitlines()
+        if line.strip().startswith("local_only_refused ")
+        and f"session={INCIDENT_REFUSAL_SESSION}" in line
+    ]
+    assert len(documented) == 1, (
+        "proxy/docs/routing.md must show exactly one worked-example refusal "
+        f"line for session {INCIDENT_REFUSAL_SESSION}; got {documented!r}"
+    )
+    return documented[0]
+
+
+def _log_messages(caplog) -> list[str]:
+    """Every captured message, in emission order."""
+    return [record.getMessage() for record in caplog.records]
+
+
+async def _issue_direct_guard_refusal(
+    mixed_model_config, preference: str
+) -> tuple:
+    """Drive the direct (free-slot) guard path for *preference*.
+
+    A 100k-token cache-cold prompt is priced at ~468 s against the 60 s wait
+    budget while a local slot is free, so the direct guard refuses. A
+    pin-local client gets the 429; ``remote-ok`` falls through to remote.
+    Returns ``(response, dispatches)``.
+    """
+    calls: list[str] = []
+
+    async def _local(_req, _path):
+        calls.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):
+        calls.append("remote")
+        return _ok_response()
+
+    # Cache-cold 100k prompt at ~3.9 ms/token ≈ 468 s ≫ 60 s budget.
+    _seed_calibration(tokens=100_000, ms_per_token=3.9)
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(0, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=100_000),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(
+                headers={
+                    "x-local-preference": preference,
+                    "x-session-id": INCIDENT_REFUSAL_SESSION,
+                }
+            ),
+            "v1/chat/completions",
+            mixed_model_config,
+            _free_slot_cfg(),
+        )
+    return result, calls
+
+
+@pytest.mark.asyncio
+async def test_direct_guard_pin_refusal_is_attributable_and_claims_no_fallback(
+    mixed_model_config, caplog
+):
+    """AC1/AC2/AC5: the 2026-10-25 refusal, reproduced end-to-end.
+
+    The refused ``local-preferred`` request must leave exactly one greppable
+    ``local_only_refused`` line carrying the dispatch context (session,
+    provider, priority, ``route=refused``) and the admission decision's own
+    evidence (tokens, ETA, budget) — and the log must not claim it routed to
+    the next provider, because it did not.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    result, calls = await _issue_direct_guard_refusal(
+        mixed_model_config, "local-preferred"
+    )
+
+    assert result.status_code == 429, (
+        f"a pin-local refusal is the retryable 429, got {result.status_code}"
+    )
+    assert calls == [], (
+        f"a refused pin-local request never dispatches, got {calls}"
+    )
+
+    messages = _log_messages(caplog)
+    # AC2: exactly one countable refusal line, and it names everything the
+    # operator needs to attribute the 429 from the log alone.
+    lines = [m for m in messages if m.startswith("local_only_refused ")]
+    assert len(lines) == 1, f"exactly one refusal line per request; got {lines!r}"
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("reason") == "eta_exceeds_budget_direct"
+    assert fields.get("preference") == "local-preferred"
+    assert fields.get("session") == INCIDENT_REFUSAL_SESSION, (
+        f"the refusal must name the session it refused; got {fields!r}"
+    )
+    assert fields.get("provider") == "local-llama", (
+        f"the refusal must name the provider it refused; got {fields!r}"
+    )
+    assert fields.get("priority") == "low"
+    assert fields.get("route") == "refused"
+    # The numbers are the admission decision's own (never re-derived here).
+    assert int(fields.get("new_tokens", -1)) == 100_000
+    assert int(fields.get("budget_tokens", -1)) == (
+        provider._cold_prefill_budget_tokens(_free_slot_cfg())
+    )
+    assert float(fields.get("eta_prefill_seconds", 0.0)) > 0.0
+    assert float(fields.get("budget_seconds", 0.0)) > 0.0
+
+    # AC5: the worked example in proxy/docs/routing.md is *this* line — the
+    # runbook must show output the build really produces, and the doc is what
+    # makes the incident verifiable outside the work item.
+    assert lines[0] == _documented_incident_refusal_line(), (
+        "the documented worked example must be the refusal line this "
+        "reproduction emits; update proxy/docs/routing.md with the emitted line"
+    )
+
+    # AC1: nothing was routed, so nothing may claim it was.
+    assert [
+        m
+        for m in messages
+        if m.startswith("local_admission_guard_direct_fallback")
+    ] == [], (
+        "a refused local-only request must not log '→ routing to next "
+        f"provider'; got {messages!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_pinned_direct_fall_through_keeps_the_fallback_line(
+    mixed_model_config, caplog
+):
+    """AC1/AC4: the truthful half — a real fall-through still says so.
+
+    Regression guard: moving the line behind the pin check must not silence it
+    for the ``remote-ok`` client that genuinely moves to the next provider.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    result, calls = await _issue_direct_guard_refusal(
+        mixed_model_config, "remote-ok"
+    )
+
+    assert result.status_code == 200, "remote-ok keeps the remote answer"
+    assert calls == ["remote"], f"remote-ok falls through; got {calls}"
+
+    messages = _log_messages(caplog)
+    fallback = [
+        m for m in messages if m.startswith("local_admission_guard_direct_fallback")
+    ]
+    assert len(fallback) == 1, (
+        f"a real fall-through logs the line exactly once; got {fallback!r}"
+    )
+    assert "→ routing to next provider" in fallback[0]
+    assert "reason=eta_exceeds_budget_direct" in fallback[0]
+    assert f"session={INCIDENT_REFUSAL_SESSION}" in fallback[0], (
+        f"the fall-through line names its session; got {fallback[0]!r}"
+    )
+    assert [m for m in messages if m.startswith("local_only_refused ")] == [], (
+        "a served request is not a refusal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_contention_queue_pin_refusal_carries_dispatch_context(
+    mixed_model_config, caplog
+):
+    """AC2/AC4: the contention-queue refusal path logs the same context.
+
+    Every slot is busy, so the request reaches the queue-entry guard, which
+    refuses a ``local-preferred`` client with a deferrable verdict. The
+    refusal line must name the session, provider, priority and route exactly as
+    the direct path does.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    case = _OccupancyRefusalCase(**_ETA_EXCEEDS_BUDGET_CASE)
+
+    dispatched: list[str] = []
+
+    async def _local(_req, _path):
+        dispatched.append("local")
+        return _ok_response()
+
+    async def _remote(_req, _path, _pc):  # pragma: no cover - must never run
+        dispatched.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _local),
+        patch("proxy.server.proxy_to_remote", _remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        _guard_patches(tokens=PROMPT_NEW_TOKENS),
+        _fixed_wait_projection(case),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(
+                headers={
+                    "x-local-preference": "local-preferred",
+                    "x-session-id": INCIDENT_REFUSAL_SESSION,
+                }
+            ),
+            "v1/chat/completions",
+            mixed_model_config,
+            _case_cfg(case),
+        )
+
+    assert result.status_code == 429, f"got {result.status_code}"
+    assert dispatched == [], f"a refused request never dispatches; got {dispatched}"
+
+    lines = [m for m in _log_messages(caplog) if m.startswith("local_only_refused ")]
+    assert len(lines) == 1, f"exactly one refusal line per request; got {lines!r}"
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("reason") == case.reason
+    assert fields.get("session") == INCIDENT_REFUSAL_SESSION
+    assert fields.get("provider") == "local-llama"
+    assert fields.get("priority") == "low"
+    assert fields.get("route") == "refused"
+    assert int(fields.get("new_tokens", -1)) == PROMPT_NEW_TOKENS
+    assert float(fields.get("eta_prefill_seconds", 0.0)) == pytest.approx(
+        case.eta_prefill_seconds, abs=0.1
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger",
+    ["queue_depth_cap", "queue_wait_expiry", "lease_active_fallback"],
+)
+async def test_deferral_exit_pin_refusal_logs_the_dispatch_context(
+    mixed_model_config, caplog, trigger
+):
+    """AC2/AC4: the queue exits and the lease path log the same context.
+
+    Both the spent-deferral exits and the ``local_lease_active`` exit refuse a
+    ``local-preferred`` client; each must leave exactly one countable refusal
+    line naming the session, the provider, the priority and the refused route.
+    """
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    result, _dispatches, _waits = await _issue_deferral_exit(
+        mixed_model_config, trigger
+    )
+
+    assert result.status_code == 429, f"{trigger}: got {result.status_code}"
+    lines = [m for m in _log_messages(caplog) if m.startswith("local_only_refused ")]
+    assert len(lines) == 1, (
+        f"{trigger}: exactly one refusal line per request; got {lines!r}"
+    )
+    fields = _parse_verdict_kv(lines[0])
+    assert fields.get("session") == "unknown", (
+        f"{trigger}: the refusal names the session (``unknown`` when the "
+        f"request carried none); got {fields!r}"
+    )
+    assert fields.get("provider") == "local-llama", (
+        f"{trigger}: the refusal must name the provider; got {fields!r}"
+    )
+    assert fields.get("priority") == "low"
+    assert fields.get("route") == "refused"

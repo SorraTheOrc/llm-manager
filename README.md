@@ -23,7 +23,7 @@ Key features
 ### Session & Slot Management
 - **Job-level slot scheduler** — configurable slot pool with queueing, per-job timeouts, and load-aware skip to avoid ReadTimeouts under concurrency.
 - **Dispatch leases** — per-session reservation of the local backend with adaptive timeouts and prefill-progress polling.
-- **Priority-based routing** — per-request `X-Priority: low|medium|high` selects the provider chain and gates the routing knobs (queueing, economic-bypass, local-vs-remote); during the configured cheap window every request routes as `low`. The slot pool is fixed at 2 and no routing-policy change ever restarts the proxy.
+- **Priority-based routing** — per-request `X-Priority: low|medium|high` selects the provider chain and gates the routing knobs (queueing, economic-bypass, local-vs-remote); during the configured cheap window every request routes as `low`. The slot pool size is `session_slot_pool_size` (shipped as 2; the slot count is a config value, not a structural constant — see [the single-slot impact audit](docs/dev/single-slot-impact.md)) and no routing-policy change ever restarts the proxy.
 - **Session tracking** — active session list with preview text, model, and provider; sessions can be deleted via the admin API.
 - **Session recording retention** — automatic pruning of old recordings with configurable retention days and background intervals.
 - **Grandfathering** — legacy session migration for in-flight requests across proxy restarts.
@@ -107,7 +107,10 @@ Git hooks
   scripts/install_git_hooks.sh --check  # verify
   ```
   `.githooks/pre-push` runs the **full test suite** on every push to
-  `dev`/`main` and refuses a red push; feature-branch pushes skip the suite.
+  `dev`/`main` and refuses a red push; it also refuses to gate at all unless
+  the checkout it measures *is* the pushed commit (clean tree at the pushed
+  sha), so a green gate is always evidence about the pushed commit.
+  Feature-branch pushes skip the suite.
   See [docs/dev/git-hooks.md](docs/dev/git-hooks.md) for bypass knobs,
   timeouts, and a stdin based push simulation.
 
@@ -170,8 +173,15 @@ exceptions are configured via `per-file-ignores` in `.ruff.toml`.
 
 ### Remaining issues
 
-After auto-fix, the remaining warnings are non-auto-fixable issues that
-require manual attention. Run `ruff check .` to see the current count.
+The tracked tree is lint-clean: `ruff check .` at the repo root reports `All
+checks passed!` (exit 0, no findings). Known-defect warnings are limited to
+stderr noise from a pre-existing invalid `# noqa` directive
+(`proxy/proxy/handlers.py:522`, tracked separately) — it is not a finding.
+Verify with:
+
+```bash
+.venv/bin/ruff check .
+```
 
 - Playwright UI tests (requires Node/npm and browser install):
   ```
@@ -230,8 +240,23 @@ Dispatch-lease settings (per-session reservation of the local backend):
 Per-priority contention-queue tuning (cost vs latency)
 ----------------------------------------------------
 
-When all local slots are busy the proxy can **queue** a request waiting for
-a slot to free, or **fall back** immediately to the next remote provider.
+**Reserve first; queue only as a straggler net.** A client that wants local
+capacity should claim it *before* sending: `POST /llama/local/reserve` returns
+the occupancy-aware admission verdict and, on `admit`, a single-use ticket the
+request presents as `X-Local-Reservation: <id>`; a ticketed request dispatches
+**without re-checking and without queueing**. `X-Local-Preference`
+(`prefer-local` / `local-preferred` / `remote-ok`) states what the client wants
+when local capacity is unavailable. That reservation handshake is the primary
+cooperative path — see [`proxy/docs/routing.md`](proxy/docs/routing.md).
+
+For everything else, when all local slots are busy the proxy can **queue** a
+request waiting for a slot to free, or **fall back** immediately to the next
+remote provider. Since LP-0MVT1146V007WXA4 the queue is a bounded **straggler
+net, not a parking lot**: a shipped **30 s** wait budget and a **2**-deep cap,
+sized from the measured evidence recorded in
+[`docs/dev/contention-queue-sweep.md`](docs/dev/contention-queue-sweep.md)
+(2026-10-22 3.3 h intake window; 2026-10-30/31 24 h pre-flip baseline).
+
 Queue entry is gated by the request's effective priority (LP-0MVDT94F0003VHUA
 AC3): ``low`` always queues (prefer a local slot over a paid remote call),
 ``high`` never queues (immediate remote fallback), ``medium`` follows the
@@ -243,13 +268,20 @@ configured policy. The caps bound the queue for every priority:
 | `contention_queue_max_depth` | Max queued requests | `[1, 16]` |
 | `contention_queue_max_wait_seconds` | Max seconds to wait for a local slot | `[1, session_guardrail_max_runtime_seconds]` |
 
-**Shipped defaults (unified config, slot pool fixed at 2):**
+**Shipped defaults (unified config, slot pool `session_slot_pool_size: 2`):**
 
 | Priority | Policy | Depth | Max wait | Rationale |
 |---|---|---|---|---|
-| **low** | ``queue`` (always) | `8` | `120s` | Deeper queue — batches requests to local to maximise cost savings |
-| **medium** | ``queue`` (config-driven) | `8` | `120s` | Today's behaviour; parity baseline |
+| **low** | ``queue`` (always) | `2` | `30s` | Straggler net — recover the seconds-scale gaps, never park a request |
+| **medium** | ``queue`` (config-driven) | `2` | `30s` | Shipped default; a wait is worth taking only when it can win inside 30 s |
 | **high** | never queues | — | — | Immediate remote fallback under local contention |
+
+The sweep (LP-0MVT1146V007WXA4, parent LP-0MVIKPRMD000Y97R) shortened the wait
+budget (60 → 30) and the depth cap (8 → 2): in the intake window every queue
+loss burned the full budget, and more than half of the pre-flip wins landed at
+or below 30 s. The three flip criteria and the two-line rollback (revert to
+60 / 8 and restart the proxy) are recorded in
+[`proxy/docs/routing.md`](proxy/docs/routing.md).
 
 For cold-cache economics (AC3): ``low`` recovers ``large_context_bypass``
 locally (queue for a slot) in both windows, ``high`` routes it remote, and
@@ -258,14 +290,16 @@ locally (queue for a slot) in both windows, ``high`` routes it remote, and
 **Tuning guidance:**
 
 - **Raise depth/wait** → more local hits, higher cost, better throughput but
-  worse tail latency under burst.
+  worse tail latency under burst (and a longer dead-wait clock when the win
+  does not arrive — re-measure before doing it).
 - **Lower depth/wait** → faster fallback to remotes, lower local utilisation,
   better tail latency.
 - Set ``contention_queue_policy: fallback`` to make ``medium`` (default)
   fall back instead of queueing (legacy fast-mode behaviour).
 
-See `proxy/docs/routing.md` for the full contention-queue semantics and
-metrics.
+See `proxy/docs/routing.md` for the full contention-queue semantics, the
+measured evidence and the rollback, and `proxy/docs/remote-fallback-timeout-budget.md`
+for how the wait budget interacts with the client-visible timeout envelope.
 
 Multiple local llama-server backends
 -------------------------------------

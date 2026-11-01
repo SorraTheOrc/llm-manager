@@ -1048,6 +1048,53 @@ async def create_embeddings(request: Request):
 
 
 
+async def _evaluate_boundary_compaction_before_remote(
+    srv,
+    request: Request,
+    provider_cfg: dict,
+    body_json: dict,
+) -> None:
+    """Run the local→remote boundary hook before a direct remote dispatch.
+
+    ``proxy/provider.py``'s two fallback cycles cover most remote traffic,
+    but this module also dispatches remote directly (unknown-model
+    ``default_remote`` and a remote model with no ``providers`` list) — the
+    third/fourth call sites the boundary hook's design note anticipates
+    (LP-0MVTDUBR00038ZRL). They go through the same helper, so the trigger,
+    the slot-pinned summarisation, the lease release and the structured event
+    are shared rather than duplicated.
+
+    Fail-open: a missing session id, a non-chat body or any error leaves the
+    dispatch untouched.
+    """
+    try:
+        from proxy.provider import _evaluate_boundary_compaction_for_remote
+        from proxy.session import _resolve_session_id_header
+
+        session_id, _ = _resolve_session_id_header(
+            getattr(request, "headers", {}) or {}
+        )
+        if not session_id:
+            return
+        await _evaluate_boundary_compaction_for_remote(
+            request,
+            str(provider_cfg.get("name") or "remote"),
+            provider_cfg,
+            body_json if isinstance(body_json, dict) else {},
+            session_id,
+            srv.config,
+        )
+    except Exception:
+        # Boundary compaction must never block a remote dispatch.
+        try:
+            srv.logger.debug(
+                "boundary compaction hook failed; dispatching unchanged",
+                exc_info=True,
+            )
+        except Exception:
+            pass
+
+
 async def _do_proxy_openai_api(
     request: Request,
     path: str,
@@ -1278,6 +1325,9 @@ async def _do_proxy_openai_api(
         # Check if default remote is enabled
         default_remote = srv.config.get("default_remote", {})
         if default_remote.get("enabled", False):
+            await _evaluate_boundary_compaction_before_remote(
+                srv, request, default_remote, body_json
+            )
             return await srv.proxy_to_remote(request, f"v1/{path}", default_remote)
 
         # If we have a current model loaded, use that
@@ -1300,6 +1350,9 @@ async def _do_proxy_openai_api(
         if providers:
             from proxy.provider import proxy_with_remote_fallback
             return await proxy_with_remote_fallback(request, f"v1/{path}", model_cfg, srv.config)
+        await _evaluate_boundary_compaction_before_remote(
+            srv, request, model_cfg, body_json
+        )
         return await srv.proxy_to_remote(request, f"v1/{path}", model_cfg)
 
     raise HTTPException(

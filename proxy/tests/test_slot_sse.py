@@ -144,8 +144,13 @@ class TestQuerySlotsDetail:
         assert "/slots" in call_url
 
     @pytest.mark.asyncio
-    async def test_queries_without_model_when_none(self):
-        """When model is None, the URL has no query string."""
+    async def test_queries_with_a_resolved_model_when_none(self):
+        """A resolved model id is sent when model is None (never model-less).
+
+        Slice 4 (LP-0MVU7ZZIA0092AXW): the router answers a model-less
+        ``/slots`` with HTTP 400, so resolution fills the gap instead of
+        omitting the query string.
+        """
         from proxy.observability import _query_slots_detail
 
         mock_client = AsyncMock()
@@ -162,7 +167,8 @@ class TestQuerySlotsDetail:
         )
 
         call_url = mock_client.get.call_args[0][0]
-        assert "?" not in call_url
+        assert "?model=" in call_url
+        assert not call_url.endswith("?model=")
 
     @pytest.mark.asyncio
     async def test_handles_400_without_model(self):

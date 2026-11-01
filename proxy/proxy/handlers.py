@@ -399,9 +399,15 @@ async def get_llama_local_status(request: Request):
          "local_last_activity_at": str | None,
          "local_last_activity_source": str | None,
          "prefill_eta_seconds": float | None,
+         "prefill_eta_kind": str,
+         "prefill_eta_assumed_cached_ratio": float,
+         "prefill_eta_reference_tokens": int | None,
          "queue_eta_seconds": float | None,
          "prefill_budget_seconds": float | None,
          "capacity_hint": str,
+         "local_route_available": bool,
+         "local_route_reason": str | None,
+         "local_route_cooldown_remaining_s": int | None,
          "status_schema_version": int}
 
     ``local_idle_seconds`` reports how long the local backend has been idle
@@ -411,13 +417,23 @@ async def get_llama_local_status(request: Request):
 
     ``prefill_eta_seconds`` and ``queue_eta_seconds`` publish the calibrated
     prefill-ETA estimate (LP-0MVGDUV5E005UWBQ): the projected prefill cost of
-    the reference prompt (the most recent dispatch for the current model, else
-    ``server.local_admission_guard_reference_tokens``, assumed cache-cold) and
-    the wait a *newcomer* would face (the prefills of the currently occupied
-    slots plus its own). Dispatchers can pace themselves from these instead of
+    the reference prompt (the median recent dispatch size for the current
+    model, else ``server.local_admission_guard_reference_tokens``) and the wait
+    a *newcomer* would face (the prefills of the currently occupied slots plus
+    its own). Dispatchers can pace themselves from these instead of
     discovering a contended 120 s wait. ``prefill_eta_calibrated`` reports
     whether the rolling calibration has enough samples; with too few samples
     the guard is inert and the wait behaviour is unchanged.
+
+    **``prefill_eta_seconds`` is a cache-cold reference-prompt bound, not a
+    per-request estimate** (LP-0MVSD5RJW008F1IB AC2): it assumes *nothing* is
+    served from the prompt cache. The semantics are published beside the value
+    so no consumer has to infer them — ``prefill_eta_kind`` is
+    ``"reference_cold_bound"``, ``prefill_eta_assumed_cached_ratio`` is
+    ``0.0`` and ``prefill_eta_reference_tokens`` is the prompt size that was
+    costed. A dispatcher that knows its own prompt size and cache state should
+    price *that* request (the same per-request path the admission guard
+    enforces) rather than read the reference bound as its own cost.
 
     ``available_slots`` and ``total_slots`` reflect the model-serving slot
     state reported by llama-server's ``/slots`` endpoint. When the server is
@@ -459,13 +475,41 @@ async def get_llama_local_status(request: Request):
     with its slot identity, so a slot llama-server has not released yet is
     annotated instead of counted as live work. Each slot carries ``abandoned``
     (bool), ``abandonment_reason`` and ``abandoned_session_id`` (both ``None``
-    when the slot is not abandoned) and ``abandoned_at_seconds_ago``; the
+    when the slot is not abandoned), ``abandoned_at_seconds_ago`` and
+    ``abandoned_scope`` (``"slot"`` | ``"endpoint"`` | ``None`` — which
+    registry entry produced the annotation: LP-0MVUVHB1V006HA5I); the
     top-level payload carries ``local_abandoned_slots`` (count of annotated
     slots). ``capacity_hint`` gains the additive value ``abandoned_busy`` —
     occupied only by abandoned work — so ``saturated`` keeps meaning live,
     proxy-owned decode work; a genuinely busy GPU is never reported ``idle``.
-    Consumers must treat any unrecognised hint value (this one included) as
-    busy, never as idle.
+    A draining slot the proxy abandoned without a usable slot identity is
+    annotated from the endpoint-wide entry (``abandoned_scope="endpoint"``)
+    only while no lease or live dispatch record owns it, and the entry is
+    dropped as soon as a fresh ``/slots`` snapshot reports the slot (or the
+    whole endpoint) free. Consumers must treat any unrecognised hint value
+    (this one included) as busy, never as idle.
+
+    Local-route availability (LP-0MVWFKIKJ005XHAY, ``status_schema_version: 5``):
+    every capacity field above describes the *engine*; ``local_route_available``
+    describes the *route*. It is ``false`` when the local provider entry would
+    currently be refused by chain resolution — ``local_route_reason`` names why
+    with a canonical ``LOCAL_FALLBACK_REASON_TOKENS`` member
+    (``local_provider_cooldown`` | ``outside_available_window``) and
+    ``local_route_cooldown_remaining_s`` gives the seconds until the route is
+    usable again (the shortest active arm). The local entries considered are
+    the ones serving the reported local model (``current_model``), so the
+    embed route and the chat route never decide each other's availability; one
+    eligible entry is enough (a multi-backend model with an armed sibling is
+    still available). With nothing armed the three fields read ``true`` /
+    ``null`` / ``null`` (never a fabricated ``0``), and the payload stays
+    well-formed when no local entry is configured or llama-server state is
+    unavailable. The split matters because the two disagree exactly when it
+    hurts: on 2026-10-31 the entry was quarantined (100 % of local attempts
+    refused) while this endpoint still reported ``available_slots: 2`` and
+    ``capacity_hint: idle``, and a dispatcher reading only slot counts launched
+    work into the poisoned route. The fields are **read-only**: they are built
+    from the in-process armed state at request time and the routing decision
+    never reads them, so there is no behaviour change and no new poll.
 
     Per-slot capacity (LP-0MVGDUVGE0024YAI, ``status_schema_version: 3``):
     each slot also carries ``owner_session_id`` and ``lease_state``
@@ -770,9 +814,12 @@ async def get_llama_local_status(request: Request):
     # -- prefill / queue ETA estimate (LP-0MVGDUV5E005UWBQ) -----------------
     # Published so a dispatcher can pace BEFORE launching a session instead of
     # discovering a 120 s contended wait. Both fields come from the calibrated
-    # prefill cost of the reference prompt (most recent dispatch for the
-    # current model, else ``local_admission_guard_reference_tokens``); they are
-    # ``None`` only if the estimate itself failed (fail-open payload).
+    # prefill cost of the reference prompt (a robust recent dispatch size for
+    # the current model, else ``local_admission_guard_reference_tokens``); they
+    # are ``None`` only if the estimate itself failed (fail-open payload).
+    # LP-0MVSD5RJW008F1IB AC2: ``prefill_eta_seconds`` is a cache-cold
+    # reference-prompt BOUND, labelled as such in the payload and in the poll
+    # log (``prefill_eta_kind`` / ``prefill_eta_assumed_cached_ratio``).
     prefill_eta: dict = {}
     try:
         from proxy.prefill_eta import status_estimate
@@ -857,6 +904,24 @@ async def get_llama_local_status(request: Request):
         if isinstance(_slot, dict) and _slot.get("abandoned") is True:
             abandoned_slots += 1
 
+    # -- local-route availability (LP-0MVWFKIKJ005XHAY, parent AC10) -------
+    # READ-ONLY observability: the routing decision never reads these values
+    # (AC10c). ``available_slots``/``capacity_hint`` say whether the ENGINE is
+    # busy; these say whether the local ROUTE would be accepted by the
+    # chain — the distinction whose absence dispatched a downtime audit into
+    # a quarantined route on 2026-10-31 (``available_slots: 2`` while 100 % of
+    # local attempts were refused). Sourced from the existing armed-state
+    # helpers at request time: no new timer, no new poll.
+    try:
+        from proxy.observability import local_route_availability
+
+        local_route = local_route_availability(
+            srv.config if isinstance(srv.config, dict) else {},
+            model=cm,
+        )
+    except Exception:
+        local_route = {}
+
     # -- prefill gate state (LP-0MVGDUUV3001XFRJ AC4) ----------------------
     # Prefills are serialised by default (``local_max_concurrent_prefills``),
     # so a dispatcher needs to see how many prefills are in flight, what the
@@ -913,6 +978,25 @@ async def get_llama_local_status(request: Request):
         "slots_stale": slots_stale,
         "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
         "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
+        # LP-0MVSD5RJW008F1IB AC6: the calibration context the metric needs is
+        # appended to the poll line (never reordered), so the analysis can see
+        # WHICH reference size and calibration state produced each published
+        # bound. Pre-change parsers are unaffected: every new field is additive
+        # and ``prefill_eta_seconds`` / ``queue_eta_seconds`` keep their names.
+        "prefill_eta_kind": prefill_eta.get("prefill_eta_kind"),
+        "prefill_eta_assumed_cached_ratio": prefill_eta.get(
+            "prefill_eta_assumed_cached_ratio"
+        ),
+        "prefill_eta_reference_tokens": prefill_eta.get(
+            "prefill_eta_reference_tokens"
+        ),
+        "prefill_eta_samples": prefill_eta.get("prefill_eta_samples", 0),
+        "prefill_eta_calibrated": bool(
+            prefill_eta.get("prefill_eta_calibrated", False)
+        ),
+        "prefill_eta_rate_bucket": prefill_eta.get(
+            "prefill_eta_rate_bucket", "solitary"
+        ),
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         "local_idle_seconds": _idle_snapshot.get("idle_seconds"),
@@ -920,7 +1004,20 @@ async def get_llama_local_status(request: Request):
         "local_in_flight_requests": live_local_requests,
         "local_abandoned_slots": abandoned_slots,
         "slots_detail_stale": detail_stale,
-        "status_schema_version": 4,
+        # LP-0MVWFKIKJ005XHAY AC10: the same route-availability evidence the
+        # payload carries, so the poll line answers "armed?" and "busy?" on
+        # its own (the failure count is log-only evidence of WHY it armed).
+        "local_route_available": bool(
+            local_route.get("local_route_available", True)
+        ),
+        "local_route_reason": local_route.get("local_route_reason"),
+        "local_route_cooldown_remaining_s": local_route.get(
+            "local_route_cooldown_remaining_s"
+        ),
+        "local_route_failure_count": local_route.get(
+            "local_route_failure_count", 0
+        ),
+        "status_schema_version": 5,
     }
     # Stable client identifier from session headers — omitted (not "unknown")
     # when absent so the log stays additive (LP-0MSKV3IEQ004ZV88).
@@ -964,6 +1061,12 @@ async def get_llama_local_status(request: Request):
         # ``None`` when the estimate is unavailable.
         "prefill_eta_seconds": prefill_eta.get("prefill_eta_seconds"),
         "queue_eta_seconds": prefill_eta.get("queue_eta_seconds"),
+        # Labelling (LP-0MVSD5RJW008F1IB AC2): the published ETA is a
+        # cache-cold reference-prompt bound, stated in the payload itself.
+        "prefill_eta_kind": prefill_eta.get("prefill_eta_kind"),
+        "prefill_eta_assumed_cached_ratio": prefill_eta.get(
+            "prefill_eta_assumed_cached_ratio"
+        ),
         "prefill_eta_reference_tokens": prefill_eta.get(
             "prefill_eta_reference_tokens"
         ),
@@ -983,6 +1086,21 @@ async def get_llama_local_status(request: Request):
         # proxy has given up on and llama-server has not released yet. Additive
         # — a consumer that ignores it behaves exactly as before.
         "local_abandoned_slots": abandoned_slots,
+        # Local-route availability (LP-0MVWFKIKJ005XHAY, parent
+        # LP-0MVWEZCB0006WPBQ AC10): whether the local ENTRY would currently be
+        # accepted by the routing chain, and why not. Additive and read-only —
+        # the routing decision never reads it, so a consumer that ignores the
+        # fields behaves exactly as before. ``local_route_reason`` is a
+        # canonical ``LOCAL_FALLBACK_REASON_TOKENS`` member (never a new
+        # spelling) and ``local_route_cooldown_remaining_s`` is ``None`` —
+        # never a fabricated ``0`` — whenever the cooldown is not armed.
+        "local_route_available": bool(
+            local_route.get("local_route_available", True)
+        ),
+        "local_route_reason": local_route.get("local_route_reason"),
+        "local_route_cooldown_remaining_s": local_route.get(
+            "local_route_cooldown_remaining_s"
+        ),
         # Additive payload version (AC1): bumped when per-slot/top-level
         # capacity fields change meaning. Consumers that ignore it behave
         # exactly as before. v3 (LP-0MVKSXR4P001V0CM): ``capacity_hint`` is
@@ -990,7 +1108,10 @@ async def get_llama_local_status(request: Request):
         # ``slots_detail_stale`` / ``local_in_flight_requests`` are added.
         # v4 (LP-0MVRMI5HK00558TB): per-slot abandonment annotation, the
         # additive ``abandoned_busy`` hint and ``local_abandoned_slots``.
-        "status_schema_version": 4,
+        # v5 (LP-0MVWFKIKJ005XHAY): ``local_route_available`` /
+        # ``local_route_reason`` / ``local_route_cooldown_remaining_s`` publish
+        # the local entry's routing availability beside its capacity.
+        "status_schema_version": 5,
         "local_owner_session_id": local_owner_session_id,
         "local_owner_lease_remaining_seconds": local_owner_lease_remaining_seconds,
         # Idle-aware local admission (LP-0MVGD9Z8Z0055Y5J): how long the local
@@ -1298,8 +1419,24 @@ async def list_models():
 
 @router.get("/metrics")
 async def prometheus_metrics():
-    """Prometheus scrape endpoint (text/plain, exposition format)."""
+    """Prometheus scrape endpoint (text/plain, exposition format).
+
+    LP-0MVO9F877008ZCP7 AC1: the gauges are refreshed here, not only in
+    ``/admin/metrics``, so a Prometheus 15 s scrape keeps
+    ``llama_process_rss_bytes`` fresh without any poll of ``/admin/metrics``.
+    The refresh is fail-soft: any resolution error is logged once and the
+    endpoint still serves the previously published gauge values.
+    """
     srv = _srv()
+    try:
+        from proxy import backend_rss
+
+        models = await backend_rss.ensure_models(srv)
+        # Resolution shells out to `podman` / walks /proc — keep it off the
+        # event loop (bounded by backend_rss.PODMAN_TIMEOUT_SECONDS).
+        await asyncio.to_thread(backend_rss.update_gauges, srv, models or None)
+    except Exception:
+        pass
     try:
         payload, content_type = srv.metrics.generate_metrics_payload()
         return Response(content=payload, media_type=content_type)
@@ -1342,16 +1479,25 @@ async def admin_metrics():
     for m in loaded_models or []:
         per_model[m] = {"last_used": srv.model_last_used.get(m), "rss_bytes": None}
 
+    # LP-0MVO9F877008ZCP7: RSS resolution no longer depends on a host
+    # process handle. backend_rss resolves the container's process tree /
+    # cgroup memory.current for podman-backed deployments, runs the
+    # host process tree (router + model children) otherwise, and covers the
+    # adopted-server case (pid = 0) via /proc port discovery. The same
+    # TTL-cached value feeds the gauges so it matches /metrics exactly.
     process_rss = None
+    rss_source = None
     try:
-        if 'psutil' in dir(srv) and srv.psutil and srv.llama_process is not None:
-            pid = getattr(srv.llama_process, 'pid', None)
-            if pid:
-                p = srv.psutil.Process(pid)
-                mem = p.memory_info()
-                process_rss = getattr(mem, 'rss', None)
+        from proxy import backend_rss
+
+        # Off the event loop: resolution may shell out to `podman` or walk /proc.
+        process_rss = await asyncio.to_thread(
+            backend_rss.update_gauges, srv, loaded_models
+        )
+        rss_source = backend_rss.last_source()
     except Exception:
         process_rss = None
+        rss_source = None
 
     if process_rss is not None and loaded_models:
         try:
@@ -1362,10 +1508,8 @@ async def admin_metrics():
             for m in loaded_models:
                 per_model[m]['rss_bytes'] = None
 
-    try:
-        srv.metrics.update_metrics(process_rss, loaded_models)
-    except Exception:
-        pass
+    # (the gauges themselves are published by backend_rss.update_gauges above,
+    #  so /metrics and /admin/metrics always agree)
 
     # Session-list index observability (LP-0MSNM9IAC000GVXT): index size,
     # index-hit vs cold-scan counts, last scan duration.
@@ -1385,6 +1529,7 @@ async def admin_metrics():
         "loaded_models": loaded_models,
         "per_model": per_model,
         "process_rss_bytes": process_rss,
+        "process_rss_source": rss_source,
         "index_observability": index_obs,
         "session_metrics": srv.session_manager.get_metrics(),
         "restore_success_total": int(srv.session_restore_observability.get("restore_success_total", 0)),

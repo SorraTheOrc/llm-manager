@@ -10,8 +10,8 @@ delivered.
 This item adds a per-session cooldown:
 
 1. On ``prefill_deadline_exceeded`` the session records a cooldown window
-   (``server.local_prefill_thrash_cooldown_seconds``, default 600; 0
-   disables).
+   (``server.local_prefill_thrash_cooldown_seconds``, default 120 since
+   2026-10-31 / LP-0MVWC8JCG007GAPW; was 600; 0 disables).
 2. During the window that session's local routing skips
    (``routing_skip_local reason=prefill_thrash_cooldown``) and reaches the
    next provider; other sessions are unaffected.
@@ -49,7 +49,10 @@ from fastapi import Response
 from proxy import contention_queue
 from proxy import router_helpers as helpers
 
-DEFAULT_COOLDOWN_SECONDS = 600.0
+#: The shipped default, read from the implementation so a default change (e.g.
+#: LP-0MVWC8JCG007GAPW's 600 -> 120) can never leave this file asserting a
+#: stale value: every test below pins *behaviour*, not the number 600.
+DEFAULT_COOLDOWN_SECONDS = helpers.DEFAULT_PREFILL_THRASH_COOLDOWN_SECONDS
 
 SESSION_A = "sess-cooling-a"
 SESSION_B = "sess-other-b"
@@ -146,18 +149,51 @@ def test_config_override_and_malformed_fallback(clock):
     )
 
 
+def test_configured_value_drives_the_skip_and_its_expiry(clock):
+    """AC2 (LP-0MVWC8JCG007GAPW): the *configured* value gates local, exactly.
+
+    A distinctive 45 s value must be what the dispatch gate refuses on: one
+    second before expiry the refusal is still armed with 1 s left, and at 45 s
+    the session is admitted again. A hard-coded 600 (the value this item
+    replaced) or 120 anywhere in the gate path fails both assertions.
+    """
+    cfg = _server_config(local_prefill_thrash_cooldown_seconds=45)
+    srv = SimpleNamespace(logger=MagicMock())
+    helpers._record_prefill_thrash_cooldown(SESSION_A, cfg, now=clock.now)
+
+    clock.advance(44)
+    refused, reason, remaining = helpers._local_dispatch_gate(
+        srv, SESSION_A, config=cfg
+    )
+    assert refused is True
+    assert reason == "prefill_thrash_cooldown"
+    assert remaining == pytest.approx(1.0)
+
+    clock.advance(1)
+    assert helpers._local_dispatch_gate(srv, SESSION_A, config=cfg) == (
+        False,
+        "",
+        0.0,
+    )
+
+
 def test_cooldown_decays_and_clears_on_expiry(clock):
     """AC3: the remaining time decays with the clock and the window is pruned
-    the moment it expires — the session is free again."""
+    the moment it expires — the session is free again.
+
+    Expressed relative to ``DEFAULT_COOLDOWN_SECONDS`` so the window length can
+    be re-tuned (e.g. LP-0MVWC8JCG007GAPW's 600 -> 120) without rewriting the
+    arithmetic; the behaviour under test is decay-then-prune, not 600.
+    """
     helpers._record_prefill_thrash_cooldown(
         SESSION_A, _server_config(), now=clock.now
     )
-    clock.advance(300)
+    clock.advance(DEFAULT_COOLDOWN_SECONDS - 10)
     assert (
         helpers._prefill_thrash_cooldown_remaining(SESSION_A, _server_config(), now=clock.now)
-        == 300
+        == 10
     )
-    clock.advance(300)
+    clock.advance(10)
     assert (
         helpers._prefill_thrash_cooldown_remaining(SESSION_A, _server_config(), now=clock.now)
         == 0
@@ -783,8 +819,25 @@ async def test_router_deadline_records_the_cooldown(monkeypatch, clock, caplog):
 
 @pytest.mark.asyncio
 async def test_router_successful_first_byte_clears_the_cooldown(monkeypatch, clock):
-    """AC3 (wiring): a successful local first byte clears the session's
-    cooldown, so the next request may route local again."""
+    """AC3 (wiring): a successful local first byte still calls the cooldown
+    clear with the recovery-fraction inputs, so a comparable success keeps
+    releasing the window.
+
+    LP-0MVSAMN14001DMTY (AC1/AC2) moved enforcement to the dispatch choke
+    point: a session whose window is armed for the prompt being dispatched is
+    refused *before* any local dispatch (``proxy_to_local`` and
+    ``_try_acquire_local_dispatch``), so a cooling-down request can no longer
+    be the release trigger for its own window — release now comes from expiry,
+    the free-GPU proof, or this first-byte clear when the admitted dispatch
+    actually matches the armed window. The clear call is therefore pinned by
+    its arguments here (the *original* prompt fingerprint and the dispatch's
+    estimated size — the two inputs the recovery-fraction rule needs, see
+    LP-0MVQITN6P008DPLB), with the rule's semantics still pinned by
+    :class:`TestCooldownScope` above.
+
+    What AC1 changed is asserted below too: an armed window for a *different*
+    prompt neither blocks this dispatch nor is released by its success.
+    """
     from proxy.router import proxy_to_local
 
     from proxy import server as srv
@@ -792,14 +845,37 @@ async def test_router_successful_first_byte_clears_the_cooldown(monkeypatch, clo
     server_cfg = _router_server_cfg()
     router_mod = _install_router_harness(monkeypatch, server_cfg)
 
-    # The session is cooling down from an earlier deadline event.
+    # A window armed by an earlier, *different* prompt: it must neither block
+    # this dispatch nor be cleared by its success (fingerprint scoping).
+    other_prompt_fingerprint = helpers._prefill_thrash_fingerprint(
+        {"messages": [{"role": "user", "content": "a different, larger prompt"}]}
+    )
     helpers._record_prefill_thrash_cooldown(
-        SESSION_A, server_cfg, now=clock.now
+        SESSION_A,
+        server_cfg,
+        now=clock.now,
+        tokens=40_000,
+        fingerprint=other_prompt_fingerprint,
     )
     assert (
-        helpers._prefill_thrash_cooldown_remaining(SESSION_A, server_cfg, now=clock.now)
+        helpers._prefill_thrash_cooldown_remaining(
+            SESSION_A,
+            server_cfg,
+            now=clock.now,
+            fingerprint=other_prompt_fingerprint,
+        )
         > 0
     )
+
+    # Spy on the clear call (wrapping the real helper, so nothing is faked).
+    clear_calls: list[dict] = []
+    real_clear = helpers._clear_prefill_thrash_cooldown
+
+    def _spy_clear(session_id, **kwargs):
+        clear_calls.append({"session_id": session_id, **kwargs})
+        return real_clear(session_id, **kwargs)
+
+    monkeypatch.setattr(router_mod, "_clear_prefill_thrash_cooldown", _spy_clear)
 
     upstream = SimpleNamespace(
         status_code=200,
@@ -845,10 +921,117 @@ async def test_router_successful_first_byte_clears_the_cooldown(monkeypatch, clo
     req = _router_request()
     resp = await proxy_to_local(req, "v1/chat/completions")
     assert resp.status_code == 200
+
+    assert clear_calls, "a successful local first byte must attempt the clear"
+    call = clear_calls[-1]
+    assert call["session_id"] == SESSION_A
+    assert call["fingerprint"] == helpers._prefill_thrash_fingerprint(
+        {"messages": [{"role": "user", "content": "hello"}]}
+    ), "the clear must use the request's (original) prompt fingerprint"
+    assert isinstance(call["tokens"], int) and call["tokens"] > 0, (
+        "the clear must carry the dispatch's size so the recovery-fraction "
+        "rule can compare it against the armed size"
+    )
+
+    # The other prompt's window is untouched by this success.
     assert (
-        helpers._prefill_thrash_cooldown_remaining(SESSION_A, server_cfg, now=clock.now)
+        helpers._prefill_thrash_cooldown_remaining(
+            SESSION_A,
+            server_cfg,
+            now=clock.now,
+            fingerprint=other_prompt_fingerprint,
+        )
+        > 0
+    ), "a success on prompt P must not release the window armed by prompt Q"
+
+
+@pytest.mark.asyncio
+async def test_router_refuses_a_cooling_down_session_before_any_local_resource(
+    monkeypatch, clock, caplog
+):
+    """LP-0MVSAMN14001DMTY AC1 (router entry): a session whose window is armed
+    for this prompt is refused inside ``proxy_to_local`` *before* any local
+    resource is acquired — the gate the in-request local retry loops cannot
+    bypass, because they re-enter ``proxy_to_local`` after provider.py's chain
+    gate has already been passed.
+
+    The refusal is a plain retryable 503 (``backend_error``), deliberately not
+    ``local_lease_active``/``no_slots_available``: provider.py would otherwise
+    queue for a local slot this gate is refusing to grant.
+    """
+    from proxy.router import proxy_to_local
+
+    from proxy import server as srv
+
+    server_cfg = _router_server_cfg()
+    _install_router_harness(monkeypatch, server_cfg)
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+
+    prompt_fingerprint = helpers._prefill_thrash_fingerprint(
+        {"messages": [{"role": "user", "content": "hello"}]}
+    )
+    helpers._record_prefill_thrash_cooldown(
+        SESSION_A,
+        server_cfg,
+        now=clock.now,
+        tokens=40_000,
+        fingerprint=prompt_fingerprint,
+    )
+
+    resp = await proxy_to_local(_router_request(), "v1/chat/completions")
+    assert resp.status_code == 503
+    assert b"local_lease_active" not in bytes(resp.body)
+    assert SESSION_A not in srv.local_dispatch_records, (
+        "the gate must refuse before a dispatch record (lease) exists"
+    )
+    assert getattr(srv, "local_active_queries", 0) == 0
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "routing_skip_local" in messages
+    assert "reason=prefill_thrash_cooldown" in messages
+    assert "entry=router_dispatch" in messages
+
+
+@pytest.mark.asyncio
+async def test_router_detours_a_request_marked_post_deadline(monkeypatch, clock, caplog):
+    """LP-0MVSAMN14001DMTY AC2 (router entry): the request-scoped
+    post-deadline marker alone refuses a local dispatch — no session cooldown
+    needed — which is what closes the header-less shape (a generated session
+    id no gate site can re-derive from the headers).
+
+    This is the "terminal in-request detour": the *same* request object that
+    was cancelled at the deadline cannot re-enter local dispatch, while a
+    different request object (another client request) is unaffected.
+    """
+    from proxy.router import proxy_to_local
+
+    from proxy import server as srv
+
+    server_cfg = _router_server_cfg()
+    _install_router_harness(monkeypatch, server_cfg)
+    caplog.set_level(logging.INFO, logger="llama-proxy")
+    assert (
+        helpers._prefill_thrash_cooldown_remaining(
+            SESSION_A, server_cfg, now=clock.now
+        )
         == 0
-    ), "a successful local first byte must clear the session's cooldown"
+    ), "the marker must refuse even with no session window armed"
+
+    req = _router_request()
+    helpers._mark_local_dispatch_terminal(req)
+
+    resp = await proxy_to_local(req, "v1/chat/completions")
+    assert resp.status_code == 503
+    assert SESSION_A not in srv.local_dispatch_records
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "routing_skip_local" in messages
+    assert "reason=post_deadline_terminal" in messages
+    assert "entry=router_dispatch" in messages
+
+    # A different request object for the same session is not terminal.
+    other_req = _router_request()
+    assert helpers._local_dispatch_terminal_at(other_req) is None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1042,10 +1225,13 @@ class TestCooldownScope:
     def test_two_prompts_arm_independent_windows(self, clock):
         cfg = _server_config()
         fp_p, fp_q = _fingerprint(PROMPT_P), _fingerprint(PROMPT_Q)
+        # Relative to the (re-tunable) window length: a quarter of it is enough
+        # to make the two windows measurably out of step without either expiring.
+        gap = DEFAULT_COOLDOWN_SECONDS / 4
         helpers._record_prefill_thrash_cooldown(
             SESSION_A, cfg, now=clock.now, tokens=40_000, fingerprint=fp_p
         )
-        clock.advance(120)
+        clock.advance(gap)
         helpers._record_prefill_thrash_cooldown(
             SESSION_A, cfg, now=clock.now, tokens=len(PROMPT_Q), fingerprint=fp_q
         )
@@ -1057,7 +1243,7 @@ class TestCooldownScope:
         remaining_q = helpers._prefill_thrash_cooldown_remaining(
             SESSION_A, cfg, now=clock.now, fingerprint=fp_q
         )
-        assert remaining_p == DEFAULT_COOLDOWN_SECONDS - 130
+        assert remaining_p == DEFAULT_COOLDOWN_SECONDS - gap - 10
         assert remaining_q == DEFAULT_COOLDOWN_SECONDS - 10
 
     def test_arming_without_a_fingerprint_keeps_session_wide_behaviour(self, clock):

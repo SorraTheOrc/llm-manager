@@ -190,9 +190,10 @@ STREAM_ERROR_ABORTED_LOCAL = (
 #
 # Lines from before LP-0MVMBMSWR0036RES carry no session UUID; lines emitted
 # since carry ``session=<uuid|unknown> attempt=<n>`` after ``reason=`` (plus
-# ``limit=``/``remaining=``/``waited=`` for budget-driven ``rate_limited*``
-# reasons). Both shapes must parse: the session-less ones keep the legacy
-# nearest-line attribution, the session-bearing ones are attributed directly.
+# ``limit=``/``remaining=``/``waited=`` for budget-driven
+# ``provider_budget_exhausted*`` reasons). Both shapes must parse: the
+# session-less ones keep the legacy nearest-line attribution, the
+# session-bearing ones are attributed directly.
 
 FALLBACK_CONCURRENCY = (
     "2026-08-02 13:58:04,301 - INFO - Fallback triggered for model=v1/chat/completions, "
@@ -226,7 +227,16 @@ FALLBACK_SESSION = (
 )
 
 # Budget-driven fallback: carries the budget snapshot the gate computed.
-FALLBACK_RATE_LIMITED_BUDGET = (
+FALLBACK_PROVIDER_BUDGET_EXHAUSTED = (
+    "2026-10-23 09:14:02,884 - INFO - Fallback triggered for model=v1/chat/completions, "
+    "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
+    "session=herdr-1792767061-1282111-17770 attempt=4 limit=60 remaining=0 waited=12.500"
+)
+
+# Legacy reason value (pre-LP-0MVMBM8YS003Y2JG): rotated logs still carry the
+# pre-rename ``rate_limited`` spelling; the parser normalizes it to
+# ``provider_budget_exhausted`` (same pattern as ``warm_cache_bypass``).
+FALLBACK_LEGACY_BUDGET_EXHAUSTED = (
     "2026-10-23 09:14:02,884 - INFO - Fallback triggered for model=v1/chat/completions, "
     "from=munitoai-free, to=opencode-go, reason=rate_limited "
     "session=herdr-1792767061-1282111-17770 attempt=4 limit=60 remaining=0 waited=12.500"
@@ -237,7 +247,7 @@ FALLBACK_RATE_LIMITED_BUDGET = (
 # session A spilled, but B has no fallback line of its own.
 FALLBACK_OTHER_SESSION = (
     "2026-10-23 09:16:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-    "from=munitoai-free, to=opencode-go, reason=rate_limited "
+    "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
     "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000"
 )
 
@@ -445,6 +455,99 @@ LOCAL_ADMISSION_GUARD_OBSERVE = (
     "reason=eta_exceeds_budget enforced=false eta_prefill_s=468.0 budget_s=120.0 "
     "priority=low policy=observe model=Qwen3 samples=12 provider=local-qwen3 "
     "session=019fc245-eeee-7e5c-871e-57ab32f875f3"
+)
+
+# --- Residency-aware admission measurement provenance ----------------------
+#
+# LP-0MVRZXPH70025ZNR (parent) / LP-0MVT2PF1C008LAPB (these fixtures). The
+# deployed llama.cpp b8782 build reports no per-slot ``context_tokens``, so the
+# pre-change ``routing_resident_prefix`` line only ever carried
+# ``reuse_ratio=none`` (3607 decisions, 0 measured, in the 2026-10-27 window).
+# The fix adds an additive ``measurement=`` field next to ``reuse_ratio``: a
+# closed vocabulary of ``measured`` / ``unavailable:<reason>`` values, so an
+# unmeasurable decision is self-describing instead of a bare ``none``.
+#
+# Both grammars are pinned here: the new-format lines below carry
+# ``measurement=``, the ``_LEGACY`` lines reproduce the pre-change shape (no
+# ``measurement=`` field) so backward compatibility is testable.
+
+# New grammar, measured: a ``measured_last_dispatch`` rung reading the last
+# measured dispatch's ``total`` (30,000) against a 49,103-token request.
+ROUTING_RESIDENT_PREFIX_MEASURED = (
+    "2026-08-02 14:00:30,000 - INFO - routing_resident_prefix "
+    "provider=local model=Qwen3 decision=admit n_past_actual=30000 "
+    "estimated_tokens=49103 reuse_ratio=0.6110 measurement=measured "
+    "slot_owner_session=019fc245-aaaa-7e5c-871e-57ab32f875f3 "
+    "residency_source=measured_last_dispatch min_ratio=0.50 tenants=2 "
+    "occupants=1 session=019fc245-aaaa-7e5c-871e-57ab32f875f3"
+)
+
+# New grammar, unmeasured: the session owns a slot but nothing was ever
+# measured for the ``(model, session)`` pair.
+ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR = (
+    "2026-08-02 14:01:00,000 - INFO - routing_resident_prefix "
+    "provider=local model=Qwen3 decision=admit n_past_actual=none "
+    "estimated_tokens=49103 reuse_ratio=none "
+    "measurement=unavailable:no_prior_measurement "
+    "slot_owner_session=019fc245-bbbb-7e5c-871e-57ab32f875f3 "
+    "residency_source=session_slot min_ratio=0.50 tenants=2 occupants=1 "
+    "session=019fc245-bbbb-7e5c-871e-57ab32f875f3"
+)
+
+# New grammar, unmeasured: the session holds no slot, so there is nothing to
+# measure (never a fabricated 0).
+ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT = (
+    "2026-08-02 14:02:00,000 - INFO - routing_resident_prefix "
+    "provider=local model=Qwen3 decision=resident_prefix_insufficient "
+    "n_past_actual=none estimated_tokens=49103 reuse_ratio=none "
+    "measurement=unavailable:no_slot "
+    "slot_owner_session=019fc245-cccc-7e5c-871e-57ab32f875f3 "
+    "residency_source=non_resident min_ratio=0.50 tenants=2 occupants=2 "
+    "session=019fc245-cccc-7e5c-871e-57ab32f875f3"
+)
+
+# New grammar, unmeasured: measurement capture is switched off
+# (``local_measured_cache_abort_enabled: false``), the documented rollback.
+ROUTING_RESIDENT_PREFIX_UNMEASURED_CAPTURE_DISABLED = (
+    "2026-08-02 14:03:00,000 - INFO - routing_resident_prefix "
+    "provider=local model=Qwen3 decision=resident_prefix_insufficient "
+    "n_past_actual=none estimated_tokens=49103 reuse_ratio=none "
+    "measurement=unavailable:capture_disabled "
+    "slot_owner_session=019fc245-dddd-7e5c-871e-57ab32f875f3 "
+    "residency_source=unknown min_ratio=0.50 tenants=2 occupants=2 "
+    "session=019fc245-dddd-7e5c-871e-57ab32f875f3"
+)
+
+# Pre-change grammar (no ``measurement=`` field), measured from the live
+# ``/slots`` snapshot — the shape old log files contain.
+ROUTING_RESIDENT_PREFIX_LEGACY = (
+    "2026-08-02 14:04:00,000 - INFO - routing_resident_prefix "
+    "provider=local model=Qwen3 decision=admit n_past_actual=49103 "
+    "estimated_tokens=49103 reuse_ratio=1.0000 "
+    "slot_owner_session=019fc245-eeee-7e5c-871e-57ab32f875f3 "
+    "residency_source=measured min_ratio=0.50 tenants=2 occupants=1 "
+    "session=019fc245-eeee-7e5c-871e-57ab32f875f3"
+)
+
+# Pre-change grammar (no ``measurement=`` field), unmeasured — the 3607/0
+# production shape this parent item exists to fix.
+ROUTING_RESIDENT_PREFIX_LEGACY_UNMEASURED = (
+    "2026-08-02 14:05:00,000 - INFO - routing_resident_prefix "
+    "provider=local model=Qwen3 decision=resident_prefix_insufficient "
+    "n_past_actual=none estimated_tokens=49103 reuse_ratio=none "
+    "slot_owner_session=019fc245-ffff-7e5c-871e-57ab32f875f3 "
+    "residency_source=non_resident min_ratio=0.50 tenants=2 occupants=2 "
+    "session=019fc245-ffff-7e5c-871e-57ab32f875f3"
+)
+
+# Pre-change grammar, tenancy refusal (its own decision value).
+ROUTING_RESIDENT_PREFIX_LEGACY_TENANT = (
+    "2026-08-02 14:06:00,000 - INFO - routing_resident_prefix "
+    "provider=local model=Qwen3 decision=tenant_limit n_past_actual=none "
+    "estimated_tokens=49103 reuse_ratio=none "
+    "slot_owner_session=019fc245-ffff-7e5c-871e-57ab32f875f3 "
+    "residency_source=non_resident min_ratio=0.50 tenants=2 occupants=2 "
+    "session=019fc245-1111-7e5c-871e-57ab32f875f3"
 )
 
 # --- Error events (real lines from /var/log/llama-proxy, Aug 3 window) ------

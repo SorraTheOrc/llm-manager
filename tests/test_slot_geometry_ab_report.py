@@ -47,7 +47,7 @@ SYNTH = """\
 2026-10-28 22:01:00,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 estimated_tokens=130500 cold_threshold=38000 warm_threshold=120000 new_tokens=130500 cached_ratio=0.00 cache_state=cold reason=large_context_bypass \u2192 skipping local, routing to next remote provider session=s1 chain_hold_cycle=0
 2026-10-28 22:02:00,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 estimated_tokens=61000 cold_threshold=38000 warm_threshold=120000 new_tokens=61000 cached_ratio=0.00 cache_state=cold reason=large_context_bypass \u2192 skipping local, routing to next remote provider session=s2 chain_hold_cycle=0
 2026-10-28 22:02:30,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 estimated_tokens=90000 cold_threshold=38000 warm_threshold=120000 new_tokens=90000 cached_ratio=0.00 cache_state=cold reason=warm_cache_bypass \u2192 skipping local, routing to next remote provider session=s3 chain_hold_cycle=0
-2026-10-28 22:03:00,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 estimated_tokens=9000 cold_threshold=38000 warm_threshold=120000 new_tokens=9000 cached_ratio=0.00 cache_state=cold reason=rate_limited \u2192 skipping local, routing to next remote provider session=s1 chain_hold_cycle=0
+2026-10-28 22:03:00,000 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 estimated_tokens=9000 cold_threshold=38000 warm_threshold=120000 new_tokens=9000 cached_ratio=0.00 cache_state=cold reason=provider_budget_exhausted \u2192 skipping local, routing to next remote provider session=s1 chain_hold_cycle=0
 2026-10-28 22:04:00,000 - INFO - dispatch_first_byte_ms=1420.5 dispatch_to_first_byte_ms=1419.0 cache_state=warm cached_ratio=0.990 queue_wait_ms=1.5 session=s1 model=Qwen3
 2026-10-28 22:05:00,000 - INFO - dispatch_first_byte_ms=2001.0 dispatch_to_first_byte_ms=2000.0 cache_state=cold cached_ratio=0.000 queue_wait_ms=1.0 session=s2 model=Qwen3
 2026-10-28 22:06:00,000 - INFO - dispatch_first_byte_ms=5002.0 dispatch_to_first_byte_ms=5000.0 cache_state=cold cached_ratio=0.000 queue_wait_ms=2.0 session=s3 model=Qwen3
@@ -184,7 +184,7 @@ AC3_METRICS = [
     ("metrics.divert_total", 5),
     ("metrics.diverts_by_reason.context_too_large", 2),
     ("metrics.diverts_by_reason.large_context_bypass", 2),
-    ("metrics.diverts_by_reason.rate_limited", 1),
+    ("metrics.diverts_by_reason.provider_budget_exhausted", 1),
     ("metrics.context_ceiling_diverts", 4),
     ("metrics.queue_waits", 7),
     ("metrics.fallback_after_queue", 2),

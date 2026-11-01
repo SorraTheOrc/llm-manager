@@ -9,8 +9,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=rgardler
-Group=rgardler
+# NOTE: this is the *user-service* template (installed into
+# ~/.config/systemd/user/). Do NOT add User=/Group= here — the systemd user
+# manager already runs as your user and cannot set supplementary groups, so the
+# unit dies at exec with "Failed to determine supplementary groups" /
+# status=216/GROUP. For a system service, see docs/systemd/.
 WorkingDirectory=/home/rgardler/projects/llm/proxy
 ExecStart=/home/rgardler/projects/llm/proxy/.venv/bin/python -m uvicorn proxy.server:app --host 0.0.0.0 --port 8000
 Environment=LLAMA_PROXY_CONFIG=/home/rgardler/projects/llm/proxy/config.yaml

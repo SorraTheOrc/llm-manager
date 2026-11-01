@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -1131,6 +1132,7 @@ async def _handle_remote_streaming(
     upstream_retry_failover_budget_seconds: float | None = None,
     pool_client: httpx.AsyncClient | None = None,
     responses_mode: bool = False,
+    clock: Callable[[], float] | None = None,
 ) -> Response:
     """Handle streaming remote proxy request with upstream stall detection and retry.
 
@@ -1162,6 +1164,14 @@ async def _handle_remote_streaming(
     - Fallthrough: after max retries exhausted, yields a synthetic
       ``finish_reason: error`` event so the caller (provider.py fallback chain)
       can route to the next provider.
+
+    *clock* is the monotonic time source used for every deadline computed
+    inside the stream generator (watchdog start, last-content timestamp and the
+    retry-failover deadline) and defaults to :func:`time.monotonic`. Tests
+    inject a deterministic clock so watchdog assertions never depend on
+    wall-clock elapsed time — a loaded host can starve the event loop between
+    two awaits, letting ``asyncio.wait_for`` time out a read whose chunk was
+    already available (LP-0MVX0NEM7003HRW3).
     """
     # Resolve upstream_idle_timeout_seconds from parameter or config
     if upstream_idle_timeout_seconds is None:
@@ -1428,19 +1438,25 @@ async def _handle_remote_streaming(
         except Exception:
             pass
 
+        # Single monotonic time source for every in-stream deadline
+        # (LP-0MVX0NEM7003HRW3). Injecting it keeps all budget arithmetic on
+        # one clock, so a test can drive elapsed time explicitly instead of
+        # racing wall-clock reads against a loaded host.
+        _monotonic = clock if clock is not None else time.monotonic
         # Per-chunk idle timeout and retry state (LP-0MRE52D3C001KP1H)
         _retry_count = 0
-        # Bounded provider failover deadline (LP-0MU1RXEPL005CK97): wall-clock
-        # deadline for the total time this provider may spend retrying
-        # stalls/empty responses before a terminal error triggers failover.
+        # Bounded provider failover deadline (LP-0MU1RXEPL005CK97): deadline on
+        # the stream's monotonic clock for the total time this provider may
+        # spend retrying stalls/empty responses before a terminal error
+        # triggers failover.
         _failover_deadline = (
-            time.monotonic() + upstream_retry_failover_budget_seconds
+            _monotonic() + upstream_retry_failover_budget_seconds
         )
         # Remote-stream watchdog state (LP-0MSVP7ZML003XZTJ): bounded
         # deadlines that terminate a "connected but idle" stream which the
         # per-chunk idle timeout cannot catch (heartbeats flowing, no
         # content progress). Updated on every content-bearing chunk.
-        _watchdog_started = time.monotonic()
+        _watchdog_started = _monotonic()
         _last_content_at = _watchdog_started
         _watchdog_terminated_reason: str | None = None
         # Empty-response retry state (LP-0MRF77A0E0026B9T)
@@ -1473,10 +1489,10 @@ async def _handle_remote_streaming(
             if (
                 (_should_retry or _should_empty_retry)
                 and not _has_content
-                and time.monotonic() >= _failover_deadline
+                and _monotonic() >= _failover_deadline
             ):
                 _failover_elapsed = upstream_retry_failover_budget_seconds - max(
-                    0.0, _failover_deadline - time.monotonic()
+                    0.0, _failover_deadline - _monotonic()
                 )
                 try:
                     _srv().logger.warning(
@@ -1538,7 +1554,7 @@ async def _handle_remote_streaming(
                 _should_empty_retry = False
                 _empty_retry_count += 1
                 # Check empty-retry timeout budget (LP-0MU1RXEPL005CK97)
-                _elapsed_since_start = time.monotonic() - _watchdog_started
+                _elapsed_since_start = _monotonic() - _watchdog_started
                 if _elapsed_since_start > upstream_empty_retry_timeout_seconds:
                     _srv().logger.warning(
                         "Empty response retry budget exceeded "
@@ -1579,7 +1595,7 @@ async def _handle_remote_streaming(
                 if not _has_content:
                     _empty_sleep = min(
                         _empty_sleep,
-                        max(0.0, _failover_deadline - time.monotonic()),
+                        max(0.0, _failover_deadline - _monotonic()),
                     )
                 await asyncio.sleep(_empty_sleep)
                 # Create fresh stream connection for empty retry
@@ -1734,7 +1750,7 @@ async def _handle_remote_streaming(
                 if not _has_content:
                     _backoff_delay = min(
                         _backoff_delay,
-                        max(0.0, _failover_deadline - time.monotonic()),
+                        max(0.0, _failover_deadline - _monotonic()),
                     )
                 try:
                     _srv().logger.info(
@@ -1807,7 +1823,7 @@ async def _handle_remote_streaming(
                     # timeout and the remaining max-duration / activity
                     # budgets, so a deadline that elapses classifies as its
                     # own reason instead of the ordinary idle-stall retry.
-                    _now = time.monotonic()
+                    _now = _monotonic()
                     _duration_remaining = (
                         _watchdog_started + upstream_max_stream_duration_seconds
                     ) - _now
@@ -1832,7 +1848,7 @@ async def _handle_remote_streaming(
                             timeout=max(0.0, _read_budget),
                         )
                     except TimeoutError:
-                        _now = time.monotonic()
+                        _now = _monotonic()
                         if _now >= _watchdog_started + upstream_max_stream_duration_seconds:
                             # Hard total-lifetime cap exceeded → terminate, no retry.
                             _watchdog_terminated_reason = "stream_max_duration"
@@ -1899,7 +1915,7 @@ async def _handle_remote_streaming(
                                         # Content-bearing chunk = activity
                                         # progress (LP-0MSVP7ZML003XZTJ):
                                         # resets the activity watchdog.
-                                        _last_content_at = time.monotonic()
+                                        _last_content_at = _monotonic()
                                     # Token counting for text content remains
                                     # unchanged (content only).
                                     if isinstance(delta, dict) and "content" in delta:
@@ -1910,12 +1926,12 @@ async def _handle_remote_streaming(
                                     # empty-retry diagnostics (LP-0MS8XAPXT009W3CL).
                                     if isinstance(delta, dict) and delta.get("tool_calls"):
                                         _saw_tool_calls = True
-                                        _last_content_at = time.monotonic()
+                                        _last_content_at = _monotonic()
                                     if isinstance(delta, dict):
                                         _rc = delta.get("reasoning_content")
                                         if isinstance(_rc, str) and _rc.strip():
                                             _saw_reasoning = True
-                                            _last_content_at = time.monotonic()
+                                            _last_content_at = _monotonic()
                             except Exception:
                                 texts.append(payload)
                         if texts:
@@ -2024,7 +2040,7 @@ async def _handle_remote_streaming(
                             session_id or "unknown",
                             provider or "remote",
                             model_name,
-                            time.monotonic() - _watchdog_started,
+                            _monotonic() - _watchdog_started,
                         )
                     except Exception:
                         pass

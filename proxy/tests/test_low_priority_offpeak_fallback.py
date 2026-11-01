@@ -13,11 +13,12 @@ This module pins the *mechanism* before the config change lands (the exact
 LP-0MVF1FQJR000NH2I, which is the only item allowed to touch the file):
 
 - target chain shape: ``local-qwen3 → munitoai-free → opencode-go-3 →
-  opencode-go-2 → opencode-go`` (AC2), with ``medium``/``high`` untouched.
+  opencode-go-2 → opencode-go → munitoai → deepseek-flash`` (AC2, with the
+  paid tail since LP-0MVY8REC80097HI0), with ``medium``/``high`` untouched.
 - UTC window gating (AC1/AC3): the opencode entries are eligible inside
   ``available_times`` (e.g. 00:00–01:00, 04:00–06:00) and skipped outside
-  them (e.g. 01:00–04:00, 06:00–10:00 gaps), falling through exactly as the
-  two-entry chain does today.
+  them (e.g. 01:00–04:00, 06:00–10:00 gaps), falling through to the
+  around-the-clock ``munitoai`` / ``deepseek-flash`` paid tail.
 - behaviour neutrality while the free tier still has budget: the paid tiers
   are never promoted ahead of ``munitoai-free``.
 - per-API-key 429 failover (AC4): a 429 on ``opencode-go-3`` does **not**
@@ -28,9 +29,11 @@ LP-0MVF1FQJR000NH2I, which is the only item allowed to touch the file):
   **does** exclude its same-gateway siblings as one failure domain
   (``_failure_domain_key``), so the three entries are not 3× outage
   resilience (LP-0MSG45I8Q0020N1F).
-- no paid-tier leak (AC5): ``munitoai``/``deepseek-flash`` never appear in a
-  ``low`` chain, and any non-free remote tier in a ``low`` chain must carry
-  ``available_times`` (off-peak-only spend).
+- paid-tier reachability (LP-0MVY8REC80097HI0): ``munitoai`` and
+  ``deepseek-flash`` declare ``low`` and appear in the ``low`` chain tail as
+  around-the-clock fallbacks (operator decision — low-priority requests were
+  left with no paid fallback once the free tier is quarantined and the
+  opencode accounts exhausted).
 
 The chain-order/window/failover tests are driven through the real routing
 seams (``provider_chain_for_priority`` + ``_resolve_provider_with_exclusions``)
@@ -58,7 +61,7 @@ from proxy.priority import (
 LOCAL_TIER = "local-qwen3"
 FREE_TIER = "munitoai-free"
 OPENCODE_NAMES = ["opencode-go-3", "opencode-go-2", "opencode-go"]
-TARGET_LOW_CHAIN = [LOCAL_TIER, FREE_TIER, *OPENCODE_NAMES]
+TARGET_LOW_CHAIN = [LOCAL_TIER, FREE_TIER, *OPENCODE_NAMES, "munitoai", "deepseek-flash"]
 LOW_CHAIN_MODELS = ("plan", "author", "code")
 
 # The off-peak windows every opencode-go entry must keep (LP-0MSXPHTD9004DZ4P).
@@ -152,7 +155,7 @@ def _next_provider(chain: list[dict], named: set[str], domains: set[str]):
 
 class TestTargetChainShape:
     @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
-    def test_low_chain_is_local_free_then_all_three_opencode_entries(self, model_name):
+    def test_low_chain_is_local_free_then_opencode_then_paid_tail(self, model_name):
         names = [e["name"] for e in _target_chain_entries(model_name)]
         assert names == TARGET_LOW_CHAIN
 
@@ -177,38 +180,39 @@ class TestLiveConfigInvariants:
         assert FREE_TIER in names
 
     @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
-    def test_every_paid_tier_in_a_low_chain_is_window_gated(self, model_name):
-        # AC6/off-peak-only spend: anything after the free tier that is not
-        # free/local must carry ``available_times``.
+    def test_opencode_entries_in_a_low_chain_are_window_gated(self, model_name):
+        # Only the opencode entries keep their ``available_times`` windows; the
+        # around-the-clock paid tail (munitoai / deepseek-flash, added by
+        # LP-0MVY8REC80097HI0) returns pickable even outside the windows.
         chain = provider_chain_for_priority(_live_model(model_name), PRIORITY_LOW)
         for entry in chain:
             name = entry.get("name", "")
-            if name in (LOCAL_TIER, FREE_TIER):
-                continue
-            assert entry.get("available_times"), (
-                f"paid tier {name!r} appears in a low chain without "
-                "available_times — off-peak-only spend would be violated"
-            )
+            if name in OPENCODE_NAMES:
+                assert entry.get("available_times"), (
+                    f"opencode tier {name!r} lost its off-peak windows"
+                )
 
-    def test_fully_paid_tiers_never_enter_a_low_chain(self):
-        # AC6: ``munitoai`` and ``deepseek-flash`` have no window discipline,
-        # so they must never be reachable from a ``low`` route. Membership is
-        # declared by each entry's own ``priorities`` label
-        # (LP-0MVGPZWY0001JD1D).
+    def test_paid_tiers_are_reachable_from_a_low_chain(self):
+        # LP-0MVY8REC80097HI0: ``munitoai`` and ``deepseek-flash`` declare
+        # ``low`` and appear in the low chain tail (around-the-clock paid
+        # fallback). Membership is declared by each entry's own ``priorities``
+        # label (LP-0MVGPZWY0001JD1D).
         config = _live_config()
-        banned = {"munitoai", "deepseek-flash"}
+        expected = {"munitoai", "deepseek-flash"}
         for model_name, model in config["models"].items():
-            low_labels = [
-                e.get("name")
-                for e in (model or {}).get("providers") or []
-                if PRIORITY_LOW in (e.get("priorities") or [])
-            ]
+            if not (model or {}).get("providers"):
+                continue
             resolved = provider_chain_for_priority(model, PRIORITY_LOW)
-            leaked = banned & {e.get("name", "") for e in resolved}
-            assert not leaked, (
-                f"model {model_name!r} low chain {low_labels!r} "
-                f"leaks paid tiers {sorted(leaked)}"
-            )
+            present = expected & {e.get("name", "") for e in resolved}
+            if model_name in LOW_CHAIN_MODELS:
+                assert present == expected, (
+                    f"model {model_name!r} low chain misses paid tiers "
+                    f"{sorted(expected - present)}"
+                )
+            else:
+                assert not present, (
+                    f"model {model_name!r} unexpectedly gained paid low tiers"
+                )
 
     @pytest.mark.parametrize("model_name", LOW_CHAIN_MODELS)
     def test_opencode_entries_keep_their_off_peak_windows(self, model_name):
@@ -222,8 +226,9 @@ class TestLiveConfigInvariants:
     def test_live_low_chain_is_exactly_the_target_order(self, model_name):
         # AC1 (parent): the shipped config's ``low`` chain is exactly
         # ``[local-qwen3, munitoai-free, opencode-go-3, opencode-go-2,
-        # opencode-go]`` — free tier ordered before any paid entry and the
-        # three keys in providers-list order.
+        # opencode-go, munitoai, deepseek-flash]`` — free tier ordered before
+        # any paid entry, the three keys in providers-list order, and the
+        # around-the-clock paid tail last (LP-0MVY8REC80097HI0).
         names = [e["name"] for e in provider_chain_for_priority(_live_model(model_name), PRIORITY_LOW)]
         assert names == TARGET_LOW_CHAIN
 
@@ -244,23 +249,24 @@ class TestWindowGating:
         entry = _live_entry("plan", entry_name)
         assert provider._is_within_allowed_window(entry, now_utc=OUTSIDE_WINDOW_UTC) is False
 
-    def test_in_window_low_chain_falls_through_to_the_paid_tiers(self):
-        # local + free already spent → the paid off-peak tier absorbs the
-        # overflow while its window is open.
+    def test_in_window_low_chain_falls_through_to_the_opencode_tiers(self):
+        # local + free already spent → the opencode tiers absorb the overflow
+        # while their windows are open.
         chain = _target_chain_entries("plan")
         with _patch_utc_now(INSIDE_WINDOW_UTC):
             picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, set())
         assert picked is not None
-        assert picked["name"] == "opencode-go-3"
+        assert picked["name"] in OPENCODE_NAMES
 
-    def test_out_of_window_low_chain_behaves_exactly_as_today(self):
-        # During the UTC 01:00-04:00 / 06:00-10:00 gaps the paid entries are
-        # skipped, so an exhausted chain resolves to ``None`` just like the
-        # two-entry ``[local-qwen3, munitoai-free]`` chain before this change.
+    def test_out_of_window_low_chain_falls_through_to_the_paid_tail(self):
+        # During the UTC 01:00-04:00 / 06:00-10:00 gaps the opencode entries
+        # are skipped, and the around-the-clock paid tail (munitoai,
+        # deepseek-flash — LP-0MVY8REC80097HI0) absorbs the overflow.
         chain = _target_chain_entries("plan")
         with _patch_utc_now(OUTSIDE_WINDOW_UTC):
             picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, set())
-        assert picked is None
+        assert picked is not None
+        assert picked["name"] == "munitoai"
 
     def test_out_of_window_low_chain_still_serves_local_and_free(self):
         chain = _target_chain_entries("plan")
@@ -307,12 +313,15 @@ class TestFailoverScope:
             "a 429 on opencode-go-3 must not exclude the independent opencode-go-2 account"
         )
 
-    def test_429_on_all_accounts_exhausts_the_chain(self):
+    def test_429_on_all_accounts_skips_opencode_and_falls_to_the_paid_tail(self):
         chain = _target_chain_entries("plan")
         excluded = {provider._usage_limit_account_key(_live_entry("plan", name)) for name in OPENCODE_NAMES}
         with _patch_utc_now(INSIDE_WINDOW_UTC):
             picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, excluded)
-        assert picked is None
+        assert picked is not None and picked["name"] == "munitoai", (
+            "all opencode accounts exhausted → the around-the-clock paid tail "
+            "(LP-0MVY8REC80097HI0) absorbs the request"
+        )
 
     def test_opencode_siblings_share_one_failure_domain(self):
         domains = {provider._failure_domain_key(_live_entry("plan", name)) for name in OPENCODE_NAMES}
@@ -322,13 +331,19 @@ class TestFailoverScope:
 
     def test_5xx_on_one_entry_excludes_its_siblings(self):
         # Honest caveat (AC5): a 5xx/stall is recorded against the shared
-        # failure domain, so the chain does NOT gain 3x outage resilience.
+        # failure domain, so the chain does NOT gain 3x outage resilience —
+        # all three opencode entries share ONE domain and are skipped
+        # together; the paid tail (different domain) still absorbs the
+        # request.
         chain = _target_chain_entries("plan")
         go3 = _live_entry("plan", "opencode-go-3")
         excluded = {provider._failure_domain_key(go3)}
         with _patch_utc_now(INSIDE_WINDOW_UTC):
             picked = _next_provider(chain, {LOCAL_TIER, FREE_TIER}, excluded)
-        assert picked is None, "same-gateway siblings must be skipped after a 5xx on opencode-go-3 (one failure domain)"
+        assert picked is not None and picked["name"] == "munitoai", (
+            "same-gateway siblings skipped after a 5xx on opencode-go-3 (one "
+            "failure domain); paid tail serves instead"
+        )
 
 
 # ---------------------------------------------------------------------------

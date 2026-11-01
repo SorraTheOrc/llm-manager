@@ -730,8 +730,12 @@ async def test_remote_fallback_free_usage_limit_does_not_affect_other_errors(sam
             request, "v1/chat/completions", sample_model_config, cfg
         )
 
-    # 429 rates are returned as-is when all providers hit the same error
-    assert result.status_code == 429
+    # A remote 429 is a rate limit, not local slot pressure, so the exhausted
+    # chain ends in the generic ``all_exhausted`` 503 — never the
+    # ``all_slots_exhausted`` 429, whose message and (since
+    # LP-0MVUXY1CL005KWCC) retry timer describe local slots.
+    assert result.status_code == 503
+    assert json.loads(result.body)["code"] == provider.EXHAUSTION_CODE_ALL
 
     # The provider should have a normal (short) cooldown, not 3h
     now = time.time()
@@ -3139,7 +3143,7 @@ def test_try_pi_auth_json_strips_api_key_suffix(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_plan_fallback_reaches_go_tier_when_free_tier_rate_limited():
+async def test_plan_fallback_reaches_go_tier_when_free_tier_budget_exhausted():
     """When the local provider is exhausted and the free remote tier returns
     429, the fallback chain must reach the Go tier (opencode-go-deepseek)
     and return a successful response."""
@@ -5438,7 +5442,7 @@ def test_context_limit_field_absent_keeps_resolution_order():
 
 class TestFallbackLogEvidence:
     """``Fallback triggered`` lines carry ``session=``/``attempt=`` plus the
-    budget evidence for ``rate_limited*`` reasons, so per-session fallback
+    budget evidence for ``provider_budget_exhausted*`` reasons, so per-session fallback
     attribution never has to guess.
 
     All three emit helpers (streaming success, non-streaming success and the
@@ -5493,13 +5497,13 @@ class TestFallbackLogEvidence:
         line = self._emit_build(caplog, session_id="sess-other-b", reason="HTTP 502")
         assert "attempt=1" in line
 
-    def test_budget_evidence_emitted_for_rate_limited(self, caplog):
+    def test_budget_evidence_emitted_for_provider_budget_exhausted(self, caplog):
         budget = {"limit": 60, "remaining": 0, "waited": 1.234}
         line = self._emit_build(
             caplog, session_id="sess-budget",
-            reason="rate_limited", budget=budget,
+            reason="provider_budget_exhausted", budget=budget,
         )
-        assert "reason=rate_limited" in line
+        assert "reason=provider_budget_exhausted" in line
         assert "limit=60" in line
         assert "remaining=0" in line
         assert "waited=1.234" in line

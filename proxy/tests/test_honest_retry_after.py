@@ -131,13 +131,22 @@ class TestBuildExhaustedResponse:
         assert "retry-after" in r.headers
         assert r.headers["retry-after"] == "45"
 
-    def test_slot_exhaustion_no_retry_after(self):
-        r = provider._build_exhausted_response(
-            all_local_slot_exhaustion=True, total_slots=4
-        )
+    def test_slot_exhaustion_carries_retry_after(self):
+        # LP-0MVUXY1CL005KWCC: the slot 429 is no longer timer-free — it
+        # advertises the same Retry-After / retry_after pair as the other
+        # exhaustion surfaces (default slot_unavailable_retry_after = 5 s).
+        with patch.object(
+            provider, "_local_occupant_prefill_seconds", return_value=0.0
+        ):
+            r = provider._build_exhausted_response(
+                all_local_slot_exhaustion=True, total_slots=4
+            )
         assert r.status_code == 429
-        # 429 text/plain has no JSON retry_after
-        assert b"slots available" in r.body
+        body = json.loads(r.body)
+        assert "slots available" in body["message"]
+        assert body["retry_after"] == 5
+        assert r.headers["retry-after"] == "5"
+        assert body["retryable"] is True
 
     def test_with_model_config_window(self):
         now = datetime(2026, 1, 1, 20, 0, 0, tzinfo=UTC)

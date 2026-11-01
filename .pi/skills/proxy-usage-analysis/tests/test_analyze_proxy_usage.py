@@ -25,11 +25,13 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import os
 import re
 import sys
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -38,7 +40,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import aggregation
 import bucketing
 import config_loader
+import engine_cross_check
 import gpu_busy
+import llama_log_parser
 import log_parser
 import recommendations
 import reporting
@@ -152,15 +156,42 @@ class TestLogLineParsing:
         assert ev.attempt_index == 3
         assert ev.budget_limit is None  # reason not budget-driven
 
-    def test_fallback_rate_limited_line_parses_budget_snapshot(self):
-        ev = log_parser.parse_log_line(fixtures.FALLBACK_RATE_LIMITED_BUDGET)
+    def test_fallback_provider_budget_exhausted_line_parses_budget_snapshot(self):
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_PROVIDER_BUDGET_EXHAUSTED)
         assert ev.kind == "fallback"
         assert ev.session == "herdr-1792767061-1282111-17770"
         assert ev.attempt_index == 4
-        assert ev.reason == "rate_limited"
+        assert ev.reason == "provider_budget_exhausted"
         assert ev.budget_limit == 60
         assert ev.budget_remaining == 0
         assert ev.budget_waited == pytest.approx(12.5)
+
+    def test_legacy_rate_limited_reason_is_normalised(self):
+        """Rotated logs predating the rename still carry ``rate_limited*``;
+        each variant normalises to ``provider_budget_exhausted*`` so one window
+        never reports both spellings (LP-0MVMBM8YS003Y2JG AC3)."""
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_LEGACY_BUDGET_EXHAUSTED)
+        assert ev.reason == "provider_budget_exhausted"
+        # The variant suffix is preserved, not flattened into the base name.
+        for legacy, expected in (
+            ("rate_limited_after_wait", "provider_budget_exhausted_after_wait"),
+            ("rate_limited_waiters", "provider_budget_exhausted_waiters"),
+            ("rate_limited_disconnect", "provider_budget_exhausted_disconnect"),
+        ):
+            line = (
+                "2026-10-23 09:14:02,884 - INFO - Fallback triggered for "
+                "model=v1/chat/completions, from=munitoai-free, to=opencode-go, "
+                f"reason={legacy} session=s-legacy attempt=1"
+            )
+            assert log_parser.parse_log_line(line).reason == expected
+
+    def test_current_reason_spelling_is_left_untouched(self):
+        """``_normalize_reason`` is a legacy mapping only: the current name (and
+        an unrelated reason that merely starts with another word) pass through."""
+        ev = log_parser.parse_log_line(fixtures.FALLBACK_PROVIDER_BUDGET_EXHAUSTED)
+        assert ev.reason == "provider_budget_exhausted"
+        other = log_parser.parse_log_line(fixtures.FALLBACK_SESSION)
+        assert other.reason == "local_lease_active"
 
     def test_fallback_session_token_unknown_maps_to_none(self):
         """The proxy emits ``session=unknown`` when the request has no UUID;
@@ -1530,11 +1561,11 @@ class TestFallbackAttribution:
     def test_session_does_not_inherit_another_sessions_reason(self):
         """The regression this change fixes: session B reached remote seconds
         after session A's spill, but B has no fallback line of its own — it must
-        stay unattributed instead of inheriting A's ``rate_limited``."""
+        stay unattributed instead of inheriting A's ``provider_budget_exhausted``."""
         lines = [
             # A's session-bearing spill, just before B's remote move.
             "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
             "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
             *self._local_then_remote("session-b", "09:06", "09:06"),
         ]
@@ -1589,7 +1620,7 @@ class TestFallbackAttribution:
             *self._local_then_remote("herdr-1792767061-1282111-17770",
                                      "09:12", "09:13"),
             "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
             "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
             *self._local_then_remote("session-b", "09:06", "09:06"),
         ]
@@ -1602,7 +1633,7 @@ class TestFallbackAttribution:
     def test_report_exposes_attribution_states(self):
         lines = [
             "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
             "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
             *self._local_then_remote("session-b", "09:06", "09:06"),
             "2026-10-23 09:10:00,000 - INFO - Stream started: provider=local "
@@ -1629,7 +1660,7 @@ class TestFallbackAttribution:
     def test_csv_row_carries_attribution(self, tmp_path):
         lines = [
             "2026-10-23 09:05:59,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=munitoai-free, to=opencode-go, reason=rate_limited "
+            "from=munitoai-free, to=opencode-go, reason=provider_budget_exhausted "
             "session=other-session-0001 attempt=1 limit=60 remaining=0 waited=0.000",
             *self._local_then_remote("session-b", "09:06", "09:06"),
         ]
@@ -2262,6 +2293,41 @@ class TestRecommendations:
         )
         recs = recommendations.generate_recommendations(res, config=None)
         assert any(r.severity == "info" and "remote" in r.title.lower() for r in recs)
+
+    def test_provider_budget_skip_is_not_a_remote_error(self):
+        """The renamed reason contains ``exhausted``, which the remote-error
+        token list also matches. A proxy budget skip is a pre-flight pacing
+        decision on a healthy provider, so it must never be reported as a
+        remote provider error (LP-0MVMBM8YS003Y2JG AC4)."""
+        res = _result_with_sessions(
+            [_session("a", remote_move=True, reason="provider_budget_exhausted")],
+            fallback_events=[
+                log_parser.LogEvent(
+                    "fallback", WINDOW_START, reason="provider_budget_exhausted"
+                )
+            ],
+        )
+        recs = recommendations.generate_recommendations(res, config=None)
+        titles = " | ".join(r.title for r in recs).lower()
+        assert "remote provider errors" not in titles
+
+    def test_provider_budget_skip_is_explained_as_pacing_not_a_429(self):
+        """Budget pacing gets its own advice that distinguishes it from an
+        upstream HTTP 429 (LP-0MVMBM8YS003Y2JG AC4/AC7)."""
+        res = _result_with_sessions(
+            [_session("a", remote_move=True, reason="provider_budget_exhausted_after_wait")],
+            fallback_events=[
+                log_parser.LogEvent(
+                    "fallback", WINDOW_START, reason="provider_budget_exhausted_after_wait"
+                )
+            ],
+        )
+        recs = recommendations.generate_recommendations(res, config=None)
+        budget = [r for r in recs if "budget" in r.title.lower()]
+        assert budget, "expected a request-budget recommendation"
+        detail = budget[0].detail.lower()
+        assert "rate_limit_rpm" in detail
+        assert "not an upstream" in detail
 
     def test_provider_context_skips_trigger_ceiling_advice(self):
         # AC4: provider-context skip events drive their own advice naming count,
@@ -7192,6 +7258,40 @@ class TestMachineReadablePrefillAndBusyJson:
         assert "local model busy (dispatch → finish)" in out
         assert "decode-only busy (lower bound)" in out
 
+    def test_cli_text_summary_labels_gpu_busy_hardware_only(self, tmp_path, capsys):
+        """AC2/AC4 (LP-0MVUIM7A50053EFN): the stdout summary keeps the
+        log-derived figure as local busy and labels the power figure as
+        hardware activity that is **not** local model utilisation. The GPU
+        source is stubbed — no live Prometheus dependency."""
+        import analyze_proxy_usage as cli
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+        stub = gpu_busy.GpuBusyResult(
+            computing_fraction=0.50,
+            total_seconds=3600.0,
+            busy_seconds=1800.0,
+            idle_seconds=1800.0,
+            smoothed_power_values=[],
+        )
+        with patch("reporting.gpu_busy.compute_gpu_busy", return_value=stub):
+            rc = cli.main(
+                [
+                    "--log-dir", str(log_dir),
+                    "--start", "2026-08-02 14:00:00",
+                    "--end", "2026-08-02 15:00:00",
+                    "--output-dir", str(tmp_path / "out"),
+                ]
+            )
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The decision position carries the log-derived figure (7 s of the
+        # 3600 s window = 0.2 %), never the stubbed 50 % hardware figure.
+        assert "local model busy (dispatch → finish) 0.2%" in out
+        assert "GPU busy — power-based (hardware, not local model utilisation) 50.0%" in out
+        assert "GPU busy (power-based, 15s sampling)" not in out
+
 
 # ---------------------------------------------------------------------------
 # Regenerated report end-to-end verification (LP-0MVJO4382002FJF2)
@@ -8005,6 +8105,260 @@ class TestResidencyAdmission:
 
 
 # ---------------------------------------------------------------------------
+# Residency measurement provenance: grammar + report breakdown
+# (LP-0MVT2PF1C008LAPB — parent LP-0MVRZXPH70025ZNR AC3(v) / AC4)
+# ---------------------------------------------------------------------------
+
+#: The closed ``measurement=`` vocabulary values these fixtures exercise.
+MEASURED = "measured"
+NO_PRIOR = "unavailable:no_prior_measurement"
+NO_SLOT = "unavailable:no_slot"
+CAPTURE_DISABLED = "unavailable:capture_disabled"
+
+
+class TestResidencyMeasurementProvenance:
+    """The additive ``measurement=`` grammar and its report breakdown.
+
+    The parent defect (LP-0MVRZXPH70025ZNR) is that every residency decision
+    logs ``n_past_actual=none`` / ``reuse_ratio=none``, so the usage report
+    shows ``3607`` decisions with ``0`` measured and the AC4 reuse rule can
+    never fire — while an unmeasurable decision and a measurable-but-unmeasured
+    one look identical. The fix adds an additive ``measurement=`` field
+    (``measured`` / ``unavailable:<reason>``) and reports the split, so
+    "decisions logged but all unmeasured" is a visible finding.
+
+    Red-first: the assertions describing the new field/section were written by
+    LP-0MVT2PF1C008LAPB as ``xfail(strict=True)``; the markers are removed here
+    (LP-0MVT2QHMU0008F2V) and now pin the behaviour. The pre-change grammar
+    assertions were unmarked from the start — they are the
+    backward-compatibility guarantee the change must not break.
+    """
+
+    @staticmethod
+    def _section(md: str) -> str:
+        return md.split("## Residency-aware admission", 1)[1].split("\n## ", 1)[0]
+
+    def _summary(self, lines: list[str]) -> aggregation.AnalysisResult:
+        return aggregation.aggregate(
+            _events([fixtures.STREAM_STARTED_LOCAL, *lines,
+                     fixtures.STREAM_FINISHED_LOCAL]),
+            datetime(2026, 8, 2, 13, 0),
+            datetime(2026, 8, 2, 15, 0),
+            _schedule(),
+        )
+
+    def _all_unmeasured_summary(self) -> aggregation.AnalysisResult:
+        return self._summary(
+            [
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_CAPTURE_DISABLED,
+            ]
+        )
+
+    # -- grammar -----------------------------------------------------------
+
+    def test_parser_reads_measured_provenance(self):
+        """AC: a ``measurement=measured`` line parses to the literal value."""
+        ev = log_parser.parse_log_line(fixtures.ROUTING_RESIDENT_PREFIX_MEASURED)
+
+        assert ev.kind == "residency_decision"
+        assert ev.measurement == MEASURED
+        assert ev.residency_source == "measured_last_dispatch"
+        assert ev.reuse_ratio == pytest.approx(0.611)
+
+    def test_parser_reads_unavailable_reason_verbatim(self):
+        """AC: an unmeasured decision carries its closed-vocabulary reason.
+
+        The reason is parsed verbatim (``unavailable:<detail>``), never
+        collapsed to a bare ``none`` or an empty string, and it accompanies an
+        absent — not fabricated — ratio.
+        """
+        ev = log_parser.parse_log_line(
+            fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR
+        )
+
+        assert ev.measurement == NO_PRIOR
+        assert ev.n_past_actual is None
+        assert ev.reuse_ratio is None
+        assert ev.residency_source == "session_slot"
+
+    @pytest.mark.parametrize(
+        "line,reason",
+        [
+            (fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT, NO_SLOT),
+            (fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR, NO_PRIOR),
+            (
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_CAPTURE_DISABLED,
+                CAPTURE_DISABLED,
+            ),
+        ],
+        ids=["no_slot", "no_prior_measurement", "capture_disabled"],
+    )
+    def test_each_unmeasured_reason_is_distinguishable(self, line, reason):
+        """AC2: every unmeasured cause has its own value, not a shared ``none``."""
+        ev = log_parser.parse_log_line(line)
+
+        assert ev.measurement == reason
+        assert ev.reuse_ratio is None
+
+    def test_reuse_ratio_none_still_maps_to_none(self):
+        """Parent constraint: ``reuse_ratio=none`` was never 0, and stays ``None``.
+
+        This holds on the new grammar too, so the additive field changes no
+        existing consumer (LP-0MVNPZY22008B536's guarantee).
+        """
+        ev = log_parser.parse_log_line(
+            fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT
+        )
+
+        assert ev.reuse_ratio is None
+        assert ev.n_past_actual is None
+        assert ev.decision == "resident_prefix_insufficient"
+
+    def test_legacy_line_parses_unchanged(self):
+        """AC: a pre-change line (no ``measurement=``) keeps every old field."""
+        ev = log_parser.parse_log_line(fixtures.ROUTING_RESIDENT_PREFIX_LEGACY)
+
+        assert ev.kind == "residency_decision"
+        assert ev.decision == "admit"
+        assert ev.n_past_actual == 49103
+        assert ev.estimated_tokens == 49103
+        assert ev.reuse_ratio == pytest.approx(1.0)
+        assert ev.residency_source == "measured"
+
+    def test_legacy_line_has_no_measurement_value(self):
+        """AC: an absent ``measurement=`` field reads ``None``, never fabricated.
+
+        Old log files must not be reclassified: a line that predates the field
+        has no provenance, so ``measurement`` is ``None`` rather than a
+        ``measured``/``unavailable:*`` claim the line never made.
+        """
+        measured = log_parser.parse_log_line(fixtures.ROUTING_RESIDENT_PREFIX_LEGACY)
+        unmeasured = log_parser.parse_log_line(
+            fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_UNMEASURED
+        )
+
+        assert measured.measurement is None
+        assert unmeasured.measurement is None
+
+    # -- report section ----------------------------------------------------
+
+    def test_section_reports_measured_and_unmeasured_counts(self):
+        """AC: the section keeps reporting measured vs unmeasured decision counts.
+
+        Passes on the pre-change grammar and must keep passing: the split is
+        the existing contract, and the additive field only refines it.
+        """
+        summary = self._summary(
+            [
+                fixtures.ROUTING_RESIDENT_PREFIX_MEASURED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_CAPTURE_DISABLED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_UNMEASURED,
+            ]
+        )
+        section = self._section(reporting.build_report(summary, None))
+
+        assert "(measured ratio: 2, no measurement: 4)" in section
+
+    def test_section_breaks_down_unmeasured_reasons(self):
+        """AC: the section shows a per-reason unmeasured breakdown.
+
+        "unmeasurable" is not one condition: no slot to measure, no prior
+        measurement for the pair, and capture switched off are three different
+        operator problems with three different remedies. Each must appear with
+        its own count instead of hiding behind a single "no measurement" total.
+        """
+        summary = self._all_unmeasured_summary()
+        section = self._section(reporting.build_report(summary, None))
+
+        for reason in (NO_PRIOR, NO_SLOT, CAPTURE_DISABLED):
+            rows = [ln for ln in section.splitlines() if reason in ln]
+            assert rows, f"per-reason breakdown must name {reason}"
+            assert any("1" in ln for ln in rows), (
+                f"the {reason} breakdown must carry its count"
+            )
+
+    def test_all_unmeasured_window_is_a_visible_finding(self):
+        """AC: an all-unmeasured window states the finding, not a silent zero.
+
+        The exact 3607/0 production condition (LP-0MVRZXPH70025ZNR): rendering
+        ``measured ratio: 0`` is silently ambiguous — it reads as a quiet window
+        rather than a broken measurement ladder. The section must say so.
+        """
+        summary = self._all_unmeasured_summary()
+        section = self._section(reporting.build_report(summary, None))
+
+        findings = [
+            ln
+            for ln in section.splitlines()
+            if re.search(r"\ball\b[^\n]*unmeasured", ln, re.IGNORECASE)
+        ]
+        assert findings, "an all-unmeasured window must render an explicit finding"
+        # The finding is its own line, not the counts bullet restated.
+        assert any("Residency decisions:" not in ln for ln in findings)
+        # And the window is still counted truthfully.
+        assert "(measured ratio: 0, no measurement: 3)" in section
+
+    # -- aggregation -------------------------------------------------------
+
+    def test_legacy_window_counters_unchanged(self):
+        """AC: old-format fixtures produce the same residency counters as before.
+
+        ``summary_to_json`` is a downstream consumer: the change must not
+        reclassify, double-count or drop a legacy decision.
+        """
+        summary = self._summary(
+            [
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_UNMEASURED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_TENANT,
+            ]
+        )
+        counters = reporting.summary_to_json(summary)
+
+        assert counters["residency_decisions"] == 3
+        assert counters["residency_resident_admits"] == 1
+        assert counters["residency_evicted_denials"] == 1
+        assert counters["residency_tenant_limit_denials"] == 1
+
+    # -- downstream handoff ------------------------------------------------
+
+    def test_json_exposes_reason_counts_for_the_classifier(self):
+        """AC: the per-reason counts are machine-readable for the AC4 classifier.
+
+        LP-0MVQ4X1S30034BQ1 classifies deadline events from ``--json`` counters
+        (never ad-hoc grep), so the measured total and the per-reason
+        unmeasured breakdown must be first-class additive keys. A pre-change
+        line has no provenance and is bucketed as ``unrecorded`` — its reason
+        is never fabricated.
+        """
+        summary = self._summary(
+            [
+                fixtures.ROUTING_RESIDENT_PREFIX_MEASURED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_PRIOR,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_NO_SLOT,
+                fixtures.ROUTING_RESIDENT_PREFIX_UNMEASURED_CAPTURE_DISABLED,
+                fixtures.ROUTING_RESIDENT_PREFIX_LEGACY_UNMEASURED,
+            ]
+        )
+        counters = reporting.summary_to_json(summary)
+
+        assert counters["residency_decisions"] == 6
+        assert counters["residency_measured_decisions"] == 2
+        assert counters["residency_unmeasured_reasons"] == {
+            NO_PRIOR: 1,
+            NO_SLOT: 1,
+            CAPTURE_DISABLED: 1,
+            "unrecorded": 1,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Explicit no-usage marker (LP-0MVMBM6N400541EH)
 # ---------------------------------------------------------------------------
 
@@ -8213,3 +8567,376 @@ class TestTokensMissingMarker:
         row = next(r for r in rows if r["session_id"] == "sess-mix")
         assert row["streams_with_usage"] == "1"
         assert row["streams_without_usage"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# Engine cross-check: proxy slot-time vs llama-server eval timings
+# (LP-0MVNWULLI006ZYXX)
+# ---------------------------------------------------------------------------
+# The report's proxy-inferred per-phase slot-seconds are compared against
+# llama-server's own summed per-task eval durations. Engine figures are sums of
+# durations (slot-seconds), never wall-clock, and never comparable with the
+# merged wall-clock `busy_seconds` union. Missing engine (or proxy) samples
+# render an explicit "unavailable" reason with `-` deltas — never 0/100%.
+
+
+class TestEngineCrossCheck:
+    PROXY_START = (
+        "2026-08-02 14:00:30,000 - INFO - Stream started: provider=local "
+        "model=Qwen3 session=s1 request=[]"
+    )
+    PROXY_FINISH = (
+        "2026-08-02 14:00:40,000 - INFO - Stream finished: reason=stop "
+        "tokens=100/10/110 session=s1 provider=local model=Qwen3 request=[]"
+    )
+
+    @staticmethod
+    def _proxy_lines(prefill_s: float = 30.0) -> list[str]:
+        """One local stream: ``prefill_s`` prefill, then a 10 s decode."""
+        return [
+            TestEngineCrossCheck.PROXY_START,
+            TestEngineCrossCheck.PROXY_FINISH,
+            f"2026-08-02 14:00:30,000 - INFO - dispatch_first_byte_ms={prefill_s * 1000} "
+            f"dispatch_to_first_byte_ms={prefill_s * 1000 - 1.0} cache_state=warm "
+            "cached_ratio=0.900 queue_wait_ms=1.0 session=s1 model=Qwen3",
+        ]
+
+    @staticmethod
+    def _engine_lines(prompt_eval_ms: float, decode_ms: float) -> list[str]:
+        """Real-format Qwen3 eval-timing lines (from /var/log/llama-proxy)."""
+        return [
+            fixtures.QWEN3_SPAWN_LINE,
+            f"[32999] prompt eval time = {prompt_eval_ms:9.2f} ms / 11449 tokens "
+            f"(    2.58 ms per token,   388.05 tokens per second)",
+            f"[32999]        eval time = {decode_ms:9.2f} ms /   153 tokens "
+            f"(   24.68 ms per token,    40.51 tokens per second)",
+        ]
+
+    def _summary(
+        self,
+        tmp_path: Path,
+        proxy_lines: list[str] | None = None,
+        llama_lines: list[str] | None = None,
+    ) -> aggregation.AnalysisResult:
+        summary = aggregation.aggregate(
+            _events(proxy_lines if proxy_lines is not None else self._proxy_lines()),
+            WINDOW_START,
+            WINDOW_END,
+            _schedule(),
+        )
+        llama_dir = tmp_path / "llama"
+        llama_dir.mkdir()
+        if llama_lines:
+            log = llama_dir / "llama-server.log"
+            log.write_text("\n".join(llama_lines) + "\n")
+            mtime = datetime(2026, 8, 2, 14, 30, 0).timestamp()
+            os.utime(log, (mtime, mtime))
+        files = llama_log_parser.discover_llama_logs(llama_dir, WINDOW_START)
+        summary.speed = llama_log_parser.build_speed_stats(
+            files, WINDOW_START, WINDOW_END, _schedule(), log_dir=llama_dir
+        )
+        return summary
+
+    @staticmethod
+    def _section(md: str) -> str:
+        return md.split("## Engine cross-check", 1)[1].split("\n## ", 1)[0]
+
+    # -- delta arithmetic --------------------------------------------------
+
+    def test_delta_arithmetic_both_directions(self, tmp_path):
+        """AC1: absolute delta and percentage delta per phase, both directions.
+
+        Proxy prefill 30 s vs engine 24 s -> +6 s / +25.0 % (proxy above);
+        proxy decode 10 s vs engine 12 s -> -2 s / -16.7 % (engine above).
+        """
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        check = engine_cross_check.compute(summary)
+        prefill = check["prefill"]
+        decode = check["decode"]
+        assert prefill["proxy_slot_seconds"] == pytest.approx(30.0)
+        assert prefill["engine_seconds"] == pytest.approx(24.0)
+        assert prefill["delta_seconds"] == pytest.approx(6.0)
+        assert prefill["delta_pct"] == pytest.approx(25.0)
+        assert decode["proxy_slot_seconds"] == pytest.approx(10.0)
+        assert decode["engine_seconds"] == pytest.approx(12.0)
+        assert decode["delta_seconds"] == pytest.approx(-2.0)
+        assert decode["delta_pct"] == pytest.approx(-16.7)
+        assert check["available_phases"] == ["prefill", "decode"]
+        assert check["status"] == "ok"
+        assert check["unit"] == "slot-seconds"
+
+    def test_engine_samples_come_from_the_qwen3_attribution(self, tmp_path):
+        """AC2: the engine sample counts are the matched Qwen3 eval lines only;
+        an mxbai-embed port's lines are excluded."""
+        summary = self._summary(
+            tmp_path,
+            llama_lines=self._engine_lines(24000.0, 12000.0)
+            + [
+                fixtures.SRV_LOAD_IGNORED,
+                "[51973] prompt eval time =   9999.00 ms /  100 tokens "
+                "(   99.99 ms per token,    10.00 tokens per second)",
+            ],
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["prefill"]["engine_samples"] == 1
+        assert check["decode"]["engine_samples"] == 1
+        assert check["prefill"]["engine_seconds"] == pytest.approx(24.0)
+
+    # -- report rendering --------------------------------------------------
+
+    def test_section_renders_comparison_and_metric_caveat(self, tmp_path):
+        """AC1/AC3: the section shows both phases with deltas and states that
+        engine figures are summed per-task durations, not wall-clock, and not
+        comparable with ``busy_seconds``."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        section = self._section(reporting.build_report(summary, None))
+        assert "Prefill (`prompt eval time`)" in section
+        assert "Decode (`eval time`)" in section
+        assert "+6.0" in section and "+25.0%" in section
+        assert "-2.0" in section and "-16.7%" in section
+        flattened = " ".join(section.split())
+        assert "sums of llama-server's per-task eval durations" in flattened
+        assert "slot-seconds" in flattened
+        assert "not wall-clock" in flattened
+        assert "busy_seconds" in flattened
+        # The caveat must not be accompanied by any busy-seconds arithmetic.
+        assert "busy_pct" in flattened
+        # Window boundedness of the engine side (no per-line timestamps).
+        assert "Window boundedness" in flattened
+        assert "windowing artefact" in flattened
+
+    def test_section_documents_direction_interpretation(self, tmp_path):
+        """AC8: the section explains what a divergence means in each direction."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        flattened = " ".join(self._section(reporting.build_report(summary, None)).split())
+        assert "proxy above engine" in flattened
+        assert "engine above proxy" in flattened
+        assert "queueing" in flattened
+        assert "unattributed" in flattened
+
+    # -- honest degradation ------------------------------------------------
+
+    def test_unavailable_when_llama_logs_are_missing(self, tmp_path):
+        """AC4: no llama logs -> unavailable with the parser's named reason and
+        ``-`` deltas, never a fabricated 0 or 100 %."""
+        summary = self._summary(tmp_path)
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "unavailable"
+        assert check["prefill"]["delta_pct"] is None
+        assert check["prefill"]["delta_seconds"] is None
+        assert "no llama-server log files" in check["prefill"]["reason"]
+        assert any("no llama-server log files" in r for r in check["engine_unavailable_reasons"])
+        section = self._section(reporting.build_report(summary, None))
+        assert "_Unavailable — prefill:" in section
+        assert "_Unavailable — decode:" in section
+        assert "100.0%" not in section
+
+    def test_unavailable_when_no_eval_lines_in_window(self, tmp_path):
+        """AC4: files parsed but no eval-timing lines (verbosity/build)."""
+        summary = self._summary(
+            tmp_path, llama_lines=fixtures.LLAMA_LOG_NO_EVAL_LINES.splitlines()
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "unavailable"
+        assert "verbosity/build" in check["prefill"]["reason"]
+        assert check["prefill"]["delta_pct"] is None
+
+    def test_unavailable_for_non_qwen3_ports(self, tmp_path):
+        """AC4: eval lines exist but only on a non-Qwen3 port (attribution
+        failure) -> unavailable with the named attribution reason."""
+        summary = self._summary(
+            tmp_path,
+            llama_lines=fixtures.LLAMA_LOG_UNDISCOVERABLE_QWEN3_PORT.splitlines(),
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "unavailable"
+        assert "attribution" in check["prefill"]["reason"]
+        assert "51973" in check["prefill"]["reason"]
+        assert check["decode"]["delta_pct"] is None
+        section = self._section(reporting.build_report(summary, None))
+        assert "attribution" in section.lower()
+        assert "100.0%" not in section
+
+    def test_phase_without_lines_but_other_phase_available(self, tmp_path):
+        """A window with decode eval lines but no prompt-eval lines reports the
+        prefill phase unavailable (and the decode phase measured) rather than
+        borrowing the generic empty-window reason."""
+        summary = self._summary(
+            tmp_path,
+            llama_lines=[
+                fixtures.QWEN3_SPAWN_LINE,
+                "[32999]        eval time =  12000.00 ms /   153 tokens "
+                "(   24.68 ms per token,    40.51 tokens per second)",
+            ],
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "partial"
+        assert check["decode"]["available"] is True
+        assert check["prefill"]["available"] is False
+        assert "`prompt eval time`" in check["prefill"]["reason"]
+
+    def test_unavailable_when_proxy_has_no_phase_samples(self, tmp_path):
+        """AC4: engine data present but no proxy-side phase samples -> the phase
+        is unavailable with a proxy-side reason, never a 100 % delta."""
+        summary = self._summary(
+            tmp_path, proxy_lines=[], llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        check = engine_cross_check.compute(summary)
+        assert check["status"] == "unavailable"
+        assert "no measurable prefill phase" in check["prefill"]["reason"]
+        assert check["prefill"]["delta_pct"] is None
+
+    # -- threshold warning -------------------------------------------------
+
+    def test_threshold_recommendation_fires_above_threshold(self, tmp_path):
+        """AC6: a 25 % prefill divergence exceeds a 10 % threshold."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        config = {"local_engine_cross_check_threshold_pct": 10.0}
+        recs = recommendations.generate_recommendations(summary, config)
+        engine_recs = [r for r in recs if "Engine cross-check" in r.title]
+        assert len(engine_recs) == 1
+        assert engine_recs[0].severity == "high"  # 25 % >= 2 x 10 %
+        assert "prefill" in engine_recs[0].evidence
+        assert "+25.0%" in engine_recs[0].evidence
+
+    def test_threshold_recommendation_silent_below_threshold(self, tmp_path):
+        """AC6: a 50 % threshold is not crossed by a 25 % / 16.7 % divergence."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        config = {"local_engine_cross_check_threshold_pct": 50.0}
+        recs = recommendations.generate_recommendations(summary, config)
+        assert not [r for r in recs if "Engine cross-check" in r.title]
+
+    def test_threshold_boundary_is_strict(self, tmp_path):
+        """AC6: the threshold is a strict bound — a delta exactly equal to it
+        does not warn (only ``|delta| > threshold`` does)."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        # prefill delta is exactly 25.0 %; decode is 16.7 %.
+        at_boundary = recommendations.generate_recommendations(
+            summary, {"local_engine_cross_check_threshold_pct": 25.0}
+        )
+        assert not [r for r in at_boundary if "Engine cross-check" in r.title]
+        just_below = recommendations.generate_recommendations(
+            summary, {"local_engine_cross_check_threshold_pct": 24.9}
+        )
+        assert [r for r in just_below if "Engine cross-check" in r.title]
+
+    def test_threshold_zero_disables_the_warning(self, tmp_path):
+        """AC6: ``0`` disables the divergence warning (documented contract)."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        recs = recommendations.generate_recommendations(
+            summary, {"local_engine_cross_check_threshold_pct": 0}
+        )
+        assert not [r for r in recs if "Engine cross-check" in r.title]
+
+    def test_default_threshold_is_twenty_five_percent(self, tmp_path):
+        """AC6: without configuration the shipped default (25 %) applies."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        check = engine_cross_check.compute(summary, None)
+        assert check["threshold_pct"] == pytest.approx(25.0)
+        assert check["threshold_enabled"] is True
+
+    def test_configured_threshold_reaches_the_report_and_json(self, tmp_path):
+        """The configured threshold is rendered and mirrored in ``--json``."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        config = {"local_engine_cross_check_threshold_pct": 12.5}
+        md = reporting.build_report(summary, config)
+        section = self._section(md)
+        assert "12.5%" in section
+        data = reporting.summary_to_json(summary, None, config)
+        assert data["engine_cross_check"]["threshold_pct"] == pytest.approx(12.5)
+
+    def test_fractional_threshold_survives_config_loading(self):
+        """The config loader coerces the percentage scalar as a float, so
+        ``12.5`` is not silently truncated to ``12``."""
+        text = "server:\n  local_engine_cross_check_threshold_pct: 12.5\n"
+        assert config_loader.parse_config_text(text)["local_engine_cross_check_threshold_pct"] == pytest.approx(12.5)
+        assert config_loader._parse_config_text_regex(text)["local_engine_cross_check_threshold_pct"] == pytest.approx(12.5)
+
+    # -- JSON contract -----------------------------------------------------
+
+    def test_json_exposes_engine_cross_check_and_keeps_existing_keys(self, tmp_path):
+        """AC5: the comparison is an additive ``engine_cross_check`` key; every
+        pre-existing key keeps its value."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        data = reporting.summary_to_json(summary)
+        assert "engine_cross_check" in data
+        assert data["engine_cross_check"]["prefill"]["proxy_slot_seconds"] == pytest.approx(30.0)
+        assert data["engine_cross_check"]["prefill"]["engine_seconds"] == pytest.approx(24.0)
+        assert data["engine_cross_check"]["decode"]["delta_pct"] == pytest.approx(-16.7)
+        legacy_keys = {
+            "window_start",
+            "window_end",
+            "sessions",
+            "total_requests",
+            "local_requests",
+            "remote_requests",
+            "fallback_events",
+            "local_busy",
+            "local_prefill",
+            "decode_speed",
+            "prompt_eval_speed",
+            "ttft",
+            "recommendations",
+            "errors",
+            "compaction",
+            "local_turn_coverage",
+        }
+        assert legacy_keys <= set(data)
+        assert data["local_busy"]["prefill_vs_decode"]["prefill"]["slot_seconds"] == pytest.approx(30.0)
+
+    def test_engine_cross_check_json_is_sorted_key_stable(self, tmp_path):
+        """The key set is deterministic for an empty window (unavailable)."""
+        summary = self._summary(tmp_path)
+        check = reporting.summary_to_json(summary)["engine_cross_check"]
+        assert set(check) == {
+            "unit",
+            "engine_metric",
+            "metric_caveat",
+            "interpretation",
+            "window_approximation",
+            "threshold_pct",
+            "threshold_enabled",
+            "status",
+            "prefill",
+            "decode",
+            "available_phases",
+            "divergent_phases",
+            "engine_unavailable_reasons",
+        }
+
+    def test_json_recommendations_count_matches_the_report(self, tmp_path):
+        """``--json``'s ``recommendations`` count is computed with the same
+        config as the Markdown report, so the two never disagree about whether
+        the cross-check warning fired."""
+        summary = self._summary(
+            tmp_path, llama_lines=self._engine_lines(24000.0, 12000.0)
+        )
+        config = {"local_engine_cross_check_threshold_pct": 10.0}
+        md = reporting.build_report(summary, config)
+        recommendations_section = md.split("## Recommendations", 1)[1].split(
+            "## Notes and limitations", 1
+        )[0]
+        headings = recommendations_section.count("### [")
+        data = reporting.summary_to_json(summary, None, config)
+        assert headings >= 1
+        assert data["recommendations"] == headings

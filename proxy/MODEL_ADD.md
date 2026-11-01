@@ -281,8 +281,8 @@ providers directly (LP-0MVFYYYXS0011T58).
 
 Skip decisions are logged as `Provider budget exhausted: skipping provider=…`
 (with limit, remaining and reason) and recorded in the request diagnostics as
-an attempt with `status=rate_limited`; an in-progress session that waited is
-recorded as `status=rate_limited_waited` with its `elapsed_wait_seconds`.
+an attempt with `status=provider_budget_exhausted`; an in-progress session that waited is
+recorded as `status=provider_budget_exhausted_waited` with its `elapsed_wait_seconds`.
 
 ### Multiple local backends (LP-0MRPILSMW004T4H8)
 
@@ -294,9 +294,13 @@ busy or unhealthy (sequential fallback, no load balancing).
 
 - Omitting `endpoint` keeps the legacy behaviour — the provider routes to
   `http://localhost:{server.llama_server_port}`.
-- Each server tracks its own dispatch leases (keyed per-endpoint) and
-  persists its slot snapshots in its own `{session_slot_save_path}/{host}-{port}/`
-  subdirectory.
+- Each server tracks its own dispatch leases (keyed per-endpoint). Slot
+  snapshots are written to the shared `session_slot_save_path` root:
+  llama-server accepts only a bare filename under its own `--slot-save-path`,
+  so a per-endpoint subdirectory would separate a snapshot from its
+  `.ratio.json` sidecar and defeat seeding/restore (LP-0MVVI8TEU006KTOZ).
+  Point every server's `--slot-save-path` at the same directory; legacy
+  `{host}-{port}/` files are still read and retired.
 - The proxy assumes the servers are already running; lifecycle management
   is out of scope for multi-backend setups.
 

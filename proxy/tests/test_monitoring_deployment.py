@@ -11,12 +11,21 @@ Validates that:
 - The documented units match the deployed stack: tailnet-only Prometheus binds,
   loopback-only exporters, a working sampler script, and install steps that
   work on a clean host (LP-0MVO8DORX004P05G).
+- The Grafana dashboard's GPU memory panel selects only series the documented
+  sampler actually publishes (LP-0MVOHRLPB0086Q5T).
+
+Also enforces the `FORBIDDEN_RULE_SERIES` contract on **every** PromQL source —
+rule files (YAML) and the GPU utilisation CLI (Python, `QUERIES` mapping) — so a
+`gpu_busy_percent` query cannot be introduced in either place
+(LP-0MVT1NVAJ007KUGO).
 """
 
+import ast
 import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -43,6 +52,7 @@ REQUIRED_RULE_FILES = {
     "prometheus.yml": [
         "gpu_compute_rules.yaml",
         "gpu_memory_alerts.yaml",
+        "llama_memory_alerts.yaml",
         "proxy_5xx_alerts.yaml",
         "slots_query_alerts.yaml",
         "remote_stream_alerts.yaml",
@@ -52,22 +62,21 @@ REQUIRED_RULE_FILES = {
 # Series that must never appear in a rule expression:
 # - rocm_vram_*: the AMD rocm-exporter publishes no release artifacts, so no
 #   exporter ever served these series and rules using them could never fire.
+#   The dashboard is covered separately by TestGrafanaDashboardVramPanel, which
+#   rejects any series the documented sampler does not publish
+#   (LP-0MVOHRLPB0086Q5T).
 # - gpu_busy_percent: saturates at ~20 W on this Strix Halo APU (it reads
 #   ~100% for any draw above ~20 W, so idle-with-context stretches report as
 #   busy), i.e. it is not a utilisation signal (LP-0MS9GA6QL007XTBP, quantified
 #   in LP-0MVSQQO910077LYL).
-# - llama_process_rss_bytes: published as 0 by the proxy (llama-server runs in a
-#   podman container, so there is no host process handle to read RSS from).
+# llama_process_rss_bytes is deliberately NOT forbidden: LP-0MVO9F877008ZCP7
+# fixed the always-0 publication (llama-server runs in a podman container, so
+# the proxy now resolves RSS via the container process tree / cgroup
+# memory.current instead of a host process handle) and restored
+# llama_memory_alerts.yaml on the series.
 FORBIDDEN_RULE_SERIES = [
     "rocm_vram_",
     "gpu_busy_percent",
-    "llama_process_rss_bytes",
-]
-
-EXPECTED_ROCM_EXPORTER_METRICS = [
-    "rocm_vram_total_bytes",
-    "rocm_vram_used_bytes",
-    "rocm_vram_free_bytes",
 ]
 
 
@@ -150,6 +159,117 @@ def _rule_expressions(path: Path) -> list[str]:
             if expr:
                 exprs.append(expr)
     return exprs
+
+
+# Non-rule PromQL consumers that must obey the same forbidden-series contract
+# (LP-0MVT1NVAJ007KUGO). A rule file is scanned as YAML; a CLI is scanned as
+# Python, because its expressions live in a ``QUERIES`` mapping. Copy-pasting a
+# ``gpu_busy_percent`` query into the CLI would otherwise be a silent
+# utilisation regression that no rule-file check could see.
+CLI_QUERY_SOURCES = [PROJECT_ROOT / "scripts" / "gpu_utilisation.py"]
+
+#: Assignment/argument names whose string values are PromQL, by convention.
+_QUERY_NAME_SUFFIXES = ("QUERY", "QUERIES", "EXPR", "EXPRESSIONS")
+_QUERY_ARGUMENT_NAMES = ("query", "queries", "expr")
+
+
+def _promql_expressions_in_python(source: str, filename: str = "<string>") -> list[str]:
+    """Return the PromQL expressions held in a Python query consumer.
+
+    Only *query* strings are extracted, never prose, so a module may document
+    why ``gpu_busy_percent`` must not be used without tripping its own guard.
+    A string counts as a query expression when it is:
+
+    * a value in an assignment whose target name ends in ``QUERY``, ``QUERIES``,
+      ``EXPR`` or ``EXPRESSIONS`` (the CLI's ``QUERIES`` dict is the canonical
+      case — nested dicts/lists are walked);
+    * a literal passed as the ``query``/``queries``/``expr`` argument of a call.
+
+    Docstrings and ``#`` comments are never scanned. Duplicates are collapsed
+    in first-seen order so an offender is reported once.
+    """
+    tree = ast.parse(source, filename=filename)
+
+    def collect(node: ast.AST) -> None:
+        """Collect string *values* below *node*, never mapping keys.
+
+        A ``QUERIES`` mapping's keys are human labels (``"computing_workload"``);
+        only the values are PromQL. f-string literals are collected part-wise so
+        an expression that interpolates the step still exposes its series names.
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            found.append(node.value)
+        elif isinstance(node, ast.Dict):
+            for value in node.values:
+                collect(value)
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            for element in node.elts:
+                collect(element)
+        elif isinstance(node, ast.JoinedStr):
+            for value in node.values:
+                collect(value)
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            collect(node.left)
+            collect(node.right)
+        elif isinstance(node, ast.FormattedValue):
+            collect(node.value)
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.upper().endswith(
+                    _QUERY_NAME_SUFFIXES
+                ):
+                    collect(node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id.upper().endswith(_QUERY_NAME_SUFFIXES)
+                and node.value is not None
+            ):
+                collect(node.value)
+        elif isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg in _QUERY_ARGUMENT_NAMES:
+                    collect(keyword.value)
+
+    deduped: list[str] = []
+    for expr in found:
+        if expr not in deduped:
+            deduped.append(expr)
+    return deduped
+
+
+def _forbidden_series_offenders(
+    expressions, *, source_label: str, forbidden=None
+) -> list[str]:
+    """Return ``<source>: <expr>`` for every expression selecting a forbidden series."""
+    series_list = FORBIDDEN_RULE_SERIES if forbidden is None else forbidden
+    offenders: list[str] = []
+    for expr in expressions:
+        for series in series_list:
+            if series in expr:
+                offenders.append(f"{source_label}: {' '.join(expr.split())}")
+                break
+    return offenders
+
+
+def _consumer_guard_offenders(path: Path) -> list[str]:
+    """Return forbidden-series offenders for a Python PromQL consumer.
+
+    Fails loudly when no query expression can be found: a rename from
+    ``QUERIES`` to something unrecognised must not turn the guard vacuously
+    green.
+    """
+    expressions = _promql_expressions_in_python(path.read_text(), filename=str(path))
+    assert expressions, (
+        f"{path.name}: no PromQL query expressions found. The "
+        f"FORBIDDEN_RULE_SERIES guard would be vacuous — keep query expressions "
+        f"in a mapping named QUERIES/QUERY/EXPR/EXPRESSIONS, or pass them as a "
+        f"query=/expr= argument."
+    )
+    return _forbidden_series_offenders(expressions, source_label=path.name)
 
 
 def _find_key(node, key: str):
@@ -249,6 +369,102 @@ def _sampler_script() -> str:
     raise AssertionError(
         f"{path} does not document the sampler script in a fenced bash block"
     )
+
+
+def _fake_gpu_sysfs(tmp_path: Path, **attributes: str) -> Path:
+    """Create a fixture sysfs tree holding the amdgpu attributes given."""
+    device = tmp_path / "sys" / "class" / "drm" / "card0" / "device"
+    device.mkdir(parents=True)
+    for name, value in attributes.items():
+        (device / name).write_text(f"{value}\n")
+    return device
+
+
+def _run_documented_sampler(tmp_path: Path, device: Path) -> Path:
+    """Run the documented sampler against *device* and return its textfile dir."""
+    sampler = tmp_path / "gpu-metrics-textfile.sh"
+    sampler.write_text(_sampler_script())
+    out_dir = tmp_path / "textfile"
+    out_dir.mkdir()
+    result = subprocess.run(
+        ["bash", str(sampler), str(out_dir)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GPU_SYSFS": str(device)},
+    )
+    assert result.returncode == 0, f"sampler failed: {result.stderr}"
+    return out_dir
+
+
+def _sampler_emitted_series(out_dir: Path) -> dict[str, str]:
+    """Return the {series: value} pairs the sampler wrote to gpu.prom."""
+    text = (out_dir / "gpu.prom").read_text()
+    return dict(
+        re.findall(r'^(gpu_\w+)\{gpu="card0"\} (\S+)$', text, re.MULTILINE)
+    )
+
+
+#: Fixture readings for a fully readable amdgpu device: every documented series
+#: is published, so the returned set is the sampler's whole output surface.
+FULL_GPU_SYSFS = {
+    "gpu_busy_percent": "100",
+    "mem_info_vram_used": "309604352",
+    "mem_info_vram_total": "1073741824",
+    "mem_info_gtt_used": "36573331456",
+}
+
+
+def _published_gpu_series(tmp_path: Path) -> set[str]:
+    """Run the documented sampler and return every series name it publishes.
+
+    The sampler in `docs/systemd/gpu-metrics.service` is the single source of
+    truth for which `gpu_*` series this host actually serves: executing it
+    against a fully readable fixture yields exactly the set node_exporter's
+    textfile collector exposes. Anything a panel queries outside this set can
+    only ever render "No data".
+    """
+    device = _fake_gpu_sysfs(tmp_path, **FULL_GPU_SYSFS)
+    published = set(_sampler_emitted_series(_run_documented_sampler(tmp_path, device)))
+    assert published, "the documented sampler published no series"
+    return published
+
+
+#: PromQL keywords/aggregation modifiers that are not series selectors.
+PROMQL_NON_SERIES_WORDS = frozenset(
+    {
+        "and",
+        "bool",
+        "by",
+        "group_left",
+        "group_right",
+        "ignoring",
+        "inf",
+        "nan",
+        "offset",
+        "on",
+        "or",
+        "unless",
+        "without",
+    }
+)
+
+
+def _selected_series(expr: str) -> set[str]:
+    """Return the series selectors of a PromQL expression.
+
+    Label values and label matchers are stripped first, so `status="5xx"` or
+    `endpoint="/v1/chat/completions"` cannot be mistaken for a series; names
+    followed by `(` are function calls (`rate(...)`), not selectors.
+    """
+    cleaned = re.sub(r'"[^"]*"', '""', expr)
+    cleaned = re.sub(r"\{[^{}]*\}", "{}", cleaned)
+    return {
+        name
+        for name in re.findall(
+            r"(?<![\w.])([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()", cleaned
+        )
+        if name not in PROMQL_NON_SERIES_WORDS
+    }
 
 
 def _exec_start_args(unit_text: str) -> list[str]:
@@ -498,6 +714,25 @@ class TestAlertRuleFiles:
         assert len(data["groups"]) >= 1
         assert len(data["groups"][0].get("rules", [])) >= 1
 
+    def test_llama_memory_alerts_registered(self):
+        """AC5: llama_memory_alerts.yaml is restored, valid, references the
+        now-working llama_process_rss_bytes series, and is registered in both
+        prometheus.yml rule_files and REQUIRED_RULE_FILES."""
+        path = MONITORING_DIR / "llama_memory_alerts.yaml"
+        data = assert_valid_yaml(path)
+        assert "groups" in data, "llama_memory_alerts.yaml missing 'groups' key"
+        groups = data["groups"]
+        assert len(groups) >= 1
+        rules = groups[0].get("rules", [])
+        assert len(rules) >= 1
+        expressions = "\n".join(str(r.get("expr", "")) for r in rules)
+        assert "llama_process_rss_bytes" in expressions, (
+            "restored rule must select the (now working) llama_process_rss_bytes series"
+        )
+        config = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
+        assert "llama_memory_alerts.yaml" in config.get("rule_files", [])
+        assert "llama_memory_alerts.yaml" in REQUIRED_RULE_FILES["prometheus.yml"]
+
     def test_alert_rule_file_names_in_prometheus_config(self):
         """The prometheus.yml references the GPU and proxy alert rule files."""
         config = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
@@ -515,7 +750,11 @@ class TestAlertRuleFiles:
         """Dead rule files must not come back: they could never fire."""
         config = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
         rule_files = config.get("rule_files", [])
-        for dead in ("gpu_vram_alerts.yaml", "llama_memory_alerts.yaml"):
+        # gpu_vram_alerts.yaml stays dead (rocm_vram_* has no exporter).
+        # llama_memory_alerts.yaml was removed alongside it but is RESTORED by
+        # LP-0MVO9F877008ZCP7 (the llama_process_rss_bytes series it selects
+        # now carries a real value) — see test_llama_memory_alerts_registered.
+        for dead in ("gpu_vram_alerts.yaml",):
             assert dead not in rule_files, (
                 f"{dead} was removed because its expressions can never be "
                 f"satisfied on this host; do not re-add it"
@@ -528,15 +767,130 @@ class TestAlertRuleFiles:
         """No rule may select a series that is unpublished or pinned."""
         offenders = []
         for rule_file in prometheus_alert_rules:
-            for expr in _rule_expressions(rule_file):
-                for forbidden in FORBIDDEN_RULE_SERIES:
-                    if forbidden in expr:
-                        offenders.append(f"{rule_file.name}: {expr.strip()}")
+            offenders.extend(
+                _forbidden_series_offenders(
+                    _rule_expressions(rule_file), source_label=rule_file.name
+                )
+            )
         assert not offenders, (
             "Rules reference series that are unpublished or meaningless on this "
             "host (rocm_vram_* has no exporter, gpu_busy_percent is pinned at "
-            "100%, llama_process_rss_bytes is always 0):\n" + "\n".join(offenders)
+            "100%):\n" + "\n".join(offenders)
         )
+
+
+class TestForbiddenSeriesGuard:
+    """The forbidden-series guard must fail on violations, not be vacuously green.
+
+    The contract is enforced on two source kinds: Prometheus rule files (YAML,
+    scanned in ``TestAlertRuleFiles``) and the GPU utilisation CLI (Python, whose
+    PromQL lives in a ``QUERIES`` mapping). These tests prove the guard would
+    have caught a ``gpu_busy_percent`` query while still allowing the
+    documentation that explains the caveat (LP-0MVT1NVAJ007KUGO AC3/AC4).
+    """
+
+    def test_gpu_utilisation_cli_uses_no_forbidden_series(self):
+        """The GPU utilisation CLI must not query a forbidden series either.
+
+        Skipped until the CLI lands (LP-0MVT1O52G000LMC6); the guard then
+        activates automatically, and fails if it can no longer find any query
+        expression (non-vacuous).
+        """
+        offenders: list[str] = []
+        checked: list[str] = []
+        for path in CLI_QUERY_SOURCES:
+            if not path.exists():
+                continue
+            checked.append(path.name)
+            offenders.extend(_consumer_guard_offenders(path))
+
+        if not checked:
+            pytest.skip(
+                "scripts/gpu_utilisation.py not implemented yet "
+                "(LP-0MVT1O52G000LMC6); guard activates when it lands"
+            )
+        assert not offenders, (
+            "The GPU utilisation CLI queries a series that is unpublished or "
+            "meaningless on this host (gpu_busy_percent saturates at ~20 W, "
+            "rocm_vram_* has no exporter):\n" + "\n".join(offenders)
+        )
+
+    def test_guard_flags_a_forbidden_series_in_a_queries_mapping(self):
+        source = (
+            "QUERIES = {\n"
+            '            "computing": "avg_over_time(gpu:computing:bool[2h])",\n'
+            '            "busy": "avg_over_time(gpu_busy_percent[2h])",\n'
+            "        }\n"
+        )
+
+        expressions = _promql_expressions_in_python(source)
+        offenders = _forbidden_series_offenders(expressions, source_label="synthetic")
+
+        assert expressions == [
+            "avg_over_time(gpu:computing:bool[2h])",
+            "avg_over_time(gpu_busy_percent[2h])",
+        ]
+        assert offenders == ["synthetic: avg_over_time(gpu_busy_percent[2h])"]
+
+    def test_guard_flags_a_forbidden_series_in_a_nested_query_expression(self):
+        source = (
+            "QUERIES = {\n"
+            '            "gpu": {"vram": "rocm_vram_used_bytes / rocm_vram_total_bytes"},\n'
+            "        }\n"
+        )
+
+        offenders = _forbidden_series_offenders(
+            _promql_expressions_in_python(source), source_label="synthetic"
+        )
+
+        assert len(offenders) == 1
+        assert "rocm_vram_" in offenders[0]
+
+    def test_guard_scans_expressions_passed_as_a_query_argument(self):
+        source = (
+            "def run(getter):\n"
+            '            return getter(query="avg_over_time(gpu_busy_percent[1h])")\n'
+        )
+
+        offenders = _forbidden_series_offenders(
+            _promql_expressions_in_python(source), source_label="synthetic"
+        )
+
+        assert len(offenders) == 1
+        assert "gpu_busy_percent" in offenders[0]
+
+    def test_guard_allows_documentation_and_comment_mentions(self):
+        source = (
+            '"""GPU utilisation. gpu_busy_percent is pinned and must not be used."""\n'
+            "# gpu_busy_percent saturates at ~20 W: never query it here.\n"
+            'NOTE = "gpu_busy_percent reads ~100% above 20 W"\n'
+            "QUERIES = {\n"
+            '            "computing": "avg_over_time(gpu:computing:bool[2h])",\n'
+            "        }\n"
+        )
+
+        expressions = _promql_expressions_in_python(source)
+
+        assert expressions == ["avg_over_time(gpu:computing:bool[2h])"]
+        assert _forbidden_series_offenders(expressions, source_label="synthetic") == []
+
+    def test_guard_fails_when_no_query_expression_is_found(self, tmp_path):
+        """A rename must not silently disable the guard (non-vacuous green)."""
+        path = tmp_path / "cli.py"
+        path.write_text('EXPRESSIONS_RENAMED = {"a": "up"}\n')
+
+        with pytest.raises(AssertionError, match="no PromQL query expressions"):
+            _consumer_guard_offenders(path)
+
+    def test_guard_passes_on_a_clean_consumer(self, tmp_path):
+        path = tmp_path / "cli.py"
+        path.write_text(
+            'QUERIES = {"computing": "avg_over_time(gpu:computing:bool[2h])"}\n'
+        )
+
+        expressions = _promql_expressions_in_python(path.read_text())
+        assert expressions == ["avg_over_time(gpu:computing:bool[2h])"]
+        assert _consumer_guard_offenders(path) == []
 
 
 # ---------------------------------------------------------------------------
@@ -854,43 +1208,132 @@ class TestRocmExporterRouteUnavailable:
         )
 
 
+DASHBOARD_PATH = MONITORING_DIR / "grafana_llama_memory_dashboard.json"
+PROVISIONED_DASHBOARD_PATH = (
+    MONITORING_DIR / "grafana" / "dashboards" / "grafana_llama_memory_dashboard.json"
+)
+
+
 class TestGrafanaDashboardVramPanel:
-    """Validation that the Grafana dashboard has VRAM panels."""
+    """The GPU memory panel must chart memory pools this host really publishes.
+
+    LP-0MVOHRLPB0086Q5T: the panel used to query `rocm_vram_*`, series no process
+    on this host serves (`amd/rocm-exporter` publishes no release artefacts), so
+    it could only ever render "No data". The published set is now derived by
+    running the documented sampler, not from a hand-maintained list, so a panel
+    selecting an unpublished series fails here instead of shipping.
+    """
 
     def _load_dashboard(self) -> dict:
-        path = MONITORING_DIR / "grafana_llama_memory_dashboard.json"
         import json
-        with open(path) as f:
+
+        with open(DASHBOARD_PATH) as f:
             return json.load(f)
 
-    def test_dashboard_has_vram_panel(self):
-        """AC 3: Grafana dashboard includes a VRAM usage panel."""
-        dashboard = self._load_dashboard()
+    def _gpu_memory_panel(self, dashboard: dict) -> dict:
         panels = dashboard.get("panels", [])
-        panel_titles = [p.get("title", "") for p in panels]
-        vram_panels = [t for t in panel_titles if "vram" in t.lower()]
-        assert len(vram_panels) >= 1, (
-            f"Expected at least one VRAM panel in dashboard, found titles: {panel_titles}"
+        for panel in panels:
+            if "vram" in panel.get("title", "").lower():
+                return panel
+        pytest.fail(
+            f"No GPU memory (VRAM) panel found in dashboard, "
+            f"found titles: {[p.get('title', '') for p in panels]}"
         )
 
-    def test_vram_panel_has_rocm_expr(self):
-        """AC 3: VRAM panel uses rocm-exporter metrics in its query."""
+    def test_dashboard_has_vram_panel(self):
+        """AC 2: the GPU memory panel survives, and its title still names VRAM."""
+        panel = self._gpu_memory_panel(self._load_dashboard())
+        assert "vram" in panel["title"].lower()
+
+    def test_panel_identity_is_preserved(self):
+        """Retyping the panel would orphan it in a deployed Grafana instance."""
         dashboard = self._load_dashboard()
-        panels = dashboard.get("panels", [])
-        for p in panels:
-            if "vram" in p.get("title", "").lower():
-                targets = p.get("targets", [])
-                all_exprs = [t.get("expr", "") for t in targets]
-                combined = " ".join(all_exprs)
-                has_rocm_metric = any(
-                    m in combined for m in EXPECTED_ROCM_EXPORTER_METRICS
+        panel = self._gpu_memory_panel(dashboard)
+        assert panel["id"] == 4
+        assert panel["type"] == "graph"
+        assert panel["datasource"] == "Prometheus"
+        assert panel["gridPos"] == {"h": 8, "w": 24, "x": 0, "y": 18}
+        assert dashboard["title"] == "LLama Server Memory"
+        assert dashboard["schemaVersion"] == 16
+
+    def test_title_names_both_pools(self):
+        """AC 2: GTT is where models live; VRAM is the BIOS carve-out."""
+        title = self._gpu_memory_panel(self._load_dashboard())["title"].lower()
+        assert "gtt" in title, "the title must name the GTT pool models map into"
+        assert "vram" in title, "the title must name the VRAM carve-out"
+        assert "carve-out" in title, (
+            "the title must label VRAM as a carve-out, not as the model pool"
+        )
+        assert "model" in title, (
+            "the title must say which pool the models occupy, or a reader will "
+            "assume the 1 GiB carve-out holds them"
+        )
+
+    def test_every_target_legend_names_its_series_and_vram_is_the_carve_out(self):
+        """AC 2: legends identify the series and mark the 1 GiB carve-out."""
+        panel = self._gpu_memory_panel(self._load_dashboard())
+        targets = panel.get("targets", [])
+        assert targets, "the GPU memory panel has no targets"
+        for target in targets:
+            selectors = _selected_series(target.get("expr", ""))
+            assert len(selectors) == 1, (
+                f"each target should select exactly one series, {target.get('expr')!r} "
+                f"selects {sorted(selectors)}"
+            )
+            series = next(iter(selectors))
+            legend = target.get("legendFormat", "")
+            assert series in legend, (
+                f"legendFormat {legend!r} does not name its series {series!r}; a "
+                f"reader cannot tell which exporter series a line comes from"
+            )
+            if "vram" in series:
+                assert "carve-out" in legend.lower(), (
+                    f"VRAM legend {legend!r} must mark the ~1 GiB BIOS carve-out"
                 )
-                assert has_rocm_metric, (
-                    f"VRAM panel '{p['title']}' should reference a rocm-exporter metric. "
-                    f"Exprs: {all_exprs}"
-                )
-                return
-        pytest.fail("No VRAM panel found in dashboard")
+
+    def test_every_target_selects_a_series_the_sampler_publishes(self, tmp_path):
+        """AC 1/AC 3: every expression resolves to a series this host serves.
+
+        The published set comes from executing the documented sampler against a
+        fully readable fixture sysfs, so a `gpu_*` name the sampler does not
+        emit fails just as loudly as a dead `rocm_*` one.
+        """
+        published = _published_gpu_series(tmp_path)
+        panel = self._gpu_memory_panel(self._load_dashboard())
+        for target in panel.get("targets", []):
+            expr = target.get("expr", "")
+            selectors = _selected_series(expr)
+            assert selectors, f"target selects no series: {expr!r}"
+            unpublished = sorted(selectors - published)
+            assert not unpublished, (
+                f"panel target {expr!r} selects series no exporter publishes: "
+                f"{unpublished} (the sampler publishes {sorted(published)})"
+            )
+
+    @pytest.mark.parametrize(
+        "path", [DASHBOARD_PATH, PROVISIONED_DASHBOARD_PATH], ids=["review", "provisioned"]
+    )
+    def test_dashboards_no_longer_query_rocm_series(self, path: Path):
+        """AC 1: the dead rocm-exporter route must not come back, in either copy."""
+        assert "rocm_" not in path.read_text(), (
+            f"{path.name} still queries rocm_* series, which nothing publishes; "
+            f"grep -c 'rocm_' must report 0 for both dashboard copies"
+        )
+
+    def test_dashboard_copies_are_byte_identical(self):
+        """The provisioning copy must not drift from the reviewed copy."""
+        assert PROVISIONED_DASHBOARD_PATH.read_bytes() == DASHBOARD_PATH.read_bytes(), (
+            f"{DASHBOARD_PATH} and {PROVISIONED_DASHBOARD_PATH} have diverged; "
+            f"edit both together"
+        )
+
+    def test_dashboard_version_was_bumped(self):
+        """AC 2: Grafana only picks up a changed dashboard when `version` moves."""
+        version = self._load_dashboard().get("version")
+        assert isinstance(version, int) and version >= 2, (
+            f"the dashboard version must be bumped past its original 1 after the "
+            f"GPU panel rewrite, got {version!r}"
+        )
 
 
 class TestMonitoringDocs:
@@ -1303,29 +1746,13 @@ class TestGpuMetricsSamplerAndUnit:
         return path
 
     def _fake_sysfs(self, tmp_path: Path, **attributes: str) -> Path:
-        device = tmp_path / "sys" / "class" / "drm" / "card0" / "device"
-        device.mkdir(parents=True)
-        for name, value in attributes.items():
-            (device / name).write_text(f"{value}\n")
-        return device
+        return _fake_gpu_sysfs(tmp_path, **attributes)
 
     def _run_sampler(self, tmp_path: Path, device: Path) -> Path:
-        out_dir = tmp_path / "textfile"
-        out_dir.mkdir()
-        result = subprocess.run(
-            ["bash", str(self._sampler_path(tmp_path)), str(out_dir)],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "GPU_SYSFS": str(device)},
-        )
-        assert result.returncode == 0, f"sampler failed: {result.stderr}"
-        return out_dir
+        return _run_documented_sampler(tmp_path, device)
 
     def _emitted_series(self, out_dir: Path) -> dict[str, str]:
-        text = (out_dir / "gpu.prom").read_text()
-        return dict(
-            re.findall(r"^(gpu_\w+)\{gpu=\"card0\"\} (\S+)$", text, re.MULTILINE)
-        )
+        return _sampler_emitted_series(out_dir)
 
     def test_unit_runs_the_documented_sampler_every_ten_seconds(self):
         """AC 2: the 10 s cadence is in the unit, not just in prose."""
@@ -1603,14 +2030,19 @@ class TestMonitoringReadmeCookbook:
     def test_covers_the_retention_window(self):
         content = _readme()
         assert "storage.tsdb.retention.time" in content
-        assert "min(timestamp(" in content, (
+        assert "min_over_time(timestamp(up)[90d:" in content, (
             "the cookbook must show how to measure the history actually retained, "
-            "not just the configured window"
+            "not just the configured window — and as a subquery: an instant "
+            "selector cannot see history"
         )
 
     def test_recording_rules_used_in_the_cookbook_exist(self):
         """Anti-drift: the guide must not query a recording rule nobody defines."""
-        mentioned = set(re.findall(r"\bgpu:[a-z0-9_:]+", _readme()))
+        # Trailing punctuation is not part of an identifier: the CLI's own
+        # output quotes the rule as `gpu:computing:bool:`.
+        mentioned = {
+            token.rstrip(":") for token in re.findall(r"\bgpu:[a-z0-9_:]+", _readme())
+        }
         assert mentioned, "the cookbook mentions no recording rules"
         undefined = sorted(mentioned - _recording_rule_names())
         assert not undefined, (
@@ -1624,10 +2056,632 @@ class TestMonitoringReadmeCookbook:
         File names such as `gpu_memory_alerts.yaml` are excluded by the negative
         lookahead on `.`, so only bare series identifiers are compared.
         """
-        mentioned = set(re.findall(r"\bgpu_[a-z_]+\b(?!\.)", _readme()))
+        # `gpu_utilisation:` is the CLI's stderr program tag, not a series.
+        mentioned = {
+            token.rstrip(":") for token in re.findall(r"\bgpu_[a-z_]+\b(?!\.)", _readme())
+        } - {"gpu_utilisation"}
         assert mentioned, "the cookbook mentions no gpu_* series"
         unpublished = sorted(mentioned - _sampler_series_names())
         assert not unpublished, (
             f"monitoring/README.md references gpu series that no exporter "
             f"publishes: {unpublished} (published: {sorted(_sampler_series_names())})"
+        )
+
+# ---------------------------------------------------------------------------
+# The decision-facing busy figure (LP-0MVUIMMX3005KYQ6, parent AC4/AC7)
+# ---------------------------------------------------------------------------
+
+REFERENCE_DOC = USAGE_ANALYSIS_SKILL_DIR / "REFERENCE.md"
+SKILL_DOC = USAGE_ANALYSIS_SKILL_DIR / "SKILL.md"
+
+#: Heading of the decision rule and of the single divergence-cause explanation.
+AUTHORITATIVE_BUSY_HEADING = "#### Which busy figure is authoritative for decisions"
+DIVERGENCE_HEADING = "#### Why the two figures diverge"
+DECISION_ANCHOR = "#which-busy-figure-is-authoritative-for-decisions"
+DIVERGENCE_ANCHOR = "#why-the-two-figures-diverge"
+
+#: Labels the shipped report renders; the docs must quote these, not invent any.
+GPU_BUSY_ROW_LABEL = "GPU busy — power-based (hardware)"
+BUSY_UPPER_ROW_LABEL = "Busy time — upper bound (dispatch → finish)"
+
+#: Docs carrying a busy-figure claim; every anchor link in them must resolve.
+BUSY_FIGURE_DOCS = (REFERENCE_DOC, SKILL_DOC, MONITORING_DIR / "README.md")
+
+
+def _documented_anchors(text: str) -> set[str]:
+    """GitHub-style heading slugs plus explicit ``<a id=...>`` anchors.
+
+    Fenced code blocks are skipped, so shell comments (``# 1. ...``) in the
+    skill docs are not mistaken for headings.
+    """
+    anchors: set[str] = set()
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith(FENCE):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        heading = re.match(r"^#{1,6}\s+(.*\S)\s*$", line)
+        if heading:
+            slug = re.sub(r"[^a-z0-9 \-_]", "", heading.group(1).lower())
+            anchors.add(slug.replace(" ", "-"))
+    anchors.update(re.findall(r'<a\s+(?:id|name)="([^"]+)"', text))
+    return anchors
+
+
+def _reference_section(*, start: str, end: str) -> str:
+    """Normalised ``REFERENCE.md`` prose between two heading lines."""
+    content = (REFERENCE_DOC.read_text()).split(start, 1)
+    assert len(content) == 2, f"REFERENCE.md has no {start!r} heading"
+    return _norm(content[1].split(end, 1)[0])
+
+
+class TestAuthoritativeBusyFigureIsDocumented:
+    """The docs name the decision figure, not just the hardware one.
+
+    Parent AC4/AC7 of LP-0MVSPWLLP008AQXZ, delivered by LP-0MVUIMMX3005KYQ6:
+    the log-derived ``local_busy`` (dispatch → finish slot union) is the figure
+    gates and alerts must quote; the power-based ``gpu_busy`` answers hardware
+    questions only and is never local model utilisation. The causes of the gap
+    stay in one place — the pre-existing divergence explanation — and are
+    linked rather than restated.
+    """
+
+    def test_reference_names_the_log_derived_figure_as_the_decision_figure(self):
+        """AC1: the rule, the consumers and the ``--json`` key are named."""
+        section = _reference_section(
+            start=AUTHORITATIVE_BUSY_HEADING, end=DIVERGENCE_HEADING
+        )
+        assert "decisions use the log-derived `local_busy`" in section, (
+            "REFERENCE.md must state which busy figure is authoritative for "
+            "decisions, not only which is hardware-side"
+        )
+        assert "gates, alerts and threshold comparisons" in section, (
+            "the guidance must name the consumers that quote the figure"
+        )
+        assert "dispatch → finish" in section, (
+            "the guidance must tie the decision figure to its definition"
+        )
+
+    def test_reference_limits_the_power_figure_to_hardware_questions(self):
+        """AC2: prefer ``gpu_busy`` only for hardware questions."""
+        section = _reference_section(
+            start=AUTHORITATIVE_BUSY_HEADING, end=DIVERGENCE_HEADING
+        )
+        assert "prefer `gpu_busy` for hardware questions only" in section
+        assert "hardware activity, not local model utilisation" in section, (
+            "the power figure must be explicitly labelled non-local"
+        )
+        assert "was the gpu computing at all" in section, (
+            "the hardware questions the power figure does answer must be named"
+        )
+
+    def test_reference_keeps_one_divergence_explanation_and_links_it(self):
+        """AC3: the causes live once, in the explanation the rule links to."""
+        reference = _norm(REFERENCE_DOC.read_text())
+        causes = "gpu work outside the proxy's slot accounting"
+        assert reference.count(causes) == 1, (
+            "the gap causes must have a single source in REFERENCE.md"
+        )
+        divergence = _reference_section(
+            start=DIVERGENCE_HEADING, end="## Legacy reason normalisation"
+        )
+        assert causes in divergence, (
+            "the divergence explanation must keep the gap-cause list"
+        )
+        section = _reference_section(
+            start=AUTHORITATIVE_BUSY_HEADING, end=DIVERGENCE_HEADING
+        )
+        assert DIVERGENCE_ANCHOR in section, (
+            "the decision rule must link the divergence explanation instead of "
+            "repeating the causes"
+        )
+        assert causes not in section
+
+    def test_skill_states_the_matching_rule_and_cross_links(self):
+        """AC4: SKILL.md carries the same rule and links the reference."""
+        skill = _norm(SKILL_DOC.read_text())
+        assert "hardware activity, not local model utilisation" in skill
+        assert "decisions use the log-derived `local_busy`" in skill, (
+            "SKILL.md must say decisions use the log-derived figure"
+        )
+        assert f"reference.md{DECISION_ANCHOR}" in skill, (
+            "SKILL.md must cross-link the REFERENCE.md decision guidance"
+        )
+        json_row = next(
+            _norm(line)
+            for line in SKILL_DOC.read_text().splitlines()
+            if line.startswith("| `--json` |")
+        )
+        assert "decision figure" in json_row, (
+            "the --json key table must mark local_busy as the decision figure"
+        )
+        assert "**not** local model utilisation" in json_row, (
+            "the --json key table must flag gpu_busy as hardware-only"
+        )
+
+    def test_monitoring_readme_does_not_leave_power_as_local_utilisation(self):
+        """AC5: the monitoring guide points at the decision figure."""
+        content = _norm((MONITORING_DIR / "README.md").read_text())
+        assert "never local model utilisation" in content, (
+            "monitoring/README.md must not leave the power figure readable as "
+            "local model utilisation"
+        )
+        assert "local_busy" in content
+        assert "gates and alerts quote" in content
+        assert DECISION_ANCHOR in content, (
+            "monitoring/README.md must link the usage-analysis decision rule"
+        )
+
+    def test_documented_labels_and_keys_are_the_shipped_ones(self):
+        """AC6: the labels/keys the docs quote are what the code emits.
+
+        Renders the shipped ``## Local model utilization`` section from the
+        reporting module itself, so a documented label can never drift from the
+        table the operator sees.
+        """
+        sys_path_added = str(USAGE_ANALYSIS_SCRIPTS)
+        if sys_path_added not in sys.path:
+            sys.path.insert(0, sys_path_added)
+        from types import SimpleNamespace
+
+        import reporting
+
+        busy = SimpleNamespace(
+            busy_seconds=453.6,
+            window_seconds=86400.0,
+            fast_busy_seconds=300.0,
+            cheap_busy_seconds=100.0,
+            fast_window_seconds=43200.0,
+            cheap_window_seconds=43200.0,
+            decode_busy_seconds=400.0,
+            decode_fast_busy_seconds=260.0,
+            decode_cheap_busy_seconds=90.0,
+            prefill_busy_seconds=53.6,
+            idle_seconds=85946.4,
+            prefill_extended_streams=0,
+            streams=1,
+            avg_stream_duration=12.0,
+            total_compute_seconds=12.0,
+            avg_concurrency=1.0,
+            peak_concurrency=1,
+            unfinished_streams=0,
+            pre_window_unfinished=0,
+        )
+        summary = SimpleNamespace(
+            busy=busy,
+            gpu_busy=SimpleNamespace(busy_seconds=33955.2, total_seconds=86400.0),
+        )
+        lines: list[str] = []
+        reporting._append_busy_section(lines.append, summary, None)
+        rendered = "\n".join(lines)
+
+        assert GPU_BUSY_ROW_LABEL in rendered
+        assert BUSY_UPPER_ROW_LABEL in rendered
+        assert "local_busy" in rendered and "not local model utilisation" in rendered
+
+        for doc in (REFERENCE_DOC, SKILL_DOC):
+            content = doc.read_text()
+            assert GPU_BUSY_ROW_LABEL in content, (
+                f"{doc.name} must quote the report's hardware row label verbatim"
+            )
+        reference = REFERENCE_DOC.read_text()
+        assert BUSY_UPPER_ROW_LABEL in reference, (
+            "REFERENCE.md must name the table row that carries the decision figure"
+        )
+        for key in ("local_busy", "gpu_busy"):
+            assert key in reference and key in SKILL_DOC.read_text()
+
+    def test_busy_figure_doc_anchors_resolve(self):
+        """AC7: every in-repo anchor link in the busy-figure docs resolves."""
+        unresolved: list[str] = []
+        for doc in BUSY_FIGURE_DOCS:
+            text = doc.read_text()
+            for target, fragment in re.findall(
+                r"\]\(([^)\s]*)#([^)\s]+)\)", text
+            ):
+                linked = doc if not target else (doc.parent / target)
+                if linked.suffix != ".md" or not linked.exists():
+                    continue
+                if fragment not in _documented_anchors(linked.read_text()):
+                    unresolved.append(f"{doc.name} -> {target or doc.name}#{fragment}")
+        assert not unresolved, (
+            f"anchor links that resolve to no heading: {unresolved}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: GPU telemetry, calibration and retention documentation
+# (LP-0MVT1O7AU002CM7P; parent LP-0MVNWUEY8008XM6W AC7/AC8)
+#
+# The docs this class guards are operator-facing, so every assertion here is
+# tied to something executable: the CLI's own argument parser, its own renderer
+# and the real sysfs sensor. A doc that drifts from the shipped behaviour fails
+# rather than describing an intention.
+# ---------------------------------------------------------------------------
+
+GPU_CLI = PROJECT_ROOT / "scripts" / "gpu_utilisation.py"
+
+#: Slot-occupancy series published by the proxy (LP-0MVT1O0VG00905EL); the
+#: README table is the one place an operator copies these names from.
+SLOT_SERIES = (
+    "llama_slots_total",
+    "llama_slots_busy",
+    "llama_slot_busy",
+    "llama_slots_in_flight_tasks",
+    "llama_slots_sample_timestamp_seconds",
+)
+
+#: Markers that put a `gpu_busy_percent` mention in the "not a utilisation
+#: signal" context the AC requires; one must appear in every README section
+#: that names the counter.
+NOT_A_SIGNAL_MARKERS = (
+    "not a utilisation",
+    "not a utilization",
+    "never a utilisation",
+    "never a utilization",
+    "saturat",
+    "continuity only",
+    "must not",
+)
+
+
+def _gpu_cli():
+    """Import ``scripts/gpu_utilisation.py`` so docs are checked against it."""
+    if str(GPU_CLI.parent) not in sys.path:
+        sys.path.insert(0, str(GPU_CLI.parent))
+    # Deliberate late import: the module path is only needed by these tests.
+    import gpu_utilisation
+
+    return gpu_utilisation
+
+
+def _markdown_sections(text: str) -> list[tuple[str, str]]:
+    """Split markdown into (heading, body) sections, one per heading.
+
+    Fenced code blocks are skipped: a bash comment (``# 1. ...``) starts with
+    ``#`` but is not a heading, and mistaking it for one truncates the section.
+    """
+    sections: list[tuple[str, list[str]]] = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith(FENCE):
+            in_fence = not in_fence
+        elif not in_fence and re.match(r"^#{1,6}\s+\S", line):
+            sections.append((line, []))
+            continue
+        if sections:
+            sections[-1][1].append(line)
+        else:
+            sections.append(("", [line]))
+    return [(heading, "\n".join(body)) for heading, body in sections]
+
+
+def _prose(text: str) -> str:
+    """Normalise markdown prose, dropping emphasis so wording matches."""
+    return _norm(text.replace("*", "").replace("`", ""))
+
+
+def _documented_cli_commands(text: str) -> list[str]:
+    """Extract `python3 scripts/gpu_utilisation.py ...` invocations from docs.
+
+    Handles shell line continuations (a trailing backslash) and strips a shell
+    pipeline suffix (`| jq ...`), so each returned string is exactly the
+    argument list a reader would paste.
+    """
+    commands: list[str] = []
+    pending: str | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("python3 scripts/gpu_utilisation.py"):
+            pending = line
+        elif pending is not None and line.startswith("--"):
+            pending = f"{pending.rstrip(chr(92))} {line}"
+        else:
+            if pending is not None:
+                commands.append(pending)
+                pending = None
+            continue
+        if not pending.endswith("\\"):
+            commands.append(pending)
+            pending = None
+    if pending is not None:
+        commands.append(pending)
+    return commands
+
+
+def _number_shape(line: str) -> str:
+    """Mask digits so two runs of the same layout compare equal."""
+    return re.sub(r"\d+(?:\.\d+)?", "#", line.strip())
+
+
+class TestGpuTelemetryDocumentation:
+    """The README documents what shipped, verified against the shipped code."""
+
+    def _readme(self) -> str:
+        return (MONITORING_DIR / "README.md").read_text()
+
+    def test_slot_occupancy_series_are_documented(self):
+        """AC: every published slot series is named in the README table."""
+        readme = self._readme()
+        assert "| Series |" in readme, (
+            "monitoring/README.md must document the slot series in a table"
+        )
+        tables = "\n".join(
+            body for _heading, body in _markdown_sections(readme) if "| Series |" in body
+        )
+        missing = [s for s in SLOT_SERIES if s not in tables]
+        assert not missing, (
+            f"slot series missing from the README series table: {missing}; an "
+            "operator cannot query a series the docs do not name"
+        )
+        # Each row must also say what the series means, not just name it.
+        for series in SLOT_SERIES:
+            row = [ln for ln in tables.splitlines() if f"`{series}" in ln]
+            assert row, f"no table row for {series}"
+            assert len(row[0].strip("|").split("|")) >= 3, (
+                f"the {series} row must carry a type and a meaning column"
+            )
+
+    def test_documented_cli_commands_parse_with_the_shipped_parser(self):
+        """AC: the documented example is copy-pasteable, not aspirational.
+
+        Every `python3 scripts/gpu_utilisation.py ...` line in the README is fed
+        to the CLI's real argparse parser: an invented or renamed flag fails
+        here instead of in an operator's terminal.
+        """
+        import shlex
+
+        gu = _gpu_cli()
+        commands = _documented_cli_commands(self._readme())
+        assert len(commands) >= 3, (
+            "monitoring/README.md must show the CLI with real invocations "
+            f"(window, absolute window, --json); found {commands}"
+        )
+        parser = gu.build_arg_parser()
+        for command in commands:
+            argv = shlex.split(command.split("|", 1)[0])
+            assert argv[:2] == ["python3", "scripts/gpu_utilisation.py"], argv
+            try:
+                parsed = parser.parse_args(argv[2:])
+            except SystemExit as exc:  # argparse exits on an unknown flag
+                raise AssertionError(
+                    f"documented CLI command does not parse: {command!r} ({exc})"
+                ) from None
+            # The example must actually ask for something.
+            assert parsed.window or parsed.since, (
+                f"documented CLI command selects no window: {command!r}"
+            )
+
+    def test_documented_example_output_matches_the_renderer(self):
+        """AC: the output block is a real run, compared with the real renderer.
+
+        The example block's provenance is the CLI's own ``render_human`` — the
+        numbers are masked, so only the layout is asserted (docs must not claim
+        a column the CLI does not print).
+        """
+        gu = _gpu_cli()
+        documented = [
+            body
+            for lang, body in _fenced_blocks(MONITORING_DIR / "README.md")
+            if "GPU utilisation" in body
+        ]
+        assert documented, (
+            "monitoring/README.md must include a real CLI output block "
+            "(a fenced block containing 'GPU utilisation')"
+        )
+        lines = documented[0].splitlines()
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("GPU utilisation"))
+        rendered = gu.GpuUtilisation(
+            window=gu.Window(1783900000, 1783907200),
+            step_seconds=gu.SCRAPE_INTERVAL_SECONDS,
+            scrape_interval_seconds=gu.SCRAPE_INTERVAL_SECONDS,
+            expected_samples=481,
+            observed_samples=0,
+            computing_samples=0,
+            idle_samples=0,
+            unknown_samples=481,
+            power_only_computing_samples=63,
+            power_mean_watts=55.0,
+            power_max_watts=120.0,
+            power_samples=481,
+            peak_busy_slots=None,
+            slot_samples=0,
+            cross_check_samples=0,
+            cross_check_mismatches=0,
+        ).render_human().splitlines()
+        got = [_number_shape(ln) for ln in lines[start:start + len(rendered)]]
+        want = [_number_shape(ln) for ln in rendered]
+        assert got == want, (
+            "monitoring/README.md's CLI output block no longer matches the "
+            f"columns the CLI prints.\n documented: {got}\n CLI:        {want}"
+        )
+
+    def test_cli_exit_codes_and_unknown_semantics_are_documented(self):
+        """AC: an operator can tell "unknown" from "idle" without reading code."""
+        gu = _gpu_cli()
+        content = _norm(self._readme())
+        for code in (gu.EXIT_OK, gu.EXIT_USAGE, gu.EXIT_PROMETHEUS_UNAVAILABLE, gu.EXIT_NO_DATA):
+            assert f"`{code}`" in content, f"README must document exit code {code}"
+        assert "no observed samples" in content, (
+            "README must quote the all-unknown message so the exit-4 run is "
+            "recognisable instead of looking like a broken host"
+        )
+        assert "never" in content and "unknown" in content, (
+            "README must state that missing data is unknown, not idle"
+        )
+
+    def test_resolution_floor_is_stated_and_matches_the_deployment(self):
+        """AC: no figure implies finer fidelity than the store holds."""
+        gu = _gpu_cli()
+        content = _norm(self._readme())
+        assert "resolution floor is 15 s" in content, (
+            "README must state the resolution floor (the 15 s scrape interval)"
+        )
+        assert "10 s" in content, (
+            "README must state the 10 s cadences (sysfs sampler and proxy slot "
+            "sample) that the 15 s scrape observes"
+        )
+        assert "resolution: step 15s (scrape floor 15s)" in content, (
+            "README must show the CLI reporting the step it actually queried and "
+            "the scrape floor"
+        )
+
+        # The documented floor is the CLI's own constant, not a coincidence.
+        assert gu.SCRAPE_INTERVAL_SECONDS == 15, (
+            "the CLI's scrape-interval constant changed; update the README's "
+            "resolution statement in the same commit"
+        )
+        assert gu.resolve_step(None, gu.SCRAPE_INTERVAL_SECONDS) == 15, (
+            "the CLI's default step must remain the scrape interval"
+        )
+        scrape_cfg = assert_valid_yaml(MONITORING_DIR / "prometheus.yml")
+        configured = {
+            job["job_name"]: job.get("scrape_interval", "15s")
+            for job in scrape_cfg["scrape_configs"]
+        }
+        assert set(configured.values()) == {"15s"}, (
+            f"monitoring/prometheus.yml scrape intervals drifted from the "
+            f"documented 15 s floor: {configured}"
+        )
+
+    def test_retention_statement_names_the_tsdb_creation_date(self):
+        """AC: 90 d is a ceiling, and history starts when the TSDB was created."""
+        content = _norm(self._readme())
+        assert "90 d" in content or "90 days" in content, (
+            "README must state the 90-day retention"
+        )
+        assert "2026-10-25" in content, (
+            "README must state when this host's history starts, so an operator "
+            "does not read '90 d' as '90 days of data available'"
+        )
+        assert "tsdb" in content, (
+            "README must say that history starts when the TSDB was created"
+        )
+        # The documented retention query must be a subquery: an instant vector
+        # cannot see history, so min(timestamp(up)) reports *now*.
+        assert "min_over_time(timestamp(up)[90d:1h])" in content, (
+            "the documented 'oldest sample' query must be a subquery; "
+            "min(timestamp(up)) returns the current scrape, not the oldest one"
+        )
+        flags_doc = _norm((DOCS_SYSTEMD_DIR / "prometheus.service").read_text())
+        assert "retention" in flags_doc, (
+            "the documented Prometheus unit must mention its retention flag"
+        )
+
+    def test_calibration_section_states_the_shared_threshold(self):
+        """AC: the bands, the sensor, and both keys that carry the threshold."""
+        gu = _gpu_cli()
+        content = _norm(self._readme())
+        for phrase in (
+            "power1_average",
+            "microwatts",
+            "server.llama_gpu_wedge_power_low_threshold_watts",
+            "gpu:computing:bool",
+        ):
+            assert phrase in content, f"calibration section is missing {phrase!r}"
+        assert "idle" in content and "computing (local generation)" in content, (
+            "the calibration section must name both measured bands"
+        )
+
+        # The documented threshold is the shipped threshold, in both places.
+        threshold = _find_key(
+            assert_valid_yaml(PROJECT_ROOT / "proxy" / "config.yaml"),
+            "llama_gpu_wedge_power_low_threshold_watts",
+        )
+        assert threshold is not None
+        assert f"{int(threshold)} w" in content, (
+            f"README must quote the shipped threshold ({threshold} W)"
+        )
+        assert float(gu.THRESHOLD_WATTS) == float(threshold), (
+            "the CLI, the rule and the proxy must share one threshold; README "
+            f"documents {threshold} W but the CLI uses {gu.THRESHOLD_WATTS} W"
+        )
+        rules = assert_valid_yaml(MONITORING_DIR / "gpu_compute_rules.yaml")
+        exprs = " ".join(
+            rule.get("expr", "")
+            for group in rules["groups"]
+            for rule in group["rules"]
+        )
+        assert f">= bool {int(threshold)}" in exprs, (
+            "gpu_compute_rules.yaml no longer carries the documented threshold"
+        )
+
+    def test_calibration_remeasure_recipe_uses_the_real_sensor(self):
+        """AC: a clean host can reproduce the numbers from the documented recipe."""
+        content = _norm(self._readme())
+        assert "cat /sys/class/drm/card0/device/hwmon/hwmon*/power1_average" in content, (
+            "the re-measure recipe must name the exact sysfs file"
+        )
+        assert "divide by" in content and "1000000" in content, (
+            "the recipe must say the file is in microwatts, or every reading is "
+            "off by six orders of magnitude"
+        )
+        glob = sorted(
+            (Path("/sys/class/drm/card0/device/hwmon")).glob("hwmon*/power1_average")
+        )
+        if not glob:
+            pytest.skip("no amdgpu hwmon power sensor on this host")
+        raw = int(glob[0].read_text().strip())
+        assert raw > 1_000_000, (
+            f"{glob[0]} reads {raw}: the documented microwatt conversion assumes "
+            "hwmon's microwatt units; re-check the recipe"
+        )
+        watts = raw / 1_000_000
+        assert 0 < watts < 1000, f"implausible GPU package power from sysfs: {watts} W"
+
+    def test_gpu_busy_percent_is_only_mentioned_as_a_non_signal(self):
+        """AC: a grep assertion keeps the counter out of utilisation claims."""
+        offenders: list[str] = []
+        mentions = 0
+        for heading, body in _markdown_sections(self._readme()):
+            if "gpu_busy_percent" not in body:
+                continue
+            mentions += body.count("gpu_busy_percent")
+            normalised = _prose(body)
+            if not any(marker in normalised for marker in NOT_A_SIGNAL_MARKERS):
+                offenders.append(heading or "<intro>")
+        assert mentions, (
+            "the README still has to explain why gpu_busy_percent is not used"
+        )
+        assert not offenders, (
+            "gpu_busy_percent may only appear in a 'not a utilisation signal' "
+            f"context; these sections name it without one: {offenders}"
+        )
+
+    def test_computing_share_is_distinguished_from_the_log_derived_busy_figure(self):
+        """AC: neither busy figure may be presented as replacing the other."""
+        content = _norm(self._readme())
+        for phrase in (
+            "local_busy.busy_pct",
+            "gpu:computing_workload:bool",
+            "12.6",
+            "39.3",
+            "none replaces another",
+        ):
+            assert phrase in content, (
+                f"README must distinguish the hardware and log-derived figures; "
+                f"missing {phrase!r}"
+            )
+        assert "proxy-inferred" in content, (
+            "the usage report's figure must be named as proxy-inferred (log "
+            "derived), not as a hardware measurement"
+        )
+
+    def test_gpu_metrics_unit_still_describes_the_shipped_cadence(self):
+        """AC: docs/systemd/gpu-metrics.service stays accurate."""
+        content = _norm((DOCS_SYSTEMD_DIR / "gpu-metrics.service").read_text())
+        assert "sleep 10" in content, "the sampler cadence documented is not 10 s"
+        assert "node_hwmon_power_average_watt" in content, (
+            "the unit document must keep naming the power series it feeds"
+        )
+        for series in SLOT_SERIES:
+            assert series in content, (
+                f"gpu-metrics.service must keep pointing slot occupancy at the "
+                f"proxy; missing {series}"
+            )
+        assert "not a utilisation" in content, (
+            "the unit document must keep saying gpu_busy_percent is not a "
+            "utilisation signal"
         )

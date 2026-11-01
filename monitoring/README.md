@@ -18,6 +18,7 @@ alive across reboots with `loginctl enable-linger`.
 |---|---|---|---|---|
 | `prometheus.service` | 3.15.1 | `127.0.0.1:9090`, `100.79.231.101:9090`, `[fd7a:115c:a1e0::9b33:e765]:9090` | tailnet UI/API, 90 d retention | [docs/systemd/prometheus.service](../docs/systemd/prometheus.service) |
 | `node_exporter.service` | 1.12.1 | `127.0.0.1:9100` | scraped by Prometheus | [docs/systemd/node_exporter.service](../docs/systemd/node_exporter.service) |
+| `llama-proxy.service` | n/a (Python/uvicorn) | `:8000` | scraped by Prometheus: proxy counters **and** the 10 s slot-occupancy sample (`llama_slots_*`, `llama_slot_busy`) | [docs/systemd/llama-proxy.service](../docs/systemd/llama-proxy.service) |
 | `gpu-metrics.service` | n/a (bash sampler) | — (writes `gpu.prom`) | 10 s sysfs sampler for node_exporter's textfile collector | [docs/systemd/gpu-metrics.service](../docs/systemd/gpu-metrics.service) |
 | `rocm-exporter.service` | — | — | **not installable**: no published release artefacts | [docs/systemd/rocm-exporter.service](../docs/systemd/rocm-exporter.service) |
 | `grafana-server.service` | 11.6.0 (documented) | `:3000` if deployed | optional dashboards; **not running on this host** | [docs/systemd/grafana-server.service](../docs/systemd/grafana-server.service) |
@@ -30,6 +31,15 @@ node_exporter :9100/metrics ┤─► prometheus :9090 (90 d) ─► (optional) 
   ├ hwmon collector  ◄── /sys/class/hwmon  (GPU power)
   └ textfile collector ◄── gpu.prom ◄── gpu-metrics.service (10 s sysfs sampler)
 ```
+
+`llama-proxy`'s `/metrics` carries two kinds of series: the proxy's own
+counters (requests, errors, backend retries) **and** a slot-occupancy sample
+refreshed every 10 s (`server.llama_slot_metrics_interval_seconds`) from the
+llama-server `/slots` path. Both are scraped every 15 s; together with the
+`hwmon` power series they are what turns "the GPU drew 115 W" into our own
+slot's work (see [GPU workload series](#gpu-workload-series-slot-occupancy)).
+This unit (`gpu-metrics.service`) cannot see slot occupancy — the proxy owns
+the only working `/slots` path.
 
 ## Prerequisites
 
@@ -208,6 +218,11 @@ and evaluates the alert rules in `monitoring/*.yaml`.
 > quantified in LP-0MVSQQO910077LYL). `amd-smi`, `rocm-smi` and `amdtop` are
 > not alternatives — see *Why not `amd-smi`, `rocm-smi` or `amdtop`?* in the
 > query cookbook below.
+> This power figure is **hardware** activity, never local model utilisation:
+> it counts any GPU draw at compute power, not just the work the proxy served.
+> The usage report's decision figure — the one gates and alerts quote — is the
+> log-derived `local_busy`; see the
+> [usage-analysis reference](../.pi/skills/proxy-usage-analysis/REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
 > GPU memory pressure is measured on **GTT**, not the
 > 1 GiB VRAM carve-out. See
 > [gpu_compute_rules.yaml](gpu_compute_rules.yaml) and
@@ -223,6 +238,7 @@ So in `monitoring/prometheus.yml` they must be **bare file names**:
 rule_files:
   - "gpu_compute_rules.yaml"
   - "gpu_memory_alerts.yaml"
+  - "llama_memory_alerts.yaml"
 ```
 
 Listing them as `monitoring/gpu_compute_rules.yaml` makes Prometheus look for
@@ -237,11 +253,40 @@ Validate before restarting:
 
 ```bash
 ~/bin/prometheus/promtool check config monitoring/prometheus.yml
-# expected: SUCCESS: 5 rule files found
+# expected: SUCCESS: 6 rule files found
 #           SUCCESS: monitoring/prometheus.yml is valid prometheus config file syntax
 ~/bin/prometheus/promtool test rules monitoring/tests/gpu_rules_test.yml
 # expected: SUCCESS
 systemctl --user restart prometheus.service
+```
+
+### llama-server memory series (llama_process_rss_bytes)
+
+`llama_memory_alerts.yaml` alerts on `llama_process_rss_bytes`, published by
+`proxy/proxy/backend_rss.py` and refreshed on **every `/metrics` scrape** (the
+15 s Prometheus scrape alone keeps it fresh; no `/admin/metrics` poll is
+needed). The value is resolved without requiring a host process handle:
+
+- **podman-backed** (`scripts/podman_start_llama.sh`): the container init pid
+  from `podman inspect -f '{{.State.Pid}}' <name>` and the summed RSS of its
+  process tree, falling back to the container cgroup's `memory.current` (the
+  number `podman stats` reports). Container name: `server.llama_container_name`,
+  else `PODMAN_LC_CONTAINER`, else auto-detected from a `podman` start script.
+- **host-direct**: the summed RSS of the llama-server process tree (router plus
+  its per-model children — model memory lives in children, so a single-process
+  read under-reports by ~99 %). The tracked `llama_process` pid is used when it
+  is a real backend process; otherwise (adopted server with `pid = 0`, or a
+  `podman exec` wrapper pid) pids are discovered by scanning `/proc` for
+  `llama-server --port <llama_server_port>`.
+
+Per-model attribution stays the documented equal split: the
+`llama_model_rss_bytes{model=...}` labels sum to the process total. A runtime
+lookup failure is fail-soft — the scrape still succeeds, the last known value
+is kept, and the reason is logged once (not per scrape). Verify with:
+
+```bash
+curl -s localhost:8000/metrics | grep llama_process_rss_bytes   # non-zero
+curl -s localhost:8000/admin/metrics | jq .process_rss_bytes    # same value
 ```
 
 ## 3. Host and GPU metrics: node_exporter + gpu-metrics
@@ -300,11 +345,17 @@ cp monitoring/grafana/dashboards/dashboards.yaml   ~/bin/grafana/conf/provisioni
 cp monitoring/grafana_llama_memory_dashboard.json  ~/bin/grafana/conf/provisioning/dashboards/
 ```
 
-Known gap: the "GPU VRAM Usage" panel in
-`monitoring/grafana_llama_memory_dashboard.json` still queries `rocm_vram_*`,
-which nothing publishes. It needs repointing at `gpu_gtt_used_bytes` /
-`gpu_vram_used_bytes` before Grafana is deployed. Prometheus itself is
-unaffected.
+The dashboard's GPU memory panel — "GPU memory: GTT (models) and VRAM
+carve-out (bytes)" — charts three of the series § 3 lists as published:
+`gpu_gtt_used_bytes` (the pool models map into) alongside
+`gpu_vram_used_bytes` and `gpu_vram_total_bytes` (the ~1 GiB BIOS carve-out,
+shown for context rather than as the model pool). Every expression is guarded
+by `TestGrafanaDashboardVramPanel`, which derives the published set by running
+the documented sampler, so a panel selecting an unpublished series fails the
+suite instead of deploying as "No data". The earlier `rocm_vram_*` query is
+gone: the AMD rocm-exporter route it assumed has no release artefacts (see
+[rocm-exporter.service](../docs/systemd/rocm-exporter.service)) and Prometheus
+has no such series to serve. Prometheus itself is unaffected.
 
 ## 5. Verification (fresh-host checklist)
 
@@ -333,9 +384,9 @@ curl -s 'http://127.0.0.1:9090/api/v1/targets?state=active' \
 # expected: llama-proxy up http://localhost:8000/metrics
 #           node-exporter up http://localhost:9100/metrics
 
-# 5. Rules loaded: 5 groups, 10 rules
+# 5. Rules loaded: 5 groups, 11 rules
 curl -s http://127.0.0.1:9090/api/v1/rules | jq -r '.data.groups[] | "\(.name) \(.rules|length)"'
-# expected: gpu-compute.rules 4
+# expected: gpu-compute.rules 5
 #           gpu-memory.rules 2
 #           proxy-5xx.rules 1
 #           llama-remote-stream.rules 1
@@ -385,6 +436,90 @@ gpu:power_watts:amdgpu
 Sanity note: the sample values depend on the machine's state. Verified
 2026-10-25 on this host: `avg_over_time(gpu:computing:bool[2h])` → 0.5,
 `sum_over_time(...[24h:15s]) * 15` → 4605 s, `gpu:power_watts:avg5m` → 67.7 W.
+
+### GPU workload fraction (power **and** a busy llama slot)
+
+`gpu:computing:bool` answers "is the GPU at compute power?", which includes
+work another process is doing. `gpu:computing_workload:bool` is the one shared
+definition of "the GPU is doing **our** local model's work": 1 while power is
+at or above the 90 W compute threshold **and** at least one llama-server slot is
+processing, 0 otherwise. The CLI, the alert rules and ad-hoc queries all read
+this series instead of re-deriving the condition.
+
+```promql
+# Share of the last 2h the GPU spent on OUR work (0..1)
+avg_over_time(gpu:computing_workload:bool[2h])
+
+# Our computing seconds in the last 24h
+sum_over_time(gpu:computing_workload:bool[24h:15s]) * 15
+
+# How much compute power we owned (power-only), for comparison
+gpu:computing:bool
+```
+
+Three properties matter when querying it:
+
+- **The join is label-agnostic.** The power series comes from the
+  `node-exporter` job (`instance="localhost:9100"`) and `llama_slots_busy` from
+  the `llama-proxy` job (`instance="localhost:8000"`), so the rule multiplies
+  with `on()` (empty label set) rather than matching on any label. A naive
+  `and on(instance)` join matches nothing and records no series at all — which
+  looks like "unknown" forever, or like "never computing" on a dashboard.
+- **Absence stays absent.** With `llama_slots_busy` missing (sampler or proxy
+  down) or the power series missing (node_exporter down) the rule records **no
+  series**, never 0. Absence is *unknown*; 0 is *idle*. Do not `or vector(0)`
+  in a query unless you deliberately want unknown reported as idle.
+- **The recorded labels are the power series' labels**
+  (`instance="localhost:9100"`, `job="node-exporter"`); no llama-proxy labels
+  leak into the combined series.
+
+The behavioural cases (0/1 values, the 90 W boundary, and both missing-input
+cases) live in `monitoring/tests/gpu_rules_test.yml`
+(LP-0MVT1O4O1004ND6L).
+
+#### GPU workload series: slot occupancy
+
+These are the series the rule above joins on. They are published by the
+**proxy** (`proxy/proxy/metrics.py`), not by `gpu-metrics.service`: the proxy
+already owns the single working `/slots` path (child-port discovery, request
+coalescing, failure backoff), so sampling from there costs no second poller.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `llama_slots_total` | gauge | slots reported by the last successful sample |
+| `llama_slots_busy` | gauge | how many of those slots have `is_processing` true |
+| `llama_slot_busy{slot="<id>"}` | gauge, 1/0 | per-slot state, so a single stuck slot is visible |
+| `llama_slots_in_flight_tasks` | gauge | slots processing a task with an assigned `id_task` (falls back to the busy count on builds that publish no `id_task`) |
+| `llama_slots_sample_timestamp_seconds` | gauge | heartbeat: the *age* of the last successful sample |
+
+Cadence: the proxy samples every 10 s
+(`server.llama_slot_metrics_interval_seconds`, default 10, deliberately below
+the 15 s scrape); Prometheus observes it at 15 s.
+
+```promql
+# Occupancy right now: busy / total
+llama_slots_busy
+llama_slots_total
+
+# Busy fraction over the last 2h (0..1). Number of busy slots, not a %.
+avg_over_time(llama_slots_busy[2h]) / avg_over_time(llama_slots_total[2h])
+
+# Which slots are stuck: 1 means that slot is processing
+llama_slot_busy == 1
+
+# Is the sampler still reporting? Age of the last successful sample, seconds.
+time() - llama_slots_sample_timestamp_seconds
+# expected: under ~15 s; a growing value means the sampler or the proxy died,
+#           which is *unknown* occupancy, not zero occupancy
+
+# Busy slot-minute count over a day
+sum_over_time(llama_slots_busy[24h:15s]) * 15 / 60
+```
+
+Read a missing slot series as **unknown**, never as zero: the proxy publishes
+nothing while its `/slots` sample is stale, and
+`gpu:computing_workload:bool` then records no series either (see the three
+properties under the workload rule above).
 
 ### Why not `amd-smi`, `rocm-smi` or `amdtop`?
 
@@ -471,11 +606,11 @@ rate(proxy_http_errors_total{status="5xx"}[5m])
 up
 ```
 
-### Retention window
+### Retention and resolution
 
-Configured retention is 90 days (`--storage.tsdb.retention.time=90d`; the
+**Configured retention is 90 days** (`--storage.tsdb.retention.time=90d`; the
 `prometheus_tsdb_*` self-metrics are not scraped by this instance, so read it
-from the flags API). Actual retained history is bounded by the oldest sample:
+from the flags API):
 
 ```bash
 curl -s http://127.0.0.1:9090/api/v1/status/flags \
@@ -483,13 +618,227 @@ curl -s http://127.0.0.1:9090/api/v1/status/flags \
 # expected: 90d
 ```
 
+**90 d is a ceiling, not a claim about available data: history starts when the
+TSDB was created.** On this host the store was created on **2026-10-25 at
+19:22 UTC** — the first retained scrape is `2026-10-25T19:22:55Z`, and the
+`hwmon` GPU power series starts slightly later, at
+`2026-10-25T20:59:50Z` (the collector was added after the first boot). Anything
+older than the TSDB creation time does not exist and no query can recover it.
+
 ```promql
-# Oldest sample held by the TSDB, as an epoch timestamp
-min(timestamp(up))
+# Oldest sample held by the TSDB, as an epoch timestamp.
+# A subquery is required: an instant vector cannot see history, so
+# min(timestamp(up)) on its own returns *now*, not the oldest sample.
+min_over_time(timestamp(up)[90d:1h])
 
 # How much history is actually retained, in days
-(time() - min(timestamp(up))) / 86400
+(time() - min_over_time(timestamp(up)[90d:1h])) / 86400
 ```
+
+The `1h` subquery step locates the first sample to within an hour; use
+`[90d:1m]` when the exact second matters (slower, ~130 k evaluation points).
+
+**Resolution floor is 15 s.** Three cadences are stacked, and the *coarsest*
+one binds:
+
+| Stage | Cadence |
+|---|---|
+| `gpu-metrics.service` sysfs sampler writes `gpu.prom` | 10 s |
+| proxy slot-occupancy sample onto `/metrics` | 10 s |
+| Prometheus scrapes both targets | **15 s** |
+
+So the finest fidelity the store holds is one sample per 15 s per series; the
+10 s writers are deliberately faster so no scrape misses a fresh value, not so
+that a 10 s claim can be made about the retained data. Slot-occupancy figures
+are additionally limited by the sampler: a task shorter than one sample
+interval can fall between two samples and show as zero busy slots.
+
+`scripts/gpu_utilisation.py` prints the resolution it actually used, never a
+finer one — the default step is the 15 s scrape interval, `--step` may only
+coarsen it, and a finer `--step` is rejected as a usage error:
+
+```text
+  resolution: step 15s (scrape floor 15s); 481 expected samples, 0 observed, 481 unknown
+```
+
+## Three "busy" figures — what each answers
+
+The stack publishes three different measures that all look like "GPU usage".
+They answer different questions, and none replaces another.
+
+| Figure | Source | Answers | Does not answer |
+|---|---|---|---|
+| `gpu:computing:bool` (`avg_over_time(...)` = computing fraction) | `node_hwmon_power_average_watt` ≥ 90 W — hardware only | "was the GPU drawing compute power?" (any consumer: us, another process, a batch job) | whether the work was *ours* |
+| `gpu:computing_workload:bool` (the CLI's `computing` share) | power ≥ 90 W **and** ≥ 1 busy llama slot | "did the GPU draw compute power while one of our slots was processing?" — hardware attributed to our slots | wall-clock slot occupancy: a single short task inside one 15 s scrape still counts as a computing instant |
+| `local_busy.busy_pct` (the usage report's decision figure) | proxy log, `dispatch → finish` slot union — **proxy-inferred**, no hardware | "how much wall-clock time did our slots spend on tasks?" — the figure gates and alerts quote | how much GPU power that work drew, or any GPU work outside the proxy |
+
+The log-derived and power-based figures end up on different scales and
+legitimately diverge. Measured
+2026-10-27 22:10 → 2026-10-28 22:10 the log-derived figure was **12.6 %**
+against a power-based **39.3 %** — a ~27-point gap (LP-0MVSPWLLP008AQXZ). The
+causes are structural: the log union counts queued slot time and misses work it
+never logged, while the power figure counts *any* GPU draw at compute power,
+including work the proxy never served, and (because a 15 s scrape is binarised
+at 90 W) rounds a 2 s burst up to a whole sample.
+
+Read them as answers to different questions:
+
+- **Is local capacity contended?** → `local_busy.busy_pct`. This is the
+  decision figure; see
+  [which busy figure is authoritative](../.pi/skills/proxy-usage-analysis/REFERENCE.md#which-busy-figure-is-authoritative-for-decisions).
+- **Did our slots actually keep the GPU computing?** →
+  `gpu:computing_workload:bool` (or `scripts/gpu_utilisation.py`).
+- **Is the GPU busy at all, whoever asked?** → `gpu:computing:bool`.
+
+## GPU utilisation CLI (`scripts/gpu_utilisation.py`)
+
+`scripts/gpu_utilisation.py` answers "how busy was the GPU between 17:00 and
+19:00?" from the deployed Prometheus store — never from `proxy.log` — so the
+figure survives log rotation and needs no log parsing. It reports the
+`gpu:computing_workload:bool` share (our work), the power-only share (any
+consumer) and an explicit `unknown` share, and it fails loudly rather than
+reporting missing data as idle.
+
+```bash
+cd /path/to/llm
+python3 scripts/gpu_utilisation.py --window 2h
+```
+
+Real run on this host (2026-10-31 22:45 UTC), shown verbatim including the
+stderr line, while the proxy's slot sampler was not reporting (exit code `4`):
+
+```text
+gpu_utilisation: no observed samples in 2026-10-31T20:45:45Z .. 2026-10-31T22:45:45Z (unknown 100.0%): the sampling pipeline was not reporting, so the GPU was neither busy nor idle in any measurable sense. Check prometheus.service, node_exporter.service and the proxy's slot sampler.
+GPU utilisation 2026-10-31T20:45:45Z .. 2026-10-31T22:45:45Z (2h)
+  computing 0.0% / idle 0.0% / unknown 100.0%
+  power-only computing 13.1% (gpu:computing:bool: any GPU consumer, not just ours)
+  power mean 55 W / max 120 W (481 samples); peak n/a busy slots
+  resolution: step 15s (scrape floor 15s); 481 expected samples, 0 observed, 481 unknown
+```
+
+That is the contract working, not a failure: without `llama_slots_busy` the
+`computing`/`idle` classification is impossible, so every instant is `unknown`
+and the exit code is non-zero. Once the sampler reports, the same command
+prints the same five lines with populated `computing`/`idle` shares, a
+`peak <n> busy slots` figure and a non-zero `observed` count. The numbers move
+with the window and the machine — the **layout** is what is stable.
+
+A fixed window, for a report or an incident write-up:
+
+```bash
+python3 scripts/gpu_utilisation.py \
+  --since 2026-10-31T02:13:00Z --until 2026-10-31T04:13:00Z --json
+```
+
+| Flag | Meaning |
+|---|---|
+| `--window <duration>` | window ending now: `30m`, `2h`, `24h`, `7d` (default `2h`) |
+| `--since <ISO8601> --until <ISO8601>` | explicit window; may not be combined with `--window` |
+| `--step <duration>` | sample step; must be ≥ the 15 s scrape interval (default 15 s) |
+| `--scrape-interval <duration>` | store resolution floor and slot-heartbeat freshness bound (default `15s`); change it only when the Prometheus scrape interval changes |
+| `--json` | machine-readable output (stable `schema_version: 1`) |
+| `--prometheus-url <url>` | override `http://127.0.0.1:9090` |
+
+`--json` carries `window`, `resolution`, `coverage` (expected / observed /
+computing / idle / unknown sample counts), `shares_pct`, `power_watts`,
+`slots.peak_busy`, `rule_cross_check` (the CLI recomputes the rule and reports
+mismatches) and `warnings`. Percentages are rounded to four decimal places and
+the sample counts are exact, so nothing is lost:
+
+```bash
+python3 scripts/gpu_utilisation.py --window 2h --json | jq '.shares_pct, .resolution'
+```
+
+Exit codes: `0` success, `1` unexpected error, `2` invalid arguments,
+`3` Prometheus unreachable or answering with an error, `4` no observed samples
+in the window (all-unknown; the message says so and the JSON is still emitted).
+
+`gpu_busy_percent` is never queried by the CLI (a regression test enforces
+it): it is not a utilisation signal on this APU, as explained in
+[Why not `amd-smi`, `rocm-smi` or `amdtop`?](#why-not-amd-smi-rocm-smi-or-amdtop).
+
+## GPU power calibration (and re-measuring it)
+
+The 90 W compute threshold is the one calibration constant shared by this
+stack and the proxy: `gpu:computing:bool` is
+`gpu:power_watts:amdgpu >= bool 90` in
+[gpu_compute_rules.yaml](gpu_compute_rules.yaml), and the proxy's GPU-wedge
+detector reads `server.llama_gpu_wedge_power_low_threshold_watts: 90` from
+`proxy/config.yaml`. They are the same number in two places and **must be
+changed together**, or the alerting layer and the proxy disagree about what
+"computing" means.
+
+Measured bands on this host (Strix Halo APU, Radeon 8060S iGPU, `gfx1151`),
+over 7 days of 15 s samples (2026-10-25 21:00 → 2026-10-31 22:00 UTC):
+
+| State | GPU package power | Evidence from that window |
+|---|---|---|
+| deep idle (display off, no GPU context) | ~4–15 W | min 4.1 W, p1 11.1 W |
+| idle with display and models resident | **~33–54 W** | p5 33.0 W, p25 35.1 W, **p50 45.0 W** |
+| computing (local generation) | **~90–117 W**, typically ≈115 W | p75 92.0 W, p95 108.1 W, p99 117.1 W |
+| peak observed | 131.0 W | max over the window |
+
+Over the same window: mean 61.0 W and 29.7 % of samples at or above 90 W. The
+90 W threshold sits between the idle bulk (p50 45 W) and the computing bulk
+(≥ p75 92 W, typically ≈115 W). That band is not empty — 3,738 of 35,063 samples (10.7 %) fell
+between 55 and 89 W, which is what transitions, partial loads and short bursts
+look like — but it is the thinnest part of the distribution, and 90 W is where
+a sample is far more likely to be computing than idling. A machine whose
+*idle* band reached 90 W would make the rule fire on an idle GPU, so re-measure
+after a hardware, driver or kernel change before trusting the figure.
+
+### Re-measuring
+
+`power1_average` is the sensor this stack already uses
+(`node_hwmon_power_average_watt`, restricted to `chip_name="amdgpu"` by the
+recording rule), so measuring it directly gives the same number Prometheus
+would:
+
+1. **Idle.** Leave the GPU alone for a couple of minutes (display on, models
+   loaded is the realistic case), then read the sensor a few times:
+
+   ```bash
+   for i in 1 2 3 4 5; do
+     cat /sys/class/drm/card0/device/hwmon/hwmon*/power1_average
+     sleep 2
+   done
+   ```
+
+   The file is in **microwatts** (the hwmon convention), so divide by
+   `1000000`: `59081000` → **59.1 W**. The `hwmon*` path varies by boot — the
+   glob above is deliberate; pin it (`ls -d .../hwmon*`) if you need one path.
+2. **Computing.** Start a known-long local generation (a large prompt, or a
+   request with a big `max_tokens`) and read the same file while it runs. Read
+   it during *prefill* or a long decode, not after the stream ends — power
+   falls back within a second or so:
+
+   ```bash
+   # in another terminal, while the generation is streaming
+   watch -n1 'cat /sys/class/drm/card0/device/hwmon/hwmon*/power1_average'
+   ```
+3. **Cross-check against the retained series** for the same minutes — this is
+   the figure the rules actually evaluate, and it proves the pipeline sees the
+   same sensor:
+
+   ```bash
+   curl -s --get http://127.0.0.1:9090/api/v1/query \
+     --data-urlencode 'query=max_over_time(gpu:power_watts:amdgpu[5m])'
+   ```
+4. **Update both thresholds together** if the bands moved — the rule
+   expression in [gpu_compute_rules.yaml](gpu_compute_rules.yaml)
+   (`>= bool 90`) *and* `server.llama_gpu_wedge_power_low_threshold_watts` in
+   `proxy/config.yaml` — then validate and apply:
+
+   ```bash
+   ~/bin/prometheus/promtool check rules monitoring/gpu_compute_rules.yaml
+   ~/bin/prometheus/promtool test rules monitoring/tests/gpu_rules_test.yml
+   systemctl --user restart prometheus.service   # lifecycle API is disabled
+   ```
+
+   If the new threshold changes the expected 0/1 boundaries in
+   `monitoring/tests/gpu_rules_test.yml`, update the synthetic series in the
+   same commit — the tests state the threshold explicitly, so a stale test is
+   a loud failure rather than a silent one.
 
 ## Alerting rules
 
@@ -503,8 +852,10 @@ min(timestamp(up))
 | `LlamaSlotsQueryFailuresCritical` | critical | `rate(llama_slots_query_failures_total[5m]) > 10` | 10m | [slots_query_alerts.yaml](slots_query_alerts.yaml) |
 | `RemoteStreamWatchdogTerminated` | warning | `rate(llama_remote_stream_terminated_total[5m]) > 0` | 5m | [remote_stream_alerts.yaml](remote_stream_alerts.yaml) |
 
-There are also three **recording** rules in `gpu_compute_rules.yaml`:
-`gpu:power_watts:amdgpu`, `gpu:computing:bool`, `gpu:power_watts:avg5m`.
+There are also four **recording** rules in `gpu_compute_rules.yaml`:
+`gpu:power_watts:amdgpu`, `gpu:computing:bool`, `gpu:computing_workload:bool`
+(power ≥ 90 W **and** ≥ 1 busy llama slot — the shared definition of our local
+model's work) and `gpu:power_watts:avg5m`.
 
 Alerts are visible in the UI (`/alerts`) and API (`/api/v1/rules`). Notification
 routing (email, webhook) needs Alertmanager, which is **not deployed** — alerts
@@ -569,7 +920,8 @@ curl -s http://127.0.0.1:9100/metrics | grep '^gpu_'
 ```
 
 If `gpu.prom` is missing, the sampler cannot read `gpu_busy_percent` (no AMD
-GPU, or the driver is not loaded) and exits without writing, by design — see
+GPU, or the driver is not loaded) and exits without writing, by design — the
+counter is only a liveness check here, never a utilisation signal; see
 [docs/systemd/gpu-metrics.service](../docs/systemd/gpu-metrics.service).
 
 ### `gpu_busy_percent` reads 100% while the machine is idle
@@ -609,3 +961,12 @@ instead. No rule in this repository may select `gpu_busy_percent`
 - LP-0MVSQQO910077LYL — why the GPU-utilisation source stays power draw
   (`amd-smi` returns `N/A`; `amdtop`/`rocm-smi` surface the saturating
   `gpu_busy_percent`; 7-day quantification).
+- LP-0MVNWUEY8008XM6W — slot-occupancy telemetry epic (this documentation
+  change is its AC7/AC8 slice).
+- LP-0MVT1O0VG00905EL — the proxy publishes the slot-occupancy series this
+  document queries.
+- LP-0MVT1O4O1004ND6L — the combined `gpu:computing_workload:bool` rule and
+  its behavioural tests.
+- LP-0MVT1O52G000LMC6 — `scripts/gpu_utilisation.py`, the CLI documented here.
+- LP-0MVSPWLLP008AQXZ — the log-derived `local_busy` is the decision figure;
+  the ~27-point divergence from the power figure.

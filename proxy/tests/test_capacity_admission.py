@@ -14,6 +14,9 @@ Covers the ACs:
   off, disabled ⇒ byte-for-byte today's routing);
 - AC5: the effective warm threshold is logged with the decision so the
   achieved setting and its reason are recorded.
+- LP-0MVXWQQ20002HAX4: the gate also enforces the admission guard's own
+  prefill deadline bounds, so it can never admit a prompt the deadline would
+  cancel (`TestPrefillDeadlineBound`).
 """
 
 from __future__ import annotations
@@ -53,6 +56,9 @@ def _enabled_config(**server_overrides) -> dict:
         "local_capacity_admission_budget_ratio": 0.8,
         "local_capacity_admission_horizon_seconds": 3600,
         "local_capacity_admission_decode_seconds": 30,
+        # Kept clear of the projections below so the ledger bound is what each
+        # legacy case exercises; the deadline bounds have their own class.
+        "local_prefill_deadline_seconds": 3600,
     }
     base.update(server_overrides)
     return _config(**base)
@@ -304,3 +310,110 @@ class TestRoutingGate:
         )
 
         assert (skip, reason) == (True, "context_too_large")
+
+
+class TestPrefillDeadlineBound:
+    """LP-0MVXWQQ20002HAX4 — the gate can never admit a doomed prefill.
+
+    Enabling capacity admission against the flat cold-prefill cap could only
+    ever buy a wasted dispatch unless the gate also honoured the admission
+    guard's own prefill deadline bounds. Both are read from the SAME config
+    the guard enforces, and both are checked against the PREFILL term only —
+    the decode allowance is not what the deadline cancels.
+    """
+
+    ETA = 60.0
+
+    def _patch_eta(self, monkeypatch, seconds: float = ETA):
+        import proxy.prefill_eta as prefill_eta
+
+        monkeypatch.setattr(
+            prefill_eta,
+            "estimate_prefill_seconds",
+            lambda *a, **k: (seconds, object()),
+        )
+
+    def test_refuses_when_prefill_reaches_the_deadline(self, monkeypatch):
+        self._patch_eta(monkeypatch)
+        cfg = _enabled_config(local_prefill_deadline_seconds=60)
+
+        assert ca.evaluate_capacity_admission(cfg, MODEL, 60_000, 0.0) is None
+
+    def test_refuses_when_prefill_exceeds_the_safety_budget(self, monkeypatch):
+        self._patch_eta(monkeypatch)
+        cfg = _enabled_config(
+            local_prefill_deadline_seconds=120,
+            local_admission_guard_budget_safety_fraction=0.5,
+        )
+
+        # 60 s prefill > 0.5 x 120 s = 60 s safety budget (strictly greater is
+        # the guard's rule; equality is admitted, so use 61 s to be explicit).
+        self._patch_eta(monkeypatch, 61.0)
+
+        assert ca.evaluate_capacity_admission(cfg, MODEL, 60_000, 0.0) is None
+
+    def test_admits_when_prefill_fits_both_bounds(self, monkeypatch):
+        self._patch_eta(monkeypatch)
+        cfg = _enabled_config(
+            local_prefill_deadline_seconds=120,
+            local_admission_guard_budget_safety_fraction=0.95,
+        )
+
+        decision = ca.evaluate_capacity_admission(cfg, MODEL, 60_000, 0.0)
+
+        assert decision is not None
+        assert decision["prefill_seconds"] == pytest.approx(self.ETA)
+        assert decision["deadline_seconds"] == pytest.approx(120.0)
+        assert decision["deadline_budget_seconds"] == pytest.approx(114.0)
+        # The decode allowance is part of the ledger projection only.
+        assert decision["projected_seconds"] == pytest.approx(
+            self.ETA + ca.DEFAULT_DECODE_SECONDS
+        )
+
+    def test_decode_allowance_is_not_charged_against_the_deadline(
+        self, monkeypatch
+    ):
+        """A short prefill with a large decode allowance still fits."""
+        self._patch_eta(monkeypatch)
+        cfg = _enabled_config(
+            local_prefill_deadline_seconds=61,
+            local_capacity_admission_decode_seconds=600,
+        )
+
+        decision = ca.evaluate_capacity_admission(cfg, MODEL, 60_000, 0.0)
+
+        assert decision is not None
+        assert decision["projected_seconds"] == pytest.approx(660.0)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"local_prefill_deadline_seconds": 0},
+            {
+                "local_prefill_deadline_seconds": 3600,
+                "local_admission_guard_budget_safety_fraction": 0.0,
+            },
+        ],
+    )
+    def test_disabled_bounds_leave_the_ledger_as_the_only_limit(
+        self, monkeypatch, overrides
+    ):
+        """0 disables a bound (documented guard rollback) — no silent refusal."""
+        # 6000 s + decode cannot fit the 0.8 x 7200 s idle ledger, so only the
+        # ledger may refuse here.
+        self._patch_eta(monkeypatch, 6000.0)
+
+        assert (
+            ca.evaluate_capacity_admission(
+                _enabled_config(**overrides), MODEL, 60_000, 0.0
+            )
+            is None
+        ), "sanity: the 6000 s projection must exhaust the idle ledger"
+
+        self._patch_eta(monkeypatch, 100.0)
+
+        decision = ca.evaluate_capacity_admission(
+            _enabled_config(**overrides), MODEL, 60_000, 0.0
+        )
+
+        assert decision is not None, "no deadline bound may refuse this prompt"

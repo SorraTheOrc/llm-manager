@@ -1,0 +1,94 @@
+{
+  "meta": {
+    "tool": "scripts/contention_queue_sweep_report.py",
+    "work_item": "LP-0MVT110PJ003XYLP",
+    "parent_work_item": "LP-0MVIKPRMD000Y97R",
+    "generated_at": "2026-10-31T05:12:24",
+    "log_dir": "/var/log/llama-proxy",
+    "parser": "proxy-usage-analysis/log_parser",
+    "sweep_budget_seconds": 30.0,
+    "min_hours": 24.0,
+    "max_gap_seconds": 3600.0,
+    "window": {
+      "since": "2026-10-30 05:00:00",
+      "until": "2026-10-31 05:00:00",
+      "hours": 24.0
+    },
+    "coverage": {
+      "files": 9,
+      "gaps": [],
+      "covered": true,
+      "data_start": "2026-10-30 05:00:00",
+      "data_end": "2026-10-31 05:00:00"
+    }
+  },
+  "sections": {
+    "ticket_backed": {
+      "count": 0,
+      "per_hour": 0.0,
+      "note": "reported for context only \u2014 ticket-backed dispatches are not a flip gate for the sweep"
+    },
+    "residual_wins": {
+      "count": 214,
+      "per_hour": 8.92,
+      "sweep_budget_seconds": 30.0,
+      "at_or_below_budget": 124,
+      "over_budget": 90,
+      "share_at_or_below_budget_pct": 57.9,
+      "wait_seconds": {
+        "n": 214,
+        "total": 4926.64,
+        "mean": 23.02,
+        "p50": 22.19,
+        "p75": 36.54,
+        "p90": 48.45,
+        "max": 59.49
+      }
+    },
+    "residual_losses": {
+      "count": 137,
+      "per_hour": 5.71,
+      "aggregate_wait_seconds": 8222.21,
+      "wait_per_hour_seconds": 342.59,
+      "mean_wait_seconds": 60.02,
+      "wait_seconds": {
+        "n": 137,
+        "total": 8222.21,
+        "mean": 60.02,
+        "p50": 60.0,
+        "p75": 60.0,
+        "p90": 60.0,
+        "max": 60.35
+      },
+      "by_reason": {
+        "local_lease_active": {
+          "count": 73,
+          "aggregate_wait_seconds": 4381.15,
+          "mean_wait_seconds": 60.02,
+          "share_of_losses_pct": 53.3
+        },
+        "none": {
+          "count": 64,
+          "aggregate_wait_seconds": 3841.06,
+          "mean_wait_seconds": 60.02,
+          "share_of_losses_pct": 46.7
+        }
+      },
+      "reason_groups": {
+        "local_lease_active": 73,
+        "none": 64,
+        "other": 0
+      }
+    },
+    "queue_events": {
+      "count": 351,
+      "per_hour": 14.62,
+      "win_share_pct": 61.0,
+      "loss_share_pct": 39.0
+    }
+  },
+  "status": {
+    "complete": true,
+    "reasons": []
+  }
+}

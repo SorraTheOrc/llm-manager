@@ -8,8 +8,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=rgardler
-Group=rgardler
+# NOTE: this is the *user-service* template (installed into
+# ~/.config/systemd/user/). Do NOT add User=/Group= here — the systemd user
+# manager already runs as your user and cannot set supplementary groups, so the
+# unit dies at exec with "Failed to determine supplementary groups" /
+# status=216/GROUP. For a system service, see docs/systemd/.
 WorkingDirectory=/home/rgardler/projects/llm
 ExecStart=/home/rgardler/projects/llm/scripts/podman_start_llama.sh router
 Environment=LLAMA_HOST_REPO=/home/rgardler/projects/llm

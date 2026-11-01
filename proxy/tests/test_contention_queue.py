@@ -41,11 +41,17 @@ from proxy import contention_queue
 # Helpers
 # ---------------------------------------------------------------------------
 
+#: The contention queue is a **pin-local** surface: since
+#: LP-0MVUH9PUU005HVS4 the default (``remote-ok``) never queues, so a stub that
+#: exercises a queue/admission-refusal path must send the pin-local value.
+PIN_LOCAL_HEADERS = {"X-Local-Preference": "local-preferred"}
+
+
 class _DummyRequest:
     """Minimal request stub for use in fallback tests."""
-    def __init__(self, body: bytes = b'{"model":"test"}'):
+    def __init__(self, body: bytes = b'{"model":"test"}', headers=None):
         self._body = body
-        self.headers = {}
+        self.headers = headers or {}
         self.method = "POST"
         self.url = type("U", (), {"path": "/v1/chat/completions"})()
 
@@ -178,7 +184,7 @@ async def test_queue_on_contention_dispatches_local_when_slot_frees(
         call_log.append("remote")
         return _ok_response()
 
-    request = _DummyRequest()
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
     cfg = _queue_cfg()
 
     with (
@@ -222,9 +228,14 @@ async def test_queue_on_contention_dispatches_local_when_slot_frees(
 
 @pytest.mark.asyncio
 async def test_fallback_after_max_wait_exceeded(mixed_model_config, caplog):
-    """When the wait cap is exceeded (no slot frees), fall back to the next
-    remote provider exactly as today. The fallback-after-queue event records
-    the elapsed wait time (F4 AC2)."""
+    """When the wait cap is exceeded (no slot frees) the queue reports a
+    fallback and the event records the elapsed wait time (F4 AC2).
+
+    The *client* that waited is pin-local, so it is never silently moved to a
+    paid provider: the fallback becomes the retryable ``429`` deferral
+    (LP-0MVUH9PUU005HVS4 — the non-pinned default never queues at all, so it
+    cannot reach this exit).
+    """
     import logging
 
     caplog.set_level(logging.INFO, logger="llama-proxy.provider")
@@ -239,7 +250,7 @@ async def test_fallback_after_max_wait_exceeded(mixed_model_config, caplog):
         call_log.append("remote")
         return _ok_response()
 
-    request = _DummyRequest()
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
     cfg = _queue_cfg()
 
     with (
@@ -257,8 +268,13 @@ async def test_fallback_after_max_wait_exceeded(mixed_model_config, caplog):
             request, "v1/chat/completions", mixed_model_config, cfg
         )
 
-    assert result.status_code == 200
-    assert call_log == ["remote"], "wait-cap exceeded must fall back to remote"
+    assert result.status_code == 429, (
+        "a pin-local client that spent its wait budget gets the retryable "
+        f"deferral, never a paid dispatch; got {result.status_code}"
+    )
+    assert call_log == [], "the pin must not be broken by a queue expiry"
+    assert result.headers.get("X-Local-Route") == "refused"
+    assert result.headers.get("X-Local-Fallback-Reason") == "fallback_after_queue"
 
     # F1 AC2: the fallback-after-queue log line carries the elapsed wait.
     messages = " ".join(r.getMessage() for r in caplog.records)
@@ -305,8 +321,12 @@ async def test_queue_module_depth_cap_returns_none():
 
 @pytest.mark.asyncio
 async def test_fallback_after_max_depth_exceeded_integration(mixed_model_config):
-    """Provider level: with max_depth=1, a second concurrent request falls
-    back to remote immediately while the first is queued."""
+    """Provider level: with max_depth=1, a second concurrent request is turned
+    away immediately while the first is queued.
+
+    The turned-away request is pin-local, so the depth-cap fallback surfaces as
+    the retryable ``429`` deferral (never a paid dispatch).
+    """
     concurrency = _MutableConcurrency(active=1, max_=1)
     call_log = []
 
@@ -332,7 +352,7 @@ async def test_fallback_after_max_depth_exceeded_integration(mixed_model_config)
     ):
         first = asyncio.create_task(
             provider.proxy_with_fallback(
-                _DummyRequest(), "v1/chat/completions", mixed_model_config, cfg
+                _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), "v1/chat/completions", mixed_model_config, cfg
             )
         )
         # Let the first request occupy the single depth slot.
@@ -344,10 +364,17 @@ async def test_fallback_after_max_depth_exceeded_integration(mixed_model_config)
 
         # Second request: depth exceeded → immediate remote fallback.
         result2 = await provider.proxy_with_fallback(
-            _DummyRequest(), "v1/chat/completions", mixed_model_config, cfg
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), "v1/chat/completions", mixed_model_config, cfg
         )
-        assert result2.status_code == 200
-        assert "remote" in call_log
+        assert result2.status_code == 429, (
+            "the depth cap turns a pinned request away with the retryable "
+            f"deferral; got {result2.status_code}"
+        )
+        assert result2.headers.get("X-Local-Fallback-Reason") == (
+            "fallback_after_queue"
+        )
+        assert "remote" not in call_log, "the pin must not be broken at the depth cap"
+        assert "local" not in call_log, "the second request never got a slot"
 
         # Free the slot → the queued first request dispatches local.
         concurrency.active = 0
@@ -482,7 +509,7 @@ async def test_cheap_mode_economic_bypass_queues_when_busy(mixed_model_config):
         call_log.append("remote")
         return _ok_response()
 
-    request = _DummyRequest(body=_economic_bypass_body())
+    request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS), body=_economic_bypass_body())
     cfg = _queue_cfg(
         local_large_context_cold_cache_threshold=100,
         local_large_context_warm_cache_threshold=100_000,
@@ -817,7 +844,7 @@ async def test_queued_dispatch_marks_request_budget(mixed_model_config):
         patch("proxy.provider._get_local_concurrency_info", concurrency),
         patch("proxy.provider.request_priority", return_value="low"),
     ):
-        request = _DummyRequest()
+        request = _DummyRequest(headers=dict(PIN_LOCAL_HEADERS))
         task = asyncio.create_task(
             provider.proxy_with_fallback(
                 request, "v1/chat/completions", mixed_model_config, cfg
@@ -843,7 +870,12 @@ async def test_queued_dispatch_marks_request_budget(mixed_model_config):
 
 @pytest.mark.asyncio
 async def test_queue_log_lines_emitted_for_queue_policy(mixed_model_config, caplog):
-    """Dispatch / fallback log lines carry queue context in queue policy."""
+    """Dispatch / fallback log lines carry queue context in queue policy.
+
+    A pin-local client that spends its queue budget is refused, so the
+    fallback-after-queue line is the *log* evidence of the expiry while no
+    provider is dispatched.
+    """
     import logging
 
     caplog.set_level(logging.INFO, logger="llama-proxy.provider")
@@ -866,10 +898,10 @@ async def test_queue_log_lines_emitted_for_queue_policy(mixed_model_config, capl
         ),
     ):
         await provider.proxy_with_fallback(
-            _DummyRequest(), "v1/chat/completions", mixed_model_config, cfg
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)), "v1/chat/completions", mixed_model_config, cfg
         )
 
-    assert call_log == ["remote"]
+    assert call_log == []
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "contention_queue_fallback_after_queue" in messages
 
@@ -997,21 +1029,22 @@ def test_contention_queue_config_logs_invalid_values(caplog):
 
 
 def test_cheap_config_declares_queue_policy():
-    """The merged cheap profile declares queue policy + tuned caps (F2 AC1,
+    """The merged cheap profile declares queue policy + the swept caps (F2 AC1,
     caps tuned 60→120 / 4→8 per LP-0MTF6EVLW007PEHN; halved 120→60 in
-    LP-0MVIQ0EXV00673HO)."""
+    LP-0MVIQ0EXV00673HO; swept 60→30 / 8→2 in LP-0MVT1146V007WXA4)."""
     from config_test_utils import get_merged_config
 
     server = get_merged_config("cheap")["server"]
     assert server["contention_queue_policy"] == "queue"
-    assert server["contention_queue_max_wait_seconds"] == 60
-    assert server["contention_queue_max_depth"] == 8
+    assert server["contention_queue_max_wait_seconds"] == 30
+    assert server["contention_queue_max_depth"] == 2
 
 
 def test_fast_config_declares_queue_policy():
-    """The merged fast profile declares queue policy + the same tuned caps as
-    cheap (depth 8, wait 60s). LP-0MV881O5C007PSL4 raised fast to cheap caps
-    (wait 120s); LP-0MVIQ0EXV00673HO halved the unified cap to 60s.
+    """The merged fast profile declares queue policy + the same swept caps as
+    cheap (depth 2, wait 30s). LP-0MV881O5C007PSL4 raised fast to cheap caps
+    (wait 120s); LP-0MVIQ0EXV00673HO halved the unified cap to 60s;
+    LP-0MVT1146V007WXA4 swept both to 30s / depth 2 (straggler net).
 
     Fast mode originally used a smaller queue (depth 3 vs 8, wait 45s vs 120s,
     LP-0MTQYIK4Z008XF2V) so burst traffic spilled to remotes sooner during
@@ -1023,8 +1056,8 @@ def test_fast_config_declares_queue_policy():
 
     server = get_merged_config("fast")["server"]
     assert server["contention_queue_policy"] == "queue"
-    assert server["contention_queue_max_wait_seconds"] == 60
-    assert server["contention_queue_max_depth"] == 8
+    assert server["contention_queue_max_wait_seconds"] == 30
+    assert server["contention_queue_max_depth"] == 2
 
 
 def test_fast_queue_caps_match_cheap():
@@ -1042,6 +1075,191 @@ def test_fast_queue_caps_match_cheap():
         f"fast wait {fast['contention_queue_max_wait_seconds']} must equal cheap wait "
         f"{cheap['contention_queue_max_wait_seconds']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Sweep 60 s / depth 8 → 30 s / depth 2 (LP-0MVT1146V007WXA4)
+#
+# The swept values must reach the queue through the one resolver, and both
+# must behave as a straggler net: depth 2 spills the third waiter immediately
+# and a parked waiter gives up at 30 s. Never a real 30 s sleep below.
+# ---------------------------------------------------------------------------
+
+
+def _shipped_server_block() -> dict:
+    """The shipped ``proxy/config.yaml`` server block (single source of truth)."""
+    from config_test_utils import get_merged_config
+
+    return get_merged_config("fast")["server"]
+
+
+def _shipped_runtime_config() -> dict:
+    """Runtime config whose queue caps come from the shipped file.
+
+    ``proxy_with_fallback`` resolves the caps through
+    ``_get_contention_queue_config(config)``, so passing the real server block
+    exercises the shipped values end to end (no patched resolver).
+    """
+    return {"provider_cooldown_seconds": 60, "server": dict(_shipped_server_block())}
+
+
+def test_shipped_sweep_reaches_one_resolver_and_both_caps():
+    """AC2: one resolver feeds the queue, the admission guard and ``/reserve``.
+
+    The shipped ``contention_queue_max_wait_seconds`` (30) and
+    ``contention_queue_max_depth`` (2) are read through
+    ``_get_contention_queue_config``; ``wait_budget_seconds`` is that same
+    number on both local paths, and ``high`` priority (which never queues)
+    resolves to 0.
+    """
+    from proxy.router import _get_contention_queue_config
+
+    from proxy import prefill_eta
+
+    server = _shipped_server_block()
+    queue_cfg = _get_contention_queue_config(server)
+    resolved = {"server": server}
+
+    assert queue_cfg["max_wait_seconds"] == 30.0
+    # Depth 2 is inside the [1, 16] clamp: accepted unchanged, not coerced.
+    assert queue_cfg["max_depth"] == 2
+    assert prefill_eta.wait_budget_seconds(resolved, "medium") == 30.0
+    assert prefill_eta.wait_budget_seconds(resolved, "low") == 30.0
+    assert prefill_eta.wait_budget_seconds(resolved, "high") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_shipped_sweep_caps_reach_the_provider_queue_wait(
+    mixed_model_config,
+):
+    """AC2 end to end: the provider hands the shipped 30 s / depth 2 to the
+    queue wait (the resolver is NOT patched in this test).
+
+    The spy reports "caps exceeded", which for the pin-local client that waited
+    is the retryable ``429`` deferral rather than a paid dispatch.
+    """
+    calls: list[dict] = []
+    call_log: list[str] = []
+
+    async def _spy_wait(**kwargs):
+        calls.append(kwargs)
+        return None  # caps exceeded → the caller falls back remote
+
+    async def _mock_proxy_to_local(_req, _path):
+        call_log.append("local")
+        return _ok_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        call_log.append("remote")
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _MutableConcurrency(1, 1)),
+        patch("proxy.provider.request_priority", return_value="low"),
+        # ``provider.py`` imports the queue lazily (``from proxy import
+        # contention_queue``), so patching the module attribute is what the
+        # wait site resolves at call time.
+        patch("proxy.contention_queue.wait_for_local_slot", _spy_wait),
+    ):
+        result = await provider.proxy_with_fallback(
+            _DummyRequest(headers=dict(PIN_LOCAL_HEADERS)),
+            "v1/chat/completions",
+            mixed_model_config,
+            _shipped_runtime_config(),
+        )
+
+    assert result.status_code == 429
+    assert call_log == []
+    assert [(c["max_wait_seconds"], c["max_depth"]) for c in calls] == [(30.0, 2)]
+
+
+@pytest.mark.asyncio
+async def test_swept_depth_two_third_waiter_falls_back_without_enqueueing():
+    """AC4: depth 2 is a straggler net — with two waiters already parked a
+    third request falls back immediately instead of enqueueing."""
+    from proxy.router import _get_contention_queue_config
+
+    queue_cfg = _get_contention_queue_config(_shipped_server_block())
+    assert queue_cfg["max_depth"] == 2
+
+    parked = [
+        asyncio.create_task(
+            contention_queue.wait_for_local_slot(
+                queue_cfg["max_wait_seconds"],
+                queue_cfg["max_depth"],
+                slot_free_check=lambda: False,
+            )
+        )
+        for _ in range(2)
+    ]
+    try:
+        for _ in range(200):
+            if contention_queue.queue_depth() == 2:
+                break
+            await asyncio.sleep(0.005)
+        assert contention_queue.queue_depth() == 2
+
+        third = await contention_queue.wait_for_local_slot(
+            queue_cfg["max_wait_seconds"],
+            queue_cfg["max_depth"],
+            slot_free_check=lambda: False,
+        )
+
+        assert third is None, "the third waiter must not park (depth cap 2)"
+        assert contention_queue.queue_depth() == 2
+    finally:
+        for task in parked:
+            task.cancel()
+        await asyncio.gather(*parked, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_swept_budget_expires_at_thirty_seconds(monkeypatch):
+    """AC4: a parked waiter that is never served falls back at the shipped
+    30 s budget.
+
+    The clock and the wait primitive are faked, so the assertion is on the
+    *budget handed to the wait* (30.0 s, resolved from the shipped config) —
+    never a real 30 s sleep.
+    """
+    from types import SimpleNamespace
+
+    from proxy.router import _get_contention_queue_config
+
+    queue_cfg = _get_contention_queue_config(_shipped_server_block())
+    assert queue_cfg["max_wait_seconds"] == 30.0
+
+    clock = {"now": 1_000.0}
+    timeouts: list[float] = []
+
+    async def _fake_wait_for(awaitable, timeout):
+        timeouts.append(timeout)
+        awaitable.close()
+        clock["now"] += timeout  # the wait consumed the whole budget
+        raise TimeoutError
+
+    monkeypatch.setattr(
+        contention_queue,
+        "asyncio",
+        SimpleNamespace(
+            Condition=asyncio.Condition,
+            Event=asyncio.Event,
+            wait_for=_fake_wait_for,
+        ),
+    )
+    monkeypatch.setattr(contention_queue.time, "monotonic", lambda: clock["now"])
+
+    result = await contention_queue.wait_for_local_slot(
+        queue_cfg["max_wait_seconds"],
+        queue_cfg["max_depth"],
+        slot_free_check=lambda: False,
+    )
+
+    assert result is None
+    assert timeouts == [30.0], "the wait must be bounded by the shipped 30 s"
+    assert contention_queue.queue_depth() == 0
 
 
 # ===================================================================
@@ -1168,6 +1386,125 @@ async def test_lease_denied_queue_budget_expires_falls_back_to_remote(lease_stat
     messages = " ".join(r.getMessage() for r in caplog.records)
     assert "contention_queue_fallback_after_queue" in messages
     assert "reason=local_lease_active" in messages
+
+
+@pytest.mark.asyncio
+async def test_lease_denied_dispatch_log_carries_own_new_tokens(lease_state, caplog):
+    """AC2: the dispatch line that ends a queue wait carries the wait's own
+    ``new_tokens`` (stamped at enqueue), never a join to another request."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [{"name": "local-llama", "type": "local", "llama_model": "Qwen3"}]
+    }
+    local_calls = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        local_calls.append(1)
+        if len(local_calls) == 1:
+            return _lease_active_response()
+        return _ok_response()
+
+    request = _DummyRequest()
+    setattr(request, provider.CONTENTION_QUEUE_NEW_TOKENS_ATTR, 35077)
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("dispatch", None, 0.5)),
+        ),
+    ):
+        await provider.proxy_with_fallback(
+            request, "v1/chat/completions", config, _queue_cfg()
+        )
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_dispatch" in messages
+    assert "new_tokens=35077" in messages
+
+
+@pytest.mark.asyncio
+async def test_lease_denied_fallback_log_carries_own_new_tokens(lease_state, caplog):
+    """AC2: the abandon line carries the same own-request ``new_tokens``."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [
+            {"name": "local-llama", "type": "local", "llama_model": "Qwen3"},
+            {"name": "remote-ok", "type": "remote",
+             "endpoint": "https://api.example.com/v1"},
+        ]
+    }
+
+    async def _mock_proxy_to_local(_req, _path):
+        return _lease_active_response()
+
+    async def _mock_proxy_to_remote(_req, _path, _pc):
+        return _ok_response()
+
+    request = _DummyRequest()
+    setattr(request, provider.CONTENTION_QUEUE_NEW_TOKENS_ATTR, 6000)
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.server.proxy_to_remote", _mock_proxy_to_remote),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("fallback", None, 300.0)),
+        ),
+    ):
+        await provider.proxy_with_fallback(
+            request, "v1/chat/completions", config, _queue_cfg()
+        )
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_fallback_after_queue" in messages
+    assert "new_tokens=6000" in messages
+
+
+@pytest.mark.asyncio
+async def test_lease_denied_dispatch_log_degrades_without_enqueue_evidence(
+    lease_state, caplog
+):
+    """Missing enqueue evidence logs ``new_tokens=unknown`` — a parseable
+    absence, never a guessed band."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+    config = {
+        "providers": [{"name": "local-llama", "type": "local", "llama_model": "Qwen3"}]
+    }
+    local_calls = []
+
+    async def _mock_proxy_to_local(_req, _path):
+        local_calls.append(1)
+        if len(local_calls) == 1:
+            return _lease_active_response()
+        return _ok_response()
+
+    with (
+        patch("proxy.router.proxy_to_local", _mock_proxy_to_local),
+        patch("proxy.provider._get_local_concurrency_info", _free_concurrency()),
+        patch("proxy.provider.request_priority", return_value="low"),
+        patch(
+            "proxy.provider._maybe_queue_for_local_slot",
+            new=AsyncMock(return_value=("dispatch", None, 0.5)),
+        ),
+    ):
+        await provider.proxy_with_fallback(
+            _DummyRequest(), "v1/chat/completions", config, _queue_cfg()
+        )
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "contention_queue_dispatch" in messages
+    assert "new_tokens=unknown" in messages
 
 
 @pytest.mark.asyncio

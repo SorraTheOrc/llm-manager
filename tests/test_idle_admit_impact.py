@@ -13,7 +13,9 @@ written against:
   * AC2 — idle-admitted requests are paired to their local dispatch by session
     inside the correlation window, bucketed by prompt size, and compared with
     non-idle dispatches in the same bucket with sample counts;
-  * AC3 — denials are compared per hour and mid-stream timeouts are split into
+  * AC3 — denials are compared on the load-normalised **denials per
+    bypass+fallback event** rate (the raw per-hour delta is reported alongside
+    it but is load-confounded) and mid-stream timeouts are split into
     *attributed* (session-matched), *coincident* (no session id, inside the
     window) and *unrelated* rather than silently blamed on the override;
   * AC4 — the interactive priority tier's first-byte p50/p90 is compared
@@ -71,6 +73,21 @@ def _idle_admit(ts, session, tokens=90000, idle=412.3):
         f"{ts} - INFO - routing_idle_admit provider=local model=Qwen3 "
         f"reason=economic_bypass_idle idle_seconds={idle} threshold_seconds=60.0 "
         f"estimated_tokens={tokens} new_tokens={tokens} cached_ratio=0.05 "
+        f"cache_state=cold session={session}\n"
+    )
+
+
+def _idle_admit_refused(ts, session, tokens=98485, idle=101.9,
+                        reason="prefill_budget_exceeded"):
+    """Admit-time prefill-feasibility refusal (LP-0MVRCLPVI0057116).
+
+    Different event from an admission: the override priced the prompt and
+    refused BEFORE dispatch, so nothing reaches a slot.
+    """
+    return (
+        f"{ts} - INFO - routing_idle_admit_refused provider=local-qwen3 model=Qwen3 "
+        f"reason={reason} idle_seconds={idle} threshold_seconds=60.0 "
+        f"estimated_tokens={tokens} new_tokens={tokens} cached_ratio=0.00 "
         f"cache_state=cold session={session}\n"
     )
 
@@ -331,23 +348,23 @@ def test_ac1_window_aggregates(tmp_path):
 
 def test_ac1_fallback_reasons_are_attributed(tmp_path):
     lines = _baseline_lines() + [
-        _fallback("2026-10-19 09:00:00,000", reason="rate_limited"),
-        _fallback("2026-10-19 09:10:00,000", reason="rate_limited"),
+        _fallback("2026-10-19 09:00:00,000", reason="provider_budget_exhausted"),
+        _fallback("2026-10-19 09:10:00,000", reason="provider_budget_exhausted"),
     ]
     data, _ = _result(_write_log(tmp_path, lines))
     reasons = data["windows"]["before"]["ac1"]["fallback_by_reason"]
-    assert reasons["rate_limited"] == 2
+    assert reasons["provider_budget_exhausted"] == 2
     assert reasons["large_context_bypass"] == 4
 
 
 def test_ac1_session_bearing_fallback_lines_keep_their_reason(tmp_path):
     """LP-0MVMBMSWR0036RES appends ``session=``/``attempt=`` (plus budget
-    fields for ``rate_limited*``) after ``reason=``; the reason must still be
+    fields for ``provider_budget_exhausted*``) after ``reason=``; the reason must still be
     counted, and the session must be picked up by the timeout-attribution
     evidence."""
     lines = _baseline_lines() + [
         "2026-10-19 09:00:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-        "from=local-qwen3, to=munitoai-free, reason=rate_limited "
+        "from=local-qwen3, to=munitoai-free, reason=provider_budget_exhausted "
         "session=herdr-1792767061-1282111-17770 attempt=1 limit=60 remaining=0 waited=0.000\n",
         "2026-10-19 09:10:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
         "from=munitoai-free, to=opencode-go, reason=HTTP 502 "
@@ -355,14 +372,65 @@ def test_ac1_session_bearing_fallback_lines_keep_their_reason(tmp_path):
     ]
     data, _ = _result(_write_log(tmp_path, lines))
     reasons = data["windows"]["before"]["ac1"]["fallback_by_reason"]
-    assert reasons["rate_limited"] == 1
+    assert reasons["provider_budget_exhausted"] == 1
     assert reasons["HTTP 502"] == 1
     assert reasons["large_context_bypass"] == 4
 
 
 # ---------------------------------------------------------------------------
-# AC2 — idle vs non-idle dispatches at the same context bucket
+# AC1 — window aggregates
 # ---------------------------------------------------------------------------
+
+
+def test_ac1_idle_admit_refusals_are_not_counted_as_admissions(tmp_path):
+    """`routing_idle_admit_refused` must not inflate the admitted population.
+
+    The refusal line (LP-0MVRCLPVI0057116 admit-time pricing) is a prefix match
+    for `routing_idle_admit`, so a naive substring parse counts every refusal as
+    an admission — in a post-fix window that is ~70x the real admits and turns
+    every one of them into a phantom "unpaired admit", which is what made AC2
+    look unmeasurable.
+    """
+    lines = _baseline_lines() + [
+        _idle_admit("2026-10-20 01:00:00,000", "idle-real", tokens=90000),
+        _dispatch("2026-10-20 01:00:02,000", "idle-real", 60200.0, 60000.0,
+                  priority="high", tokens=90000),
+        _idle_admit_refused("2026-10-20 02:00:00,000", "idle-refused"),
+        _idle_admit_refused("2026-10-20 02:10:00,000", "idle-refused-2",
+                            reason="eta_exceeds_budget"),
+    ]
+    data, _ = _result(_write_log(tmp_path, lines))
+    ac1 = data["windows"]["after"]["ac1"]
+    assert ac1["local_idle_admit"] == 1
+    assert ac1["local_idle_admit_refused"] == 2
+    assert ac1["idle_admit_refused_by_reason"] == {
+        "prefill_budget_exceeded": 1,
+        "eta_exceeds_budget": 1,
+    }
+    counts = data["windows"]["after"]["ac2"]["idle_admitted_sample_counts"]
+    assert counts == {
+        "idle_admit_events": 1,
+        "paired_local_dispatches": 1,
+        "unpaired_admits": 0,
+    }
+    event_counts = data["windows"]["after"]["event_counts"]
+    assert event_counts["idle_admit"] == 1
+    assert event_counts["idle_admit_refused"] == 2
+
+
+def test_ac1_pairs_idle_admit_before_its_refusal_prefix(tmp_path):
+    """A refusal must not be counted even when it is the only idle line."""
+    lines = _baseline_lines() + [
+        _idle_admit_refused("2026-10-20 02:00:00,000", "idle-refused"),
+    ]
+    data, _ = _result(_write_log(tmp_path, lines))
+    ac1 = data["windows"]["after"]["ac1"]
+    assert ac1["local_idle_admit"] == 0
+    assert ac1["local_idle_admit_refused"] == 1
+    assert data["verdict"]["recommendation"]["decision"] == "measure"
+    assert any(
+        "No `routing_idle_admit` events" in note for note in data["verdict"]["notes"]
+    )
 
 
 def test_ac2_pairs_idle_admits_with_their_dispatch(tmp_path):
@@ -415,6 +483,52 @@ def test_ac2_dispatch_outside_correlation_window_is_not_paired(tmp_path):
     assert counts["unpaired_admits"] == 1
     # The dispatch still counts as a non-idle local dispatch.
     assert data["windows"]["after"]["ac2"]["non_idle_service_ms"]["n"] == 1
+
+
+def test_ac2_check_is_measurable_when_enough_admits_pair(tmp_path):
+    data, _ = _result(_write_log(tmp_path, _baseline_lines() + _after_lines()))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC2:")
+    )
+    assert check["measurable"] is True
+    assert check["pass"] is True
+    assert check["idle_admits"] == 6
+    assert check["unpaired_admits"] == 0
+
+
+def test_ac2_states_the_comparison_is_unmeasurable_when_nothing_paired(tmp_path):
+    """An admit that never dispatched leaves AC2 with no treatment sample.
+
+    The recorded 2026-10-22→23 window is this shape (0 of 31 admits paired).
+    The report must say the comparison is *unmeasurable* with its sample
+    counts, not merely fail a check: that is what the parent's AC2 allows
+    ("the comparison must state sample counts").
+    """
+    lines = _baseline_with_interactive() + [
+        _idle_admit("2026-10-20 01:00:00,000", "refused-1", tokens=95000),
+        _fallback("2026-10-20 01:00:01,000"),
+        # A non-idle control dispatch, so the note's control sample count is real.
+        _dispatch("2026-10-20 03:00:00,000", "other", 40000.0, 39900.0,
+                  cache_state="warm", priority="medium", tokens=20000),
+    ]
+    data, _ = _result(_write_log(tmp_path, lines))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC2:")
+    )
+    assert check["measurable"] is False
+    assert check["pass"] is False
+    assert check["observed"] == 0
+    assert check["idle_admits"] == 1
+    assert check["unpaired_admits"] == 1
+    assert check["non_idle_samples"] >= 1
+    note = " ".join(data["verdict"]["notes"])
+    assert "AC2 unmeasurable" in note
+    assert "0 of 1" in note
+    assert "non-idle control n=" in note
 
 
 def test_ac2_legacy_dispatch_falls_back_to_routing_check_bucket(tmp_path):
@@ -478,6 +592,116 @@ def test_ac3_denial_increase_fails_the_check(tmp_path):
     )
     assert check["pass"] is False
     assert check["observed_pct_change"] > 5.0
+    # The load-normalised rate also rises (a genuine surge fails either way),
+    # and every pre-existing key stays in the JSON next to the new
+    # normalised keys (backward-compatible check shape):
+    assert check["normalised_pct_change"] > 5.0
+    assert check["before_per_hour"] is not None
+    assert check["after_per_hour"] is not None
+    assert round(check["before_per_event"], 4) == 0.4  # 2 denials / 5 events
+    assert check["before_events"] == 5                  # 1 bypass + 4 fallbacks
+    assert check["after_events"] == 6                   # 0 bypass + 6 fallbacks
+
+
+def test_ac3_load_normalised_rate_decouples_from_window_load(tmp_path):
+    """A raw per-hour increase driven by a heavier window no longer fails AC3.
+
+    LP-0MVSAZLNL007B072 regression pin: the raw per-hour rate cannot separate
+    "the override causes denials" from "a busier window has proportionally more
+    of everything", so the verdict uses denials per bypass+fallback event.
+    Before (24 h): 2 denials over 5 events (0.40/event); after (24 h): 3
+    denials over 20 events (0.15/event). The raw per-hour rate rises
+    (0.083 -> 0.125/h, i.e. +50%, beyond the 5 % band) while the per-event
+    rate falls -62.5%: the check passes and the raw delta is still reported.
+    """
+    before = _baseline_lines()  # 1 bypass + 4 fallbacks + 2 denials
+    after = [
+        _skip_line(_stamp("2026-10-20 01:00", index * 60), f"load-{index}", cycle=0)
+        for index in range(10)
+    ] + [
+        _fallback(_stamp("2026-10-20 03:00", index * 60))
+        for index in range(10)
+    ] + [
+        _denied(_stamp("2026-10-20 20:00", index * 60))
+        for index in range(3)
+    ]
+    data, _ = _result(_write_log(tmp_path, before + after))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC3: local_dispatch_denied")
+    )
+    assert check["pass"] is True
+    assert check["normalised_pct_change"] == -62.5
+    assert round(check["before_per_event"], 4) == 0.4
+    assert round(check["after_per_event"], 4) == 0.15
+    assert check["before_events"] == 5
+    assert check["after_events"] == 20
+    # The raw per-hour delta stays reported next to the verdict metric.
+    assert check["observed_pct_change"] > 5.0
+
+
+def test_ac3_synthetic_per_event_denial_increase_still_fails(tmp_path):
+    """A genuine per-event denial increase still fails AC3."""
+    before = _baseline_lines()  # 2 denials / 5 events = 0.40 per event
+    after = [
+        _skip_line(_stamp("2026-10-20 01:00", index * 60), f"load-{index}", cycle=0)
+        for index in range(4)
+    ] + [
+        _fallback("2026-10-20 03:00:00,000"),
+    ] + [
+        _denied(_stamp("2026-10-20 20:00", index))
+        for index in range(4)
+    ]
+    data, _ = _result(_write_log(tmp_path, before + after))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC3: local_dispatch_denied")
+    )
+    # 4 denials / 5 events = 0.80 per event vs 0.40 before -> +100% -> fails.
+    assert check["pass"] is False
+    assert check["normalised_pct_change"] == 100.0
+    assert check["before_events"] == 5
+    assert check["after_events"] == 5
+
+
+def test_ac3_exact_window_numbers_normalise_as_recorded():
+    """The recorded 2026-10-22/23 window arithmetic (fail -> pass), exact.
+
+    Before 1,584 denials / 8,743 bypass+fallback events = 0.181; after 1,731 /
+    16,590 = 0.104 -> -42.4% per event (pass), while the raw per-hour rate rose
+    +9.3% (66.0 -> 72.1/h) and failed under the old verdict (LP-0MVSAZLNL007B072).
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("idle_admit_impact", SCRIPT)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    before_rate = tool._denials_per_event(1584, 8743)
+    after_rate = tool._denials_per_event(1731, 16590)
+    assert round(before_rate, 3) == 0.181
+    assert round(after_rate, 3) == 0.104
+    assert tool._pct_change(before_rate, after_rate) == -42.4
+    # What the old raw per-hour verdict compared:
+    assert tool._pct_change(1584 / 24.0, 1731 / 24.0) > 5.0
+
+
+def test_ac3_denial_check_warns_when_denials_have_no_load_events(tmp_path):
+    """Denials with zero bypass+fallback events cannot be normalised: the
+    check fails with an explicit note, never a silent vacuous pass."""
+    lines = [_denied(_stamp("2026-10-20 21:00", index * 60)) for index in range(6)]
+    data, _ = _result(_write_log(tmp_path, lines))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC3: local_dispatch_denied")
+    )
+    assert check["pass"] is False
+    assert check["before_per_event"] == 0.0   # zero denials, zero events
+    assert check["after_per_event"] is None   # denials with no events
+    assert check["normalised_pct_change"] is None
+    assert any("unmeasurable" in note for note in data["verdict"]["notes"])
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +754,98 @@ def test_ac4_unmeasurable_when_dispatch_lines_lack_priority(tmp_path):
         if check["target"].startswith("AC4:")
     )
     assert check["pass"] is False
+    assert check["measurable"] is False
     assert any("priority=" in note for note in data["verdict"]["notes"])
+
+
+def test_ac4_zero_baseline_is_unmeasurable_not_a_999_percent_regression(tmp_path):
+    """A window with no interactive-tier sample cannot express a % change.
+
+    The recorded 2026-10-22→23 window has before n=0: reporting
+    ``_NEW_ACTIVITY_PCT`` (999 %) there invents a regression the data cannot
+    support, and the parent's AC4 asks for "unchanged within noise" *or* the
+    regression stated with causal evidence — neither of which a zero-baseline
+    percentage is.
+    """
+    data, _ = _result(_write_log(tmp_path, _baseline_lines() + _after_lines()))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC4:")
+    )
+    assert check["before"]["n"] == 0
+    assert check["after"]["n"] == 5
+    assert check["measurable"] is False
+    assert check["observed_p50_pct_change"] is None
+    assert check["observed_p90_pct_change"] is None
+    assert check["pass"] is False
+    note = " ".join(data["verdict"]["notes"])
+    assert "AC4 unmeasurable" in note
+    assert "999" not in note
+    assert "Interactive latency regressed" not in note
+
+
+def test_ac4_names_a_cross_tier_prefill_overlap_as_the_cause(tmp_path):
+    """AC4's causal evidence is a prefill *overlap*, not a tier match.
+
+    A ``low``-priority idle-admitted prefill holds the slot while a
+    ``high``-priority request is dispatched; the note must name both, which is
+    the cross-tier attribution the AC4 wording asks for.
+    """
+    after = [
+        _idle_admit("2026-10-20 01:00:00,000", "idle-low", tokens=95000),
+        _dispatch("2026-10-20 01:00:02,000", "idle-low", 60200.0, 60000.0,
+                  priority="low", tokens=95000),
+        _dispatch("2026-10-20 01:00:20,000", "interactive-slow", 45000.0, 44000.0,
+                  cache_state="warm", priority="high", tokens=20000),
+        _dispatch("2026-10-20 12:00:00,000", "interactive-clear", 41000.0, 40900.0,
+                  cache_state="warm", priority="high", tokens=20000),
+    ]
+    data, _ = _result(_write_log(tmp_path, _baseline_with_interactive() + after))
+    check = next(
+        check
+        for check in data["verdict"]["checks"]
+        if check["target"].startswith("AC4:")
+    )
+    assert check["measurable"] is True
+    assert check["pass"] is False
+    overlap = data["windows"]["after"]["ac4"]["overlap"]
+    assert overlap["interactive_samples"] == 2
+    assert overlap["interactive_samples_overlapped"] == 1
+    assert overlap["idle_prefills_with_interval"] == 1
+    assert overlap["cross_tier_prefills"] == 1
+    assert overlap["same_tier_prefills"] == 0
+    assert [entry["admit_session"] for entry in overlap["cross_tier"]] == ["idle-low"]
+    assert overlap["cross_tier"][0]["interactive_sessions"] == ["interactive-slow"]
+    assert overlap["same_tier"] == []
+    note = " ".join(data["verdict"]["notes"])
+    assert "idle-low" in note and "interactive-slow" in note
+    assert "cross-tier" in note
+
+
+def test_ac4_states_when_no_idle_prefill_overlapped_the_interactive_tier(tmp_path):
+    """A regression with no overlap is stated as unattributed by this evidence."""
+    after = _after_lines(interactive_service_ms=40000.0)
+    data, _ = _result(_write_log(tmp_path, _baseline_with_interactive() + after))
+    overlap = data["windows"]["after"]["ac4"]["overlap"]
+    assert overlap["idle_prefills_with_interval"] == 6
+    assert overlap["interactive_samples"] == 5
+    assert overlap["interactive_samples_overlapped"] == 0
+    assert overlap["same_tier"] == []
+    assert overlap["cross_tier"] == []
+    note = " ".join(data["verdict"]["notes"])
+    assert "No in-flight overlap" in note
+
+
+def test_ac4_recommendation_reports_an_unmeasurable_tier(tmp_path):
+    """The AC5 reasons must not print a percentage for an unmeasurable tier."""
+    data, _ = _result(
+        _write_log(tmp_path, _baseline_lines() + _after_lines(fallbacks=2))
+    )
+    recommendation = data["verdict"]["recommendation"]
+    reasons = " ".join(recommendation["reasons"])
+    assert "unmeasurable" in reasons
+    assert "None%" not in reasons
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +873,19 @@ def test_ac5_recommends_enable_by_default_when_fallbacks_fall_without_harm(tmp_p
     lines = (
         _baseline_with_interactive()
         + list(chain.from_iterable(before_lease))
-        + _after_lines(fallbacks=2, denials=1)
+        # Fallbacks fall 4 -> 3 while the six lease-gate refusals still land in
+        # the after window; the AC3 verdict is the load-normalised per-event
+        # rate, so the after window carries matching economic-bypass load
+        # (8 denials / 5 events = 1.60 before vs 7 / 7 = 1.00 after) and the
+        # denial figure passes alongside the 25% fallback reduction.
+        + _after_lines(
+            fallbacks=3,
+            denials=1,
+            actions_after=[
+                _skip_line(_stamp("2026-10-20 18:00", index * 60), f"bypass-{index}")
+                for index in range(4)
+            ],
+        )
         + list(chain.from_iterable(after_lease))
     )
     data, code = _result(_write_log(tmp_path, lines))
@@ -786,7 +1113,7 @@ def test_lease_gate_absent_leaves_existing_output_unchanged(tmp_path):
     lines = [line for line in _baseline_lines() if "local_dispatch_denied" not in line]
     data, _ = _result(_write_log(tmp_path, lines))
     before = data["windows"]["before"]
-    assert before["ac1"] == {
+    expected = {
         "local_idle_admit": 0,
         "local_streams": 1,
         "remote_streams": 1,
@@ -799,6 +1126,10 @@ def test_lease_gate_absent_leaves_existing_output_unchanged(tmp_path):
         "local_prefill_slot_seconds": 39.9,
         "timeout_events": 0,
     }
+    # Every pre-existing field keeps its value; the idle-admit refusal counter
+    # (LP-0MVRCLPVI0057116) is additive and zero on a log without refusals.
+    assert {key: before["ac1"][key] for key in expected} == expected
+    assert before["ac1"]["local_idle_admit_refused"] == 0
     assert before["ac2"]["idle_admitted_sample_counts"] == {
         "idle_admit_events": 0,
         "paired_local_dispatches": 0,

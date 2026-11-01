@@ -27,9 +27,11 @@ statement, which no production helper can express (LP-0MVSHXU8E004BL57 AC6).
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -62,6 +64,12 @@ WAIT_BUDGET_REASONS = {
 
 #: Reasons whose timer comes from real expiry state rather than the ETA formula.
 REAL_EXPIRY_REASONS = {"cooldown"}
+
+#: Chain-exhaustion surfaces documented in the same table. They reuse the
+#: refusal retry vocabulary (``Retry-After`` / ``retry_at`` / ``retryable``) but
+#: are not refusal *reasons*: the slot ``429`` is the terminal exhaustion
+#: surface, not a pin-local refusal (LP-0MVUXY1CL005KWCC).
+CHAIN_EXHAUSTION_ROWS = {"all_slots_exhausted"}
 
 #: Real cooldown remainder used to replay a documented non-admission row.
 COOLDOWN_REMAINDER_SECONDS = 90
@@ -124,11 +132,44 @@ def test_documented_reasons_are_exactly_the_emitted_vocabulary():
     """One documented row per emitted reason — no invented, no missing reason."""
     documented = set(_contract_rows())
 
-    assert documented == EMITTED_REFUSAL_REASONS, (
+    assert documented == EMITTED_REFUSAL_REASONS | CHAIN_EXHAUSTION_ROWS, (
         "routing.md's per-reason retry table must document every refusal reason "
-        f"and nothing else; missing={sorted(EMITTED_REFUSAL_REASONS - documented)} "
-        f"unexpected={sorted(documented - EMITTED_REFUSAL_REASONS)}"
+        "(plus the chain-exhaustion slot surface) and nothing else; "
+        f"missing={sorted((EMITTED_REFUSAL_REASONS | CHAIN_EXHAUSTION_ROWS) - documented)} "
+        f"unexpected={sorted(documented - (EMITTED_REFUSAL_REASONS | CHAIN_EXHAUSTION_ROWS))}"
     )
+
+
+def test_documented_slot_exhaustion_row_matches_the_real_builder():
+    """The chain slot ``429`` row must describe what the builder really emits.
+
+    LP-0MVUXY1CL005KWCC: the slot-exhaustion refusal was the last admission
+    surface with no retry timing. Its documented row is replayed through the
+    real builder — with the live occupant probe pinned to "nothing
+    measurable" so the documented fallback (``slot_unavailable_retry_after``)
+    owns the value — so a doc row cannot claim a timer the response omits.
+    """
+    row = _contract_rows()["all_slots_exhausted"]
+    slot_config = {
+        "server": {
+            "max_retry_after_seconds": 3600,
+            "slot_unavailable_retry_after": 5,
+        }
+    }
+    with patch.object(
+        provider, "_local_occupant_prefill_seconds", return_value=0.0
+    ):
+        response = provider._build_exhausted_response(
+            all_local_slot_exhaustion=True, total_slots=1, config=slot_config
+        )
+    body = json.loads(response.body)
+
+    assert row["retryable"].strip("`").lower() == "true"
+    assert row["Retry-After"].lower() != "absent"
+    assert row["retry_at"].lower() != "absent"
+    assert body["retryable"] is True
+    assert body["retry_after"] == 5, "documented fallback is slot_unavailable_retry_after"
+    assert response.headers["retry-after"] == str(body["retry_after"])
 
 
 def test_documented_no_timer_rows_match_the_production_constant():
@@ -250,4 +291,151 @@ def test_local_preferred_is_documented_as_pinned_while_deferrable():
     assert "never refused for local capacity" in plain, (
         "the contract must state that a too-large request is promoted to a "
         "remote tier, never refused for local capacity"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary docs contract (LP-0MVUH9Q4O008RHDX AC1/AC2/AC3)
+#
+# The docs deliverable is prose, so these specs pin the parts a production
+# helper can adjudicate: the *documented* preference table against
+# ``admission_reserve``'s live vocabulary, the documented default against
+# ``DEFAULT_PREFERENCE``, the escalation token against the constant the proxy
+# emits, and the client-facing compaction guidance against the live set (so a
+# future retirement cannot leave advice that ``400``s).
+# ---------------------------------------------------------------------------
+
+PREFERENCE_TABLE_HEADING = "### `X-Local-Preference` request header"
+
+
+def _preference_section() -> str:
+    """The documented ``X-Local-Preference`` section, heading to next heading."""
+    text = ROUTING_DOC.read_text()
+    start = text.index(PREFERENCE_TABLE_HEADING)
+    rest = text[start + len(PREFERENCE_TABLE_HEADING) :]
+    end = re.search(r"\n#{2,4} ", rest)
+    return rest[: end.start()] if end else rest
+
+
+def _documented_preference_rows() -> list[tuple[str, str]]:
+    """``(value, row text)`` for every preference-table row.
+
+    *row text* is the value cell's own remainder (which is where the "(default)"
+    marker belongs) plus the behaviour cell, lower-cased so the assertions read
+    as behaviour rather than as copy.
+    """
+    rows: list[tuple[str, str]] = []
+    in_table = False
+    for line in _preference_section().splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            in_table = False
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if cells[0].lower() == "value":
+            in_table = True
+            continue
+        if not in_table or all(set(cell) <= set("-: ") for cell in cells):
+            continue
+        match = re.match(r"`([a-z-]+)`(.*)", cells[0])
+        assert match, f"a preference-table row must start with a backticked value: {line!r}"
+        marker = match.group(2).strip()
+        behaviour = cells[1] if len(cells) > 1 else ""
+        rows.append((match.group(1), f"{marker} {behaviour}".lower()))
+    assert rows, "the preference table must document the live values"
+    return rows
+
+
+def test_documented_preference_table_is_exactly_the_live_vocabulary():
+    """AC1/AC2: the documented values *are* ``VALID_PREFERENCES``, in order.
+
+    A documented value the proxy rejects would send clients into a ``400``; a
+    live value missing from the table would leave a supported policy
+    undiscoverable. Retired values stay out of the table entirely (they may
+    only appear as migration notes).
+    """
+    from proxy import admission_reserve
+
+    documented = [value for value, _ in _documented_preference_rows()]
+    assert sorted(documented) == sorted(admission_reserve.VALID_PREFERENCES), (
+        "the documented preference table must be exactly the live vocabulary "
+        f"{admission_reserve.VALID_PREFERENCES}, got {documented}"
+    )
+    assert len(documented) == len(set(documented)), (
+        f"a documented preference row is duplicated: {documented}"
+    )
+    for retired in admission_reserve.RETIRED_PREFERENCES:
+        assert retired not in documented, (
+            f"{retired!r} is retired: it must not appear as a table row"
+        )
+
+
+def test_documented_default_is_the_live_default_and_steps_immediately():
+    """AC1/AC2: the default row names the real default and its contract.
+
+    ``remote-ok`` is the default (an absent header resolves to it), and the
+    documented behaviour is the immediate step to the next provider — no queue,
+    no deferral, no local-capacity refusal. A future flip cannot leave the docs
+    claiming a different default.
+    """
+    from proxy import admission_reserve
+
+    rows = dict(_documented_preference_rows())
+    default = admission_reserve.DEFAULT_PREFERENCE
+    assert default in rows, f"the default {default!r} must have a table row"
+    assert "default" in rows[default], (
+        f"the {default!r} row must be marked as the default"
+    )
+    marked_defaults = [value for value, cell in rows.items() if "default" in cell]
+    assert marked_defaults == [default], (
+        "exactly one row may claim to be the default, got "
+        f"{marked_defaults}"
+    )
+    behaviour = rows[default]
+    for claim in ("no queue", "no deferral", "local-capacity `429`"):
+        assert claim in behaviour, (
+            f"the {default!r} row must state the immediate-step contract "
+            f"({claim!r} missing)"
+        )
+
+
+def test_documented_escalation_token_is_the_emitted_constant():
+    """AC2: the documented escalation token is the one the proxy emits."""
+    from proxy import admission_reserve
+
+    # The bounded-deferral contract lives in the pin-local section rather than
+    # the header table, so the whole document is searched; the token is unique.
+    whole = " ".join(ROUTING_DOC.read_text().split())
+    assert admission_reserve.LOCAL_FALLBACK_DEFERRAL_EXHAUSTED in whole, (
+        "routing.md must document the escalation token "
+        f"{admission_reserve.LOCAL_FALLBACK_DEFERRAL_EXHAUSTED!r}"
+    )
+    assert "local_deferral_max_refusals" in whole, (
+        "the deferral budget knob must be documented alongside the token"
+    )
+    assert "deferral_refusals_exhausted" in whole
+    assert admission_reserve.LOCAL_FALLBACK_DEFERRAL_EXHAUSTED == (
+        "deferral_refusals_exhausted"
+    ), "the documented spelling must stay the emitted spelling"
+
+
+def test_compaction_guidance_names_only_live_preference_values():
+    """AC3: the client-facing remedy must never advise a retired value.
+
+    ``_COMPACTION_GUIDANCE`` is shipped verbatim in a refusal body, so a
+    retired value there would tell a client to send a header that now answers
+    ``400`` — the exact stale-advice failure this slice exists to prevent.
+    """
+    from proxy import admission_reserve
+
+    guidance = provider._COMPACTION_GUIDANCE
+    named = set(re.findall(r"X-Local-Preference:\s*([A-Za-z-]+)", guidance))
+    assert named, "the compaction remedy must name a preference value to send"
+    live = set(admission_reserve.VALID_PREFERENCES)
+    assert named <= live, (
+        f"the guidance names value(s) {sorted(named - live)} that are not live; "
+        f"live values are {sorted(live)}"
+    )
+    assert not (named & set(admission_reserve.RETIRED_PREFERENCES)), (
+        "the guidance must not advise a retired value"
     )

@@ -41,6 +41,16 @@ make_sidecar() {
     fi
 }
 
+# Create an orphan sidecar (no snapshot) with a given age in days
+make_orphan() {
+    local dir="$1"
+    local age_days="$2"
+    local name="$3"
+    mkdir -p "$dir"
+    echo '{}' > "$dir/$name"
+    touch -d "$(date -d "$age_days days ago" +%Y-%m-%dT%H:%M:%S)" "$dir/$name"
+}
+
 # ---------------------------------------------------------------
 # Test: --dry-run lists candidates without deleting anything
 # ---------------------------------------------------------------
@@ -220,8 +230,10 @@ test_orphan_sidecars_pruned() {
     TESTS_TMPDIR="$(mktemp -d)"
     local cache="$TESTS_TMPDIR/cache"
     mkdir -p "$cache/localhost-8080"
-    echo '{}' > "$cache/slot_root-orphan.bin.ratio.json"
-    echo '{}' > "$cache/localhost-8080/slot_nested-orphan.bin.ratio.json"
+    # Aged beyond --min-age-days so this pins the orphan sweep, not the
+    # recent-orphan guard (LP-0MVUJBFRL005VDNA).
+    make_orphan "$cache" 3 "slot_root-orphan.bin.ratio.json"
+    make_orphan "$cache/localhost-8080" 3 "slot_nested-orphan.bin.ratio.json"
 
     local rc
     "$SCRIPT" --path "$cache" --max-age-days 7 --max-size-gb 100 >/dev/null 2>&1
@@ -237,6 +249,92 @@ test_orphan_sidecars_pruned() {
         pass "nested orphan sidecar pruned"
     else
         fail "nested orphan sidecar survived"
+    fi
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
+# Test: orphan sidecars honour --min-age-days (stale pruned, recent kept)
+# ---------------------------------------------------------------
+test_orphan_sidecar_min_age_guard() {
+    echo "Test: stale orphan sidecars pruned, ones newer than --min-age-days kept"
+    TESTS_TMPDIR="$(mktemp -d)"
+    local cache="$TESTS_TMPDIR/cache"
+    mkdir -p "$cache/localhost-8080"
+    make_orphan "$cache" 3 "slot_stale.bin.ratio.json"
+    make_orphan "$cache/localhost-8080" 0 "slot_fresh.bin.ratio.json"
+
+    local out rc
+    out=$("$SCRIPT" --path "$cache" --max-age-days 7 --max-size-gb 100 2>&1)
+    rc=$?
+
+    if [ "$rc" = "0" ]; then pass "script exits 0 with only orphan sidecars"; else fail "script exited $rc"; fi
+    if [ ! -f "$cache/slot_stale.bin.ratio.json" ]; then
+        pass "stale orphan sidecar pruned"
+    else
+        fail "stale orphan sidecar survived"
+    fi
+    if [ -f "$cache/localhost-8080/slot_fresh.bin.ratio.json" ]; then
+        pass "recent orphan sidecar kept"
+    else
+        fail "recent orphan sidecar was pruned"
+    fi
+    if echo "$out" | grep -q "SUMMARY: 1 orphan sidecar(s) kept (newer than --min-age-days)"; then
+        pass "recent orphan reported as kept"
+    else
+        fail "recent orphan not reported as kept"
+    fi
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
+# Test: orphan sidecars are pruned when --min-age-days is 0
+# ---------------------------------------------------------------
+test_orphan_min_age_zero() {
+    echo "Test: --min-age-days 0 deletes recent orphan sidecars (guard disabled)"
+    TESTS_TMPDIR="$(mktemp -d)"
+    local cache="$TESTS_TMPDIR/cache"
+    make_orphan "$cache" 0 "slot_fresh.bin.ratio.json"
+
+    "$SCRIPT" --path "$cache" --max-age-days 7 --max-size-gb 100 --min-age-days 0 >/dev/null 2>&1
+
+    if [ ! -f "$cache/slot_fresh.bin.ratio.json" ]; then
+        pass "recent orphan pruned with --min-age-days 0"
+    else
+        fail "recent orphan survived with --min-age-days 0"
+    fi
+    cleanup_tmp
+}
+
+# ---------------------------------------------------------------
+# Test: dry-run reports deletable and kept orphans, deleting neither
+# ---------------------------------------------------------------
+test_orphan_dry_run_both_categories() {
+    echo "Test: --dry-run reports deletable and kept orphans and deletes neither"
+    TESTS_TMPDIR="$(mktemp -d)"
+    local cache="$TESTS_TMPDIR/cache"
+    make_orphan "$cache" 3 "slot_stale.bin.ratio.json"
+    make_orphan "$cache" 0 "slot_fresh.bin.ratio.json"
+
+    local out rc
+    out=$("$SCRIPT" --path "$cache" --max-age-days 7 --max-size-gb 100 --dry-run 2>&1)
+    rc=$?
+
+    if [ "$rc" = "0" ]; then pass "dry-run exits 0"; else fail "dry-run exited $rc"; fi
+    if [ -f "$cache/slot_stale.bin.ratio.json" ] && [ -f "$cache/slot_fresh.bin.ratio.json" ]; then
+        pass "dry-run deleted nothing"
+    else
+        fail "dry-run deleted an orphan sidecar"
+    fi
+    if echo "$out" | grep -q "Would delete orphan sidecar"; then
+        pass "dry-run lists the deletable orphan"
+    else
+        fail "dry-run listed no deletable orphan"
+    fi
+    if echo "$out" | grep -q "DRY-RUN SUMMARY: 1 orphan sidecar(s) kept (newer than --min-age-days)"; then
+        pass "dry-run reports the kept recent orphan"
+    else
+        fail "dry-run did not report the kept recent orphan"
     fi
     cleanup_tmp
 }
@@ -262,6 +360,9 @@ test_noop_when_healthy
 test_pair_deleted_together
 test_endpoint_subdirectories
 test_orphan_sidecars_pruned
+test_orphan_sidecar_min_age_guard
+test_orphan_min_age_zero
+test_orphan_dry_run_both_categories
 test_missing_dir
 
 echo ""

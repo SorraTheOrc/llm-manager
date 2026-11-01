@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -25,7 +26,9 @@ from pathlib import Path
 
 import aggregation
 import bucketing
+import capacity_signals
 import config_loader
+import engine_cross_check
 import gpu_busy
 import llama_log_parser
 import log_parser
@@ -99,12 +102,17 @@ CONTENTION_BASELINE = {
     "source": "LP-0MVGR2OXT0096OGK description (pre-change baseline)",
 }
 
-# M3 verdict tolerance: the predicted p50 prefill duration is called a match
-# when it is within this percentage of the observed p50. Wider than the 10%
-# band the calibration itself targets because this compares two differently
-# conditioned distributions (reference-prompt, cache-cold prediction vs the
-# prompt mix that actually ran) at a quantile, not per dispatch.
+# M3 matched per-dispatch tolerance: the guard's priced ETA for a dispatch is
+# called a match when the median relative error against that same dispatch's
+# observed first-byte time is within this percentage (two-sided). It applies
+# ONLY to matched pairs (LP-0MVSD5RJW008F1IB AC1/AC3); the cross-population
+# "bound vs served remainder" comparison is a one-sided bound test below.
 PREFILL_ETA_MATCH_TOLERANCE_PCT = 25.0
+
+# M3 bound test (LP-0MVSD5RJW008F1IB AC3): below this many observed dispatches
+# the window cannot decide whether the published cache-cold bound held, so the
+# verdict is ``inconclusive`` rather than a verdict on noise.
+PREFILL_ETA_BOUND_MIN_SAMPLES = 30
 
 # M1 verdict threshold: the share of attributed denials whose decision block
 # measured zero local work (``idle_leased``) above which the lease/busy signal
@@ -120,6 +128,10 @@ class AnalysisRun:
     # Fast/cheap mode schedule map (per-mode profiles + mode timeline from the
     # logs); None when not built (e.g. no config discovered).
     mode_map: object | None = None
+    # Configured ``slots_stale`` rate target this run was generated with
+    # (LP-0MVU8O4EL005IYP9): carried so the ``--json`` output is built with the
+    # same target the rendered section used.
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET
 
 
 def _fmt_ts(ts: datetime | None) -> str:
@@ -284,6 +296,36 @@ def _error_row(e: log_parser.LogEvent) -> dict:
 
 # JSON key used when a provider or model is not derivable from the log line.
 UNKNOWN_LABEL = "(unknown)"
+
+# Bucket label for an unmeasured residency decision whose line predates the
+# additive ``measurement=`` field (LP-0MVT2QHMU0008F2V): old logs are not
+# reclassified, and "no provenance recorded" is distinct from a reason the
+# proxy actually emitted.
+UNRECORDED_MEASUREMENT_LABEL = "unrecorded"
+
+
+def _residency_measurement_breakdown(
+    summary: AnalysisResult,
+) -> tuple[int, Counter]:
+    """Return ``(measured_count, unmeasured_reason_counts)`` for residency.
+
+    The single source of truth behind both the rendered breakdown
+    (``_append_residency_section``) and the machine-readable keys in
+    ``summary_to_json`` (LP-0MVT2QHMU0008F2V); the two can never disagree.
+
+    A decision is *measured* when it carries a numeric ``reuse_ratio``. An
+    unmeasured decision is bucketed by its parsed ``measurement=`` value
+    verbatim (``unavailable:no_slot``, ...), or ``unrecorded`` when the line
+    predates the field — never fabricated into a measurement.
+    """
+    events = list(getattr(summary, "residency_events", []) or [])
+    measured_count = sum(1 for ev in events if ev.reuse_ratio is not None)
+    reasons = Counter(
+        ev.measurement or UNRECORDED_MEASUREMENT_LABEL
+        for ev in events
+        if ev.reuse_ratio is None
+    )
+    return measured_count, reasons
 
 
 def error_provider_model_json(summary: AnalysisResult) -> dict:
@@ -541,8 +583,8 @@ def local_turn_coverage(summary: AnalysisResult) -> dict:
         if _fallback_reason_label(s) in aggregation.CONTEXT_FALLBACK_REASONS
     ]
     context_before_local = [s for s in context_fallbacks if s.local_requests == 0]
-    rate_limited = [
-        s for s in all_sessions if _fallback_reason_label(s) == "rate_limited"
+    budget_exhausted = [
+        s for s in all_sessions if log_parser.is_provider_budget_reason(_fallback_reason_label(s))
     ]
 
     return {
@@ -579,7 +621,7 @@ def local_turn_coverage(summary: AnalysisResult) -> dict:
             "declined_before_local_turn": len(declined_before_local),
             "context_fallback_sessions": len(context_fallbacks),
             "context_fallback_before_local_turn": len(context_before_local),
-            "rate_limited_sessions": len(rate_limited),
+            "provider_budget_exhausted_sessions": len(budget_exhausted),
         },
     }
 
@@ -732,13 +774,14 @@ def _append_local_turn_coverage_section(
                 "the configured cold/warm thresholds — never on a session's first "
                 "message."
             )
-        if notes["rate_limited_sessions"]:
+        if notes["provider_budget_exhausted_sessions"]:
             ap(
-                "- `rate_limited` is the proxy's own per-provider RPM budget "
-                "pacing (`provider_budget.py`: the configured `rate_limit_rpm` "
-                "window for that provider is exhausted, so the request passes to "
-                "the next provider immediately) — not an upstream HTTP 429; those "
-                "surface as `upstream_http_error status=429` events instead."
+                "- `provider_budget_exhausted` is the proxy's own per-provider "
+                "RPM budget pacing (`provider_budget.py`: the configured "
+                "`rate_limit_rpm` window for that provider is exhausted, so the "
+                "request passes to the next provider immediately) — not an "
+                "upstream HTTP 429; those surface as "
+                "`upstream_http_error status=429` events instead."
             )
 
     missing = coverage["sessions_with_local"] - coverage["total"]["context_samples"]
@@ -793,6 +836,7 @@ def build_report(
     speed: llama_log_parser.SpeedStats | None = None,
     mode_map: bucketing.ModeScheduleMap | None = None,
     profiles: dict | None = None,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
 ) -> str:
     recs = recommendations.generate_recommendations(summary, config, mode_map)
     hours = (summary.window_end - summary.window_start).total_seconds() / 3600.0
@@ -988,7 +1032,12 @@ def build_report(
 
     _append_busy_section(ap, summary, schedule)
     _append_prefill_vs_decode_section(ap, summary)
+    _append_engine_cross_check_section(ap, summary, config)
     _append_contention_prediction_section(ap, summary, speed)
+    # Local capacity signals (LP-0MVU8O4EL005IYP9 AC1.4): the stale-poll rate
+    # against its configurable target, immediately after the contention
+    # prediction it explains. Omitted when the window has no status polls.
+    _append_capacity_signals_section(ap, summary, stale_rate_target)
 
     _append_mode_timeline_section(ap, summary, mode_map)
 
@@ -1038,7 +1087,8 @@ def build_report(
     )
     ap(
         "- `Fallback triggered` lines carry `session=`/`attempt=` plus budget evidence "
-        "(`limit=`/`remaining=`/`waited=`) when the reason is `rate_limited*`. A session's "
+        "(`limit=`/`remaining=`/`waited=`) when the reason is "
+        "`provider_budget_exhausted*`. A session's "
         "reason therefore comes from its own evidence (its `Fallback triggered` or "
         "`routing_skip_local` line); the nearest-line-within-60s heuristic applies only to "
         "session-less lines from rotated logs predating the session stamp, so a session never "
@@ -1620,6 +1670,32 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
     Also lists post-acceptance evictions (`local_eviction`) by reason so a
     regression in reclaim behaviour (dead sessions gating the pool) shows up
     as data rather than as a client-visible stall.
+
+    **Measurement provenance (LP-0MVT2QHMU0008F2V AC4).** The pre-change line
+    could only say `reuse_ratio=none`, which made "no slot to measure", "no
+    prior measurement for the pair" and "capture switched off" look identical
+    — the 2026-10-27 window logged 3,607 decisions with 0 measured and the AC4
+    reuse rule could never fire. The additive `measurement=` field
+    (`measured` / `unavailable:<reason>`, closed vocabulary from
+    LP-0MVT2Q1SD009JLKD) is now parsed onto `LogEvent.measurement` and this
+    section reports:
+
+    - the measured / unmeasured decision split (unchanged line);
+    - a per-reason **Unmeasured reason** table, counted with
+      `Counter(ev.measurement or "unrecorded")` over unmeasured decisions, so
+      each cause gets its own count and remedy (a line predating the field
+      counts as `unrecorded`);
+    - an explicit **all-unmeasured finding** when `measured == 0` and there
+      are residency decisions — "decisions logged but all unmeasured" is a
+      broken measurement ladder, never a quiet window.
+
+    **Downstream handoff (LP-0MVQ4X1S30034BQ1 classifier).** The same counts are
+    exposed machine-readably by `summary_to_json` as the additive keys
+    `residency_measured_decisions` (int) and
+    `residency_unmeasured_reasons` (`{reason: count}`; reasons are the raw
+    `measurement=` values, `unrecorded` for old lines). Both are computed by
+    `_residency_measurement_breakdown`, so the report and the JSON can never
+    disagree. No existing key changes meaning or value.
     """
     residency_events = list(getattr(summary, "residency_events", []) or [])
     eviction_events = list(getattr(summary, "eviction_events", []) or [])
@@ -1630,6 +1706,8 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
         return
 
     measured = [ev for ev in residency_events if ev.reuse_ratio is not None]
+    measured_count, unmeasured_reasons = _residency_measurement_breakdown(summary)
+    unmeasured_count = len(residency_events) - measured_count
     resident = [ev for ev in measured if ev.decision == "admit"]
     evicted = [
         ev
@@ -1655,6 +1733,15 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
     ap(f"- Residency decisions: **{len(residency_events)}** "
        f"(measured ratio: {len(measured)}, no measurement: "
        f"{len(residency_events) - len(measured)})")
+    if unmeasured_count and not measured_count:
+        # The exact 3607/0 production condition (LP-0MVRZXPH70025ZNR): a bare
+        # "measured ratio: 0" reads as a quiet window. Say it as a finding.
+        dominant, dominant_count = unmeasured_reasons.most_common(1)[0]
+        ap(f"- **Finding: all {unmeasured_count} residency decisions in this "
+           f"window are unmeasured** (dominant reason: `{dominant}`, "
+           f"{dominant_count} of {unmeasured_count}). The measurement ladder "
+           "is not emitting a numeric prefix — this is a defect signal, not a "
+           "quiet window.")
     ap(f"- Resident admissions (ratio at/above threshold): **{len(resident)}**")
     ap(f"- Evicted denials (`resident_prefix_insufficient`): **{len(evicted)}** "
        f"with a measured prefix, **{len(no_slot)}** with no slot at all")
@@ -1662,6 +1749,15 @@ def _append_residency_section(ap, summary: AnalysisResult) -> None:
     if eviction_events:
         ap(f"- Post-acceptance evictions (`local_eviction`): "
            f"**{len(eviction_events)}**")
+    if unmeasured_count:
+        # Per-reason breakdown (LP-0MVT2QHMU0008F2V AC4): "unmeasurable" is
+        # three different operator problems; each gets its own count.
+        ap("")
+        ap("| Unmeasured reason | Decisions | Share |")
+        ap("|---|---|---|")
+        for reason, count in unmeasured_reasons.most_common():
+            ap(f"| `{reason}` | {count} | "
+               f"{_pct(count, unmeasured_count):.1f}% |")
 
     if measured:
         def _ratio_stats(events) -> str:
@@ -2317,9 +2413,14 @@ def _append_busy_section(ap, summary: AnalysisResult, schedule: bucketing.SlotSc
         ap("_The **GPU busy** row uses Prometheus power-consumption data "
            "(`avg_over_time(gpu:computing:bool[Nh])`, evaluated every 15 s): "
            "1 while the GPU draws ≥ 90 W (the recording-rule threshold), 0 "
-           "otherwise. It is the authoritative hardware-side busy measure, "
-           "complementary to the log-based slot-occupancy figures above, "
-           "and does not depend on the proxy's stream lifecycle logs._")
+           "otherwise. It is **hardware activity, not local model "
+           "utilisation**: it counts GPU work outside the proxy's slot "
+           "accounting (other workloads, non-local requests) and misses "
+           "proxy-served work during log gaps. The decision figure for local "
+           "model utilisation is the log-derived `local_busy` "
+           "(`dispatch → finish`) above; this row is supplementary hardware "
+           "telemetry and does not depend on the proxy's stream lifecycle "
+           "logs._")
 
 
 def _phase_cell(value: float | None) -> str:
@@ -2455,6 +2556,108 @@ def _append_prefill_vs_decode_section(ap, summary: AnalysisResult) -> None:
         )
 
 
+def _delta_cell(value: float | None, *, as_percent: bool = False) -> str:
+    """Format a cross-check delta (one decimal, always signed).
+
+    ``None`` renders as ``-`` so an unavailable phase never shows a fabricated
+    ``0`` or ``100%`` (LP-0MVNWULLI006ZYXX AC4).
+    """
+    if value is None:
+        return "-"
+    return f"{value:+,.1f}%" if as_percent else f"{value:+,.1f}"
+
+
+def _append_engine_cross_check_section(
+    ap, summary: AnalysisResult, config: dict | None
+) -> None:
+    """Append the ``## Engine cross-check`` section to the report.
+
+    Independently validates the report's most consequential local figures: the
+    proxy-inferred per-phase slot-seconds from ``## Prefill vs decode`` are
+    compared against llama-server's own summed per-task eval durations
+    (``prompt eval time`` for prefill, ``eval time`` for decode), with the
+    absolute delta and the percentage delta of the engine figure. The engine
+    totals come from the same Qwen3-attributed, in-window eval lines that feed
+    the speed sections, so the port-attribution rules are reused unchanged.
+
+    The section states explicitly that engine figures are **sums of per-task
+    durations (slot-seconds), not wall-clock**, and therefore not comparable
+    with ``busy_seconds`` / ``busy_pct`` (a merged union) — no arithmetic here
+    mixes the two. A phase whose engine or proxy samples are missing renders an
+    explicit "unavailable" note with the reason (reusing the parser's named
+    empty-window diagnostics) and ``-`` deltas, never a misleading ``0`` or
+    ``100%`` (AC 3 / AC 4).
+    """
+    check = engine_cross_check.compute(summary, config)
+    ap("")
+    ap("## Engine cross-check")
+    ap("")
+    ap(
+        "Independent validation of the local phase slot-time above: the "
+        "proxy-inferred prefill/decode slot-seconds compared against "
+        "llama-server's own per-task eval timings, from the same Qwen3-port "
+        "attributed eval lines that feed `## Decode speed` / `## Prompt eval "
+        "speed`."
+    )
+    ap("")
+    ap(engine_cross_check.METRIC_CAVEAT)
+    ap("")
+    ap(engine_cross_check.WINDOW_APPROXIMATION)
+    ap("")
+    ap(
+        "| Phase | Proxy-inferred slot-seconds | Engine seconds (summed per task) "
+        "| Delta (s) | Delta (%) | Samples proxy/engine |"
+    )
+    ap("|---|---|---|---|---|---|")
+    for phase, label in (
+        (engine_cross_check.PHASE_PREFILL, "Prefill (`prompt eval time`)"),
+        (engine_cross_check.PHASE_DECODE, "Decode (`eval time`)"),
+    ):
+        entry = check[phase]
+        # A phase with no samples on either side renders ``-``, never a 0.
+        proxy_cell = f"{entry['proxy_slot_seconds']:,.1f}" if entry["proxy_samples"] else "-"
+        engine_cell = f"{entry['engine_seconds']:,.1f}" if entry["engine_samples"] else "-"
+        samples_cell = f"{entry['proxy_samples']}/{entry['engine_samples']}"
+        ap(
+            f"| {label} | {proxy_cell} | {engine_cell} | "
+            f"{_delta_cell(entry['delta_seconds'])} | "
+            f"{_delta_cell(entry['delta_pct'], as_percent=True)} | {samples_cell} |"
+        )
+    ap("")
+    if check["threshold_enabled"]:
+        ap(
+            f"Delta is proxy − engine; the percentage is of the engine figure (the "
+            f"independent reference). Divergence threshold: **{check['threshold_pct']:.1f}%** "
+            "absolute per phase (`local_engine_cross_check_threshold_pct` in "
+            "`proxy/config.yaml`); a phase above it raises a warning recommendation."
+        )
+    else:
+        ap(
+            "Delta is proxy − engine; the percentage is of the engine figure (the "
+            "independent reference). Divergence warnings are disabled "
+            "(`local_engine_cross_check_threshold_pct: 0`)."
+        )
+    ap("")
+    ap(engine_cross_check.INTERPRETATION)
+    unavailable = [
+        (phase, check[phase])
+        for phase in engine_cross_check.PHASES
+        if not check[phase]["available"]
+    ]
+    if unavailable:
+        ap("")
+        for phase, entry in unavailable:
+            ap(f"_Unavailable — {phase}: {entry['reason']}._")
+    if check["divergent_phases"]:
+        ap("")
+        ap(
+            "_Divergent phase(s): "
+            + ", ".join(check["divergent_phases"])
+            + f" — above the {check['threshold_pct']:.1f}% threshold."
+            " See the recommendation in `## Recommendations`._"
+        )
+
+
 def _append_contention_prediction_section(
     ap, summary: AnalysisResult, speed: llama_log_parser.SpeedStats | None
 ) -> None:
@@ -2559,24 +2762,36 @@ def _append_contention_prediction_section(
             f"Only {idle_share:.1f}% of attributed denials fired with the pool "
             "measured idle — most denials tracked genuine prefill/decode work."
         )
-    if eta["verdict"] == "matches_reality":
-        eta_verdict_label = "matches reality"
+    if eta["verdict"] == "bound_holds":
+        eta_verdict_label = "holds"
         eta_sentence = (
-            "the predicted prefill ETA is within tolerance of observed prefill "
-            "durations."
+            "The served p90 stayed within the published cache-cold reference "
+            f"bound (observed p90 {eta['observed']['p90']} s ≤ predicted p50 "
+            f"{eta['predicted']['p50']} s, n={eta['bound']['observed_samples']})."
         )
-    elif eta["verdict"] in ("over_predicts", "under_predicts"):
-        eta_verdict_label = "does not match reality"
+    elif eta["verdict"] == "bound_violated":
+        eta_verdict_label = "was violated"
         eta_sentence = (
-            f"The predicted prefill ETA {eta['verdict']} observed prefill "
-            "durations."
+            "Served prefill durations exceeded the published cache-cold "
+            f"reference bound (observed p90 {eta['observed']['p90']} s > "
+            f"predicted p50 {eta['predicted']['p50']} s, "
+            f"n={eta['bound']['observed_samples']}) — the bound is "
+            "under-stated on real traffic."
         )
     else:
         eta_verdict_label = "inconclusive"
-        eta_sentence = "the prefill ETA comparison is inconclusive."
+        eta_sentence = (
+            "The bound-vs-served comparison is inconclusive (fewer than "
+            f"{eta['bound']['min_samples']} observed dispatches, or no "
+            "published polls) so the bound is neither confirmed nor refuted."
+        )
     ap(f"**Denial signal (`lease_state`): {denial_verdict_label}.** {denial_sentence}")
-    ap(f"**Prefill-ETA signal (`prefill_eta_seconds`): {eta_verdict_label}.** {eta_sentence}")
-    if "does not match reality" in (denial_verdict_label, eta_verdict_label):
+    ap(f"**Prefill-ETA bound (`prefill_eta_seconds`, cache-cold reference bound): "
+       f"{eta_verdict_label}.** {eta_sentence}")
+    if "does not match reality" in denial_verdict_label or eta_verdict_label in (
+        "was violated",
+        "inconclusive",
+    ):
         overall_label = "do not unambiguously match reality"
     else:
         overall_label = "match reality"
@@ -2585,7 +2800,19 @@ def _append_contention_prediction_section(
        f"{baseline['denials']}, denials/hour {now_dph:.1f} vs {base_dph:.1f}, busy "
        f"{busy_pct:.1f}% vs {baseline['busy_pct']}%).**")
     ap("")
-    ap("### M3 — prefill_eta_seconds accuracy (predicted vs observed, p50/p90)")
+    ap("### M3 — prefill_eta_seconds accuracy (bound vs served remainder, p50/p90)")
+    ap("")
+    ap("**Comparison: bound vs served remainder.** The first table is the "
+       "historical quantile-matched comparison. Read it as *does the published "
+       "cache-cold reference bound hold against traffic that actually ran*, not "
+       "as a per-request calibration score: the prediction is a cache-cold "
+       "reference-prompt **bound** while the observation is the **uncached "
+       "remainder** of mostly cache-warm prompts, so a large predicted−observed "
+       "gap is expected by construction (the two populations differ). The "
+       "verdict is therefore one-sided — `bound_holds` when the served p90 "
+       "stays within the published p50, `bound_violated` otherwise, and "
+       f"`inconclusive` below {eta['bound']['min_samples']} observed "
+       "dispatches.")
     ap("")
     ap("| Quantile | Predicted (status polls) | Observed (prompt eval) | "
        "Error (pred−obs) | Relative |")
@@ -2601,15 +2828,299 @@ def _append_contention_prediction_section(
        f"{eta['error_p90'] if eta['error_p90'] is not None else '-'} s | "
        f"{eta['relative_error_p90_pct'] if eta['relative_error_p90_pct'] is not None else '-'}% |")
     ap("")
-    ap("Predicted = the calibrated `prefill_eta_seconds` published on "
+    ap("Predicted = the calibrated cache-cold reference bound published on "
        "`status_request` polls; observed = llama-server `prompt eval time` "
        "durations for dispatches that ran. The two streams cannot be paired "
        "1:1 (llama-server eval lines carry no per-line timestamps), so the "
-       "comparison is quantile-matched: the p50/p90 of each distribution and "
-       "the signed error at both quantiles. The prediction is the cache-cold "
-       "reference-prompt cost, so systematic over-prediction (high predicted "
-       "p50 vs low observed p50) means the ETA over-refuses servable work.")
-    ap(f"**(prefill ETA verdict: {eta['verdict']})**")
+       "comparison is quantile-matched — a cross-population comparison, "
+       "labelled and bounded as above.")
+    ap(f"**(prefill ETA bound verdict: {eta['verdict']}; observed p90 "
+       f"{eta['bound']['observed_p90'] if eta['bound']['observed_p90'] is not None else '-'} s "
+       f"vs predicted p50 "
+       f"{eta['bound']['predicted_p50'] if eta['bound']['predicted_p50'] is not None else '-'} s, "
+       f"margin {'-' if eta['bound']['margin_seconds'] is None else str(eta['bound']['margin_seconds']) + ' s'})**")
+    ap("")
+    matched = eta["matched"]
+    ap("### M3b — matched per-dispatch prefill ETA accuracy (guard decision → "
+       "that dispatch's first byte)")
+    ap("")
+    ap("Predicted = the ETA the admission guard priced **for this dispatch** "
+       "(`eta_prefill_s`, the own-prefill term); observed = that same "
+       "dispatch's `dispatch_to_first_byte_ms`. Joined on the `session=` id, so "
+       "predicted and observed describe the same request — the only comparison "
+       "here where the "
+       f"{eta['matched']['tolerance_pct']:.0f}% tolerance is a calibration score.")
+    ap("")
+    ap("| Metric | Value |")
+    ap("|---|---:|")
+    ap(f"| Matched pairs | {matched['pairs']} "
+       f"(admitted {matched['admitted_pairs']}, observe-policy "
+       f"{matched['observe_pairs']}) |")
+    ap(f"| Enforced refusals (never paired) | "
+       f"{matched['enforced_refusals']} |")
+    ap(f"| Unmatched dispatches | {matched['unmatched_dispatches']} "
+       f"of {matched['dispatches']} |")
+    ap(f"| Predicted p50 / p90 | "
+       f"{matched['predicted_p50'] if matched['predicted_p50'] is not None else '-'} s / "
+       f"{matched['predicted_p90'] if matched['predicted_p90'] is not None else '-'} s |")
+    ap(f"| Observed p50 / p90 | "
+       f"{matched['observed_p50'] if matched['observed_p50'] is not None else '-'} s / "
+       f"{matched['observed_p90'] if matched['observed_p90'] is not None else '-'} s |")
+    ap(f"| Relative error p50 / p90 | "
+       f"{matched['relative_error_p50_pct'] if matched['relative_error_p50_pct'] is not None else '-'}% / "
+       f"{matched['relative_error_p90_pct'] if matched['relative_error_p90_pct'] is not None else '-'}% |")
+    ap("")
+    ap("Unmatched dispatches are never folded into the matched figure: an "
+       "inert (uncalibrated) guard, or an inactive `observe`-mode decision, "
+       "logs no priced ETA and cannot be scored, and an enforced refusal "
+       "never owns a first byte. The verdict uses the **median** per-pair "
+       "relative error; its p90 is tail-dominated by very fast cache-warm "
+       "dispatches (a 0.3 s first byte against a several-second ETA is a huge "
+       "percentage). "
+       f"**(matched prefill ETA verdict: {matched['verdict']})**")
+    ap("")
+
+
+def capacity_signals_json(
+    summary: AnalysisResult,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+) -> dict:
+    """The additive ``capacity_signals`` block of the ``--json`` summary.
+
+    LP-0MVU8O4EL005IYP9 AC1.5: mirrors the ``## Local capacity signals``
+    section (``slots_stale`` sub-key) so automation can read what the Markdown
+    shows. The rate and the target verdict come from the shared derivation
+    (``scripts/lib/capacity_signals.py``), so this block and the section can
+    never disagree.
+
+    LP-0MVU8O9OC005YQU1 AC2.5 widens the same block **additively**:
+    ``capacity_hint`` (counts and shares per token, unexpected tokens included),
+    ``saturated_without_live_work`` (count plus its share of all polls and of
+    ``saturated`` polls), ``targets`` (every target's observed value and
+    verdict — what the section's one-line verdict names) and ``coverage`` (the
+    poll span the caveat is about). ``all_targets_met`` is ``null`` on a window
+    with no status polls, exactly like ``slots_stale.passed``: the section is
+    omitted then, so a consumer must not read a silent ``true`` as an
+    all-clear. Existing keys keep their meaning.
+    """
+    signals = summary.capacity_signals
+    hints = signals.hints
+    check, targets = _capacity_targets(summary, stale_rate_target)
+    coverage = capacity_signals.poll_coverage(
+        signals.first_poll_ts,
+        signals.last_poll_ts,
+        summary.window_start,
+        summary.window_end,
+    )
+    return {
+        "slots_stale": {
+            "status_polls": signals.status_polls,
+            "count": signals.slots_stale,
+            "denominator": signals.slots_stale_denominator,
+            "rate": check["observed"],
+            "target": check["target"],
+            "passed": check["passed"] if signals.status_polls else None,
+        },
+        "capacity_hint": {
+            "status_polls": signals.status_polls,
+            "counts": dict(hints.counts),
+            "shares": dict(hints.shares),
+        },
+        "saturated_without_live_work": {
+            "saturated": hints.saturated,
+            "count": hints.saturated_without_live_work,
+            "rate_of_polls": hints.violation_share_of_polls,
+            "rate_of_saturated": hints.violation_share_of_saturated,
+        },
+        "targets": targets,
+        "all_targets_met": (
+            all(target["passed"] for target in targets)
+            if signals.status_polls
+            else None
+        ),
+        "coverage": coverage,
+    }
+
+
+def _capacity_targets(
+    summary: AnalysisResult,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+) -> tuple[dict, list[dict]]:
+    """The capacity target checks, shared by the section and the JSON block.
+
+    One list drives both, so the section's verdict and
+    ``capacity_signals.targets`` cannot name different misses
+    (LP-0MVU8O9OC005YQU1 AC2.4/AC2.5).
+    """
+    signals = summary.capacity_signals
+    check = capacity_signals.stale_rate_check(
+        signals.slots_stale,
+        signals.slots_stale_denominator,
+        stale_rate_target,
+    )
+    violations = signals.hints.saturated_without_live_work
+    targets = [
+        {
+            "name": "slots_stale rate",
+            "target": check["target"],
+            "observed": check["observed"],
+            "passed": check["passed"],
+        },
+        {
+            "name": "saturated only with live local work",
+            "target": 0,
+            "observed": violations,
+            "passed": violations == 0,
+        },
+    ]
+    return check, targets
+
+
+def _append_capacity_signals_section(
+    ap,
+    summary: AnalysisResult,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+) -> None:
+    """Append the ``## Local capacity signals`` section (AC1.4).
+
+    LP-0MVU8O4EL005IYP9: publishes the ``slots_stale`` (stale-poll) rate for the
+    report's own window against its configurable target, immediately after the
+    contention-prediction section, so the operator can judge polling-path health
+    from the nightly report alone instead of running
+    ``scripts/capacity_signal_verification.py`` by hand.
+
+    LP-0MVU8O9OC005YQU1 AC2.4 adds the ``capacity_hint`` distribution (counts
+    **and** shares, every token — an unexpected one keeps its own row) and the
+    ``saturated``-without-live-work rows (count plus its share of all polls and
+    of ``saturated`` polls), followed by a verdict that names each unmet target.
+    AC2.7 adds the coverage/caveat text: the polls' own span is stated, and a
+    window the retained logs do not span is labelled a **partial** measurement
+    rather than published as a complete night.
+
+    Omitted entirely — no heading, no zero-fill — when the window has no status
+    polls, so a night with no polls (or no logs at all) renders exactly as it
+    did before and the unattended 05:00 run cannot fail on an empty window
+    (AC1.8). The figures come from the aggregation's half-open status-poll
+    window, which uses the same shared derivation as the standalone tool
+    (AC1.1/AC1.3, AC2.2/AC2.3).
+    """
+    signals = summary.capacity_signals
+    if not signals.status_polls:
+        return
+    hints = signals.hints
+    check, targets = _capacity_targets(summary, stale_rate_target)
+    excluded = signals.status_polls - signals.slots_stale_denominator
+    ap("")
+    ap("## Local capacity signals")
+    ap("")
+    ap("Health of the local status surface (`GET /llama/local/status`) over this "
+       "window, measured from the proxy log. Derived by the same implementation "
+       "the standalone `scripts/capacity_signal_verification.py` tool uses "
+       "(LP-0MVU8O4EL005IYP9), so the two surfaces cannot disagree.")
+    ap("")
+    ap("### slots_stale — stale-poll rate vs target")
+    ap("")
+    ap("| Metric | Value |")
+    ap("|---|---:|")
+    ap(f"| Status polls (`status_request` with `capacity_hint=`) | "
+       f"{signals.status_polls:,} |")
+    ap(f"| Polls with `slots_stale=true` | {signals.slots_stale:,} |")
+    ap(f"| Stale-rate denominator (polls carrying `slots_stale`) | "
+       f"{signals.slots_stale_denominator:,} |")
+    ap(f"| Stale rate | {check['observed']:.2%} |")
+    ap(f"| Target | < {check['target']:.2%} of status polls |")
+    ap(f"| Outcome | **{'met' if check['passed'] else 'unmet'}** |")
+    ap("")
+    if excluded:
+        ap(f"{excluded:,} poll(s) carry no `slots_stale` field (schema 1) and "
+           "are excluded from the rate rather than counted as fresh.")
+        ap("")
+
+    # AC2.4: the full ``capacity_hint`` distribution — counts and shares, every
+    # token in its own row (an unexpected token is a vocabulary change worth
+    # seeing, never something to drop or re-bucket).
+    ap("### capacity_hint — the payload's own claim")
+    ap("")
+    ap("| `capacity_hint` | Status polls | Share |")
+    ap("|---|---:|---:|")
+    for token, count in hints.counts.items():
+        ap(f"| {token} | {count:,} | {hints.shares[token]:.2%} |")
+    ap(f"| **total** | **{signals.status_polls:,}** | **100.00%** |")
+    ap("")
+    ap("Shares are of all status polls in the window. Every token observed is "
+       "listed — a token this report does not know (a new claim name, or "
+       "`unknown` for a poll with no readable value) keeps its own row rather "
+       "than being dropped or re-bucketed, so a vocabulary change is visible "
+       "on the night it lands.")
+    ap("")
+
+    # AC2.4: the saturated-without-live-work rows, with both denominators.
+    violation_passed = hints.saturated_without_live_work == 0
+    ap("### saturated only with live local work")
+    ap("")
+    ap("| Metric | Value |")
+    ap("|---|---:|")
+    ap(f"| `capacity_hint=saturated` polls | {hints.saturated:,} |")
+    ap(f"| ... with **no** live local work | "
+       f"{hints.saturated_without_live_work:,} |")
+    ap(f"| Share of status polls | {hints.violation_share_of_polls:.2%} |")
+    ap(f"| Share of `saturated` polls | "
+       f"{hints.violation_share_of_saturated:.2%} |")
+    ap("| Target | 0 violating polls |")
+    ap(f"| Outcome | **{'met' if violation_passed else 'unmet'}** |")
+    ap("")
+    ap("Live work is any of `local_in_flight_requests > 0` (schema 3, "
+       "authoritative), `local_active_query=true` or `active_query=true` — the "
+       "same rule `scripts/capacity_signal_verification.py` applies, with the "
+       "flags as the schema-2 fallback. A truthful status surface reports "
+       "`saturated` only while real local streams run, so a violating poll is "
+       "the false-`saturated` signal the payload fix targeted. This derivation "
+       "uses the status surface's own liveness fields, not an independent GPU "
+       "probe.")
+    ap("")
+
+    # AC2.4: one line that names each unmet target instead of burying it.
+    unmet = [target["name"] for target in targets if not target["passed"]]
+    if unmet:
+        ap("**Verdict:** unmet — " + "; ".join(unmet) + ".")
+    else:
+        ap("**Verdict:** met — "
+           + "; ".join(target["name"] for target in targets) + ".")
+    ap("")
+
+    # AC2.7: state the poll span, and label a truncated window as partial — a
+    # retention window that does not reach the report's edges must not read as
+    # a complete measurement.
+    coverage = capacity_signals.poll_coverage(
+        signals.first_poll_ts,
+        signals.last_poll_ts,
+        summary.window_start,
+        summary.window_end,
+    )
+    if coverage["covered"]:
+        ap(f"Coverage: the {signals.status_polls:,} polls span "
+           f"{_fmt_ts(signals.first_poll_ts)} → "
+           f"{_fmt_ts(signals.last_poll_ts)}, reaching both edges of this "
+           f"window (tolerance {coverage['max_gap_seconds'] / 3600:.0f} h).")
+    else:
+        ap("**Limitation:** the poll data does not span the whole window "
+           f"({_fmt_ts(signals.first_poll_ts)} → "
+           f"{_fmt_ts(signals.last_poll_ts)} against "
+           f"{_fmt_ts(summary.window_start)} → "
+           f"{_fmt_ts(summary.window_end)}; "
+           f"{coverage['window_start_gap_seconds'] / 3600:.1f} h missing at "
+           f"the start, "
+           f"{coverage['window_end_gap_seconds'] / 3600:.1f} h at the end). "
+           "Log retention does not cover this window, so the distribution "
+           "and the violation counts are a **partial** measurement — do not "
+           "read them as a complete night.")
+    ap("")
+    ap("`slots_stale` means the served slot counts *or* the per-slot detail came "
+       "from the last-known cache because the fresh `/slots` query failed. It is "
+       "a **polling-path** signal, not a capacity verdict: it says whether the "
+       "status surface was telling the truth, and it is only comparable between "
+       "nights measured on the same build. A stale poll served in under a second "
+       "is normally a failure-backoff cache hit.")
     ap("")
 
 
@@ -3082,6 +3593,7 @@ def run_analysis(
     config: dict | None = None,
     llama_log_dir: Path | None = None,
     mode_map: bucketing.ModeScheduleMap | None = None,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
 ) -> AnalysisRun:
     """Discover log files, stream-parse them, aggregate sessions, and write
     the CSVs and report into ``output_dir``.
@@ -3102,6 +3614,11 @@ def run_analysis(
     configured ``server.priority_window`` supplies the fast/cheap schedule
     (LP-0MVKSXXIR006OBI2), and only a window with neither signal falls back to
     the legacy slot-schedule attribution.
+
+    ``stale_rate_target`` is the configurable ``slots_stale`` rate target
+    (LP-0MVU8O4EL005IYP9 AC1.6, default 5 %): it is threaded into the rendered
+    ``## Local capacity signals`` section and carried on the returned
+    :class:`AnalysisRun` so ``--json`` evaluates the same target.
     """
     log_dir = Path(log_dir)
     output_dir = Path(output_dir)
@@ -3150,10 +3667,23 @@ def run_analysis(
     write_error_artifacts(summary, output_dir)
     report_path = output_dir / "report.md"
     report_path.write_text(
-        build_report(summary, config, summary.speed, mode_map, profiles=profiles),
+        build_report(
+            summary,
+            config,
+            summary.speed,
+            mode_map,
+            profiles=profiles,
+            stale_rate_target=stale_rate_target,
+        ),
         encoding="utf-8",
     )
-    return AnalysisRun(summary=summary, files=files, archived_to=archived_to, mode_map=mode_map)
+    return AnalysisRun(
+        summary=summary,
+        files=files,
+        archived_to=archived_to,
+        mode_map=mode_map,
+        stale_rate_target=stale_rate_target,
+    )
 
 
 def provider_context_skips_json(
@@ -3192,8 +3722,22 @@ def provider_context_skips_json(
     }
 
 
-def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap | None = None) -> dict:
-    """Machine-readable summary of the analysis (one dict; JSON-serialisable)."""
+def summary_to_json(
+    summary: AnalysisResult,
+    mode_map: bucketing.ModeScheduleMap | None = None,
+    config: dict | None = None,
+    stale_rate_target: float = capacity_signals.DEFAULT_STALE_RATE_TARGET,
+) -> dict:
+    """Machine-readable summary of the analysis (one dict; JSON-serialisable).
+
+    ``config`` is optional and only used for the config-driven thresholds
+    (currently the engine cross-check divergence threshold); passing it keeps
+    ``--json``'s figures identical to the Markdown report's.
+
+    ``stale_rate_target`` is the configured ``slots_stale`` rate target the
+    ``capacity_signals`` block is evaluated against (LP-0MVU8O4EL005IYP9 AC1.6);
+    it defaults to the reference tool's 5 %.
+    """
     sessions = list(summary.sessions.values())
     local_only = sum(1 for s in sessions if s.remote_requests == 0)
     fell_back = sum(1 for s in sessions if s.fell_back)
@@ -3206,6 +3750,11 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
     # Contended-pricing split (LP-0MVS9YKHL007UBBZ AC2): the same computation
     # feeds the markdown section, so the two views cannot disagree.
     _admission = aggregation.admission_breakdown(summary)
+    # Measurement provenance (LP-0MVT2QHMU0008F2V): computed once so the two
+    # additive keys below are always consistent with each other.
+    _measured_decisions, _unmeasured_reasons = _residency_measurement_breakdown(
+        summary
+    )
     return {
         "window_start": _fmt_ts(summary.window_start),
         "window_end": _fmt_ts(summary.window_end),
@@ -3274,6 +3823,13 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
             for e in getattr(summary, "residency_events", []) or []
             if getattr(e, "decision", None) == "tenant_limit"
         ),
+        # Measurement provenance (LP-0MVT2QHMU0008F2V AC4, downstream handoff to
+        # LP-0MVQ4X1S30034BQ1's classifier): the measured decision count and the
+        # per-reason unmeasured breakdown. Both are ADDITIVE — every key above
+        # keeps its value and meaning. Reasons are the raw ``measurement=``
+        # values; ``unrecorded`` covers lines predating the field.
+        "residency_measured_decisions": _measured_decisions,
+        "residency_unmeasured_reasons": dict(_unmeasured_reasons),
         "local_evictions": len(getattr(summary, "eviction_events", []) or []),
         # Parent AC7(a), LP-0MVN4LCQJ0034S5S AC2: accepted dispatches evicted
         # before their first byte. Both keys are ADDITIVE — nothing above
@@ -3347,8 +3903,15 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         "errors_by_provider_model": error_provider_model_json(summary),
         "errors_by_root_cause": root_cause_json(summary),
         "compaction": compaction_json(summary),
-        "recommendations": len(recommendations.generate_recommendations(summary, None, mode_map)),
+        "recommendations": len(
+            recommendations.generate_recommendations(summary, config, mode_map)
+        ),
         "local_busy": _busy_json(summary.busy),
+        # Engine cross-check (LP-0MVNWULLI006ZYXX): proxy-inferred phase
+        # slot-seconds vs llama-server's summed per-task eval durations, with
+        # per-phase availability/reason and the divergent phases. ADDITIVE —
+        # every key above keeps its value and meaning.
+        "engine_cross_check": engine_cross_check.compute(summary, config),
         "gpu_busy": _gpu_busy_json(summary.gpu_busy) if summary.gpu_busy else None,
         "local_prefill": _prefill_json(summary.busy),
         "decode_speed": _speed_json(summary.speed) if summary.speed else None,
@@ -3357,6 +3920,10 @@ def summary_to_json(summary: AnalysisResult, mode_map: bucketing.ModeScheduleMap
         # Local-turn coverage (LP-0MVM93DE6009JGBU): the same derivation the
         # Markdown section renders, so `--json` consumers need not scrape it.
         "local_turn_coverage": local_turn_coverage(summary),
+        # Local capacity signals (LP-0MVU8O4EL005IYP9 AC1.5): the same
+        # ``slots_stale`` figures and target verdict the Markdown section
+        # renders. ADDITIVE — every key above keeps its value and meaning.
+        "capacity_signals": capacity_signals_json(summary, stale_rate_target),
     }
 
 
@@ -3579,9 +4146,12 @@ def _busy_json(busy: aggregation.BusyStats | None) -> dict | None:
 def _gpu_busy_json(gpu: object | None) -> dict | None:
     """JSON-friendly GPU busy-time from Prometheus power consumption.
 
-    Complement to ``local_busy``: measures the authoritative hardware-side
-    busy fraction from GPU power draw (``gpu:computing:bool``), independent
-    of proxy log events. Returns ``None`` when the query fails.
+    Supplementary hardware telemetry, **not** a local-utilisation signal:
+    measures when the GPU drew compute-level power (``gpu:computing:bool``),
+    independent of proxy log events, so it counts GPU work outside the
+    proxy's slot accounting. Decisions use the log-derived ``local_busy``
+    (``dispatch → finish``); this block is its hardware-side complement.
+    Returns ``None`` when the query fails.
     """
     if gpu is None:
         return None
@@ -3600,25 +4170,154 @@ def _gpu_busy_json(gpu: object | None) -> dict | None:
     }
 
 
+def _matched_prefill_eta(summary: AnalysisResult) -> dict:
+    """Matched per-dispatch prefill-ETA accuracy (LP-0MVSD5RJW008F1IB AC1).
+
+    Joins each local dispatch's first byte to the ETA the *admission guard
+    priced for that same dispatch*: predicted = the guard record's
+    ``eta_prefill_s`` (the own-prefill term — not ``projected_wait_s``, which
+    adds occupancy the observed first byte already includes once), observed =
+    that dispatch's ``dispatch_to_first_byte_ms``. The join key is the
+    ``session=`` identifier both lines carry.
+
+    Reporting rules from the brief:
+
+    - a dispatch with no matching guard record is **unmatched** and never
+      folded into the matched figure (the guard is inert for uncalibrated
+      buckets and logs nothing for inactive observe-mode decisions);
+    - observe-policy pairs (a would-be refusal priced without enforcement)
+      are valid *pricing* measurements and are included, but counted
+      separately from ordinary admitted dispatches so a rollout window stays
+      interpretable. The log's ``enforced`` token means "the refusal was
+      applied" — it is ``false`` for every admitted request, so the ``policy``
+      token decides the split;
+    - an **enforced refusal never pairs**: it refused that request, so a later
+      first byte in the same session belongs to a different request. Those
+      records are counted in ``enforced_refusals`` and excluded from the
+      candidate set (the dispatch becomes unmatched);
+    - guard records whose priced ETA is ``0`` (the calibration-independent
+      cold-prefill budget refusal) are not estimates and are skipped.
+    """
+    def _num(value) -> float | None:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    guards: dict[str, list[tuple[datetime, float, str | None]]] = {}
+    enforced_refusals = 0
+    for event in getattr(summary, "local_admission_events", []) or []:
+        session = getattr(event, "session", None)
+        eta = _num(getattr(event, "eta_prefill_s", None))
+        if not session or eta is None or eta <= 0.0:
+            continue
+        if getattr(event, "enforced", None) == "true":
+            # A refusal that was actually applied: the request did not
+            # dispatch, so it is never a pairing candidate.
+            enforced_refusals += 1
+            continue
+        guards.setdefault(session, []).append(
+            (event.ts, eta, getattr(event, "policy", None))
+        )
+    for entries in guards.values():
+        entries.sort(key=lambda item: item[0])
+
+    dispatches = 0
+    unmatched = 0
+    pairs: list[tuple[float, float, str | None]] = []
+    for event in getattr(summary, "ttft_events", []) or []:
+        if getattr(event, "ttft_source", None) not in (None, "local"):
+            continue
+        service_ms = _num(getattr(event, "dispatch_to_first_byte_ms", None))
+        session = getattr(event, "session", None)
+        if service_ms is None or service_ms <= 0.0:
+            continue
+        dispatches += 1
+        candidates = guards.get(session) if session else None
+        if not candidates:
+            unmatched += 1
+            continue
+        # The guard fires at admission, before the first byte: take the last
+        # decision at or before it (falling back to the earliest recorded one).
+        chosen = candidates[0]
+        for candidate in candidates:
+            if candidate[0] <= event.ts:
+                chosen = candidate
+        pairs.append((chosen[1], service_ms / 1000.0, chosen[2]))
+
+    predicted = [p for p, _o, _pol in pairs]
+    observed = [o for _p, o, _pol in pairs]
+    relative = [
+        (p - o) / o * 100.0 for p, o in zip(predicted, observed) if o > 0
+    ]
+    rel_p50 = _percentile(relative, 50)
+    rel_p90 = _percentile(relative, 90)
+    if not pairs or rel_p50 is None:
+        verdict = "inconclusive"
+    elif abs(rel_p50) <= PREFILL_ETA_MATCH_TOLERANCE_PCT:
+        verdict = "matches_reality"
+    elif rel_p50 > 0:
+        verdict = "over_predicts"
+    else:
+        verdict = "under_predicts"
+
+    def _r(value: float | None) -> float | None:
+        return round(value, 2) if value is not None else None
+
+    return {
+        "pairs": len(pairs),
+        "dispatches": dispatches,
+        "unmatched_dispatches": unmatched,
+        # Mutually exclusive split of the matched pairs: an observe-policy
+        # would-be refusal, or an ordinary admitted dispatch. Enforced
+        # refusals are excluded from pairing entirely (``enforced_refusals``
+        # counts the guard records dropped for that reason).
+        "admitted_pairs": sum(1 for _p, _o, pol in pairs if pol != "observe"),
+        "observe_pairs": sum(1 for _p, _o, pol in pairs if pol == "observe"),
+        "enforced_refusals": enforced_refusals,
+        "predicted_p50": _r(_percentile(predicted, 50)),
+        "predicted_p90": _r(_percentile(predicted, 90)),
+        "observed_p50": _r(_percentile(observed, 50)),
+        "observed_p90": _r(_percentile(observed, 90)),
+        "relative_error_p50_pct": _r(rel_p50),
+        "relative_error_p90_pct": _r(rel_p90),
+        "tolerance_pct": PREFILL_ETA_MATCH_TOLERANCE_PCT,
+        "verdict": verdict,
+    }
+
+
 def prefill_eta_error_json(
     summary: AnalysisResult, speed: llama_log_parser.SpeedStats | None
 ) -> dict:
     """M3 (LP-0MVGR2OXT0096OGK): predicted-vs-observed prefill ETA error.
 
-    Predicted: every non-``None`` ``prefill_eta_seconds`` published on
-    ``status_request`` polls inside the window. Observed: the llama-server
-    ``prompt eval time`` durations (seconds) for the dispatches that ran.
-    The two streams cannot be joined 1:1 (llama-server eval lines carry no
-    per-line timestamps — see REFERENCE.md limitations), so the comparison is
-    quantile-matched: the p50/p90 of each distribution and the signed error at
-    both quantiles, plus the relative error against the observed value.
+    Two comparisons, because a cache-cold reference bound and a per-request
+    estimate answer different questions (LP-0MVSD5RJW008F1IB AC1/AC3):
 
-    The verdict rescues the operator from reading the table:
-    ``matches_reality`` when the predicted p50 is within the tolerance of the
-    observed p50, ``over_predicts`` / ``under_predicts`` when it misses wide
-    in that direction (an over-prediction is the harmful direction — it
-    refuses work that would have been servable), ``inconclusive`` when either
-    side has no samples.
+    - **bound vs served remainder** (the historical quantile-matched table).
+      Predicted: every non-``None`` ``prefill_eta_seconds`` published on
+      ``status_request`` polls inside the window. Observed: the llama-server
+      ``prompt eval time`` durations (seconds) for the dispatches that ran.
+      The two streams cannot be joined 1:1 (llama-server eval lines carry no
+      per-line timestamps — see REFERENCE.md limitations), so the comparison
+      is quantile-matched. The prediction is a cache-cold reference-prompt
+      *bound* while the observation is the *uncached remainder* of mostly-warm
+      prompts, so a large gap is expected; the only meaningful question is
+      whether the bound is **violated** (observed p90 above predicted p50).
+      That is reported one-sided as ``bound_holds`` / ``bound_violated`` /
+      ``inconclusive`` (below :data:`PREFILL_ETA_BOUND_MIN_SAMPLES` observed
+      samples) — never as a two-sided calibration verdict.
+    - **matched per-dispatch accuracy** (``matched``): the ETA the guard priced
+      for a dispatch vs that same dispatch's ``dispatch_to_first_byte_ms``,
+      where the 25 % two-sided tolerance *is* meaningful
+      (:func:`_matched_prefill_eta`).
+
+    The pre-existing keys (``predicted`` / ``observed`` / ``error_p50`` /
+    ``error_p90`` / ``relative_error_*`` / ``tolerance_pct`` / ``verdict``)
+    keep their names and shapes for trend continuity; ``verdict`` now reports
+    the one-sided bound test, and ``comparison`` states which comparison it
+    describes.
     """
     predicted = sorted(
         float(e.prefill_eta_seconds)
@@ -3651,15 +4350,24 @@ def prefill_eta_error_json(
     err_p90 = _error(pred_p90, obs_p90)
     rel_p50 = _relative(pred_p50, obs_p50)
     rel_p90 = _relative(pred_p90, obs_p90)
-    if not predicted or not observed or rel_p50 is None:
-        verdict = "inconclusive"
-    elif abs(rel_p50) <= PREFILL_ETA_MATCH_TOLERANCE_PCT:
-        verdict = "matches_reality"
-    elif rel_p50 > 0:
-        verdict = "over_predicts"
+    # One-sided bound test (Q3 = replace the two-sided tolerance here): the
+    # cache-cold bound must not be exceeded by the served p90. Below the
+    # sample floor the window cannot decide, and ``inconclusive`` says so.
+    if (
+        pred_p50 is None
+        or obs_p90 is None
+        or len(observed) < PREFILL_ETA_BOUND_MIN_SAMPLES
+    ):
+        bound_verdict = "inconclusive"
+        bound_holds: bool | None = None
+    elif obs_p90 <= pred_p50:
+        bound_verdict = "bound_holds"
+        bound_holds = True
     else:
-        verdict = "under_predicts"
+        bound_verdict = "bound_violated"
+        bound_holds = False
     return {
+        "comparison": "bound_vs_served_remainder",
         "predicted": {
             "samples": len(predicted),
             "p50": pred_p50,
@@ -3675,7 +4383,25 @@ def prefill_eta_error_json(
         "relative_error_p50_pct": rel_p50,
         "relative_error_p90_pct": rel_p90,
         "tolerance_pct": PREFILL_ETA_MATCH_TOLERANCE_PCT,
-        "verdict": verdict,
+        # One-sided bound test (AC3): observed p90 must stay within the
+        # published p50 bound.
+        "bound": {
+            "verdict": bound_verdict,
+            "holds": bound_holds,
+            "predicted_p50": pred_p50,
+            "observed_p90": obs_p90,
+            "observed_samples": len(observed),
+            "min_samples": PREFILL_ETA_BOUND_MIN_SAMPLES,
+            "margin_seconds": (
+                round(pred_p50 - obs_p90, 2)
+                if pred_p50 is not None and obs_p90 is not None
+                else None
+            ),
+        },
+        "verdict": bound_verdict,
+        # Matched per-dispatch accuracy (AC1): the 25 % two-sided tolerance
+        # applies here, where predicted and observed describe one dispatch.
+        "matched": _matched_prefill_eta(summary),
     }
 
 

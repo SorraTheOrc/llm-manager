@@ -147,10 +147,10 @@ target. Each local ``dispatch_first_byte_ms`` log line now carries:
 | `queue_wait_ms` | Dispatch start → slot acquired (the single-slot contention/queue segment) |
 
 Queue wait is separately capped by the existing contention-queue policy
-(`server.contention_queue_max_wait_seconds`, default 60 — pinned by
-test_contention_queue.py), so the re-scoped target reads: for warm-cache
-local dispatches, `dispatch_to_first_byte_ms` p99 < 60 s, with the queue
-wait bounded by the cap. Warm/cold classification and lookup helpers live in
+(`server.contention_queue_max_wait_seconds`, shipped 30 s since the
+LP-0MVT1146V007WXA4 sweep — pinned by `test_contention_queue_docs.py`), so the
+re-scoped target reads: for warm-cache local dispatches,
+`dispatch_to_first_byte_ms` p99 < 60 s, with the queue wait bounded by the cap. Warm/cold classification and lookup helpers live in
 `proxy/test_dispatch_first_byte_metric.py`-covered helpers
 (`_classify_cache_state`, `_lookup_dispatch_cache_state`).
 
@@ -202,6 +202,32 @@ the derived value, so clients back off correctly. Regression tests:
   deterministic proofs are the terminal `retry_budget_exhausted` event and
   the budget value in the failover warning log.
 - **AC5 — full suite green.**
+
+## Deterministic clock for watchdog/timing assertions (LP-0MVX0NEM7003HRW3)
+
+Every deadline computed inside the stream generator — the watchdog start,
+the last-content timestamp that resets the activity budget, and
+`_failover_deadline` — is derived from a **single monotonic clock** passed as
+`_handle_remote_streaming(clock=...)`. It defaults to `time.monotonic`, so
+production behaviour is unchanged (one clock, one arithmetic path).
+
+The seam exists because a watchdog assertion must never be decided by
+wall-clock elapsed time: a host under load can starve the event loop between
+two awaits, so `asyncio.wait_for` fires its timeout handler before the read
+task's step even though the upstream chunk was already available. Before the
+seam, the post-timeout re-check read `time.monotonic()` again and a small test
+budget (0.2 s) could therefore look expired, producing a spurious
+`stream_activity_timeout` error on a stream that had been delivering content
+the whole time. Production budgets (1800 s activity / 14400 s duration) are
+orders of magnitude beyond any realistic scheduling stall, so the seam is a
+test-determinism fix, not a production behaviour change.
+
+`proxy/tests/test_remote_stream_duration_watchdog.py` injects `FakeClock` and
+covers both directions:
+
+- content progress spaced below the budget but spanning 3× it (timer reset),
+- a starved read that raises `TimeoutError` with zero clock progress (retried
+  as an ordinary stall, never classified as an activity expiry).
 
 ## Related items
 

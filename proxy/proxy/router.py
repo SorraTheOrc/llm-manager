@@ -73,6 +73,18 @@ class MeasuredCacheAbortDetourError(Exception):
         super().__init__("measured_cache_deficit")
 
 
+def _format_abort_seconds(value) -> str:
+    """Format a benefit-gate seconds value for the abort log line.
+
+    Unusable values (``None`` / non-numeric) render as ``unknown``: the
+    ``measured_cache_abort`` line is diagnostics and must never break dispatch
+    by raising inside the format call.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "unknown"
+    return f"{value:.1f}"
+
+
 def _log_measured_prefill(srv, session_id, model_name, measured) -> None:
     """Emit the one-per-dispatch ``prefill_progress_measured`` line (F2 AC6).
 
@@ -118,7 +130,11 @@ from proxy.lifecycle import (  # noqa: E402
     _resolve_slot_model_name,
     _self_healing_response,
 )
+from proxy.local_route_starvation import (  # noqa: E402
+    LOCAL_ROUTE_REASON_PREFILL_THRASH,
+)
 from proxy.measured_cache_abort import (  # noqa: E402
+    DETAIL_WITHIN_ETA_BUDGET,
     MEASURED_CACHE_DEFICIT_REASON,
     AbortSettings,
 )
@@ -187,11 +203,14 @@ from .router_helpers import (  # noqa: E402  # noqa: E402, F401
     _increment_active_queries,
     _increment_local_active_queries,
     _increment_per_model_query,
+    _local_dispatch_gate,
+    _mark_local_dispatch_terminal,
     _normalize_outgoing_headers,
     _prefetch_measured_cache_abort,
     _prefill_thrash_fingerprint,
     _record_prefill_thrash_cooldown,
     _release_client_disconnect_dispatch,
+    _release_completed_dispatch,
     _release_measured_cache_abort_dispatch,
     _release_prefill_deadline_dispatch,
     _request_dedup_hash,
@@ -246,6 +265,12 @@ def _get_contention_queue_config(server_config: dict) -> dict:
     F2 AC3/AC4). Entry is gated per request by the effective priority (AC3,
     LP-0MVDT94F0003VHUA): ``low`` always queues, ``high`` never queues,
     ``medium`` engages when the merged base config's policy is ``queue``.
+
+    This is the ONE place the budget is resolved (LP-0MVIKPRMD000Y97R AC2):
+    ``prefill_eta.wait_budget_seconds`` reads ``max_wait_seconds`` from here,
+    and both the prefill-ETA admission guard and ``POST /llama/local/reserve``
+    compare against that same number — no second constant, no per-call
+    default, no per-reason budget.
     """
     policy = str(
         server_config.get("contention_queue_policy", "fallback") or "fallback"
@@ -268,6 +293,10 @@ def _get_contention_queue_config(server_config: dict) -> dict:
             server_config.get("session_guardrail_max_runtime_seconds"),
         )
         max_runtime = 1800
+    # Below is the INERT no-config fallback: an absent
+    # ``contention_queue_policy`` resolves to ``fallback`` (nothing queues),
+    # so these defaults never govern a running proxy. The shipped values live
+    # in ``proxy/config.yaml`` (30 s / depth 2 since LP-0MVT1146V007WXA4).
     raw_wait = server_config.get("contention_queue_max_wait_seconds", 60)
     try:
         wait = float(raw_wait) if raw_wait is not None else 60.0
@@ -592,6 +621,22 @@ async def _update_session_and_slot(
                 exc_info=True,
             )
 
+    # Record local-served provenance in the session store
+    # (LP-0MVTDU6Y1004ZCGX AC2). The local→remote boundary-compaction decision
+    # reads this recorded counter, never a live slot assignment, so a
+    # released/save-restored slot does not disqualify the session. Only a
+    # successful (non-4xx/5xx) local completion counts as a served turn — the
+    # same success bound the slot save uses below. Fail-open: a bookkeeping
+    # failure must never affect the response.
+    if isinstance(upstream_status, int) and 0 <= upstream_status < 400:
+        try:
+            await srv.session_manager.mark_locally_served(session_id)
+        except Exception:
+            srv.logger.debug(
+                "Failed to record local-served provenance",
+                exc_info=True,
+            )
+
     # Update per-session cached-tokens ratio from REAL usage data
     # (LP-0MS9GAN2P009KK6G). The final usage chunk in the local response
     # reports prompt_tokens + prompt_tokens_details.cached_tokens; use the
@@ -838,6 +883,28 @@ async def _cleanup_after_request(
             except Exception:
                 pass
 
+    # LP-0MVWFKI8O001X694 (parent LP-0MVWEZCB0006WPBQ AC8/AC8b): this is the
+    # request's single end-of-request cleanup, so it is also where a dispatch
+    # lease that outlived its request must be released. The endpoint-scoped
+    # decrement above transitions only the record of the endpoint the request
+    # completed on; a lease taken on *another* (local) endpoint — the shape
+    # produced when the local attempt ended without a first byte and the chain
+    # re-routed the request to a remote provider — used to stay ``active`` and
+    # be evicted 180 s later as ``local_eviction_after_acceptance
+    # reason=no_progress_watchdog``, arming a local entry cooldown for a
+    # request that succeeded. Released here, at completion, it is never seen by
+    # the tenancy-expiry / no-progress sweep at all.
+    if decrement_local and session_id:
+        try:
+            await _release_completed_dispatch(
+                srv,
+                session_id,
+                served_endpoint=backend,
+                request=request,
+            )
+        except Exception:
+            pass
+
     # On client disconnect, immediately remove the dispatch lease record.
     # The ``disconnect`` reason is the stream-end path (a client that vanished
     # *after* the first byte, LP-0MQTHP828000JYM6); a client that vanished
@@ -1054,6 +1121,18 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
     except Exception:
         body_json = {}
 
+    # LP-0MVSAMN14001DMTY AC2: fingerprint the **client's** prompt here, before
+    # ``_handle_session`` rewrites ``body_json["messages"]`` to the delta it is
+    # about to prefill. provider.py's chain gate fingerprints the original
+    # client body it parsed, so arming the cooldown from the post-delta body
+    # produced a key the gate could never look up — the 2026-10-26 incident's
+    # session logged zero ``routing_skip_local reason=prefill_thrash_cooldown``
+    # lines across four successive local dispatches. The digest is
+    # turn-scoped (``_prefill_thrash_fingerprint``), so the two bodies agree
+    # either way; capturing the original keeps the arming site honest about
+    # which prompt failed.
+    _client_prompt_fingerprint = _prefill_thrash_fingerprint(body_json)
+
     # Session handling – incremental prompt ingestion
     session_result = await _handle_session(
         srv, body_json, server_config, request.headers
@@ -1269,7 +1348,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                     _estimated_tokens,
                 )
                 _resolved_abort_settings = AbortSettings.from_config(
-                    server_config
+                    server_config, model=model_name
                 )
                 if _resolved_abort_settings.enabled:
                     _measured_abort_settings = _resolved_abort_settings
@@ -1378,6 +1457,59 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
         )
 
     # -------------------------------------------------------------------
+    # Post-deadline local thrash gate (LP-0MVSAMN14001DMTY AC1/AC2)
+    #
+    # Every local dispatch reaches this point — the provider chain, the
+    # provider's in-request local retry loops, ``ui.py``'s direct dispatch and
+    # the contention-queue re-dispatch all end up in ``proxy_to_local``. The
+    # gate therefore sits here, *before* any local resource is acquired (lease,
+    # slot, counters), so it also covers the anonymous/non-explicit path that
+    # acquires its record through ``_increment_local_active_queries`` rather
+    # than through the lease choke point.
+    #
+    # Two refusals, both logged by the helper as ``routing_skip_local``:
+    # - ``post_deadline_terminal``: this very request's local dispatch was
+    #   already cancelled by ``prefill_deadline_exceeded`` — local is terminal
+    #   for it, so the in-request re-dispatch that re-armed a fresh lease 147-150
+    #   ms after the release (2026-10-26 10:39-10:47) cannot recur.
+    # - ``prefill_thrash_cooldown``: the session's post-deadline window is armed
+    #   for this prompt, so the chain falls to the next provider instead of
+    #   burning the prefill again.
+    #
+    # The detour response is the same retryable 503 ``backend_error`` shape the
+    # deadline path returns — deliberately **not** ``local_lease_active``/
+    # ``no_slots_available``, which would make provider.py queue for a local slot
+    # the gate is refusing to grant.
+    _local_gate_refused, _local_gate_reason, _local_gate_remaining = (
+        _local_dispatch_gate(
+            srv,
+            session_id,
+            request=request,
+            config=server_config,
+            fingerprint=_client_prompt_fingerprint,
+            entry="router_dispatch",
+        )
+    )
+    if _local_gate_refused:
+        try:
+            record_http_error(
+                "v1/chat/completions", "5xx", _local_gate_reason
+            )
+        except Exception:
+            pass
+        return _build_backend_error_response(
+            srv, path, session_id, session_created,
+            is_delta_request, session_fallback_reason,
+            # LP-0MVXSSYTN001TBW5 AC1: a thrash-gate refusal is a verdict on
+            # *this* request/prompt (already terminal for local, or inside its
+            # post-deadline window), never on local's health. Naming the reason
+            # on the response (header + in-process marker) is what makes the
+            # fallback loop defer this one 503 instead of quarantining the whole
+            # local entry for every session for 60 s.
+            local_dispatch_reason=_local_gate_reason,
+        )
+
+    # -------------------------------------------------------------------
     # Local dispatch gating — no-preemption lease check
     # Only applies to explicitly-provided sessions (X-Session-Id header).
     # Anonymous/auto-generated sessions are ephemeral and should not
@@ -1406,6 +1538,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
             # verbatim on the dispatch record so the post-acceptance eviction
             # event reports the numbers the admission model used.
             admission_evidence=getattr(request, "_local_admission_evidence", None),
+            # LP-0MVSAMN14001DMTY AC2: defence in depth — the lease choke point
+            # re-checks the same gates (the early return above already refused
+            # a request that arrived with either gate armed).
+            request=request,
         )
         if not acquired:
             _cold = cold_start.is_cold(server_config)
@@ -1691,7 +1827,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             session_id,
                             tokens=_estimated_tokens,
                             config=server_config,
-                            fingerprint=_prefill_thrash_fingerprint(body_json),
+                            fingerprint=_client_prompt_fingerprint,
                         )
                         srv.backend_ready = True
                         # LP-0MUGQHPJ50046LV8: pin the stream context manager
@@ -1827,6 +1963,60 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                     raise MeasuredCacheAbortDetourError(
                                         _prefetch.decision, _prefetch.measured
                                     )
+                                # ── Benefit gate declined (LP-0MVWDZ22I005A26B) ──
+                                # The gate priced the measured deficit inside the
+                                # request's own prefill-deadline budget, so the
+                                # dispatch keeps running. Report the gate's own
+                                # evidence (``measured_eta_s`` / ``budget_s`` /
+                                # ``detail``) on the same ``measured_cache_abort``
+                                # line the abort uses, so an operator can see why
+                                # the deficit was tolerated (parent AC5). Nothing
+                                # else changes: no release, no detour, no
+                                # cooldown (the arming site is inside the abort
+                                # branch below and is never reached).
+                                _continue_decision = _prefetch.decision
+                                if (
+                                    _continue_decision is not None
+                                    and _continue_decision.detail
+                                    == DETAIL_WITHIN_ETA_BUDGET
+                                ):
+                                    _continue_eta_s = (
+                                        _continue_decision.measured_eta_s
+                                    )
+                                    _continue_budget_s = _continue_decision.budget_s
+                                    try:
+                                        srv.logger.warning(
+                                            "measured_cache_abort session=%s "
+                                            "model=%s detail=%s total=%s "
+                                            "cache=%s measured_new_tokens=%s "
+                                            "priced_new_tokens=%s "
+                                            "deficit_ratio=%s bound_tokens=%s "
+                                            "measured_eta_s=%s budget_s=%s "
+                                            "→ measured deficit fits the "
+                                            "prefill budget, continuing local "
+                                            "dispatch",
+                                            session_id or "unknown",
+                                            model_name or "unknown",
+                                            _continue_decision.detail,
+                                            _prefetch.measured.total
+                                            if _prefetch.measured is not None
+                                            else "unknown",
+                                            _prefetch.measured.cache
+                                            if _prefetch.measured is not None
+                                            else "unknown",
+                                            _continue_decision.measured_new_tokens,
+                                            _continue_decision.priced_new_tokens,
+                                            _continue_decision.deficit_ratio,
+                                            _continue_decision.bound_tokens,
+                                            _format_abort_seconds(
+                                                _continue_eta_s
+                                            ),
+                                            _format_abort_seconds(
+                                                _continue_budget_s
+                                            ),
+                                        )
+                                    except Exception:
+                                        pass
                             except MeasuredCacheAbortDetourError:
                                 raise
                             except TimeoutError:
@@ -1947,14 +2137,16 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         try:
                             srv.logger.warning(
                                 "measured_cache_abort session=%s model=%s "
-                                "reason=%s total=%s cache=%s "
+                                "reason=%s detail=%s total=%s cache=%s "
                                 "measured_new_tokens=%s priced_new_tokens=%s "
                                 "deficit_ratio=%s bound_tokens=%s "
+                                "measured_eta_s=%s budget_s=%s "
                                 "elapsed_s=%.1f → cancelling local dispatch "
                                 "early and detouring to the next provider",
                                 session_id or "unknown",
                                 model_name or "unknown",
                                 MEASURED_CACHE_DEFICIT_REASON,
+                                _abort_decision.detail,
                                 _abort_measured.total
                                 if _abort_measured is not None else "unknown",
                                 _abort_measured.cache
@@ -1963,6 +2155,10 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 _abort_decision.priced_new_tokens,
                                 _abort_decision.deficit_ratio,
                                 _abort_decision.bound_tokens,
+                                _format_abort_seconds(
+                                    _abort_decision.measured_eta_s
+                                ),
+                                _format_abort_seconds(_abort_decision.budget_s),
                                 _abort_elapsed,
                             )
                         except Exception:
@@ -1979,7 +2175,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 session_id,
                                 server_config,
                                 tokens=_estimated_tokens,
-                                fingerprint=_prefill_thrash_fingerprint(body_json),
+                                fingerprint=_client_prompt_fingerprint,
+                                reason=MEASURED_CACHE_DEFICIT_REASON,
                             )
                             if _abort_cooldown_deadline > 0:
                                 srv.logger.info(
@@ -1994,7 +2191,17 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                             pass
                         # Release the lease/marker/counters exactly like the
                         # deadline path (AC7) and close the upstream stream.
+                        # LP-0MVSAMN14001DMTY AC2: the same measured deficit is
+                        # terminal for local inside this request, for the same
+                        # reason the deadline detour is.
+                        _mark_local_dispatch_terminal(request)
                         try:
+                            # LP-0MVUVHAQP001IRKK: forward the pinned slot
+                            # identity and the live upstream stream, exactly as
+                            # the deadline twin does, so this earliest-abort
+                            # path cancels the backend task and annotates the
+                            # abandoned slot instead of relying on a
+                            # post-free session lookup.
                             await _release_measured_cache_abort_dispatch(
                                 srv,
                                 session_id,
@@ -2002,6 +2209,8 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                 request=request,
                                 measured=_abort_measured,
                                 priced_new_tokens=_priced_new_tokens,
+                                abandoned_slot_id=slot_id,
+                                upstream_stream_cm=cm,
                             )
                         except Exception:
                             pass
@@ -2031,6 +2240,13 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         return _build_backend_error_response(
                             srv, path, session_id, session_created,
                             is_delta_request, session_fallback_reason,
+                            # LP-0MVWFKESK0005G61 AC1b: name the reason on the
+                            # response (header + in-process marker) so the
+                            # fallback loop defers *this* 503 instead of
+                            # quarantining the whole local entry for every
+                            # session. The abort is a verdict on the prompt, not
+                            # on local's health.
+                            local_dispatch_reason=MEASURED_CACHE_DEFICIT_REASON,
                         )
                     except Exception as _exc:
                         # LP-0MUCEFB8E003YVFF: distinct, observable log line
@@ -2080,6 +2296,7 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                                             fingerprint=_prefill_thrash_fingerprint(
                                                 body_json
                                             ),
+                                            reason=LOCAL_ROUTE_REASON_PREFILL_THRASH,
                                         )
                                     )
                                     if _prefill_cooldown_deadline > 0:
@@ -2115,6 +2332,18 @@ async def proxy_to_local(request: Request, path: str, endpoint: str | None = Non
                         # the slot is recorded as abandoned for the status
                         # annotation.
                         if _prefill_deadline_fired:
+                            # LP-0MVSAMN14001DMTY AC2: the deadline detour is
+                            # TERMINAL for local inside this request. Marking
+                            # the request object (not the session) is what makes
+                            # the 2026-10-26 re-dispatch impossible: the retry
+                            # loops re-enter ``proxy_to_local`` with the *same*
+                            # ``Request``, and the dispatch gate refuses it
+                            # (``routing_skip_local reason=post_deadline_terminal``)
+                            # instead of arming a fresh lease 147-150 ms after the
+                            # release below. A concurrent request from the same
+                            # session has its own ``Request`` object and is
+                            # covered by the session-wide cooldown instead.
+                            _mark_local_dispatch_terminal(request)
                             try:
                                 await _release_prefill_deadline_dispatch(
                                     srv,

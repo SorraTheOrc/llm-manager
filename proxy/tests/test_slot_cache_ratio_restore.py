@@ -356,7 +356,14 @@ class TestSeedCachedRatio:
             is None
         )
 
-    def test_endpoint_specific_slot_directory(self, tmp_path):
+    def test_legacy_endpoint_directory_snapshot_still_seeds(self, tmp_path):
+        """Backward compatibility: snapshots written under the legacy
+        ``{host}-{port}/`` layout (LP-0MRPILSMW004T4H8) remain discoverable.
+
+        LP-0MVVI8TEU006KTOZ moved new snapshots to llama-server's real save
+        directory (the cache root); the reader keeps the endpoint directory as
+        a fallback so files written before the fix are still found and retired.
+        """
         endpoint = "http://192.168.0.199:8080"
         config = _write_snapshot(tmp_path, endpoint=endpoint)
 
@@ -847,10 +854,9 @@ class TestEvictionSnapshotPairing:
 
     def _slot_paths(self, tmp_path):
         slot_root = tmp_path / "slot-cache"
-        base = slot_root / "localhost-8080"
-        base.mkdir(parents=True, exist_ok=True)
+        slot_root.mkdir(parents=True, exist_ok=True)
         return (
-            str(_slot_filename_for_session(SESSION, base)),
+            str(_slot_filename_for_session(SESSION, slot_root)),
             {"session_slot_save_path": str(slot_root)},
         )
 
@@ -863,9 +869,12 @@ class TestEvictionSnapshotPairing:
         filename, server = self._slot_paths(tmp_path)
 
         async def _fake_save(_port, _slot, target, _timeout, model=None, endpoint=None):
+            # llama-server contract: it accepts only a bare filename and writes
+            # it under its own --slot-save-path (the cache root).
+            on_disk = Path(server["session_slot_save_path"]) / Path(target).name
             if snapshot_written:
-                Path(target).parent.mkdir(parents=True, exist_ok=True)
-                Path(target).write_bytes(b"KV-SNAPSHOT")
+                on_disk.parent.mkdir(parents=True, exist_ok=True)
+                on_disk.write_bytes(b"KV-SNAPSHOT")
             return snapshot_written
 
         monkeypatch.setattr(session_mod, "_save_slot_snapshot", _fake_save)
@@ -930,7 +939,13 @@ class TestEvictionSnapshotPairing:
         assert [m for m in caplog.messages if m.startswith("slot_ratio_restored ")]
 
     def test_no_recorded_prefix_writes_no_sidecar(self, tmp_path, monkeypatch):
-        """Documented rule: never invent a token count on the eviction path."""
+        """Documented rule: never invent a token count on the eviction path.
+
+        The snapshot is still saved (the KV is worth retaining for a restore),
+        but without a recorded prefix there is no honest sidecar, so the pair
+        stays unpaired until the session's next measured turn (the router path)
+        writes a paired snapshot.
+        """
         report, filename, _server = self._evict(monkeypatch, tmp_path)
 
         assert report["saved"] is True
@@ -1091,6 +1106,138 @@ class TestUnmeasuredUsageRequestSave:
         assert read_slot_ratio_sidecar(filename) is None
 
 
+class TestSnapshotDirectoryAlignment:
+    """LP-0MVVI8TEU006KTOZ — snapshot, sidecar and restore share one directory.
+
+    llama-server's slot endpoint accepts only a bare filename
+    (``fs_validate_filename(..., allow_subdirs=False)``) and writes it under
+    its own ``--slot-save-path``. ``_build_slot_context`` appended
+    ``{host}-{port}/`` for an endpoint, so the snapshot landed in the cache
+    root while the sidecar write, the restore existence pre-check and the seed
+    lookup all pointed at the endpoint subdirectory: every request for a
+    session with a snapshot logged ``missing_sidecar`` and no restore was ever
+    attempted. Measured over the >=24 h post-fix window (2026-10-29T12:58:32Z
+    to 2026-10-30T12:58:32Z): 605 ``missing_sidecar`` seeds, 0 ``found``, 0
+    restored dispatches.
+    """
+
+    ENDPOINT = "http://localhost:8080"
+
+    def _config(self, tmp_path):
+        slot_root = tmp_path / "slot-cache"
+        slot_root.mkdir(parents=True, exist_ok=True)
+        return {
+            "session_slot_save_path": str(slot_root),
+            "session_slot_pool_size": 2,
+        }
+
+    def test_slot_context_uses_the_llama_server_save_directory(self, tmp_path):
+        from proxy.session import _build_slot_context, _slot_owners
+
+        _slot_owners.clear()
+        config = self._config(tmp_path)
+        slot, filename, _timeout = _build_slot_context(
+            config,
+            SESSION,
+            {"messages": _messages()},
+            endpoint=self.ENDPOINT,
+        )
+
+        assert slot is not None
+        assert Path(filename).parent == Path(config["session_slot_save_path"])
+        assert Path(filename).name == f"slot_{SESSION}.bin"
+
+    def test_router_save_is_seedable_where_llama_server_wrote_it(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """End-to-end: save via the router, then seed from the same snapshot.
+
+        The stubbed save reproduces llama-server's real contract (bare filename
+        under its ``--slot-save-path``) rather than writing at the proxy-side
+        path, which is exactly what the earlier tests masked.
+        """
+        import asyncio
+
+        import proxy.router as router
+        from proxy.session import _build_slot_context, _slot_owners
+
+        caplog.set_level(logging.INFO, logger="llama-proxy.provider")
+        _slot_owners.clear()
+        config = self._config(tmp_path)
+        messages = _messages(4)
+        slot, filename, timeout = _build_slot_context(
+            config, SESSION, {"messages": messages}, endpoint=self.ENDPOINT
+        )
+        assert slot is not None
+        written: list[Path] = []
+
+        async def _fake_save(
+            _port, _slot, target, _timeout, model=None, endpoint=None
+        ):
+            on_disk = Path(config["session_slot_save_path"]) / Path(target).name
+            on_disk.write_bytes(b"KV-SNAPSHOT")
+            written.append(on_disk)
+            return True
+
+        monkeypatch.setattr(router, "_save_slot_snapshot", _fake_save, raising=False)
+        monkeypatch.setattr(
+            router, "_detect_restore_signal_from_llama_log", lambda *a, **k: False
+        )
+
+        response = MagicMock()
+        response.content = json.dumps(
+            {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+        ).encode("utf-8")
+        response.headers = {}
+
+        asyncio.run(
+            router._update_session_and_slot(
+                MagicMock(
+                    current_model=MODEL,
+                    logger=MagicMock(),
+                    session_manager=MagicMock(
+                        set_restore_confirmed=AsyncMock(),
+                        get=AsyncMock(return_value=None),
+                        update_messages=AsyncMock(),
+                        append_messages=AsyncMock(),
+                    ),
+                ),
+                SESSION,
+                {"messages": messages},
+                False,
+                [],
+                len(messages),
+                response,
+                llama_port=8080,
+                slot_id=slot,
+                slot_filename=filename,
+                slot_timeout=timeout,
+                slot_model_payload=MODEL,
+                slot_enabled=True,
+                upstream_status=200,
+                endpoint=self.ENDPOINT,
+            )
+        )
+
+        assert written == [Path(filename)]
+        assert sidecar_path(filename).exists()
+        assert sidecar_path(filename).parent == Path(filename).parent
+        assert (
+            seed_cached_ratio(
+                config,
+                {"messages": messages},
+                MODEL,
+                SESSION,
+                100_000,
+                endpoint=self.ENDPOINT,
+            )
+            == "restored"
+        )
+        assert any(
+            m.startswith("slot_ratio_seed outcome=found") for m in caplog.messages
+        )
+
+
 class TestSnapshotRetirementCoupling:
     """AC3 — a snapshot is never retired without its sidecar (and vice versa)."""
 
@@ -1218,22 +1365,107 @@ class TestCleanupScriptRetention:
         assert recent.exists()
         assert Path(str(recent) + ".ratio.json").exists()
 
+    @staticmethod
+    def _make_orphan(cache: Path, relative: str, *, age_days: int) -> Path:
+        """A sidecar with no matching snapshot, mtime ``age_days`` ago."""
+        path = cache / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        stamp = (datetime.now(UTC) - timedelta(days=age_days)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        subprocess.run(["touch", "-d", stamp, str(path)], check=True)
+        return path
+
     def test_orphan_sidecars_are_pruned_with_no_snapshots_present(self, tmp_path):
-        """The observed 139-orphan/0-snapshot state must not be a no-op."""
+        """The observed 139-orphan/0-snapshot state must not be a no-op.
+
+        The orphans are aged beyond ``--min-age-days`` so this still pins the
+        orphan sweep itself rather than the recent-orphan guard.
+        """
         cache = tmp_path / "slot-cache"
-        cache.mkdir(parents=True)
-        root_orphan = cache / "slot_gone.bin.ratio.json"
-        root_orphan.write_text("{}", encoding="utf-8")
-        nested = cache / "localhost-8080"
-        nested.mkdir()
-        nested_orphan = nested / "slot_gone_too.bin.ratio.json"
-        nested_orphan.write_text("{}", encoding="utf-8")
+        root_orphan = self._make_orphan(
+            cache, "slot_gone.bin.ratio.json", age_days=10
+        )
+        nested_orphan = self._make_orphan(
+            cache, "localhost-8080/slot_gone_too.bin.ratio.json", age_days=10
+        )
 
         result = self._run(cache)
 
         assert result.returncode == 0, result.stderr
         assert not root_orphan.exists()
         assert not nested_orphan.exists()
+
+    def test_stale_orphan_sidecar_is_deleted(self, tmp_path):
+        """An orphan older than ``--min-age-days`` is still pruned."""
+        cache = tmp_path / "slot-cache"
+        orphan = self._make_orphan(cache, "slot_stale.bin.ratio.json", age_days=3)
+
+        result = self._run(cache)
+
+        assert result.returncode == 0, result.stderr
+        assert not orphan.exists()
+        assert "Deleted orphan sidecar" in result.stdout
+        assert "orphan sidecar(s) kept" not in result.stdout
+
+    def test_recent_orphan_sidecar_is_kept_and_reported(self, tmp_path):
+        """LP-0MVUJBFRL005VDNA: ``--min-age-days`` protects fresh orphans.
+
+        A sidecar written moments ago may belong to a save in flight, or to a
+        save that failed between writing the sidecar and the snapshot, so it
+        must survive one cleanup cycle instead of being swept while its
+        snapshot is transiently absent.
+        """
+        cache = tmp_path / "slot-cache"
+        orphan = self._make_orphan(
+            cache, "localhost-8080/slot_fresh.bin.ratio.json", age_days=0
+        )
+
+        result = self._run(cache)
+
+        assert result.returncode == 0, result.stderr
+        assert orphan.exists()
+        assert "Deleted orphan sidecar" not in result.stdout
+        assert (
+            "SUMMARY: 1 orphan sidecar(s) kept (newer than --min-age-days)"
+            in result.stdout
+        )
+
+    def test_min_age_days_zero_deletes_recent_orphans(self, tmp_path):
+        """``--min-age-days 0`` disables the guard, as it does for the size rule."""
+        cache = tmp_path / "slot-cache"
+        orphan = self._make_orphan(cache, "slot_fresh.bin.ratio.json", age_days=0)
+
+        result = self._run(cache, "--min-age-days", "0")
+
+        assert result.returncode == 0, result.stderr
+        assert not orphan.exists()
+        assert "Deleted orphan sidecar" in result.stdout
+
+    def test_dry_run_reports_both_orphan_categories_and_deletes_nothing(
+        self, tmp_path
+    ):
+        """A dry run reports the deletable and the kept-recent orphan."""
+        cache = tmp_path / "slot-cache"
+        stale = self._make_orphan(cache, "slot_stale.bin.ratio.json", age_days=3)
+        fresh = self._make_orphan(
+            cache, "localhost-8080/slot_fresh.bin.ratio.json", age_days=0
+        )
+
+        result = self._run(cache, "--dry-run")
+
+        assert result.returncode == 0, result.stderr
+        assert stale.exists()
+        assert fresh.exists()
+        assert "Would delete orphan sidecar" in result.stdout
+        assert (
+            "DRY-RUN SUMMARY: 1 orphan sidecar(s) would be pruned" in result.stdout
+        )
+        assert (
+            "DRY-RUN SUMMARY: 1 orphan sidecar(s) kept (newer than --min-age-days)"
+            in result.stdout
+        )
 
     def test_paired_sidecar_survives_retention(self, tmp_path):
         cache = tmp_path / "slot-cache"
