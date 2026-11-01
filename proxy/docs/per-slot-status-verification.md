@@ -154,7 +154,12 @@ ignores the new fields behaves exactly as before (contract test:
 (LP-0MVKSXR4P001V0CM) adds stale-detail reconciliation of `capacity_hint` and
 truthful in-flight accounting. v4 (LP-0MVRMI5HK00558TB) adds the abandoned-work
 annotation, the `abandoned_busy` hint value and the top-level
-`local_abandoned_slots` count.
+`local_abandoned_slots` count; v4 additionally carries the `abandoned_scope`
+discriminator and can annotate a draining slot from an **endpoint-wide**
+registry entry when the release could not resolve a slot identity
+(LP-0MVUVHB1V006HA5I / LP-0MVUVHAQP001IRKK). That is an additive widening of
+*which* abandonments are annotatable — no field is removed or reinterpreted, so
+`status_schema_version` stays `4`.
 
 ## Payload (new fields)
 
@@ -178,13 +183,14 @@ annotation, the `abandoned_busy` hint value and the top-level
      "lease_state": "generating", "phase": "prefill",
      "prefill_eta_seconds": 187.0, "abandoned": false,
      "abandonment_reason": null, "abandoned_session_id": null,
-     "abandoned_at_seconds_ago": null},
+     "abandoned_at_seconds_ago": null, "abandoned_scope": null},
     {"slot_id": 1, "is_processing": true, "n_decoded": 41,
      "context_tokens": 4096, "owner_session_id": null,
      "lease_state": "generating", "phase": "decode",
      "prefill_eta_seconds": null, "abandoned": true,
-     "abandonment_reason": "prefill_deadline",
-     "abandoned_session_id": "herdr-…", "abandoned_at_seconds_ago": 12.4}
+     "abandonment_reason": "measured_cache_deficit",
+     "abandoned_session_id": "herdr-…", "abandoned_at_seconds_ago": 12.4,
+     "abandoned_scope": "endpoint"}
   ]
 }
 ```
@@ -200,13 +206,16 @@ Per-slot fields (all additive):
 | `prefill_eta_seconds` | `float \| null` | Shared calibrated prefill cost of the slot's loaded context, only for a slot in `prefill`; `null` otherwise or when not computable. It is a **cache-cold** estimate (`cached_ratio = 0.0`), labelled by `prefill_eta_kind` / `prefill_eta_assumed_cached_ratio` (LP-0MVSD5RJW008F1IB). |
 | `prefill_eta_kind` | `"reference_cold_bound"` | Discriminator: the ETA is a cache-cold bound, not a per-request estimate. |
 | `prefill_eta_assumed_cached_ratio` | `0.0` | The cache state the ETA assumes: nothing served from the prompt cache. |
-| `abandoned` | `bool` | `true` when the proxy gave up on the dispatch occupying this slot (see [Abandoned work](#abandoned-work-lp-0mvr5hk00558tb-ac1)) and llama-server has not released it yet. Always present. |
+| `abandoned` | `bool` | `true` when the proxy gave up on the dispatch occupying this slot (see [Abandoned work](#abandoned-work-lp-0mvr5hk00558tb-ac1)) and llama-server has not released it yet — matched either by this slot's own registry entry or, for a draining ghost with no live owner, by an endpoint-wide entry. Always present. |
 | `abandonment_reason` | `str \| null` | Which abandonment gave the slot up: `prefill_deadline`, `session_evicted`, `no_progress_watchdog`, `client_disconnect` (also `orphan_cleanup` / `measured_cache_deficit` from the sweep and the early abort). `null` when `abandoned` is `false`. |
 | `abandoned_session_id` | `str \| null` | The session that was abandoned (the slot's own identity is already `slot_id`). `null` when `abandoned` is `false`. |
 | `abandoned_at_seconds_ago` | `float \| null` | Age of the abandonment, so a consumer can reason about how long a ghost may persist (the registry TTL is 900 s). |
+| `abandoned_scope` | `"slot" \| "endpoint" \| null` | Which registry entry produced the annotation: `"slot"` when the slot's own recorded identity matched, `"endpoint"` when an endpoint-wide entry (an abandonment recorded without a resolvable slot id, or one whose recorded id no longer matched the draining slot) was applied behind the no-live-owner guard, `null` when the slot is not abandoned (LP-0MVUVHB1V006HA5I). |
 
 Top-level fields: `capacity_hint`, `prefill_budget_seconds`,
-`local_abandoned_slots` (count of `abandoned: true` slots),
+`local_abandoned_slots` (count of `abandoned: true` slots — including slots
+annotated from an endpoint-wide entry, so an abandonment that could not name a
+slot is still counted and reported rather than dropped),
 `status_schema_version` (plus the existing `prefill_eta_seconds` /
 `queue_eta_seconds`).
 
@@ -302,7 +311,9 @@ Two mechanisms now apply, per reason (details and the log lines are in
    prefill, so the ghost window is short rather than the whole prefill.
 2. **Annotate what remains.** The abandoned slot identity (endpoint, slot,
    session, reason, timestamp) is recorded in-process with a 900 s TTL, and the
-   status payload publishes it. A slot the backend has not released yet is then
+   status payload publishes it. An abandonment that cannot name a slot is
+   recorded as an endpoint-wide entry instead of being dropped (see below). A
+   slot the backend has not released yet is then
    *busy, not ours*: `capacity_hint` is `abandoned_busy` — **never**
    `saturated` (that must keep meaning live, proxy-owned decode work) and
    **never** `idle` (a busy-but-abandoned pool folded into `idle` would admit a
@@ -311,6 +322,95 @@ Two mechanisms now apply, per reason (details and the log lines are in
 The annotation is explicit and attributable (slot identity + reason + session),
 never a blanket discount of llama-server processing: a fresh snapshot whose
 slots are genuinely live still reports `saturated`.
+
+### Registry entries: slot-scoped and endpoint-wide
+
+The registry (`_abandoned_slots` in `proxy/proxy/router_helpers.py`) is
+in-process and keyed `(endpoint, key)` — it resets with the routing state it
+describes. An abandonment is recorded as **one of two scopes**:
+
+| `scope` | Key | Recorded when | Matched to |
+|---|---|---|---|
+| `slot` | the slot id | the release resolved a real slot identity | that slot only (exact endpoint first, then the legacy/default label, then any endpoint carrying that id) |
+| `endpoint` | `ABANDONED_SLOT_ENDPOINT_WIDE` (`-1`) | the release could **not** resolve a slot identity, **or** the resolved id did not match the slot the backend reported for the session | any *processing* slot on the endpoint that no lease and no live dispatch record owns |
+
+The sentinel is a negative `int` on purpose: llama-server slot ids are always
+non-negative, so an endpoint-wide entry can never collide with a real slot, and
+keeping it an `int` preserves the registry's `tuple[str, int]` key contract.
+There is at most **one** endpoint-wide entry per endpoint, so the registry can
+never hold more entries than the pool size plus one — re-abandoning refreshes
+the entry instead of adding another.
+
+Identity is resolved **before** the assignment is freed, in precedence order
+(explicit slot id → the dispatch record's `slot_id` pinned at admission → the
+live session assignment), and the provenance is logged as
+`slot_source=explicit|assignment|endpoint_wide` on every
+`abandoned_slot_recorded` line. The resolved id is re-verified against the slot
+llama-server reports for that session; a mismatch logs
+`abandoned_slot_mismatch recorded_slot=… observed_slot=…` and records the
+endpoint-wide entry **in addition to** the exact one, so the "attributable but
+unmatched" shape is diagnosable from production logs instead of silent
+(LP-0MVUVHAQP001IRKK).
+
+The status builder matches in order
+(`annotate_slots_for_status`, `proxy/proxy/observability.py`):
+
+1. the slot's own registry entry → `abandoned_scope="slot"`;
+2. the endpoint-wide entry, applied **only** to a slot with
+   `is_processing: true` and `owner_session_id: null` — i.e. no dispatch lease
+   **and** no live dispatch record → `abandoned_scope="endpoint"`;
+3. otherwise no annotation (`abandoned_scope: null`).
+
+Step 2's guard is the whole safety argument: an endpoint-wide entry names no
+slot, so it may only describe a *draining ghost*. A slot a live dispatch record
+still owns keeps reporting `saturated`, which is why the truthful-status
+contract of LP-0MVKSXR4P001V0CM is not weakened. The annotation is read-only
+status decoration: it never frees or acquires capacity, never decrements a
+counter and never creates a lease.
+
+### Clearing, TTL and freshness
+
+An entry is dropped when the backend **disproves** it, and only on fresh
+evidence: a fresh (`slots_detail_stale=false`) snapshot that reports a slot
+`is_processing: false` clears that slot's entries, and a fresh snapshot with
+**nothing** processing clears the endpoint-wide entry. A *stale* snapshot is a
+fossil of a past request and clears nothing, and a snapshot that reports no
+slots at all (no model, server down) annotates and clears nothing — omitting a
+slot id is not evidence about that slot. Clearing is registry hygiene only:
+no lease is released and no capacity counter moves.
+
+The 900 s TTL (`DEFAULT_ABANDONED_SLOT_TTL_SECONDS`) is the backstop that keeps
+the annotation bounded even if the backend never reports the slot free: it is
+comfortably longer than the 90 s prefill deadline and the 180 s no-progress
+watchdog, so an entry outlives the window in which its ghost can still be seen
+processing, and it is lazily pruned on read (no timer task). Re-recording the
+same slot or endpoint refreshes the window, so a slot abandoned twice does not
+expire from the first event.
+
+### Why a draining-only pool never reads `saturated`
+
+`compute_capacity_hint()` rule 0 returns `abandoned_busy` when no slot is free
+and **no generating slot is live**. With every abandonment now attributable —
+by slot id, by a re-verified id, or endpoint-wide behind the no-live-owner
+guard — a pool whose only work is draining can no longer present a single live
+generating slot, so it reads `abandoned_busy`, never `saturated` and never
+`idle`.
+
+### Attribution in the measurement tool
+
+`scripts/capacity_signal_verification.py` counts a lease release as an
+abandonment event only for its `_ABANDON_REASONS` set. The set was widened to
+include `measured_cache_deficit` (imported from `proxy.measured_cache_abort`,
+so the two cannot drift): that release gives up on a dispatch while
+llama-server keeps working on it, exactly like the deadline, watchdog and
+eviction reasons, and leaving it out is what made 5 of the 12 residual polls
+below unattributable (LP-0MVUVHBD40067FE3).
+
+**Baseline effect.** The published historical counts — 247 polls / 2.12 % (pre-
+fix baseline) and 12 polls / 0.11 % (post-fix residual) — were computed with
+the narrower four-reason set. A widened tally is therefore not directly
+comparable with them; every report the tool emits states this discontinuity
+explicitly rather than silently re-basing the numbers.
 
 The table is authoritative only while the served `/slots` detail is **fresh**.
 When `slots_detail_stale` is true, the cached `is_processing`/`phase` describe
@@ -374,6 +474,10 @@ optional per-slot `owner_session_id`; extend them to also read:
 - `slots[].abandoned` / `abandonment_reason` / `abandoned_session_id` and the
   top-level `local_abandoned_slots` (LP-0MVRMI5HK00558TB) — for reporting and
   for distinguishing a ghost from live work without re-deriving it.
+  `slots[].abandoned_scope` (`"slot"` | `"endpoint"` | `null`) says whether the
+  slot's own identity matched or the annotation came from the endpoint-wide
+  entry, i.e. whether the ghost's identity could be resolved at release time
+  (LP-0MVUVHB1V006HA5I).
 - `prefill_budget_seconds` — the admission guard's budget, so the dispatcher
   paces to the same number the proxy enforces.
 
@@ -550,4 +654,64 @@ resolver `f58e8964`) → 29.59 % (same build, 24 h cycle). False `saturated`
 falls in step (2.12 % → 1.07 % → 0.27 % of polls), and no stale poll produced
 `saturated` in any window, so the cache-time reconciliation contract above
 still holds.
+
+## The 12-poll residual (2026-10-29 night, LP-0MVT2KW5A008X037)
+
+One further comparable night (2026-10-29 20:00 → 2026-10-30 07:00, the first
+window entirely inside the post-deploy uptime) took the false-saturation
+residual to **12 polls / 0.11 %** from the 247 / 2.12 % baseline — a 95.1 %
+reduction and not quite zero. Artifacts:
+`~/proxy-usage-reports/2026-10-29_night-post-deploy/` (`REPORT.md`,
+`saturated_without_live_work_attribution.csv`). Every remaining violation has
+**fresh** slot detail (`slots_detail_stale=false`), so none of them is a
+cache-reconciliation miss; the same tool and window length were used for both
+sides.
+
+| Episode (local) | Polls | Attribution | Release → poll gap |
+|---|---|---|---|
+| 2026-10-30 06:57:36 | 3 (inside one second) | none — nearest release `measured_cache_deficit`, 31 s earlier | 31 s |
+| 2026-10-30 06:01:20–21 | 2 | none | — |
+| 2026-10-29 20:19:25 | 1 | `session_evicted` | 295 s |
+| 2026-10-29 20:35:03 | 1 | `prefill_deadline` | 14 s |
+| 2026-10-29 23:36:23 | 2 | `no_progress_watchdog` | 182 s |
+| 2026-10-29 23:47:30–31 | 2 | `prefill_deadline` | 48 s |
+| 2026-10-30 01:43:11 | 1 | `session_evicted` | 520 s |
+
+That is 7 attributable and 5 unattributable polls, and they are **two shapes
+of the same annotation gap**, not a liveness defect:
+
+1. **Attributable but unmatched (7 polls).** An abandonment whose cancel
+   succeeded left a slot still `is_processing` while the registry carried no
+   entry the status builder could match — `local_abandoned_slots=0` on every
+   one of them. The recorded identity (or its endpoint label) did not line up
+   with the slot llama-server kept draining. Fixed by pinning the slot id at
+   admission, re-verifying it against the slot the backend reports, and
+   falling back to the endpoint-wide entry on a mismatch
+   (`slot_source=` / `abandoned_slot_mismatch` now make the answer readable
+   from the logs).
+2. **Unattributable (5 polls).** A release with no slot identity at all —
+   notably `measured_cache_deficit`, which used to pass neither a slot id nor
+   an upstream stream — so no entry could name the slot. Fixed by (a) every
+   release path recording either an exact identity or the endpoint-wide entry
+   (an abandonment is never silently dropped) and (b) the measurement tool
+   counting `measured_cache_deficit` as an abandonment reason.
+
+Both shapes are what the endpoint-wide entry plus the no-live-owner guard
+exist to close: the draining slot has no lease and no live dispatch record, so
+it is annotated `abandoned_scope="endpoint"`, and a pool occupied only by such
+ghosts reads `abandoned_busy` rather than `saturated`.
+
+Two observations on the residual table are **not claimed as causes** here and
+are triaged by the follow-on item `LP-0MVUVHCAP004V0JI` (which either
+reproduces and files a `discovered-from` item, or records "not reproduced" with
+the evidence checked): the two rows reporting `available_slots=1` alongside
+`saturated` (a purely occupied pool cannot produce that) and the one row
+reporting `latency_ms=3355` while `slots_detail_stale=false`. Neither is fixed
+by this change.
+
+The next measurement of this residual (a comparable night on the build that
+contains the endpoint-wide annotation) is a separate operational run; the
+history above is the baseline it is read against, with the widened
+`_ABANDON_REASONS` set noted as a discontinuity.
+
 

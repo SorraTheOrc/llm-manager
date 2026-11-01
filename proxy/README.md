@@ -2158,7 +2158,8 @@ Response:
 | `slots_stale`             | `bool`        | The served slot counts **or** per-slot detail came from the last-known cache. |
 | `slots_detail_stale`      | `bool`        | The per-slot detail (and therefore `capacity_hint` input) is cached.       |
 | `slot_counts_stale`       | `bool`        | The `available_slots` / `total_slots` pair is cached.                      |
-| `local_abandoned_slots`   | `int`         | Slots annotated `abandoned` — dispatches the proxy gave up on that llama-server has not released yet (LP-0MVRMI5HK00558TB). |
+| `local_abandoned_slots`   | `int`         | Slots annotated `abandoned` — dispatches the proxy gave up on that llama-server has not released yet (LP-0MVRMI5HK00558TB). The count is **endpoint-wide aware**: an abandonment recorded without a resolvable slot identity (or whose recorded id no longer matches the draining slot) is stored as one endpoint-wide registry entry and still counts once here, so no abandonment the proxy gave up on is invisible (LP-0MVUVHB1V006HA5I, LP-0MVUVHAQP001IRKK). |
+| `slots[].abandoned_scope` | `string \| null` | Which registry entry produced a slot's `abandoned` annotation: `"slot"` (the slot's own recorded identity matched), `"endpoint"` (an endpoint-wide entry applied to a processing slot that no lease **and** no live dispatch record owns — i.e. a draining ghost), or `null` when the slot is not abandoned. Additive within `status_schema_version` 4 (LP-0MVUVHB1V006HA5I). |
 | `status_schema_version`   | `int`         | Payload schema version (currently `4`).                                    |
 
 **Performance:**
@@ -2170,9 +2171,22 @@ variable). If the query times out, safe defaults (mostly `false`/`null`) are
 returned and `llama_server_running` is set to `false`.
 
 Local dispatches the proxy abandons (prefill deadline, session eviction,
-no-progress watchdog, client disconnect) are cancelled upstream where a handle
-exists and otherwise reported per slot as `abandoned` with its reason and
-session, so a ghost llama-server is still finishing never reads as live work.
+no-progress watchdog, client disconnect, orphan sweep, measured cache deficit)
+are cancelled upstream where a handle exists and otherwise reported per slot as
+`abandoned` with its reason, session and `abandoned_scope`, so a ghost
+llama-server is still finishing never reads as live work. Every abandonment
+records an identity that can match the slot it gave up on, or an **endpoint-wide**
+entry that matches a draining slot on that endpoint only while no lease and no
+live dispatch record owns it — so a release with no resolvable slot id is still
+annotatable, and live work is still reported `saturated`. The entry is cleared
+when a fresh `/slots` snapshot reports the slot free and is TTL-bounded (900 s)
+regardless. `scripts/capacity_signal_verification.py` counts a
+`measured_cache_deficit` release as an abandonment event; that widens the
+attribution baseline (the historical 247-poll / 12-poll counts used the
+narrower reason set), which every report states explicitly. Details in
+[docs/per-slot-status-verification.md](docs/per-slot-status-verification.md#abandoned-work-lp-0mvr5hk00558tb-ac1)
+and
+[docs/routing.md](docs/routing.md#abandoned-local-dispatches-lp-0mvr5hk00558tb-ac1).
 The post-deadline prefill-thrash cooldown is scoped to the **(session, prompt
 fingerprint)** that actually failed and is released as soon as a fresh snapshot
 proves the GPU free, so it never vetoes an unrelated prompt on an idle GPU while

@@ -1960,7 +1960,7 @@ Memory bound: the key is the slot identity, so the registry can never hold
 more entries than there are ``(endpoint, slot)`` pairs plus **one**
 endpoint-wide entry per endpoint — re-abandoning the same slot (or the same
 endpoint without an identity) overwrites/refreshes its entry. Expiry is lazy
-(pruned on read and by the periodic sweep), so no timer task is needed.
+(evaluated on every read), so no timer task is needed.
 """
 
 
@@ -1972,8 +1972,8 @@ def _abandoned_slot_key(endpoint: str | None, slot_id: int) -> tuple[str, int]:
 def _prune_abandoned_slots(now: float | None = None) -> int:
     """Drop expired entries; return how many were removed.
 
-    Expiry is lazy (evaluated on read and on this sweep) so the registry needs
-    no timer of its own.
+    Expiry is lazy (evaluated on every registry read) so the registry needs no
+    timer of its own.
     """
     _now = time.monotonic() if now is None else now
     expired = [

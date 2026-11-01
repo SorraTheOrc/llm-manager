@@ -2392,7 +2392,7 @@ Two mechanisms, applied per reason:
 | `session_evicted` | **Cancel** the pinned `stream_cm` of each released record, then **annotate** what could not be cancelled | `lease_released … reason=session_evicted`, `abandoned_slot_recorded …` |
 | `no_progress_watchdog` | **Cancel** the record's `stream_cm` (existing, `LP-0MVIQ0FJC000YLX0`) + **annotate** | `lease_released … reason=no_progress_watchdog`, `abandoned_slot_recorded …` |
 | `client_disconnect` | **Cancel** the record's `stream_cm` (existing, `LP-0MVLFVY6K003VYEL`) + **annotate** | `lease_released … reason=client_disconnect`, `abandoned_slot_recorded …` |
-| `orphan_cleanup` / measured cache deficit | **Cancel** + **annotate** (same shared core) | `lease_released … reason=<that reason>` |
+| `orphan_cleanup` / `measured_cache_deficit` | **Cancel** + **annotate** (same shared core); both now carry the dispatch record's pinned slot identity and the upstream stream, so the earliest abort path is attributable too (`LP-0MVUVHAQP001IRKK`) | `lease_released … reason=<that reason>`, `abandoned_slot_recorded … slot_source=…` |
 
 A `measured_cache_deficit` abandonment only exists because the benefit gate
 **allowed** the abort: all three conditions held, so the measured cold ETA
@@ -2419,14 +2419,81 @@ processing; the cooldown was 600 s when this bound was chosen and is 120 s
 since 2026-10-31, `LP-0MVWC8JCG007GAPW`, so the margin only grew), keyed by slot identity so the registry cannot grow past the pool,
 and pruned lazily on read. It is published on `/llama/local/status`:
 `status_schema_version` 4, each slot carrying `abandoned`,
-`abandonment_reason`, `abandoned_session_id` and `abandoned_at_seconds_ago`,
-the top level carrying `local_abandoned_slots`, and `capacity_hint` gaining the
-additive value `abandoned_busy` for a pool occupied *only* by abandoned work.
+`abandonment_reason`, `abandoned_session_id`, `abandoned_at_seconds_ago` and
+`abandoned_scope`, the top level carrying `local_abandoned_slots`, and
+`capacity_hint` gaining the additive value `abandoned_busy` for a pool
+occupied *only* by abandoned work.
 `saturated` therefore keeps meaning live, proxy-owned decode work, and a
 busy-but-abandoned pool is never reported `idle`. See
 [per-slot-status-verification.md](per-slot-status-verification.md) for the
 status semantics and the consumer rule (any unrecognised hint value → treat as
 busy).
+
+**No abandonment is ever dropped.** The measured residual after the first fix
+(`LP-0MVT2KW5A008X037`: 12 polls / 0.11 % of a comparable night still reported
+`saturated` with no live work) was an *annotation identity* gap, not a
+liveness gap: the proxy knew it had given up, but the recorded identity did not
+match the slot llama-server was still draining — and a release that carried no
+identity at all (`measured_cache_deficit`) could not name a slot even in
+principle. Both shapes are now covered:
+
+- **Identity is resolved before the assignment is freed**, in precedence order:
+  the caller's explicit slot id → the dispatch record's `slot_id` pinned at
+  admission (`_pin_dispatch_slot`, so it survives the later assignment free) →
+  the live session assignment. The provenance is published on the log as
+  `slot_source=explicit|assignment|endpoint_wide` on every
+  `abandoned_slot_recorded` line.
+- **The resolved id is re-verified** against the slot llama-server reports for
+  that session; a mismatch logs
+  `abandoned_slot_mismatch session=… recorded_slot=… observed_slot=…` and
+  records the endpoint-wide entry **in addition to** the exact one.
+- **Unknown slot → endpoint-wide entry.** When no slot identity can be
+  resolved, the entry is stored under
+  `ABANDONED_SLOT_ENDPOINT_WIDE` (`slot_id=None`, `scope="endpoint"`) instead
+  of being discarded. The sentinel is a negative `int` because llama-server slot
+  ids are non-negative, so it can never collide with a real slot; there is at
+  most one such entry per endpoint, so growth stays bounded.
+
+**Why a draining-only pool never reads `saturated`.** The status builder
+(`annotate_slots_for_status`) matches the slot's own entry first
+(`abandoned_scope="slot"`), then falls back to the endpoint-wide entry
+(`abandoned_scope="endpoint"`) — but **only** for a slot that is
+`is_processing` with `owner_session_id: null`, i.e. neither a dispatch lease
+nor a live dispatch record owns it. That guard is what keeps the truthful-status
+contract intact: an endpoint-wide entry can only ever describe a *draining
+ghost*, so a genuinely live, proxy-owned slot still reports `saturated` and
+`capacity_hint` rule 0 (`abandoned_busy` only when **no** generating slot is
+live) is unchanged in intent. This is why the pool's hint is `abandoned_busy`
+rather than `saturated` while llama-server finishes a task the proxy walked
+away from.
+
+The entry is dropped as soon as the backend **disproves** it: a **fresh**
+`/slots` snapshot reporting the slot not processing clears that slot's entries,
+and a fresh snapshot with nothing processing clears the endpoint-wide entry. A
+stale snapshot never clears anything (cached `is_processing: false` is a fossil,
+not proof of release) and a snapshot with no slots at all changes nothing.
+Clearing and annotating are read-only status decoration: no lease is released,
+no counter is decremented, no capacity is acquired.
+
+**Abandoned work is still not dispatched behind.** The annotation changes what
+the status *says*, never what the gate *admits*: a slot llama-server is still
+draining has no free capacity, so `available_slots` and the admission gate are
+untouched, and `abandoned_busy` is a **non-idle** hint — a consumer that admits
+only on `idle` (herdr's downtime worker, for instance) does not dispatch behind
+a ghost. Folding abandoned work into `idle` was rejected for exactly that
+reason: it would start a second prefill behind a draining one and lengthen the
+tail.
+
+**Measurement.** `scripts/capacity_signal_verification.py` attributes a
+violating poll to a preceding `lease_released` event, and its
+`_ABANDON_REASONS` set now includes `measured_cache_deficit` (imported from
+`proxy.measured_cache_abort`): that release gives up on a dispatch while
+llama-server keeps working on it, so leaving it out made 5 of the 12 residual
+AC4 polls unattributable. Widening the set changes the historical baseline —
+the published 247 polls / 2.12 % pre-fix and 12 polls / 0.11 % post-fix counts
+were computed with the narrower four-reason set — and every tool report states
+that discontinuity rather than silently re-basing the comparison
+(`LP-0MVUVHBD40067FE3`).
 
 Interaction with the cooldown above: the annotation is what makes the *skip*
 decision honest (a ghost no longer reads as live work), while the ghost itself
