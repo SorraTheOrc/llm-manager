@@ -235,10 +235,10 @@ class TestCitationsStillResolve:
         ("proxy/config.yaml", 1381, "local_session_tenants: 2"),
         # 9 — capacity admission + status fail-open
         ("proxy/proxy/capacity_admission.py", 124, "def _slots"),
-        ("proxy/proxy/handlers.py", 426, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 656, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 702, "session_slot_pool_size"),
-        ("proxy/proxy/handlers.py", 829, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 442, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 714, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 760, "session_slot_pool_size"),
+        ("proxy/proxy/handlers.py", 890, "session_slot_pool_size"),
         # geometry-independent retention + per-session snapshot filenames
         ("proxy/proxy/session.py", 1202, "def _slot_filename_for_session"),
         ("proxy/proxy/session.py", 1204, "slot_{safe_id}.bin"),
