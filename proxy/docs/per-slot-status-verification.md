@@ -159,13 +159,17 @@ discriminator and can annotate a draining slot from an **endpoint-wide**
 registry entry when the release could not resolve a slot identity
 (LP-0MVUVHB1V006HA5I / LP-0MVUVHAQP001IRKK). That is an additive widening of
 *which* abandonments are annotatable — no field is removed or reinterpreted, so
-`status_schema_version` stays `4`.
+the abandonment change kept `status_schema_version` at `4`. The payload version
+is now `5` (`LP-0MVWFKIKJ005XHAY` added the read-only `local_route_available` /
+`local_route_reason` / `local_route_cooldown_remaining_s` fields, see
+[routing.md](routing.md#the-published-route-fields-status_schema_version-5));
+every field described below is unchanged by that bump.
 
 ## Payload (new fields)
 
 ```json
 {
-  "status_schema_version": 4,
+  "status_schema_version": 5,
   "total_slots": 2,
   "available_slots": 0,
   "contention_queue_depth": 3,          // existing, elsewhere in the payload
@@ -494,6 +498,18 @@ it would admit a dispatch behind a ghost and lengthen the tail.
 All of these are optional: the existing `is_processing` / `n_decoded` /
 `available_slots` reads keep working unchanged (AC1).
 
+`available_slots` and `capacity_hint` answer different questions and their pair
+can read `available_slots: 1` with `capacity_hint: saturated`. `available_slots`
+counts the slots llama-server reports as **not processing**; the hint classifies
+**admission capacity**, and a slot held by a post-stream lease is
+`idle_leased` — not capacity for a newcomer — while another slot decodes (626 of
+the 1,283 `saturated` polls in a direct scan of that window's status log; the
+tool's own filtered count is 1,307). A dispatcher that needs
+the engine verdict reads `capacity_hint` (keyed on `lease_state`), not the raw
+slot count; `slot_counts_stale` additionally flags a count served from the
+last-known cache
+([triage of the residual](#the-12-poll-residual-2026-10-29-night-lp-0mvt2kw5a008x037)).
+
 ## Post-fix measurement (2026-10-24 20:00 → 2026-10-25 07:00, Europe/Dublin)
 
 What the reconciliation above actually did on the first post-fix night
@@ -701,13 +717,42 @@ exist to close: the draining slot has no lease and no live dispatch record, so
 it is annotated `abandoned_scope="endpoint"`, and a pool occupied only by such
 ghosts reads `abandoned_busy` rather than `saturated`.
 
-Two observations on the residual table are **not claimed as causes** here and
-are triaged by the follow-on item `LP-0MVUVHCAP004V0JI` (which either
-reproduces and files a `discovered-from` item, or records "not reproduced" with
-the evidence checked): the two rows reporting `available_slots=1` alongside
-`saturated` (a purely occupied pool cannot produce that) and the one row
-reporting `latency_ms=3355` while `slots_detail_stale=false`. Neither is fixed
-by this change.
+Two observations on the residual table were **not claimed as causes** and were
+triaged by the follow-on item `LP-0MVUVHCAP004V0JI`; neither is fixed by this
+change:
+
+1. **`available_slots=1` alongside `saturated` (06:01:20 and 01:43:11).**
+   Reproduced. It is not one defect: the two fields measure different things,
+   and one of the two rows was counts-stale.
+   - *01:43:11*: fresh counts **and** fresh detail, and the shape is common —
+     626 of the 1,283 `saturated` polls in that window carried
+     `available_slots>0`.
+     The streaming dispatch finished at 01:43:10, its 30 s lease was renewed at
+     01:43:10.6, so the backend-freed slot was `idle_leased` (reserved, not
+     capacity for a newcomer) while the other slot was processing. On that
+     (pre-fix) build the freed slot also kept its abandonment annotation — the
+     pre-fix no-clear-on-free behaviour that clearing/TTL above now removes —
+     so `local_abandoned_slots` was non-zero. With the shipped fix the
+     unannotated processing slot is matched by the endpoint-wide entry and the
+     poll reads `abandoned_busy`; the `available_slots`/`capacity_hint` pairing
+     itself is documented behaviour and is pinned by
+     `test_available_slots_free_while_hint_saturated_for_leased_slot`.
+   - *06:01:20*: `slots_stale=true` with `slots_detail_stale=false`, i.e.
+     `slot_counts_stale=true` — the counts were served from the last-known
+     cache (89 of the 144 counts-stale polls that night reported
+     `available_slots>0`, 54 of them `saturated`) while the hint came from fresh
+     detail. The handler reconciles `available_slots` only when *detail* is
+     stale, never when *counts* are, so the pair can disagree. Disclosed by
+     `slot_counts_stale`; recorded as `discovered-from:LP-0MVUTYHG7001S6BM` and
+     not changed here.
+2. **`latency_ms=3355` with `slots_detail_stale=false` (06:57:36).**
+   **Not reproduced as a distinct defect.** `latency_ms` is the whole poll, not
+   the `/slots` detail budget: the handler issues up to three sequential bounded
+   queries (`query_llama_status` 1 s, counts 2 s, detail 1 s → 4 s envelope), so
+   3,355 ms is inside the envelope. That second also produced three concurrent
+   polls (3,355 / 856 / 26 ms) — the leader fetched and the two followers reused
+   the single-flight payload — and `slots_detail_stale=false` truthfully says the
+   detail query returned 200 within its own budget.
 
 The next measurement of this residual (a comparable night on the build that
 contains the endpoint-wide annotation) is a separate operational run; the

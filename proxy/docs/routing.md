@@ -2551,11 +2551,15 @@ cooldown so the annotation outlives the window in which the ghost can still be s
 processing; the cooldown was 600 s when this bound was chosen and is 120 s
 since 2026-10-31, `LP-0MVWC8JCG007GAPW`, so the margin only grew), keyed by slot identity so the registry cannot grow past the pool,
 and pruned lazily on read. It is published on `/llama/local/status`:
-`status_schema_version` 4, each slot carrying `abandoned`,
+`status_schema_version` 4 introduced the abandonment fields — each slot carrying
+`abandoned`,
 `abandonment_reason`, `abandoned_session_id`, `abandoned_at_seconds_ago` and
 `abandoned_scope`, the top level carrying `local_abandoned_slots`, and
 `capacity_hint` gaining the additive value `abandoned_busy` for a pool
-occupied *only* by abandoned work.
+occupied *only* by abandoned work. (The payload version is `5` since the
+read-only `local_route_*` fields of LP-0MVWFKIKJ005XHAY, see
+[the published route fields](#the-published-route-fields-status_schema_version-5);
+the abandonment fields are unchanged by that bump.)
 `saturated` therefore keeps meaning live, proxy-owned decode work, and a
 busy-but-abandoned pool is never reported `idle`. See
 [per-slot-status-verification.md](per-slot-status-verification.md) for the

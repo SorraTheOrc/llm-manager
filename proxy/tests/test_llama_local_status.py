@@ -1051,13 +1051,17 @@ class _CapacityStatusHarness:
         slot_owners=None,
         dispatch_records=None,
         counts_outcome=None,
+        counts=None,
         llama_running=True,
     ):
         """Issue /llama/local/status and return the parsed JSON body.
 
         ``stale_cache`` exercises the degraded path: the fresh detail query
         returns nothing and the last-known per-slot cache is served with
-        ``slots_stale=true``. ``counts_outcome`` simulates the fresh counts
+        ``slots_stale=true``. ``counts`` is the ``(available, total)`` tuple the
+        fresh counts query returns (default ``(0, 0)``); it is deliberately
+        independent of ``slots_detail`` because the two are separate ``/slots``
+        reads. ``counts_outcome`` simulates the fresh counts
         query's ``status_out`` (e.g. ``{"status": 400, "reason": "http_400"}``
         for an unloaded model) while still returning ``(0, 0)``.
         ``llama_running`` selects the engine-health state the fake status query
@@ -1074,7 +1078,7 @@ class _CapacityStatusHarness:
 
         detail_mock = AsyncMock(return_value=slots_detail or [])
         if counts_outcome is None:
-            counts_mock = AsyncMock(return_value=(0, 0))
+            counts_mock = AsyncMock(return_value=counts or (0, 0))
         else:
             async def _counts(*_args, **kwargs):
                 out = kwargs.get("status_out")
@@ -1224,6 +1228,41 @@ async def test_lease_state_idle_leased_after_stream_finished():
     slot = j["slots"][0]
     assert slot["lease_state"] == "idle_leased"
     assert slot["owner_session_id"] == "idle-holder"
+
+
+@pytest.mark.asyncio
+async def test_available_slots_free_while_hint_saturated_for_leased_slot():
+    """LP-0MVUVHCAP004V0JI triage: ``available_slots`` and ``capacity_hint``
+    answer different questions, so the pair can legitimately read
+    ``available_slots: 1`` with ``capacity_hint: saturated``.
+
+    ``available_slots`` counts the slots llama-server reports as *not
+    processing*; the hint classifies admission capacity, and a post-stream
+    lease still reserves a slot (``lease_state="idle_leased"``), so it is not
+    capacity for a newcomer while another slot decodes. This reproduces the
+    *shape* of the 2026-10-29 residual row 01:43:11 (the streaming dispatch
+    finished at 01:43:10, its 30 s lease was renewed 0.5 s before the poll, and
+    one other slot was decoding) — documented behaviour, not a defect.
+    """
+    import time
+
+    j = await _CapacityStatusHarness().get(
+        slots_detail=[
+            _slot(0, is_processing=True, n_decoded=41),
+            _slot(1, is_processing=False),
+        ],
+        counts=(1, 2),
+        slot_owners={("", 1): "post-stream-holder"},
+        dispatch_records={
+            "post-stream-holder": {
+                "active": False,
+                "expires_at": time.monotonic() + 30.0,
+            }
+        },
+    )
+    assert j["available_slots"] == 1
+    assert [s["lease_state"] for s in j["slots"]] == ["generating", "idle_leased"]
+    assert j["capacity_hint"] == "saturated"
 
 
 @pytest.mark.asyncio
@@ -1717,7 +1756,8 @@ async def test_endpoint_wide_entry_annotates_the_draining_slot(
     endpoint_wide_abandonment,
 ):
     """Shape 2 end-to-end: fresh detail, one processing slot, no live dispatch
-    — ``abandoned_busy`` with one annotated slot, and the schema stays v4."""
+    — ``abandoned_busy`` with one annotated slot; the annotation stays additive
+    within the current schema version (5 since LP-0MVWFKIKJ005XHAY)."""
     j = await _CapacityStatusHarness().get(
         slots_detail=[_slot(1, is_processing=True, n_decoded=7)],
     )
