@@ -63,8 +63,11 @@ MAX_RESERVE_TTL_SECONDS = 60
 #: ``local-preferred`` is the **canonical pin-local value**: the client asks
 #: that its request never be moved to a remote provider while local can serve
 #: it (the deferral/timing semantics live outside this vocabulary module).
-#: ``prefer-local`` (the default) may fall through; ``remote-ok`` keeps the
-#: local route and never waits for it.
+#: ``remote-ok`` is the **default**: it keeps the local route and never waits
+#: for it, so it is reached by an absent header and by any unknown value.
+#: ``prefer-local`` is retired (a ``400`` before routing,
+#: LP-0MVUH9PUU005HVS4) and survives only as a
+#: :data:`RETIRED_PREFERENCES` entry.
 #:
 #: ``remote-ok`` is a **historic name** (LP-0MVUH9OYZ007GMWF AC1): it means
 #: *"local allowed, remote acceptable"* — the local entry stays in the chain

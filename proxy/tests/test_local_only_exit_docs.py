@@ -208,12 +208,15 @@ def test_no_local_route_is_documented_as_a_refusal_not_a_fall_through():
 
 
 def test_response_headers_section_keeps_the_other_two_preferences_accurate():
-    """prefer-local unchanged / no preference strips, per the X-Local-Route docs.
+    """The default falls through / no preference strips, per the X-Local-Route
+    docs.
 
-    The section must state that ``prefer-local`` falls through exactly as
-    before **and** that the only chain-level strip is the capacity filter — a
-    ``remote-ok`` request keeps the local route (LP-0MVUH9OYZ007GMWF AC1/AC5),
-    so a sentence claiming the preference removes local entries fails here.
+    The section must state that the default (``remote-ok``, which an absent
+    header resolves to) falls through **and** that the only chain-level strip is
+    the capacity filter — a ``remote-ok`` request keeps the local route
+    (LP-0MVUH9OYZ007GMWF AC1/AC5), so a sentence claiming the preference removes
+    local entries fails here. Since LP-0MVUH9PUU005HVS4 ``prefer-local`` is
+    retired, so the default is the value that sentence must name.
     """
     text = ROUTING_DOC.read_text()
 
@@ -221,9 +224,12 @@ def test_response_headers_section_keeps_the_other_two_preferences_accurate():
     headers = headers[: headers.index("### Per-reason retry contract")]
     # Line wrapping is not part of the contract: compare on normalised prose.
     plain = " ".join(headers.split())
-    assert "`prefer-local` (the default) keeps today's behaviour unchanged" in plain, (
-        "the response-header section must state that prefer-local falls through "
-        "exactly as before"
+    assert (
+        "`remote-ok` (the default, and what an absent header resolves to) keeps "
+        "the local route" in plain
+    ), (
+        "the response-header section must name the live default and state that "
+        "it keeps the local route and falls through"
     )
     assert "The only chain-level strip that exists is the capacity filter" in plain, (
         "the response-header section must re-anchor stripping on the capacity "

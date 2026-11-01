@@ -1785,7 +1785,7 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 | Admission guard, queue path — projected first byte reaches `local_prefill_deadline_seconds` | `prefill_eta_exceeds_deadline` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_deadline ...` |
 | Admission guard, queue path — safety-budget bound of the deadline | `prefill_eta_exceeds_safety_budget` | refusing | `local_admission_guard ... reason=prefill_eta_exceeds_safety_budget ...` |
 | Admission guard, queue path — flat cold-prefill token cap (`local_cold_prefill_budget_tokens`): the prompt outgrows the local serving envelope | `prefill_budget_exceeded` | promoting | `local_admission_guard ... reason=prefill_budget_exceeded ...` |
-| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` — **only** when the free-slot ETA/budget bound is itself the cause; a deadline, deadline-relative safety-budget or flat cold-prefill refusal keeps its own governing token (`prefill_eta_exceeds_deadline` / `prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded`), so the direct path never relabels a non-ETA bound (`prefill_budget_exceeded` is a `too_large` verdict there: the pin declines and a remote tier serves the request — see [Promoted](#promoted-a-too-large-request-leaves-the-local-chain)) | refusing | `local_admission_guard ... free_slot=true ...` plus, for a pin-local client, `local_only_refused reason=<token> ... route=refused`. The `local_admission_guard_direct_fallback ... → routing to next provider` line is emitted **only** when the request really falls through to the next provider (`prefer-local` / `remote-ok` / absent header) |
+| Admission guard, direct free-slot dispatch path | `eta_exceeds_budget_direct` — **only** when the free-slot ETA/budget bound is itself the cause; a deadline, deadline-relative safety-budget or flat cold-prefill refusal keeps its own governing token (`prefill_eta_exceeds_deadline` / `prefill_eta_exceeds_safety_budget` / `prefill_budget_exceeded`), so the direct path never relabels a non-ETA bound (`prefill_budget_exceeded` is a `too_large` verdict there: the pin declines and a remote tier serves the request — see [Promoted](#promoted-a-too-large-request-leaves-the-local-chain)) | refusing | `local_admission_guard ... free_slot=true ...` plus, for a pin-local client, `local_only_refused reason=<token> ... route=refused`. The `local_admission_guard_direct_fallback ... → routing to next provider` line is emitted **only** when the request really falls through to the next provider (`remote-ok` / absent header — the immediate-step default) |
 | Local entry in cooldown (chain resolution) | `local_provider_cooldown` | refusing | `Skipping provider=<local>: ... in cooldown (...s remaining) reason=local_provider_cooldown preference=...` |
 | Router skip: prompt at/over the warm (KV-slot) cap; the per-entry `max_context_tokens` ceiling composes as an additional cap — the prompt can never fit local, however long it waits | `context_too_large` | promoting | `routing_skip_local ... reason=context_too_large → skipping local, routing to next remote provider` |
 | Router skip: economic cold-prefill bypass (an idle-admission denial keeps this token) | `large_context_bypass` | refusing | `routing_skip_local ... reason=large_context_bypass ...` |
@@ -1806,8 +1806,8 @@ every other row is a temporal (deferrable) exit and therefore refuses.
 
 The table is pinned by `proxy/tests/test_local_only_refusal_matrix.py` (one row
 per exit: a pinned `local-preferred` request ⇒ `429` + token + **no upstream
-call**; `prefer-local` and an absent header ⇒ today's remote fall-through,
-byte-compatible) and by `proxy/tests/test_local_fallback_reason_tokens.py`
+call**; `remote-ok` and an absent header ⇒ the default's immediate remote
+fall-through, with no queue and no deferral) and by `proxy/tests/test_local_fallback_reason_tokens.py`
 (per-branch tokens equal the log `reason=` verbatim). Every "not local" line
 also carries `preference=<parsed>` and `priority_routing ... session=<id>`
 (LP-0MVRMC275000R2W6), and each refusal emits exactly one
@@ -1821,8 +1821,8 @@ computed once by `admission_reserve.local_capacity_verdict`
 
 **Counting refusals.** `local_only_refused` is the countable token for this
 failure class: the guard's own `local_admission_guard decision=reject …` line is
-shared with a `prefer-local` request that is refused locally and *then served
-remotely*, so `decision=reject` alone cannot distinguish the two. The refusal
+shared with a `remote-ok` request, which never enters the queue at all, so
+`decision=reject` alone cannot distinguish the two. The refusal
 line always names its dispatch context and the admission evidence it was built
 from (LP-0MVNTJQVB007QWEZ):
 
@@ -1846,8 +1846,8 @@ headers, and `grep -c 'local_only_refused route=refused'` counts the class.
 Conversely, no log line may claim routing that did not happen: for a pin-local
 refusal the direct-guard dispatch point emits `local_only_refused` and **not**
 `local_admission_guard_direct_fallback … → routing to next provider`, which is
-reserved for a real fall-through (the `prefer-local` / `remote-ok` / absent
-header clients that are served by the next provider).
+reserved for a real fall-through (the `remote-ok` / absent-header clients that
+are served by the next provider).
 
 **Worked example.** The 2026-10-25 refusal of session
 `herdr-1792897705-4039879-16152` — a cache-cold 100k-token prompt priced far
@@ -2015,16 +2015,16 @@ Every response carries `X-Local-Route`:
   `X-Local-Admission*` estimate and token headers — see the
   [per-reason retry contract](#per-reason-retry-contract-lp-0mvntt4x8009io2x).
 
-`prefer-local` (the default) keeps today's behaviour unchanged: on every one
-of the exits above it falls through to the next provider exactly as before.
-The pin adds the deferral for `local-preferred` while its verdict is
-`deferrable`, and drops the local entry entirely when the verdict is
-`too_large`. `remote-ok` keeps the local route and is enforced at the
-**admission** decision rather than at the chain: the local entry is never
-removed from the chain *before* dispatch, so a `remote-ok` request reaches a
-local-route exit exactly like an absent header does — it simply never waits at
-one. The only chain-level strip that exists is the capacity filter, and no
-preference value can trigger it.
+`remote-ok` (the default, and what an absent header resolves to) keeps the
+local route and is enforced at the **admission** decision rather than at the
+chain: on every one of the exits above it falls through to the next provider,
+immediately, with no queue wait and no local-capacity `429`. The local entry is
+never removed from the chain *before* dispatch, so a `remote-ok` request
+reaches a local-route exit exactly like an absent header does — it simply never
+waits at one. The pin adds the deferral for `local-preferred` while its verdict
+is `deferrable`, and drops the local entry entirely when the verdict is
+`too_large`. The only chain-level strip that exists is the capacity filter, and
+no preference value can trigger it.
 
 ### Per-reason retry contract (LP-0MVNTT4X8009IO2X)
 
@@ -2049,10 +2049,9 @@ and header a client must honour:
 - `suggested_action` — human-readable remediation: "compact and resend" when
   `retryable: false`, "wait / reduce the size / route remote" when `true`. On
   `retryable: false` the shipped string still carries a pre-deferral clause
-  suggesting a switch to `prefer-local` to reach a remote fallback; a
-  `too_large` `local-preferred` request is already promoted automatically, so
-  treat the compaction half (resend at `budget_tokens` or less) as the
-  actionable remedy. The string refresh is tracked in LP-0MVTGI2RP009SRKN.
+  suggesting a switch to `remote-ok` to reach a remote fallback. A `too_large`
+  `local-preferred` request is already promoted automatically, so treat the
+  compaction half (resend at `budget_tokens` or less) as the actionable remedy.
 - `verdict` — `deferrable` when the block is temporal (waiting can help) or
   `too_large` when the request itself exceeds the local serving envelope
   (`prefill_budget_exceeded` / `context_too_large`). Additive: every other
@@ -2065,7 +2064,7 @@ and header a client must honour:
   free-slot admission refusal share the one builder, so both report the verdict
   and the same body/header shape (LP-0MVNTJJGX00375VQ AC1/AC2). The
   *chain-exhaustion* admission-refusal variant (the `local_admission_reject`
-  response a `prefer-local` request reaches when the rest of the chain is
+  response a non-pinned request reaches when the rest of the chain is
   genuinely exhausted) is the one surface that does not (LP-0MVSS435600370D6).
 - Token evidence — `X-Local-Admission-New-Tokens` / body `new_tokens` and
   `X-Local-Admission-Budget-Tokens` / body `budget_tokens` on **every**
@@ -2100,8 +2099,8 @@ and header a client must honour:
   context ceiling) and resend; no amount of waiting makes this request fit
   local capacity.
 - To let a remote provider serve such a request instead, send
-  `X-Local-Preference: prefer-local` (or `remote-ok`): neither pins, so the
-  remote fallback is reachable again. A client that cannot change its routing
+  `X-Local-Preference: remote-ok` (or omit the header, which is the default):
+  `remote-ok` never pins, so the remote fallback is reachable again. A client that cannot change its routing
   must read the refusal as "local cannot serve this request now", never as "all
   providers are down" — the two are different `code` values and different
   prose.
@@ -2186,7 +2185,8 @@ A chain-resolution exit (cooldown / reset / window) records no expiry on the
 request, so it is recomputed from live local availability state at refusal
 time; an exit that measures its own expiry (lease, queue, thrash cooldown)
 records it as it falls through. Only the pin-local refusal advertises these
-values — `prefer-local` keeps today's remote fall-through, and the ETA/occupancy
+values — only a pinned `local-preferred` request advertises them, while the
+default `remote-ok` steps straight to the next provider, and the ETA/occupancy
 reasons keep their `ceil(wait − budget)` timer.
 
 **Local-preferred means pinned while deferrable, promoted when too large.** A
@@ -2198,8 +2198,9 @@ exit→token table are in
 [`local-preferred`: pinned while deferrable, promoted when too large](#local-preferred-pinned-while-deferrable-promoted-when-too-large).
 A request that is `too_large` is **never refused for local capacity**: waiting
 cannot help, so the local entry leaves the chain and a remote tier serves it
-(`outcome=promoted`). Under `prefer-local` (the default) an exit instead falls
-through to the next provider, and waiting is the client's own choice.
+(`outcome=promoted`). Under `remote-ok` (the default) an exit instead falls
+through to the next provider immediately, and waiting is the client's own
+choice — a client that wants the proxy to wait opts in with `local-preferred`.
 
 `/llama/local/status` publishes the reservation counters
 (`reserved_outstanding`, `reserved_issued`, `reserved_used`,

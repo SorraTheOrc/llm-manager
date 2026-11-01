@@ -2079,10 +2079,8 @@ server:
   # 10 s, capped at 60 s, cancellable via
   # ``DELETE /llama/local/reserve/<id>`` and pruned on expiry.
   #
-  # ``X-Local-Preference: prefer-local|local-preferred|remote-ok`` expresses
-  # intent per request:
-  #   prefer-local (default) — today's behaviour: serve local when it fits the
-  #     wait budget, otherwise fall through to the next provider.
+  # ``X-Local-Preference: local-preferred|remote-ok`` expresses intent per
+  # request — exactly two values are live:
   #   local-preferred — the CANONICAL pin-local value. The request's capacity
   #     verdict splits it two ways. A DEFERRABLE request (the block is
   #     temporal, so waiting can help) is never moved to a paid provider: it
@@ -2093,22 +2091,32 @@ server:
   #     or the prompt over the local context limit derived from
   #     ``local_model_ctx_size``) is never deferred and never refused for local
   #     capacity: the local entry leaves the chain and a remote tier serves it.
-  #   remote-ok — local allowed, remote acceptable. The local route stays in
-  #     the chain and is attempted exactly as an absent header attempts it,
-  #     and a request that cannot be served locally RIGHT NOW steps straight
-  #     to the next provider: it never enters the contention queue, never
-  #     defers and never receives a local-capacity 429. The name is historic
-  #     (it once removed the local provider from the chain); no preference
-  #     value strips a local entry any more.
-  # The legacy spelling ``local-only`` is RETIRED (LP-0MVUH9PAZ002UAPA): it is
-  # no longer accepted and a request that sends it is refused with 400 and
-  # ``code: local_preference_retired`` (the body names ``local-preferred`` as
-  # the successor) BEFORE any routing, queueing, lease or dispatch state is
-  # written, with exactly one WARNING naming the value and the session. Migrate
-  # a client by sending ``local-preferred``; a client that must never spend
-  # remote budget pins a chain with no remote entries instead. Unknown values
-  # and an absent header behave exactly as ``prefer-local`` (today). ``high``
-  # priority keeps its never-queue semantics under every preference.
+  #   remote-ok (DEFAULT) — local allowed, remote acceptable. The local route
+  #     stays in the chain and is attempted, and a request that cannot be
+  #     served locally RIGHT NOW steps straight to the next provider: it never
+  #     enters the contention queue, never defers and never receives a
+  #     local-capacity 429 (so its queue wait is always 0 and the deferral /
+  #     reservation surfaces are reachable only for ``local-preferred``). The
+  #     name is historic (it once removed the local provider from the chain);
+  #     no preference value strips a local entry any more.
+  # Two spellings are RETIRED and both are refused with 400 and
+  # ``code: local_preference_retired`` BEFORE any routing, queueing, lease or
+  # dispatch state is written, with exactly one WARNING naming the value (and
+  # the session, when resolvable):
+  #   ``local-only`` (LP-0MVUH9PAZ002UAPA) — the old alias of
+  #     ``local-preferred``.
+  #   ``prefer-local`` (LP-0MVUH9PUU005HVS4) — the old default. It asked to
+  #     WAIT for local; the new default does not, so silently reinterpreting it
+  #     would deliver a different policy with no signal. Migrate a client that
+  #     needs the wait to ``local-preferred``, and a client that is happy to
+  #     step remote to ``remote-ok``.
+  # A client that must never spend remote budget pins a chain with no remote
+  # entries (e.g. the ``private`` model) rather than a preference value.
+  # Unknown values and an absent header resolve to the default ``remote-ok``;
+  # an unknown value also logs one WARNING naming the value received and the
+  # default it resolved to (LP-0MVUH9PUU005HVS4 AC22), while an absent header
+  # stays silent. ``high`` priority keeps its never-queue semantics under every
+  # preference.
   #
   # Interaction with the queue: ``contention_queue_max_wait_seconds`` is the
   # wait budget both this guard and ``/reserve`` compare against, and

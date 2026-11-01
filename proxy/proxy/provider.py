@@ -4812,7 +4812,7 @@ NOT_TIME_RETRYABLE_REFUSAL_REASONS = frozenset(
 _COMPACTION_GUIDANCE = (
     "Do not retry: waiting cannot make this request fit. Compact the session "
     "history (the refusal carries new_tokens/budget_tokens so the target size "
-    "is explicit) and resend, or send X-Local-Preference: prefer-local to "
+    "is explicit) and resend, or send X-Local-Preference: remote-ok to "
     "allow a remote fallback."
 )
 
@@ -7230,10 +7230,13 @@ def _note_local_token_evidence(
 
 
 def _request_local_preference(request) -> str:
-    """Return the request's ``X-Local-Preference`` (default ``prefer-local``).
+    """Return the request's ``X-Local-Preference`` (default ``remote-ok``).
 
-    Unknown values fall back to today's behaviour (AC8). The parsed value is
-    cached on the request so both routing cycles and the refusal path agree.
+    An **unknown** value resolves to the default and logs one ``WARNING``
+    naming the value received and the default it resolved to
+    (LP-0MVUH9PUU005HVS4 AC22): the header stays additive, but a client typo
+    must be visible in ``proxy.log``. The parsed value is cached on the request
+    so both routing cycles and the refusal path agree.
 
     A **retired** value raises :class:`LocalPreferenceRetiredError` instead of
     falling back (LP-0MVUH9PAZ002UAPA AC1/AC2): the retirement must fail closed
@@ -7380,8 +7383,9 @@ def _local_preference_pins_local(request, preference: str | None = None) -> bool
       the remote tiers and must **not** be refused for local capacity
       (parent AC4). Chain-level stripping and the promoted outcome line belong
       to LP-0MVSM06LB001PRU4; this predicate only declines the pin.
-    * ``prefer-local`` / ``remote-ok`` / absent header — never pinned, exactly
-      as today (parent AC5).
+    * ``remote-ok`` / absent header — never pinned: the default is the
+      immediate-step policy, so a pin never applies to it (parent AC5).
+      (``prefer-local`` is retired and answers ``400`` before routing.)
 
     Fail-safe direction (parent constraints): an unclassifiable exit stays
     pinned, because
@@ -7433,8 +7437,9 @@ async def _promote_too_large_local_request(
     :func:`admission_reserve.local_capacity_verdict` — the single verdict
     source (parent AC1/AC3); no reason or size table is re-derived here.
 
-    Only a pin-local (``local-preferred``) request is eligible: ``prefer-local``
-    and ``remote-ok`` keep today's behaviour (parent AC5). A chain with no
+    Only a pin-local (``local-preferred``) request is eligible: ``remote-ok``
+    (the default) and a headerless request keep the immediate-step behaviour
+    (parent AC5). A chain with no
     non-local entry is left intact (the filter's remote-less carve-out):
     stripping it would manufacture an empty-chain exhaustion, so the local
     route keeps its existing deferral/refusal exits (parent A5/AC5).
@@ -7584,7 +7589,7 @@ def _log_local_only_refusal(
     same classification as the 429 body rather than a second guess.
 
     LP-0MVNTJQVB007QWEZ: the line is the *countable* token for this failure
-    class (``decision=reject`` is shared with the ``prefer-local`` fall-through
+    class (``decision=reject`` is shared with the ``remote-ok`` fall-through
     that is served remotely), so it also carries the dispatch context
     (``session`` / ``provider`` / ``priority``) and the admission decision's own
     evidence (``new_tokens`` / ``budget_tokens`` / ``eta_prefill_seconds`` /
@@ -8351,7 +8356,7 @@ def _build_deferral_refusal_response(
       re-derived estimate.
 
     Returns ``None`` — leaving the caller's pre-existing ``continue`` exactly
-    as it was — when the request is not pinned to local (``prefer-local`` /
+    as it was — when the request is not pinned to local (``remote-ok`` /
     ``remote-ok`` / absent header keep today's fall-through) or when its
     verdict is ``too_large`` (waiting cannot help; that request is promoted to
     the remote tiers by the sibling chain-stripping slice, never refused for
@@ -8416,7 +8421,7 @@ async def _build_local_only_refusal_for_remote(
 
     Inert for a local candidate (the request still completes locally) and,
     through the single pin predicate
-    :func:`_local_preference_pins_local`, for ``prefer-local`` / absent header /
+    :func:`_local_preference_pins_local`, for ``remote-ok`` / absent header /
     ``remote-ok`` clients, so AC3 byte-compatibility is preserved and a
     ``remote-ok`` request keeps the local route (it falls through at the
     admission decision instead — LP-0MVUH9OYZ007GMWF AC1/AC4). The predicate
@@ -13099,7 +13104,7 @@ async def _proxy_with_fallback_cycle(
             # never run this remote-only walk — a fits-local request is not
             # promoted. Its refusal names ``local_lease_active`` and carries
             # the lease remainder; the walk below stays byte-identical for
-            # ``prefer-local`` / ``remote-ok`` / absent-header clients.
+            # ``remote-ok`` / absent-header clients.
             _lease_refusal = _build_deferral_refusal_response(
                 request,
                 config,
@@ -14085,7 +14090,7 @@ async def _proxy_with_fallback_cycle(
                         # emits no line of its own and never claims it routed
                         # onwards (LP-0MVNTJQVB007QWEZ AC1/AC2). The exhaustion
                         # builder keeps its admission-refusal variant for the
-                        # genuinely exhausted chain a ``prefer-local`` request
+                        # genuinely exhausted chain a ``remote-ok`` request
                         # reaches after the guard refused it.
                         return _build_local_only_refusal_response(
                             {
